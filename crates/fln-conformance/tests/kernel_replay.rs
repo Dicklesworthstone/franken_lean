@@ -8167,7 +8167,11 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 wall_ms: 0,
                 ..sample_whole_mathlib_receipt()
             },
-            "wall_ms",
+            // NOT the bare `wall_ms`: the profile refusal explains that
+            // `wall_ms` is uninterpretable without knowing the profile, so it
+            // contains that word too. `wall_ms: 0` is what belongs to this rule
+            // alone.
+            "wall_ms: 0",
         ),
         (
             "population does not conserve",
@@ -8379,6 +8383,7 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
         ),
     ];
 
+    let mut observed: Vec<(&str, String, &str)> = Vec::new();
     for (name, mutant, expected) in mutants {
         let verdict = mutant.validate(&pin, &corpus);
         let reason = match verdict {
@@ -8393,6 +8398,38 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             "`{name}` was refused for the wrong reason: expected a message naming \
              `{expected}`, got `{reason}`"
         );
+        observed.push((name, reason, expected));
+    }
+
+    // EVERY EXPECTATION MUST IDENTIFY ITS OWN CELL, checked against the real
+    // refusals rather than by reading the messages.
+    //
+    // Four waves of this bead were spent finding, by hand, cells whose expected
+    // fragment was also emitted by a DIFFERENT rule -- three floors sharing
+    // "below the", two delimiters sharing "as a delimiter". Each time, either
+    // rule could have been deleted and both cells would still have passed. This
+    // makes the property standing instead of remembered: if any refusal here
+    // contains another cell's expectation, the two are interchangeable and this
+    // fails naming both.
+    //
+    // It compares the strings the guard actually produced. An earlier attempt to
+    // derive the same thing by scanning the source for message literals returned
+    // a confidently wrong answer -- it truncated `validate` at the first nested
+    // brace and matched code fragments -- which is exactly why the comparison
+    // belongs here, where no parsing is involved.
+    for (name, reason, _) in &observed {
+        for (other_name, _, other_expected) in &observed {
+            if name == other_name {
+                continue;
+            }
+            assert!(
+                !reason.contains(other_expected),
+                "the refusal for `{name}` contains `{other_expected}`, which is the expectation \
+                 belonging to `{other_name}`. The two cells cannot tell each other's rule apart, \
+                 so either rule could be deleted and both would still pass. Assert on the part \
+                 that differs"
+            );
+        }
     }
 }
 
