@@ -2256,7 +2256,8 @@ def self_test_sandbox(work):
                 ("rename", (0, 1)), ("replace", (0, 1)),
                 ("truncate", (0,)), ("symlink", (1,)), ("link", (1,)),
                 ("chmod", (0,)), ("chown", (0,)), ("utime", (0,)),
-                ("mkdir", (0,)), ("makedirs", (0,)))
+                ("mkdir", (0,)), ("makedirs", (0,)),
+                ("mkfifo", (0,)), ("mknod", (0,)))
     # ...and subprocess is not the only way to start one. os.posix_spawn went
     # through, and so did os.fork -- visibly, because the forked child carried on
     # through the rest of the probe and printed its output a second time. A
@@ -2266,7 +2267,11 @@ def self_test_sandbox(work):
         (module, opname) for module, opname in (
             (subprocess, "Popen"), (os, "system"), (os, "posix_spawn"),
             (os, "posix_spawnp"), (os, "fork"), (os, "forkpty"),
-            (os, "execv"), (os, "execve"), (os, "execvp"), (os, "spawnv"))
+            (os, "execv"), (os, "execve"), (os, "execvp"), (os, "spawnv"),
+            # ...and signalling one. On a box this many panes share, a case that
+            # sends a signal to a pid reaches somebody else's run, and os.kill
+            # went through every version of this sandbox so far.
+            (os, "kill"), (os, "killpg"))
         if hasattr(module, opname))
     saved = {}
 
@@ -2292,6 +2297,18 @@ def self_test_sandbox(work):
     #
     # Read-only opens stay permitted, because the guards under test read artifacts
     # on purpose: only a flag carrying write intent is refused.
+    #
+    # WHAT THIS DOES NOT REACH, stated because a sandbox nobody knows the edge of
+    # is worse than a smaller one somebody does. A file handle obtained BEFORE the
+    # sandbox is entered keeps working inside it: the interception is on the call
+    # that opens a path, not on the write that follows, so `handle.write(...)` on
+    # a descriptor hoisted from outside is not seen. Measured rather than assumed
+    # -- a target file outside the temp directory went from 26 bytes to 27 that
+    # way. Closing it would mean patching io.TextIOWrapper.write, which is also
+    # what sys.stderr is, and the cure is worse than the disease. No case here can
+    # reach it without deliberately hoisting a handle, and the case
+    # `sandbox/known-limit-pre-opened-handle` keeps the boundary executable rather
+    # than folklore.
     real_os_open = os.open
     WRITE_FLAGS = (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
 
@@ -2308,8 +2325,9 @@ def self_test_sandbox(work):
     def guard_proc(opname):
         def wrapper(*args, **kwargs):
             raise SelfTestViolation(
-                f"the self-test called {opname}; it must never start a process, "
-                "because it has to stay runnable anywhere in under a second")
+                f"the self-test called {opname}; it must never start or signal a "
+                "process, because it has to stay runnable anywhere in under a "
+                "second and it shares this machine with other work")
         return wrapper
 
     def guarded_open(file, mode="r", *args, **kwargs):
@@ -2500,6 +2518,18 @@ def self_test():
     case("sandbox/allows-temp-replace",
          blocked(lambda: os.replace(os.path.join(work, "never-created"),
                                     os.path.join(work, "nor-this"))), False)
+    case("sandbox/blocks-mkfifo",
+         blocked(lambda: os.mkfifo(outside + ".fifo")), True)
+    case("sandbox/blocks-kill",
+         blocked(lambda: os.kill(os.getpid(), 0)), True)
+    # A CHARACTERIZATION OF THE BOUNDARY, not a wish. This asserts the limitation
+    # the docstring names: a handle opened before the sandbox still writes. If
+    # somebody closes that hole the case fails, and the right response is to flip
+    # it to True rather than to wonder what changed.
+    _hoisted = builtins.open(os.path.join(work, "hoisted.lean"), "w")
+    case("sandbox/known-limit-pre-opened-handle",
+         blocked(lambda: (_hoisted.write("x"), _hoisted.flush())), False)
+    _hoisted.close()
     case("sandbox/blocks-chmod",
          blocked(lambda: os.chmod(outside, 0o600)), True)
     case("sandbox/blocks-utime",
