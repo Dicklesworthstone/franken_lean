@@ -10651,3 +10651,235 @@ fn the_ten_field_one_arrays() {
          properties CAN differ, so matching them is a fact and not a tautology"
     );
 }
+
+/// The eight terminate the descent - the alternation does not repeat.
+///
+/// `dbf145f6` left two questions as unmeasured: whether the eight lead anywhere
+/// further, and whether the alternation repeats below them. Both are answered
+/// by one closure. Everything reachable from all eight is 39 objects:
+///
+///   tag 2 arity 2   19      tag 0 arity 3    8   (the eight themselves)
+///   tag 249         4       tag 1 arity 2    4
+///   tag 1 arity 1   3       tag 4 arity 2    1
+///
+/// NO ARRAY IS REACHABLE, and neither is any of the four structural shapes this
+/// descent has been made of: no head record, no wrapper, no four-field record,
+/// no pair. The only objects of the triple shape reachable from the eight are
+/// the eight. What lies below them is names, the strings inside those names,
+/// and two small expression nodes.
+///
+/// So the container chain ENDS here. The alternation `dbf145f6` found - the
+/// 111's kind, a wrapper, the 111's kind again - does not continue, because
+/// nothing below offers a container to continue through.
+///
+/// THE THIRTY-NINE IS THE GUARD, and it is doing real work. A walk that had
+/// failed would return the eight roots and nothing else, and "no arrays
+/// reachable" would be exactly what a broken traversal reports. Thirty-nine
+/// objects across six shapes, including strings four levels of pointer down,
+/// is a walk that demonstrably walked. Without that count the absence would be
+/// unreadable.
+///
+/// The absences are reported for what they are worth. Each shape occurs in the
+/// hundreds elsewhere in the corpus, so their absence from a 39-object closure
+/// is not surprising on its own - a set that small will miss most things. What
+/// carries is that the closure is CLOSED: 39 objects and no branching
+/// container, which is a property of the whole set rather than of any one
+/// shape's absence.
+#[test]
+fn the_eight_terminate_the_descent() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut roots = 0usize;
+    let mut reachable = 0usize;
+    let mut shapes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut structural: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut triples_reachable = 0usize;
+    let mut triples_are_the_roots = 0usize;
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        // Down to the eight: wrapper, inner record, its array, the ten, their
+        // field-1 arrays, and the elements there.
+        let mut eight: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            let Some(tail) = resolve(word_at(bytes, node + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            let Some(inner) = resolve(word_at(bytes, tail + 8)) else {
+                continue;
+            };
+            let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3)) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(ten) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                if shape(ten) != Some((0, 3)) {
+                    continue;
+                }
+                let Some(below) = resolve(word_at(bytes, ten + 8 + 8)) else {
+                    continue;
+                };
+                for k in 0..word_at(bytes, below + 8) {
+                    if let Some(element) = resolve(word_at(bytes, below + 24 + 8 * k as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        eight.insert(element);
+                    }
+                }
+            }
+        }
+        roots += eight.len();
+
+        // The closure under every pointer field, arrays included.
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut stack: Vec<usize> = eight.iter().copied().collect();
+        while let Some(offset) = stack.pop() {
+            if !seen.insert(offset) {
+                continue;
+            }
+            let object = at.get(&offset).expect("a walked object");
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                for slot in 0..usize::from(object.other) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 8 + 8 * slot)) {
+                        stack.push(child);
+                    }
+                }
+            } else if object.tag == abi::TAG_ARRAY {
+                for i in 0..word_at(bytes, offset + 8) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 24 + 8 * i as usize)) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        reachable += seen.len();
+
+        for &offset in &seen {
+            let object = at.get(&offset).expect("a walked object");
+            *shapes
+                .entry(format!("tag {} arity {}", object.tag, object.other))
+                .or_default() += 1;
+            for (probe, label) in [
+                ((0u8, 5u8), "head record"),
+                ((4, 1), "wrapper"),
+                ((0, 4), "four-field record"),
+                ((0, 2), "pair"),
+            ] {
+                if (object.tag, object.other) == probe {
+                    *structural.entry(label.to_owned()).or_default() += 1;
+                }
+            }
+            if object.tag == abi::TAG_ARRAY {
+                *structural.entry("array".to_owned()).or_default() += 1;
+            }
+            if (object.tag, object.other) == (0, 3) {
+                triples_reachable += 1;
+                if eight.contains(&offset) {
+                    triples_are_the_roots += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(roots, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(roots, 8, "the eight `dbf145f6` found");
+
+    // The guard first: a failed walk returns the roots and nothing else.
+    assert_eq!(
+        reachable, 39,
+        "thirty-nine objects reachable from the eight. This is the guard: a \
+         walk that had failed would return the eight roots alone, and \"no \
+         arrays reachable\" is exactly what a broken traversal reports"
+    );
+    assert!(
+        reachable > roots * 2,
+        "the closure must reach well beyond its own roots, or the absences \
+         below are unreadable"
+    );
+
+    assert_eq!(
+        shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 3".to_owned(), 8),
+            ("tag 1 arity 1".to_owned(), 3),
+            ("tag 1 arity 2".to_owned(), 4),
+            ("tag 2 arity 2".to_owned(), 19),
+            ("tag 249 arity 0".to_owned(), 4),
+            ("tag 4 arity 2".to_owned(), 1),
+        ],
+        "names, the strings inside them, and two small expression nodes"
+    );
+
+    // The termination.
+    assert!(
+        structural.is_empty(),
+        "no array and none of the four structural shapes this descent is made \
+         of is reachable: {structural:?}. The container chain ENDS here, so the \
+         alternation `dbf145f6` found does not continue - nothing below offers \
+         a container to continue through"
+    );
+    assert_eq!(
+        (triples_reachable, triples_are_the_roots),
+        (8, 8),
+        "and the only objects of the triple shape reachable from the eight are \
+         the eight themselves"
+    );
+}
