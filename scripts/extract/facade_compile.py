@@ -75,6 +75,9 @@ the toolchain would report a perfect facade:
   * A PROVIDER-DEPENDENCY JOIN requires a demanded row's `provided_by` owner to
     occur exactly once in its declared type dependencies. Structural provenance
     and type-level closure must name the same generated owner.
+  * A TYPE-DEPENDENCY SHAPE JOIN requires every non-Init demand to carry a
+    duplicate-free, non-self-referential list of named type dependencies. The
+    dependency relation used by the provider join must itself be well-formed.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -352,11 +355,13 @@ def join_demanded_rows(names, manifest_rows):
     emission_mismatches = []
     provider_mismatches = []
     provider_dependency_mismatches = []
+    type_dependency_shape_mismatches = []
     signature_provenance_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
     printer_join = Counter()
+    type_dependency_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -369,6 +374,7 @@ def join_demanded_rows(names, manifest_rows):
         if outcome != "init-substrate" and not isinstance(row.get("signature"), str):
             signatureless.append(name)
             continue
+        type_deps = row.get("type_deps")
         if outcome != "init-substrate":
             printer = row.get("printer")
             level_params = row.get("level_params")
@@ -380,6 +386,16 @@ def join_demanded_rows(names, manifest_rows):
                 )
                 continue
             printer_join[printer] += 1
+            if (not isinstance(type_deps, list)
+                    or not all(isinstance(dep, str) and dep for dep in type_deps)
+                    or len(type_deps) != len(set(type_deps))
+                    or name in type_deps):
+                type_dependency_shape_mismatches.append(
+                    f"{name}(type_deps={type_deps!r})"
+                )
+                continue
+            type_dependency_join["rows"] += 1
+            type_dependency_join["edges"] += len(type_deps)
         expected_role = "init-substrate" if outcome == "init-substrate" else "demanded"
         if row.get("role") != expected_role:
             role_mismatches.append(
@@ -404,7 +420,6 @@ def join_demanded_rows(names, manifest_rows):
                     f"{name}(provided_by={provider!r})"
                 )
                 continue
-            type_deps = row.get("type_deps")
             if (not isinstance(type_deps, list)
                     or type_deps.count(provider) != 1):
                 provider_dependency_mismatches.append(
@@ -423,7 +438,7 @@ def join_demanded_rows(names, manifest_rows):
         emission_join["emitted" if expected_emitted else "not_emitted"] += 1
     if (unclassified or signatureless or role_mismatches or emission_mismatches
             or provider_mismatches or provider_dependency_mismatches
-            or signature_provenance_mismatches):
+            or signature_provenance_mismatches or type_dependency_shape_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -443,13 +458,17 @@ def join_demanded_rows(names, manifest_rows):
             details.append("signature-provenance=" + ", ".join(
                 signature_provenance_mismatches[:8]
             ))
+        if type_dependency_shape_mismatches:
+            details.append("type-dependency-shape=" + ", ".join(
+                type_dependency_shape_mismatches[:8]
+            ))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
         )
     return (dispositions, dict(sorted(roles.items())),
             dict(sorted(emission_join.items())), dict(sorted(provider_join.items())),
-            dict(sorted(printer_join.items())))
+            dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -662,7 +681,9 @@ def main():
 
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
-     demand_printers) = join_demanded_rows(demand_names, manifest_rows)
+     demand_printers, demand_type_dependencies) = join_demanded_rows(
+         demand_names, manifest_rows
+     )
     type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
 
     # Mutation control for the source guard above. It is deliberately in-memory:
@@ -777,6 +798,7 @@ def main():
         "demanded_emission_join": demand_emission,
         "demanded_provider_join": demand_providers,
         "demanded_signature_printer_join": demand_printers,
+        "demanded_type_dependency_join": demand_type_dependencies,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
