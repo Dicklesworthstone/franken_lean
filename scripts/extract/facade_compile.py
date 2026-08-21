@@ -2106,6 +2106,20 @@ def main():
             "REFUSE: facade manifest probe-metadata count equality diverges "
             f"({json.dumps(probe_metadata_count_join, sort_keys=True)})"
         )
+    private_quarantine_count_join = {
+        "summary_private_name_rows": manifest_summary.get("private_name_rows"),
+        "summary_quarantined": manifest_summary.get("quarantined"),
+        "pinned_private_quarantine_count": 37,
+    }
+    if (private_quarantine_count_join["summary_private_name_rows"]
+            != private_quarantine_count_join["pinned_private_quarantine_count"]
+            or private_quarantine_count_join["summary_quarantined"]
+            != private_quarantine_count_join[
+                "pinned_private_quarantine_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest private-quarantine count diverges "
+            f"({json.dumps(private_quarantine_count_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3231,6 +3245,7 @@ def main():
             emission_pin_presence_count_join
         ),
         "manifest_probe_metadata_count_join": probe_metadata_count_join,
+        "manifest_private_quarantine_count_join": private_quarantine_count_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
