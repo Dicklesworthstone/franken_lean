@@ -424,7 +424,8 @@ fn every_named_auxiliary_family_decodes_across_the_whole_init_corpus() {
 
 #[test]
 fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
-    let lib = lib_or_skip!("every_named_private_auxiliary_family_reaches_the_constant_info_decoder");
+    let lib =
+        lib_or_skip!("every_named_private_auxiliary_family_reaches_the_constant_info_decoder");
 
     // The corpus census above proves that the private `constNames` arrays name
     // each family. That is necessary but insufficient: a future decoder could
@@ -465,11 +466,11 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
             )
         });
         let chain = chain_bytes(&lib, &relative);
-        let private_view = OleanView::parse_with_dependencies(
-            &chain.private,
-            &[&chain.exported, &chain.server],
-        )
-        .unwrap_or_else(|error| panic!("{family} {name}: parse private {relative}: {error}"));
+        let private_view =
+            OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+                .unwrap_or_else(|error| {
+                    panic!("{family} {name}: parse private {relative}: {error}")
+                });
         let constants = DeclDecoder::new(&private_view, WalkBudget::default())
             .decode_module_constants()
             .unwrap_or_else(|error| panic!("{family} {name}: decode private {relative}: {error}"));
