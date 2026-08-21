@@ -110,6 +110,10 @@ the toolchain would report a perfect facade:
     recognized effect class. Name/type availability never promotes an
     semantically unclassified facade row into the evidence set.
 
+  * A DEMANDED-BUCKET JOIN requires every non-Init demanded row to carry a
+    recognized risk bucket. Effect metadata alone is not a complete facade
+    disposition when a row is exposed to the compilation probe.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -129,6 +133,7 @@ PARTITION = os.path.join(REPO, "contracts", "builtin_partition.tsv")
 SCHEMA = "fln-facade-compile/1"
 DEMANDED_OUTCOMES = frozenset(("emitted", "init-substrate", "quarantined"))
 DEMANDED_EFFECTS = frozenset(("pure", "toolchain-monad", "io", "monad-transformer"))
+DEMANDED_BUCKETS = frozenset(("R-NONE", "R-EFFECT", "R-EXTERN", "R-UNSAFE"))
 
 
 def input_digest(path):
@@ -432,6 +437,7 @@ def join_demanded_rows(names, manifest_rows):
     signature_provenance_mismatches = []
     level_parameter_mismatches = []
     effect_mismatches = []
+    bucket_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
@@ -439,6 +445,7 @@ def join_demanded_rows(names, manifest_rows):
     type_dependency_join = Counter()
     level_parameter_join = Counter()
     effect_join = Counter()
+    bucket_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -458,6 +465,11 @@ def join_demanded_rows(names, manifest_rows):
                 effect_mismatches.append(f"{name}(effect={effect!r})")
                 continue
             effect_join[effect] += 1
+            bucket = row.get("bucket")
+            if bucket not in DEMANDED_BUCKETS:
+                bucket_mismatches.append(f"{name}(bucket={bucket!r})")
+                continue
+            bucket_join[bucket] += 1
             printer = row.get("printer")
             level_params = row.get("level_params")
             if (printer not in ("pp.fullNames", "pp.explicit", "pp.maxexplicit")
@@ -536,7 +548,7 @@ def join_demanded_rows(names, manifest_rows):
     if (unclassified or signatureless or role_mismatches or emission_mismatches
             or provider_mismatches or provider_dependency_mismatches
             or signature_provenance_mismatches or type_dependency_shape_mismatches
-            or level_parameter_mismatches or effect_mismatches):
+            or level_parameter_mismatches or effect_mismatches or bucket_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -566,6 +578,8 @@ def join_demanded_rows(names, manifest_rows):
             ))
         if effect_mismatches:
             details.append("effect=" + ", ".join(effect_mismatches[:8]))
+        if bucket_mismatches:
+            details.append("bucket=" + ", ".join(bucket_mismatches[:8]))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
@@ -573,7 +587,8 @@ def join_demanded_rows(names, manifest_rows):
     return (dispositions, dict(sorted(roles.items())),
             dict(sorted(emission_join.items())), dict(sorted(provider_join.items())),
             dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())),
-            dict(sorted(level_parameter_join.items())), dict(sorted(effect_join.items())))
+            dict(sorted(level_parameter_join.items())), dict(sorted(effect_join.items())),
+            dict(sorted(bucket_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -871,7 +886,8 @@ def main():
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
      demand_printers, demand_type_dependencies,
-     demand_level_parameters, demand_effects) = join_demanded_rows(
+     demand_level_parameters, demand_effects,
+     demand_buckets) = join_demanded_rows(
          demand_names, manifest_rows
      )
     type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
@@ -1011,6 +1027,7 @@ def main():
         "demanded_type_dependency_join": demand_type_dependencies,
         "demanded_level_parameter_join": demand_level_parameters,
         "demanded_effect_join": demand_effects,
+        "demanded_bucket_join": demand_buckets,
         "type_dependency_target_join": type_dependency_target_join,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
