@@ -2836,6 +2836,10 @@ fn is_private_cli_private_report_unsafe_rec_residual(display: &str) -> bool {
             .any(|component| component == "_unsafe_rec")
 }
 
+fn is_private_cli_private_report_standalone_unsafe_rec_residual(display: &str) -> bool {
+    display == "_private.CliPrivateReport.0._unsafe_rec"
+}
+
 fn is_private_loop_proof_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -3331,6 +3335,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_cli_private_report_unsafe_rec_residual,
     );
+    let mut private_cli_private_report_standalone_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_cli_private_report_standalone_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_cli_private_report_standalone_unsafe_rec_residual,
+    );
     let mut private_loop_proof_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3739,6 +3751,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_unsafe_rec_residuals)
     };
+    let private_cli_private_report_standalone_unsafe_rec_observed =
+        private_cli_private_report_standalone_unsafe_rec_residuals.observed;
+    let private_cli_private_report_standalone_unsafe_rec_omitted =
+        private_cli_private_report_standalone_unsafe_rec_residuals.omitted();
+    let private_cli_private_report_standalone_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
+    };
     let private_loop_proof_observed = private_loop_proof_residuals.observed;
     let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
     let private_loop_proof_names = if json {
@@ -4045,6 +4066,7 @@ fn render_check_olean_success(
                 "\"privateInitDataUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitPreludeUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportStandaloneUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4156,6 +4178,9 @@ fn render_check_olean_success(
             private_cli_private_report_unsafe_rec_observed,
             private_cli_private_report_unsafe_rec_names,
             private_cli_private_report_unsafe_rec_omitted,
+            private_cli_private_report_standalone_unsafe_rec_observed,
+            private_cli_private_report_standalone_unsafe_rec_names,
+            private_cli_private_report_standalone_unsafe_rec_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
@@ -4347,6 +4372,9 @@ fn render_check_olean_success(
                 "decoded _private CliPrivateReport _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport _unsafe_rec residual names: {}\n",
                 "decoded _private CliPrivateReport _unsafe_rec residual names omitted: {}\n",
+                "decoded _private CliPrivateReport standalone _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport standalone _unsafe_rec residual names: {}\n",
+                "decoded _private CliPrivateReport standalone _unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop._proof_* residual names: {}\n",
                 "decoded _private .loop._proof_* residual names omitted: {}\n",
@@ -4535,6 +4563,9 @@ fn render_check_olean_success(
             private_cli_private_report_unsafe_rec_observed,
             private_cli_private_report_unsafe_rec_names,
             private_cli_private_report_unsafe_rec_omitted,
+            private_cli_private_report_standalone_unsafe_rec_observed,
+            private_cli_private_report_standalone_unsafe_rec_names,
+            private_cli_private_report_standalone_unsafe_rec_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
@@ -5168,6 +5199,16 @@ fn render_check_olean_set_success(
             is_private_cli_private_report_unsafe_rec_residual,
         );
     }
+    let mut private_cli_private_report_standalone_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_cli_private_report_standalone_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_cli_private_report_standalone_unsafe_rec_residual,
+        );
+    }
     let mut private_loop_proof_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -5655,6 +5696,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_unsafe_rec_residuals)
     };
+    let private_cli_private_report_standalone_unsafe_rec_observed =
+        private_cli_private_report_standalone_unsafe_rec_residuals.observed;
+    let private_cli_private_report_standalone_unsafe_rec_omitted =
+        private_cli_private_report_standalone_unsafe_rec_residuals.omitted();
+    let private_cli_private_report_standalone_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
+    };
     let private_loop_proof_observed = private_loop_proof_residuals.observed;
     let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
     let private_loop_proof_names = if json {
@@ -5967,6 +6017,7 @@ fn render_check_olean_set_success(
                 "\"privateInitDataUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitPreludeUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportStandaloneUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -6080,6 +6131,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_unsafe_rec_observed,
             private_cli_private_report_unsafe_rec_names,
             private_cli_private_report_unsafe_rec_omitted,
+            private_cli_private_report_standalone_unsafe_rec_observed,
+            private_cli_private_report_standalone_unsafe_rec_names,
+            private_cli_private_report_standalone_unsafe_rec_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
@@ -6273,6 +6327,9 @@ fn render_check_olean_set_success(
                 "decoded _private CliPrivateReport _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport _unsafe_rec residual names: {}\n",
                 "decoded _private CliPrivateReport _unsafe_rec residual names omitted: {}\n",
+                "decoded _private CliPrivateReport standalone _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport standalone _unsafe_rec residual names: {}\n",
+                "decoded _private CliPrivateReport standalone _unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop._proof_* residual names: {}\n",
                 "decoded _private .loop._proof_* residual names omitted: {}\n",
@@ -6463,6 +6520,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_unsafe_rec_observed,
             private_cli_private_report_unsafe_rec_names,
             private_cli_private_report_unsafe_rec_omitted,
+            private_cli_private_report_standalone_unsafe_rec_observed,
+            private_cli_private_report_standalone_unsafe_rec_names,
+            private_cli_private_report_standalone_unsafe_rec_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,

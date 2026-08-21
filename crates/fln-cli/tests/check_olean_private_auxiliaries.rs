@@ -828,6 +828,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportStandaloneUnsafeRecResiduals",
+        1,
+        &["_private.CliPrivateReport.0._unsafe_rec"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateLoopProofResiduals",
         1,
         &["_private.CliPrivateReport.0.loop._proof_1"],
@@ -1366,6 +1372,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.CliPrivateReport.0._unsafe_rec",
             "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
         ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport standalone _unsafe_rec residuals",
+        "decoded _private CliPrivateReport standalone _unsafe_rec residual names",
+        1,
+        &["_private.CliPrivateReport.0._unsafe_rec"],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private .loop._proof_* residuals", "decoded _private .loop._proof_* residual names", 1, &["_private.CliPrivateReport.0.loop._proof_1"]);
     assert_human_named_residuals(
