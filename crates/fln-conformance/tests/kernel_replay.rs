@@ -4952,6 +4952,20 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
     }
 
     let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(versioned_name);
+    // AN EMPTY LIBRARY IS A TREE WITH NO FILES, NOT A MISSING TREE. Every
+    // directory here used to be created as the PARENT of some entry, so a
+    // fixture asked for no entries created nothing and handed back a path to a
+    // directory that does not exist. The caller's walk then failed with `read
+    // corpus directory ...: No such file or directory` -- which reads as a
+    // provisioning fault, not as a library that happens to hold no modules, and
+    // sends whoever hits it looking for the fixture writer's bug.
+    //
+    // That is the same distinction the corpus classifier draws between an absent
+    // root and a misprovisioned one, and the same one the retained-receipt
+    // reader draws between a file that is not there and a file it cannot read.
+    // Third place in this file, and the only one where the two were conflated.
+    fs::create_dir_all(&base)
+        .unwrap_or_else(|error| panic!("create fixture tree {}: {error}", base.display()));
     for relative in relative_files {
         let path = base.join(relative);
         let parent = path
@@ -6948,7 +6962,12 @@ fn the_inventory_vectors_are_parallel_and_the_extension_match_is_exact() {
 ///
 /// **The fixture holds a file, deliberately.** A directory with no entries at all
 /// and a directory whose entries are simply not oleans must both walk to nothing,
-/// and the second is the case that actually occurs in a real tree.
+/// and the second is the case that actually occurs in a real tree. The first half
+/// of that sentence was unbacked when it was written -- the fixture writer only
+/// ever created directories as the PARENT of an entry, so a tree with no entries
+/// at all could not be built and was never walked. It can now, and
+/// `an_empty_library_walks_to_nothing_and_a_missing_one_does_not_walk` is where
+/// it is checked.
 #[test]
 fn a_tree_with_no_oleans_walks_clean_and_only_the_receipt_floor_refuses_it() {
     let library = write_inventory_fixture("t6r7-inventory-empty-v1", &["notes.txt", "Sub/read.me"]);
@@ -7001,6 +7020,85 @@ fn a_tree_with_no_oleans_walks_clean_and_only_the_receipt_floor_refuses_it() {
         reason.contains("closure module(s)") && reason.contains("below the"),
         "the refusal must come from the size floor, because that is the ONLY rule anywhere that \
          distinguishes an empty tree from a corpus: {reason}"
+    );
+}
+
+/// An EMPTY library walks to nothing; a MISSING one does not walk at all.
+///
+/// **The neighbouring test names both cases and could only build one.** Its doc
+/// says a directory with no entries and a directory whose entries are not oleans
+/// must both walk to nothing, and its fixture holds `notes.txt` -- because the
+/// writer created directories only as the PARENT of an entry, so asking for no
+/// entries created nothing. A caller who did that got back a path to a
+/// directory that was never made, and the walk answered `read corpus directory
+/// ...: No such file or directory`. The half of the claim about an empty tree
+/// had no fixture behind it, and the failure it would have produced points at
+/// the filesystem rather than at the tree.
+///
+/// **Absent and empty are different everywhere else in this file.** The corpus
+/// classifier separates an absent root from a misprovisioned one so the first
+/// can skip and the second must fail. The retained-receipt reader separates a
+/// file that is not there from one it cannot read, so nothing announces "no
+/// receipt is retained" about a file sitting right there. This was the third
+/// instance of the same distinction and the only one where the two collapsed
+/// into one outcome.
+///
+/// **Both roots are walked here, and they are told apart by what they return**,
+/// not by a message fragment they might come to share: the empty tree returns
+/// `Ok` with a population of zero, the missing tree returns `Err`. A cell that
+/// asserted only "the empty tree does not panic" would pass on the old
+/// behaviour, since a failed walk returns `Err` rather than unwinding.
+#[test]
+fn an_empty_library_walks_to_nothing_and_a_missing_one_does_not_walk() {
+    let empty = write_inventory_fixture("t6r7-inventory-nothing-at-all-v1", &[]);
+
+    assert!(
+        empty.is_dir(),
+        "a fixture asked for no entries must still be a TREE. {} does not exist, so its caller \
+         would be told the corpus is unreadable rather than that the library holds no modules",
+        empty.display()
+    );
+
+    // ANTI-VACUITY: the tree must really hold nothing. If some earlier shape had
+    // left files under this name, the zero below would be a filter's answer over
+    // a populated tree rather than the empty walk this test is about.
+    let entries = fs::read_dir(&empty)
+        .unwrap_or_else(|error| panic!("read {}: {error}", empty.display()))
+        .count();
+    assert_eq!(
+        entries,
+        0,
+        "{} holds {entries} entr(ies); this test is about a tree with NOTHING in it",
+        empty.display()
+    );
+
+    let walked = walk_olean_inventory(&empty, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("an empty library must walk, not fail: {reason}"));
+    assert!(
+        walked.oleans.is_empty() && walked.modules.is_empty(),
+        "an empty tree must project to an empty inventory, not to a phantom module: {:?} / {:?}",
+        walked.oleans,
+        walked.modules
+    );
+
+    // THE PART THAT DIFFERS. A root that was never created must still fail, and
+    // fail as a filesystem fault -- otherwise this change would have turned a
+    // missing corpus into a silently empty one, which is the far worse error and
+    // exactly what the floor in `WholeMathlibReceipt::validate` exists to catch
+    // downstream.
+    let missing = empty.join("never-created");
+    let reason = match walk_olean_inventory(&missing, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(accepted) => panic!(
+            "a directory that does not exist walked to an inventory of {} module(s); an absent \
+             tree must never read as an empty one",
+            accepted.modules.len()
+        ),
+    };
+    assert!(
+        reason.contains("read corpus directory") && reason.contains("never-created"),
+        "the refusal must say which directory could not be read, or an absent root is \
+         indistinguishable from an empty one in the log as well as in the return value: {reason}"
     );
 }
 
