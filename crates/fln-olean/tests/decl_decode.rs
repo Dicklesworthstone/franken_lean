@@ -11721,6 +11721,227 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The imports root - two modules import the same module twice.
+///
+/// `imports` is the one `ModuleData` slot this file has never opened.
+/// `5e57207b` measured how many objects each root reaches and moved on;
+/// `Init.olean`'s 130 and Prelude's 1 were left as numbers.
+///
+/// EVERY IMPORT RECORD IS `(0, 1, 24)` - one pointer and an 8-byte scalar tail -
+/// in all four modules. Uniform, unlike almost everything else this bead has
+/// counted.
+///
+/// THE RECORDS ARE ALL DISTINCT AND THE NAMES ARE NOT. `Init.olean` has 43
+/// records and 42 distinct name objects; `Init.SizeOfLemmas.olean` has 5 and 4.
+/// Both list one module twice, and the repeat SHARES a single name object
+/// rather than storing the spelling again. Two records, one name - which is the
+/// object-versus-spelling distinction this whole bead turns on, appearing in a
+/// place where the duplication is the import list's own content and not an
+/// artefact of interning.
+///
+/// AND THE 130 RECONCILES EXACTLY. Under `Init.olean`'s `imports` root: one
+/// array, 43 strings, and 86 constructors which are 43 records plus 43 name
+/// links. Forty-two of those links are the full names and the forty-third is
+/// the shared `Init` prefix that all of them hang off - so 42 + 1 = 43 links,
+/// and 42 leaf strings plus `"Init"` = 43 strings. Every object under that root
+/// is accounted for, and the count is asserted as a sum.
+///
+/// PRELUDE IMPORTS NOTHING, and its `imports` root is not an empty list but the
+/// single interned empty array of `03f23abe` - which is why `5e57207b` found
+/// that root reaching exactly one object.
+///
+/// THE TAIL WORDS ARE PINNED AS OBSERVED AND NOT INTERPRETED. They take several
+/// values across the modules and look like packed byte flags, but nothing here
+/// measures what any bit means, so nothing here says.
+///
+/// POPULATION SCOPE: all four modules, the `imports` root and everything
+/// reachable from it, each asserted by name.
+#[test]
+fn the_imports_root() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut reach_rows: Vec<(String, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut record_shapes: BTreeSet<(u8, u8, u16)> = BTreeSet::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let array = resolve(word_at(bytes, root + 8)).expect("imports array");
+        let length = word_at(bytes, array + 8);
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        let mut names: BTreeSet<usize> = BTreeSet::new();
+        for i in 0..length {
+            let record = resolve(word_at(bytes, array + 24 + 8 * i as usize)).expect("record");
+            let shape = at.get(&record).expect("walked");
+            record_shapes.insert((shape.tag, shape.other, shape.cs_sz));
+            records.insert(record);
+            if let Some(name) = resolve(word_at(bytes, record + 8)) {
+                names.insert(name);
+            }
+        }
+        rows.push((
+            module.clone(),
+            usize::try_from(length).expect("in range"),
+            records.len(),
+            names.len(),
+        ));
+
+        // Everything under the root, decomposed by kind.
+        let under = reachable_from(bytes, base, word_at(bytes, root + 8));
+        let mut arrays = 0usize;
+        let mut strings = 0usize;
+        let mut name_links = 0usize;
+        let mut other_ctors = 0usize;
+        for off in &under {
+            let object = at.get(off).expect("walked");
+            if object.tag == abi::TAG_ARRAY {
+                arrays += 1;
+            } else if object.tag == abi::TAG_STRING {
+                strings += 1;
+            } else if object.tag == 1 {
+                name_links += 1;
+            } else {
+                other_ctors += 1;
+            }
+        }
+        reach_rows.push((
+            module.clone(),
+            under.len(),
+            arrays,
+            strings,
+            name_links,
+            other_ctors,
+        ));
+    }
+
+    let keep3 = |all: Vec<(&str, usize, usize, usize)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c)| (m.to_owned(), a, b, c))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep3(vec![
+            ("Init.olean", 43, 43, 42),
+            ("Init.BinderNameHint.olean", 2, 2, 2),
+            ("Init.SizeOfLemmas.olean", 5, 5, 4),
+            ("Init/Prelude.olean", 0, 0, 0),
+        ]),
+        "per module: import entries, DISTINCT record objects, and DISTINCT name \
+         objects. The records are always all distinct; the names are not. \
+         `Init.olean` lists 43 imports under 42 names and \
+         `Init.SizeOfLemmas.olean` 5 under 4, so both name one module TWICE and \
+         the repeat shares a single name object rather than storing the \
+         spelling again"
+    );
+    assert_eq!(
+        record_shapes.into_iter().collect::<Vec<_>>(),
+        vec![(0, 1, 24)],
+        "every import record in every module has one pointer and an 8-byte \
+         scalar tail - one shape, unlike almost everything else this bead has \
+         counted"
+    );
+
+    assert_eq!(
+        reach_rows
+            .iter()
+            .map(|(m, a, b, c, d, e)| (m.as_str(), *a, *b, *c, *d, *e))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 130, 1, 43, 43, 43),
+            ("Init.BinderNameHint.olean", 9, 1, 3, 3, 2),
+            ("Init.SizeOfLemmas.olean", 22, 1, 8, 8, 5),
+            ("Init/Prelude.olean", 1, 1, 0, 0, 0),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "everything under the `imports` root, decomposed into arrays, strings, \
+         name links and other constructors. `Init.olean`'s 130 is one array, 43 \
+         strings, 43 name links and 43 records: 42 of the links are the full \
+         names and the 43rd is the shared `Init` prefix they all hang off, so \
+         42 + 1 = 43 links and 42 leaf strings plus `\"Init\"` = 43 strings"
+    );
+    for ((module, total, arrays, strings, links, records), (_, _, _, names)) in
+        reach_rows.iter().zip(&rows)
+    {
+        assert_eq!(
+            arrays + strings + links + records,
+            *total,
+            "{module}: the four kinds must account for every object under the \
+             root"
+        );
+        assert!(
+            links >= names,
+            "{module}: every full name is itself a link, so links cannot be \
+             fewer"
+        );
+    }
+
+    // Links beyond the full names are shared PREFIX objects.
+    assert_eq!(
+        reach_rows
+            .iter()
+            .zip(&rows)
+            .map(|((m, _, _, _, links, _), (_, _, _, names))| (m.as_str(), links - names))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 1),
+            ("Init.BinderNameHint.olean", 1),
+            ("Init.SizeOfLemmas.olean", 4),
+            ("Init/Prelude.olean", 0),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "name links beyond the distinct full names - the shared PREFIX objects. \
+         `Init.olean` has exactly ONE for all 42 of its imports, because every \
+         one of them is `Init.something` and they all hang off a single `Init`. \
+         `Init.SizeOfLemmas.olean` needs four, its imports being three and four \
+         components deep"
+    );
+
+    if prelude_loaded {
+        let (_, total, arrays, strings, links, records) = reach_rows.last().expect("Prelude last");
+        assert_eq!(
+            (*total, *arrays, *strings, *links, *records),
+            (1, 1, 0, 0, 0),
+            "Prelude imports nothing, and its `imports` root is not an empty \
+             list but the single interned empty array of `03f23abe` - which is \
+             why `5e57207b` found that root reaching exactly one object"
+        );
+    }
+}
+
 /// Tag against arity - tag 7 skips arity two, and arity zero exists.
 ///
 /// `d76a2fdc` tabulated tag against tail width. This is the companion table,
