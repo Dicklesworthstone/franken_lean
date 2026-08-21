@@ -2060,6 +2060,27 @@ def main():
             "REFUSE: facade manifest kept instance-attribute count must exceed "
             f"dropped count ({json.dumps(instance_attribute_inequality_join, sort_keys=True)})"
         )
+    demanded_init_substrate_inequality_join = {
+        "summary_demanded": manifest_summary.get("demanded"),
+        "summary_demanded_init_substrate": manifest_summary.get(
+            "demanded_init_substrate"
+        ),
+    }
+    if (not isinstance(demanded_init_substrate_inequality_join[
+            "summary_demanded"], int)
+            or isinstance(demanded_init_substrate_inequality_join[
+                "summary_demanded"], bool)
+            or not isinstance(demanded_init_substrate_inequality_join[
+                "summary_demanded_init_substrate"], int)
+            or isinstance(demanded_init_substrate_inequality_join[
+                "summary_demanded_init_substrate"], bool)
+            or demanded_init_substrate_inequality_join["summary_demanded"]
+            <= demanded_init_substrate_inequality_join[
+                "summary_demanded_init_substrate"]):
+        raise SystemExit(
+            "REFUSE: facade manifest demanded count must exceed demanded "
+            f"Init-substrate count ({json.dumps(demanded_init_substrate_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4003,6 +4024,9 @@ def main():
         ),
         "manifest_instance_attribute_inequality_join": (
             instance_attribute_inequality_join
+        ),
+        "manifest_demanded_init_substrate_inequality_join": (
+            demanded_init_substrate_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
