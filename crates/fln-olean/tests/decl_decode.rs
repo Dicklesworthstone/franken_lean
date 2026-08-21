@@ -5416,3 +5416,231 @@ fn the_slot_three_arrays_include_an_empty_one() {
          is decoded, because no decoder here accepts them"
     );
 }
+
+/// The one-field elements: one shape wraps a name, the other wraps the first.
+///
+/// `4277a152` counted 102 elements across the four array groups and left them
+/// unopened. One of the 102 is boxed, so 101 are objects, and this reads those.
+///
+/// A COUNTING TRAP SITS IN FRONT OF THIS MEASUREMENT AND I WALKED INTO IT
+/// BEFORE CATCHING IT. Iterating the arrays by CARRIER gives 104 elements,
+/// because a shared array is visited once per carrier that points at it.
+/// `4277a152` counted over DISTINCT arrays. The two numbers describe different
+/// things and only one of them reconciles with what is already pinned, so this
+/// cell deduplicates arrays first and asserts the reconciliation - 22 from the
+/// seeds and 79 from the interior against the 6, 16, 30 and 49 pointer elements
+/// `4277a152` pins.
+///
+/// That is the fifth reference-versus-object confusion in this structure, and
+/// the first to appear inside the measuring code rather than in the data. It is
+/// caught here only because a total disagreed with a landed pin; without that
+/// cross-check it would have produced a clean, wrong histogram.
+///
+/// THE `tag 1` SHAPE WRAPS A NAME, uniformly - a numbered name link in all 35
+/// distinct objects across both populations - and every one goes to the
+/// production `decode_name` rather than being matched by shape.
+///
+/// THE `tag 2` SHAPE WRAPS THE `tag 1` SHAPE, in 11 of its 16 distinct objects,
+/// and something else in the other 5. So the two element shapes interlock, the
+/// same way the two slot-4 shapes did at `241893a7`. This cell says the edges
+/// exist and how many; it does not say what they build, because `3575962c`
+/// established that counting edges cannot answer that.
+///
+/// The seeds' entire `tag 2` population is ONE object, which is why its inner
+/// histogram is a single entry and no proportion is drawn from it.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_one_field_elements_wrap_names() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut totals: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut by_shape: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut inner: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut names_decoded = 0usize;
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+        let shape_of = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for population in ["seed", "interior"] {
+            let mut carriers: BTreeSet<usize> = BTreeSet::new();
+            for node in &all {
+                if (population == "seed") == seeds.contains(node)
+                    && let Some(record) = resolve(word_at(bytes, node + 8))
+                    && let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 3))
+                {
+                    carriers.insert(target);
+                }
+            }
+            // Deduplicate the ARRAYS before reading elements, or a shared array
+            // is counted once per carrier and the total stops reconciling.
+            let mut arrays: BTreeSet<usize> = BTreeSet::new();
+            for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                for &carrier in &carriers {
+                    if at.get(&carrier).map(|o| (o.tag, o.other)) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        arrays.insert(array);
+                    }
+                }
+            }
+
+            let mut references = 0usize;
+            let mut distinct: BTreeSet<usize> = BTreeSet::new();
+            let mut per_shape: std::collections::BTreeMap<String, BTreeSet<usize>> =
+                std::collections::BTreeMap::new();
+            let mut shape_references: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for array in arrays {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) {
+                        references += 1;
+                        distinct.insert(element);
+                        let shape = shape_of(element);
+                        *shape_references.entry(shape.clone()).or_default() += 1;
+                        per_shape.entry(shape).or_default().insert(element);
+                    }
+                }
+            }
+            let entry = totals.entry(population.to_owned()).or_default();
+            entry.0 += references;
+            entry.1 += distinct.len();
+
+            for (shape, group) in per_shape {
+                let key = format!("{population}/{shape}");
+                let counts = by_shape.entry(key.clone()).or_default();
+                counts.0 += shape_references.get(&shape).copied().unwrap_or(0);
+                counts.1 += group.len();
+                for element in group {
+                    let field = word_at(bytes, element + 8);
+                    let target = resolve(field).expect("the single field is a pointer");
+                    *inner
+                        .entry(format!("{key}/{}", shape_of(target)))
+                        .or_default() += 1;
+                    // Only the `tag 1` shape claims to hold a name; only it is
+                    // handed to the decoder.
+                    if shape == "tag 1 arity 1" {
+                        DeclDecoder::new(&view, WalkBudget::default())
+                            .decode_name(field)
+                            .unwrap_or_else(|e| panic!("{module}: must be a Name: {e}"));
+                        names_decoded += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            totals.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // The reconciliation: 22 + 79 is `4277a152`'s 6 + 16 + 30 + 49.
+    assert_eq!(
+        totals.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior".to_owned(), (79, 36)),
+            ("seed".to_owned(), (22, 15)),
+        ],
+        "element references and distinct objects. 22 + 79 = 101, which is the \
+         pointer elements `4277a152` pins as 6, 16, 30 and 49 - iterating \
+         arrays by CARRIER instead gives 104, because a shared array is visited \
+         once per carrier"
+    );
+
+    assert_eq!(
+        by_shape.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 1 arity 1".to_owned(), (55, 21)),
+            ("interior/tag 2 arity 1".to_owned(), (24, 15)),
+            ("seed/tag 1 arity 1".to_owned(), (21, 14)),
+            ("seed/tag 2 arity 1".to_owned(), (1, 1)),
+        ],
+        "the two shapes per population. The seeds' entire `tag 2` population is \
+         ONE object"
+    );
+
+    assert_eq!(
+        inner.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 1 arity 1/tag 2 arity 2".to_owned(), 21),
+            ("interior/tag 2 arity 1/tag 1 arity 1".to_owned(), 10),
+            ("interior/tag 2 arity 1/tag 4 arity 2".to_owned(), 5),
+            ("seed/tag 1 arity 1/tag 2 arity 2".to_owned(), 14),
+            ("seed/tag 2 arity 1/tag 1 arity 1".to_owned(), 1),
+        ],
+        "the `tag 1` shape wraps a numbered name link uniformly; the `tag 2` \
+         shape wraps the `tag 1` shape in 11 of its 16 distinct objects, so the \
+         two interlock - how deep is a traversal's question, not a count's"
+    );
+    assert_eq!(
+        names_decoded, 35,
+        "every `tag 1` element's field accepted by the production `decode_name`"
+    );
+}
