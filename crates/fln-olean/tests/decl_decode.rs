@@ -6420,3 +6420,298 @@ fn the_measured_chain_reconciles() {
         "pooled against the per-population 14 + 33 arrays and 14 + 21 elements"
     );
 }
+
+/// The overlap sets - which did not exist as sets until `243053f8`.
+///
+/// The ledger found that the two populations share 5 arrays and 12 `tag 1`
+/// elements below the four-field records. Nothing has opened those. They are
+/// the newest thing in the descent and the only set the ledger counts that no
+/// cell has looked inside.
+///
+/// THE SHARED ELEMENTS ARE NOT SPECIAL, which is `c726dec5`'s answer for the
+/// shared head records arriving again four levels down. Every `tag 1` element
+/// points at a numbered name link - the 12 shared ones, the 2 seed-only, the 9
+/// interior-only, without distinction. Sharing is what compaction does to
+/// identical subterms, not a mark on the data.
+///
+/// THE EMPTY ARRAY IS ONE OBJECT, NOT TWO. `4277a152` pinned a length-zero
+/// array in each `tag 3` group and I described it as "one in each". Both
+/// populations reach the SAME object: the seeds have one, the interior has one,
+/// and the shared set has one. Two memberships, one array - the membership
+/// versus object distinction again, in a sentence I wrote before the ledger
+/// existed to catch it.
+///
+/// AND THE SHARING IS NOT EXPLAINED BY THE SHARED ARRAYS. Only 4 of the 12
+/// shared elements sit inside a shared array; the other 8 are reached through
+/// DIFFERENT arrays in each population that happen to hold the same element.
+/// So the overlap is not one shared container dragging its contents along - the
+/// elements are shared on their own account, which is a stronger statement and
+/// the one the containers would have hidden.
+///
+/// The length histograms are pinned per group and nothing is said about their
+/// tendency; five shared arrays support no adjective.
+#[test]
+fn the_shared_objects_are_not_special() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut sizes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut lengths: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut inner: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut empties: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut containment: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        let mut carriers: Vec<usize> = Vec::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) == Some((0, 2)) {
+                carriers.push(object.off);
+            }
+        }
+        let records: BTreeSet<usize> = carriers
+            .iter()
+            .filter_map(|&node| resolve(word_at(bytes, node + 8)))
+            .filter(|&head| shape(head) == Some((0, 5)))
+            .collect();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        // The two populations' arrays and `tag 1` elements.
+        let mut group: [(BTreeSet<usize>, BTreeSet<usize>); 2] = [
+            (BTreeSet::new(), BTreeSet::new()),
+            (BTreeSet::new(), BTreeSet::new()),
+        ];
+        for (which, population) in [true, false].into_iter().enumerate() {
+            for &node in &all {
+                if seeds.contains(&node) != population {
+                    continue;
+                }
+                let Some(record) = resolve(word_at(bytes, node + 8)) else {
+                    continue;
+                };
+                let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3)) else {
+                    continue;
+                };
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        group[which].0.insert(array);
+                    }
+                }
+            }
+            let arrays = group[which].0.clone();
+            for array in arrays {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((1, 1))
+                    {
+                        group[which].1.insert(element);
+                    }
+                }
+            }
+        }
+
+        let shared_arrays: BTreeSet<usize> =
+            group[0].0.intersection(&group[1].0).copied().collect();
+        let shared_elements: BTreeSet<usize> =
+            group[0].1.intersection(&group[1].1).copied().collect();
+
+        for (name, set) in [
+            ("arrays/shared", shared_arrays.clone()),
+            (
+                "arrays/seed only",
+                group[0].0.difference(&group[1].0).copied().collect(),
+            ),
+            (
+                "arrays/interior only",
+                group[1].0.difference(&group[0].0).copied().collect(),
+            ),
+        ] {
+            *sizes.entry(name.to_owned()).or_default() += set.len();
+            for array in set {
+                let length = word_at(bytes, array + 8);
+                *lengths
+                    .entry(format!("{name}/length {length}"))
+                    .or_default() += 1;
+            }
+        }
+        for (name, set) in [
+            ("tag1/shared", shared_elements.clone()),
+            (
+                "tag1/seed only",
+                group[0].1.difference(&group[1].1).copied().collect(),
+            ),
+            (
+                "tag1/interior only",
+                group[1].1.difference(&group[0].1).copied().collect(),
+            ),
+        ] {
+            *sizes.entry(name.to_owned()).or_default() += set.len();
+            for element in set {
+                let target = resolve(word_at(bytes, element + 8)).expect("a pointer");
+                *inner
+                    .entry(format!(
+                        "{name}/tag {} arity {}",
+                        at[&target].tag, at[&target].other
+                    ))
+                    .or_default() += 1;
+            }
+        }
+
+        // The empty array: one object, or one per population?
+        for (name, set) in [
+            ("seed", group[0].0.clone()),
+            ("interior", group[1].0.clone()),
+            ("shared", shared_arrays.clone()),
+        ] {
+            *empties.entry(name.to_owned()).or_default() +=
+                set.iter().filter(|&&a| word_at(bytes, a + 8) == 0).count();
+        }
+
+        // Are the shared elements inside the shared arrays?
+        let mut inside: BTreeSet<usize> = BTreeSet::new();
+        for &array in &shared_arrays {
+            for i in 0..word_at(bytes, array + 8) {
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                    && shape(element) == Some((1, 1))
+                {
+                    inside.insert(element);
+                }
+            }
+        }
+        *containment
+            .entry("inside a shared array".to_owned())
+            .or_default() += inside.len();
+        *containment
+            .entry("of those, shared".to_owned())
+            .or_default() += inside.intersection(&shared_elements).count();
+        *containment
+            .entry("shared but not inside one".to_owned())
+            .or_default() += shared_elements.difference(&inside).count();
+    }
+
+    if !prelude_loaded {
+        assert!(
+            sizes.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        sizes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("arrays/interior only".to_owned(), 28),
+            ("arrays/seed only".to_owned(), 9),
+            ("arrays/shared".to_owned(), 5),
+            ("tag1/interior only".to_owned(), 9),
+            ("tag1/seed only".to_owned(), 2),
+            ("tag1/shared".to_owned(), 12),
+        ],
+        "the overlap sets the ledger found, and their complements"
+    );
+
+    // Not special: every `tag 1` element points at the same thing.
+    assert_eq!(
+        inner.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag1/interior only/tag 2 arity 2".to_owned(), 9),
+            ("tag1/seed only/tag 2 arity 2".to_owned(), 2),
+            ("tag1/shared/tag 2 arity 2".to_owned(), 12),
+        ],
+        "shared and unshared alike point at a numbered name link - `c726dec5`'s \
+         answer for the head records, four levels down"
+    );
+
+    // One empty array, two memberships.
+    assert_eq!(
+        empties.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior".to_owned(), 1),
+            ("seed".to_owned(), 1),
+            ("shared".to_owned(), 1),
+        ],
+        "`4277a152` pinned a length-zero array in each group and I called it \
+         \"one in each\". The shared set has one too, so both populations reach \
+         the SAME object: two memberships, one array"
+    );
+
+    // The sharing is not the containers'.
+    assert_eq!(
+        containment.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("inside a shared array".to_owned(), 4),
+            ("of those, shared".to_owned(), 4),
+            ("shared but not inside one".to_owned(), 8),
+        ],
+        "only 4 of the 12 shared elements sit in a shared array; the other 8 \
+         are reached through DIFFERENT arrays holding the same element, so the \
+         overlap is not one container dragging its contents along"
+    );
+
+    assert_eq!(
+        lengths.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("arrays/interior only/length 1".to_owned(), 3),
+            ("arrays/interior only/length 2".to_owned(), 14),
+            ("arrays/interior only/length 3".to_owned(), 5),
+            ("arrays/interior only/length 4".to_owned(), 3),
+            ("arrays/interior only/length 5".to_owned(), 2),
+            ("arrays/interior only/length 6".to_owned(), 1),
+            ("arrays/seed only/length 1".to_owned(), 2),
+            ("arrays/seed only/length 2".to_owned(), 7),
+            ("arrays/shared/length 0".to_owned(), 1),
+            ("arrays/shared/length 1".to_owned(), 2),
+            ("arrays/shared/length 2".to_owned(), 2),
+        ],
+        "lengths per group; five shared arrays support no adjective, so none is \
+         offered"
+    );
+}
