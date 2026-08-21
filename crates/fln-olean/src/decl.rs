@@ -3651,6 +3651,87 @@ mod tests {
         );
     }
 
+    /// A scalar in an Expr's CHILD slot is refused.
+    ///
+    /// Expressions are heap objects; a boxed scalar there is not a small
+    /// expression, it is a slot holding something that is not an expression at
+    /// all. Unchecked, the post-order walk below would skip it and the node
+    /// would be built from a child that was never decoded.
+    ///
+    /// SHADOWING CHECKED. Within `decode_expr` the order is constructor, then
+    /// arity, then this child loop, and only afterwards the size bind I added
+    /// at 269b4671 — so neither that bind nor the padding rules can fire ahead
+    /// of it. The plant writes a slot rather than the header, so the arity and
+    /// size are untouched, which the cell re-asserts after planting.
+    #[test]
+    fn a_scalar_in_an_expr_child_slot_is_refused() {
+        let mut bytes = forall_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified forall fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let pi_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("forallE expression");
+
+        let (tag, other, cs_sz) = view.obj_header(pi_off).expect("forallE header");
+        assert_eq!((tag, other, cs_sz), (7, 3, 48));
+        assert_eq!(
+            DeclDecoder::expr_child_slots(tag),
+            &[1, 2],
+            "binder type and body are the child slots"
+        );
+
+        // Slot 1 is the binder type, and it must currently be a heap Expr.
+        let slot = pi_off as usize + 8 + 8;
+        let child = view.read_u64(pi_off + 8 + 8).expect("binder type");
+        assert_eq!(
+            child & 1,
+            0,
+            "the fixture's binder type is a heap expression"
+        );
+
+        // Box a scalar in its place.
+        let planted: u64 = (0 << 1) | 1;
+        bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(pi_off).expect("header after plant"),
+            (7, 3, 48),
+            "the header is untouched, so the arity and size rules cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a scalar in a child slot must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "scalar Expr child",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `ConstantInfo` wrapper claiming more than its one payload pointer is
     /// refused.
     ///
