@@ -262,6 +262,7 @@ open Lean in
       -- and field projections are structural facts, not type facts. Report the
       -- constructor telescope so the emitter can rebuild the declaration itself.
       if let ConstantInfo.inductInfo iv := info then
+        IO.println s!"IND\t{n}\t{iv.numParams}\t{",".intercalate (iv.ctors.map toString)}"
         if isStructure env n then
           if let some ctor := iv.ctors.head? then
             if let some cinfo := env.find? ctor then
@@ -405,6 +406,7 @@ def probe(lean, env, work, names):
     extern_of = {}
     impl_by = {}
     kind_of = {}
+    inductives = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -428,6 +430,11 @@ def probe(lean, env, work, names):
         elif line.startswith("SAFE\t"):
             _, name, status = line.split("\t", 2)
             safety_status[name] = status.strip()
+            current = None
+        elif line.startswith("IND\t"):
+            _, name, nparams, ctors = line.split("\t", 3)
+            inductives[name] = {"num_params": int(nparams),
+                                "ctors": [c for c in ctors.strip().split(",") if c]}
             current = None
         elif line.startswith("KIND\t"):
             _, name, knd = line.split("\t", 2)
@@ -488,7 +495,7 @@ def probe(lean, env, work, names):
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
             module_of, struct_fields, res_head, priorities, extern_of, impl_by,
-            kind_of)
+            kind_of, inductives)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -544,12 +551,19 @@ structure FlnProbeStruct (A : Type) where
   fld : A
 class FlnProbeClass (A : Type) where
   meth : A
+inductive FlnProbeEnum where
+  | alpha
+  | beta
+inductive FlnProbeRec (A : Type) where
+  | leaf : A -> FlnProbeRec A
+  | node : FlnProbeRec A -> FlnProbeRec A -> FlnProbeRec A
 open Lean in
 #eval! show CoreM Unit from do
   let env <- getEnv
   for (n, _) in env.constants.map₂.toList do
     let s := toString n
-    if s.startsWith "FlnProbeStruct" || s.startsWith "FlnProbeClass" then
+    if s.startsWith "FlnProbeStruct" || s.startsWith "FlnProbeClass"
+       || s.startsWith "FlnProbeEnum" || s.startsWith "FlnProbeRec" then
       IO.println s!"GEN {s}"
 '''
 
@@ -793,10 +807,22 @@ def probe_companions(lean, env, work):
         raise SystemExit(f"REFUSE: the pinned binary refused the companion probe:\n"
                          f"{(proc.stdout + proc.stderr)[:1200]}")
     struct_c, class_c = set(), set()
+    ind_c, ctor_c = set(), set()
+    PROBE_CTORS = ("alpha", "beta", "leaf", "node")
     for line in proc.stdout.splitlines():
         if not line.startswith("GEN "):
             continue
         name = line[4:].strip()
+        for prefix, bucket in (("FlnProbeEnum.", ind_c), ("FlnProbeRec.", ind_c)):
+            if name.startswith(prefix):
+                suffix = name[len(prefix):]
+                head = suffix.split(".")[0]
+                if head in PROBE_CTORS:
+                    # relative to a CONSTRUCTOR, not to the inductive
+                    rest = suffix[len(head):].lstrip(".")
+                    ctor_c.add(rest)
+                else:
+                    ind_c.add(suffix)
         for prefix, bucket in (("FlnProbeStruct.", struct_c),
                                ("FlnProbeClass.", class_c)):
             if name.startswith(prefix):
@@ -806,13 +832,18 @@ def probe_companions(lean, env, work):
                 # telescope.
                 if suffix not in ("fld", "meth"):
                     bucket.add(suffix)
+    if not ind_c or not ctor_c:
+        raise SystemExit(
+            "REFUSE: the companion probe measured no inductive companions "
+            f"(inductive={len(ind_c)}, ctor={len(ctor_c)}) — an empty set would "
+            "make every generated recursor look like a row the facade owes")
     if not struct_c or not class_c:
         raise SystemExit(
             "REFUSE: the companion probe measured nothing (struct="
             f"{len(struct_c)}, class={len(class_c)}) — an empty companion set makes "
             "every generated companion look like a row the facade owes, and the "
             "redeclaration errors that follow would be blamed on the wrong thing")
-    return sorted(struct_c), sorted(class_c)
+    return sorted(struct_c), sorted(class_c), sorted(ind_c), sorted(ctor_c)
 TOKEN = re.compile(r"(?<![\w.\u00ab\u00bb])([A-Za-z_][\w'!?]*(?:\.[A-Za-z_][\w'!?]*)*)(?![\w.])")
 
 
@@ -882,6 +913,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_extern = {}
     pin_impl_by = {}
     pin_kind = {}
+    pin_inductives = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -900,7 +932,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds, rh, prio, ext, iby, knd) = probe(
+         rd, sfy, mod, flds, rh, prio, ext, iby, knd, ind) = probe(
             lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
@@ -914,6 +946,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_extern.update(ext)
         pin_impl_by.update(iby)
         pin_kind.update(knd)
+        pin_inductives.update(ind)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -922,6 +955,12 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         known |= set(frontier)
         nxt = set()
         for name in frontier:
+            iv = pin_inductives.get(name)
+            if iv:
+                for c in iv["ctors"]:
+                    if c not in known and c not in absent_projections:
+                        nxt.add(c)
+                        derived.add(c)
             st = structs.get(name)
             if st:
                 for i, b in sorted(binders.get(name, {}).items()):
@@ -946,7 +985,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
             pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head,
-            pin_priority, pin_extern, pin_impl_by, pin_kind)
+            pin_priority, pin_extern, pin_impl_by, pin_kind, pin_inductives)
 
 
 def order(names, deps):
@@ -1085,6 +1124,44 @@ def binder_text(b, deps):
     return f"{open_}{safe_ident(name)} : {ty}{close}"
 
 
+def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map):
+    """Declare a real `inductive`, so the kernel generates its constructors and
+    recursor and IOTA-REDUCTION comes back.
+
+    Wave 62 measured what the axiom form costs: 49 rows whose Reference kind is a
+    constructor or a recursor were declared as bare axioms, so a match on them
+    reduces upstream and is stuck in the facade while every type check passes. A
+    structure block already fixes that for single-constructor types; this does it
+    for the rest.
+    """
+    binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
+    params = []
+    for i, b in sorted(bs.items()):
+        if i >= iv["num_params"]:
+            break
+        b = dict(b, kind=pks.get(i, "default"))
+        if b["kind"] != "inst" and needs_rename(b["user"]):
+            b = dict(b, user=f"flnp{i}")
+        params.append(b)
+    head = f"inductive {d['decl_name']}{binder}" + (
+        (" " + " ".join(binder_text(b, deps) for b in params)) if params else "")
+    lines = [head + " where"]
+    # the type being declared and its own constructors are in scope UNQUALIFIED
+    # inside the block and are not yet at `_root_`, so they are excluded from the
+    # anchoring rather than pointed at a name that does not exist yet.
+    own = {name} | set(iv["ctors"])
+    for c in iv["ctors"]:
+        ty = ctypes.get(c)
+        if not ty:
+            return None
+        short = c.split(".")[-1]
+        if not renderable_name(short):
+            return None
+        cdeps = [x for x in deps_map.get(c, ()) if x not in own]
+        lines.append(f"  | {safe_ident(short)} : {root_anchor(ty, cdeps)}")
+    return lines
+
+
 def structural_block(name, d, st, bs, deps, pks):
     """A `class`/`structure` declaration rebuilt from the pin's own constructor
     telescope. This is the ONE thing an axiom facade cannot do: class-hood and
@@ -1165,13 +1242,22 @@ def instance_prio(name, priorities):
 
 def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
            structural, structs, binders, deps, pbinders, transparent,
-           value_explicit_for, companions, priorities):
+           value_explicit_for, companions, priorities, inductives,
+           pin_inductives_ref, types_ref, ind_companions, ctor_companions):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
     # Everything a structural declaration generates for itself: re-declaring a
     # projection the `class` block already produces is a redeclaration error.
     provided = {}
+    for i in inductives:
+        iv = pin_inductives_ref.get(i) or {}
+        for suffix in ind_companions:
+            provided[f"{i}.{suffix}"] = i
+        for c in iv.get("ctors", ()):
+            provided[c] = i
+            for suffix in ctor_companions:
+                provided[f"{c}.{suffix}" if suffix else c] = i
     for c in structural:
         st = structs[c]
         # The block always generates a PUBLIC `<C>.mk`. Where the Reference's
@@ -1188,6 +1274,21 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
     for name in ordered:
         if name in quarantine or name in provided:
             continue
+        if name in inductives:
+            block = inductive_block(name, decl[name],
+                                    pin_inductives_ref.get(name) or {},
+                                    types_ref, deps.get(name, ()),
+                                    pbinders.get(name, {}),
+                                    binders.get(name, {}), deps)
+            if block is not None:
+                d = decl[name]
+                body.append(f"-- role={d['role']} bucket={d['bucket']} inductive "
+                            f"module={d['module']}")
+                for line in block:
+                    body.append(line)
+                    line_map[len(body)] = ("inductive", name)
+                emitted.append(name)
+                continue
         if name in structural:
             block = structural_block(name, decl[name], structs[name],
                                      binders.get(name, {}), deps.get(name, ()),
@@ -1288,7 +1389,7 @@ def main():
      rounds, structs, binders, absent_projections, pbinders,
      pin_reducibility, pin_safety, pin_module,
      pin_fields, pin_res_head, pin_priority, pin_extern,
-     pin_impl_by, pin_kind) = close_over_types(
+     pin_impl_by, pin_kind, pin_inductives) = close_over_types(
         lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
@@ -1368,6 +1469,7 @@ def main():
     # kind is now measured, carried per row, and the axiom-declared kernel-special
     # rows are counted as their own disclosed class.
     kind_disagreements = []
+    ctor_owner = {}
 
     def is_reducible(n):
         pin = pin_reducibility.get(n)
@@ -1465,7 +1567,7 @@ def main():
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
          pb2, rd2, sfy2, mod2, flds2, rh2, prio2, ext2,
-         iby2, knd2) = close_over_types(lean, env, work, extra, census)
+         iby2, knd2, ind2) = close_over_types(lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
@@ -1479,6 +1581,7 @@ def main():
         pin_extern.update(ext2)
         pin_impl_by.update(iby2)
         pin_kind.update(knd2)
+        pin_inductives.update(ind2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1543,6 +1646,30 @@ def main():
         # A transparent row must be ordered after the constants its VALUE names,
         # not only after the ones its type names.
         deps[n] = sorted(set(deps.get(n, [])) | set(vdeps.get(n, [])))
+    # Which INDUCTIVES (not structures — those have their own path) the facade will
+    # declare properly. A row whose constructors this run never typed cannot be
+    # written, and an inductive whose parameters cannot be named is refused for the
+    # same reason a structure would be.
+    inductive_decls, inductive_refused = set(), {}
+    for name, iv in pin_inductives.items():
+        if name not in decl or name in structs:
+            continue
+        if not iv["ctors"]:
+            inductive_refused[name] = "no constructors reported"
+            continue
+        missing = [c for c in iv["ctors"] if c not in types]
+        if missing:
+            inductive_refused[name] = f"constructor types not probed: {missing[:3]}"
+            continue
+        inductive_decls.add(name)
+    for _n in sorted(inductive_decls):
+        _own = {_n} | set(pin_inductives[_n]["ctors"])
+        _dep = set(deps.get(_n, ()))
+        for _c in pin_inductives[_n]["ctors"]:
+            _dep |= {x for x in deps.get(_c, ()) if x not in _own}
+        deps[_n] = sorted(_dep)
+    inductive_full = set(inductive_decls)
+
     structural_full = set(structural)
     bare_candidates = set()
     for c, bs in binders.items():
@@ -1566,7 +1693,8 @@ def main():
             "mention them freely, so the partition that calls them shared is wrong "
             "and the rows blaming their absence would be the wrong rows")
 
-    struct_companions, class_companions = probe_companions(lean, env, work)
+    (struct_companions, class_companions, ind_companions,
+     ctor_companions) = probe_companions(lean, env, work)
     companions = sorted(set(struct_companions) | set(class_companions))
     ordered, cycle_residue = order(list(types), deps)
     explicit_for, maxexp_for, dropped_attrs, attr_reason = set(), set(), set(), {}
@@ -1594,6 +1722,9 @@ def main():
             # nothing ever looked again once the cause was repaired.
             transparent = set(transparent_full)
             transparent_refused = {}
+            inductive_decls = set(inductive_full)
+            inductive_refused = {k: v for k, v in inductive_refused.items()
+                                 if not v.startswith("pin rejected")}
             value_explicit_for = set()
             structural = set(structural_full)
             structural_refused = {k: v for k, v in structural_refused.items()
@@ -1610,7 +1741,8 @@ def main():
             text, line_map, emitted, attr_count, provided = render(
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
                 structural, structs, binders, deps, pbinders, transparent,
-            value_explicit_for, companions, pin_priority)
+            value_explicit_for, companions, pin_priority, inductive_decls,
+            pin_inductives, types, ind_companions, ctor_companions)
             candidate = args.out + ".candidate.lean"
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -1626,13 +1758,14 @@ def main():
                 os.replace(candidate, args.out)
                 break
             (blamed_axioms, blamed_attrs, blamed_structs, blamed_transparent,
-             blame_msg) = set(), set(), set(), set(), {}
+             blamed_inductives, blame_msg) = (set(), set(), set(), set(), set(), {})
             for m in re.finditer(r"\.candidate\.lean:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out):
                 hit = line_map.get(int(m.group(1)))
                 if hit is None:
                     continue
                 {"attr": blamed_attrs, "struct": blamed_structs,
-                 "transparent": blamed_transparent}.get(
+                 "transparent": blamed_transparent,
+                 "inductive": blamed_inductives}.get(
                     hit[0], blamed_axioms).add(hit[1])
                 blame_msg[hit[1]] = ((m.group(2) or "-") + ": " + m.group(3))[:220]
             # ONLY fall back to bare locations when no `error:` line named a
@@ -1645,10 +1778,11 @@ def main():
                     hit = line_map.get(int(m.group(1)))
                     if hit is not None:
                         {"attr": blamed_attrs, "struct": blamed_structs,
-                         "transparent": blamed_transparent}.get(
+                         "transparent": blamed_transparent,
+                         "inductive": blamed_inductives}.get(
                             hit[0], blamed_axioms).add(hit[1])
             if not (blamed_axioms or blamed_attrs or blamed_structs
-                    or blamed_transparent):
+                    or blamed_transparent or blamed_inductives):
                 raise SystemExit(
                     f"REFUSE: elaboration failed but no error line maps to a "
                     f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
@@ -1694,6 +1828,12 @@ def main():
             # A structural block the pin rejects DEMOTES to the axiom form rather than
             # taking the row out of the facade: coverage must never fall because the
             # stronger emission was attempted.
+            for name in blamed_inductives:
+                if name in inductive_decls:
+                    inductive_decls.discard(name)
+                    inductive_refused[name] = ("pin rejected the inductive block -- "
+                                               + blame_msg.get(name, "-"))
+                    progressed = True
             for name in blamed_structs - victims_s:
                 if name in structural:
                     structural.discard(name)
@@ -1932,6 +2072,66 @@ def main():
             "REFUSE: the projection type check did not reject a deliberately wrong "
             f"ascription ({TYPE_DECOY_TYPE}) — it cannot tell a matching type from "
             "a mismatched one, so the types it just pronounced correct mean nothing")
+    # A GENERATED companion's type is DERIVED by Lean and printed by the pin with
+    # the same implicit-argument elision it uses everywhere else. That elision is
+    # not always recoverable: `Lean.Expr.brecOn`'s printed type names
+    # `Lean.Expr.below t`, whose `motive` is implicit and cannot be synthesized
+    # from the ascription alone, so the row fails on the PRINTING and not on the
+    # type. Emission already answers this with a printer ladder; the check now
+    # uses the same ladder instead of pronouncing a mismatch the emitter would
+    # have repaired. The retry carries its OWN decoy, because a retry that cannot
+    # fail would silently absolve every row it touched.
+    maxexp_type_checked = []
+    if type_mismatches:
+        retry = [n for n in sorted(type_mismatches)
+                 if (decl.get(n) or {}).get("typem")]
+        if retry:
+            rlines, rmap = [], {}
+            for name in retry:
+                d = decl[name]
+                lv = d.get("levels") or ""
+                rbinder = (".{" + lv.replace(",", ", ") + "}") if lv else ""
+                rlines.append(
+                    f"noncomputable def flntyr_{len(rlines)}{rbinder} : "
+                    f"{root_anchor(d['typem'], deps.get(name, ()))} := "
+                    f"@{d['decl_name']}")
+                rmap[len(rlines)] = ("TYPE", name)
+            rlines.append(
+                f"noncomputable def flntyr_decoy : {TYPE_DECOY_TYPE} := "
+                f"@{decl[retry[0]]['decl_name']}")
+            rmap[len(rlines)] = ("TYPEDECOY", retry[0])
+            rpath = args.out + ".verify2.lean"
+            with open(rpath, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(rlines) + "\n")
+            rproc = subprocess.run(
+                [lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false", rpath],
+                capture_output=True, text=True, env=env, timeout=1800)
+            rout = rproc.stdout + rproc.stderr
+            rbase = os.path.basename(rpath)
+            still, rdecoy_caught = {}, False
+            for m in re.finditer(
+                    rf"{re.escape(rbase)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                    rout):
+                hit = rmap.get(int(m.group(1)))
+                if hit is None:
+                    continue
+                if hit[0] == "TYPEDECOY":
+                    rdecoy_caught = True
+                else:
+                    still[hit[1]] = ((m.group(2) or "-") + ": " + m.group(3))[:200]
+            os.remove(rpath)
+            if not rdecoy_caught:
+                raise SystemExit(
+                    "REFUSE: the maximally-explicit retry of the projection type "
+                    f"check did not reject a deliberately wrong ascription "
+                    f"({TYPE_DECOY_TYPE}) — it cannot tell a matching type from a "
+                    "mismatched one, so every row it just absolved means nothing")
+            for name in retry:
+                if name in still:
+                    type_mismatches[name] = still[name]
+                else:
+                    del type_mismatches[name]
+                    maxexp_type_checked.append(name)
     if type_mismatches:
         listed = sorted(type_mismatches)[:8]
         raise SystemExit(
@@ -2116,6 +2316,24 @@ def main():
             "in the facade — a facade that quarantines its way to a green is not a "
             "facade, and this artifact will not land")
 
+    for _ind, _iv in pin_inductives.items():
+        for _c in _iv.get("ctors", ()):
+            ctor_owner[_c] = _ind
+    kernel_special_why = {}
+    for _n in sorted(emitted_set):
+        if pin_kind.get(_n) not in ("ctor", "rec", "quot"):
+            continue
+        if _n in provided or _n in structural or _n in transparent:
+            continue
+        _own = ctor_owner.get(_n) or (_n[:-4] if _n.endswith(".rec") else None)
+        if _own is None:
+            kernel_special_why[_n] = "no owning inductive could be named"
+        elif _own in inductive_refused:
+            kernel_special_why[_n] = f"owner refused: {inductive_refused[_own]}"
+        elif _own not in decl:
+            kernel_special_why[_n] = "owner is outside the closure"
+        else:
+            kernel_special_why[_n] = "owner is in the closure and was not declared"
     rows = [{
         "schema": SCHEMA, "kind": "summary", "pin": tag,
         "claim_class": "bounded_model",
@@ -2160,15 +2378,46 @@ def main():
         "instance_attrs_kept": sum(1 for n in emitted
                                    if decl[n]["instance"] and n not in dropped_attrs),
         "instance_attrs_dropped": len(dropped_attrs),
+        "projection_type_maxexplicit_retry": sorted(maxexp_type_checked),
+        "projection_type_maxexplicit_note": "these generated companions could not "
+            "be ascribed to the pin's DEFAULT printing of their own type and were "
+            "confirmed against its maximally explicit printing instead. The type is "
+            "the Reference's either way; what the default printing loses is an "
+            "implicit argument the ascription cannot re-synthesize -- "
+            "`Lean.Expr.below t` inside `Lean.Expr.brecOn` is the measured case.",
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "inductive_declarations": len(inductive_decls),
+        "inductive_rows": sorted(inductive_decls),
+        "inductive_refused": len(inductive_refused),
+        "inductive_refused_reasons": {k: inductive_refused[k]
+                                      for k in sorted(inductive_refused)},
+        "inductive_refused_demanded": sorted(
+            n for n in inductive_refused if n in facade_demand),
+        "inductive_companions_measured": ind_companions,
+        "ctor_companions_measured": ctor_companions,
         "kind_probed": len(pin_kind),
         "kind_census_disagreements": kind_disagreements,
         "kernel_special_as_axiom": sorted(
             n for n in emitted_set
             if pin_kind.get(n) in ("ctor", "rec", "quot")
             and n not in provided and n not in structural and n not in transparent),
+        "kernel_special_population": sum(
+            1 for n in emitted_set if pin_kind.get(n) in ("ctor", "rec", "quot")),
+        "kernel_special_owner": {
+            n: (ctor_owner.get(n) or (n[:-4] if n.endswith(".rec") else None))
+            for n in sorted(emitted_set)
+            if pin_kind.get(n) in ("ctor", "rec", "quot")
+            and n not in provided and n not in structural and n not in transparent},
+        "kernel_special_why": {
+            k: v for k, v in sorted(kernel_special_why.items())},
+        "kernel_special_denominator_note": "wave 62 read 49 for this class and this "
+            "run reads more from the SAME defect: the constructors of an inductive "
+            "must be in the closure before an `inductive` block can be written for "
+            "it, so rows that were previously absent -- not sound -- are now "
+            "emitted and counted. Read it against kernel_special_population, and "
+            "read kernel_special_why for the owner that refused.",
         "kernel_special_note": "a constructor or recursor carries the kernel's "
             "iota-reduction and a quot constant is a kernel primitive; declared as "
             "a plain `axiom` the row has the right TYPE and none of the "
@@ -2331,9 +2580,13 @@ def main():
             "instance_registered": bool(d["instance"]) and name not in dropped_attrs,
             "instance_drop_reason": attr_reason.get(name),
             "form": ("transparent-abbrev" if name in transparent
+                     else "inductive" if name in inductive_decls
                      else "class" if name in structural and structs[name]["is_class"]
                      else "structure" if name in structural
-                     else "class-projection" if name in provided else "axiom"),
+                     else ("kernel-generated" if name in provided
+                           and pin_kind.get(name) in ("ctor", "rec", "quot")
+                           else "class-projection") if name in provided
+                     else "axiom"),
             "provided_by": provided.get(name),
             "structural_refused_reason": structural_refused.get(name),
             "transparent_refused_reason": transparent_refused.get(name),
@@ -2386,8 +2639,9 @@ def main():
           f"nondefault "
           f"presence={presence_checked}/{len(expected_permissive)}permissive "
           f"fieldsets={field_sets_checked} "
-          f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
+          f"projtypes={len(type_checked)}/{len(maxexp_type_checked)}maxexp roundtrip={roundtrip_checked} "
           f"values={values_checked} "
+          f"inductives={len(inductive_decls)}/{len(inductive_refused)}refused "
           f"kind={len(pin_kind)} kind_drift={len(kind_disagreements)} "
           f"implby={len(pin_impl_by)} implby_drift={len(impl_by_disagreements)} "
           f"ext_probed={len(pin_extern)}"
