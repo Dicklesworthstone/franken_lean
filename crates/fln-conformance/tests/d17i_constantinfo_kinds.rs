@@ -8100,3 +8100,127 @@ fn structure_projections_are_named_by_their_constructors_binders() {
         "the complete families must span real field counts, widest is {widest}"
     );
 }
+
+/// Non-Prop inductives that carry no generated `ctorIdx`.
+const NON_PROP_WITHOUT_CTOR_IDX: &[&str] = &[
+    "BEq",
+    "Decidable",
+    "Empty",
+    "Inhabited",
+    "Lean.Name._impl",
+    "MProd",
+    "PEmpty",
+    "PLift",
+    "PProd",
+    "PULift",
+    "PUnit",
+    "Prod",
+    "Subtype",
+    "ULift",
+];
+
+/// `ctorIdx` — a third generated family, at eliminator scale, that nothing here
+/// had read.
+///
+/// The eliminator cell covers `casesOn`/`recOn`/`noConfusion`/`below`/`brecOn`
+/// and the projection cell covers structure fields. `X.ctorIdx` is neither: it
+/// is the generated function taking a value of `X` to its constructor index,
+/// and there are 103 of them in `Init/Prelude` — the same order as the 127
+/// `casesOn` and 115 `noConfusion` the file already pins.
+///
+/// Measured over the module's 127 inductives:
+///
+///   103 carry a `ctorIdx`, and every one of them is a DEFINITION
+///   all 10 Prop-valued inductives lack it, without exception, so being a Prop
+///     implies having no `ctorIdx` — the same one-way shape as `noConfusion`
+///   the converse is FALSE: 14 non-Props lack it too, and they are named above
+///
+/// I do not claim why those 14 lack it, and the obvious guess is measurably
+/// wrong. "`ctorIdx` exists iff the inductive has at least two constructors and
+/// is not a Prop" fails with NINETY-THREE counterexamples, because most bearers
+/// are single-constructor classes — `Add`, `Monad`, `Zero` all carry one. The
+/// 14 include zero-constructor types (`Empty`, `PEmpty`), universe-polymorphic
+/// structures (`PLift`, `PProd`, `PUnit`, `ULift`, `Prod`, `Subtype`) and
+/// `Lean.Name._impl`, which the eliminator cell already records as absent from
+/// two other generated families. Recording the failed hypothesis so nobody
+/// re-derives it.
+///
+/// `toCtorIdx` is a separate and much rarer family: exactly ONE exists in this
+/// module, `Bool.toCtorIdx`. A second appearing is a change in generation.
+#[test]
+fn the_ctor_index_family_is_absent_for_every_prop_and_for_fourteen_others() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let kinds = kinds(&infos);
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    assert_eq!(
+        inductives.len(),
+        127,
+        "the inductive census must be reached, got {}",
+        inductives.len()
+    );
+
+    let mut present = 0usize;
+    let mut props = 0usize;
+    let mut props_with = Vec::new();
+    let mut non_prop_without: Vec<&String> = Vec::new();
+    for (name, induct) in &inductives {
+        let index = format!("{name}.ctorIdx");
+        let has = kinds.get(&index);
+        let prop = inductive_result_is_prop(induct);
+        if prop {
+            props += 1;
+        }
+        match has {
+            Some(kind) => {
+                assert_eq!(*kind, "Defn", "{index} must be a definition, not a {kind}");
+                present += 1;
+                if prop {
+                    props_with.push(name);
+                }
+            }
+            None => {
+                if !prop {
+                    non_prop_without.push(name);
+                }
+            }
+        }
+    }
+
+    assert!(
+        props_with.is_empty(),
+        "a Prop-valued inductive must not carry a ctorIdx: {props_with:?}"
+    );
+    assert_eq!(
+        non_prop_without, NON_PROP_WITHOUT_CTOR_IDX,
+        "the non-Prop inductives that carry no ctorIdx; the Prop rule is one-way and these \
+         are why"
+    );
+    assert_eq!(
+        (present, props),
+        (103, 10),
+        "both sides of the implication must be populated, or it holds vacuously"
+    );
+    assert_eq!(
+        present + props + non_prop_without.len(),
+        inductives.len(),
+        "present, Prop-absent and non-Prop-absent must account for every inductive"
+    );
+
+    // A separate, much rarer family.
+    let to_index: Vec<&String> = kinds
+        .keys()
+        .filter(|name| name.ends_with(".toCtorIdx"))
+        .collect();
+    assert_eq!(
+        to_index,
+        vec!["Bool.toCtorIdx"],
+        "exactly one toCtorIdx exists at the pin"
+    );
+}
