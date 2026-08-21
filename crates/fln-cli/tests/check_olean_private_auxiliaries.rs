@@ -1264,6 +1264,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths keep private splitRevAt-go unsafe-rec residuals beside merge-sort split-traversal unsafe-rec residuals",
     );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
+                    == r##""\"mergeSortInternalSplitTraversalUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+                    && lines[1].trim()
+                        == r##""\"privateFindLeadingSpacesConsumeUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep merge-sort split-traversal unsafe-rec residuals beside private find-leading-spaces consume unsafe-rec residuals",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
