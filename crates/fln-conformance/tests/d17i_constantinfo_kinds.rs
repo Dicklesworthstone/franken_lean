@@ -14951,3 +14951,150 @@ fn import_flags_take_six_combinations_and_import_all_is_never_exported() {
         "no Init edge is both `import all` and meta, which is the class the census cannot see"
     );
 }
+
+/// The four extension blocks every olean in the library carries.
+const UNIVERSAL_EXTENSION_BLOCKS: &[&str] = &[
+    "Lean.deprecatedModuleExt",
+    "_private.Lean.Compiler.ModPkgExt.0.Lean.modPkgExt",
+    "sineQueNon",
+    "symbolFrequency",
+];
+
+/// Extension blocks crossed against namespaces: 120 names, four universal,
+/// forty-one confined.
+///
+/// The vocabulary cell measures 96 block names over the `Init` census at
+/// exported level and stops at the census boundary. Extensions move
+/// independently of imports — a module can gain a block without gaining an edge
+/// — so neither the flag cell nor the layering cell says anything about this,
+/// and the other 1,833 oleans were never read for their block names.
+///
+/// Over all 2,433 exported parts, 45,162 `(module, block)` pairs and a
+/// vocabulary of 120:
+///
+///   Init 96   Std 74   Lean 72   Lake 55
+///   LeanChecker 20   Leanc 19   LeanIR 12   LakeMain 10
+///
+/// The namespace figures do not sum to 120 and are not meant to: a block name
+/// belongs to as many namespaces as carry it, and 41 of the 120 are confined to
+/// exactly one.
+///
+/// FOUR BLOCKS ARE IN EVERY SINGLE OLEAN — `deprecatedModuleExt`, `modPkgExt`,
+/// and the two unprefixed `sineQueNon` and `symbolFrequency`. Those two carry no
+/// namespace at all, which is worth pinning by name: every other block in the
+/// library is named under `Lean`, `Std`, `Lake` or a `_private` scope, and a
+/// tool that assumed block names are dotted paths would mis-handle exactly these
+/// two, in every module.
+///
+/// INIT'S NAMESPACE VOCABULARY IS 96, THE SAME AS THE CENSUS FIGURE, even though
+/// this walk includes `Init.olean` and the census does not. So the aggregator
+/// contributes no block name of its own — consistent with it declaring no
+/// constants, and asserted here so the two counts agreeing is a checked fact
+/// rather than a coincidence between cells.
+///
+/// Anti-vacuity: carrier counts run from 1 to 2,433, so the vocabulary is
+/// neither all-universal nor all-unique, and the four universal blocks are a
+/// real minority rather than the shape of the whole table.
+///
+/// Conservation first: the carrier counts must sum to the pair total before any
+/// class is named — a block dropped from the vocabulary would otherwise vanish
+/// from both sides at once.
+#[test]
+fn extension_blocks_cross_namespaces_with_four_universal_and_forty_one_confined() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut carriers: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_namespace: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut pairs = 0usize;
+    let mut without_aggregator: BTreeSet<String> = BTreeSet::new();
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let namespace = module.split('.').next().expect("a module name").to_owned();
+        for block in module_view(&lib, &module, Level::Exported).extensions {
+            pairs += 1;
+            *carriers.entry(block.name.clone()).or_default() += 1;
+            if namespace == "Init" && module != "Init" {
+                without_aggregator.insert(block.name.clone());
+            }
+            by_namespace
+                .entry(namespace.clone())
+                .or_default()
+                .insert(block.name);
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        carriers.values().sum::<usize>(),
+        pairs,
+        "the carrier counts must account for every (module, block) pair"
+    );
+    assert_eq!(
+        (all.exported.len(), pairs, carriers.len()),
+        (2_433, 45_162, 120),
+        "the library block census at exported level"
+    );
+
+    assert_eq!(
+        by_namespace
+            .iter()
+            .map(|(namespace, blocks)| (namespace.as_str(), blocks.len()))
+            .collect::<BTreeMap<&str, usize>>(),
+        BTreeMap::from([
+            ("Init", 96),
+            ("Lake", 55),
+            ("LakeMain", 10),
+            ("Lean", 72),
+            ("LeanChecker", 20),
+            ("LeanIR", 12),
+            ("Leanc", 19),
+            ("Std", 74),
+        ]),
+        "the vocabulary each namespace uses; these overlap and do not sum to 120"
+    );
+
+    // The universal four, and the confined forty-one.
+    let universal: BTreeSet<&String> = carriers
+        .iter()
+        .filter(|(_, count)| **count == all.exported.len())
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        universal.into_iter().cloned().collect::<BTreeSet<String>>(),
+        UNIVERSAL_EXTENSION_BLOCKS
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect::<BTreeSet<String>>(),
+        "the blocks every olean carries"
+    );
+    let confined = carriers
+        .keys()
+        .filter(|name| by_namespace.values().filter(|v| v.contains(*name)).count() == 1)
+        .count();
+    assert_eq!(
+        confined, 41,
+        "blocks that occur under exactly one namespace"
+    );
+
+    // Anti-vacuity: the table is neither all-universal nor all-unique.
+    assert_eq!(
+        (
+            carriers.values().copied().min().expect("nonempty"),
+            carriers.values().copied().max().expect("nonempty")
+        ),
+        (1, 2_433),
+        "carrier counts span the full range"
+    );
+
+    // The aggregator adds no block name. Comparing its vocabulary against the
+    // rest of Init is the actual claim; asserting 96 again would restate the
+    // table above and could not fail on its own.
+    assert_eq!(
+        by_namespace["Init"], without_aggregator,
+        "Init.olean contributes no block name the rest of Init lacks"
+    );
+}
