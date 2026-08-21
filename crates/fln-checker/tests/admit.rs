@@ -3026,6 +3026,45 @@ fn kr600_803_witness_refuses_a_forged_num_minors_count() {
 }
 
 #[test]
+fn kr600_803_witness_refuses_a_forged_num_rules_count() {
+    let mut entries = dependent_field_inductive_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    let mut rules = metadata.rules().to_vec();
+    rules.push(metadata.rules()[0].clone());
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Witness", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                rules,
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_witness_fixture_pins_constructor_index_parameters_and_fields() {
     let entries = dependent_field_inductive_entries();
     let constructor = entries[1].declaration();
