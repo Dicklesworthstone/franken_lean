@@ -13998,6 +13998,19 @@ fn contractions_expanded(text: &str) -> String {
         .replace("wasn't", "was not")
 }
 
+/// The documents this repository reads line by line rather than by allowance.
+///
+/// Written out THREE times before this: once in the allowance tier to skip them,
+/// once in the strict tier to read them, and once again in a different guard
+/// entirely (`the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin`).
+/// Three copies of one decision, and nothing joining them -- so a document added
+/// to the strict tier would still be skipped-and-unread if the first copy were
+/// missed, and the other guard would go on checking a pair while this one
+/// checked a triple. The conservation count below is what makes the join
+/// observable: every document in scope is either skipped here or examined here,
+/// and the skipped ones are exactly these.
+const SCANNED_DOCUMENTS: [&str; 2] = ["AGENTS.md", "README.md"];
+
 /// The one form the stale rules read, and the ORDER is load-bearing.
 ///
 /// Case was the last spelling this rule could not see. Its anchor tested
@@ -17601,15 +17614,28 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         "vendored upstream markdown must stay out of the scope, or this guard reports on Lean's \
          prose as though we had written it"
     );
+    for document in SCANNED_DOCUMENTS {
+        assert!(
+            names_a_scanned_document(document),
+            "{document} is read line by line by the strict tier and skipped by the allowance \
+             tier, and the walk does not reach it: no tier examines it and every count below \
+             still balances"
+        );
+    }
+    let in_scope = documents.len();
+    let mut skipped = 0usize;
+    let mut examined = 0usize;
     for path in documents {
         let name = path
             .strip_prefix(&repo)
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        if name == "AGENTS.md" || name == "README.md" {
+        if SCANNED_DOCUMENTS.contains(&name.as_str()) {
+            skipped += 1;
             continue;
         }
+        examined += 1;
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
@@ -17649,8 +17675,27 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         );
     }
 
+    // EVERY DOCUMENT IN SCOPE IS READ BY EXACTLY ONE TIER. A document skipped
+    // here on the belief that the strict tier reads it, while the strict tier
+    // reads a different list, is examined by nothing at all and shows up in no
+    // count -- the failure is silence rather than a wrong number.
+    assert_eq!(
+        skipped + examined,
+        in_scope,
+        "{in_scope} markdown documents are in scope, {skipped} were skipped as strictly scanned \
+         and {examined} were examined against the allowance: every document must be read by \
+         exactly one tier"
+    );
+    assert_eq!(
+        skipped,
+        SCANNED_DOCUMENTS.len(),
+        "the allowance tier skipped {skipped} documents while {} are declared strictly scanned; \
+         a document skipped by one tier and not read by the other is checked by nothing",
+        SCANNED_DOCUMENTS.len()
+    );
+
     let mut checked = 0usize;
-    for doc in ["AGENTS.md", "README.md"] {
+    for doc in SCANNED_DOCUMENTS {
         let text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
         assert_eq!(
@@ -17850,7 +17895,7 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
     // visible to a reader without making it a wall.
     let repo = fln_conformance::checked_workspace_root!();
     let marker = corpus_matrix_marker(&receipts);
-    for doc in ["AGENTS.md", "README.md"] {
+    for doc in SCANNED_DOCUMENTS {
         let doc_text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
         assert!(
