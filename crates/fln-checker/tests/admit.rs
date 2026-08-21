@@ -1689,6 +1689,43 @@ fn init_bool_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_punit_entries() -> Vec<ConstantEntry> {
+    let punit = checker_name("PUnit");
+    let unit = checker_qualified(&["PUnit", "unit"]);
+    let rec = checker_qualified(&["PUnit", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let punit_expr = || Expr::const_(primary_name("PUnit"), vec![u.clone()]);
+    let unit_expr = || Expr::const_(Name::from_components(["PUnit", "unit"]), vec![u.clone()]);
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, punit_expr(), Expr::sort(v.clone()));
+    let minor = || Expr::app(bv(0), unit_expr());
+    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
+        "unit", BinderInfo::Default, minor(), primary_pi(
+            "t", BinderInfo::Default, punit_expr(), Expr::app(bv(2), bv(0)),
+        ),
+    ));
+    let rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
+        primary_name("unit"), minor(), bv(0), BinderInfo::Default,
+    ), BinderInfo::Default);
+    vec![
+        ConstantEntry::new(punit.clone(), ConstantDeclaration::inductive(
+            vec![u_name.clone()], decoded(&Expr::sort(u.clone())), ConstantSafety::Safe,
+            InductiveDeclaration::new(0, 0, vec![punit.clone()], vec![unit.clone()], 0, false, false),
+        )),
+        ConstantEntry::new(unit.clone(), ConstantDeclaration::constructor(
+            vec![u_name.clone()], decoded(&punit_expr()), ConstantSafety::Safe,
+            ConstructorDeclaration::new(punit.clone(), 0, 0, 0),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            vec![v_name, u_name], decoded(&rec_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![punit], 0, 0, 1, 1, vec![RecursorRule::new(unit, 0, decoded(&rhs))], false),
+        )),
+    ]
+}
+
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
@@ -1726,6 +1763,25 @@ fn kr600_803_init_bool_refuses_a_forged_true_iota_rule() {
             metadata.rules()[0].clone(),
             RecursorRule::new(checker_qualified(&["Bool", "true"]), 0, decoded(&Expr::bvar(0).expect("packs"))),
         ], metadata.k()),
+    ));
+    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
+}
+
+#[test]
+fn kr600_803_init_punit_universes_constructor_and_iota_are_reconstructed() {
+    let entries = init_punit_entries();
+    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    assert!(verdict.is_admitted(), "exact Init.PUnit block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_punit_refuses_a_forged_iota_rule() {
+    let mut entries = init_punit_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(checker_qualified(&["PUnit", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["PUnit", "unit"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
     ));
     assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
