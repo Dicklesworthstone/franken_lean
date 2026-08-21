@@ -1810,20 +1810,39 @@ def published_bytes_error(out, text, what="the facade"):
 
     Returns an error string, or None.
     """
+    # COMPARED AS BYTES, and read as bytes, which is the whole point. Decoding
+    # first made this check unable to answer about the one file it most needed to:
+    # `open(out, encoding="utf-8").read()` raises UnicodeDecodeError on a corrupt
+    # artifact, UnicodeDecodeError is a ValueError and not an OSError, so it went
+    # straight past the handler below and out as a traceback. A check written to
+    # turn "the published file is wrong" into a refusal instead turned the worst
+    # case into a crash, and a crash is not a verdict: it names no artifact, gives
+    # no byte counts, and reads as a broken extractor rather than a broken output.
+    want = text.encode("utf-8")
     try:
-        with open(out, encoding="utf-8") as fh:
-            on_disk = fh.read()
+        with open(out, "rb") as fh:
+            raw = fh.read()
     except OSError as exc:
         return (f"{what} this run reported on is not readable at {out}: "
                 f"{exc.__class__.__name__}. Every claim this run makes describes a "
                 "file that is not there")
-    if on_disk != text:
-        return (f"{out} holds {len(on_disk)} bytes but this run built and reported "
-                f"on {len(text)} for {what}. The refusal verdicts, the axiom-line "
-                "pin and every count this run publishes describe the text it "
-                "built, so if the published file is a different one they are true "
-                "of nothing that shipped")
-    return None
+    if raw == want:
+        return None
+    # Decoding is now only used to DESCRIBE the mismatch, never to find it, so a
+    # file that cannot be decoded is reported rather than raised.
+    try:
+        raw.decode("utf-8")
+        detail = ("It decodes, so this is a different text rather than a damaged "
+                  "one")
+    except UnicodeDecodeError as exc:
+        detail = (f"It is not valid UTF-8 ({exc.reason}, first bad byte at "
+                  f"offset {exc.start}), so it is not even the kind of file this "
+                  "run writes")
+    return (f"{out} holds {len(raw)} bytes but this run built and reported on "
+            f"{len(want)} for {what}. {detail}. The refusal verdicts, the "
+            "axiom-line pin and every count this run publishes describe the text "
+            "it built, so if the published file is a different one they are true "
+            "of nothing that shipped")
 
 
 def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
