@@ -2332,6 +2332,20 @@ def main():
             "REFUSE: facade manifest safety-implementation probe diverges "
             f"({json.dumps(safety_implementation_probe_join, sort_keys=True)})"
         )
+    extern_result_head_probe_join = {
+        "summary_extern_probed": manifest_summary.get("extern_probed"),
+        "summary_result_head_probed": manifest_summary.get("result_head_probed"),
+        "pinned_extern_result_head_count": 2042,
+    }
+    if (extern_result_head_probe_join["summary_extern_probed"]
+            != extern_result_head_probe_join["pinned_extern_result_head_count"]
+            or extern_result_head_probe_join["summary_result_head_probed"]
+            != extern_result_head_probe_join[
+                "pinned_extern_result_head_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest extern-result-head probe diverges "
+            f"({json.dumps(extern_result_head_probe_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3484,6 +3498,7 @@ def main():
         "manifest_safety_implementation_probe_join": (
             safety_implementation_probe_join
         ),
+        "manifest_extern_result_head_probe_join": extern_result_head_probe_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
