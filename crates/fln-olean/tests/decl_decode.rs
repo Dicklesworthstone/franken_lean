@@ -1213,3 +1213,205 @@ fn no_third_shape_shares_the_cons_cell_header_and_the_sizes_identify_the_two() {
         "a third shape shares the cons cell's tag and arity: {unexpected_sizes:?}"
     );
 }
+
+/// The bound population covers more than ONE of `list_ptrs`'s callers.
+///
+/// `the_measured_cons_cells_are_the_ones_the_decoder_walked` binds the cells to
+/// the decoder's traversal, and it is green - but it walks `levelParams` and
+/// nothing else. `decode_name_list` has seven call sites: `levelParams`, `all`
+/// on five different payloads, and `ctors`. So "the cells `list_ptrs` walks"
+/// has meant "the cells ONE of its seven callers walks", and the size rule the
+/// repair adds would apply to all of them. That is the denominator question one
+/// level up: not which objects were measured, but which CALLERS produced the
+/// objects that were measured.
+///
+/// MATCHED BY CONTENT, NOT BY SLOT INDEX, and that is forced rather than
+/// stylistic. `all` lives at payload slot 3 for a definition, 2 for a theorem
+/// and an opaque, 3 for an inductive, 1 for a recursor, and `ctors` at 4 - so a
+/// cell keyed on slot numbers would encode six layout constants and mean
+/// nothing when one moved. Instead this scans every pointer slot of the
+/// payload, tries to read a cons chain of names from each, and accepts the slot
+/// whose decoded members EQUAL the list the decoder returned. A layout change
+/// moves which slot matches; it cannot make a wrong slot match.
+///
+/// IDENTIFIED BY REFERENCE, NOT BY HEADER, which is the w113 lesson applied
+/// rather than restated. A `ConstantVal` is trusted only when its slot-0 name
+/// is one the module declares; the payload is then whatever object POINTS AT
+/// that `ConstantVal` in its own slot 0 - `base` is slot 0 in all eight
+/// variants. No `(tag, other, cs_sz)` triple is treated as an identity
+/// anywhere in this cell, because `(0, 3, 32)` already proved they are not.
+///
+/// A candidate slot that is not a cons chain is skipped, not asserted against.
+/// The claim is carried by REQUIRING a matching chain to exist, not by
+/// rejecting the ones that do not match.
+#[test]
+fn the_all_and_ctors_chains_are_bound_to_the_decoder_too() {
+    fn shown(names: &[fln_core::name::Name]) -> Vec<String> {
+        names.iter().map(|n| n.to_display_string()).collect()
+    }
+    fn name_lists(info: &ConstantInfo) -> Vec<(&'static str, Vec<String>)> {
+        match info {
+            ConstantInfo::Defn(v) => vec![("all", shown(&v.all))],
+            ConstantInfo::Thm(v) => vec![("all", shown(&v.all))],
+            ConstantInfo::Opaque(v) => vec![("all", shown(&v.all))],
+            ConstantInfo::Rec(v) => vec![("all", shown(&v.all))],
+            ConstantInfo::Induct(v) => vec![("all", shown(&v.all)), ("ctors", shown(&v.ctors))],
+            ConstantInfo::Axiom(_) | ConstantInfo::Quot(_) | ConstantInfo::Ctor(_) => Vec::new(),
+        }
+    }
+
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+        }
+    }
+
+    let mut lists_bound = 0usize;
+    let mut members_bound = 0usize;
+    let mut fields_seen: BTreeSet<&'static str> = BTreeSet::new();
+    let mut widths: BTreeSet<i64> = BTreeSet::new();
+    let mut sizes: BTreeSet<u16> = BTreeSet::new();
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let infos = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .unwrap_or_else(|e| panic!("{module}: decode: {e}"));
+        let census: BTreeSet<String> = infos.iter().map(|i| i.name().to_display_string()).collect();
+
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let deref = |ptr: u64| -> Option<usize> {
+            (ptr & 1 == 0)
+                .then(|| usize::try_from(ptr.checked_sub(base)?).ok())
+                .flatten()
+        };
+
+        // Trusted `ConstantVal`s: the header shape is a filter, the NAME is the
+        // evidence.
+        let mut trusted: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            if (object.tag, object.other) != (0, 3) {
+                continue;
+            }
+            let Ok(name) = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(word_at(bytes, object.off + 8))
+            else {
+                continue;
+            };
+            let name = name.to_display_string();
+            if census.contains(&name) {
+                trusted.entry(name).or_default().push(object.off);
+            }
+        }
+
+        // Payloads, by the `ConstantVal` they carry in their own slot 0.
+        let mut payloads: std::collections::BTreeMap<usize, Vec<Obj>> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            if object.other == 0 || object.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            if let Some(off) = deref(word_at(bytes, object.off + 8)) {
+                payloads.entry(off).or_default().push(*object);
+            }
+        }
+
+        // Read a chain of names from one slot, tolerantly: `None` means this
+        // slot is not a name list, which is the common case and not a fault.
+        let chain_at = |slot_word: u64| -> Option<(Vec<String>, Vec<Obj>)> {
+            let mut cursor = slot_word;
+            let mut cells: Vec<Obj> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            loop {
+                if cursor & 1 == 1 {
+                    return (cursor >> 1 == 0).then_some((names, cells));
+                }
+                let cell = *at.get(&deref(cursor)?)?;
+                if (cell.tag, cell.other) != (1, 2) || cells.len() == 4096 {
+                    return None;
+                }
+                let head = DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(word_at(bytes, cell.off + 8))
+                    .ok()?;
+                names.push(head.to_display_string());
+                cells.push(cell);
+                cursor = word_at(bytes, cell.off + 16);
+            }
+        };
+
+        for info in &infos {
+            let declaration = info.name().to_display_string();
+            for (field, expected) in name_lists(info) {
+                if expected.is_empty() {
+                    continue; // boxed nil is not a cell; nothing to bind
+                }
+                let found = trusted
+                    .get(&declaration)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .flat_map(|cv| payloads.get(cv).map(Vec::as_slice).unwrap_or(&[]))
+                    .find_map(|payload| {
+                        (0..usize::from(payload.other)).find_map(|slot| {
+                            let word = word_at(bytes, payload.off + 8 + 8 * slot);
+                            chain_at(word).filter(|(names, _)| *names == expected)
+                        })
+                    });
+                let (_, cells) = found.unwrap_or_else(|| {
+                    panic!(
+                        "{module}: {declaration}.{field}: the decoder returned \
+                         {expected:?}, and no slot of any payload carrying this \
+                         declaration's ConstantVal holds a cons chain of those \
+                         names. The cells measured elsewhere are then not the \
+                         cells this caller of `list_ptrs` walks"
+                    )
+                });
+                for cell in &cells {
+                    widths.insert(i64::from(cell.cs_sz) - (8 + 8 * i64::from(cell.other)));
+                    sizes.insert(cell.cs_sz);
+                }
+                members_bound += cells.len();
+                lists_bound += 1;
+                fields_seen.insert(field);
+            }
+        }
+    }
+
+    // Anti-vacuity: every empty list is skipped, so a corpus of singleton
+    // blocks would bind nothing and pass.
+    assert!(
+        lists_bound > 0 && members_bound > 0,
+        "nothing was bound: {lists_bound} lists, {members_bound} members"
+    );
+    assert!(
+        fields_seen.contains("all"),
+        "the `all` caller must be exercised, or this cell extends the bound \
+         population by nothing: {fields_seen:?}"
+    );
+
+    // The same width and size, now on cells reached through callers the green
+    // binding cell never touched.
+    assert_eq!(
+        widths.iter().copied().collect::<Vec<_>>(),
+        vec![0_i64],
+        "cells reached through {fields_seen:?} store nothing after head and \
+         tail ({members_bound} cells over {lists_bound} lists)"
+    );
+    assert_eq!(
+        sizes.iter().copied().collect::<Vec<_>>(),
+        vec![24_u16],
+        "and carry the size recorded for the `levelParams` cells"
+    );
+}
