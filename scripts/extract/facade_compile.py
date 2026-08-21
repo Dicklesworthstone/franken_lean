@@ -1462,6 +1462,18 @@ def main():
             "REFUSE: facade manifest quarantine-summary join disagrees with its rows "
             f"({json.dumps(quarantine_summary_join, sort_keys=True)})"
         )
+    coverage_summary_join = {
+        "emitted_coverage": manifest_summary.get("demanded_emitted"),
+        "verified_coverage": manifest_summary.get("facade_demand"),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in coverage_summary_join.values())
+            or coverage_summary_join["emitted_coverage"]
+            != coverage_summary_join["verified_coverage"]):
+        raise SystemExit(
+            "REFUSE: facade manifest coverage-summary join diverges "
+            f"({json.dumps(coverage_summary_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2522,6 +2534,7 @@ def main():
         "manifest_claim_class_join": manifest_claim_class_join,
         "manifest_withdrawal_join": manifest_withdrawal_join,
         "manifest_quarantine_summary_join": quarantine_summary_join,
+        "manifest_coverage_summary_join": coverage_summary_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
