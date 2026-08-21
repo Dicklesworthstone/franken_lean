@@ -5644,3 +5644,224 @@ fn the_one_field_elements_wrap_names() {
         "every `tag 1` element's field accepted by the production `decode_name`"
     );
 }
+
+/// The `tag 4` objects the elements wrap - the same tag and arity as the slot-3
+/// ones, and NOT the same thing.
+///
+/// `fffc0e71` found that 5 of the interior's 16 `tag 2` elements wrap something
+/// other than a `tag 1`, and that something is `tag 4 arity 2`. So is one of
+/// the three shapes at slot 3, pinned at `6a4dba87`. They are not the same
+/// type:
+///
+///   slot 3's `tag 4`     a numbered name link, and an ARRAY
+///   these                a name link, and a field that is boxed or a pointer
+///
+/// A tag and an arity do not identify a type. That is the finding this whole
+/// investigation opened with - `daaaabe2`, where `(1, 2)` at 24 bytes turned
+/// out to be `List.cons` and several other things - and here it is again, four
+/// levels deeper, between two populations this file has been describing
+/// separately for three waves without noticing they collide.
+///
+/// NOTHING IS DECODED HERE, and the collision is exactly why. The `(4, 2)`
+/// shape has been identified once in this file, at `aec3efd1`, as `Expr.const`.
+/// These match that shape and one of them even carries what a `List Level`
+/// would look like. Handing them to `decode_expr` would very likely succeed and
+/// would prove nothing about which of two types sharing a shape this is - it
+/// would be the shape argument again, wearing a decoder.
+///
+/// THE SEEDS HAVE NONE. Zero, not a small number: the seeds' entire `tag 2`
+/// population is one object and it wraps a `tag 1`. That is asserted as a count
+/// of zero, the discipline `d8906952` settled for categorical absences.
+///
+/// Slot 1 is boxed four times and a pointer once - the THIRD non-uniform field
+/// found here, after `6a4dba87` and `4277a152`. Five objects support no
+/// proportion, so the two counts are pinned and nothing is said about which
+/// case is typical.
+#[test]
+fn the_wrapped_tag_four_objects_are_not_the_slot_three_ones() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut totals: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut fields: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut slot_three_fields: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+        let shape_of = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for population in ["seed", "interior"] {
+            let mut carriers: BTreeSet<usize> = BTreeSet::new();
+            for node in &all {
+                if (population == "seed") == seeds.contains(node)
+                    && let Some(record) = resolve(word_at(bytes, node + 8))
+                    && let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 3))
+                {
+                    carriers.insert(target);
+                }
+            }
+            // Arrays deduplicated first, the `fffc0e71` reconciliation.
+            let mut arrays: BTreeSet<usize> = BTreeSet::new();
+            for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                for &carrier in &carriers {
+                    if at.get(&carrier).map(|o| (o.tag, o.other)) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        arrays.insert(array);
+                    }
+                }
+                // For the comparison below: what slot 3's own `tag 4` holds.
+                if tag == 4 {
+                    for &carrier in &carriers {
+                        if at.get(&carrier).map(|o| (o.tag, o.other)) != Some((4, 2)) {
+                            continue;
+                        }
+                        for field in 0..2usize {
+                            let word = word_at(bytes, carrier + 8 + 8 * field);
+                            let described = resolve(word)
+                                .map_or_else(|| format!("boxed {}", word >> 1), &shape_of);
+                            *slot_three_fields
+                                .entry(format!("{population}/slot {field} {described}"))
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut references = 0usize;
+            let mut distinct: BTreeSet<usize> = BTreeSet::new();
+            for array in arrays {
+                for i in 0..word_at(bytes, array + 8) {
+                    let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                        continue;
+                    };
+                    if at.get(&element).map(|o| (o.tag, o.other)) != Some((2, 1)) {
+                        continue;
+                    }
+                    if let Some(target) = resolve(word_at(bytes, element + 8))
+                        && at.get(&target).map(|o| (o.tag, o.other)) == Some((4, 2))
+                    {
+                        references += 1;
+                        distinct.insert(target);
+                    }
+                }
+            }
+            let entry = totals.entry(population.to_owned()).or_default();
+            entry.0 += references;
+            entry.1 += distinct.len();
+            for target in distinct {
+                for field in 0..2usize {
+                    let word = word_at(bytes, target + 8 + 8 * field);
+                    let described =
+                        resolve(word).map_or_else(|| format!("boxed {}", word >> 1), &shape_of);
+                    *fields
+                        .entry(format!("{population}/slot {field} {described}"))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            totals.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        totals.into_iter().collect::<Vec<_>>(),
+        vec![("interior".to_owned(), (6, 5)), ("seed".to_owned(), (0, 0)),],
+        "the seeds have NONE - zero, not a small number, because their entire \
+         `tag 2` population is one object and it wraps a `tag 1`"
+    );
+
+    assert_eq!(
+        fields.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/slot 0 tag 1 arity 2".to_owned(), 5),
+            ("interior/slot 1 boxed 0".to_owned(), 4),
+            ("interior/slot 1 tag 1 arity 2".to_owned(), 1),
+        ],
+        "a name link, and a field that is boxed four times and a pointer once - \
+         the THIRD non-uniform field found here. Five objects support no \
+         proportion, so both counts are pinned and neither is called typical"
+    );
+
+    // The collision: same tag, same arity, different fields.
+    assert_eq!(
+        slot_three_fields.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/slot 0 tag 2 arity 2".to_owned(), 26),
+            ("interior/slot 1 tag 246 arity 0".to_owned(), 26),
+            ("seed/slot 0 tag 2 arity 2".to_owned(), 11),
+            ("seed/slot 1 tag 246 arity 0".to_owned(), 11),
+        ],
+        "slot 3's `tag 4` objects hold a NUMBERED name link and an ARRAY. The \
+         wrapped ones hold a name link and a boxed-or-pointer field. Same tag, \
+         same arity, different type - which is `daaaabe2`'s finding four levels \
+         deeper, and why nothing here is handed to a decoder"
+    );
+}
