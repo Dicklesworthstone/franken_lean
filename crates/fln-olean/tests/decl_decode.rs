@@ -3080,3 +3080,169 @@ fn the_head_record_slots_are_names_and_a_short_array() {
     );
     assert_eq!(elements, 157, "and the elements they hold between them");
 }
+
+/// Slot 3 of the head records is an EXPRESSION, and a telescope at that.
+///
+/// The other option is empty again, and for the reason recorded at `c726dec5`:
+/// `9d365d6a` pins that not one of the 11 tag-4 objects has a pointer head, so
+/// there are no tag-4 head records to classify. Two waves have now offered it.
+///
+/// Slot 3 has been "tag 7 arity 3" since `2475a62f` and nothing more. That
+/// shape is one this project has already measured elsewhere: `49b72dcf` bound
+/// `Expr.forallE` to `(7, 3, 48)` over 9,547 objects in this same Prelude,
+/// after I had first written the wrong size and had to correct it. So the shape
+/// is not a fresh guess - it is a match against a corpus measurement that
+/// already exists.
+///
+/// A MATCH IS STILL ONLY A MATCH, so the cell hands every one to the production
+/// `decode_expr`. Sixty-nine acceptances is the decoder agreeing with the
+/// bytes; a shape comparison would only be my arithmetic agreeing with my
+/// arithmetic, which is the circularity refused at `84951450` and again at
+/// `3b510e62`.
+///
+/// What the sub-slots hold makes it a TELESCOPE rather than a lone binder. Slot
+/// 0 is a name link in all 69 - both link constructors occur, 34 of one and 35
+/// of the other - and slot 2, the body, is itself `(7, 3)` in 51 of the 69. A
+/// binder whose body is another binder, fifty-one deep across the population,
+/// is a dependent function type written out.
+///
+/// And they are shared: 69 references reach 52 distinct objects. That is the
+/// same reference-versus-object gap as `2475a62f`'s 71-and-69, in a different
+/// slot, and it is pinned here as both numbers for the same reason.
+///
+/// No size is asserted; classification is by constructor tag and arity, and by
+/// what the decoder accepts. No type outside `Expr` is named, and no extension
+/// or schema is speculated about.
+#[test]
+fn the_head_record_slot_three_is_a_pi_type() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut distinct: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut shapes: BTreeSet<(u8, u8)> = BTreeSet::new();
+    let mut decoded = 0usize;
+    let mut binder_names: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut names_decoded = 0usize;
+    let mut nested_binders = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let Some(tail) = resolve(word_at(bytes, object.off + 16)) else {
+                continue;
+            };
+            if at.get(&tail).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(head) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&head).map(|h| (h.tag, h.other)) == Some((0, 5)) {
+                records.insert(head);
+            }
+        }
+
+        for record in records {
+            references += 1;
+            let word = word_at(bytes, record + 8 + 8 * 3);
+            let off = resolve(word).expect("slot 3 is a pointer");
+            let object = at.get(&off).expect("resolved above");
+            shapes.insert((object.tag, object.other));
+            distinct.insert((index, off));
+
+            // The production decoder, not a shape comparison.
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_expr(word)
+                .unwrap_or_else(|e| panic!("{module}: slot 3 must decode as an Expr: {e}"));
+            decoded += 1;
+
+            // Sub-slot 0: the binder name.
+            let name_word = word_at(bytes, off + 8);
+            let name_off = resolve(name_word).expect("a binder name is a pointer");
+            let link = at.get(&name_off).expect("resolved above");
+            *binder_names
+                .entry(format!("tag {} arity {}", link.tag, link.other))
+                .or_default() += 1;
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(name_word)
+                .unwrap_or_else(|e| panic!("{module}: a binder name must decode: {e}"));
+            names_decoded += 1;
+
+            // Sub-slot 2: the body. Another binder makes it a telescope.
+            if let Some(body) = resolve(word_at(bytes, off + 24))
+                && at.get(&body).map(|o| (o.tag, o.other)) == Some((7, 3))
+            {
+                nested_binders += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(references, 69, "one slot 3 per distinct head record");
+    assert_eq!(
+        distinct.len(),
+        52,
+        "reaching 52 distinct objects - the same reference-versus-object gap as \
+         `2475a62f`'s 71 and 69, in a different slot"
+    );
+    assert_eq!(
+        shapes.into_iter().collect::<Vec<_>>(),
+        vec![(7, 3)],
+        "one shape across all 69"
+    );
+    assert_eq!(
+        decoded, 69,
+        "and every one accepted by the PRODUCTION `decode_expr`, which is the \
+         decoder agreeing with the bytes rather than my arithmetic agreeing \
+         with itself"
+    );
+
+    assert_eq!(
+        binder_names.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 2".to_owned(), 34),
+            ("tag 2 arity 2".to_owned(), 35)
+        ],
+        "sub-slot 0 is a name link in all 69, and BOTH link constructors occur"
+    );
+    assert_eq!(names_decoded, 69, "each accepted by `decode_name` as well");
+    assert_eq!(
+        nested_binders, 51,
+        "and in 51 of the 69 the body is itself a binder - a dependent function \
+         type written out, not a lone binder"
+    );
+}
