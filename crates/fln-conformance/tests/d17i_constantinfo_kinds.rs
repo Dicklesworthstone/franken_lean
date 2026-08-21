@@ -3463,3 +3463,104 @@ fn every_iota_right_hand_side_abstracts_exactly_its_recursors_telescope() {
          at the top of this range first"
     );
 }
+
+/// The `all` lists agree with each other — a relation between two fields this
+/// file already reads separately.
+///
+/// `InductiveVal.all` and `RecursorVal.all` both name a block. Cells above use
+/// each of them: the rules cell gathers a block's constructors by iterating
+/// `rec.all`, the numeric cell counts motives against its length, and the
+/// nesting cell keys carve-outs off `rec.all[0]`. Not one of them checks that
+/// the two lists AGREE. A recursor naming a different block than its inductive
+/// declares would send every one of those cells to the wrong constructor set and
+/// they would all still pass, because each is internally consistent with the
+/// list it happened to read.
+///
+/// Three coherence relations, over `Init/Prelude` at private level — 127
+/// inductives, 129 recursors, 157 constructors, zero violations of any:
+///
+///   an inductive's `all` contains the inductive itself
+///   a recursor's `all` equals its head inductive's `all`
+///   a constructor's `induct` is a member of that inductive's own `all`
+///
+/// SCOPE, AND IT IS A LIMIT ON EVERY `all`-ITERATING CELL IN THIS FILE, NOT JUST
+/// THIS ONE. A scan of all 600 `Init` modules carrying a complete chain finds
+/// ZERO mutual inductive blocks: every `all` in the corpus this file measures is
+/// a singleton. So these relations, and the block iteration in the cells above,
+/// have only ever been exercised on one-type blocks. They are stated as laws
+/// rather than as "`all` has one element" precisely so that a mutual block
+/// arriving is checked rather than rejected — but nothing here has yet SEEN one,
+/// and that is worth knowing before this file's block coverage is described as
+/// complete.
+#[test]
+fn inductive_and_recursor_block_lists_agree() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(
+                info.name().to_display_string(),
+                v.all.iter().map(Name::to_display_string).collect(),
+            );
+        }
+    }
+    assert!(
+        inductives.len() > 100,
+        "the inductive census must be reached, got {}",
+        inductives.len()
+    );
+
+    for (name, all) in &inductives {
+        assert!(
+            all.contains(name),
+            "{name}: an inductive must be a member of its own block, or every lookup keyed on \
+             `all` goes somewhere else"
+        );
+        for member in all {
+            assert_eq!(
+                inductives.get(member),
+                Some(all),
+                "{name}: block member {member} declares a different block"
+            );
+        }
+    }
+
+    let mut recursors = 0usize;
+    let mut constructors = 0usize;
+    for info in &infos {
+        match info {
+            ConstantInfo::Rec(v) => {
+                recursors += 1;
+                let all: Vec<String> = v.all.iter().map(Name::to_display_string).collect();
+                let head = inductives
+                    .get(&all[0])
+                    .expect("recursor's head inductive decodes");
+                assert_eq!(
+                    &all,
+                    head,
+                    "{}: a recursor's block must be the block its head inductive declares",
+                    info.name().to_display_string()
+                );
+            }
+            ConstantInfo::Ctor(v) => {
+                constructors += 1;
+                let induct = v.induct.to_display_string();
+                let all = inductives
+                    .get(&induct)
+                    .expect("constructor's inductive decodes");
+                assert!(
+                    all.contains(&induct),
+                    "{}: its inductive is not a member of its own block",
+                    info.name().to_display_string()
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        recursors > 100 && constructors > 120,
+        "both populations must be reached ({recursors} recursors, {constructors} constructors)"
+    );
+}
