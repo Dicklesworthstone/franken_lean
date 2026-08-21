@@ -260,6 +260,8 @@ const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1: &str = "_private.Init.Data.Array
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Array/BasicAux";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.eq_2";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2_MODULE: &str = "Init/Data/Array/BasicAux";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.splitter";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER_MODULE: &str = "Init/Data/Array/BasicAux";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -2058,6 +2060,9 @@ fn list_to_array_aux_basic_aux_match_is_decoded_from_its_private_storage_module(
 
 #[test]
 fn list_to_array_aux_basic_aux_second_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_second_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+
+#[test]
+fn list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
