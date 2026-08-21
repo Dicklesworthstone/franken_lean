@@ -10289,3 +10289,197 @@ fn a_structure_projection_is_the_primitive_proj_at_its_own_index() {
         "the index match must be exercised beyond the first field, got {indices:?}"
     );
 }
+
+/// The projection implementation is uniform across kinds — the cell above
+/// excused the theorems instead of checking them.
+///
+/// That cell requires the 136 definition-valued projections to contain a `Proj`
+/// node at their own index and says of the six theorem-valued ones that they
+/// "are not required to, since a proof-valued projection need not reduce". That
+/// is true and it is weaker than the artifact. All six DO carry one:
+///
+///   `And.left` projects `(And, 0)`, `And.right` `(And, 1)`, `Char.valid`
+///   `(Char, 1)`, `Fin.isLt` `(Fin, 1)`, `String.isValidUTF8` `(String, 1)`,
+///   `Subtype.property` `(Subtype, 1)`
+///
+/// So 142 of the 145 fields are projected by the primitive node at their own
+/// ordinal, and the three that are not are the ones with no projection at all.
+/// The KIND of a projection varies with whether its result is a proposition;
+/// the IMPLEMENTATION does not vary at all.
+///
+/// The alternative is ruled out rather than assumed absent: none of the six
+/// references `.rec`, `.recOn` or `.casesOn`. They are not eliminating through
+/// the recursor and happening to also carry a `Proj`; the projection node is
+/// how they are written.
+///
+/// This is the same mistake the cell above was written to correct, made one
+/// level along. There, a search keyed on name plus an assumed KIND reported
+/// four theorems as absent. Here, having found them, I let the kind excuse them
+/// from the check instead of asking whether the kind changed anything. It did
+/// not.
+#[test]
+fn every_projection_uses_the_primitive_node_whatever_its_kind() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let declared = kinds(&infos);
+    let mut bodies: BTreeMap<String, &Expr> = BTreeMap::new();
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<String>)> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Defn(v) => drop(bodies.insert(name, &v.value)),
+            ConstantInfo::Thm(v) => drop(bodies.insert(name, &v.value)),
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_name, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_name.to_display_string());
+                    current = body;
+                }
+                drop(constructors.insert(name, (v, binders)));
+            }
+            _ => {}
+        }
+    }
+
+    let mut projected = 0usize;
+    let mut absent = 0usize;
+    let mut fields = 0usize;
+    let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut indices: BTreeSet<u64> = BTreeSet::new();
+    let mut departures: Vec<String> = Vec::new();
+    let mut eliminating: Vec<String> = Vec::new();
+    for (name, induct) in &inductives {
+        if induct.ctors.len() != 1 {
+            continue;
+        }
+        let ctor_name = induct.ctors[0].to_display_string();
+        let Some((ctor, binders)) = constructors.get(&ctor_name) else {
+            continue;
+        };
+        let start = ctor.num_params as usize;
+        for (position, field) in binders[start..start + ctor.num_fields as usize]
+            .iter()
+            .enumerate()
+        {
+            fields += 1;
+            let plain = format!("{name}.{field}");
+            let suffix = format!(".{plain}");
+            let Some((declaration, kind)) = declared
+                .get_key_value(&plain)
+                .or_else(|| {
+                    declared
+                        .iter()
+                        .find(|(candidate, _)| candidate.ends_with(&suffix))
+                })
+                .map(|(candidate, kind)| (candidate.clone(), *kind))
+            else {
+                absent += 1;
+                continue;
+            };
+
+            let mut found = false;
+            let mut eliminator = false;
+            let mut stack: Vec<&Expr> = bodies.get(&declaration).into_iter().copied().collect();
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current.allocation_identity()) {
+                    continue;
+                }
+                match current.node() {
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => {
+                        if struct_name.to_display_string() == **name && *idx == position as u64 {
+                            found = true;
+                        }
+                        stack.push(expr);
+                    }
+                    ExprNode::Const { name: target, .. } => {
+                        let target = target.to_display_string();
+                        if target.ends_with(".rec")
+                            || target.ends_with(".recOn")
+                            || target.ends_with(".casesOn")
+                        {
+                            eliminator = true;
+                        }
+                    }
+                    ExprNode::App { f, a } => {
+                        stack.push(f);
+                        stack.push(a);
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type);
+                        stack.push(body);
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_);
+                        stack.push(value);
+                        stack.push(body);
+                    }
+                    ExprNode::MData { expr, .. } => stack.push(expr),
+                    _ => {}
+                }
+            }
+
+            if found {
+                projected += 1;
+                *by_kind.entry(kind).or_default() += 1;
+                indices.insert(position as u64);
+            } else {
+                departures.push(declaration.clone());
+            }
+            if kind == "Thm" && eliminator {
+                eliminating.push(declaration);
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        projected + absent + departures.len(),
+        fields,
+        "every field must be projected, absent, or a departure"
+    );
+    assert!(
+        departures.is_empty(),
+        "every projection that exists carries a Proj node at its own index, whatever its \
+         kind: {departures:?}"
+    );
+    assert_eq!(
+        (fields, projected, absent),
+        (145, 142, 3),
+        "142 of the 145 fields are projected by the primitive node"
+    );
+    assert_eq!(
+        by_kind
+            .iter()
+            .map(|(kind, count)| (*kind, *count))
+            .collect::<Vec<(&str, usize)>>(),
+        vec![("Defn", 136), ("Thm", 6)],
+        "and both kinds do it, so the kind changes nothing about the implementation"
+    );
+    assert!(
+        eliminating.is_empty(),
+        "no theorem-valued projection eliminates through a recursor: {eliminating:?}"
+    );
+    assert!(
+        indices.len() >= 4,
+        "the index match must be exercised beyond the first field, got {indices:?}"
+    );
+}
