@@ -3651,6 +3651,78 @@ mod tests {
         );
     }
 
+    /// A scalar reaching the expression decoder as a ROOT is refused.
+    ///
+    /// This is the sibling of the child-slot rule and a genuinely separate
+    /// site, because the child loop rejects a scalar BEFORE it can ever be
+    /// pushed onto the stack. The only way a scalar reaches the top of that
+    /// loop is as the root the decoder was handed — a slot the caller believed
+    /// was an expression. `ConstantVal.type_` is such a slot, so planting a
+    /// boxed scalar there is the one shape that exercises it.
+    ///
+    /// SHADOWING CHECKED. `decode_constant_val` validates its own header —
+    /// arity, then the size bind from f820d9b1 — before touching any slot, and
+    /// the plant leaves that header alone. The two slots decoded ahead of the
+    /// type, `name` and `levelParams`, are untouched too, so neither the Name
+    /// rules nor the list rules can fire first. The cell asserts the header is
+    /// unchanged after planting.
+    #[test]
+    fn a_scalar_reaching_the_expression_decoder_as_a_root_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+
+        // ConstantVal slot 2 is the type, and it is decoded as an Expr ROOT.
+        let slot = base_off as usize + 24;
+        let type_ptr = view.read_u64(base_off + 24).expect("type slot");
+        assert_eq!(
+            type_ptr & 1,
+            0,
+            "the fixture's type is a heap expression, so the plant is a change"
+        );
+
+        let planted: u64 = (0 << 1) | 1;
+        bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(base_off).expect("owner header"),
+            (0, 3, 32),
+            "the ConstantVal is untouched, so its arity and size rules cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a scalar handed to the expression decoder must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "scalar Expr",
+                    ..
+                }
+            ),
+            "expected the root refusal rather than the child-slot one: {error:?}"
+        );
+    }
+
     /// A scalar in an Expr's CHILD slot is refused.
     ///
     /// Expressions are heap objects; a boxed scalar there is not a small
