@@ -6104,6 +6104,14 @@ fn the_cap_refuses_without_reaching_the_read() {
 /// out which entry appeared or vanished, which is the entire question when a
 /// count is off by one.
 ///
+/// **Two planted records, because one of them cannot distinguish the rule from
+/// its cheap version.** The first holds two entries against a one-entry build,
+/// so "did the number of entries change" refuses it as well. The second is one
+/// entry on each side with different names -- a shape change that does not
+/// change the size -- and only a content comparison refuses it. Its tree is
+/// planted too, so the harm is exhibited: the refused build must not have added
+/// its entry to the stale tree.
+///
 /// **The record sits BESIDE the tree, not inside it**, and that is asserted:
 /// a marker file within the fixture directory would join every walk of it, and
 /// `an_empty_library_walks_to_nothing_and_a_missing_one_does_not_walk` requires
@@ -6182,6 +6190,67 @@ fn a_fixture_rebuilt_with_a_different_shape_is_refused() {
         !tmp.join("t6r7-selftest-manifest-stale-v1").exists(),
         "the rebuild was refused and its tree exists anyway; the shape check must run BEFORE the \
          files are written"
+    );
+
+    // A SHAPE CHANGE THAT DOES NOT CHANGE THE SIZE. The planted record above
+    // holds two entries and the build asks for one, so a cheap rule -- did the
+    // number of entries change -- refuses it as well and cannot be told apart
+    // from the real one. This pair is one entry on each side with different
+    // names, which only a content comparison refuses. Measured against both
+    // rules, with the green case, before this cell was written.
+    const SAME_SIZE: &str = "t6r7-selftest-manifest-same-size-v1";
+    let same_size_record = tmp.join(format!("{SAME_SIZE}.manifest"));
+    let same_size_tree = tmp.join(SAME_SIZE);
+    fs::write(&same_size_record, b"Gone.olean")
+        .unwrap_or_else(|error| panic!("plant the same-size record: {error}"));
+    // The tree the record describes, planted too, so the harm is exhibited
+    // rather than argued: this is what the new list would union into.
+    fs::create_dir_all(&same_size_tree)
+        .unwrap_or_else(|error| panic!("plant the stale tree: {error}"));
+    fs::write(same_size_tree.join("Gone.olean"), b"")
+        .unwrap_or_else(|error| panic!("plant the stale file: {error}"));
+
+    // THE SIZES MUST MATCH, SAID IN CODE. If this record were ever edited to a
+    // second entry, the cheap rule would refuse it too and the cell would become
+    // another copy of the one above without failing.
+    let planted = fs::read_to_string(&same_size_record)
+        .unwrap_or_else(|error| panic!("read the same-size record: {error}"));
+    assert_eq!(
+        planted.lines().count(),
+        1,
+        "the planted record and the requested list must hold the SAME number of entries, or this \
+         cell does not distinguish a content comparison from a size one"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let same_size =
+        std::panic::catch_unwind(|| write_inventory_fixture(SAME_SIZE, &["Kept.olean"]));
+    std::panic::set_hook(previous);
+    let payload = same_size.err().unwrap_or_else(|| {
+        panic!("one entry replaced by a different one is still a shape change and must be refused")
+    });
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("Gone.olean") && message.contains("Kept.olean"),
+        "the refusal must name what the earlier run left behind and what is asked for now: \
+         {message}"
+    );
+
+    // THE HARM, EXHIBITED. The stale tree is untouched: the entry the new list
+    // named was never added to it, which is exactly what a union would have done.
+    assert!(
+        same_size_tree.join("Gone.olean").is_file(),
+        "the planted stale file must still be there; nothing here sweeps"
+    );
+    assert!(
+        !same_size_tree.join("Kept.olean").exists(),
+        "the refused build added its entry to the stale tree anyway, which is the union this \
+         record exists to prevent"
     );
 }
 
