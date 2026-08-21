@@ -4735,6 +4735,42 @@ impl CorpusMatrixReceipt {
                     .to_string(),
             );
         }
+        // AND A WIDTH THAT TOOK NO TIME WAS NOT RUN. `wall_ms` is guarded above
+        // and the per-width timings were only COUNTED, so `per_width_ms:
+        // [0, 0, 0]` passed: three timings for three widths, a plausible total
+        // beside them, and no width having run. The widths ARE the claim, and
+        // this is the third place in this row where a list satisfied a rule
+        // about its length while saying nothing -- after the empty digest list
+        // and the equal placeholders.
+        if let Some((width, _)) = self
+            .per_width_ms
+            .iter()
+            .enumerate()
+            .find(|(_, elapsed)| **elapsed == 0)
+        {
+            return Err(format!(
+                "row records 0 ms at width index {width}. A width that took no time was not \
+                 run, and an observation missing a width is not evidence for the widths PG-5 \
+                 names"
+            ));
+        }
+        // AND THE PARTS MAY NOT EXCEED THE WHOLE. Measured on the committed row:
+        // the three widths sum to 1,801,839 ms inside a 1,926,656 ms wall, so
+        // 124,817 ms of the run is corpus setup outside any width. The rule is
+        // `sum <= wall`, which assumes the widths run one after another -- true
+        // of this lane, whose own waiver prices "three quarters of it in the
+        // sequential column". IF THE LANE EVER RUNS WIDTHS CONCURRENTLY THIS IS
+        // THE RULE TO REVISIT, not the receipt: a concurrent lane would make the
+        // sum legitimately exceed the wall, and repairing the row to fit would
+        // be falsifying it.
+        let width_total: u64 = self.per_width_ms.iter().sum();
+        if width_total > self.wall_ms {
+            return Err(format!(
+                "row records {width_total} ms across its widths inside a {} ms wall. The parts \
+                 exceed the whole, so at least one of the two was not measured",
+                self.wall_ms
+            ));
+        }
 
         // PROVENANCE. These two fields are what bind the row to a corpus revision and to the
         // source that produced it. Empty strings are not weak provenance, they are none.
@@ -18506,6 +18542,22 @@ fn a_receipt_that_compared_nothing_is_refused() {
                 ..real.clone()
             },
             "empty corpus_fixture_hash",
+        ),
+        (
+            "a width that took no time",
+            CorpusMatrixReceipt {
+                per_width_ms: vec![real.per_width_ms[0], 0, real.per_width_ms[2]],
+                ..real.clone()
+            },
+            "0 ms at width index 1",
+        ),
+        (
+            "widths that outlast the run containing them",
+            CorpusMatrixReceipt {
+                wall_ms: real.per_width_ms.iter().sum::<u64>() - 1,
+                ..real.clone()
+            },
+            "The parts exceed the whole",
         ),
         (
             "three equal placeholders where the digests should be",
