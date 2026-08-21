@@ -456,6 +456,56 @@ open Lean in
 '''
 
 
+INIT_DECOY = "Fln.InitCheck.DecoyNotInTheSubstrate"
+
+
+def probe_init_substrate(lean, env, work, names):
+    """Put the SUBSTRATE BOUNDARY to the pin.
+
+    The emitter declares nothing whose census module sits under `Init`, on the
+    ground that every non-prelude Lean file imports `Init` implicitly and both
+    sides therefore share those constants. That claim carries the whole partition:
+    118 demanded rows are recorded as "served by Init" rather than as facade
+    coverage, and every generated type is free to mention them. It had never been
+    checked against the pin.
+
+    So each such name is `#check`ed in a file with NO imports at all — the exact
+    context the facade module elaborates in — alongside a decoy that cannot exist,
+    because a probe that silently produced nothing would also report zero failures.
+    """
+    names = sorted(n for n in set(names) if renderable_name(n))
+    if not names:
+        return [], 0
+    lines = ["set_option autoImplicit false"]
+    line_map = {}
+    for n in names:
+        lines.append(f"#check @{renderable_name(n)}")
+        line_map[len(lines)] = n
+    lines.append(f"#check @{INIT_DECOY}")
+    line_map[len(lines)] = INIT_DECOY
+    src = os.path.join(work, "init_substrate.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    proc = subprocess.run([lean, "-DmaxErrors=100000", src], capture_output=True,
+                          text=True, env=env, timeout=1800)
+    out = proc.stdout + proc.stderr
+    base = os.path.basename(src)
+    failed = {}
+    for m in re.finditer(rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                         out):
+        n = line_map.get(int(m.group(1)))
+        if n is not None:
+            failed[n] = ((m.group(2) or "-") + ": " + m.group(3))[:200]
+    if INIT_DECOY not in failed:
+        raise SystemExit(
+            f"REFUSE: the Init-substrate probe did not notice {INIT_DECOY}, which is "
+            "absent by construction — it cannot tell a shared constant from a "
+            "missing one, and 'every Init name resolves' would be a green it never "
+            "earned")
+    failed.pop(INIT_DECOY)
+    return sorted(failed.items()), len(names)
+
+
 def probe_companions(lean, env, work):
     """Ask the pin which companions a structure and a class actually generate.
 
@@ -1053,6 +1103,17 @@ def main():
                 bare_candidates.add(comp)
     MEASURED_UNWRITABLE.update(probe_writable(lean, env, work, bare_candidates))
 
+    init_failed, init_checked = probe_init_substrate(
+        lean, env, work, set(init_provided) | set(init_demanded))
+    if init_failed:
+        listed = [n for n, _ in init_failed[:8]]
+        raise SystemExit(
+            f"REFUSE: {len(init_failed)} constants the emitter treats as Init "
+            f"substrate do not resolve without imports: {listed} — first reason: "
+            f"{init_failed[0][1]}. The facade declares none of them and its types "
+            "mention them freely, so the partition that calls them shared is wrong "
+            "and the rows blaming their absence would be the wrong rows")
+
     struct_companions, class_companions = probe_companions(lean, env, work)
     companions = sorted(set(struct_companions) | set(class_companions))
     ordered, cycle_residue = order(list(types), deps)
@@ -1499,6 +1560,13 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "init_substrate_checked": init_checked,
+        "init_substrate_falsified": [n for n, _ in init_failed],
+        "init_substrate_note": "every constant the emitter treats as Init substrate "
+            "was #checked in a file with NO imports — the context the facade module "
+            "itself elaborates in — alongside a decoy that cannot exist, so a probe "
+            "that measured nothing cannot pass as a clean substrate",
+        "init_substrate_decoy": INIT_DECOY,
         "bare_names_probed": len(bare_candidates),
         "bare_names_refused_by_pin": sorted(MEASURED_UNWRITABLE),
         "bare_names_note": "every name the emitter was about to write BARE was put "
@@ -1594,6 +1662,7 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"init_checked={init_checked} "
           f"bare_refused={len(MEASURED_UNWRITABLE)} "
           f"private_rows={sum(private_owners.values())}"
           f"/{len(private_owners)}mods "
