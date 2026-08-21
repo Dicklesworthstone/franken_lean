@@ -136,6 +136,18 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "findNextLine",
         "_unsafe_rec",
     ]);
+    let merge_sort_tr_run_unsafe_rec_residual = fln::Name::from_components([
+        "_private", "Init", "Data", "List", "Sort", "Impl", "0", "List", "MergeSort",
+        "Internal", "mergeSortTR", "run", "_unsafe_rec",
+    ]);
+    let merge_tr_go_unsafe_rec_residual = fln::Name::from_components([
+        "_private", "Init", "Data", "List", "Sort", "Impl", "0", "List", "MergeSort",
+        "Internal", "mergeTR", "go", "_unsafe_rec",
+    ]);
+    let split_rev_at_go_unsafe_rec_residual = fln::Name::from_components([
+        "_private", "Init", "Data", "List", "Sort", "Impl", "0", "List", "MergeSort",
+        "Internal", "splitRevAt", "go", "_unsafe_rec",
+    ]);
     let private_sunfold_residual = fln::Name::from_components([
         "_private",
         "CliPrivateReport",
@@ -326,6 +338,18 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
     private_constants.push(axiom(
+        merge_sort_tr_run_unsafe_rec_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
+        merge_tr_go_unsafe_rec_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
+        split_rev_at_go_unsafe_rec_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
         private_sunfold_residual,
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
@@ -421,7 +445,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":26"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":29"));
     assert!(json.stdout.contains(
         "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
     ));
@@ -441,7 +465,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateEqNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateUnsafeRecSunfoldResiduals\":{\"observed\":7,\"names\":[{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.mergeSortTR._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateUnsafeRecSunfoldResiduals\":{\"observed\":10,"
     ));
     assert!(json.stdout.contains(
         "\"privateSunfoldFResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.CliPrivateReport.0._f\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -450,7 +474,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateSunfoldResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateUnsafeRecResiduals\":{\"observed\":6,\"names\":[{\"name\":\"_private.CliPrivateReport.0._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.mergeSortTR._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateUnsafeRecResiduals\":{\"observed\":9,"
     ));
     assert!(json.stdout.contains(
         "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -480,6 +504,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"stringExtraUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
+        "\"mergeSortCompanionOnlyUnsafeRecResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
         "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
@@ -489,7 +516,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateInsertIdxLoopUnaryResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateMergeSortTRUnsafeRecResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.mergeSortTR._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateMergeSortTRUnsafeRecResiduals\":{\"observed\":2,"
     ));
     assert!(json.stdout.contains(
         "\"coreObservablesLoopUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -502,7 +529,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 26 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 29 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
         "decoded _private.loop auxiliaries: 7 (reporting only; not a G1 claim)"
@@ -559,11 +586,11 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("decoded _private eq_N residual names omitted: 0"));
     assert!(human.stdout.contains(
-        "decoded _private _unsafe_rec/_sunfold residuals: 7 (decoded companion names; reporting only; not a G1 claim)"
+        "decoded _private _unsafe_rec/_sunfold residuals: 10 (decoded companion names; reporting only; not a G1 claim)"
     ));
-    assert!(human.stdout.contains(
-        "decoded _private _unsafe_rec/_sunfold residual names: _private.CliPrivateReport.0._sunfold, _private.CliPrivateReport.0._unsafe_rec, _private.CliPrivateReport.0.mergeSortTR._unsafe_rec, _private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec, _private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
-    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private _unsafe_rec/_sunfold residual names: _private.CliPrivateReport.0._sunfold"));
     assert!(human
         .stdout
         .contains("decoded _private _unsafe_rec/_sunfold residual names omitted: 0"));
@@ -586,11 +613,11 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("decoded _private _sunfold residual names omitted: 0"));
     assert!(human.stdout.contains(
-        "decoded _private _unsafe_rec residuals: 6 (decoded companion names; reporting only; not a G1 claim)"
+        "decoded _private _unsafe_rec residuals: 9 (decoded companion names; reporting only; not a G1 claim)"
     ));
-    assert!(human.stdout.contains(
-        "decoded _private _unsafe_rec residual names: _private.CliPrivateReport.0._unsafe_rec, _private.CliPrivateReport.0.mergeSortTR._unsafe_rec, _private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec, _private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
-    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private _unsafe_rec residual names: _private.CliPrivateReport.0._unsafe_rec"));
     assert!(human
         .stdout
         .contains("decoded _private _unsafe_rec residual names omitted: 0"));
@@ -676,6 +703,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("decoded _private String.findLeadingSpacesSize _unsafe_rec residual names omitted: 0"));
     assert!(human.stdout.contains(
+        "decoded _private List.MergeSort companion-only _unsafe_rec residuals: 3 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private List.MergeSort companion-only _unsafe_rec residual names: _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private List.MergeSort companion-only _unsafe_rec residual names omitted: 0"));
+    assert!(human.stdout.contains(
         "decoded _private .loop.match_1 residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
     assert!(human.stdout.contains(
@@ -703,11 +739,11 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("decoded _private insertIdx.loop._unary residual names omitted: 0"));
     assert!(human.stdout.contains(
-        "decoded _private mergeSortTR._unsafe_rec residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+        "decoded _private mergeSortTR._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
     ));
-    assert!(human.stdout.contains(
-        "decoded _private mergeSortTR._unsafe_rec residual names: _private.CliPrivateReport.0.mergeSortTR._unsafe_rec"
-    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private mergeSortTR._unsafe_rec residual names: _private.CliPrivateReport.0.mergeSortTR._unsafe_rec"));
     assert!(human
         .stdout
         .contains("decoded _private mergeSortTR._unsafe_rec residual names omitted: 0"));
