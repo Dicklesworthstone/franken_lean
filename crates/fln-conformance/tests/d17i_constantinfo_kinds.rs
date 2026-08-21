@@ -11780,3 +11780,94 @@ fn the_walked_field_census_equals_the_stored_field_counts() {
         "the field-count distribution, including the constructors carrying none"
     );
 }
+
+/// Constructors reached by two iota rules: their own recursor's, and the nested
+/// family's.
+const DOUBLY_RULED_CONSTRUCTORS: &[&str] = &["Array.mk", "List.cons", "List.nil"];
+
+/// The iota rules cover every constructor, and cover exactly three twice.
+///
+/// The rule cell counts rules with a FLOOR — `rules_seen >= 150` — and the
+/// rule-list cell compares each recursor's rules against its own block as a
+/// sequence. Neither totals the rules, and neither asks how the whole rule
+/// multiset sits over the whole constructor census.
+///
+/// It sits like this: 160 rules over 157 constructors. Every rule names a
+/// declared constructor, every constructor is named by at least one rule, and
+/// exactly THREE are named twice — `Array.mk`, `List.cons` and `List.nil`, once
+/// by their own recursor and once by the nested `Lean.Syntax` family that
+/// eliminates through them.
+///
+/// That is why the totals differ by three, and it is not visible per recursor:
+/// each of the six recursors involved lists exactly the constructors it should,
+/// so the sequence check passes for all of them while the multiset covers three
+/// constructors twice.
+///
+/// 154 × 1 + 3 × 2 = 160, and the conservation is asserted before the figures.
+#[test]
+fn the_iota_rules_cover_every_constructor_and_three_of_them_twice() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut constructors: BTreeSet<String> = BTreeSet::new();
+    let mut covered: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rules = 0usize;
+    for info in &infos {
+        match info {
+            ConstantInfo::Ctor(_) => {
+                constructors.insert(info.name().to_display_string());
+            }
+            ConstantInfo::Rec(v) => {
+                for rule in &v.rules {
+                    rules += 1;
+                    *covered.entry(rule.ctor.to_display_string()).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        covered.values().sum::<usize>(),
+        rules,
+        "the coverage table must account for every rule"
+    );
+    let foreign: Vec<&String> = covered
+        .keys()
+        .filter(|name| !constructors.contains(*name))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "every rule must name a declared constructor: {foreign:?}"
+    );
+    let uncovered: Vec<&String> = constructors
+        .iter()
+        .filter(|name| !covered.contains_key(*name))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "every constructor must be named by a rule, or its recursor cannot reduce: \
+         {uncovered:?}"
+    );
+
+    let twice: Vec<&str> = covered
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        twice,
+        DOUBLY_RULED_CONSTRUCTORS.to_vec(),
+        "exactly these constructors are reached by two rules"
+    );
+    assert_eq!(
+        (rules, constructors.len(), twice.len()),
+        (160, 157, 3),
+        "160 rules over 157 constructors, differing by the three covered twice"
+    );
+    assert!(
+        covered.values().all(|count| *count <= 2),
+        "no constructor is reached more than twice"
+    );
+}
