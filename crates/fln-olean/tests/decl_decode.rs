@@ -11721,6 +11721,207 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The ten surviving mixed contexts, enumerated - and what they cost in OBJECTS.
+///
+/// `03c853b1` ended by saying the six irreducible shapes' mixed contexts "are
+/// now enumerable". It did not enumerate them, and a claim that something could
+/// be measured is not a measurement. There are TEN, and this is the list.
+///
+/// COUNTING CONTEXTS AND COUNTING OBJECTS RANK THEM DIFFERENTLY, which is the
+/// finding. By context count four shapes tie at one apiece and look alike. By
+/// the number of objects a context rule would get wrong - the MINORITY side of
+/// each split, which is what a decoder would actually misclassify - they are:
+///
+///   (0, 1)   19        (0, 2)    1        (0, 3)    6
+///   (1, 1)    5        (1, 2)   95        (2, 2)   33
+///
+/// `(0, 2)`'s entire irreducible ambiguity is ONE OBJECT out of 572 arriving
+/// through that context. `(2, 2)`'s is 33. The context count called those two
+/// equal.
+///
+/// `(1, 2)` IS STILL THE WORST ON BOTH MEASURES, and the honest correction is
+/// to its MARGIN rather than to its rank: five contexts against one is a factor
+/// of five, but 95 minority objects against 33 is a factor of 2.9.
+/// `03c853b1` reported the first and I have pointed its doc here.
+///
+/// EDGES WOULD HAVE MISLED WORSE STILL. `(1, 2)`'s context under a
+/// `(0, 3, 32)` parent carries 1,586 arrival EDGES but only 40 distinct
+/// objects, and `(1, 1)`'s single context carries 490 edges over 17 objects.
+/// An edge-based severity would rank the first about forty times worse than it
+/// is. Both counts are pinned side by side so the divergence is in the
+/// assertion rather than in this comment.
+///
+/// POPULATION SCOPE: all four modules pooled, constructor objects only, array
+/// arrivals excluded - the same notion `03c853b1` was left with, recomputed
+/// here rather than quoted.
+#[test]
+fn the_ten_surviving_mixed_contexts() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    // Context keyed on the parent's shape, SIZE and slot; array arrivals are
+    // not a context a decoder could key on and are excluded.
+    type Context = (u8, u8, u16, usize);
+    let mut sizes: std::collections::BTreeMap<(u8, u8), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut edges: std::collections::BTreeMap<((u8, u8), Context, u16), usize> =
+        std::collections::BTreeMap::new();
+    let mut objects_seen: std::collections::BTreeMap<
+        ((u8, u8), Context, u16),
+        BTreeSet<(usize, usize)>,
+    > = std::collections::BTreeMap::new();
+
+    for (index, (_, bytes)) in modules.iter().enumerate() {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                sizes
+                    .entry((object.tag, object.other))
+                    .or_default()
+                    .insert(object.cs_sz);
+            }
+        }
+        for parent in &objects {
+            if parent.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            for slot in 0..usize::from(parent.other) {
+                let word = word_at(bytes, parent.off + 8 + 8 * slot);
+                let Some(child) = resolve(word).and_then(|off| at.get(&off)) else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let key = (
+                    (child.tag, child.other),
+                    (parent.tag, parent.other, parent.cs_sz, slot),
+                    child.cs_sz,
+                );
+                *edges.entry(key).or_default() += 1;
+                objects_seen
+                    .entry(key)
+                    .or_default()
+                    .insert((index, child.off));
+            }
+        }
+    }
+
+    // Which (shape, context) pairs still see more than one size.
+    let mut mixed: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    for ((shape, context, size), _) in &edges {
+        if sizes[shape].len() > 1 {
+            mixed.entry((*shape, *context)).or_default().insert(*size);
+        }
+    }
+    mixed.retain(|_, seen| seen.len() > 1);
+
+    // The list, with both counts side by side.
+    let table: Vec<(u8, u8, u8, u8, u16, usize, Vec<(u16, usize, usize)>)> = mixed
+        .iter()
+        .map(|((shape, context), seen)| {
+            (
+                shape.0,
+                shape.1,
+                context.0,
+                context.1,
+                context.2,
+                context.3,
+                seen.iter()
+                    .map(|size| {
+                        let key = (*shape, *context, *size);
+                        (*size, edges[&key], objects_seen[&key].len())
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        table,
+        vec![
+            (0, 1, 0, 1, 16, 0, vec![(16, 19, 19), (24, 266, 266)]),
+            (0, 2, 0, 2, 24, 1, vec![(24, 608, 571), (32, 1, 1)]),
+            (0, 3, 0, 2, 24, 1, vec![(32, 116, 6), (40, 142, 142)]),
+            (1, 1, 0, 3, 40, 2, vec![(16, 373, 5), (24, 117, 12)]),
+            (1, 2, 0, 1, 16, 0, vec![(24, 56, 56), (32, 5, 5)]),
+            (1, 2, 0, 2, 24, 1, vec![(24, 205, 84), (32, 44, 44)]),
+            (1, 2, 0, 3, 32, 1, vec![(24, 1568, 22), (32, 18, 18)]),
+            (1, 2, 0, 4, 48, 1, vec![(24, 210, 14), (32, 142, 142)]),
+            (1, 2, 1, 1, 16, 0, vec![(24, 14, 14), (32, 165, 165)]),
+            (2, 2, 1, 2, 24, 0, vec![(24, 64, 64), (32, 43, 33)]),
+        ],
+        "every surviving mixed context: child shape, then the parent's tag, \
+         arity, SIZE and slot, then per child size the arrival EDGES and the \
+         distinct OBJECTS. The two diverge badly - `(1, 2)` under a \
+         `(0, 3, 32)` parent has 1,586 edges over 40 objects, and `(1, 1)`'s \
+         single context 490 edges over 17 - so an edge-based severity would \
+         rank the first about forty times worse than it is"
+    );
+    assert_eq!(
+        table.len(),
+        10,
+        "ten contexts, which `03c853b1` did not list"
+    );
+
+    // What a context rule would actually get wrong, per shape.
+    let mut minority: std::collections::BTreeMap<(u8, u8), usize> =
+        std::collections::BTreeMap::new();
+    for ((shape, context), seen) in &mixed {
+        let counts: Vec<usize> = seen
+            .iter()
+            .map(|size| objects_seen[&(*shape, *context, *size)].len())
+            .collect();
+        let total: usize = counts.iter().sum();
+        *minority.entry(*shape).or_default() +=
+            total - counts.iter().copied().max().expect("non-empty");
+    }
+    assert_eq!(
+        minority.into_iter().collect::<Vec<_>>(),
+        vec![
+            ((0, 1), 19),
+            ((0, 2), 1),
+            ((0, 3), 6),
+            ((1, 1), 5),
+            ((1, 2), 95),
+            ((2, 2), 33),
+        ],
+        "the MINORITY side of each split, summed per shape - the objects a \
+         context rule would misclassify. By context count `(0, 2)` and `(2, 2)` \
+         both have exactly one mixed context and look alike; in objects one is \
+         a SINGLE object out of 572 and the other is 33. `(1, 2)` is still the \
+         worst on both measures, but its margin over the next worst falls from \
+         a factor of five in contexts to 2.9 in objects"
+    );
+}
+
 /// Strengthening the context buys two shapes - and `(1, 2)` is an outlier.
 ///
 /// `49e423e7` asked whether the arrival context determines a child's stored
@@ -11746,6 +11947,12 @@ fn the_other_references_to_that_name() {
 /// SIX SHAPES SURVIVE BOTH REFINEMENTS: `(0,1)` `(0,2)` `(0,3)` `(1,1)`
 /// `(1,2)` `(2,2)`. Among them the mixed counts are 1, 1, 1, 1, 5, 1 - five
 /// shapes with a single stubborn context each, and `(1, 2)` with five.
+///
+/// Counting CONTEXTS is not the same as counting objects, and
+/// `the_ten_surviving_mixed_contexts` enumerates them and measures the
+/// difference. "A factor of five" below is a factor in this metric; in objects
+/// it is 2.9, and one of the four single-context shapes turns out to be a
+/// single OBJECT.
 ///
 /// THAT IS THE SHARPEST FORM THE BLOCK HAS TAKEN. `daaaabe2` showed a size rule
 /// cannot identify a cons cell; `49e423e7` showed `(1, 2)` is the worst of the
