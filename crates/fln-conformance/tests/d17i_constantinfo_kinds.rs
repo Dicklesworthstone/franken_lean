@@ -2493,3 +2493,108 @@ fn the_unsafe_byte_on_axioms_and_opaques_matches_the_vendored_declarations() {
         "the pin carries both safe and unsafe opaques ({unsafe_opaques} unsafe of {opaques})"
     );
 }
+
+/// The reflexive inductives, and the modules that hold them.
+///
+/// Four across the 600 `Init` modules carrying a complete chain. `Init/Prelude`
+/// has NONE, which is why the previous increment declined to bind this flag
+/// there — an assertion over a module where every value is false is a green
+/// with no evidence behind it.
+const REFLEXIVE_INDUCTIVES: &[(&str, &[&str])] = &[
+    ("Init/WF", &["Acc", "Acc.below"]),
+    (
+        "Init/Internal/Order/Basic",
+        &["Lean.Order.iterates", "Lean.Order.iterates.below"],
+    ),
+];
+
+/// `is_reflexive`, bound where it is actually true — and `Acc` in particular,
+/// because this bead runs on it.
+///
+/// Comment 2250 recorded this flag as deliberately unasserted: every inductive
+/// in `Init/Prelude` carries it false, so any check there would be a vacuous
+/// zero. That was a disclosed gap, and a disclosed gap is worth nothing until
+/// the thing it names is run. Searching the 600 `Init` modules finds exactly
+/// four reflexive inductives, and the first of them is `Acc`.
+///
+/// `Acc` is the type the whole bead runs on: it is one of the 76 subsingletons
+/// whose large elimination the 228 rows were about, and the theorem-unfold
+/// repair at `e7cdcbbc` turns on its shape. So this cell also pins the four
+/// observables that argument needs, on the artifact rather than in a comment:
+///
+///   `Acc` is reflexive, is recursive, has ONE constructor, and that
+///   constructor has FIELDS — therefore `Acc.rec` carries `k = false`, and K
+///   conversion cannot stand in for reducing a theorem major premise.
+///
+/// The K-population cell pins `k = true` for exactly `Eq`, `HEq` and `True` in
+/// `Prelude` with `PUnit` as the negative control. `Acc` is the other half of
+/// that control from a different module: a Prop with a single constructor, which
+/// still does not get K, because its constructor is not field-free.
+///
+/// Non-vacuity comes from the contrast rather than a floor: a decode returning
+/// `false` everywhere fails on `Init/WF`, and one returning `true` everywhere
+/// fails on `Init/Prelude`.
+#[test]
+fn the_reflexive_flag_is_bound_where_it_is_true_and_acc_still_refuses_k() {
+    let lib = lib_or_skip!();
+
+    for (module, expected) in REFLEXIVE_INDUCTIVES {
+        let (infos, _) = decode_at(&lib, &module.replace('/', "."), Level::Private);
+        let mut reflexive: Vec<String> = infos
+            .iter()
+            .filter_map(|info| match info {
+                ConstantInfo::Induct(v) if v.is_reflexive => Some(info.name().to_display_string()),
+                _ => None,
+            })
+            .collect();
+        // Sorted: the table is the claim, not the constant array's order.
+        reflexive.sort();
+        assert_eq!(
+            reflexive, *expected,
+            "{module}: the reflexive inductives at the pin"
+        );
+    }
+
+    // The contrast that makes the above non-vacuous, and the reason this flag
+    // could not be bound in the previous increment.
+    let prelude = decode_prelude_private(&lib);
+    assert!(
+        !prelude
+            .iter()
+            .any(|info| matches!(info, ConstantInfo::Induct(v) if v.is_reflexive)),
+        "Init/Prelude carries no reflexive inductive; if that changes, the flag can and should \
+         be bound there too"
+    );
+
+    // `Acc`, and the four observables the `e7cdcbbc` reachability argument uses.
+    let (wf, _) = decode_at(&lib, "Init.WF", Level::Private);
+    let find = |name: &str| {
+        wf.iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("{name} decodes from Init/WF"))
+    };
+    let ConstantInfo::Induct(acc) = find("Acc") else {
+        panic!("Acc is an inductive")
+    };
+    assert!(
+        acc.is_reflexive && acc.is_rec,
+        "Acc is reflexive and recursive"
+    );
+    assert_eq!(acc.ctors.len(), 1, "Acc has a single constructor");
+    let ConstantInfo::Ctor(intro) = find("Acc.intro") else {
+        panic!("Acc.intro is a constructor")
+    };
+    assert!(
+        intro.num_fields > 0,
+        "Acc.intro must carry fields — a field-free single constructor is what earns K"
+    );
+    let ConstantInfo::Rec(acc_rec) = find("Acc.rec") else {
+        panic!("Acc.rec is a recursor")
+    };
+    assert!(
+        !acc_rec.k,
+        "Acc.rec must NOT carry K. This is the observable the theorem-unfold repair depends on: \
+         a Prop whose recursor eliminates into data, whose constructor has fields, so neither \
+         proof irrelevance nor K conversion can substitute for reducing a theorem major."
+    );
+}
