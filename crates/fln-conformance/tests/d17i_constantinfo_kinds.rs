@@ -7162,3 +7162,122 @@ fn multiply_declared_names_agree_on_everything_except_their_proofs() {
          claimed over declarations that share nothing"
     );
 }
+
+/// The single reference in `Init.Meta.Defs` that the `import_all` edge is
+/// required for.
+const IMPORT_ALL_IS_REQUIRED_FOR: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
+
+/// The import closure that respects `import_all`, which the existing closure
+/// does not — and it is still total.
+///
+/// `closure_declared` walks the transitive imports and decodes EVERY member at
+/// the requested level. At `Level::Private` that reads every closure member's
+/// private part, and a real environment does not get one: an ordinary `import`
+/// supplies the exported declarations, and only `import all` supplies the
+/// private ones. The helper cannot respect that, because `decode_at` hands back
+/// imports as bare `Vec<String>` with the flags discarded before it sees them.
+///
+/// So the cell above proves `Init.Meta.Defs` is reference-closed at private
+/// level against an environment LARGER than Lean would build. The result
+/// survives the correction, and the correction is what makes it mean something:
+///
+///   the permissive closure declares 9,217 names; the flag-respecting one —
+///     the module itself at private, its ONE `import_all` target at private,
+///     every other member at exported only — declares 8,744, which is 473 fewer
+///   all 898 referenced constants still resolve, zero unresolved
+///   EXACTLY ONE of them resolves only because of the `import_all` private
+///     part, and it is `_private.Init.Prelude.0.Lean.Name.beq.match_1` — the
+///     reference this bead observed crossing an import edge in the first place
+///
+/// That last number is the point. `import_all` is load-bearing here for one
+/// name out of 898, so a decode that ignored the flag would look correct on
+/// 897 of them; and the earlier "ZERO unresolved" was true while being proved
+/// with parts the environment would not have had.
+#[test]
+fn the_import_closure_that_respects_import_all_is_still_total() {
+    let lib = lib_or_skip!();
+    const MODULE: &str = "Init.Meta.Defs";
+
+    let (own, _) = decode_at(&lib, MODULE, Level::Private);
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    for info in &own {
+        for expr in declaration_expressions(info) {
+            referenced.append(&mut referenced_constants(expr));
+        }
+    }
+    let mut available: BTreeSet<String> = own
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+    assert_eq!(
+        (available.len(), referenced.len()),
+        (530, 898),
+        "{MODULE}: the declaration and reference censuses this row is stated against"
+    );
+
+    // The transitive closure at EXPORTED level, which is what an ordinary
+    // import supplies.
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let direct = module_view(&lib, MODULE, Level::Private).imports;
+    let mut queue: Vec<String> = direct
+        .iter()
+        .map(|import| import.module.to_display_string())
+        .collect();
+    while let Some(current) = queue.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let (infos, imports) = decode_at(&lib, &current, Level::Exported);
+        available.extend(infos.iter().map(|info| info.name().to_display_string()));
+        queue.extend(imports);
+    }
+    let exported_only = available.clone();
+
+    // And the private parts of exactly the `import all` targets.
+    let all_edges: Vec<String> = direct
+        .iter()
+        .filter(|import| import.import_all)
+        .map(|import| import.module.to_display_string())
+        .collect();
+    assert_eq!(
+        all_edges.len(),
+        1,
+        "{MODULE} carries one import_all edge, which is what makes the difference measurable"
+    );
+    for module in &all_edges {
+        let (infos, _) = decode_at(&lib, module, Level::Private);
+        available.extend(infos.iter().map(|info| info.name().to_display_string()));
+    }
+
+    let (permissive, missing) = closure_declared(&lib, MODULE, Level::Private);
+    assert_eq!(missing, 0, "an absent module would shrink both closures");
+    assert!(
+        available.len() < permissive.len(),
+        "the flag-respecting closure must be strictly smaller, or it is the same computation \
+         under another name ({} vs {})",
+        available.len(),
+        permissive.len()
+    );
+    assert_eq!(
+        (available.len(), permissive.len()),
+        (8_744, 9_217),
+        "the two closure sizes"
+    );
+
+    let unresolved: Vec<&String> = referenced.difference(&available).collect();
+    assert!(
+        unresolved.is_empty(),
+        "{MODULE} stays reference-closed once the closure respects import_all: {unresolved:?}"
+    );
+
+    // What the flag actually buys, by name.
+    let owed_to_import_all: Vec<&String> = referenced
+        .iter()
+        .filter(|name| !exported_only.contains(*name))
+        .collect();
+    assert_eq!(
+        owed_to_import_all,
+        vec![IMPORT_ALL_IS_REQUIRED_FOR],
+        "exactly one reference is resolved only by the import_all private part"
+    );
+}
