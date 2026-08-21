@@ -4868,6 +4868,39 @@ fn walk_olean_inventory(
 /// run's leftovers join the population and the counts below stop meaning what
 /// they say.
 fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> PathBuf {
+    // `relative_files` IS A PROMISE THE PARAMETER'S NAME MAKES AND NOTHING KEPT.
+    // `Path::join` obeys the caller, not the name: an entry beginning with `/`
+    // DISCARDS the base entirely and lands wherever it says -- outside
+    // `CARGO_TARGET_TMPDIR`, outside `target/`, anywhere -- and a `..` entry
+    // climbs out of this tree into a SIBLING fixture's, where it would add a
+    // file to a test that never mentioned it and move a count nobody can trace
+    // back here.
+    //
+    // The registry below cannot see that collision: the two fixtures have
+    // different names and share only a file. Neither can the obvious guard --
+    // `base.join("../x").starts_with(base)` is TRUE, because `..` is an ordinary
+    // component to a lexical prefix test and nothing resolves it. So the check
+    // is on the COMPONENTS of the entry, which is the only place the escape is
+    // visible before it happens.
+    //
+    // On components, NOT on the substring `..`. `Dotted/x..olean` is a real
+    // fixture entry in this file whose components are both `Normal`; a substring
+    // test would refuse it and would be refusing a legitimate tree.
+    //
+    // Before the lock, deliberately: a panic while the guard is alive would
+    // poison the Mutex and take every later fixture in the process down with it.
+    for relative in relative_files {
+        assert!(
+            Path::new(relative)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "fixture entry `{relative}` is not a plain relative path. Every component must be an \
+             ordinary name: a leading `/` discards the fixture base and writes outside the target \
+             directory, and a `..` writes into a sibling fixture's tree, where the file joins \
+             another test's population and moves a count that has nothing to do with this fixture"
+        );
+    }
+
     // TWO TESTS SHARING A NAME IS INVISIBLE UNTIL IT CORRUPTS A COUNT. Nothing
     // removes these trees, so a second build under the same name UNIONS into the
     // first: one test's walk then sees the other's files, its census comes out
@@ -6603,6 +6636,146 @@ fn a_stem_ending_in_a_dot_mints_a_name_no_import_can_match() {
         "a dot inside a component is part of the name, and only a segment with NO characters is \
          refused"
     );
+}
+
+/// A fixture entry that leaves the tree is refused BEFORE anything is written.
+///
+/// **The parameter is called `relative_files` and nothing made it so.**
+/// `Path::join` follows the caller: `base.join("/data/tmp/x.olean")` is
+/// `/data/tmp/x.olean` -- the base is discarded and the write lands outside
+/// `CARGO_TARGET_TMPDIR` altogether -- while `base.join("../sibling/x.olean")`
+/// climbs into whatever tree sits beside this one. Both were reachable from any
+/// caller, and the writer creates parent directories on the way, so neither
+/// needed the target to exist first.
+///
+/// **It is the same hazard the name registry exists for, by a route the registry
+/// cannot see.** That guard catches two tests claiming one NAME. This is two
+/// tests sharing one FILE while holding different names, which the registry
+/// reads as two unrelated fixtures. The symptom is identical and worse to trace:
+/// a count moves in a test whose own fixture list never mentions the file.
+///
+/// **The obvious guard is vacuous, which is why the check is on components.**
+/// `base.join("../sibling").starts_with(base)` returns TRUE: `..` is an ordinary
+/// component to a lexical prefix test, and nothing on that path resolves it. A
+/// containment check written that way would pass on the one input it exists to
+/// catch. That is asserted below rather than described, because it is the reason
+/// for the shape of the fix.
+///
+/// **And on components, not on the substring.** `Dotted/x..olean` -- a real
+/// entry in this file, from the empty-segment fixture -- contains `..` and is
+/// perfectly legal: both of its components are `Normal`. A substring test would
+/// refuse a tree the walk is supposed to accept.
+///
+/// **The refusals are told apart by the entry they name**, since a message
+/// saying only "bad fixture entry" would let the absolute cell pass on the
+/// parent-directory cell's panic.
+#[test]
+fn a_fixture_entry_that_leaves_the_tree_is_refused_before_anything_is_written() {
+    // THE MECHANISM, LEXICALLY, WITH NO FILESYSTEM INVOLVED. If either of these
+    // two stops holding, the guard above is solving a problem that no longer
+    // exists and the cells below are theatre.
+    let base = Path::new("/fixtures/tree");
+    assert_eq!(
+        base.join("/data/tmp/evil.olean"),
+        Path::new("/data/tmp/evil.olean"),
+        "an absolute entry must DISCARD the base -- that is what makes it an escape rather than a \
+         nested path"
+    );
+    assert!(
+        base.join("../sibling/F.olean").starts_with(base),
+        "`starts_with` must still accept the escaping path; if it has learned to resolve `..`, \
+         the containment check this guard replaced is no longer vacuous and the fix can be \
+         simplified"
+    );
+
+    let refuse = |name: &str, entry: &str| -> String {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| write_inventory_fixture(name, &[entry]));
+        std::panic::set_hook(previous);
+        let payload = outcome
+            .err()
+            .unwrap_or_else(|| panic!("`{entry}` must be refused, not written"));
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // NOTHING MAY LAND. The two targets are named here so their absence can be
+    // checked afterwards: a refusal that arrives after the write would still
+    // produce a panic and would still pass a message assertion.
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let escaped_sibling = tmp.join("t6r7-escaped-sibling");
+    let outside_target = tmp.join("t6r7-outside-target-marker.olean");
+
+    // The absolute entry points INSIDE the target directory on purpose. It is
+    // outside the fixture tree, which is all this cell is about, and if the
+    // guard ever regressed the stray write lands in `target/` rather than
+    // somewhere a test has no business touching.
+    let outside_entry = outside_target
+        .to_str()
+        .unwrap_or_else(|| panic!("{} is not UTF-8", outside_target.display()));
+    let climbed = refuse(
+        "t6r7-selftest-escape-parent-v1",
+        "../t6r7-escaped-sibling/Foo.olean",
+    );
+    let absolute = refuse("t6r7-selftest-escape-absolute-v1", outside_entry);
+
+    // ASSERTED ON THE PART THAT DIFFERS: both refusals share every word except
+    // the entry, so each cell must find its own and not the other's.
+    assert!(
+        climbed.contains("../t6r7-escaped-sibling/Foo.olean") && !climbed.contains(outside_entry),
+        "the parent-directory refusal must name its own entry: {climbed}"
+    );
+    assert!(
+        absolute.contains(outside_entry) && !absolute.contains("../t6r7-escaped-sibling/Foo.olean"),
+        "the absolute refusal must name its own entry: {absolute}"
+    );
+
+    assert!(
+        !escaped_sibling.exists(),
+        "the entry was refused and a directory still appeared at {}; the check must run BEFORE \
+         `create_dir_all`, or the refusal is an announcement about a write that already happened",
+        escaped_sibling.display()
+    );
+    assert!(
+        !outside_target.exists(),
+        "the absolute entry was refused and a file still appeared at {}, outside the fixture tree",
+        outside_target.display()
+    );
+
+    // GREEN CONTROL, ON BOTH HALVES. A nested entry must still be written, and
+    // an entry CONTAINING `..` inside a component must still be legal -- the
+    // rule is about components, not about the two characters.
+    let ok = write_inventory_fixture(
+        "t6r7-selftest-escape-ok-v1",
+        &["Sub/Inner.olean", "Dotted/x..olean"],
+    );
+    for entry in ["Sub/Inner.olean", "Dotted/x..olean"] {
+        let written = ok.join(entry);
+        assert!(
+            written.is_file(),
+            "`{entry}` is a plain relative entry and must still be written: {}",
+            written.display()
+        );
+        // CONTAINMENT, RESOLVED RATHER THAN LEXICAL -- the check `starts_with`
+        // could not do above.
+        let real = written
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize {}: {error}", written.display()));
+        let root = ok
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize {}: {error}", ok.display()));
+        assert!(
+            real.starts_with(&root),
+            "`{entry}` was written to {} , which is not below the fixture tree {}",
+            real.display(),
+            root.display()
+        );
+    }
 }
 
 /// What a module name MEANS, written out independently of how it is computed.
