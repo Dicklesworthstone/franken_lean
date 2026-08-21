@@ -9915,3 +9915,242 @@ fn the_six_inner_records_are_a_third_population() {
          either. Only reading the fields separated these"
     );
 }
+
+/// The six inner records' arrays - a parallel structure, and a disjointness
+/// that proves less than it looks.
+///
+/// `8a1b98cb` left these unread and said so as UNMEASURED, which is the
+/// correction that cell made to its own predecessor. Measured now:
+///
+///   6 references to 5 distinct arrays, one shared by two records
+///   none of the 5 is among the 51 slot-2 arrays or the 42 slot-3 arrays
+///   every one has length 2
+///   10 elements, all the three-field triple shape, 10 distinct, none boxed
+///   none of the 10 is among the 111 known triples
+///
+/// SO THE `tag 4` WRAPPERS LEAD INTO A PARALLEL COPY OF THE SAME STRUCTURE:
+/// four-field record, then an array, then triples - the same shapes at every
+/// level, and disjoint objects at every level.
+///
+/// THE DISJOINTNESS IS THE WEAK HALF AND I AM SAYING SO RATHER THAN LEADING
+/// WITH IT. `2baabd20` measured 5,553 objects of the triple shape across this
+/// corpus. The 111 already characterised are about two per cent of them, so ten
+/// draws landing outside that set is the EXPECTED outcome under no hypothesis
+/// at all - roughly four chances in five. The same argument applies to the
+/// arrays. Reporting "disjoint at every level" as the finding would be the
+/// mistake `1cc74dd0` caught in thirteen-of-thirteen, three levels deeper.
+///
+/// WHAT CARRIES WEIGHT IS THE PARALLELISM, which no base rate explains away:
+/// the same three shapes in the same nesting, every array the same length, and
+/// sharing present at the array level exactly as it is in the characterised
+/// structure. That is a description of arrangement, not of membership, and
+/// arrangement is what disjointness cannot speak to.
+///
+/// This is the fourth distinct use of the base-rate check in this file, and the
+/// second where it limits a result of mine rather than dissolving or supporting
+/// one.
+#[test]
+fn the_six_inner_record_arrays() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut arrays: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut refcounts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut in_slot2 = 0usize;
+    let mut in_slot3 = 0usize;
+    let mut lengths: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut element_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut elements: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut in_known_triples = 0usize;
+    let mut known_triples = 0usize;
+    let mut triple_shape_total = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        // The corpus-wide triple-shape population, for the base rate.
+        triple_shape_total += objects
+            .iter()
+            .filter(|object| (object.tag, object.other) == (0, 3))
+            .count();
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        // The characterised populations this is compared against.
+        let mut slot2_arrays: BTreeSet<usize> = BTreeSet::new();
+        let mut triples: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                slot2_arrays.insert(array);
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        triples.insert(element);
+                    }
+                }
+            }
+        }
+        known_triples += triples.len();
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        let mut slot3_arrays: BTreeSet<usize> = BTreeSet::new();
+        for &node in &all {
+            if let Some(record) = resolve(word_at(bytes, node + 8))
+                && let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3))
+            {
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        slot3_arrays.insert(array);
+                    }
+                }
+            }
+        }
+
+        // The six inner records, and their slot-3 arrays.
+        let mut inner: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            if let Some(tail) = resolve(word_at(bytes, node + 16))
+                && shape(tail) == Some((4, 1))
+                && let Some(record) = resolve(word_at(bytes, tail + 8))
+            {
+                inner.insert(record);
+            }
+        }
+        let mut counts: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for &record in &inner {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 3)) {
+                references += 1;
+                arrays.insert((index, array));
+                *counts.entry(array).or_default() += 1;
+            }
+        }
+        for (&array, &count) in &counts {
+            *refcounts.entry(count).or_default() += 1;
+            if slot2_arrays.contains(&array) {
+                in_slot2 += 1;
+            }
+            if slot3_arrays.contains(&array) {
+                in_slot3 += 1;
+            }
+            let length = word_at(bytes, array + 8);
+            *lengths.entry(length).or_default() += 1;
+            for i in 0..length {
+                let element =
+                    resolve(word_at(bytes, array + 24 + 8 * i as usize)).expect("an element");
+                let object = at.get(&element).expect("resolved above");
+                *element_shapes
+                    .entry(format!("tag {} arity {}", object.tag, object.other))
+                    .or_default() += 1;
+                elements.insert((index, element));
+                if triples.contains(&element) {
+                    in_known_triples += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(
+        (references, arrays.len()),
+        (6, 5),
+        "six references to five arrays"
+    );
+    assert_eq!(
+        refcounts.into_iter().collect::<Vec<_>>(),
+        vec![(1, 4), (2, 1)],
+        "one of them shared by two records - sharing is present here exactly as \
+         it is in the characterised structure"
+    );
+    assert_eq!(
+        lengths.into_iter().collect::<Vec<_>>(),
+        vec![(2, 5)],
+        "every array has length 2"
+    );
+    assert_eq!(
+        element_shapes.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 3".to_owned(), 10)],
+        "and holds the three-field triple shape"
+    );
+    assert_eq!(elements.len(), 10, "ten distinct elements, none shared");
+
+    // The weak half, with the base rate that weakens it.
+    assert_eq!(
+        (in_slot2, in_slot3, in_known_triples),
+        (0, 0, 0),
+        "none of the arrays is among the 51 slot-2 or 42 slot-3 arrays, and \
+         none of the ten elements is among the known triples"
+    );
+    assert_eq!(known_triples, 111, "the triple population compared against");
+    assert_eq!(
+        triple_shape_total, 5553,
+        "against 5,553 objects of that shape in the corpus, so the 111 are \
+         about two per cent and ten draws landing outside them is the EXPECTED \
+         outcome under no hypothesis - roughly four chances in five. The \
+         disjointness is not the finding; the parallel arrangement is, and no \
+         base rate speaks to arrangement"
+    );
+}
