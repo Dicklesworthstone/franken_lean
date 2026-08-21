@@ -2380,6 +2380,23 @@ def main():
             "REFUSE: facade manifest extern-reducibility probe diverges "
             f"({json.dumps(extern_reducibility_probe_join, sort_keys=True)})"
         )
+    kind_reducibility_probe_join = {
+        "summary_kind_probed": manifest_summary.get("kind_probed"),
+        "summary_reducibility_probed": manifest_summary.get(
+            "reducibility_probed"
+        ),
+        "pinned_kind_reducibility_count": 2042,
+    }
+    if (kind_reducibility_probe_join["summary_kind_probed"]
+            != kind_reducibility_probe_join[
+                "pinned_kind_reducibility_count"]
+            or kind_reducibility_probe_join["summary_reducibility_probed"]
+            != kind_reducibility_probe_join[
+                "pinned_kind_reducibility_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest kind-reducibility probe diverges "
+            f"({json.dumps(kind_reducibility_probe_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3538,6 +3555,9 @@ def main():
         ),
         "manifest_extern_reducibility_probe_join": (
             extern_reducibility_probe_join
+        ),
+        "manifest_kind_reducibility_probe_join": (
+            kind_reducibility_probe_join
         ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
