@@ -13847,7 +13847,7 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
     const WIDEST_STRADDLE: usize = 3;
     let lines = text.lines().collect::<Vec<_>>();
     let states_it = |line: &str| {
-        let text = contractions_expanded(line);
+        let text = stale_scan_form(line);
         text.contains("matrix") && stale.iter().any(|s| text.contains(s))
     };
     (2..=WIDEST_STRADDLE).find_map(|width| {
@@ -13857,7 +13857,7 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
             {
                 return None;
             }
-            let joined = contractions_expanded(&run.join(" "));
+            let joined = stale_scan_form(&run.join(" "));
             let split = joined.contains("matrix") && stale.iter().any(|s| joined.contains(s));
             split.then_some(index + 1)
         })
@@ -13996,6 +13996,22 @@ fn contractions_expanded(text: &str) -> String {
         .replace("hasn't", "has not")
         .replace("hadn't", "had not")
         .replace("wasn't", "was not")
+}
+
+/// The one form the stale rules read, and the ORDER is load-bearing.
+///
+/// Case was the last spelling this rule could not see. Its anchor tested
+/// `contains("matrix")`, so a sentence opening "Matrix runs are unbuilt" named a
+/// subject the rule did not recognise, and every needle was lowercase too.
+///
+/// Lowercasing happens BEFORE the contractions are expanded, because the
+/// expansion itself matches lowercase: "Doesn't exist" at the start of a
+/// sentence survives an expand-then-lowercase pipeline untouched and is caught
+/// by neither half. Two normalisations composed in the wrong order leave a gap
+/// that neither has alone, which is the same join this guard has now met in
+/// four separate rules.
+fn stale_scan_form(segment: &str) -> String {
+    contractions_expanded(&segment.to_ascii_lowercase())
 }
 
 /// The one place a segment is collapsed, so every rule below indexes the same
@@ -17341,6 +17357,33 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         "a qualifier in the sentence that states the claim must still count, or the bound \
          reddens every honest site"
     );
+    // AND SO IS A CAPITAL LETTER. The anchor tested `contains("matrix")`, so a
+    // sentence opening with the subject named a subject the rule did not
+    // recognise. Measured against the rule this replaces: invisible, now caught.
+    for cased in [
+        "Matrix runs are unbuilt\n",
+        "The corpus-scale Matrix does not exist\n",
+        "The corpus-scale matrix Doesn't exist\n",
+    ] {
+        let scanned = stale_scan_form(cased);
+        assert!(
+            scanned.contains("matrix") && STALE.iter().any(|stale| scanned.contains(stale)),
+            "a retracted description is the same false statement whichever letters it \
+             capitalises: {cased}"
+        );
+    }
+    // AND THE ORDER OF THE TWO NORMALISATIONS IS THE WHOLE OF THAT LAST CASE.
+    // The expansion matches lowercase, so expanding first and lowercasing after
+    // leaves "Doesn't exist" untouched by both halves.
+    assert!(
+        !contractions_expanded("The corpus-scale matrix Doesn't exist").contains("does not exist"),
+        "this is the pipeline that misses it, pinned so the order is not swapped back by \
+         someone reading the two steps as interchangeable"
+    );
+    assert!(
+        stale_scan_form("The corpus-scale matrix Doesn't exist").contains("does not exist"),
+        "and this is the order that catches it: lowercase, then expand"
+    );
     // A CONTRACTION IS A SPELLING, AND THE STALE RULE WAS WRITTEN AGAINST ONE
     // WORDING. Measured against the rule this replaces: each of these was
     // invisible, and each is the natural way to write the retracted claim.
@@ -17585,7 +17628,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
              claim stands unqualified while this guard reports green"
         );
         for (index, line) in text.lines().enumerate() {
-            let expanded = contractions_expanded(line);
+            let expanded = stale_scan_form(line);
             if expanded.contains("matrix") {
                 for stale in STALE {
                     assert!(
