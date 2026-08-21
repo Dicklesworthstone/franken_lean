@@ -1826,8 +1826,8 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
     };
     let bv = |index| Expr::bvar(index).expect("packs");
     let motive = || primary_pi("t", BinderInfo::Default, sum_expr(bv(1), bv(0)), Expr::sort(w.clone()));
-    let inl_minor = || primary_pi("value", BinderInfo::Default, bv(3), Expr::app(bv(1), inl_expr(bv(3), bv(2), bv(0))));
-    let inr_minor = || primary_pi("value", BinderInfo::Default, bv(3), Expr::app(bv(2), inr_expr(bv(4), bv(3), bv(0))));
+    let inl_minor = || primary_pi("value", BinderInfo::Default, bv(2), Expr::app(bv(1), inl_expr(bv(3), bv(2), bv(0))));
+    let inr_minor = || primary_pi("value", BinderInfo::Default, bv(2), Expr::app(bv(2), inr_expr(bv(4), bv(3), bv(0))));
     let rec_type = primary_pi("α", BinderInfo::Implicit, left_type(), primary_pi(
         "β", BinderInfo::Implicit, right_type(), primary_pi(
             "motive", BinderInfo::Implicit, motive(), primary_pi(
