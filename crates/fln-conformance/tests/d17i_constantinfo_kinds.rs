@@ -15891,3 +15891,121 @@ fn the_server_part_adds_no_names_anywhere_in_the_library() {
         "the server-added block count per module, with the same ceiling of five Init shows"
     );
 }
+
+/// The axioms-extension witness over the whole library.
+///
+/// `the_axioms_extension_biconditional_holds_over_every_init_module` pins three
+/// things across the census: the block occurs exactly when a module exports a
+/// declaration, its entry count equals the exported declaration count, and read
+/// at PRIVATE level that count stays at the EXPORTED figure. The last is the one
+/// this bead cares about — `exportedAxiomsExt` is filled by `CollectAxioms`, a
+/// different pass from the one that writes `constNames`, so it is an independent
+/// witness that part selection is right, and a drift would show as two arrays
+/// disagreeing without decoding a single declaration.
+///
+/// A witness measured on a quarter of the artifact is a quarter of a witness.
+/// Over all 2,431 chains:
+///
+///   2,153 carry the block, every one with an entry count equal to its exported
+///         `constNames` length, and every one still reporting that same figure
+///         when the chain is read at private level
+///     278 lack it, and every one of those has an empty exported array
+///       0 carry it with an empty array, so the biconditional closes both ways
+///
+/// So the independent witness agrees with the constant array in 2,153 modules at
+/// both levels, not 517.
+///
+/// THE WIDEST BLOCK IS STILL 2,204. The `Init` cell pins that as a magnitude
+/// anchor, being `Init.Prelude`'s exported declaration count. Four times the
+/// population does not beat it: Prelude has the largest exported array in the
+/// entire library. That is asserted here rather than left implied, because the
+/// corresponding `Init` figure for the PRIVATE arrays turned out not to be the
+/// library maximum at all — `Init.Data.UInt.Lemmas` holds 2,468 — and the two
+/// facts are easy to conflate. Exported and private have different champions.
+///
+/// Anti-vacuity: both sides of the biconditional are populated at 2,153 and 278,
+/// and the largest block counts 2,204 entries, so neither the equality nor the
+/// absence is carried by empty modules.
+///
+/// Conservation first: the carrying and lacking chains must account for the
+/// whole census before either side is characterised.
+#[test]
+fn the_axioms_witness_agrees_with_the_constant_array_library_wide() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let entries_of = |view: &ModuleDataView| -> Option<u64> {
+        view.extensions
+            .iter()
+            .find(|block| block.name == EXPORTED_AXIOMS_EXT)
+            .map(|block| block.entries)
+    };
+
+    let mut chains = 0usize;
+    let mut carrying = 0usize;
+    let mut lacking = 0usize;
+    let mut private_agrees = 0usize;
+    let mut widest = 0u64;
+    for path in &all.exported {
+        if !all.private.contains(path) {
+            continue;
+        }
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        chains += 1;
+
+        let exported = module_view(&lib, &module, Level::Exported);
+        let declared = exported.const_names.len() as u64;
+        match entries_of(&exported) {
+            Some(entries) => {
+                carrying += 1;
+                widest = widest.max(entries);
+                assert_eq!(
+                    entries, declared,
+                    "{module}: the axioms block counts {entries} where the module exports \
+                     {declared}"
+                );
+                assert!(
+                    declared > 0,
+                    "{module}: a module exporting nothing must not carry the block"
+                );
+                if entries_of(&module_view(&lib, &module, Level::Private)) == Some(declared) {
+                    private_agrees += 1;
+                }
+            }
+            None => {
+                lacking += 1;
+                assert_eq!(
+                    declared, 0,
+                    "{module}: the block is absent, so the exported array must be empty"
+                );
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        carrying + lacking,
+        chains,
+        "every chain either carries the block or does not"
+    );
+    assert_eq!(
+        (chains, carrying, lacking),
+        (2_431, 2_153, 278),
+        "both sides of the biconditional are populated across the library"
+    );
+
+    // The part-selection witness, at library scale.
+    assert_eq!(
+        private_agrees, carrying,
+        "read at private level the block must still count the EXPORTED declarations"
+    );
+
+    // Prelude still holds the largest exported array in the library.
+    assert_eq!(
+        widest, 2_204,
+        "the widest axioms block; the exported champion is not the private one"
+    );
+}
