@@ -3730,6 +3730,9 @@ def main():
     init_provided_structural_refused_inequality_join = {"summary_init_provided": manifest_summary.get("init_provided"), "summary_structural_refused": manifest_summary.get("structural_refused")}
     if (not isinstance(init_provided_structural_refused_inequality_join["summary_init_provided"], int) or isinstance(init_provided_structural_refused_inequality_join["summary_init_provided"], bool) or not isinstance(init_provided_structural_refused_inequality_join["summary_structural_refused"], int) or isinstance(init_provided_structural_refused_inequality_join["summary_structural_refused"], bool) or init_provided_structural_refused_inequality_join["summary_init_provided"] <= init_provided_structural_refused_inequality_join["summary_structural_refused"]):
         raise SystemExit("REFUSE: facade manifest Init-provided count must exceed structural-refusal count " + json.dumps(init_provided_structural_refused_inequality_join, sort_keys=True))
+    init_provided_structural_class_inequality_join = {"summary_init_provided": manifest_summary.get("init_provided"), "summary_structural_class": manifest_summary.get("structural_class")}
+    if (not isinstance(init_provided_structural_class_inequality_join["summary_init_provided"], int) or isinstance(init_provided_structural_class_inequality_join["summary_init_provided"], bool) or not isinstance(init_provided_structural_class_inequality_join["summary_structural_class"], int) or isinstance(init_provided_structural_class_inequality_join["summary_structural_class"], bool) or init_provided_structural_class_inequality_join["summary_init_provided"] <= init_provided_structural_class_inequality_join["summary_structural_class"]):
+        raise SystemExit("REFUSE: facade manifest Init-provided count must exceed structural-class count " + json.dumps(init_provided_structural_class_inequality_join, sort_keys=True))
     demanded_init_substrate_private_names_inequality_join = {"summary_demanded_init_substrate": manifest_summary.get("demanded_init_substrate"), "summary_private_name_rows": manifest_summary.get("private_name_rows")}
     if (not isinstance(demanded_init_substrate_private_names_inequality_join["summary_demanded_init_substrate"], int) or isinstance(demanded_init_substrate_private_names_inequality_join["summary_demanded_init_substrate"], bool) or not isinstance(demanded_init_substrate_private_names_inequality_join["summary_private_name_rows"], int) or isinstance(demanded_init_substrate_private_names_inequality_join["summary_private_name_rows"], bool) or demanded_init_substrate_private_names_inequality_join["summary_demanded_init_substrate"] <= demanded_init_substrate_private_names_inequality_join["summary_private_name_rows"]):
         raise SystemExit("REFUSE: facade manifest demanded Init-substrate count must exceed private-name row count " + json.dumps(demanded_init_substrate_private_names_inequality_join, sort_keys=True))
@@ -6066,6 +6069,9 @@ def main():
         ),
         "manifest_init_provided_structural_refused_inequality_join": (
             init_provided_structural_refused_inequality_join
+        ),
+        "manifest_init_provided_structural_class_inequality_join": (
+            init_provided_structural_class_inequality_join
         ),
         "manifest_demanded_init_substrate_private_names_inequality_join": (
             demanded_init_substrate_private_names_inequality_join
