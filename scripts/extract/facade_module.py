@@ -422,9 +422,12 @@ UNWRITABLE_CHARS = frozenset(
 
 
 def writable_component(part):
+    # The hand-written rules are the CANDIDATE filter; the pin's own refusals
+    # (MEASURED_UNWRITABLE, populated before anything is rendered) are the verdict.
     return (bool(part) and not part[0].isdigit()
             and not (set(part) & UNWRITABLE_CHARS)
-            and part not in LEAN_KEYWORDS)
+            and part not in LEAN_KEYWORDS
+            and part not in MEASURED_UNWRITABLE)
 
 
 def safe_ident(part):
@@ -650,6 +653,54 @@ HEADER = [
     "set_option maxRecDepth 8000",
     "",
 ]
+
+
+# Names the pin has REJECTED in binder position during this run. LEAN_KEYWORDS and
+# UNWRITABLE_CHARS are my hand-written approximations of the pin's grammar, and a
+# keyword missing from them is not a small error: an unescaped keyword is a PARSE
+# error, a parse error takes every later declaration in the file with it, and the
+# repair loop then blames a dozen innocent rows (measured in wave 13, where `end`
+# and `private` cost three demanded rows through exactly that cascade). So every
+# name the emitter is about to write BARE is put to the pin first, and anything it
+# refuses is escaped instead. Escaping is always sound — «end» IS `end` — so the
+# fail-safe direction is to escape, and only the pin's acceptances are trusted.
+MEASURED_UNWRITABLE = set()
+
+WRITABLE_PROBE_HEAD = "set_option linter.unusedVariables false\n"
+
+
+def probe_writable(lean, env, work, names):
+    """Return the subset of `names` the pin REFUSES as a bare binder.
+
+    Each candidate is its own command, so a rejection is local: the pin reports it
+    and carries on to the next line (verified against the pin — `end` fails while
+    the `start` line still runs). A name is treated as writable only when its
+    marker actually prints, so a probe that silently produced nothing escapes
+    everything rather than waving it all through.
+    """
+    names = sorted(set(names))
+    if not names:
+        return set()
+    lines = [WRITABLE_PROBE_HEAD]
+    for i, n in enumerate(names):
+        lines.append(f'#eval (fun {n} => IO.println "FLNOK{i}") 0')
+    src = os.path.join(work, "writable.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    proc = subprocess.run([lean, "-DmaxErrors=100000", src], capture_output=True,
+                          text=True, env=env, timeout=1800)
+    accepted = set()
+    for m in re.finditer(r"FLNOK(\d+)", proc.stdout):
+        idx = int(m.group(1))
+        if idx < len(names):
+            accepted.add(names[idx])
+    if not accepted:
+        raise SystemExit(
+            f"REFUSE: the writability probe accepted none of {len(names)} names — "
+            "either the pin refused the whole probe or its marker changed, and a "
+            "probe that accepts nothing would escape every field name in the "
+            "facade without saying why")
+    return set(names) - accepted
 
 
 def writable_binder(name):
@@ -991,6 +1042,17 @@ def main():
         # not only after the ones its type names.
         deps[n] = sorted(set(deps.get(n, [])) | set(vdeps.get(n, [])))
     structural_full = set(structural)
+    bare_candidates = set()
+    for c, bs in binders.items():
+        for b in bs.values():
+            if writable_component(b["user"]):
+                bare_candidates.add(b["user"])
+    for name in decl:
+        for comp in name.split("."):
+            if writable_component(comp):
+                bare_candidates.add(comp)
+    MEASURED_UNWRITABLE.update(probe_writable(lean, env, work, bare_candidates))
+
     struct_companions, class_companions = probe_companions(lean, env, work)
     companions = sorted(set(struct_companions) | set(class_companions))
     ordered, cycle_residue = order(list(types), deps)
@@ -1437,6 +1499,12 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "bare_names_probed": len(bare_candidates),
+        "bare_names_refused_by_pin": sorted(MEASURED_UNWRITABLE),
+        "bare_names_note": "every name the emitter was about to write BARE was put "
+            "to the pin in binder position first; the ones it refused are escaped "
+            "instead. An unescaped keyword is a PARSE error, and a parse error is "
+            "not local — it takes every later declaration with it.",
         "structure_companions_measured": struct_companions,
         "class_companions_measured": class_companions,
         "companions_bound": "measured from the pin with a parameterised structure "
@@ -1526,6 +1594,7 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"bare_refused={len(MEASURED_UNWRITABLE)} "
           f"private_rows={sum(private_owners.values())}"
           f"/{len(private_owners)}mods "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)

@@ -1804,8 +1804,10 @@ structure Lean.Meta.Context where
   univApprox : _root_.Bool
   inTypeClassResolution : _root_.Bool
   cacheInferType : _root_.Bool
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.SavedState : Type
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
+structure Lean.Meta.SavedState where
+  core : _root_.Lean.Core.SavedState
+  «meta» : _root_.Lean.Meta.State
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.TryThis
 axiom Lean.Meta.Tactic.TryThis.addSuggestion : _root_.Lean.Syntax → _root_.Lean.Meta.Tactic.TryThis.Suggestion → _root_.optParam (_root_.Option _root_.Lean.Syntax) _root_.Option.none → _root_.optParam _root_.String "Try this:" → _root_.optParam (_root_.Option _root_.String) _root_.Option.none → _root_.optParam _root_.Lean.Meta.Hint.DiffGranularity _root_.Lean.Meta.Hint.DiffGranularity.none → _root_.optParam _root_.Lean.MessageData _root_.Lean.MessageData.nil → _root_.Lean.Core.CoreM _root_.Unit
 -- role=substrate bucket=- effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Attr
@@ -1852,19 +1854,15 @@ structure Lean.AttributeImpl where
   erase : _root_.Lean.Name → _root_.Lean.AttrM _root_.Unit
 -- role=demanded bucket=R-EFFECT effect=io module=Lean.Elab.Command
 axiom Lean.Elab.Command.addLinter : _root_.Lean.Elab.Command.Linter → _root_.IO _root_.Unit
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.SavedState : Type
+-- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
+structure Lean.Elab.Term.SavedState where
+  «meta» : _root_.Lean.Meta.SavedState
+  «elab» : _root_.Lean.Elab.Term.State
 -- role=substrate bucket=- structural=structure module=Lean.EnvExtension
 structure Lean.MapDeclarationExtension (α : Type) where
   toPersistentEnvExtension : _root_.Lean.PersistentEnvExtension (_root_.Lean.Name × α) (_root_.Lean.Name × α) (_root_.Lean.NameMap α)
 -- role=demanded bucket=R-NONE transparent module=Lean.Meta.Basic
 @[reducible] noncomputable def Lean.Meta.MetaM : Type → Type := _root_.ReaderT _root_.Lean.Meta.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Meta.State _root_.Lean.Core.CoreM)
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.SavedState.core : _root_.Lean.Meta.SavedState → _root_.Lean.Core.SavedState
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.SavedState.meta : _root_.Lean.Meta.SavedState → _root_.Lean.Meta.State
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.SavedState.mk : _root_.Lean.Core.SavedState → _root_.Lean.Meta.State → _root_.Lean.Meta.SavedState
 -- role=substrate bucket=- structural=structure module=Lean.Environment
 structure Lean.PersistentEnvExtensionDescr (α : Type) (β : Type) (σ : Type) where
   toPersistentEnvExtensionDescrCore : _root_.Lean.PersistentEnvExtensionDescrCore α β σ
@@ -1887,12 +1885,6 @@ structure Lean.Elab.Tactic.SavedState where
   tactic : _root_.Lean.Elab.Tactic.State
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Simp
 axiom Lean.Elab.Tactic.mkSimpOnly : _root_.Lean.Syntax → _root_.Lean.Meta.Simp.UsedSimps → _root_.Lean.Meta.MetaM _root_.Lean.Syntax
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.SavedState.elab : _root_.Lean.Elab.Term.SavedState → _root_.Lean.Elab.Term.State
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.SavedState.meta : _root_.Lean.Elab.Term.SavedState → _root_.Lean.Meta.SavedState
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.SavedState.mk : _root_.Lean.Meta.SavedState → _root_.Lean.Elab.Term.State → _root_.Lean.Elab.Term.SavedState
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
 axiom Lean.FVarId.getUserName : _root_.Lean.FVarId → _root_.Lean.Meta.MetaM _root_.Lean.Name
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Replace
