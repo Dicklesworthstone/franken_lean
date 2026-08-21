@@ -13846,7 +13846,10 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
     /// A hard-wrapped sentence spans a few lines, not a section.
     const WIDEST_STRADDLE: usize = 3;
     let lines = text.lines().collect::<Vec<_>>();
-    let states_it = |line: &str| line.contains("matrix") && stale.iter().any(|s| line.contains(s));
+    let states_it = |line: &str| {
+        let text = contractions_expanded(line);
+        text.contains("matrix") && stale.iter().any(|s| text.contains(s))
+    };
     (2..=WIDEST_STRADDLE).find_map(|width| {
         lines.windows(width).enumerate().find_map(|(index, run)| {
             if run.iter().any(|line| states_it(line))
@@ -13854,7 +13857,7 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
             {
                 return None;
             }
-            let joined = run.join(" ");
+            let joined = contractions_expanded(&run.join(" "));
             let split = joined.contains("matrix") && stale.iter().any(|s| joined.contains(s));
             split.then_some(index + 1)
         })
@@ -13974,6 +13977,25 @@ fn markdown_documents_below(root: &Path) -> Vec<PathBuf> {
     }
     found.sort();
     found
+}
+
+/// A contraction is a spelling, and the stale list is literal.
+///
+/// The same shape that hid the PG-5 gate row for four commits: a rule written
+/// against one wording, and a document free to use another. "the corpus-scale
+/// matrix doesn't exist" is the natural way to write the retracted claim and
+/// matches none of the four needles; so does the typographic apostrophe that a
+/// markdown editor inserts without being asked. Expanded here rather than added
+/// to the list, because the list would then need every contraction of every
+/// phrase it ever grows.
+fn contractions_expanded(text: &str) -> String {
+    text.replace('\u{2019}', "'")
+        .replace("doesn't", "does not")
+        .replace("don't", "do not")
+        .replace("isn't", "is not")
+        .replace("hasn't", "has not")
+        .replace("hadn't", "had not")
+        .replace("wasn't", "was not")
 }
 
 /// The one place a segment is collapsed, so every rule below indexes the same
@@ -17133,7 +17155,19 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     ];
     // A document may not still describe the corpus matrix as missing. Scoped to lines that
     // mention a matrix so ordinary uses of these words elsewhere are not swept in.
-    const STALE: [&str; 4] = ["unbuilt", "does not exist", "is not built", "not built yet"];
+    // AND THE INTERVENING WORD IS NOT A CONTRACTION, SO IT NEEDS A NEEDLE.
+    // "does not YET exist" is the same retracted claim and no expansion reaches
+    // it; nor does "has not been built". Measured with rg before adding: zero
+    // occurrences of any of these in the scanned documents, so the population is
+    // empty and the plants below are the whole of it.
+    const STALE: [&str; 6] = [
+        "unbuilt",
+        "does not exist",
+        "is not built",
+        "not built yet",
+        "does not yet exist",
+        "has not been built",
+    ];
     // R4 asks for the cadence STATED WHERE THE CLAIM IS MADE, so this is checked per claim
     // site, not per document. The first version checked per document and a planted mutant
     // survived it: stripping the cadence from the B4 bullet left the reader of that bullet
@@ -17306,6 +17340,38 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         0,
         "a qualifier in the sentence that states the claim must still count, or the bound \
          reddens every honest site"
+    );
+    // A CONTRACTION IS A SPELLING, AND THE STALE RULE WAS WRITTEN AGAINST ONE
+    // WORDING. Measured against the rule this replaces: each of these was
+    // invisible, and each is the natural way to write the retracted claim.
+    for missed in [
+        "the corpus-scale matrix doesn't exist\nand that is that\n",
+        "the corpus-scale matrix does not yet exist\nand that is that\n",
+        "the corpus-scale matrix has not been built\nand that is that\n",
+    ] {
+        assert!(
+            contractions_expanded(missed).contains("matrix")
+                && STALE
+                    .iter()
+                    .any(|stale| contractions_expanded(missed).contains(stale)),
+            "a retracted description spelled with a contraction or an intervening word is the \
+             same false statement, and a literal needle list walks past it: {missed}"
+        );
+    }
+    // AND THE TYPOGRAPHIC APOSTROPHE IS THE ONE AN EDITOR INSERTS UNASKED.
+    assert!(
+        contractions_expanded("the matrix doesn\u{2019}t exist").contains("does not exist"),
+        "a curly apostrophe must normalise like a straight one, or the rule depends on which \
+         editor wrote the sentence"
+    );
+    // AND THE CONTROL AGAINST THE WIDENING: A TRUE STATEMENT MUST STAY CLEAN.
+    assert!(
+        !STALE.iter().any(|stale| {
+            contractions_expanded("the corpus-scale matrix exists and has been run once")
+                .contains(stale)
+        }),
+        "the sentence the documents actually carry must not become a stale description; this \
+         widening must refuse wordings, not facts"
     );
     // AND THE TWO RULES OF THE ALLOWANCE TIER MUST BE READ TOGETHER. This input
     // is the whole point of the assertion above: the site count is ZERO while a
@@ -17519,10 +17585,11 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
              claim stands unqualified while this guard reports green"
         );
         for (index, line) in text.lines().enumerate() {
-            if line.contains("matrix") {
+            let expanded = contractions_expanded(line);
+            if expanded.contains("matrix") {
                 for stale in STALE {
                     assert!(
-                        !line.contains(stale),
+                        !expanded.contains(stale),
                         "{doc}:{} still describes the corpus-scale matrix as missing, but it \
                          exists and has been run (R2 of fln-corpus-thread-matrix-93te). A \
                          stale qualifier is a false statement in the other direction:\n  {line}",
