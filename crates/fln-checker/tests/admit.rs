@@ -2133,6 +2133,19 @@ fn kr600_803_init_empty_refuses_a_forged_recursor_rule() {
 }
 
 #[test]
+fn kr600_803_init_empty_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = init_empty_entries();
+    let recursor = entries[1].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 1);
+    assert_eq!(metadata.num_parameters(), 0);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 0);
+    assert!(metadata.rules().is_empty());
+}
+
+#[test]
 fn kr600_803_init_false_eliminator_is_reconstructed_independently() {
     let entries = init_false_entries();
     let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
