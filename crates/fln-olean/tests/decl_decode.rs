@@ -11721,6 +11721,325 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// What the three contexts decide: nothing. What the array decides: all of it.
+///
+/// `bcf39e12` found the 6,163-object remainder carried by three mixed
+/// grandparent contexts, and named the three as the thing to attack. This asks
+/// what they decide, and the answer is that they decide NOTHING about stored
+/// size - that is what "mixed" means, and it is why the remainder exists.
+///
+/// ONE STEP FINER DECIDES EVERYTHING. A context is where an array ARRIVES; the
+/// array itself is a different thing, and every one of the 61 arrays holding
+/// these objects is size-pure for its shape. So all 6,163 are decided - 27
+/// arrays for `(0, 2)`'s 5,076, 6 for `(0, 3)`'s 1,074, 28 for `(1, 2)`'s 13,
+/// and not one mixed array among them. The residue closes completely.
+///
+/// AND THAT IS NOT LUCK, which is the half that needed a denominator. Across
+/// all four modules there are 2,610 (array, shape) pairs. 769 hold a single
+/// object and 77 belong to a shape with only one stored size, so both are pure
+/// by construction and prove nothing. The remaining 1,764 are AT RISK - a
+/// multi-size shape with at least two objects in the array - covering 19,676
+/// objects, the largest single pair holding 2,204. NONE of the 1,764 is mixed.
+///
+/// So an array's elements of a given shape share one stored size, over 1,764
+/// genuine opportunities to fail. The three trivial and at-risk classes are
+/// asserted to sum to the 2,610, so the at-risk population cannot quietly
+/// shrink.
+///
+/// WHY THE CONTEXT LOSES WHAT THE ARRAY KEEPS: 180 arrays hold objects of more
+/// than one SHAPE, so arrays are not homogeneous in shape - they are
+/// homogeneous in size WITHIN a shape. A context, which stands for many arrays
+/// at once, cannot see that.
+///
+/// A DECODER HAS THE ARRAY IN HAND. This is not a hypothetical discriminator:
+/// the array is the object being iterated when its elements are reached, so a
+/// rule keyed on it is available exactly where it is needed.
+///
+/// WHAT IS LEFT AFTER THIS. The 6,163 were the array-only half of the
+/// indeterminate set; the other half is the 1,174 whose every CONSTRUCTOR
+/// arrival is mixed, which this does not touch and which `94ea5264` pins. And
+/// all of this is about stored SIZE - a proxy for the cons-or-name question
+/// that blocks `list_ptrs`, not that question. No rule is proposed here.
+///
+/// POPULATION SCOPE: all four modules pooled; the remainder is the six shapes
+/// `03c853b1` left unseparated, the base rate is every (array, shape) pair in
+/// the corpus.
+#[test]
+fn the_holding_array_decides_the_whole_remainder() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    type Context = (u8, u8, u16, usize);
+    type Handle = (usize, usize);
+    const SURVIVORS: [(u8, u8); 6] = [(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2)];
+
+    let mut grand_sizes: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut grand_arrivals: std::collections::BTreeMap<Handle, BTreeSet<Context>> =
+        std::collections::BTreeMap::new();
+    let mut holders: std::collections::BTreeMap<Handle, BTreeSet<Handle>> =
+        std::collections::BTreeMap::new();
+    let mut profile_of: std::collections::BTreeMap<Handle, (u8, u8, u16)> =
+        std::collections::BTreeMap::new();
+    let mut has_ctor: BTreeSet<Handle> = BTreeSet::new();
+    let mut shape_sizes: std::collections::BTreeMap<(u8, u8), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut pair_objects: std::collections::BTreeMap<(Handle, (u8, u8)), BTreeSet<usize>> =
+        std::collections::BTreeMap::new();
+    let mut pair_sizes: std::collections::BTreeMap<(Handle, (u8, u8)), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut arrays_by_shape_count: std::collections::BTreeMap<Handle, BTreeSet<(u8, u8)>> =
+        std::collections::BTreeMap::new();
+
+    for (index, (_, bytes)) in modules.iter().enumerate() {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                profile_of.insert(
+                    (index, object.off),
+                    (object.tag, object.other, object.cs_sz),
+                );
+                shape_sizes
+                    .entry((object.tag, object.other))
+                    .or_default()
+                    .insert(object.cs_sz);
+            }
+        }
+        let mut array_contexts: std::collections::BTreeMap<usize, BTreeSet<Context>> =
+            std::collections::BTreeMap::new();
+        for parent in &objects {
+            if parent.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            for slot in 0..usize::from(parent.other) {
+                let Some((off, child)) = resolve(word_at(bytes, parent.off + 8 + 8 * slot))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                let key = (parent.tag, parent.other, parent.cs_sz, slot);
+                if child.tag <= abi::TAG_MAX_CTOR_TAG {
+                    has_ctor.insert((index, off));
+                } else if child.tag == abi::TAG_ARRAY {
+                    array_contexts.entry(off).or_default().insert(key);
+                }
+            }
+        }
+        for holder in &objects {
+            if holder.tag != abi::TAG_ARRAY {
+                continue;
+            }
+            let inherited = array_contexts.get(&holder.off);
+            for i in 0..word_at(bytes, holder.off + 8) {
+                let Some((off, child)) = resolve(word_at(bytes, holder.off + 24 + 8 * i as usize))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let shape = (child.tag, child.other);
+                let pair = ((index, holder.off), shape);
+                pair_objects.entry(pair).or_default().insert(off);
+                pair_sizes.entry(pair).or_default().insert(child.cs_sz);
+                arrays_by_shape_count
+                    .entry((index, holder.off))
+                    .or_default()
+                    .insert(shape);
+                let Some(keys) = inherited else {
+                    continue;
+                };
+                for key in keys {
+                    grand_sizes
+                        .entry((shape, *key))
+                        .or_default()
+                        .insert(child.cs_sz);
+                    grand_arrivals.entry((index, off)).or_default().insert(*key);
+                }
+                holders
+                    .entry((index, off))
+                    .or_default()
+                    .insert((index, holder.off));
+            }
+        }
+    }
+
+    // The remainder, defined exactly as `bcf39e12` defines it.
+    let mut rows: Vec<(u8, u8, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut pooled_remainder = 0usize;
+    let mut pooled_decided = 0usize;
+    let mut pooled_arrays: BTreeSet<Handle> = BTreeSet::new();
+    for shape in SURVIVORS {
+        let remainder: Vec<Handle> = profile_of
+            .iter()
+            .filter(|(key, profile)| {
+                (profile.0, profile.1) == shape
+                    && !has_ctor.contains(*key)
+                    && !grand_arrivals.get(*key).is_some_and(|keys| {
+                        keys.iter().any(|context| {
+                            grand_sizes
+                                .get(&(shape, *context))
+                                .is_some_and(|seen| seen.len() == 1)
+                        })
+                    })
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut arrays: BTreeSet<Handle> = BTreeSet::new();
+        for key in &remainder {
+            if let Some(set) = holders.get(key) {
+                arrays.extend(set.iter().copied());
+            }
+        }
+        let pure = arrays
+            .iter()
+            .filter(|array| pair_sizes[&(**array, shape)].len() == 1)
+            .count();
+        let decided = remainder
+            .iter()
+            .filter(|key| {
+                holders.get(*key).is_some_and(|set| {
+                    set.iter()
+                        .any(|array| pair_sizes[&(*array, shape)].len() == 1)
+                })
+            })
+            .count();
+        pooled_remainder += remainder.len();
+        pooled_decided += decided;
+        pooled_arrays.extend(arrays.iter().copied());
+        rows.push((
+            shape.0,
+            shape.1,
+            remainder.len(),
+            arrays.len(),
+            pure,
+            arrays.len() - pure,
+            decided,
+        ));
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            (0, 1, 0, 0, 0, 0, 0),
+            (0, 2, 5076, 27, 27, 0, 5076),
+            (0, 3, 1074, 6, 6, 0, 1074),
+            (1, 1, 0, 0, 0, 0, 0),
+            (1, 2, 13, 28, 28, 0, 13),
+            (2, 2, 0, 0, 0, 0, 0),
+        ],
+        "per shape: the remainder, the arrays holding it, how many of those are \
+         size-PURE for that shape, how many are mixed, and how many objects are \
+         DECIDED by array identity. Not one mixed array anywhere"
+    );
+    assert_eq!(
+        (
+            pooled_remainder,
+            pooled_arrays.len(),
+            pooled_decided,
+            pooled_remainder - pooled_decided
+        ),
+        (6163, 61, 6163, 0),
+        "so the three contexts decide nothing about size - that is what mixed \
+         means - and the 61 arrays they stand for decide ALL 6,163. The residue \
+         closes completely"
+    );
+
+    // The base rate, without which the zero above is an anecdote.
+    let multi_size: BTreeSet<(u8, u8)> = shape_sizes
+        .iter()
+        .filter(|(_, seen)| seen.len() > 1)
+        .map(|(shape, _)| *shape)
+        .collect();
+    let single_object = pair_objects
+        .iter()
+        .filter(|(_, objects)| objects.len() < 2)
+        .count();
+    let single_size_shape = pair_objects
+        .iter()
+        .filter(|((_, shape), objects)| objects.len() >= 2 && !multi_size.contains(shape))
+        .count();
+    let at_risk: Vec<&(Handle, (u8, u8))> = pair_objects
+        .iter()
+        .filter(|((_, shape), objects)| objects.len() >= 2 && multi_size.contains(shape))
+        .map(|(pair, _)| pair)
+        .collect();
+    assert_eq!(
+        (
+            pair_objects.len(),
+            single_object,
+            single_size_shape,
+            at_risk.len(),
+            at_risk
+                .iter()
+                .filter(|pair| pair_sizes[**pair].len() > 1)
+                .count(),
+            at_risk
+                .iter()
+                .map(|pair| pair_objects[*pair].len())
+                .sum::<usize>(),
+            at_risk
+                .iter()
+                .map(|pair| pair_objects[*pair].len())
+                .max()
+                .expect("non-empty")
+        ),
+        (2610, 769, 77, 1764, 0, 19676, 2204),
+        "(array, shape) pairs; those holding ONE object; those of a shape with \
+         one stored size - both pure by construction and proving nothing; those \
+         AT RISK, being a multi-size shape with at least two objects; the mixed \
+         ones among them; the objects they cover; and the largest single pair. \
+         An array's elements of a given shape share one stored size over 1,764 \
+         genuine opportunities to fail"
+    );
+    assert_eq!(
+        single_object + single_size_shape + at_risk.len(),
+        pair_objects.len(),
+        "the trivial and at-risk classes must account for every pair, so the \
+         at-risk population cannot quietly shrink"
+    );
+
+    // Why a context cannot see what an array can.
+    assert_eq!(
+        arrays_by_shape_count
+            .values()
+            .filter(|shapes| shapes.len() > 1)
+            .count(),
+        180,
+        "180 arrays hold objects of more than one SHAPE, so arrays are not \
+         homogeneous in shape - they are homogeneous in size WITHIN a shape. A \
+         context stands for many arrays at once and cannot see that"
+    );
+}
+
 /// The 6,163 that stay indeterminate - three contexts and one size.
 ///
 /// `259932d6` left a remainder: of the 10,262 blind objects, the holding
