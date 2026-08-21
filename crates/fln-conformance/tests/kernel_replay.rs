@@ -17405,6 +17405,39 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     let production = comment_free(&SOURCE[..production_end]);
     let production = production.as_str();
 
+    // THE NEEDLES BELOW ARE ALSO IN THIS GUARD, WHICH IS WHY THE REGION MATTERS.
+    // Both assertions that follow ask whether the production code still contains
+    // a construct, by searching for its exact text -- and that exact text
+    // appears a second time in this file, as the string literal in the assertion
+    // doing the asking. Measured: two occurrences each, the construct at lines
+    // 1396 and 15972 and this guard's own copies at 17409 and 17417.
+    //
+    // Nothing arranged that. The region ends at the census guard's definition,
+    // and this guard is excluded from it only because it happens to sit LATER IN
+    // THE FILE. Move this guard above that landmark, or rename the landmark, and
+    // the region swallows these literals: both assertions then pass by reading
+    // themselves, the constructs they exist to find could be deleted outright,
+    // and the guard reports green. That is the self-match this file's own
+    // comment says has already bitten it four times.
+    //
+    // The check is a COUNT rather than a decoy, because the string that would
+    // silently satisfy the cell is the needle itself. Strictly fewer occurrences
+    // inside the region than in the file means at least one lies outside it --
+    // and the ones outside are this guard's. Written as an inequality rather
+    // than `== 1` on purpose: a second legitimate construct in production code
+    // must not redden a guard about self-exclusion.
+    for needle in [
+        "for threads in [1usize, 8, 32]",
+        "const CORPUS_MATRIX_WIDTHS: [usize; 3] = [1, 8, 32];",
+    ] {
+        assert!(
+            production.matches(needle).count() < SOURCE.matches(needle).count(),
+            "every occurrence of `{needle}` lies inside the search region, so this guard's own \
+             assertion text is in scope and the two checks below can be satisfied by reading \
+             themselves"
+        );
+    }
+
     assert!(
         production.contains("for threads in [1usize, 8, 32]"),
         "the Prelude thread matrix disappeared; the claim would then have no support at \
