@@ -363,12 +363,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         private_companion_observed,
         "{json}",
     );
-    let decoded_private_auxiliary_name_set = json_non_empty_name_strings(json_array_field(
+    let decoded_private_auxiliary_names = json_array_field(
         json,
         "decodedPrivateAuxiliaryNames",
-    ))
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    );
+    assert_eq!(
+        json_array_len(decoded_private_auxiliary_names),
+        private_companion_observed,
+        "{json}",
+    );
+    let decoded_private_auxiliary_name_set =
+        json_non_empty_name_strings(decoded_private_auxiliary_names)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
     assert!(
         private_companion_name_set.is_subset(&decoded_private_auxiliary_name_set),
         "{json}",
