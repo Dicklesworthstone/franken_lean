@@ -543,6 +543,67 @@ def probe_init_substrate(lean, env, work, names):
     return sorted(failed.items()), len(names)
 
 
+def probe_type_roundtrip(lean, env, work, rows):
+    """Does each emitted TYPE STRING denote the Reference's own type?
+
+    Every axiom in the facade is declared from a string the pin PRINTED for that
+    constant, and the emitter checks that the string elaborates in the facade. That
+    is not the same claim. A pretty-printed type can re-elaborate to a different
+    term — implicits re-inferred, coercions re-inserted — and the facade would then
+    declare a subtly wrong type for a row that resolves perfectly well. Wave 13
+    showed this class is real: `Expr.brecOn`'s printed type elided a motive nothing
+    could re-infer.
+
+    The question is asked in the PIN, where the real type is known:
+
+        noncomputable def flntyr_i.{u} : <printed type> := @X.{u}
+
+    If the string denotes something other than X's actual type, the pin refuses.
+    Together with the facade-side projection check this closes the chain: Lean's
+    derived type, the printed string, and the Reference's real type all agree.
+
+    `rows` is [(name, level_params, emitted_type_string, is_unsafe)].
+    """
+    if not rows:
+        return {}, 0
+    lines = ["import Lean"]
+    line_map = {}
+    for i, (name, levels, ty, unsafe) in enumerate(rows):
+        binder = (".{" + ", ".join(levels) + "}") if levels else ""
+        # An UNSAFE constant may not be referenced from a safe definition — the
+        # kernel refuses the probe itself, which reads as a type mismatch for a row
+        # whose type is perfectly right (measured on exactly the three unsafe rows:
+        # Lean.Environment.evalConst, evalConstCheck, Lean.Meta.evalExpr).
+        kw = "unsafe def" if unsafe else "noncomputable def"
+        lines.append(f"{kw} flntyr_{i}{binder} : {ty} := @{name}{binder}")
+        line_map[len(lines)] = name
+    dname, dlevels, _, dunsafe = rows[0]
+    dbinder = (".{" + ", ".join(dlevels) + "}") if dlevels else ""
+    lines.append(f"{'unsafe def' if dunsafe else 'noncomputable def'} "
+                 f"flntyr_decoy{dbinder} : {TYPE_DECOY_TYPE} := @{dname}{dbinder}")
+    line_map[len(lines)] = "@@DECOY@@"
+    src = os.path.join(work, "typeroundtrip.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    proc = subprocess.run([lean, "-DmaxErrors=100000", src], capture_output=True,
+                          text=True, env=env, timeout=1800)
+    out = proc.stdout + proc.stderr
+    base = os.path.basename(src)
+    failed = {}
+    for m in re.finditer(rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                         out):
+        n = line_map.get(int(m.group(1)))
+        if n is not None and n not in failed:
+            failed[n] = ((m.group(2) or "-") + ": " + m.group(3))[:200]
+    if "@@DECOY@@" not in failed:
+        raise SystemExit(
+            "REFUSE: the type round-trip check accepted a deliberately wrong type "
+            f"for {dname} — it cannot tell the Reference's type from another one, "
+            "so the types it just pronounced faithful mean nothing")
+    failed.pop("@@DECOY@@")
+    return failed, len(rows)
+
+
 def probe_transparent_values(lean, env, work, rows):
     """Does each emitted VALUE denote the Reference's own term?
 
@@ -1658,6 +1719,31 @@ def main():
         if val and name not in quarantine:
             value_rows.append(
                 (name, d["levels"].split(",") if d["levels"] else [], val))
+    # Every emitted type string is round-tripped in the pin, using the exact
+    # string this run wrote (readable, explicit, or maximally explicit — whichever
+    # tier the row landed on).
+    type_rows = []
+    for name in claimed:
+        d = decl.get(name) or {}
+        if name in provided:
+            continue  # generated, not written from a string by this emitter
+        ty = (d.get("typem") if name in maxexp_for
+              else d.get("typex") if name in explicit_for else d.get("type"))
+        if ty:
+            type_rows.append(
+                (name, d["levels"].split(",") if d["levels"] else [], ty,
+                 pin_safety.get(name) == "unsafe"))
+    roundtrip_mismatches, roundtrip_checked = probe_type_roundtrip(
+        lean, env, work, type_rows)
+    if roundtrip_mismatches:
+        listed = sorted(roundtrip_mismatches)[:8]
+        raise SystemExit(
+            f"REFUSE: {len(roundtrip_mismatches)} emitted type strings do not "
+            f"denote the Reference's type: {listed} — first reason: "
+            f"{roundtrip_mismatches[listed[0]]}. The facade declares its rows FROM "
+            "these strings, so a string that re-elaborates to something else "
+            "declares a subtly wrong type for a row that resolves perfectly well")
+
     value_mismatches, values_checked = probe_transparent_values(
         lean, env, work, value_rows)
     if value_mismatches:
@@ -1840,6 +1926,14 @@ def main():
             "becomes _private.privtest.0.Foo.bar. The price is the module count "
             "above, not a redesign of the surface.",
         "emission_verified": emission_verified,
+        "type_roundtrip_checked": roundtrip_checked,
+        "type_roundtrip_mismatches": sorted(roundtrip_mismatches),
+        "type_roundtrip_note": "each type STRING this emitter wrote was ascribed to "
+            "the Reference's own constant in the PIN's environment, so the pin "
+            "decides whether the printed string still denotes the type it was "
+            "printed from. With the facade-side projection check this closes the "
+            "chain: derived type, printed string and real type all agree. A "
+            "deliberately wrong type rides along and the run refuses if it passes.",
         "transparent_values_checked": values_checked,
         "transparent_value_mismatches": sorted(value_mismatches),
         "transparent_value_note": "each emitted transparent VALUE was equated to the "
@@ -1933,7 +2027,8 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
-          f"projtypes={len(type_checked)} values={values_checked} "
+          f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
+          f"values={values_checked} "
           f"mod_probed={len(pin_module)} mod_drift={len(module_disagreements)} "
           f"safe_probed={len(pin_safety)} "
           f"safe_drift={len(safety_disagreements)} "
