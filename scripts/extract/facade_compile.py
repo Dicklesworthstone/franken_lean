@@ -1510,6 +1510,18 @@ def main():
             "REFUSE: facade manifest type-round-trip pin diverges "
             f"({json.dumps(type_roundtrip_pin_join, sort_keys=True)})"
         )
+    transparent_values_pin_join = {
+        "summary_transparent_values_checked": manifest_summary.get(
+            "transparent_values_checked"
+        ),
+        "pinned_transparent_values_checked": 667,
+    }
+    if (transparent_values_pin_join["summary_transparent_values_checked"]
+            != transparent_values_pin_join["pinned_transparent_values_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest transparent-values pin diverges "
+            f"({json.dumps(transparent_values_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2574,6 +2586,7 @@ def main():
         "manifest_structural_field_set_join": structural_field_set_join,
         "manifest_projection_type_pin_join": projection_type_pin_join,
         "manifest_type_roundtrip_pin_join": type_roundtrip_pin_join,
+        "manifest_transparent_values_pin_join": transparent_values_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
