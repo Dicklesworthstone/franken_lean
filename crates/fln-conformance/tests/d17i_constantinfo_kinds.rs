@@ -7960,3 +7960,143 @@ fn a_repeated_import_row_differs_in_flags_that_a_name_keyed_dedup_would_lose() {
         "and not every group differs in it, or the flag would carry no information here"
     );
 }
+
+/// Structure-shaped inductives that do NOT carry a projection for every field:
+/// `(inductive, result is a Prop, fields, projections present)`.
+const INCOMPLETE_PROJECTION_FAMILIES: &[(&str, bool, u32, usize)] = &[
+    ("And", true, 2, 0),
+    ("ByteArray.IsValidUTF8", true, 2, 0),
+    ("Char", false, 2, 1),
+    ("Fin", false, 2, 1),
+    ("Lean.Macro.State", false, 3, 2),
+    ("Nonempty", true, 1, 0),
+    ("String", false, 2, 1),
+    ("Subtype", false, 2, 1),
+];
+
+/// A structure's field projections are NAMED by its constructor's binder names
+/// — a second generated family, disjoint from the eliminators.
+///
+/// The eliminator cell covers `casesOn`, `recOn`, `noConfusion`, `below` and
+/// `brecOn`. Field projections are a different generator with a different rule,
+/// and nothing here reads them. The rule is not a naming convention that has to
+/// be guessed: for a structure-shaped inductive — one constructor, no indices —
+/// the projection for field `i` is named after the constructor's own binder at
+/// position `num_params + i`, so the family is derived from three stored fields
+/// this file already reads separately and had never related.
+///
+/// Measured over `Init/Prelude` at private level, 103 structure-shaped
+/// inductives carrying at least one field:
+///
+///   95 carry a DEFINITION named `<Inductive>.<binder>` for every field
+///   8 do not, and they fall into two measured shapes: three are Prop-valued
+///     and carry ZERO projections, and five are not Props and are short by
+///     EXACTLY ONE
+///
+/// The eight are pinned by name with their field and projection counts, so a
+/// ninth fails and so does a change in how short any of the five is.
+///
+/// What this cell does NOT claim: why the five are short by one. Each of
+/// `Char`, `Fin`, `String` and `Subtype` carries a proof as its last field, so
+/// "the missing projection is the proof field" is the obvious explanation — and
+/// deciding whether a field's type is a proposition needs type inference, which
+/// this file does not have and the artifact does not store. The counts are
+/// measured; the mechanism is not asserted.
+#[test]
+fn structure_projections_are_named_by_their_constructors_binders() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut kinds: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<String>)> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        kinds.insert(name.clone(), kind_of(info));
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_name, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_name.to_display_string());
+                    current = body;
+                }
+                drop(constructors.insert(name, (v, binders)));
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        inductives.len() > 100,
+        "the inductive census must be reached, got {}",
+        inductives.len()
+    );
+
+    let mut complete = 0usize;
+    let mut widest = 0u32;
+    let mut incomplete: Vec<(String, bool, u32, usize)> = Vec::new();
+    for (name, induct) in &inductives {
+        if induct.ctors.len() != 1 || induct.num_indices != 0 {
+            continue;
+        }
+        let ctor_name = induct.ctors[0].to_display_string();
+        let Some((ctor, binders)) = constructors.get(&ctor_name) else {
+            continue;
+        };
+        if ctor.num_fields == 0 {
+            continue;
+        }
+        let start = ctor.num_params as usize;
+        let fields = &binders[start..start + ctor.num_fields as usize];
+        let present = fields
+            .iter()
+            .filter(|field| kinds.get(&format!("{name}.{field}")) == Some(&"Defn"))
+            .count();
+        if present == fields.len() {
+            complete += 1;
+            widest = widest.max(ctor.num_fields);
+        } else {
+            incomplete.push((
+                name.clone(),
+                inductive_result_is_prop(induct),
+                ctor.num_fields,
+                present,
+            ));
+        }
+    }
+
+    let expected: Vec<(String, bool, u32, usize)> = INCOMPLETE_PROJECTION_FAMILIES
+        .iter()
+        .map(|(name, prop, fields, present)| ((*name).to_owned(), *prop, *fields, *present))
+        .collect();
+    assert_eq!(
+        incomplete, expected,
+        "the structures that do not project every field, with how many they do project"
+    );
+
+    // The two shapes, measured rather than explained.
+    assert!(
+        incomplete
+            .iter()
+            .all(|(_, prop, fields, present)| if *prop {
+                *present == 0
+            } else {
+                *present + 1 == *fields as usize
+            }),
+        "a Prop-valued structure projects nothing, and a non-Prop one is short by exactly one"
+    );
+
+    assert_eq!(
+        (complete, complete + incomplete.len()),
+        (95, 103),
+        "the complete families and the whole structure-shaped population"
+    );
+    assert!(
+        widest >= 5,
+        "the complete families must span real field counts, widest is {widest}"
+    );
+}
