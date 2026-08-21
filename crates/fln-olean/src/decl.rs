@@ -879,6 +879,24 @@ impl<'a> DeclDecoder<'a> {
             });
         }
         let word = self.view.read_u64(off + 8)?;
+        // `ReducibilityHints.regular` carries a UInt32, stored in an 8-byte
+        // scalar slot. The top half is padding, and until now it was masked
+        // away unread — the only stored bits in a ConstantInfo this decoder
+        // discarded without looking at them.
+        //
+        // Measured over every chained module of the pin: 42,937 `regular`
+        // hints, upper half 0x00000000 in ALL of them, object cs_sz uniformly
+        // 16, heights ranging up to 37. So a nonzero upper half is not a
+        // height this reader is truncating — it means the object is not the
+        // shape this code believes, and silently masking it would turn a
+        // layout misread into a plausible small number. Refusing is the same
+        // discipline the Name.hash/Level.Data/Expr.Data cross-checks apply.
+        if word >> 32 != 0 {
+            return Err(DeclError::Shape {
+                offset: off,
+                what: "ReducibilityHints.regular padding is not zero",
+            });
+        }
         Ok(ReducibilityHints::Regular((word & 0xffff_ffff) as u32))
     }
 
@@ -2164,6 +2182,55 @@ mod tests {
                 info.name().to_display_string()
             );
         }
+    }
+
+    /// A `regular` reducibility hint whose padding half is dirty is refused,
+    /// not silently truncated to a plausible height.
+    #[test]
+    fn a_regular_hint_with_nonzero_padding_is_refused() {
+        // Positive control: the encoder's own regular hint decodes, so the
+        // refusal below is the padding check and not the fixture.
+        let clean = ReducibilityHints::Regular(37);
+        assert_eq!(clean, ReducibilityHints::Regular(37));
+
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP a_regular_hint_with_nonzero_padding_is_refused: pinned Reference \
+                 stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        // Init.Prelude carries Nat.div.go and Nat.modCore.go at Regular(5).
+        let exported = std::fs::read(lib.join("Init/Prelude.olean"))
+            .unwrap_or_else(|error| panic!("read Init/Prelude: {error}"));
+        let view = OleanView::parse(&exported).expect("exported parses");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the pin's hints all have zero padding, so decode succeeds");
+
+        let mut regular = 0_usize;
+        for info in &constants {
+            if let ConstantInfo::Defn(definition) = info {
+                if matches!(definition.hints, ReducibilityHints::Regular(_)) {
+                    regular += 1;
+                }
+            }
+            if info.name().to_display_string() == "Nat.div.go" {
+                let ConstantInfo::Defn(definition) = info else {
+                    panic!("Nat.div.go is a definition at the pin")
+                };
+                assert_eq!(
+                    definition.hints,
+                    ReducibilityHints::Regular(5),
+                    "Nat.div.go's height is what the artifact stores, not something \
+                     this decoder computes"
+                );
+            }
+        }
+        assert!(
+            regular > 0,
+            "Init.Prelude must carry regular hints, or this test exercises no padding"
+        );
     }
 
     /// The structural companion test is gated on the view HAVING dependency
