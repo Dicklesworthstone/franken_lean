@@ -1510,6 +1510,55 @@ fn eq_def_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 }
 
 #[test]
+fn sunfold_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib =
+        lib_or_skip!("sunfold_private_auxiliary_requires_the_companion_and_keeps_its_real_kind");
+
+    // `_sunfold` is a compiler-generated structural-unfolding helper. Its
+    // recovery must be tied to real private-only chain membership and retain a
+    // concrete declaration kind, not a manufactured axiom.
+    let (relative, name) = init_chain_modules(&lib)
+        .into_iter()
+        .find_map(|relative| {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::sunfold(name))
+                .map(|name| (relative, name.clone()))
+        })
+        .expect("the pinned Init private companions contain a private-only _sunfold witness");
+    let chain = chain_bytes(&lib, &relative);
+
+    let exported_view = OleanView::parse(&chain.exported)
+        .unwrap_or_else(|error| panic!("_sunfold {name}: parse exported {relative}: {error}"));
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("_sunfold {name}: decode exported {relative}: {error}"));
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != name),
+        "_sunfold {name}: exported decoder unexpectedly has the private auxiliary"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap_or_else(|error| panic!("_sunfold {name}: parse private {relative}: {error}"));
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("_sunfold {name}: decode private {relative}: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == name)
+        .unwrap_or_else(|| panic!("_sunfold {name}: private decoder lost it in {relative}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        "_sunfold {name}: companion recovery decoded only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
 fn verified_chain_decode_returns_the_private_superset_on_the_real_pin() {
     let lib = lib_or_skip!("verified_chain_decode_returns_the_private_superset_on_the_real_pin");
     let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
