@@ -2036,6 +2036,23 @@ def main():
             "REFUSE: facade manifest residue-count equality diverges "
             f"({json.dumps(residue_zero_join, sort_keys=True)})"
         )
+    structural_field_set_count_join = {
+        "summary_structural_declarations": manifest_summary.get(
+            "structural_declarations"
+        ),
+        "summary_field_sets_checked": manifest_summary.get("field_sets_checked"),
+        "pinned_structural_field_set_count": 196,
+    }
+    if (structural_field_set_count_join["summary_structural_declarations"]
+            != structural_field_set_count_join[
+                "pinned_structural_field_set_count"]
+            or structural_field_set_count_join["summary_field_sets_checked"]
+            != structural_field_set_count_join[
+                "pinned_structural_field_set_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-field-set count diverges "
+            f"({json.dumps(structural_field_set_count_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3153,6 +3170,9 @@ def main():
         "manifest_uncensused_zero_join": uncensused_zero_join,
         "manifest_probe_shape_count_join": probe_shape_count_join,
         "manifest_residue_zero_join": residue_zero_join,
+        "manifest_structural_field_set_count_join": (
+            structural_field_set_count_join
+        ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
