@@ -257,6 +257,11 @@ the toolchain would report a perfect facade:
     and every Init-substrate row to carry none. Closure-only rows cannot evade
     the provenance shape checks applied to demanded rows.
 
+  * A MANIFEST-EFFECT-TOTALITY JOIN requires every typed declaration's effect
+    to belong to the full generator vocabulary, including the task-only
+    closure class, while Init-substrate rows carry none. An un-demanded row
+    cannot introduce an unclassified semantic effect.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -276,6 +281,7 @@ PARTITION = os.path.join(REPO, "contracts", "builtin_partition.tsv")
 SCHEMA = "fln-facade-compile/1"
 DEMANDED_OUTCOMES = frozenset(("emitted", "init-substrate", "quarantined"))
 DEMANDED_EFFECTS = frozenset(("pure", "toolchain-monad", "io", "monad-transformer"))
+MANIFEST_EFFECTS = DEMANDED_EFFECTS | frozenset(("task",))
 DEMANDED_BUCKETS = frozenset(("R-NONE", "R-EFFECT", "R-EXTERN", "R-UNSAFE"))
 DEMANDED_SAFETIES = frozenset(("safe", "unsafe"))
 DEMANDED_FORMS = frozenset(("axiom", "transparent-abbrev", "class-projection", "class", "structure"))
@@ -1465,6 +1471,37 @@ def main():
             f"malformed={malformed_type_dependencies[:8]!r}, "
             f"duplicates={duplicate_type_dependencies[:8]!r})"
         )
+    unknown_effect_rows = []
+    init_effect_rows = []
+    manifest_effect_counts = Counter()
+    for row in manifest_rows:
+        effect = row.get("effect")
+        if row.get("role") == "init-substrate":
+            if effect is not None:
+                init_effect_rows.append(row["name"])
+            continue
+        if effect not in MANIFEST_EFFECTS:
+            unknown_effect_rows.append(row["name"])
+            continue
+        manifest_effect_counts[effect] += 1
+    manifest_effect_join = {
+        "typed_rows": manifest_signature_join["non_init_rows"],
+        "recognized_effect_rows": sum(manifest_effect_counts.values()),
+        "effects": dict(sorted(manifest_effect_counts.items())),
+        "init_rows": manifest_signature_join["init_rows"],
+        "init_rows_with_effect": len(init_effect_rows),
+        "unknown_effect_rows": len(unknown_effect_rows),
+    }
+    if (manifest_effect_join["typed_rows"] == 0
+            or manifest_effect_join["recognized_effect_rows"]
+            != manifest_effect_join["typed_rows"]
+            or manifest_effect_join["init_rows_with_effect"] != 0
+            or manifest_effect_join["unknown_effect_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest effect-totality join failed "
+            f"({json.dumps(manifest_effect_join, sort_keys=True)}, "
+            f"unknown={unknown_effect_rows[:8]!r}, init={init_effect_rows[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1895,6 +1932,7 @@ def main():
         "manifest_role_partition_join": manifest_role_join,
         "manifest_global_provider_join": manifest_provider_join,
         "manifest_type_dependency_totality_join": manifest_type_dependency_join,
+        "manifest_effect_totality_join": manifest_effect_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
