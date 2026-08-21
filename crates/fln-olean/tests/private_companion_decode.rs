@@ -423,6 +423,10 @@ const ARRAY_MAP_M_MAP_UNSAFE_REC: &str =
     "_private.Init.Data.Array.Basic.0.Array.mapM.map._unsafe_rec";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_MAP_M_MAP_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
+/// The generated induction theorem for `Array.mapM.map`.
+const ARRAY_MAP_M_MAP_INDUCT: &str = "_private.Init.Data.Array.Basic.0.Array.mapM.map.induct";
+/// The pin's private array stores this theorem in the basic module.
+const ARRAY_MAP_M_MAP_INDUCT_MODULE: &str = "Init/Data/Array/Basic";
 /// The private recursion helper generated for `Array.takeWhile`.
 const ARRAY_TAKE_WHILE_GO: &str = "_private.Init.Data.Array.Basic.0.Array.takeWhile.go";
 /// The pin's private array stores this helper in the basic module.
@@ -2645,6 +2649,34 @@ fn array_map_m_map_unsafe_rec_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_MAP_M_MAP_UNSAFE_REC} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_map_m_map_induct_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_map_m_map_induct_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_MAP_INDUCT_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_MAP_M_MAP_INDUCT.to_owned()),
+        "the private companion of {ARRAY_MAP_M_MAP_INDUCT_MODULE} must retain \
+         {ARRAY_MAP_M_MAP_INDUCT}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_MAP_INDUCT)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_MAP_M_MAP_INDUCT}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_MAP_M_MAP_INDUCT} as {} instead of Thm",
         recovered.kind_name()
     );
 }
