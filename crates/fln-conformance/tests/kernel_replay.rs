@@ -1382,6 +1382,27 @@ struct DecodedCorpusModule {
 }
 
 fn read_corpus_module_part(path: &Path) -> Result<Vec<u8>, String> {
+    read_corpus_module_part_with(path, || fs::read(path))
+}
+
+/// The same reader with its READ as a parameter, so the ORDER can be observed.
+///
+/// **The cap's entire value is that it refuses before allocating.** Both cap
+/// sites use one constant, so this one refuses nothing the aggregate would not
+/// also refuse -- a version that checked after `fs::read` would return the same
+/// `Err`, with the same words, for the same file, having first pulled half a
+/// gigabyte into memory. Every assertion anyone can write against the RESULT
+/// passes either way, which is why the ordering went unpinned when the cap
+/// itself was planted.
+///
+/// Taking the read as an argument is what makes the difference observable
+/// without observing an allocation: a caller can pass a reader that must never
+/// run. Production passes `fs::read` one line above, so the two cannot drift in
+/// what they read -- only in when.
+fn read_corpus_module_part_with(
+    path: &Path,
+    read_bytes: impl FnOnce() -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if metadata.len() > MAX_PINNED_OLEAN_BYTES {
@@ -1392,7 +1413,7 @@ fn read_corpus_module_part(path: &Path) -> Result<Vec<u8>, String> {
             MAX_PINNED_OLEAN_BYTES
         ));
     }
-    fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+    read_bytes().map_err(|error| format!("read {}: {error}", path.display()))
 }
 
 fn corpus_module_parts_hash(name: &str, parts: &[(&str, &[u8])]) -> String {
@@ -5492,6 +5513,121 @@ fn an_over_cap_module_part_is_refused_and_the_refusal_names_both_numbers() {
             .unwrap_or_else(|reason| panic!("a small part must be read: {reason}")),
         b"not-really-an-olean",
         "the reader must return the file's bytes; the cap is a limit, not a filter"
+    );
+}
+
+/// The cap refuses WITHOUT reaching the read.
+///
+/// **The hole this closes was disclosed one commit ago and is the whole point of
+/// the cap.** `an_over_cap_module_part_is_refused_and_the_refusal_names_both_numbers`
+/// shows the refusal happens and shows what it says. It cannot show WHEN: a
+/// version that read the file first and checked the size afterwards returns the
+/// same `Err`, with the same words, about the same file -- after pulling half a
+/// gigabyte into memory. Since both cap sites share one constant, the per-part
+/// check changes no verdict at all; refusing before allocating is the only thing
+/// it is for, and that was exactly the part nothing tested.
+///
+/// **Observed by making the read a parameter, not by observing an allocation.**
+/// The reader passed here panics if it is ever called. If the check runs first
+/// the refusal comes back and the closure never runs; if it moved after the
+/// read, the closure fires and this test fails naming the reason. No allocation
+/// counter, no timing, no platform assumption -- the same parametric-probe move
+/// this repository already uses when the fact to establish is an exact
+/// operation rather than a value.
+///
+/// **The injection is green-controlled, or the first cell is vacuous.** A
+/// `read_corpus_module_part_with` that never called its reader under ANY
+/// condition would satisfy the panic cell perfectly. So an under-cap file is
+/// read through an injected reader returning a sentinel, and that sentinel must
+/// come back: the reader is reached when the cap does not refuse, and its result
+/// is what the function returns.
+///
+/// **What stays unpinned, so it is not read as more.** The ordering is pinned
+/// INSIDE `read_corpus_module_part_with`. Production is a one-line delegation to
+/// it, visible in the same screenful, and a future version that read the file
+/// before delegating would not be caught here. Binding that too would need the
+/// production wrapper to be the thing under test, which is what a parametric
+/// probe trades away.
+#[test]
+fn the_cap_refuses_without_reaching_the_read() {
+    // A FIXTURE NAME OF ITS OWN, not the one the neighbouring cap test uses.
+    // Sharing it would have two tests `File::create` the same over-cap file, and
+    // `create` truncates: in a parallel run one test's `set_len` lands between
+    // the other's truncate and its `stat`, and the size assertion fails for a
+    // reason that has nothing to do with the cap.
+    let library = write_inventory_fixture("t6r7-sparse-cap-order-v1", &[]);
+    let over_cap = library.join("Huge.olean");
+    let handle = fs::File::create(&over_cap)
+        .unwrap_or_else(|error| panic!("create {}: {error}", over_cap.display()));
+    handle
+        .set_len(MAX_PINNED_OLEAN_BYTES + 1)
+        .unwrap_or_else(|error| panic!("size {}: {error}", over_cap.display()));
+    drop(handle);
+
+    let metadata = fs::metadata(&over_cap)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", over_cap.display()));
+    assert_eq!(
+        metadata.len(),
+        MAX_PINNED_OLEAN_BYTES + 1,
+        "the fixture must be over the cap, or the reader below is skipped for the ordinary reason \
+         that the file is small"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let allocated = metadata.blocks() * 512;
+        assert!(
+            allocated < 1024 * 1024,
+            "the over-cap fixture allocated {allocated} bytes on disk; it is supposed to be a hole"
+        );
+    }
+
+    // THE READER MUST NOT RUN. If the cap moved after the read this panics, and
+    // the message says which of the two orders was observed rather than leaving
+    // a bare unwind in the log.
+    let reason = match read_corpus_module_part_with(&over_cap, || {
+        panic!(
+            "the reader ran for a file the cap had already seen was too big. The size check has \
+             moved AFTER the read, so the refusal now costs the half gigabyte it exists to avoid \
+             -- and every assertion about the returned error still passes"
+        )
+    }) {
+        Err(reason) => reason,
+        Ok(bytes) => panic!(
+            "an over-cap part was accepted, {} bytes of it, without the reader being reached",
+            bytes.len()
+        ),
+    };
+    assert!(
+        reason.contains("corpus cap"),
+        "the refusal must be the cap's, not some other failure that also skipped the read: \
+         {reason}"
+    );
+
+    // GREEN CONTROL ON THE INJECTION. Without this, a function that never called
+    // its reader would pass the cell above for the wrong reason.
+    let under_cap = library.join("Small.olean");
+    fs::write(&under_cap, b"on-disk-bytes")
+        .unwrap_or_else(|error| panic!("write {}: {error}", under_cap.display()));
+    let sentinel = b"bytes-from-the-injected-reader".to_vec();
+    let returned = read_corpus_module_part_with(&under_cap, || Ok(sentinel.clone()))
+        .unwrap_or_else(|reason| panic!("an under-cap part must be read: {reason}"));
+    assert_eq!(
+        returned, sentinel,
+        "the injected reader must be REACHED when the cap does not refuse, and what it returns \
+         must be what the function returns -- otherwise the panic cell above is satisfied by a \
+         reader that is never called at all"
+    );
+
+    // AND PRODUCTION IS WIRED TO THE FILESYSTEM. The probe proves an order; this
+    // proves the order is about reading this file, not about a reader that only
+    // exists in a test.
+    assert_eq!(
+        read_corpus_module_part(&under_cap)
+            .unwrap_or_else(|reason| panic!("the production reader must read: {reason}")),
+        b"on-disk-bytes",
+        "the one-line wrapper must pass `fs::read`, or the ordering pinned above is about \
+         something production does not do"
     );
 }
 
