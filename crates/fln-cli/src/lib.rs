@@ -2695,6 +2695,25 @@ fn is_private_unsafe_rec_or_sunfold_residual(display: &str) -> bool {
             .any(|component| matches!(component, "_unsafe_rec" | "_sunfold"))
 }
 
+fn is_private_loop_proof_residual(display: &str) -> bool {
+    if !display.starts_with("_private.") {
+        return false;
+    }
+
+    let mut components = display.split('.');
+    while let Some(component) = components.next() {
+        if component == "loop"
+            && components.next().is_some_and(|next| {
+                next.strip_prefix("_proof_")
+                    .is_some_and(|suffix| !suffix.is_empty())
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn render_named_residuals_json(residuals: &mut DecodedNamedResiduals) -> String {
     format!(
         "[{}]",
@@ -2760,6 +2779,12 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_unsafe_rec_or_sunfold_residual,
     );
+    let mut private_loop_proof_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_loop_proof_residuals
+        .observe_matching(&checked.decoded.constants, is_private_loop_proof_residual);
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
@@ -2788,6 +2813,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_unsafe_residuals)
     };
+    let private_loop_proof_observed = private_loop_proof_residuals.observed;
+    let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
+    let private_loop_proof_names = if json {
+        render_named_residuals_json(&mut private_loop_proof_residuals)
+    } else {
+        render_named_residuals_human(&mut private_loop_proof_residuals)
+    };
     let stdout = if json {
         format!(
             concat!(
@@ -2799,6 +2831,7 @@ fn render_check_olean_success(
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -2821,6 +2854,9 @@ fn render_check_olean_success(
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
+            private_loop_proof_observed,
+            private_loop_proof_names,
+            private_loop_proof_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
@@ -2847,6 +2883,9 @@ fn render_check_olean_success(
                 "decoded _private _unsafe_rec/_sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _unsafe_rec/_sunfold residual names: {}\n",
                 "decoded _private _unsafe_rec/_sunfold residual names omitted: {}\n",
+                "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private .loop._proof_* residual names: {}\n",
+                "decoded _private .loop._proof_* residual names omitted: {}\n",
                 "dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -2870,6 +2909,9 @@ fn render_check_olean_success(
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
+            private_loop_proof_observed,
+            private_loop_proof_names,
+            private_loop_proof_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
@@ -3235,6 +3277,14 @@ fn render_check_olean_set_success(
             is_private_unsafe_rec_or_sunfold_residual,
         );
     }
+    let mut private_loop_proof_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_loop_proof_residuals
+            .observe_matching(&module.decoded.constants, is_private_loop_proof_residual);
+    }
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
@@ -3263,6 +3313,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_unsafe_residuals)
     };
+    let private_loop_proof_observed = private_loop_proof_residuals.observed;
+    let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
+    let private_loop_proof_names = if json {
+        render_named_residuals_json(&mut private_loop_proof_residuals)
+    } else {
+        render_named_residuals_human(&mut private_loop_proof_residuals)
+    };
     let companion_modules = checked
         .modules
         .iter()
@@ -3280,6 +3337,7 @@ fn render_check_olean_set_success(
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
@@ -3304,6 +3362,9 @@ fn render_check_olean_set_success(
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
+            private_loop_proof_observed,
+            private_loop_proof_names,
+            private_loop_proof_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
@@ -3332,6 +3393,9 @@ fn render_check_olean_set_success(
                 "decoded _private _unsafe_rec/_sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _unsafe_rec/_sunfold residual names: {}\n",
                 "decoded _private _unsafe_rec/_sunfold residual names omitted: {}\n",
+                "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private .loop._proof_* residual names: {}\n",
+                "decoded _private .loop._proof_* residual names omitted: {}\n",
                 "module and declaration dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -3357,6 +3421,9 @@ fn render_check_olean_set_success(
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
+            private_loop_proof_observed,
+            private_loop_proof_names,
+            private_loop_proof_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
