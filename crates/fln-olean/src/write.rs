@@ -1237,7 +1237,12 @@ mod tests {
     fn base(local_name: &str, type_: &Expr) -> ConstantVal {
         ConstantVal {
             name: name(local_name),
-            level_params: vec![name("u")],
+            // TWO distinct universe parameters. Every constant in these
+            // fixtures shares this base, and a single-element list has no
+            // ORDER to get wrong, so `levelParams` was unpinnable for all of
+            // them at once. See
+            // `the_constructor_universe_parameters_keep_their_arity_and_order_on_the_wire`.
+            level_params: vec![name("u"), name("v")],
             type_: type_.clone(),
         }
     }
@@ -1523,6 +1528,158 @@ mod tests {
             display(&inductive.ctors),
             ctors_on_the_wire,
             "`ctors` as chained"
+        );
+    }
+
+    /// A constructor's universe parameters keep their ARITY and their ORDER.
+    ///
+    /// A `ConstructorVal` has NO list field of its own - `base`, `induct`,
+    /// `cidx`, `numParams`, `numFields` and one scalar - so its only cons chain
+    /// is the `levelParams` inside its `base`, and that is what this pins. It
+    /// held one name until this commit, and a list of one has no order to get
+    /// wrong.
+    ///
+    /// THE COLLISION THIS GUARDS IS REAL AND IS NOT HYPOTHETICAL. `levelParams`
+    /// is slot 1 of the `ConstantVal`; `induct` is slot 1 of the
+    /// `ConstructorVal` that CONTAINS it. So a decoder walking from the wrong
+    /// base reads `induct` where the parameter list belongs - and `induct` is a
+    /// `Name`, whose `Name.str` link is tag 1 with two pointer fields, which is
+    /// exactly `List.cons`'s tag and arity. `list_ptrs` (decl.rs:587) tests
+    /// `tag == 1 && other == 2` and discards `cs_sz`, so it ACCEPTS the first
+    /// link of a name as a cons cell, taking the prefix as the head and the
+    /// string as the tail.
+    ///
+    /// What stops it today is the next iteration failing on the string object,
+    /// not the check that should have caught it. The two shapes are separated
+    /// only by the stored size - 24 bytes for a cons cell against 32 for a name
+    /// link - and this cell asserts that difference on the bytes our own writer
+    /// emits, so the distinguishing fact is recorded even though the decoder
+    /// does not yet read it. It is a claim about this encoder's output, not a
+    /// measurement of the pin.
+    #[test]
+    fn the_constructor_universe_parameters_keep_their_arity_and_order_on_the_wire() {
+        let type_ = Expr::sort(Level::param(name("u")));
+        let params = vec![name("u"), name("v")];
+
+        // The guard: with one parameter, or two equal ones, a reversal would
+        // decode identically and everything below would still pass.
+        assert_eq!(params.len(), 2, "two parameters, or there is no order");
+        assert_ne!(
+            params[0], params[1],
+            "the parameters must be distinguishable"
+        );
+
+        // One constant, so the constants array's element 0 is unambiguous.
+        let constants = vec![ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: name("Demo.ind.mk"),
+                level_params: params.clone(),
+                type_: type_.clone(),
+            },
+            induct: name("Demo.ind"),
+            cidx: 0,
+            num_params: 1,
+            num_fields: 2,
+            is_unsafe: false,
+        })];
+
+        let encoded = encode_module(
+            ModuleWriteInput {
+                is_module: true,
+                imports: &[],
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            header(),
+            WriteBudget::default(),
+        )
+        .expect("encode module");
+
+        let view = OleanView::parse(&encoded.bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        assert_eq!(
+            view.obj_header(info_off).expect("ConstantInfo header").0,
+            6,
+            "ConstantInfo.ctorInfo"
+        );
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("ConstructorVal pointer"))
+            .expect("ConstructorVal object");
+
+        // The base is slot 0 of the payload; levelParams is slot 1 of the base.
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("base pointer"))
+            .expect("ConstantVal object");
+        let mut cursor = view.read_u64(base_off + 8 + 8).expect("levelParams slot");
+        let mut on_the_wire = Vec::new();
+        let mut cell_sizes = Vec::new();
+        while cursor & 1 == 0 {
+            let cell = view.deref(cursor).expect("cons cell");
+            let (tag, other, cs_sz) = view.obj_header(cell).expect("cons header");
+            assert_eq!((tag, other), (1, 2), "List.cons");
+            cell_sizes.push(cs_sz);
+            on_the_wire.push(
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(view.read_u64(cell + 8).expect("head pointer"))
+                    .expect("parameter name")
+                    .to_display_string(),
+            );
+            cursor = view.read_u64(cell + 16).expect("tail pointer");
+        }
+        assert_eq!(cursor >> 1, 0, "the list ends in boxed nil");
+        assert_eq!(
+            on_the_wire,
+            vec!["u".to_owned(), "v".to_owned()],
+            "the universe parameters, in the order they were given; a level is \
+             referred to by its POSITION, so a reversal renames every one"
+        );
+
+        // The collision: `induct` sits at the ConstructorVal's slot 1, where a
+        // decoder walking from the wrong base would look for the list above.
+        let induct_off = view
+            .deref(view.read_u64(val_off + 8 + 8).expect("induct pointer"))
+            .expect("induct Name object");
+        let (induct_tag, induct_other, induct_size) =
+            view.obj_header(induct_off).expect("induct header");
+        assert_eq!(
+            (induct_tag, induct_other),
+            (1, 2),
+            "a `Name.str` link carries the SAME tag and arity as `List.cons`, \
+             which is why `list_ptrs` cannot reject it on shape alone"
+        );
+        assert!(
+            cell_sizes.iter().all(|size| *size != induct_size),
+            "the stored size is the only thing separating the two shapes on \
+             the bytes this writer emits: cons cells {cell_sizes:?} against a \
+             name link of {induct_size}"
+        );
+
+        // And the decoder agrees with the bytes rather than with the encoder.
+        let mut decoder = DeclDecoder::new(&view, WalkBudget::default());
+        let decoded = decoder.decode_module_constants().expect("constants");
+        let ConstantInfo::Ctor(constructor) = &decoded[0] else {
+            panic!("the fixture declares one constructor")
+        };
+        assert_eq!(
+            constructor
+                .base
+                .level_params
+                .iter()
+                .map(Name::to_display_string)
+                .collect::<Vec<_>>(),
+            on_the_wire,
+            "the parameters as chained"
+        );
+        assert_eq!(
+            constructor.induct.to_display_string(),
+            "Demo.ind",
+            "and `induct` was read as a name, not consumed as a list"
         );
     }
 
