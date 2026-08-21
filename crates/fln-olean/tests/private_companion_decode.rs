@@ -316,6 +316,11 @@ const ARRAY_FOR_IN_UNSAFE_LOOP: &str =
     "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop";
 /// The pin's private array stores this loop in the basic module.
 const ARRAY_FOR_IN_UNSAFE_LOOP_MODULE: &str = "Init/Data/Array/Basic";
+/// The private monadic map implementation helper.
+const ARRAY_MAP_M_UNSAFE_MAP: &str =
+    "_private.Init.Data.Array.Basic.0.Array.mapMUnsafe.map";
+/// The pin's private array stores this helper in the basic module.
+const ARRAY_MAP_M_UNSAFE_MAP_MODULE: &str = "Init/Data/Array/Basic";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1812,6 +1817,35 @@ fn array_for_in_unsafe_loop_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_FOR_IN_UNSAFE_LOOP} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_map_m_unsafe_map_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_map_m_unsafe_map_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_UNSAFE_MAP_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_MAP_M_UNSAFE_MAP.to_owned()),
+        "the private companion of {ARRAY_MAP_M_UNSAFE_MAP_MODULE} must retain \
+         {ARRAY_MAP_M_UNSAFE_MAP}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_UNSAFE_MAP)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_MAP_M_UNSAFE_MAP}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_MAP_M_UNSAFE_MAP} as {} instead of Defn",
         recovered.kind_name()
     );
 }
