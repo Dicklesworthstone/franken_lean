@@ -1020,7 +1020,10 @@ def join_resistance_demand(manifest_summary, module_join):
             f"REFUSE: resistance-demand join needs exactly one summary, found {len(summaries)}"
         )
     summary = summaries[0]
-    fields = ("joined", "toolchain_api", "exact_demanded", "orphans")
+    fields = (
+        "joined", "toolchain_api", "exact_demanded", "orphans", "resisting",
+        "unresisting", "demanded_names", "union_demanded", "tactic_files",
+    )
     values = {field: summary.get(field) for field in fields}
     if (summary.get("schema") != "fln-facade-resistance/1"
             or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
@@ -1028,7 +1031,11 @@ def join_resistance_demand(manifest_summary, module_join):
             or values["joined"] != values["toolchain_api"]
             or values["joined"] != manifest_summary.get("demanded")
             or values["exact_demanded"] != module_join["toolchain_distinct_symbols"]
-            or values["orphans"] != 0):
+            or values["orphans"] != 0
+            or values["resisting"] + values["unresisting"] != values["joined"]
+            or values["demanded_names"] < values["exact_demanded"]
+            or values["union_demanded"] < values["joined"]
+            or values["tactic_files"] == 0):
         raise SystemExit(
             "REFUSE: resistance-demand cross join disagrees with its cohorts "
             f"(resistance={json.dumps(values, sort_keys=True)}, "
