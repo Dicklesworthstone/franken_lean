@@ -36,6 +36,10 @@ the toolchain would report a perfect facade:
     one classified facade-manifest row. Each emitted check carries that row's
     disposition, so an unclassified name cannot disappear behind a name-only
     probe or a misleading aggregate.
+  * A QUARANTINE CONTROL selects a demanded quarantined row and requires it to
+    remain unresolved against both the generated and empty facades. A row marked
+    quarantined is neither emitted nor Init substrate; treating it as available
+    would make the disposition join lie.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -264,6 +268,19 @@ def join_demanded_rows(names, manifest_rows):
     return dispositions
 
 
+def choose_quarantine_control(dispositions):
+    """Choose an actually-demanded quarantine row for the disposition control."""
+    candidates = sorted(
+        name for name, outcome in dispositions.items() if outcome == "quarantined"
+    )
+    if not candidates:
+        raise SystemExit(
+            "REFUSE: demanded-row join found no quarantined demand — the "
+            "quarantine disposition has no observable control"
+        )
+    return candidates[0]
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -407,6 +424,17 @@ def main():
             f"an EMPTY facade resolves {ok_empty} — the probe is measuring the "
             "substrate, not the facade, and no result from it may be published")
 
+    quarantine_name = choose_quarantine_control(demand_dispositions)
+    quarantine_generated = v_facade[quarantine_name]
+    quarantine_empty = v_empty[quarantine_name]
+    if quarantine_generated != "unresolved" or quarantine_empty != "unresolved":
+        raise SystemExit(
+            f"REFUSE: quarantined demanded row {quarantine_name} resolves as "
+            f"generated={quarantine_generated!r}, empty={quarantine_empty!r} — "
+            "the demanded-row disposition is stale or the facade leaks a "
+            "quarantined declaration"
+        )
+
     removed_name = choose_row_removal_control(set(control_names), manifest_rows)
     if v_facade[removed_name] != "available":
         raise SystemExit(
@@ -480,6 +508,11 @@ def main():
             "generated_verdict": v_facade[removed_name],
             "removed_verdict": v_removed[removed_name],
             "removed_diagnostic": removed_detail.get(removed_name),
+        },
+        "quarantine_control": {
+            "name": quarantine_name,
+            "generated_verdict": quarantine_generated,
+            "empty_verdict": quarantine_empty,
         },
         "reference_imported": False,
         "reading": "every toolchain-api constant the curated real mathlib metaprogram "
