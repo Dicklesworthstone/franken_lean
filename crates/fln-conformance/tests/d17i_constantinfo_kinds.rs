@@ -11501,3 +11501,107 @@ fn a_blocks_constructor_list_matches_the_declarations_that_name_it() {
         "and the distribution must account for every block"
     );
 }
+
+/// A mutual group has exactly as many members as its `all` list is long.
+///
+/// The mutual-group cell requires every member of a group to declare the same
+/// `all` vector, and every declaration to appear in its own. Both are
+/// membership. Neither counts, and a list carrying the same name TWICE passes
+/// both: the vector is shared, so every member still declares the identical
+/// list, and each still appears in it. Only its length is wrong.
+///
+/// Measured over `Init/Prelude`'s 1,887 value-carrying declarations:
+///
+///   1,883 distinct groups, and for every one the length of `all` equals the
+///     number of declarations carrying exactly that list
+///   no `all` list contains a duplicate
+///   1,879 groups have a single member and 4 have two, which is what makes the
+///     equation more than "every group is a singleton"
+///
+/// The four pairs are the whole of the mutual population here, and they are the
+/// only place the equation is tested above one. A decode that collapsed a pair
+/// would leave 1,881 singletons and satisfy a check that only looked at
+/// membership.
+///
+/// Conservation runs first: the per-group member counts must sum to the whole
+/// value-carrying census, so a group that lost a member cannot balance against
+/// one that gained.
+#[test]
+fn a_mutual_group_has_as_many_members_as_its_list_is_long() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut carried: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for info in &infos {
+        let all = match info {
+            ConstantInfo::Defn(v) => &v.all,
+            ConstantInfo::Thm(v) => &v.all,
+            ConstantInfo::Opaque(v) => &v.all,
+            _ => continue,
+        };
+        carried.insert(
+            info.name().to_display_string(),
+            all.iter().map(Name::to_display_string).collect(),
+        );
+    }
+
+    let mut members: BTreeMap<&Vec<String>, usize> = BTreeMap::new();
+    for group in carried.values() {
+        *members.entry(group).or_default() += 1;
+    }
+
+    // Conservation first.
+    assert_eq!(
+        members.values().sum::<usize>(),
+        carried.len(),
+        "the group table must account for every value-carrying declaration"
+    );
+    assert_eq!(
+        carried.len(),
+        1887,
+        "the value-carrying census this row is stated against"
+    );
+
+    let mut mismatched: Vec<(&Vec<String>, usize, usize)> = Vec::new();
+    let mut duplicated: Vec<&Vec<String>> = Vec::new();
+    for (group, count) in &members {
+        if group.len() != *count {
+            mismatched.push((group, group.len(), *count));
+        }
+        let distinct: BTreeSet<&String> = group.iter().collect();
+        if distinct.len() != group.len() {
+            duplicated.push(group);
+        }
+    }
+    assert!(
+        duplicated.is_empty(),
+        "no `all` list may repeat a name, which membership alone cannot see: {duplicated:?}"
+    );
+    assert!(
+        mismatched.is_empty(),
+        "a group's length must equal how many declarations carry it (list, length, members): \
+         {:?}",
+        &mismatched[..mismatched.len().min(4)]
+    );
+
+    let spread: BTreeMap<usize, usize> =
+        members.keys().fold(BTreeMap::new(), |mut table, group| {
+            *table.entry(group.len()).or_default() += 1;
+            table
+        });
+    assert_eq!(
+        spread.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+        vec![(1, 1879), (2, 4)],
+        "1,879 singleton groups and four pairs"
+    );
+    assert_eq!(
+        spread.values().sum::<usize>(),
+        members.len(),
+        "and the distribution must account for every group"
+    );
+    assert_eq!(
+        spread.get(&2).copied().unwrap_or_default(),
+        4,
+        "the four pairs are the only place this equation is tested above one"
+    );
+}
