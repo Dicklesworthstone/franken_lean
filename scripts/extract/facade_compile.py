@@ -170,6 +170,10 @@ the toolchain would report a perfect facade:
     three pinned environment shards. A valid hash list cannot omit a load-bearing
     extraction input or substitute an unrelated file.
 
+  * A RESISTANCE-DEMAND CROSS JOIN requires the resistance artifact's measured
+    demand totals to agree with both the facade manifest and exact-demand
+    denominator. A hashed resistance input cannot still report a stale cohort.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -997,6 +1001,43 @@ def join_manifest_input_digests(summary):
     return {"verified_inputs": len(entries)}
 
 
+def join_resistance_demand(manifest_summary, module_join):
+    """Cross-bind the resistance cohort to manifest and exact-demand totals."""
+    path = os.path.join(REPO, "contracts", "facade_resistance.ndjson")
+    summaries = []
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(
+                    f"REFUSE: {path}:{lineno} is not JSON ({exc})"
+                ) from exc
+            if row.get("kind") == "summary":
+                summaries.append(row)
+    if len(summaries) != 1:
+        raise SystemExit(
+            f"REFUSE: resistance-demand join needs exactly one summary, found {len(summaries)}"
+        )
+    summary = summaries[0]
+    fields = ("joined", "toolchain_api", "exact_demanded", "orphans")
+    values = {field: summary.get(field) for field in fields}
+    if (summary.get("schema") != "fln-facade-resistance/1"
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                   for value in values.values())
+            or values["joined"] != values["toolchain_api"]
+            or values["joined"] != manifest_summary.get("demanded")
+            or values["exact_demanded"] != module_join["toolchain_distinct_symbols"]
+            or values["orphans"] != 0):
+        raise SystemExit(
+            "REFUSE: resistance-demand cross join disagrees with its cohorts "
+            f"(resistance={json.dumps(values, sort_keys=True)}, "
+            f"manifest_demanded={manifest_summary.get('demanded')!r}, "
+            f"exact_demanded={module_join['toolchain_distinct_symbols']!r})"
+        )
+    return values
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -1183,6 +1224,7 @@ def main():
             f"({json.dumps(generator_residue, sort_keys=True)})"
         )
     manifest_input_digest_join = join_manifest_input_digests(manifest_summary)
+    resistance_demand_join = join_resistance_demand(manifest_summary, module_join)
     manifest_outcome_join = join_manifest_demanded_outcomes(
         manifest_rows, manifest_summary
     )
@@ -1334,6 +1376,7 @@ def main():
         "manifest_emission_verification_join": emission_verification,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
+        "resistance_demand_join": resistance_demand_join,
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
