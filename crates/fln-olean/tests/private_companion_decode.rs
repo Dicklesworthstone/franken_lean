@@ -167,6 +167,10 @@ const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1_MODULE: &str = "Init/Data/A
 const LIST_SIZE_TO_ARRAY_AUX: &str = "_private.Init.Data.Array.BasicAux.0.List.size_toArrayAux";
 /// The pin's private array stores this theorem in the BasicAux module.
 const LIST_SIZE_TO_ARRAY_AUX_MODULE: &str = "Init/Data/Array/BasicAux";
+/// The first private equation theorem for `List.toArrayAux`.
+const LIST_TO_ARRAY_AUX_EQ_1: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.eq_1";
+/// The pin's private array stores this theorem in the BasicAux module.
+const LIST_TO_ARRAY_AUX_EQ_1_MODULE: &str = "Init/Data/Array/BasicAux";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1118,6 +1122,35 @@ fn list_size_to_array_aux_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {LIST_SIZE_TO_ARRAY_AUX} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn list_to_array_aux_equation_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("list_to_array_aux_equation_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_EQ_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&LIST_TO_ARRAY_AUX_EQ_1.to_owned()),
+        "the private companion of {LIST_TO_ARRAY_AUX_EQ_1_MODULE} must retain \
+         {LIST_TO_ARRAY_AUX_EQ_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == LIST_TO_ARRAY_AUX_EQ_1)
+        .unwrap_or_else(|| panic!("private decoder lost {LIST_TO_ARRAY_AUX_EQ_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {LIST_TO_ARRAY_AUX_EQ_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
