@@ -2899,7 +2899,7 @@ fn list_rule_rhs(
         list_universe,
         true,
     );
-    let mut result = builder.bvar(2);
+    let mut result = builder.bvar(if selected_cons { 2 } else { 1 });
     if selected_cons {
         let head = builder.bvar(1);
         result = builder.apply(result, head);
