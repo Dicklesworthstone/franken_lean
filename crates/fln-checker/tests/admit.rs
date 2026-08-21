@@ -4921,6 +4921,32 @@ fn kr600_803_witness_refuses_a_forged_extra_recursor_rule() {
 }
 
 #[test]
+fn kr600_803_witness_mk_refuses_a_forged_constructor_index() {
+    let mut entries = dependent_field_inductive_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Witness", "mk"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Witness"), 1, 0, 1),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_witness_refuses_a_forged_num_indices_count() {
     let mut entries = dependent_field_inductive_entries();
     let declaration = entries[2].declaration();
