@@ -3651,6 +3651,67 @@ mod tests {
         );
     }
 
+    /// A `ConstantInfo` wrapper claiming more than its one payload pointer is
+    /// refused.
+    ///
+    /// SHADOWING CHECKED, and this rule is the one place in this function
+    /// nothing can precede: it is the FIRST check `decode_constant_info` makes,
+    /// ahead of the payload deref and therefore ahead of the payload size
+    /// (1b53cb09) and padding (e9348f58) binds I added later. The wrapper's own
+    /// `cs_sz` is not bound by anything, so the plant leaves it at 16 while
+    /// claiming two pointers and only the arity rule can object — which is what
+    /// makes the kill attributable rather than needing the size co-plant the
+    /// per-variant arities (`AxiomVal arity` and friends) would.
+    #[test]
+    fn a_constant_info_wrapper_claiming_the_wrong_arity_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+
+        let (tag, other, cs_sz) = view.obj_header(info_off).expect("ConstantInfo header");
+        assert_eq!(tag, 0, "the axiom variant");
+        assert_eq!(other, 1, "one pointer: the payload");
+        assert_eq!(cs_sz, 16, "and nothing else");
+
+        // Claim two payload pointers where the wrapper has one, leaving the
+        // size alone.
+        let header = view.read_u64(info_off).expect("header word");
+        let planted = (header & !0x00ff_0000_0000_0000) | (2_u64 << 48);
+        bytes[info_off as usize..info_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(info_off).expect("header after plant"),
+            (0, 2, 16),
+            "only the arity moved"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a ConstantInfo wrapper with the wrong arity must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ConstantInfo arity",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `Name` link whose constructor is neither `str` nor `num` is refused.
     ///
     /// Nothing shadows it: within `decode_name` the constructor check runs
