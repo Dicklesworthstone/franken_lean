@@ -13826,19 +13826,38 @@ fn claim_sites_hidden_by_a_line_break(text: &str) -> usize {
 /// mentions the matrix and calls it missing, so "the corpus-scale matrix" on one
 /// line and "does not exist" on the next is caught by neither half.
 ///
-/// Returns the 1-based number of the first line of such a pair. Pairs where one
+/// Returns the 1-based number of the first line of such a run. Runs where one
 /// line alone already states both are excluded: those belong to the per-line
 /// rule, and reporting them here would blame the wrong line.
+///
+/// A PAIR IS NOT THE WIDEST A SENTENCE WRAPS. This scanned two lines at a time,
+/// so "the corpus-scale matrix" / "does" / "not exist yet" was stated by no
+/// line, by no pair, and therefore by nothing -- the same join the claim scan
+/// carried until the previous commit, one rule over. Measured: old `None`, new
+/// `Some(1)`.
+///
+/// The widening stops at a blank line, and that bound is load-bearing rather
+/// than decorative: without it `AGENTS.md:1155` is reported, where a sentence
+/// naming the matrix is followed by a paragraph break and then, in a different
+/// paragraph, a phrase from the stale list. Joining across a paragraph is how a
+/// scan of this shape starts inventing sites, so the plant below pins the
+/// refusal.
 fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
+    /// A hard-wrapped sentence spans a few lines, not a section.
+    const WIDEST_STRADDLE: usize = 3;
     let lines = text.lines().collect::<Vec<_>>();
     let states_it = |line: &str| line.contains("matrix") && stale.iter().any(|s| line.contains(s));
-    lines.windows(2).enumerate().find_map(|(index, pair)| {
-        let joined = format!("{} {}", pair[0], pair[1]);
-        let split = joined.contains("matrix")
-            && stale.iter().any(|s| joined.contains(s))
-            && !states_it(pair[0])
-            && !states_it(pair[1]);
-        split.then_some(index + 1)
+    (2..=WIDEST_STRADDLE).find_map(|width| {
+        lines.windows(width).enumerate().find_map(|(index, run)| {
+            if run.iter().any(|line| states_it(line))
+                || run.iter().any(|line| line.trim().is_empty())
+            {
+                return None;
+            }
+            let joined = run.join(" ");
+            let split = joined.contains("matrix") && stale.iter().any(|s| joined.contains(s));
+            split.then_some(index + 1)
+        })
     })
 }
 
@@ -17038,6 +17057,25 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         stale_claim_split_across_lines("the corpus-scale matrix\ndoes not exist yet\n", &STALE),
         Some(1),
         "a stale claim split across a break must be found, or the rule below cannot fire"
+    );
+    // AND A PAIR IS NOT THE WIDEST A SENTENCE WRAPS. Measured against the rule
+    // this replaces: old None, new Some(1). Neither the pair scan nor the
+    // per-line scan could see a claim wrapped over three lines.
+    assert_eq!(
+        stale_claim_split_across_lines("the corpus-scale matrix\ndoes\nnot exist yet\n", &STALE),
+        Some(1),
+        "a stale claim wrapped over three lines is stated by no line and by no pair, so a scan \
+         bounded at two lines reports green on a document that still carries it"
+    );
+    // AND THE WIDENING MUST STOP AT A PARAGRAPH BREAK. This control is against
+    // my own fix: deleting the blank-line bound makes this input report Some(1),
+    // and makes AGENTS.md:1155 report Some(1) too, where a sentence naming the
+    // matrix and a phrase from the stale list sit in DIFFERENT paragraphs.
+    assert_eq!(
+        stale_claim_split_across_lines("the matrix is fine\n\nthe corpus does not exist\n", &STALE),
+        None,
+        "two paragraphs are not one wrapped sentence; joining across a blank line is how this \
+         scan starts inventing sites that nobody wrote"
     );
     assert_eq!(
         stale_claim_split_across_lines("the matrix does not exist\nand that is that\n", &STALE),
