@@ -143,6 +143,8 @@ const ARRAY_MAP_M_PROOF_AUXILIARIES: [&str; 2] = [
     "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
     "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
 ];
+/// A private equation-compiler match helper used by Prelude's name equality.
+const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The two tail-recursive merge-sort implementation helpers in the pinned
 /// `Init.Data.List.Sort.Impl` companion delta.
 /// `mergeSortTR₂` helpers that are `_private.`-mangled AND declared by the
@@ -547,6 +549,49 @@ fn array_map_m_proof_auxiliaries_recover_with_concrete_kinds() {
             recovered.kind_name()
         );
     }
+}
+
+#[test]
+fn prelude_name_beq_match_1_requires_the_companion_and_keeps_its_real_kind() {
+    let lib =
+        lib_or_skip!("prelude_name_beq_match_1_requires_the_companion_and_keeps_its_real_kind");
+    let chain = chain_bytes(&lib, "Init/Prelude");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        !exported_names.contains(&NAME_BEQ_MATCH_1.to_owned()),
+        "the exported Prelude part must omit {NAME_BEQ_MATCH_1}"
+    );
+    assert!(
+        private_names.contains(&NAME_BEQ_MATCH_1.to_owned()),
+        "the Prelude private companion must restore {NAME_BEQ_MATCH_1}"
+    );
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != NAME_BEQ_MATCH_1),
+        "exported decoder unexpectedly recovered {NAME_BEQ_MATCH_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == NAME_BEQ_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {NAME_BEQ_MATCH_1}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        "private companion decoded {NAME_BEQ_MATCH_1} only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
 }
 
 #[test]
