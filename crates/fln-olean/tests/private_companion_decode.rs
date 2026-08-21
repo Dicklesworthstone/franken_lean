@@ -403,6 +403,11 @@ const OPTION_DECIDABLE_EQ_MATCH_1_EQ_2: &str =
     "_private.Init.Data.Option.Attach.0.Option.instDecidableEq.match_1.eq_2";
 /// The pin's private option companion stores this theorem in Attach.
 const OPTION_DECIDABLE_EQ_MATCH_1_EQ_2_MODULE: &str = "Init/Data/Option/Attach";
+/// The private splitter for the `Option.instDecidableEq` match.
+const OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER: &str =
+    "_private.Init.Data.Option.Attach.0.Option.instDecidableEq.match_1.splitter";
+/// The pin's private option companion stores this definition in Attach.
+const OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER_MODULE: &str = "Init/Data/Option/Attach";
 /// The private stored definition implementing `List.hasDecEq`.
 const LIST_HAS_DEC_EQ: &str = "List.hasDecEq";
 /// The census places the implementation in Prelude's private companion.
@@ -2835,6 +2840,40 @@ fn option_decidable_eq_second_match_is_decoded_from_its_private_storage_module()
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_DECIDABLE_EQ_MATCH_1_EQ_2} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn option_decidable_eq_match_splitter_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "option_decidable_eq_match_splitter_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER.to_owned()),
+        "the private companion of {OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER_MODULE} must retain \\
+         {OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| {
+            info.name().to_display_string() == OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER
+        })
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER} as {} instead of Defn",
         recovered.kind_name()
     );
 }
