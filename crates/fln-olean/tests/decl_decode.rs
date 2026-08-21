@@ -92,9 +92,9 @@ fn companion_and_public_names() -> Option<(BTreeSet<String>, BTreeSet<String>)> 
 
 fn numbered_private_auxiliary(name: &str, prefix: &str) -> bool {
     name.rsplit('.').next().is_some_and(|segment| {
-        segment
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        segment.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
     })
 }
 
@@ -118,9 +118,7 @@ fn assert_private_auxiliary_family(family: &str, belongs_to_family: impl Fn(&str
 
 #[test]
 fn private_companion_decodes_match_n_auxiliaries() {
-    assert_private_auxiliary_family("match_N", |name| {
-        numbered_private_auxiliary(name, "match_")
-    });
+    assert_private_auxiliary_family("match_N", |name| numbered_private_auxiliary(name, "match_"));
 }
 
 #[test]
