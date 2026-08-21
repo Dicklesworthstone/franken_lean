@@ -3672,3 +3672,109 @@ fn recursor_level_parameters_extend_their_inductives_by_at_most_a_motive_univers
          recursors carry the extra parameter and {prop_unextended} do not"
     );
 }
+
+/// The leading `num` binder domains of a type.
+fn leading_domains(type_: &Expr, num: usize) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    let mut current = type_;
+    while out.len() < num {
+        let ExprNode::ForallE {
+            binder_type, body, ..
+        } = current.node()
+        else {
+            break;
+        };
+        out.push(binder_type);
+        current = body;
+    }
+    out
+}
+
+/// The inductive's own arity, and the parameters it SHARES with its
+/// constructors.
+///
+/// The arity cell checked a constructor's telescope and a recursor's. It never
+/// checked the inductive's own, and the inductive is where `num_params` and
+/// `num_indices` are declared — every other cell that uses those two numbers
+/// takes them from here.
+///
+/// The second relation is the one with teeth. Block admission opens the
+/// parameter telescope ONCE and reuses those locals for every constructor in the
+/// block, so a constructor whose leading binders differ from its inductive's is
+/// a block the kernel cannot form. Nothing checked that the artifact never
+/// presents one. It is a relation between two types this file already reads
+/// separately — the inductive's and the constructor's — and neither cell that
+/// reads them compares them.
+///
+/// Measured over `Init/Prelude` at private level:
+///
+///   127 inductives, every telescope exactly `num_params + num_indices`
+///   107 constructors of parameterised inductives, every leading parameter
+///       domain equal to its inductive's; 50 more are skipped as their
+///       inductive takes no parameters
+///
+/// Non-vacuity for the first: `num_indices` is 0 for 123 of the 127 and nonzero
+/// for 4, and `num_params` ranges 0 to 6 with 28 at zero — so the sum is not a
+/// constant and an equality against it is not free. For the second: the
+/// parameterised majority is floored, since a check that skipped every
+/// constructor would report no failures at all.
+#[test]
+fn inductive_arity_matches_its_type_and_constructors_share_its_parameters() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+
+    let mut indexed = 0usize;
+    let mut parameterised = 0usize;
+    for (name, induct) in &inductives {
+        assert_eq!(
+            telescope_length(&induct.base.type_),
+            (induct.num_params + induct.num_indices) as usize,
+            "{name}: an inductive's telescope is its parameters followed by its indices, and \
+             those two numbers are what every other cell reads from here"
+        );
+        if induct.num_indices > 0 {
+            indexed += 1;
+        }
+        if induct.num_params > 0 {
+            parameterised += 1;
+        }
+    }
+    assert!(
+        indexed >= 4 && parameterised >= 90 && parameterised < inductives.len(),
+        "the sum must not be a constant: {indexed} indexed, {parameterised} parameterised of {}",
+        inductives.len()
+    );
+
+    let mut compared = 0usize;
+    for info in &infos {
+        let ConstantInfo::Ctor(ctor) = info else {
+            continue;
+        };
+        let induct = inductives
+            .get(&ctor.induct.to_display_string())
+            .expect("constructor's inductive decodes");
+        if induct.num_params == 0 {
+            continue;
+        }
+        let count = induct.num_params as usize;
+        assert_eq!(
+            leading_domains(&ctor.base.type_, count),
+            leading_domains(&induct.base.type_, count),
+            "{}: its leading parameter binders differ from its inductive's, so block admission \
+             could not open one telescope and reuse it across the block",
+            info.name().to_display_string()
+        );
+        compared += 1;
+    }
+    assert!(
+        compared >= 100,
+        "a check that skipped every constructor would report no failures; {compared} compared"
+    );
+}
