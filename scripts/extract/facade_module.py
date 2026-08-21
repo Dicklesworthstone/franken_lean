@@ -432,16 +432,66 @@ def safe_ident(part):
     if writable_component(part):
         return part
     return "«" + part + "»"
-# A `structure` block generates these alongside the fields. Emitting an axiom for
-# one is a redeclaration; omitting it when the owner is NOT structural loses the
-# row. The list is a claim about the pin's elaborator, and it is CHECKED both ways
-# by the compile rig: a name wrongly assumed generated shows up as unresolved, and
-# one wrongly emitted shows up as "already been declared".
-STRUCTURE_COMPANIONS = (
-    "mk", "rec", "recOn", "casesOn", "brecOn", "below", "ndrec", "noConfusion",
-    "noConfusionType", "_sizeOf_inst", "_sizeOf_1", "toCtorIdx", "ctorIdx",
-    "injEq", "sizeOf_spec",
-)
+# What a `structure`/`class` block generates alongside its fields is a fact about
+# the PIN's elaborator, so it is measured from the pin rather than listed here.
+# The list this replaced was wrong in both directions: it put `injEq` and
+# `sizeOf_spec` at the top level when the pin generates them under `mk.`, it never
+# mentioned `mk.inj`, `mk.noConfusion` or `mk._flat_ctor`, and it claimed `brecOn`,
+# `below`, `ndrec` and `toCtorIdx`, which a structure does not get at all.
+COMPANION_PROBE = r'''import Lean
+structure FlnProbeStruct (A : Type) where
+  fld : A
+class FlnProbeClass (A : Type) where
+  meth : A
+open Lean in
+#eval show CoreM Unit from do
+  let env <- getEnv
+  for (n, _) in env.constants.map₂.toList do
+    let s := toString n
+    if s.startsWith "FlnProbeStruct" || s.startsWith "FlnProbeClass" then
+      IO.println s!"GEN {s}"
+'''
+
+
+def probe_companions(lean, env, work):
+    """Ask the pin which companions a structure and a class actually generate.
+
+    BOUND, stated because one probe shape cannot speak for every declaration: this
+    measures a parameterised structure with one field and a parameterised class
+    with one method — which is the shape this emitter produces. A recursive
+    inductive gets `brecOn`/`below` too, and the facade never emits one. Anything
+    this set still gets wrong is caught downstream either as an unresolved
+    emission claim or as an "already been declared" redeclaration.
+    """
+    src = os.path.join(work, "companions.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(COMPANION_PROBE)
+    proc = subprocess.run([lean, src], capture_output=True, text=True, env=env,
+                          timeout=1800)
+    if proc.returncode != 0:
+        raise SystemExit(f"REFUSE: the pinned binary refused the companion probe:\n"
+                         f"{(proc.stdout + proc.stderr)[:1200]}")
+    struct_c, class_c = set(), set()
+    for line in proc.stdout.splitlines():
+        if not line.startswith("GEN "):
+            continue
+        name = line[4:].strip()
+        for prefix, bucket in (("FlnProbeStruct.", struct_c),
+                               ("FlnProbeClass.", class_c)):
+            if name.startswith(prefix):
+                suffix = name[len(prefix):]
+                # `fld`/`meth` are the probe's own FIELDS, not companions: the real
+                # emitter derives field projections from each structure's own
+                # telescope.
+                if suffix not in ("fld", "meth"):
+                    bucket.add(suffix)
+    if not struct_c or not class_c:
+        raise SystemExit(
+            "REFUSE: the companion probe measured nothing (struct="
+            f"{len(struct_c)}, class={len(class_c)}) — an empty companion set makes "
+            "every generated companion look like a row the facade owes, and the "
+            "redeclaration errors that follow would be blamed on the wrong thing")
+    return sorted(struct_c), sorted(class_c)
 TOKEN = re.compile(r"(?<![\w.\u00ab\u00bb])([A-Za-z_][\w'!?]*(?:\.[A-Za-z_][\w'!?]*)*)(?![\w.])")
 
 
@@ -706,7 +756,7 @@ def structural_refusal(name, st, bs):
 
 def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
            structural, structs, binders, deps, pbinders, transparent,
-           value_explicit_for):
+           value_explicit_for, companions):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -724,7 +774,7 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
         for i, b in sorted(binders.get(c, {}).items()):
             if i >= st["num_params"]:
                 provided[f"{c}.{b['user']}"] = c
-        for suffix in STRUCTURE_COMPANIONS:
+        for suffix in companions:
             provided[f"{c}.{suffix}"] = c
     for name in ordered:
         if name in quarantine or name in provided:
@@ -941,6 +991,8 @@ def main():
         # not only after the ones its type names.
         deps[n] = sorted(set(deps.get(n, [])) | set(vdeps.get(n, [])))
     structural_full = set(structural)
+    struct_companions, class_companions = probe_companions(lean, env, work)
+    companions = sorted(set(struct_companions) | set(class_companions))
     ordered, cycle_residue = order(list(types), deps)
     explicit_for, maxexp_for, dropped_attrs, attr_reason = set(), set(), set(), {}
     value_explicit_for = set()
@@ -983,7 +1035,7 @@ def main():
             text, line_map, emitted, attr_count, provided = render(
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
                 structural, structs, binders, deps, pbinders, transparent,
-            value_explicit_for)
+            value_explicit_for, companions)
             candidate = args.out + ".candidate.lean"
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -1214,7 +1266,7 @@ def main():
     # directions here: `Lean.ImportM.Context.casesOn` was recorded unemitted while
     # it resolved perfectly well (a structural block generates it), and
     # `Lean.MetavarContext._sizeOf_inst` was recorded as served by Init while Init
-    # does not have it and the name was absent. STRUCTURE_COMPANIONS is likewise a
+    # does not have it and the name was absent. The companion set is likewise a
     # CLAIM about the pin's elaborator, and the rig that used to catch such drift
     # from the outside cannot run against a facade with no quarantined demand left.
     #
@@ -1385,6 +1437,11 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "structure_companions_measured": struct_companions,
+        "class_companions_measured": class_companions,
+        "companions_bound": "measured from the pin with a parameterised structure "
+            "and class of the shape this emitter produces; a recursive inductive "
+            "also gets brecOn/below and the facade never emits one",
         "private_name_rows": sum(private_owners.values()),
         "private_name_modules": dict(sorted(private_owners.items())),
         "private_name_prerequisite":
