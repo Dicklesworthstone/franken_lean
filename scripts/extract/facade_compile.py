@@ -3754,6 +3754,9 @@ def main():
     type_roundtrip_field_sets_inequality_join = {"summary_type_roundtrip_checked": manifest_summary.get("type_roundtrip_checked"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
     if (not isinstance(type_roundtrip_field_sets_inequality_join["summary_type_roundtrip_checked"], int) or isinstance(type_roundtrip_field_sets_inequality_join["summary_type_roundtrip_checked"], bool) or not isinstance(type_roundtrip_field_sets_inequality_join["summary_field_sets_checked"], int) or isinstance(type_roundtrip_field_sets_inequality_join["summary_field_sets_checked"], bool) or type_roundtrip_field_sets_inequality_join["summary_type_roundtrip_checked"] <= type_roundtrip_field_sets_inequality_join["summary_field_sets_checked"]):
         raise SystemExit("REFUSE: facade manifest type-roundtrip count must exceed field-set count " + json.dumps(type_roundtrip_field_sets_inequality_join, sort_keys=True))
+    projection_types_demanded_init_substrate_inequality_join = {"summary_projection_types_checked": manifest_summary.get("projection_types_checked"), "summary_demanded_init_substrate": manifest_summary.get("demanded_init_substrate")}
+    if (not isinstance(projection_types_demanded_init_substrate_inequality_join["summary_projection_types_checked"], int) or isinstance(projection_types_demanded_init_substrate_inequality_join["summary_projection_types_checked"], bool) or not isinstance(projection_types_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], int) or isinstance(projection_types_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], bool) or projection_types_demanded_init_substrate_inequality_join["summary_projection_types_checked"] <= projection_types_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"]):
+        raise SystemExit("REFUSE: facade manifest projection-type count must exceed demanded Init-substrate count " + json.dumps(projection_types_demanded_init_substrate_inequality_join, sort_keys=True))
     transparent_declarations_demanded_init_substrate_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_demanded_init_substrate": manifest_summary.get("demanded_init_substrate")}
     if (not isinstance(transparent_declarations_demanded_init_substrate_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_declarations_demanded_init_substrate_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_declarations_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], int) or isinstance(transparent_declarations_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], bool) or transparent_declarations_demanded_init_substrate_inequality_join["summary_transparent_declarations"] <= transparent_declarations_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"]):
         raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed demanded Init-substrate count " + json.dumps(transparent_declarations_demanded_init_substrate_inequality_join, sort_keys=True))
@@ -6030,6 +6033,9 @@ def main():
         ),
         "manifest_type_roundtrip_field_sets_inequality_join": (
             type_roundtrip_field_sets_inequality_join
+        ),
+        "manifest_projection_types_demanded_init_substrate_inequality_join": (
+            projection_types_demanded_init_substrate_inequality_join
         ),
         "manifest_transparent_declarations_demanded_init_substrate_inequality_join": (
             transparent_declarations_demanded_init_substrate_inequality_join
