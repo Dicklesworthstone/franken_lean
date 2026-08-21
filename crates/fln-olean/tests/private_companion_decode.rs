@@ -340,6 +340,10 @@ const LIST_HAS_DEC_EQ_MATCH_3_MODULE: &str = "Init/Prelude";
 const LIST_HAS_DEC_EQ_MATCH_1: &str = "List.hasDecEq.match_1";
 /// The census places this equation helper in Prelude's private companion.
 const LIST_HAS_DEC_EQ_MATCH_1_MODULE: &str = "Init/Prelude";
+/// The first private proof helper for `List.hasDecEq`.
+const LIST_HAS_DEC_EQ_PROOF_1: &str = "List.hasDecEq._proof_1";
+/// The census places this theorem in Prelude's private companion.
+const LIST_HAS_DEC_EQ_PROOF_1_MODULE: &str = "Init/Prelude";
 /// The fifth private match helper for `List.hasDecEq`.
 const LIST_HAS_DEC_EQ_MATCH_5: &str = "List.hasDecEq.match_5";
 /// The census places this equation helper in Prelude's private companion.
@@ -2400,6 +2404,35 @@ fn list_has_dec_eq_first_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {LIST_HAS_DEC_EQ_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn list_has_dec_eq_first_proof_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("list_has_dec_eq_first_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, LIST_HAS_DEC_EQ_PROOF_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&LIST_HAS_DEC_EQ_PROOF_1.to_owned()),
+        "the private companion of {LIST_HAS_DEC_EQ_PROOF_1_MODULE} must retain \\
+         {LIST_HAS_DEC_EQ_PROOF_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == LIST_HAS_DEC_EQ_PROOF_1)
+        .unwrap_or_else(|| panic!("private decoder lost {LIST_HAS_DEC_EQ_PROOF_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {LIST_HAS_DEC_EQ_PROOF_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
