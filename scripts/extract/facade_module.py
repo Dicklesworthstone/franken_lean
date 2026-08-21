@@ -3759,3 +3759,22 @@ if __name__ == "__main__":
             f"({exc.strerror}). Whatever it was writing is not what it "
             "intended to write, and no artifact should be read as this run's "
             "until it is regenerated") from exc
+    except BaseException:
+        # ENUMERATING THE WAYS A RUN CAN DIE IS THE DEFECT, not the coverage. The
+        # three arms above name a refusal, a pin that never answered and a write
+        # that failed; a run that ends any OTHER way skipped the note entirely,
+        # and "any other way" is not hypothetical here. Wave 63 died on a
+        # KeyError from the manifest's own form table, with the facade already
+        # replaced on disk. A pane interrupted at the keyboard -- which is how
+        # runs on this box are usually stopped -- is a KeyboardInterrupt and not
+        # even an Exception. Both left the .lean from that run beside the manifest
+        # from the previous one with nothing said.
+        #
+        # This is the same repair the scope of four earlier guards needed: a
+        # prefix scan standing in for a population, a hand-listed suffix set, a
+        # registry standing in for the disk, and now a list of exception types
+        # standing in for "the run did not finish". It reports and re-raises, so
+        # the traceback a genuine bug deserves is still printed, and the typed
+        # refusals above still win for the two classes worth naming.
+        _report_divergence()
+        raise
