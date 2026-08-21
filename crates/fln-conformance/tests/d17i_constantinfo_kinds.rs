@@ -2675,3 +2675,93 @@ fn exactly_one_nested_block_licenses_every_nesting_carve_out_in_this_file() {
         );
     }
 }
+
+/// The opaques that exist only at private level, and they are this bead's own
+/// family: the `.loop` auxiliaries named in its filing text alongside `match_N`
+/// and `_proof_N`.
+const PRIVATE_ONLY_OPAQUES: &[&str] = &[
+    "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop",
+    "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop",
+];
+
+/// `OpaqueVal.value` — the last stored field in a `ConstantInfo` that nothing
+/// asserts about.
+///
+/// The closure and hints cells WALK it, because `declaration_expressions`
+/// includes it, but no cell says anything about what is in it. That gap matters
+/// because an opaque is the one kind whose body is checked and then never used:
+/// admission type-checks the value against the declared type under KR-974,
+/// while the delta gate refuses to unfold it — the explicit `Opaque` arm added
+/// at `ccc44fe6`. A decode that produced a placeholder body would satisfy every
+/// reference and resolution check in this file and would only ever be caught by
+/// the kernel actually checking it.
+///
+/// Measured over `Init/Prelude` at private level: 14 opaques, every one with a
+/// real body — 3 to 11 distinct constants across 5 to 36 nodes, no empty or
+/// trivial value among them.
+///
+/// The exported comparison splits them, and the split is the interesting half:
+///
+///   12 are `Axiom` at exported level — the body was withheld, then restored
+///    2 are ABSENT from the exported part entirely
+///
+/// Those two are `getHeadInfo?.loop` and `getTailPos?.loop`, the `.loop` members
+/// of the auxiliary family this bead's filing text named. Their `.match_1`
+/// siblings are two of the six `ArtifactIncomplete` rows pinned above, so the
+/// same declaration family shows up here in a third shape: absent at exported
+/// level, opaque with a real body at private level.
+#[test]
+fn every_opaque_carries_a_real_body_and_two_of_them_exist_only_privately() {
+    let lib = lib_or_skip!();
+    let private = decode_prelude_private(&lib);
+    let (exported, _) = decode_at(&lib, "Init.Prelude", Level::Exported);
+    let exported_kinds: BTreeMap<String, &'static str> = exported
+        .iter()
+        .map(|info| (info.name().to_display_string(), kind_of(info)))
+        .collect();
+
+    let mut private_only: Vec<String> = Vec::new();
+    let mut restored_from_axiom = 0usize;
+    let mut smallest_body = usize::MAX;
+    let mut opaques = 0usize;
+    for info in &private {
+        let ConstantInfo::Opaque(v) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        opaques += 1;
+
+        // A placeholder body would pass every other cell in this file.
+        let referenced = referenced_constants(&v.value);
+        assert!(
+            !referenced.is_empty(),
+            "{name}: an opaque's value is type-checked at admission, so a body referencing \
+             nothing at all is not a body"
+        );
+        smallest_body = smallest_body.min(referenced.len());
+
+        match exported_kinds.get(&name).copied() {
+            Some("Axiom") => restored_from_axiom += 1,
+            None => private_only.push(name),
+            other => panic!("{name}: unexpected exported kind {other:?} for an opaque"),
+        }
+    }
+
+    assert!(
+        opaques >= 10 && smallest_body >= 2,
+        "the pin's opaques must be a real population with real bodies ({opaques} opaques, \
+         smallest body references {smallest_body} constants)"
+    );
+    assert!(
+        restored_from_axiom >= 10,
+        "most opaques are postulated at exported level and restored by the private part, got \
+         {restored_from_axiom}"
+    );
+    // Sorted: the table is the claim, not the constant array's order.
+    private_only.sort();
+    assert_eq!(
+        private_only, PRIVATE_ONLY_OPAQUES,
+        "the opaques with no exported counterpart are the `.loop` auxiliaries this bead named; \
+         a new one is a new member of that family and should be adjudicated, not absorbed"
+    );
+}
