@@ -118,6 +118,14 @@ fn exported_and_private_names(chain: &ChainBytes) -> (Vec<String>, Vec<String>) 
 /// The exact constant `franken_lean-timy` names as never decoded.
 const TIMY_WITNESS: &str = "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1";
 
+/// A private-mangled declaration that is deliberately present in Init.Prelude's
+/// exported array as well as its companion chain.
+const HEAD_INFO_LOOP_UNSAFE_REC: &str =
+    "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec";
+/// Its private-only dependency, which must be recovered from the companion.
+const HEAD_INFO_LOOP_MATCH_1: &str =
+    "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1";
+
 #[test]
 fn timy_witness_module_recovers_its_private_match_auxiliary() {
     let lib = lib_or_skip!("timy_witness_module_recovers_its_private_match_auxiliary");
@@ -229,6 +237,68 @@ fn timy_match_1_requires_the_private_companion_for_a_non_axiom_decode() {
     assert!(
         !matches!(recovered, ConstantInfo::Axiom(_)),
         "private companion recovery weakened {TIMY_WITNESS} to an axiom"
+    );
+}
+
+#[test]
+fn prelude_exported_mangled_unsafe_rec_still_requires_its_private_match_companion() {
+    let lib = lib_or_skip!(
+        "prelude_exported_mangled_unsafe_rec_still_requires_its_private_match_companion"
+    );
+    let chain = chain_bytes(&lib, "Init/Prelude");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    // `_private.` is a display-name mangling convention, not an origin bit.
+    // This exact loop helper is public-overlap: both arrays carry it. Its
+    // `match_1` dependency is the RED companion-only member, so name-prefix
+    // classification would otherwise report the wrong failure source.
+    assert!(
+        exported_names.contains(&HEAD_INFO_LOOP_UNSAFE_REC.to_owned()),
+        "Init.Prelude's exported part must retain the public-overlap {HEAD_INFO_LOOP_UNSAFE_REC}"
+    );
+    assert!(
+        private_names.contains(&HEAD_INFO_LOOP_UNSAFE_REC.to_owned()),
+        "Init.Prelude's private chain must retain the public-overlap {HEAD_INFO_LOOP_UNSAFE_REC}"
+    );
+    assert!(
+        !exported_names.contains(&HEAD_INFO_LOOP_MATCH_1.to_owned()),
+        "the exported part must omit the companion-only {HEAD_INFO_LOOP_MATCH_1}"
+    );
+    assert!(
+        private_names.contains(&HEAD_INFO_LOOP_MATCH_1.to_owned()),
+        "the private companion must restore {HEAD_INFO_LOOP_MATCH_1}"
+    );
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    assert!(
+        exported_constants
+            .iter()
+            .any(|info| info.name().to_display_string() == HEAD_INFO_LOOP_UNSAFE_REC),
+        "exported decoder lost its public-overlap private-mangled declaration"
+    );
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != HEAD_INFO_LOOP_MATCH_1),
+        "exported decoder unexpectedly recovered the companion-only match_1"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let private_constants = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode");
+    let recovered = private_constants
+        .iter()
+        .find(|info| info.name().to_display_string() == HEAD_INFO_LOOP_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {HEAD_INFO_LOOP_MATCH_1}"));
+    assert!(
+        !matches!(recovered, ConstantInfo::Axiom(_)),
+        "companion recovery weakened {HEAD_INFO_LOOP_MATCH_1} to an axiom"
     );
 }
 
