@@ -2891,6 +2891,20 @@ def self_test():
             _f for _f in ast.parse(builtins.open(__file__, encoding="utf-8").read()).body
             if isinstance(_f, ast.FunctionDef) and _f.name == "main"))
         if isinstance(_n, ast.Call) and getattr(_n.func, "id", "") == "publication_floor")
+    # The floor is checked at the START and again at each PUBLISH. One call per
+    # declared output for the pre-flight, plus one per publish: the count expected
+    # is derived, so a third artifact raises the bar by itself.
+    _space_calls = sum(
+        1 for _n in ast.walk(next(
+            _f for _f in ast.parse(
+                builtins.open(__file__, encoding="utf-8").read()).body
+            if isinstance(_f, ast.FunctionDef) and _f.name == "main"))
+        if isinstance(_n, ast.Call)
+        and getattr(_n.func, "id", "") == "insufficient_space_error")
+    case("space/main-rechecks-at-every-publish",
+         None if _space_calls >= 1 + len(OUTPUT_ARGS)
+         else f"main checks space {_space_calls} times; expected the pre-flight "
+              f"plus one per publish for {len(OUTPUT_ARGS)} outputs", False)
     case("space/main-sizes-every-declared-output",
          None if _floor_calls >= len(OUTPUT_ARGS)
          else f"main calls publication_floor {_floor_calls} times for "
@@ -4096,6 +4110,20 @@ def main():
     if _acc:
         raise SystemExit("REFUSE: " + _acc)
 
+    # RE-CHECKED HERE, because the pre-flight is 700 lines and a whole pin pass
+    # away. Free space on this box has fallen by hundreds of MiB inside a single
+    # wave while other panes worked, so passing the floor at the start says
+    # nothing about holding it at the publish -- and by this point the facade may
+    # already have been replaced in the attempt loop, so running out now leaves
+    # the pair inconsistent rather than merely unfinished.
+    #
+    # The floor here is EXACT rather than estimated: the bytes about to be written
+    # are in hand, where the pre-flight could only size the previous artifact.
+    _space = insufficient_space_error((
+        (os.path.dirname(args.out) or ".", len(text.encode("utf-8")),
+         "the facade about to be written"),))
+    if _space:
+        raise SystemExit("REFUSE: " + _space)
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
     published[args.out] = (text, "the facade", SCRATCH_SUFFIXES)
@@ -4862,6 +4890,14 @@ def main():
     # refuses elsewhere: the comparison would then be against a second rendering
     # rather than against what was actually written.
     manifest_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    # ...and again for the manifest, which is written through a temporary that
+    # coexists with the file it replaces, so the bytes it needs are its own.
+    _space = insufficient_space_error((
+        (os.path.dirname(args.manifest) or ".",
+         len(manifest_text.encode("utf-8")),
+         "the manifest about to be written"),))
+    if _space:
+        raise SystemExit("REFUSE: " + _space)
     tmp = args.manifest + MANIFEST_TMP_SUFFIX
     scratch_created.add((args.manifest, tmp))
     with open(tmp, "w", encoding="utf-8") as fh:
