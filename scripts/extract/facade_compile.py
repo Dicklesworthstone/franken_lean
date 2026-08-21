@@ -277,6 +277,11 @@ the toolchain would report a perfect facade:
     abbreviation, with a reason in both cases. A failed transparent emission
     cannot masquerade as a successful transparent row.
 
+  * A MANIFEST-STRUCTURAL-FALLBACK JOIN requires every structural refusal to
+    be either an axiomized fallback or a withheld structure, with every
+    withheld structural row reasoned and no emitted class or structure marked
+    refused. Structural failure cannot leak into a successful block claim.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1644,6 +1649,57 @@ def main():
             f"unexplained={unexplained_withheld_transparents[:8]!r}, "
             f"refused_emitted={refused_emitted_transparents[:8]!r})"
         )
+    structural_fallback_rows = [
+        row for row in manifest_rows
+        if isinstance(row.get("structural_refused_reason"), str)
+        and row["structural_refused_reason"].strip()
+    ]
+    axiomized_structural_fallbacks = [
+        row for row in structural_fallback_rows if row.get("form") == "axiom"
+    ]
+    withheld_structures = [
+        row for row in structural_fallback_rows
+        if row.get("form") == "structure" and row.get("emitted") is False
+    ]
+    malformed_structural_fallbacks = sorted(
+        row["name"] for row in structural_fallback_rows
+        if row not in axiomized_structural_fallbacks and row not in withheld_structures
+    )
+    unexplained_withheld_structures = sorted(
+        row["name"] for row in manifest_rows
+        if row.get("form") in {"class", "structure"}
+        and row.get("emitted") is False
+        and row not in withheld_structures
+    )
+    refused_emitted_structurals = sorted(
+        row["name"] for row in manifest_rows
+        if row.get("form") in {"class", "structure"}
+        and row.get("emitted") is True
+        and isinstance(row.get("structural_refused_reason"), str)
+        and row["structural_refused_reason"].strip()
+    )
+    manifest_structural_fallback_join = {
+        "refusal_rows": len(structural_fallback_rows),
+        "axiomized_fallbacks": len(axiomized_structural_fallbacks),
+        "withheld_structures": len(withheld_structures),
+        "malformed_fallback_rows": len(malformed_structural_fallbacks),
+        "unexplained_withheld_structures": len(unexplained_withheld_structures),
+        "refused_emitted_structurals": len(refused_emitted_structurals),
+    }
+    if (manifest_structural_fallback_join["refusal_rows"] == 0
+            or manifest_structural_fallback_join["axiomized_fallbacks"]
+            + manifest_structural_fallback_join["withheld_structures"]
+            != manifest_structural_fallback_join["refusal_rows"]
+            or manifest_structural_fallback_join["malformed_fallback_rows"] != 0
+            or manifest_structural_fallback_join["unexplained_withheld_structures"] != 0
+            or manifest_structural_fallback_join["refused_emitted_structurals"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-fallback join failed "
+            f"({json.dumps(manifest_structural_fallback_join, sort_keys=True)}, "
+            f"malformed={malformed_structural_fallbacks[:8]!r}, "
+            f"unexplained={unexplained_withheld_structures[:8]!r}, "
+            f"refused_emitted={refused_emitted_structurals[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -2078,6 +2134,7 @@ def main():
         "manifest_safety_totality_join": manifest_safety_join,
         "manifest_level_parameter_totality_join": manifest_level_parameter_join,
         "manifest_transparency_fallback_join": manifest_transparency_fallback_join,
+        "manifest_structural_fallback_join": manifest_structural_fallback_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
