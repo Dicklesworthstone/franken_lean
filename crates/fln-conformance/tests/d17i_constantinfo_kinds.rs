@@ -6718,3 +6718,72 @@ fn the_is_module_flag_predicts_which_oleans_have_companions() {
          about the same files"
     );
 }
+
+/// The file's two decode helpers are the same decoding, decoding is
+/// deterministic, and both agree with the header count.
+///
+/// This file reads `Init/Prelude` at private level through two different
+/// helpers. `decode_prelude_private` opens the three parts and decodes.
+/// `decode_at` first parses the exported part standalone to read its imports,
+/// then parses the chain and decodes. They are separate code paths — 31 cells
+/// use the first and 12 use the second — and nothing checks they produce the
+/// same thing. If they drifted, the file's claims would silently split into two
+/// populations while every cell went on describing "Init/Prelude at private
+/// level".
+///
+/// Three identities, none of them previously stated:
+///
+///   the two helpers agree element for element AND in order, so a cell may be
+///     moved between them without changing what it asserts
+///   decoding the same bytes twice through the same helper gives the same
+///     result. The decoder caches names, levels and expressions in `HashMap`s,
+///     and a `HashMap` iterated anywhere on the output path would leak its
+///     order into the answer — a nondeterminism this project's own doctrine
+///     rules out, and one that no single decode can reveal
+///   the decoded count equals the `constants` field read from the header by
+///     `module_view`, which is a different reader over the same bytes
+///
+/// Non-vacuity: the comparison runs over 2,314 declarations spanning all EIGHT
+/// `ConstantInfo` kinds, so it is not agreement over a short or uniform list.
+#[test]
+fn the_two_decode_helpers_agree_and_decoding_is_deterministic() {
+    let lib = lib_or_skip!();
+
+    let direct = decode_prelude_private(&lib);
+    let (routed, _) = decode_at(&lib, "Init.Prelude", Level::Private);
+    assert_eq!(
+        direct.len(),
+        routed.len(),
+        "the two helpers must decode the same number of declarations"
+    );
+    assert!(
+        direct == routed,
+        "the two helpers must produce the same declarations in the same order; first \
+         disagreement at {:?}",
+        direct
+            .iter()
+            .zip(&routed)
+            .position(|(a, b)| a != b)
+            .map(|index| direct[index].name().to_display_string())
+    );
+
+    let again = decode_prelude_private(&lib);
+    assert!(
+        direct == again,
+        "decoding the same bytes twice must give the same answer, including order"
+    );
+
+    let header = module_view(&lib, "Init.Prelude", Level::Private);
+    assert_eq!(
+        direct.len() as u64,
+        header.constants,
+        "the decoded declarations must match the count the header reader reports"
+    );
+
+    let kinds: BTreeSet<&'static str> = direct.iter().map(kind_of).collect();
+    assert_eq!(
+        (direct.len(), kinds.len()),
+        (2314, 8),
+        "the agreement must be over the full census and every ConstantInfo kind, got {kinds:?}"
+    );
+}
