@@ -138,6 +138,10 @@ the toolchain would report a perfect facade:
     equal the corpus pin in `SUITE.lock`. The demand slice cannot be reported
     against a different source epoch.
 
+  * A DEMAND-COVERAGE-SPLIT JOIN requires the exact-demand artifact's covered
+    and uncovered counts to sum to its toolchain-api denominator. The coverage
+    aggregate cannot silently drop a demanded row.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -223,6 +227,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
     census_missing = None
     demand_pin = None
     demand_corpus_commit = None
+    covered_by_stubs = None
+    uncovered = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -240,6 +246,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
                 census_missing = row.get("census_missing")
                 demand_pin = row.get("pin")
                 demand_corpus_commit = row.get("corpus_commit")
+                covered_by_stubs = row.get("covered_by_stubs")
+                uncovered = row.get("uncovered")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -290,6 +298,16 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
             f"(demand={demand_corpus_commit!r}, "
             f"suite={expected_corpus_commit!r})"
         )
+    if (not isinstance(covered_by_stubs, int) or isinstance(covered_by_stubs, bool)
+            or not isinstance(uncovered, int) or isinstance(uncovered, bool)
+            or covered_by_stubs < 0 or uncovered < 0
+            or covered_by_stubs + uncovered != declared_toolchain_api_demand):
+        raise SystemExit(
+            "REFUSE: exact-demand coverage-split join disagrees with its "
+            f"denominator (covered_by_stubs={covered_by_stubs!r}, "
+            f"uncovered={uncovered!r}, "
+            f"demanded={declared_toolchain_api_demand!r})"
+        )
     if uncensused:
         raise SystemExit(
             "REFUSE: exact-demand census-partition join found uncensused symbols "
@@ -333,6 +351,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
         "census_missing": 0,
         "reference_pin": expected_pin,
         "corpus_commit": expected_corpus_commit,
+        "covered_by_stubs": covered_by_stubs,
+        "uncovered": uncovered,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
