@@ -63,6 +63,9 @@ the toolchain would report a perfect facade:
   * A STRUCTURAL-PROVIDER JOIN requires every demanded row that claims a
     `provided_by` structural block to name one emitted class or structure row.
     Generated projections and transparent wrappers cannot cite a phantom owner.
+  * An UNRESOLVED-QUARANTINE JOIN requires the observed unresolved demanded set
+    to equal the manifest's quarantined set, with an explicit quarantine reason
+    for every member. The remaining known gap cannot be silently reclassified.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -446,6 +449,34 @@ def enforce_disposition_matrix(dispositions, generated, empty):
     return dict(sorted(Counter(dispositions.values()).items()))
 
 
+def join_unresolved_quarantine(dispositions, manifest_rows, verdicts, diagnostics):
+    """Bind every observed unresolved demanded name to one justified quarantine."""
+    rows_by_name = {row["name"]: row for row in manifest_rows}
+    unresolved = sorted(name for name, verdict in verdicts.items() if verdict == "unresolved")
+    quarantined = sorted(
+        name for name, outcome in dispositions.items() if outcome == "quarantined"
+    )
+    if unresolved != quarantined:
+        raise SystemExit(
+            "REFUSE: observed unresolved demand does not equal the quarantined "
+            "manifest set (observed=" + ", ".join(unresolved[:8])
+            + "; quarantined=" + ", ".join(quarantined[:8]) + ")"
+        )
+    joined = []
+    for name in unresolved:
+        reason = rows_by_name[name].get("quarantine_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise SystemExit(
+                f"REFUSE: unresolved demanded row {name} has no quarantine_reason"
+            )
+        joined.append({
+            "name": name,
+            "quarantine_reason": reason,
+            "diagnostic": diagnostics.get(name),
+        })
+    return joined
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -588,7 +619,9 @@ def main():
     # under Init, which every non-prelude module imports implicitly — so the honest
     # control is "the facade adds resolutions", not "nothing resolves without it".
     control_names = sorted(demand_names)
-    v_facade, _, _ = run_probe(lean, root, work, "control_facade", control_names, sigs)
+    v_facade, facade_detail, _ = run_probe(
+        lean, root, work, "control_facade", control_names, sigs
+    )
     v_empty, _, _ = run_probe(lean, empty_root, work, "control_empty", control_names, sigs)
     ok_facade = sum(1 for v in v_facade.values() if v == "available")
     ok_empty = sum(1 for v in v_empty.values() if v == "available")
@@ -600,6 +633,9 @@ def main():
 
     disposition_matrix = enforce_disposition_matrix(
         demand_dispositions, v_facade, v_empty
+    )
+    unresolved_quarantine_join = join_unresolved_quarantine(
+        demand_dispositions, manifest_rows, v_facade, facade_detail
     )
 
     quarantine_name = choose_quarantine_control(demand_dispositions)
@@ -679,6 +715,7 @@ def main():
             "init_substrate": disposition_matrix.get("init-substrate", 0),
             "quarantined": disposition_matrix.get("quarantined", 0),
         },
+        "unresolved_quarantine_join": unresolved_quarantine_join,
         "available": verdict_counts["available"],
         "unresolved": verdict_counts["unresolved"],
         "resolved_but_rejected": verdict_counts["resolved-but-rejected"],
