@@ -162,8 +162,9 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
     let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
     assert_eq!(
-        private_companion_observed
-            .checked_add(private_companion_missing)
+        private_companion_omitted
+            .checked_add(private_companion_observed)
+            .and_then(|count| count.checked_add(private_companion_missing))
             .expect("private companion residual counters do not overflow"),
         decoded_private_auxiliaries,
         "{json}",
