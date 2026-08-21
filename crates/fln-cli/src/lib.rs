@@ -49,6 +49,10 @@ const OLEAN_DIFF_MAX_RENDERED_CHANGES: usize = 256;
 const OLEAN_MAX_RENDERED_NAME_CHARS: usize = 256;
 const OLEAN_DIFF_MAX_RENDERED_KINDS_PER_SIDE: usize = 16;
 const CHECK_OLEAN_MAX_RENDERED_PRIVATE_LOOP_AUXILIARIES: usize = 32;
+const CORE_OBSERVABLES_LOOP_RESIDUAL_PREFIXES: [&str; 2] = [
+    "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.",
+    "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.",
+];
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -2625,25 +2629,36 @@ impl DecodedPrivateLoopAuxiliaries {
         for constant in constants {
             let name = constant.name();
             let display = name.to_display_string();
-            if !display.starts_with("_private.")
-                || !display.split('.').any(|component| component == "loop")
-            {
+            if !is_private_loop_auxiliary(&display) {
                 continue;
             }
-            self.observed = self.observed.saturating_add(1);
-            if self.names.len() < CHECK_OLEAN_MAX_RENDERED_PRIVATE_LOOP_AUXILIARIES {
-                self.names.push(name.clone());
-                continue;
+            self.observe_name(name);
+        }
+    }
+
+    fn observe_core_observables_residuals(&mut self, constants: &[fln::ConstantInfo]) {
+        for constant in constants {
+            let name = constant.name();
+            if is_core_observables_loop_residual(&name.to_display_string()) {
+                self.observe_name(name);
             }
-            let mut greatest = 0;
-            for index in 1..self.names.len() {
-                if self.names[index] > self.names[greatest] {
-                    greatest = index;
-                }
+        }
+    }
+
+    fn observe_name(&mut self, name: &fln::Name) {
+        self.observed = self.observed.saturating_add(1);
+        if self.names.len() < CHECK_OLEAN_MAX_RENDERED_PRIVATE_LOOP_AUXILIARIES {
+            self.names.push(name.clone());
+            return;
+        }
+        let mut greatest = 0;
+        for index in 1..self.names.len() {
+            if self.names[index] > self.names[greatest] {
+                greatest = index;
             }
-            if name < &self.names[greatest] {
-                self.names[greatest] = name.clone();
-            }
+        }
+        if name < &self.names[greatest] {
+            self.names[greatest] = name.clone();
         }
     }
 
@@ -2655,6 +2670,16 @@ impl DecodedPrivateLoopAuxiliaries {
         self.names.sort();
         &self.names
     }
+}
+
+fn is_private_loop_auxiliary(display: &str) -> bool {
+    display.starts_with("_private.") && display.split('.').any(|component| component == "loop")
+}
+
+fn is_core_observables_loop_residual(display: &str) -> bool {
+    CORE_OBSERVABLES_LOOP_RESIDUAL_PREFIXES
+        .iter()
+        .any(|prefix| display.starts_with(prefix))
 }
 
 fn render_private_loop_auxiliary_names_json(
@@ -2705,12 +2730,24 @@ fn render_check_olean_success(
         names: Vec::new(),
     };
     private_loop_auxiliaries.observe(&checked.decoded.constants);
+    let mut core_observables_loop_residuals = DecodedPrivateLoopAuxiliaries {
+        observed: 0,
+        names: Vec::new(),
+    };
+    core_observables_loop_residuals.observe_core_observables_residuals(&checked.decoded.constants);
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
         render_private_loop_auxiliary_names_json(&mut private_loop_auxiliaries)
     } else {
         render_private_loop_auxiliary_names_human(&mut private_loop_auxiliaries)
+    };
+    let core_observables_loop_observed = core_observables_loop_residuals.observed;
+    let core_observables_loop_omitted = core_observables_loop_residuals.omitted();
+    let core_observables_loop_names = if json {
+        render_private_loop_auxiliary_names_json(&mut core_observables_loop_residuals)
+    } else {
+        render_private_loop_auxiliary_names_human(&mut core_observables_loop_residuals)
     };
     let stdout = if json {
         format!(
@@ -2720,6 +2757,7 @@ fn render_check_olean_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -2733,6 +2771,9 @@ fn render_check_olean_success(
             private_loop_observed,
             private_loop_names,
             private_loop_omitted,
+            core_observables_loop_observed,
+            core_observables_loop_names,
+            core_observables_loop_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
@@ -2750,6 +2791,9 @@ fn render_check_olean_success(
                 "decoded _private.loop auxiliaries: {} (reporting only; not a G1 claim)\n",
                 "decoded _private.loop auxiliary names: {}\n",
                 "decoded _private.loop auxiliary names omitted: {}\n",
+                "core-observables .loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "core-observables .loop residual names: {}\n",
+                "core-observables .loop residual names omitted: {}\n",
                 "dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -2764,6 +2808,9 @@ fn render_check_olean_success(
             private_loop_observed,
             private_loop_names,
             private_loop_omitted,
+            core_observables_loop_observed,
+            core_observables_loop_names,
+            core_observables_loop_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
@@ -3102,12 +3149,27 @@ fn render_check_olean_set_success(
     for module in &checked.modules {
         private_loop_auxiliaries.observe(&module.decoded.constants);
     }
+    let mut core_observables_loop_residuals = DecodedPrivateLoopAuxiliaries {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        core_observables_loop_residuals
+            .observe_core_observables_residuals(&module.decoded.constants);
+    }
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
         render_private_loop_auxiliary_names_json(&mut private_loop_auxiliaries)
     } else {
         render_private_loop_auxiliary_names_human(&mut private_loop_auxiliaries)
+    };
+    let core_observables_loop_observed = core_observables_loop_residuals.observed;
+    let core_observables_loop_omitted = core_observables_loop_residuals.omitted();
+    let core_observables_loop_names = if json {
+        render_private_loop_auxiliary_names_json(&mut core_observables_loop_residuals)
+    } else {
+        render_private_loop_auxiliary_names_human(&mut core_observables_loop_residuals)
     };
     let companion_modules = checked
         .modules
@@ -3123,6 +3185,7 @@ fn render_check_olean_set_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
@@ -3138,6 +3201,9 @@ fn render_check_olean_set_success(
             private_loop_observed,
             private_loop_names,
             private_loop_omitted,
+            core_observables_loop_observed,
+            core_observables_loop_names,
+            core_observables_loop_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
@@ -3157,6 +3223,9 @@ fn render_check_olean_set_success(
                 "decoded _private.loop auxiliaries: {} (reporting only; not a G1 claim)\n",
                 "decoded _private.loop auxiliary names: {}\n",
                 "decoded _private.loop auxiliary names omitted: {}\n",
+                "core-observables .loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "core-observables .loop residual names: {}\n",
+                "core-observables .loop residual names omitted: {}\n",
                 "module and declaration dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -3173,6 +3242,9 @@ fn render_check_olean_set_success(
             private_loop_observed,
             private_loop_names,
             private_loop_omitted,
+            core_observables_loop_observed,
+            core_observables_loop_names,
+            core_observables_loop_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,

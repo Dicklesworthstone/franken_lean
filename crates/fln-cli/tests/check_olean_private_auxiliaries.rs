@@ -52,6 +52,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "0",
         "loop",
     ]);
+    let core_observables_loop_residual = fln::Name::from_components([
+        "_private",
+        "Init",
+        "Prelude",
+        "0",
+        "Lean",
+        "Syntax",
+        "getHeadInfo?",
+        "loop",
+        "match_1",
+    ]);
     let proposition_type = fln::Expr::sort(fln::Level::zero());
     let proposition_expr = fln::Expr::const_(proposition.clone(), Vec::new());
     let public_constants = vec![
@@ -60,6 +71,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     ];
     let mut private_constants = public_constants.clone();
     private_constants.push(axiom(private_auxiliary, proposition_expr));
+    private_constants.push(axiom(
+        core_observables_loop_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
 
     let unique = format!(
         "fln-cli-check-olean-private-auxiliaries-{}-{}",
@@ -96,9 +111,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":1"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":2"));
     assert!(json.stdout.contains(
-        "\"decodedPrivateLoopAuxiliaries\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"decodedPrivateLoopAuxiliaries\":{\"observed\":2,"
+    ));
+    assert!(json.stdout.contains(
+        "\"coreObservablesLoopResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains("\"g1Satisfied\":false"));
 
@@ -108,10 +126,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 1 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 2 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
-        "decoded _private.loop auxiliaries: 1 (reporting only; not a G1 claim)"
+        "decoded _private.loop auxiliaries: 2 (reporting only; not a G1 claim)"
     ));
     assert!(human
         .stdout
@@ -119,5 +137,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private.loop auxiliary names omitted: 0"));
+    assert!(human.stdout.contains(
+        "core-observables .loop residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "core-observables .loop residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"
+    ));
+    assert!(human
+        .stdout
+        .contains("core-observables .loop residual names omitted: 0"));
     assert!(human.stdout.contains("G1 satisfied: no"));
 }
