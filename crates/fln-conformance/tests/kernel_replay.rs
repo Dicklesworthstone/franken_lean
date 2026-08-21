@@ -1554,6 +1554,12 @@ fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
 fn module_names_below(root: &Path, module_prefix: Option<&str>) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
     collect_present_oleans(root, &mut paths)?;
+    // REDUNDANT AND KEPT, for the same measured reason as the sort in
+    // `walk_olean_inventory`: the helper's output is already in this order. It
+    // stays because `modules[i]` must be the projection of `oleans[i]`, and that
+    // correspondence is only true while BOTH sides order paths the same way --
+    // so the two sites are a matched pair, and removing one of them alone is the
+    // change that would silently break the pairing.
     paths.sort();
     paths
         .into_iter()
@@ -4797,6 +4803,15 @@ fn walk_olean_inventory(
 ) -> Result<OleanInventory, String> {
     let mut oleans = Vec::new();
     collect_present_oleans(library, &mut oleans)?;
+    // REDUNDANT AND KEPT. `collect_present_oleans` already emits paths in this
+    // exact order -- a depth-first walk with entries sorted by file name within
+    // each directory produces precisely the global path order, measured, because
+    // component-wise path comparison IS lexicographic order on the component
+    // sequence. Deleting this line changes nothing observable, so no test can
+    // kill it; it stays because the order is what this function GUARANTEES to
+    // its caller, and that guarantee should not depend on a helper's internal
+    // choice. Said plainly so a mutation campaign records it as inert rather
+    // than as a surviving mutant somebody ought to chase.
     oleans.sort();
     let modules = module_names_below(library, module_prefix)?;
 
@@ -5252,6 +5267,107 @@ fn many_collisions_are_summarised_without_hiding_how_many() {
         !reason.contains("Fixture.D.Y") && !reason.contains("D.Y.olean"),
         "the fourth collision is claimed to be omitted and appears anyway, so the count and the \
          list disagree about the same message: {reason}"
+    );
+}
+
+/// `collect_present_oleans` is canonical BEFORE any caller sorts it.
+///
+/// **Three sorts, and not one of them could be killed.** The walk's order is
+/// established three times over: once inside the helper, once in
+/// `module_names_below`, once in `walk_olean_inventory`. Every existing
+/// assertion reads the walk's output, which is re-sorted on the way out, so
+/// deleting any single sort leaves every test green -- and the neighbouring
+/// test's doc claimed the opposite until this commit. A declaration that no
+/// mutant can falsify is indistinguishable from one that no longer works.
+///
+/// **This caller is the one that does not re-sort.** It reads the helper
+/// directly, so the innermost sort is the only thing standing between it and
+/// whatever order the filesystem hands back. That makes exactly one of the three
+/// observable; the other two are declared inert where they sit rather than left
+/// looking like escaped mutants.
+///
+/// **What the helper's order is worth.** A depth-first walk with entries sorted
+/// by file name within each directory emits paths in the global path order --
+/// component-wise comparison IS lexicographic order on the component sequence --
+/// so a direct caller can rely on the result being canonical without sorting it
+/// again. That is a contract worth pinning independently of the walk, because
+/// the walk is not its only caller: the empty-segment test reads it to show a
+/// file reaches the projection, and a future one will read it for its order.
+///
+/// **The observation depends on the filesystem, and that is disclosed rather
+/// than assumed.** If `read_dir` happened to return entries already sorted, an
+/// unsorted helper would pass this test. The raw order is read first and
+/// compared; when it cannot distinguish the two implementations the test says so
+/// in a typed line instead of reporting a green that means nothing. On the host
+/// this was written for, `read_dir` returns neither sorted nor creation order.
+#[test]
+fn the_walk_helper_is_canonical_before_any_caller_sorts_it() {
+    const CREATED: [&str; 6] = [
+        "Zeta.olean",
+        "Mid.olean",
+        "Alpha.olean",
+        "Nested/Zulu.olean",
+        "Nested/Alfa.olean",
+        "Algebra/Basic.olean",
+    ];
+    let library = write_inventory_fixture("t6r7-inventory-helper-order-v1", &CREATED);
+
+    // ANTI-VACUITY ON THE FIXTURE: created out of sorted order, or an unsorted
+    // helper could return creation order and satisfy everything below.
+    let mut expected_order = CREATED.to_vec();
+    expected_order.sort_unstable();
+    assert_ne!(
+        CREATED.to_vec(),
+        expected_order,
+        "the fixture must be created OUT of sorted order: {CREATED:?}"
+    );
+
+    // WHAT THE FILESYSTEM ACTUALLY HANDS BACK. Read before the helper, so the
+    // disclosure below is about this tree rather than about a hoped-for one.
+    let raw = fs::read_dir(&library)
+        .unwrap_or_else(|error| panic!("read {}: {error}", library.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("enumerate {}: {error}", library.display()))
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    let mut raw_sorted = raw.clone();
+    raw_sorted.sort();
+    if raw == raw_sorted {
+        println!(
+            "{{\"schema\":\"fln-t6r7-helper-order/1\",\"status\":\"observation_cannot_distinguish\",\
+             \"claims\":\"NOTHING about the helper's sort. This filesystem returned directory \
+             entries already in sorted order, so an unsorted helper would satisfy the assertions \
+             below as well as a sorted one.\"}}"
+        );
+    }
+
+    let mut collected = Vec::new();
+    collect_present_oleans(&library, &mut collected)
+        .unwrap_or_else(|reason| panic!("the fixture must enumerate: {reason}"));
+    assert_eq!(
+        collected.len(),
+        CREATED.len(),
+        "every fixture file must be collected before its order means anything: {collected:?}"
+    );
+
+    // THE CONTRACT: the helper's own output, untouched, IS the canonical order.
+    // Stated as an equality against a sorted copy rather than as `windows(2)`,
+    // because a helper that returned a sorted SUBSET would satisfy the pairwise
+    // form and this one also pins that nothing moved.
+    let mut canonical = collected.clone();
+    canonical.sort();
+    assert_eq!(
+        collected, canonical,
+        "the helper returned paths in an order no caller established. Every caller in this file \
+         re-sorts, so this is the only place the helper's own guarantee is visible -- and a \
+         direct caller that trusted it would silently get filesystem order"
+    );
+    assert!(
+        collected[0].ends_with("Algebra/Basic.olean"),
+        "`Algebra/Basic.olean` sorts first and `Zeta.olean` was created first; the helper is \
+         reporting an order it did not choose: {collected:?}"
     );
 }
 
@@ -6474,10 +6590,25 @@ fn qualification_prepends_unconditionally_which_is_why_the_walk_guard_is_defensi
 /// order would disagree about the corpus while both looking self-consistent.
 ///
 /// **It rests on three separate `sort` calls** -- one in `walk_olean_inventory`,
-/// two inside the helpers it uses -- and nothing asserted any of them. Removing
-/// any one leaves a walk that is still stable per process and no longer
-/// canonical across hosts, which is the failure mode that does not show up until
-/// two machines compare receipts.
+/// two inside the helpers it uses -- and nothing asserted any of them.
+///
+/// **This paragraph used to end "removing any one leaves a walk that is still
+/// stable per process and no longer canonical across hosts", and that is false
+/// of all three.** Measured, not argued: a depth-first walk whose entries are
+/// sorted by file name within each directory emits paths in exactly the order a
+/// global sort of those paths produces, because component-wise path order IS
+/// lexicographic order on the component sequence. So the innermost sort alone
+/// already makes the walk canonical, and either outer sort alone restores the
+/// order if the innermost is gone. Each of the three is individually removable
+/// with no observable change here, and this test would survive all three
+/// single-deletion mutants while its own doc promised they would die.
+///
+/// The one of the three that CAN be made observable is the innermost, through a
+/// caller that does not re-sort;
+/// `the_walk_helper_is_canonical_before_any_caller_sorts_it` is that caller. The
+/// two outer sorts stay as defence in depth and are declared redundant where
+/// they sit, so a mutation campaign records them as known-inert rather than as
+/// escaped mutants.
 ///
 /// **The fixture is created in reverse-sorted order on purpose.** On filesystems
 /// that hand back entries in creation order -- which is common -- an unsorted
