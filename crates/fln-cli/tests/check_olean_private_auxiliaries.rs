@@ -345,6 +345,15 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths emit decodedPrivateAuxiliaryNames",
     );
+    assert_eq!(
+        include_str!("../src/lib.rs")
+            .match_indices(
+                r#"\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}}"#,
+            )
+            .count(),
+        2,
+        "both check-olean JSON render paths emit the decoded-private loop object",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
