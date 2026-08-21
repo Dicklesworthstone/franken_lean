@@ -8647,6 +8647,28 @@ fn sample_whole_mathlib_receipt() -> WholeMathlibReceipt {
     }
 }
 
+/// Cut a row at roughly half its length, on a character boundary.
+///
+/// **`&row[..row.len() / 2]` is a latent panic.** Rust slices strings by BYTE
+/// index and refuses an index that falls inside a character, so the midpoint of
+/// a row containing any multi-byte content may abort with "byte index is not a
+/// char boundary" instead of producing the truncated row the cell wants. It is
+/// safe today only because the sample receipt happens to be pure ASCII -- a
+/// property of the fixture's current contents, not of the format, and one
+/// nothing asserts.
+///
+/// A row legitimately carries whatever a corpus path, a bead name or a family
+/// token contains, and the hostile-field test already proves those are escaped
+/// rather than rejected. So the truncation walks back to the nearest boundary
+/// rather than trusting the halfway point to be one.
+fn truncate_near_half(row: &str) -> String {
+    let mut cut = row.len() / 2;
+    while cut > 0 && !row.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    row[..cut].to_string()
+}
+
 /// Cut a row off immediately after `needle`, so the key is present and only its
 /// value's terminator is missing.
 ///
@@ -8824,6 +8846,59 @@ fn the_whole_mathlib_floors_are_anchored_and_coherent() {
     );
 }
 
+/// Truncating a row never splits a character.
+///
+/// **The hazard is concrete, not theoretical.** `"aé a"` is five bytes and its
+/// midpoint, byte two, lands inside the `é` -- so `&row[..row.len() / 2]` on a
+/// row shaped like that aborts rather than truncating. I checked that case
+/// before claiming it: several plausible multi-byte strings DO have a boundary
+/// at their midpoint, so "contains non-ASCII" is not sufficient to trigger it
+/// and the failure would arrive only for some contents.
+///
+/// The round-trip cell that truncates is meant to test the reader's response to
+/// a cut row. If the cut itself panicked, the cell would fail with an arithmetic
+/// complaint about indices and say nothing about the reader at all.
+#[test]
+fn truncating_a_row_never_splits_a_character() {
+    for row in [
+        "aé a",
+        "café au lait",
+        "{\"schema\":\"x\",\"bead\":\"franken–lean\"}",
+        "",
+        "x",
+        "ありがとう",
+    ] {
+        let cut = truncate_near_half(row);
+        assert!(
+            row.starts_with(&cut),
+            "the truncation must be a prefix of the row: {cut:?} of {row:?}"
+        );
+        assert!(
+            cut.len() <= row.len() / 2,
+            "the truncation must not grow the row: {cut:?} of {row:?}"
+        );
+        // THE REAL PROPERTY, and my first attempt at it was vacuous: I wrote a
+        // UTF-8 round trip, which a `String` passes by construction because it
+        // is already valid UTF-8. What matters is where the cut LANDS -- the
+        // slice would have panicked before ever producing a String to check.
+        assert!(
+            row.is_char_boundary(cut.len()),
+            "the cut fell inside a character of {row:?} at byte {}",
+            cut.len()
+        );
+    }
+
+    // ANTI-VACUITY: at least one case must actually need the walk-back, or this
+    // test is a list of strings whose midpoints were already boundaries.
+    let needs_walkback = ["aé a", "ありがとう"]
+        .iter()
+        .any(|row| !row.is_char_boundary(row.len() / 2));
+    assert!(
+        needs_walkback,
+        "no case here has a midpoint inside a character, so nothing exercises the walk-back"
+    );
+}
+
 /// The schema NAME is the retained contract, and its value was pinned nowhere.
 ///
 /// **Producer and reader both read the constant, so the value is unconstrained.**
@@ -8900,7 +8975,7 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         // lands wherever half the row happens to be, so which field goes missing
         // is not a property worth pinning. It asserts only that SOMETHING was
         // missing, which is all a random truncation can honestly claim.
-        ("truncated", row[..row.len() / 2].to_string(), "missing"),
+        ("truncated", truncate_near_half(&row), "missing"),
         (
             "field dropped",
             row.replace(",\"wall_ms\":11000000", ""),
