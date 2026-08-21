@@ -4886,6 +4886,115 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// Every NON-ANSWER token the lane can actually produce is a legal family too,
+/// including the one that is COMPOSED out of another enum.
+///
+/// **The half of the token law that was never closed.**
+/// `every_kernel_rejection_class_yields_a_legal_family_token` walks all 17
+/// `RejectClass` variants and the two `context:` reasons. It says nothing about
+/// the `inconclusive:` family, which is the other side of the census and the
+/// side whose tokens are not constants: `resource_usage_facts` builds
+/// `inconclusive:StructuralBudget:<unit>` by interpolating a second enum's name
+/// into the token.
+///
+/// **That composition is exactly what the delimiter rule exists for.** A family
+/// token is serialized as `token=count` and joined with `,`. Every other token in
+/// the system is a fixed identifier, so the rule looks like paranoia -- but this
+/// one's tail comes from `StructuralUnit`, and the day a unit is added whose
+/// evidence name carries a comma or an equals sign, every census row containing
+/// that family is re-read as different families with different counts, silently.
+/// The rule was written for this case and had never been pointed at it.
+///
+/// **The tokens come from the production function, not from a re-derivation.**
+/// `resource_usage_facts` is what the lane calls, so what is checked is the
+/// string the lane would actually write. A test that rebuilt the token from its
+/// parts would agree with itself and prove nothing. The `match` is exhaustive
+/// with no wildcard, so a new `ResourceReason` stops the build here, and the
+/// structural units come from `StructuralUnit::ALL` rather than a hand-list.
+///
+/// **What this does NOT enumerate, said plainly so the count above is not read
+/// as the whole population.** `verdict_facts` also emits
+/// `inconclusive:Cancelled`, `inconclusive:DependencyUnavailable` and
+/// `inconclusive:AuthorityIncomplete` from `InconclusiveCause`. Those three are
+/// fixed identifiers with no interpolated tail, so they cannot acquire a
+/// delimiter the way the composed token can, and they are not built here. The
+/// compile-time completeness this test buys is over `ResourceReason` and
+/// `StructuralUnit` only.
+#[test]
+fn every_non_answer_outcome_yields_a_legal_family_token() {
+    let mut tokens = Vec::new();
+    for reason in [
+        ResourceReason::Heartbeats {
+            consumed: 3,
+            limit: 2,
+        },
+        ResourceReason::ExecutionSteps,
+        ResourceReason::RecursionDepth { limit: 7 },
+        ResourceReason::Cancelled,
+        ResourceReason::Memory { limit_bytes: 11 },
+    ] {
+        // COMPILE-TIME COMPLETENESS: no wildcard, so a new variant is a build
+        // error here rather than an untested family token.
+        match reason {
+            ResourceReason::Heartbeats { .. }
+            | ResourceReason::ExecutionSteps
+            | ResourceReason::RecursionDepth { .. }
+            | ResourceReason::Cancelled
+            | ResourceReason::Memory { .. }
+            | ResourceReason::StructuralBudget { .. } => {}
+        }
+        let usage = ResourceUsage {
+            reason,
+            allowed: 64,
+            observed: 65,
+        };
+        tokens.push(resource_usage_facts(&usage).0);
+    }
+    // The composed family, over the registered units rather than a hand-list.
+    assert!(
+        !StructuralUnit::ALL.is_empty(),
+        "an empty unit registry would make the composed family vacuous"
+    );
+    for unit in StructuralUnit::ALL {
+        let usage = ResourceUsage {
+            reason: ResourceReason::StructuralBudget { unit },
+            allowed: 64,
+            observed: 65,
+        };
+        tokens.push(resource_usage_facts(&usage).0);
+    }
+    // The two remaining non-answer shapes the replay can record.
+    tokens.push("internal_fault".to_string());
+
+    assert_eq!(
+        tokens.len(),
+        6 + StructuralUnit::ALL.len(),
+        "the resource-derived non-answer population changed size without this test noticing"
+    );
+
+    for token in &tokens {
+        if let Err(reason) = check_family_token(token, FamilyDirection::NoAnswer) {
+            panic!(
+                "the lane can record `{token}` as a non-answer, but the census would refuse it: \
+                 {reason}"
+            );
+        }
+        assert!(
+            check_family_token(token, FamilyDirection::Restrictive).is_err(),
+            "`{token}` was accepted as a RESTRICTIVE family. A non-answer counted as a D23 \
+             finding would report a budget exhaustion as a kernel divergence"
+        );
+    }
+
+    // The composed token really is composed -- if this stops holding, the case
+    // this test exists for has quietly disappeared and the rest is a formality.
+    assert!(
+        tokens.iter().any(|token| token.matches(':').count() >= 2),
+        "no token carries a composed tail any more, so the delimiter rule is no longer being \
+         exercised against interpolated content: {tokens:?}"
+    );
+}
+
 /// `oleans` and `modules` are PARALLEL: `modules[i]` is the projection of
 /// `oleans[i]`, and the extension match is exact.
 ///
