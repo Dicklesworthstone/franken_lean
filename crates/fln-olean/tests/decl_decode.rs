@@ -3587,3 +3587,201 @@ fn the_third_shape_links_are_pairs_and_never_chains() {
          71 are not independent, and the other 55 are"
     );
 }
+
+/// The 157 array elements are (Name, Name, Expr) triples.
+///
+/// BOTH OPTIONS ARE STILL IMPOSSIBLE and this is the fifth wave to offer one of
+/// them. The head records are `tag 0` ARITY 5, so there is no slot 5 - pinned
+/// at `2475a62f`, and `8ca067f9` read slot 4, the last one. The 11 tag-4
+/// objects have no head records at all, because `9d365d6a` pins that not one of
+/// them has a pointer head. Repeating the reasons rather than quietly
+/// substituting work is the only way the log stays honest about what was asked.
+///
+/// So this opens the one thing I could still name as unread: `3b510e62`
+/// counted 157 elements across the 69 slot-2 arrays and never looked inside
+/// them.
+///
+/// Every element is the same three-field shape, and the three fields go to the
+/// PRODUCTION decoders rather than to a shape comparison: slots 0 and 1 to
+/// `decode_name`, slot 2 to `decode_expr`, 471 decodes in all. That is the
+/// instrument that identified the `Expr.const` declNames at `aec3efd1` and the
+/// binder names at `c7836115`, and it is the difference between the bytes
+/// agreeing with themselves and the decoder agreeing with the bytes.
+///
+/// Slot 1 admits BOTH name link constructors, 97 and 60, and slot 2 admits six
+/// expression shapes. A field that varies is holding real values; the uniform
+/// slot 0 is the one that would look the same if it held a repeated constant,
+/// which is why the varying ones are worth counting separately.
+///
+/// The 157 references reach 111 distinct objects. That is the third
+/// reference-versus-object gap in this structure, after `2475a62f`'s 71-and-69
+/// and `c7836115`'s 69-and-52, and by now it should be assumed rather than
+/// discovered: a compacted region shares every structurally identical subterm,
+/// so a count of references is never a count of objects until it has been
+/// deduplicated.
+///
+/// No size is asserted, and no type, extension or schema is named.
+#[test]
+fn the_slot_two_array_elements_are_name_name_expr_triples() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut arrays = 0usize;
+    let mut elements = 0usize;
+    let mut boxed_elements = 0usize;
+    let mut distinct: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut element_shapes: BTreeSet<(u8, u8)> = BTreeSet::new();
+    let mut names_decoded = 0usize;
+    let mut exprs_decoded = 0usize;
+    let mut second_names: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut third_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let head = resolve(word_at(bytes, object.off + 8));
+            if head.and_then(|h| at.get(&h)).map(|h| (h.tag, h.other)) == Some((0, 5))
+                && let Some(head) = head
+            {
+                records.insert(head);
+            }
+        }
+
+        for record in records {
+            arrays += 1;
+            let array = resolve(word_at(bytes, record + 8 + 8 * 2)).expect("slot 2 is an array");
+            let length = word_at(bytes, array + 8);
+            for i in 0..length {
+                elements += 1;
+                let word = word_at(bytes, array + 24 + 8 * i as usize);
+                let Some(off) = resolve(word) else {
+                    boxed_elements += 1;
+                    continue;
+                };
+                let element = at.get(&off).expect("resolved above");
+                element_shapes.insert((element.tag, element.other));
+                distinct.insert((index, off));
+
+                // Field 0 and field 1 to `decode_name`; field 2 to `decode_expr`.
+                for slot in 0..2usize {
+                    let field = word_at(bytes, off + 8 + 8 * slot);
+                    DeclDecoder::new(&view, WalkBudget::default())
+                        .decode_name(field)
+                        .unwrap_or_else(|e| {
+                            panic!("{module}: element field {slot} must decode as a Name: {e}")
+                        });
+                    names_decoded += 1;
+                    if slot == 1
+                        && let Some(link) = resolve(field)
+                    {
+                        let link = at.get(&link).expect("resolved above");
+                        *second_names
+                            .entry(format!("tag {} arity {}", link.tag, link.other))
+                            .or_default() += 1;
+                    }
+                }
+                let third = word_at(bytes, off + 8 + 8 * 2);
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_expr(third)
+                    .unwrap_or_else(|e| {
+                        panic!("{module}: element field 2 must decode as an Expr: {e}")
+                    });
+                exprs_decoded += 1;
+                if let Some(expression) = resolve(third) {
+                    let expression = at.get(&expression).expect("resolved above");
+                    *third_shapes
+                        .entry(format!("tag {} arity {}", expression.tag, expression.other))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(arrays, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(arrays, 69, "one slot-2 array per distinct head record");
+    assert_eq!(
+        elements, 157,
+        "the elements `3b510e62` counted and never opened"
+    );
+    assert_eq!(boxed_elements, 0, "every element is a pointer");
+    assert_eq!(
+        distinct.len(),
+        111,
+        "reaching 111 distinct objects - the third reference-versus-object gap \
+         in this structure, after 71-and-69 and 69-and-52"
+    );
+    assert_eq!(
+        element_shapes.into_iter().collect::<Vec<_>>(),
+        vec![(0, 3)],
+        "and every one is the same three-field shape"
+    );
+
+    // The production decoders, not shape comparisons.
+    assert_eq!(
+        names_decoded, 314,
+        "two names per element, every one accepted by `decode_name`"
+    );
+    assert_eq!(
+        exprs_decoded, 157,
+        "and one expression per element, accepted by `decode_expr`"
+    );
+    assert_eq!(
+        second_names.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 2".to_owned(), 97),
+            ("tag 2 arity 2".to_owned(), 60)
+        ],
+        "the second name admits BOTH link constructors, so it holds real names \
+         rather than a repeated constant"
+    );
+    assert_eq!(
+        third_shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 1".to_owned(), 61),
+            ("tag 10 arity 2".to_owned(), 2),
+            ("tag 3 arity 1".to_owned(), 30),
+            ("tag 4 arity 2".to_owned(), 23),
+            ("tag 5 arity 2".to_owned(), 16),
+            ("tag 7 arity 3".to_owned(), 25),
+        ],
+        "and the expression admits six shapes"
+    );
+}
