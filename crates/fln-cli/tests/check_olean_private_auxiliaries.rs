@@ -1878,6 +1878,20 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
+    let human_dependency_order_derived = match human_line_suffix(
+        &human.stdout,
+        "dependency order: ",
+    ) {
+        "derived" => true,
+        status => panic!("human dependency-order status is derived: {status}"),
+    };
+    assert_eq!(
+        human_dependency_order_derived,
+        json_bool_field(&json.stdout, "dependencyOrderDerived"),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
+    );
     assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
         &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
