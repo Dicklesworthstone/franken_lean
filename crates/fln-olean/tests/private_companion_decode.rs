@@ -191,6 +191,11 @@ const ARRAY_FOLDL_ATTACH_SIMP_1_1: &str =
     "_private.Init.Data.Array.Attach.0.Array.foldl_attach._simp_1_1";
 /// The module whose private array owns the generated simp theorem at the pin.
 const ARRAY_FOLDL_ATTACH_SIMP_1_1_MODULE: &str = "Init/Data/Array/Attach";
+/// The distinct generated simp theorem for `Array.foldr_attach`.
+const ARRAY_FOLDR_ATTACH_SIMP_1_1: &str =
+    "_private.Init.Data.Array.Attach.0.Array.foldr_attach._simp_1_1";
+/// The pin's private array stores this sibling theorem in the attach module.
+const ARRAY_FOLDR_ATTACH_SIMP_1_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -969,6 +974,36 @@ fn array_foldl_attach_simp_theorem_is_decoded_from_its_private_storage_module() 
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_FOLDL_ATTACH_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_foldr_attach_simp_theorem_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_foldr_attach_simp_theorem_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_FOLDR_ATTACH_SIMP_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_FOLDR_ATTACH_SIMP_1_1.to_owned()),
+        "the private companion of {ARRAY_FOLDR_ATTACH_SIMP_1_1_MODULE} must retain \
+         {ARRAY_FOLDR_ATTACH_SIMP_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_FOLDR_ATTACH_SIMP_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_FOLDR_ATTACH_SIMP_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_FOLDR_ATTACH_SIMP_1_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
