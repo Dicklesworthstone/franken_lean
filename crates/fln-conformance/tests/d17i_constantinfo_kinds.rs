@@ -6156,3 +6156,114 @@ fn the_server_part_adds_documentation_extensions_and_no_declarations() {
         );
     }
 }
+
+/// `(module, shared declarations, kind changes, Axiom→Defn, Axiom→Thm,
+/// Axiom→Opaque)`.
+const LEVEL_TRANSITION_ROWS: &[(&str, usize, usize, usize, usize, usize)] = &[
+    ("Init.Prelude", 2204, 246, 86, 148, 12),
+    ("Init.Meta.Defs", 379, 197, 165, 16, 16),
+    ("Init.Data.List.Basic", 791, 228, 20, 208, 0),
+];
+
+/// Changing which part you read cannot change what a declaration MEANS — the
+/// soundness content of the part-selection repair, never asserted.
+///
+/// The kind cell above establishes that the private read does not rewrite kinds
+/// wholesale and that no name is lost. Both are about the NAME set and the kind
+/// tag. Neither says anything about the declaration's TYPE, and the type is the
+/// whole of what a declaration asserts. A part selection that silently altered
+/// types would satisfy every cell in this file and would be a soundness defect
+/// rather than a restrictive one — the opposite direction from everything else
+/// d17i collects, and the direction that actually matters.
+///
+/// Measured over three modules, 3,374 declarations present in both parts:
+///
+///   ZERO have a different `type_` — compared structurally, not by hash
+///   ZERO have different `level_params`
+///   671 change kind, and EVERY ONE of them is from `Axiom`. Not one
+///     declaration changes between two kinds that both carry a value
+///
+/// So the exported part postulates and the private part supplies, and that is
+/// the only thing that ever differs. `Axiom → Defn`, `Axiom → Thm` and
+/// `Axiom → Opaque` all occur, in proportions that differ sharply per module —
+/// `Init.Data.List.Basic` has 208 theorems restored and no opaques at all,
+/// while `Init.Meta.Defs` is mostly definitions. The zero in that row is
+/// asserted as a zero, so a decode that started producing opaques there fails.
+#[test]
+fn reading_the_private_part_changes_bodies_and_never_types() {
+    let lib = lib_or_skip!();
+
+    for (module, shared_count, changed_count, to_defn, to_thm, to_opaque) in LEVEL_TRANSITION_ROWS {
+        let (exported, _) = decode_at(&lib, module, Level::Exported);
+        let (private, _) = decode_at(&lib, module, Level::Private);
+
+        let private_by_name: BTreeMap<String, &ConstantInfo> = private
+            .iter()
+            .map(|info| (info.name().to_display_string(), info))
+            .collect();
+
+        let mut shared = 0usize;
+        let mut retyped: Vec<String> = Vec::new();
+        let mut relevelled: Vec<String> = Vec::new();
+        let mut transitions: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        let mut not_from_axiom: Vec<(String, &str, &str)> = Vec::new();
+        for before in &exported {
+            let name = before.name().to_display_string();
+            let Some(after) = private_by_name.get(&name) else {
+                continue;
+            };
+            shared += 1;
+
+            if before.constant_val().type_ != after.constant_val().type_ {
+                retyped.push(name.clone());
+            }
+            if before.constant_val().level_params != after.constant_val().level_params {
+                relevelled.push(name.clone());
+            }
+            let (from, to) = (kind_of(before), kind_of(after));
+            if from != to {
+                *transitions.entry((from, to)).or_default() += 1;
+                if from != "Axiom" {
+                    not_from_axiom.push((name, from, to));
+                }
+            }
+        }
+
+        assert!(
+            retyped.is_empty(),
+            "{module}: the private part must not change a declaration's type; these differ: {:?}",
+            &retyped[..retyped.len().min(8)]
+        );
+        assert!(
+            relevelled.is_empty(),
+            "{module}: nor its universe parameters: {:?}",
+            &relevelled[..relevelled.len().min(8)]
+        );
+        assert!(
+            not_from_axiom.is_empty(),
+            "{module}: every kind change is a postulate being supplied, so nothing may change \
+             between two kinds that both carry a value: {not_from_axiom:?}"
+        );
+
+        assert_eq!(shared, *shared_count, "{module}: shared declaration census");
+        let count = |to: &str| transitions.get(&("Axiom", to)).copied().unwrap_or_default();
+        assert_eq!(
+            (
+                transitions.values().sum::<usize>(),
+                count("Defn"),
+                count("Thm"),
+                count("Opaque")
+            ),
+            (*changed_count, *to_defn, *to_thm, *to_opaque),
+            "{module}: the transition census, including the zeros"
+        );
+        // Non-vacuity: the comparison must be against a real population, and
+        // the unchanged majority is what makes "zero retyped" meaningful rather
+        // than a consequence of nothing being shared.
+        assert!(
+            *changed_count < shared,
+            "{module}: most shared declarations keep their kind, so the type comparison runs \
+             over declarations that did NOT change as well"
+        );
+    }
+}
