@@ -102,6 +102,9 @@ the toolchain would report a perfect facade:
   * A MANIFEST-OUTCOME TOTAL JOIN makes the manifest summary's demanded outcome
     counts equal the declaration rows it summarizes. A stale aggregate cannot
     conceal an omitted emitted, Init, or quarantined demanded row.
+  * A LEVEL-PARAMETER JOIN requires every universe parameter carried into a
+    demanded typed probe to occur in its Reference signature. The probe cannot
+    invent a stale universe binder that the signature no longer uses.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -422,11 +425,13 @@ def join_demanded_rows(names, manifest_rows):
     provider_dependency_mismatches = []
     type_dependency_shape_mismatches = []
     signature_provenance_mismatches = []
+    level_parameter_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
     printer_join = Counter()
     type_dependency_join = Counter()
+    level_parameter_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -450,7 +455,22 @@ def join_demanded_rows(names, manifest_rows):
                     f"{name}(printer={printer!r}, level_params={level_params!r})"
                 )
                 continue
+            signature = row["signature"]
+            unused_levels = [
+                level for level in level_params
+                if not re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(level)}(?![A-Za-z0-9_])",
+                    signature,
+                )
+            ]
+            if unused_levels:
+                level_parameter_mismatches.append(
+                    f"{name}(unused-levels={unused_levels!r})"
+                )
+                continue
             printer_join[printer] += 1
+            level_parameter_join["rows"] += 1
+            level_parameter_join["parameters"] += len(level_params)
             if (not isinstance(type_deps, list)
                     or not all(isinstance(dep, str) and dep for dep in type_deps)
                     or len(type_deps) != len(set(type_deps))
@@ -503,7 +523,8 @@ def join_demanded_rows(names, manifest_rows):
         emission_join["emitted" if expected_emitted else "not_emitted"] += 1
     if (unclassified or signatureless or role_mismatches or emission_mismatches
             or provider_mismatches or provider_dependency_mismatches
-            or signature_provenance_mismatches or type_dependency_shape_mismatches):
+            or signature_provenance_mismatches or type_dependency_shape_mismatches
+            or level_parameter_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -527,13 +548,18 @@ def join_demanded_rows(names, manifest_rows):
             details.append("type-dependency-shape=" + ", ".join(
                 type_dependency_shape_mismatches[:8]
             ))
+        if level_parameter_mismatches:
+            details.append("level-parameter=" + ", ".join(
+                level_parameter_mismatches[:8]
+            ))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
         )
     return (dispositions, dict(sorted(roles.items())),
             dict(sorted(emission_join.items())), dict(sorted(provider_join.items())),
-            dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())))
+            dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())),
+            dict(sorted(level_parameter_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -830,7 +856,8 @@ def main():
 
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
-     demand_printers, demand_type_dependencies) = join_demanded_rows(
+     demand_printers, demand_type_dependencies,
+     demand_level_parameters) = join_demanded_rows(
          demand_names, manifest_rows
      )
     type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
@@ -968,6 +995,7 @@ def main():
         "demanded_provider_join": demand_providers,
         "demanded_signature_printer_join": demand_printers,
         "demanded_type_dependency_join": demand_type_dependencies,
+        "demanded_level_parameter_join": demand_level_parameters,
         "type_dependency_target_join": type_dependency_target_join,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
