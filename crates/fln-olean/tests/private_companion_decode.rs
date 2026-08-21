@@ -488,8 +488,9 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
         ("_unary", family::unary),
         ("_sunfold", family::sunfold),
     ];
-    let mut representatives: [Option<(String, String)>; 11] =
-        [None, None, None, None, None, None, None, None, None, None, None];
+    let mut representatives: [Option<(String, String)>; 11] = [
+        None, None, None, None, None, None, None, None, None, None, None,
+    ];
 
     for relative in init_chain_modules(&lib) {
         let chain = chain_bytes(&lib, &relative);
