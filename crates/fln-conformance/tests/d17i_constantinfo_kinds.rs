@@ -11871,3 +11871,79 @@ fn the_iota_rules_cover_every_constructor_and_three_of_them_twice() {
         "no constructor is reached more than twice"
     );
 }
+
+/// The rules' `nfields` sum to the field census plus the doubly-ruled
+/// constructors' own fields.
+///
+/// Each rule's `nfields` is already checked against its constructor's
+/// `num_fields`, and the field census is already pinned at 229. Nothing sums
+/// the rule side. It comes to 232, and the difference is exactly the fields of
+/// the three constructors the previous cell found covered twice: `Array.mk`
+/// with one, `List.cons` with two, `List.nil` with none.
+///
+/// A COINCIDENCE THAT WOULD HIDE A WRONG MODEL. Those field counts sum to 3,
+/// which is also the number of extra RULES. So "232 = 229 + 3" is satisfied
+/// equally by "one field per extra rule", which is false — `List.nil` adds a
+/// rule and no field, `List.cons` adds one rule and two. The cell therefore
+/// derives the correction from the three constructors' own `num_fields` and
+/// asserts those three values, so the two models are distinguished rather than
+/// both passing.
+///
+/// Conservation runs first: the rule sum must equal the census plus the
+/// correction before any figure is pinned.
+#[test]
+fn the_rule_field_counts_sum_to_the_census_plus_the_doubly_ruled() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut fields: BTreeMap<String, u32> = BTreeMap::new();
+    let mut rule_fields = 0usize;
+    let mut rules = 0usize;
+    for info in &infos {
+        match info {
+            ConstantInfo::Ctor(v) => {
+                fields.insert(info.name().to_display_string(), v.num_fields);
+            }
+            ConstantInfo::Rec(v) => {
+                for rule in &v.rules {
+                    rules += 1;
+                    rule_fields += rule.nfields as usize;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let census: usize = fields.values().map(|count| *count as usize).sum();
+    let correction: usize = DOUBLY_RULED_CONSTRUCTORS
+        .iter()
+        .map(|name| {
+            *fields
+                .get(*name)
+                .unwrap_or_else(|| panic!("{name} must be a decoded constructor"))
+                as usize
+        })
+        .sum();
+
+    // Conservation first.
+    assert_eq!(
+        rule_fields,
+        census + correction,
+        "the rules' nfields must sum to the field census plus the doubly-ruled fields"
+    );
+    assert_eq!(
+        (rules, rule_fields, census, correction),
+        (160, 232, 229, 3),
+        "the rule and field censuses this row is stated against"
+    );
+
+    // The three field counts, so "plus one per extra rule" cannot pass instead.
+    assert_eq!(
+        DOUBLY_RULED_CONSTRUCTORS
+            .iter()
+            .map(|name| fields[*name])
+            .collect::<Vec<u32>>(),
+        vec![1, 2, 0],
+        "the correction is these fields, not one per extra rule — they only sum alike"
+    );
+}
