@@ -8385,3 +8385,187 @@ fn the_identified_shapes_are_not_unique() {
         "each shape needs a population before its uniqueness can be tested"
     );
 }
+
+/// The triples' SECOND name field, read at last - and it is nothing like the
+/// first.
+///
+/// `c0a4f175` pinned field 1 by constructor - 61 and 50 over the 111 distinct
+/// triples - and never read a name. I named this set as unopened in that
+/// commit's own bead comment and then spent four waves on audits instead. This
+/// opens it.
+///
+/// UNITS FIRST, since `88fb5754` was a whole wave lost to leaving them
+/// implicit. The 51 and the 20 count DISTINCT OBJECTS; the 61, 50 and 111 count
+/// USES, one per distinct triple. Both bases appear here on purpose, and both
+/// are named in every assertion that carries them.
+///
+/// FIELD 1 IS NOT FIELD 0, in every dimension available:
+///
+///                     field 0 (`3373af3b`)      field 1 (here)
+///   distinct objects  31                        51
+///   distinct roots    ONE, `_uniq`              20
+///   link kinds        one - numbered only       both, 61 and 50
+///   components        all two                   61 one, 50 two
+///
+/// THE COMPONENT COUNT TRACKS THE LINK KIND EXACTLY - 61 single-component and
+/// 61 string links, 50 two-component and 50 numbered links. That is not
+/// automatic: a string link may carry a multi-component prefix and a numbered
+/// link may sit on the anonymous name, so both correlations could have failed
+/// and neither does.
+///
+/// This comparison has discriminating power, which is the check `f2da5b0e`
+/// added and which I now run before claiming a difference: field 1's root count
+/// is 20, so "one root like field 0" was reachable and is not what the corpus
+/// says.
+///
+/// THE SPELLINGS ARE THE FRAGILE PART, flagged as at `aec3efd1` and `3373af3b`.
+/// The 20 roots come from reading string payloads with the walker in this file,
+/// which I have had to correct once. The counts of DISTINCT roots and the
+/// correlations above do not depend on any byte of that decoding being right.
+#[test]
+fn the_triple_second_field_names() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut objects_seen: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut uses = 0usize;
+    let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut components: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    let mut correlated = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        // Arrays deduplicated, then triples deduplicated - the `c0a4f175` basis.
+        let mut arrays: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                arrays.insert(array);
+            }
+        }
+        let mut triples: BTreeSet<usize> = BTreeSet::new();
+        for array in arrays {
+            for i in 0..word_at(bytes, array + 8) {
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                    && shape(element) == Some((0, 3))
+                {
+                    triples.insert(element);
+                }
+            }
+        }
+
+        for triple in triples {
+            let word = word_at(bytes, triple + 8 + 8);
+            let link = resolve(word).expect("field 1 is a pointer");
+            uses += 1;
+            objects_seen.insert((index, link));
+
+            let object = at.get(&link).expect("resolved above");
+            let kind = format!("tag {} arity {}", object.tag, object.other);
+            *kinds.entry(kind.clone()).or_default() += 1;
+
+            // Components, from the production decoder's rendering.
+            let name = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(word)
+                .unwrap_or_else(|e| panic!("{module}: field 1 must be a Name: {e}"))
+                .to_display_string();
+            let parts = name.split('.').count();
+            *components.entry(parts).or_default() += 1;
+            roots.insert(name.split('.').next().unwrap_or_default().to_owned());
+
+            // The correlation: one component with a string link, two with a
+            // numbered link. Neither is automatic.
+            if (parts == 1) == (object.tag == 1) {
+                correlated += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(uses, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // DISTINCT OBJECTS.
+    assert_eq!(
+        objects_seen.len(),
+        51,
+        "distinct field-1 name OBJECTS - the 51 `c0a4f175` pins"
+    );
+    assert_eq!(
+        roots.len(),
+        20,
+        "and 20 distinct root components among them, against field 0's ONE"
+    );
+
+    // USES, one per distinct triple.
+    assert_eq!(uses, 111, "USES, one per distinct triple");
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 2".to_owned(), 61),
+            ("tag 2 arity 2".to_owned(), 50),
+        ],
+        "by link kind, per use - the 61 and 50 `c0a4f175` pins, so this cell \
+         reconciles with a landed total on the same basis"
+    );
+    assert_eq!(
+        components.into_iter().collect::<Vec<_>>(),
+        vec![(1, 61), (2, 50)],
+        "and by component count, per use"
+    );
+    assert_eq!(
+        correlated, uses,
+        "the component count tracks the link kind EXACTLY - a string link may \
+         carry a multi-component prefix and a numbered link may sit on the \
+         anonymous name, so both correlations could have failed and neither \
+         does"
+    );
+
+    // Discriminating power, checked before the difference is claimed.
+    assert!(
+        roots.len() > 1,
+        "field 1 having many roots is only a difference from field 0 if more \
+         than one root was reachable here"
+    );
+}
