@@ -1717,6 +1717,16 @@ def main():
             "REFUSE: facade manifest cycle-residue pin diverges "
             f"({json.dumps(cycle_residue_pin_join, sort_keys=True)})"
         )
+    structural_refused_pin_join = {
+        "summary_structural_refused": manifest_summary.get("structural_refused"),
+        "pinned_structural_refused": 30,
+    }
+    if (structural_refused_pin_join["summary_structural_refused"]
+            != structural_refused_pin_join["pinned_structural_refused"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-refusal pin diverges "
+            f"({json.dumps(structural_refused_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2801,6 +2811,7 @@ def main():
         "manifest_kernel_special_as_axiom_pin_join": kernel_special_as_axiom_pin_join,
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
+        "manifest_structural_refused_pin_join": structural_refused_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
