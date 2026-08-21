@@ -8077,6 +8077,31 @@ fn a_carve_out_matches_one_whole_declaration_name_and_nothing_else() {
          would excuse the wrong declaration"
     );
 
+    // CASE ALONE MUST MISS, and this pair is the only thing here that says so.
+    // Every miss below differs from a planted name by more than case, so a
+    // lookup written with `eq_ignore_ascii_case` returns exactly what `==`
+    // returns on all of them and cannot be told apart. Measured over the whole
+    // list before these two were added.
+    //
+    // The harm is not hypothetical in this repository's subject matter: `List`
+    // and `list` are both real Lean namespaces -- the lowercase one is the Lean 3
+    // spelling -- so a case-blind lookup would let one reviewed row excuse a
+    // DIFFERENT declaration, which is precisely what the message below warns
+    // about.
+    for variant in ["list.map", "LIST.MAP"] {
+        assert!(
+            PLANTED
+                .iter()
+                .any(|row| row.declaration.eq_ignore_ascii_case(variant)),
+            "`{variant}` must differ from a planted name by CASE ALONE, or it is an ordinary miss \
+             and distinguishes nothing"
+        );
+        assert!(
+            !PLANTED.iter().any(|row| row.declaration == variant),
+            "`{variant}` must not BE a planted name, or the miss below is asking for a hit"
+        );
+    }
+
     // Misses, in both directions.
     for absent in [
         "List",          // a PREFIX of a planted name
@@ -8084,6 +8109,8 @@ fn a_carve_out_matches_one_whole_declaration_name_and_nothing_else() {
         "List.mapA",     // shares a prefix, matches neither
         "Array.map",     // unrelated
         "",              // empty
+        "list.map",      // differs by CASE alone
+        "LIST.MAP",      // and again, the other way
     ] {
         assert!(
             carve_out_in(PLANTED, absent).is_none(),
