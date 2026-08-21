@@ -3763,6 +3763,9 @@ def main():
     transparent_declarations_field_sets_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
     if (not isinstance(transparent_declarations_field_sets_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_declarations_field_sets_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_declarations_field_sets_inequality_join["summary_field_sets_checked"], int) or isinstance(transparent_declarations_field_sets_inequality_join["summary_field_sets_checked"], bool) or transparent_declarations_field_sets_inequality_join["summary_transparent_declarations"] <= transparent_declarations_field_sets_inequality_join["summary_field_sets_checked"]):
         raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed field-set count " + json.dumps(transparent_declarations_field_sets_inequality_join, sort_keys=True))
+    private_names_structural_refused_inequality_join = {"summary_private_name_rows": manifest_summary.get("private_name_rows"), "summary_structural_refused": manifest_summary.get("structural_refused")}
+    if (not isinstance(private_names_structural_refused_inequality_join["summary_private_name_rows"], int) or isinstance(private_names_structural_refused_inequality_join["summary_private_name_rows"], bool) or not isinstance(private_names_structural_refused_inequality_join["summary_structural_refused"], int) or isinstance(private_names_structural_refused_inequality_join["summary_structural_refused"], bool) or private_names_structural_refused_inequality_join["summary_private_name_rows"] <= private_names_structural_refused_inequality_join["summary_structural_refused"]):
+        raise SystemExit("REFUSE: facade manifest private-name row count must exceed structural-refusal count " + json.dumps(private_names_structural_refused_inequality_join, sort_keys=True))
     demanded_field_sets_inequality_join = {"summary_demanded": manifest_summary.get("demanded"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
     if (not isinstance(demanded_field_sets_inequality_join["summary_demanded"], int) or isinstance(demanded_field_sets_inequality_join["summary_demanded"], bool) or not isinstance(demanded_field_sets_inequality_join["summary_field_sets_checked"], int) or isinstance(demanded_field_sets_inequality_join["summary_field_sets_checked"], bool) or demanded_field_sets_inequality_join["summary_demanded"] <= demanded_field_sets_inequality_join["summary_field_sets_checked"]):
         raise SystemExit("REFUSE: facade manifest demand count must exceed field-set count " + json.dumps(demanded_field_sets_inequality_join, sort_keys=True))
@@ -6057,6 +6060,9 @@ def main():
         ),
         "manifest_transparent_declarations_field_sets_inequality_join": (
             transparent_declarations_field_sets_inequality_join
+        ),
+        "manifest_private_names_structural_refused_inequality_join": (
+            private_names_structural_refused_inequality_join
         ),
         "manifest_demanded_field_sets_inequality_join": (
             demanded_field_sets_inequality_join
