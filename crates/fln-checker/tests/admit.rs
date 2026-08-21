@@ -5281,6 +5281,36 @@ fn kr600_803_init_nat_zero_refuses_a_forged_constructor_field_count() {
 }
 
 #[test]
+fn kr600_803_init_nat_zero_refuses_a_forged_constructor_index() {
+    let mut entries = nat_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Nat", "zero"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Nat"), 1, 0, 0),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Init.Nat.zero constructor-index verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_init_nat_succ_refuses_a_forged_constructor_field_count() {
     let mut entries = nat_entries();
     let constructor = entries[2].declaration();
