@@ -11721,6 +11721,288 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Strengthening the context buys two shapes - and `(1, 2)` is an outlier.
+///
+/// `49e423e7` asked whether the arrival context determines a child's stored
+/// size, with context taken as `(parent tag, parent arity, slot)`. Six of
+/// fourteen shapes separated. That leaves the obvious question it did not ask:
+/// is that the right notion of context, or would a stronger one do better?
+///
+/// TWO STRENGTHENINGS, BOTH INDEPENDENT, WORTH ONE SHAPE EACH.
+///
+///   ignore ARRAY arrivals            6 -> 7, flipping `(0, 4)`
+///   include the PARENT'S OWN SIZE    6 -> 7, flipping `(7, 3)`
+///   both together                    6 -> 8
+///
+/// They flip DIFFERENT shapes and compose, which is measured rather than
+/// assumed - two refinements each worth "+1" could easily have been the same
+/// +1, and the composed count is asserted to show they are not.
+///
+/// Including the parent's size is the natural strengthening: it asks whether
+/// the parent's LAYOUT, not merely its shape, fixes the child's. It raises the
+/// context count for `(1, 2)` from 40 to 52 and leaves its mixed count at SIX,
+/// unchanged. More contexts, no more separation.
+///
+/// SIX SHAPES SURVIVE BOTH REFINEMENTS: `(0,1)` `(0,2)` `(0,3)` `(1,1)`
+/// `(1,2)` `(2,2)`. Among them the mixed counts are 1, 1, 1, 1, 5, 1 - five
+/// shapes with a single stubborn context each, and `(1, 2)` with five.
+///
+/// THAT IS THE SHARPEST FORM THE BLOCK HAS TAKEN. `daaaabe2` showed a size rule
+/// cannot identify a cons cell; `49e423e7` showed `(1, 2)` is the worst of the
+/// unseparable shapes. This shows it stays the worst after the context notion
+/// has been strengthened twice in independent directions, and by a factor of
+/// five over every other survivor. `list_ptrs` is not blocked by a discriminator
+/// I have not thought of yet; it is blocked by the one shape that resists every
+/// discriminator this file has tried.
+///
+/// POPULATION SCOPE: all four modules pooled, constructor objects only - the
+/// same 14 multi-size shapes and 46,334 objects as `49e423e7`, recomputed here
+/// rather than quoted.
+#[test]
+fn strengthening_the_context_buys_two_shapes() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    // Context A keys on the parent's shape; context B adds its stored size.
+    // The array key stands for "arrived through an array element".
+    const ARRAY_A: (u8, u8, usize) = (abi::TAG_ARRAY, 0, usize::MAX);
+    const ARRAY_B: (u8, u8, u16, usize) = (abi::TAG_ARRAY, 0, 0, usize::MAX);
+
+    let mut sizes: std::collections::BTreeMap<(u8, u8), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut population: std::collections::BTreeMap<(u8, u8), usize> =
+        std::collections::BTreeMap::new();
+    let mut ctx_a: std::collections::BTreeMap<
+        (u8, u8),
+        std::collections::BTreeMap<(u8, u8, usize), BTreeSet<u16>>,
+    > = std::collections::BTreeMap::new();
+    let mut ctx_b: std::collections::BTreeMap<
+        (u8, u8),
+        std::collections::BTreeMap<(u8, u8, u16, usize), BTreeSet<u16>>,
+    > = std::collections::BTreeMap::new();
+
+    for (_, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                sizes
+                    .entry((object.tag, object.other))
+                    .or_default()
+                    .insert(object.cs_sz);
+                *population.entry((object.tag, object.other)).or_default() += 1;
+            }
+        }
+        for parent in &objects {
+            let arrivals: Vec<((u8, u8, usize), (u8, u8, u16, usize), u64)> =
+                if parent.tag <= abi::TAG_MAX_CTOR_TAG {
+                    (0..usize::from(parent.other))
+                        .map(|slot| {
+                            (
+                                (parent.tag, parent.other, slot),
+                                (parent.tag, parent.other, parent.cs_sz, slot),
+                                word_at(bytes, parent.off + 8 + 8 * slot),
+                            )
+                        })
+                        .collect()
+                } else if parent.tag == abi::TAG_ARRAY {
+                    (0..word_at(bytes, parent.off + 8))
+                        .map(|i| {
+                            (
+                                ARRAY_A,
+                                ARRAY_B,
+                                word_at(bytes, parent.off + 24 + 8 * i as usize),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            for (key_a, key_b, word) in arrivals {
+                let Some(child) = resolve(word).and_then(|off| at.get(&off)) else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let shape = (child.tag, child.other);
+                ctx_a
+                    .entry(shape)
+                    .or_default()
+                    .entry(key_a)
+                    .or_default()
+                    .insert(child.cs_sz);
+                ctx_b
+                    .entry(shape)
+                    .or_default()
+                    .entry(key_b)
+                    .or_default()
+                    .insert(child.cs_sz);
+            }
+        }
+    }
+
+    let multi: Vec<(u8, u8)> = sizes
+        .iter()
+        .filter(|(_, seen)| seen.len() > 1)
+        .map(|(shape, _)| *shape)
+        .collect();
+    assert_eq!(
+        (
+            multi.len(),
+            multi.iter().map(|s| population[s]).sum::<usize>()
+        ),
+        (14, 46334),
+        "the same multi-size population as `49e423e7`, recomputed rather than \
+         quoted"
+    );
+
+    // Contexts and mixed counts under both notions, per shape.
+    let table: Vec<(u8, u8, usize, usize, usize, usize)> = multi
+        .iter()
+        .map(|shape| {
+            let a = &ctx_a[shape];
+            let b = &ctx_b[shape];
+            (
+                shape.0,
+                shape.1,
+                a.len(),
+                a.values().filter(|seen| seen.len() > 1).count(),
+                b.len(),
+                b.values().filter(|seen| seen.len() > 1).count(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        table,
+        vec![
+            (0, 1, 19, 2, 19, 2),
+            (0, 2, 8, 2, 8, 2),
+            (0, 3, 12, 2, 12, 2),
+            (0, 4, 8, 1, 8, 1),
+            (0, 5, 8, 0, 8, 0),
+            (0, 6, 2, 0, 2, 0),
+            (0, 7, 2, 0, 2, 0),
+            (1, 1, 24, 2, 26, 1),
+            (1, 2, 40, 6, 52, 6),
+            (2, 2, 19, 1, 21, 1),
+            (3, 1, 9, 0, 10, 0),
+            (4, 1, 11, 0, 11, 0),
+            (4, 2, 20, 0, 23, 0),
+            (7, 3, 13, 1, 16, 0),
+        ],
+        "tag, arity, then contexts and MIXED contexts under A (parent shape and \
+         slot) and under B (parent shape, SIZE and slot). `(1, 2)` gains twelve \
+         contexts under B and keeps all six of its mixed ones - more contexts, \
+         no more separation"
+    );
+
+    // What each refinement is worth, and that they are not the same one.
+    let count = |pick: &dyn Fn(&(u8, u8)) -> bool| multi.iter().filter(|s| pick(s)).count();
+    let sep_a = |shape: &(u8, u8)| ctx_a[shape].values().all(|seen| seen.len() == 1);
+    let sep_a_no_array = |shape: &(u8, u8)| {
+        ctx_a[shape]
+            .iter()
+            .filter(|(key, _)| **key != ARRAY_A)
+            .all(|(_, seen)| seen.len() == 1)
+    };
+    let sep_b = |shape: &(u8, u8)| ctx_b[shape].values().all(|seen| seen.len() == 1);
+    let sep_both = |shape: &(u8, u8)| {
+        ctx_b[shape]
+            .iter()
+            .filter(|(key, _)| **key != ARRAY_B)
+            .all(|(_, seen)| seen.len() == 1)
+    };
+    assert_eq!(
+        (
+            count(&sep_a),
+            count(&sep_a_no_array),
+            count(&sep_b),
+            count(&sep_both)
+        ),
+        (6, 7, 7, 8),
+        "separable shapes under the base notion, under each refinement alone, \
+         and under both. Each refinement is worth exactly ONE shape and \
+         together they are worth TWO"
+    );
+    assert_eq!(
+        (
+            multi
+                .iter()
+                .filter(|s| sep_a_no_array(s) && !sep_a(s))
+                .copied()
+                .collect::<Vec<_>>(),
+            multi
+                .iter()
+                .filter(|s| sep_b(s) && !sep_a(s))
+                .copied()
+                .collect::<Vec<_>>()
+        ),
+        (vec![(0, 4)], vec![(7, 3)]),
+        "and they flip DIFFERENT shapes, which is why they compose. Two \
+         refinements each worth `+1` could have been the same +1; measured, \
+         they are not"
+    );
+
+    // What survives both, and how badly.
+    let survivors: Vec<(u8, u8, usize)> = multi
+        .iter()
+        .filter(|shape| !sep_both(shape))
+        .map(|shape| {
+            (
+                shape.0,
+                shape.1,
+                ctx_b[shape]
+                    .iter()
+                    .filter(|(key, seen)| **key != ARRAY_B && seen.len() > 1)
+                    .count(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        survivors,
+        vec![
+            (0, 1, 1),
+            (0, 2, 1),
+            (0, 3, 1),
+            (1, 1, 1),
+            (1, 2, 5),
+            (2, 2, 1),
+        ],
+        "the six shapes no refinement here separates, with their surviving \
+         mixed-context counts. Five have ONE stubborn context; `(1, 2)` has \
+         FIVE. It stays the worst after the context notion has been \
+         strengthened twice in independent directions, by a factor of five over \
+         every other survivor"
+    );
+}
+
 /// Which multi-size shapes the arrival context separates - the whole census.
 ///
 /// `5efac560` measured one shape and concluded that discrimination is
