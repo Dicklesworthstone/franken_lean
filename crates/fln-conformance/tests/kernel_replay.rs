@@ -13525,6 +13525,53 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
         "the refusal must name the epoch mismatch and the offending pin: {forged_reason}"
     );
 
+    // THE FORGERY ABOVE CARRIES A PIN. AN EMPTY ONE DOES NOT, AND WAS UNTESTED.
+    // Measured against both the real rule and one that reads an empty field as
+    // "the producer did not record this, so do not complain": the decorated pin
+    // is refused by both, a NEIGHBOURING epoch is refused by both, and only an
+    // empty pin separates them.
+    //
+    // That reading is a plausible thing to write here, because `pin` and
+    // `corpus_commit` are the only two identity fields with no emptiness rule of
+    // their own -- `corpus_fixture_hash`, `lane_source_digest_at_run`, `bead`
+    // and `target` each have one. Someone adding emptiness handling for
+    // consistency could easily write it as a skip rather than a refusal, and the
+    // equality is the only thing standing in the way.
+    //
+    // A receipt carrying no epoch would then validate against ANY epoch: evidence
+    // filed under nothing, accepted by whichever run asked for it.
+    assert!(
+        !forged.pin.is_empty(),
+        "the forgery above must carry a pin, or it already covers this case and the two cells are \
+         the same cell"
+    );
+    let unpinned = WholeMathlibReceipt {
+        pin: String::new(),
+        ..sample_whole_mathlib_receipt()
+    };
+    let unpinned_reason = unpinned
+        .validate(&pin, &corpus)
+        .expect_err("a receipt recording no epoch at all must not validate against one");
+    assert!(
+        unpinned_reason.contains("epoch"),
+        "an absent pin must be refused as an epoch mismatch, not left to some later field rule: \
+         {unpinned_reason}"
+    );
+
+    // THE SAME HOLE ON THE OTHER HALF OF THE BINDING. The corpus commit is bound
+    // by an equality too, and nothing else requires it to be present.
+    let uncommitted = WholeMathlibReceipt {
+        corpus_commit: String::new(),
+        ..sample_whole_mathlib_receipt()
+    };
+    let uncommitted_reason = uncommitted
+        .validate(&pin, &corpus)
+        .expect_err("a receipt recording no corpus commit must not validate against one");
+    assert!(
+        uncommitted_reason.contains("corpus commit"),
+        "an absent corpus commit must be refused as a corpus mismatch: {uncommitted_reason}"
+    );
+
     // THE REAL POPULATION, which may legitimately be empty at this commit.
     let path = whole_mathlib_receipt_path(&pin);
     let text = match read_retained_rows(&path).unwrap_or_else(|fault| panic!("{fault}")) {
