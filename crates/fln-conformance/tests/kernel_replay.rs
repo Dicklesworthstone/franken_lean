@@ -5145,6 +5145,31 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
         );
     }
 
+    // THE LIST IS A SET, AND NOTHING MADE IT ONE. `fs::write` creates or
+    // truncates, so an entry named twice produces ONE file: the tree comes out
+    // smaller than the list that built it. Every fixture test here takes its
+    // expected count from that list -- `oleans.len() == CREATED.len()` in the
+    // sorted and helper-order tests, a literal `3` or `4` elsewhere -- so the
+    // duplicate surfaces as "the walk must enumerate exactly N files", accusing
+    // the walk of losing a file that was never written. A repeated line in a
+    // hand-written list is an ordinary copy-paste slip; being told which line it
+    // is beats re-deriving it from a count that is off by one.
+    //
+    // It also poisons the shape record beside the tree: the manifest would store
+    // the entry twice, so a later run that tidied the list to one copy would be
+    // refused as a shape change that never happened.
+    {
+        let mut seen = BTreeSet::new();
+        for relative in relative_files {
+            assert!(
+                seen.insert(*relative),
+                "fixture `{versioned_name}` lists `{relative}` more than once. The second write \
+                 truncates the first, so the tree holds one file where the list names two and \
+                 every count taken from the list is one too many"
+            );
+        }
+    }
+
     // TWO TESTS SHARING A NAME IS INVISIBLE UNTIL IT CORRUPTS A COUNT. Nothing
     // removes these trees, so a second build under the same name UNIONS into the
     // first: one test's walk then sees the other's files, its census comes out
@@ -5938,6 +5963,89 @@ fn a_fixture_rebuilt_with_a_different_shape_is_refused() {
         !tmp.join("t6r7-selftest-manifest-stale-v1").exists(),
         "the rebuild was refused and its tree exists anyway; the shape check must run BEFORE the \
          files are written"
+    );
+}
+
+/// A fixture list that repeats an entry is refused, before anything is written.
+///
+/// **A duplicate does not build two files, it builds one.** `fs::write` creates
+/// or truncates, so `["A.olean", "A.olean"]` leaves a tree of size one. Every
+/// fixture test here derives its expected count from the LIST -- the sorted and
+/// helper-order tests compare against `CREATED.len()`, others against a literal
+/// -- so the slip surfaces as "the walk must enumerate exactly N files". The
+/// walk is then blamed for losing a file that was never written, and the person
+/// reading that message goes to the walk, which is correct.
+///
+/// **It also poisons the shape record.** The manifest beside the tree would
+/// store the entry twice, so a later run whose list had been tidied to one copy
+/// would be refused as a shape change that never happened -- a second wrong
+/// diagnosis downstream of the first.
+///
+/// **Planted, because the live population is clean.** No fixture list in this
+/// file repeats an entry, so the guard would never run and a guard nothing
+/// satisfies is indistinguishable from one that no longer works. The green
+/// control comes first: a list holding two DIFFERENT entries that happen to
+/// share a directory must still build both, or the rule would be refusing
+/// neighbours rather than repeats.
+#[test]
+fn a_fixture_list_that_repeats_an_entry_is_refused() {
+    // GREEN CONTROL FIRST. Two distinct entries under one directory, which is
+    // the shape a too-eager rule would refuse.
+    let ok = write_inventory_fixture(
+        "t6r7-selftest-duplicate-ok-v1",
+        &["Same/One.olean", "Same/Two.olean"],
+    );
+    for entry in ["Same/One.olean", "Same/Two.olean"] {
+        assert!(
+            ok.join(entry).is_file(),
+            "`{entry}` is distinct from its sibling and must still be written"
+        );
+    }
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let repeated = std::panic::catch_unwind(|| {
+        write_inventory_fixture(
+            "t6r7-selftest-duplicate-v1",
+            &["Twice.olean", "Other.olean", "Twice.olean"],
+        )
+    });
+    std::panic::set_hook(previous);
+
+    let payload = repeated
+        .err()
+        .unwrap_or_else(|| panic!("a fixture list that names an entry twice must be refused"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+
+    // NAMES THE REPEAT, NOT MERELY THE FACT. "duplicate entry" would leave the
+    // reader counting a list by eye, which is the work the guard exists to do.
+    assert!(
+        message.contains("Twice.olean"),
+        "the refusal must name the entry that repeats: {message}"
+    );
+    assert!(
+        message.contains("t6r7-selftest-duplicate-v1"),
+        "the refusal must name the fixture: {message}"
+    );
+    // AND NOT THE INNOCENT ONE. A message listing the whole list would satisfy
+    // the assertion above while telling the reader nothing about which line to
+    // look at.
+    assert!(
+        !message.contains("Other.olean"),
+        "the refusal names `Other.olean`, which appears once; a message that prints the whole \
+         list has not located anything: {message}"
+    );
+
+    assert!(
+        !Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("t6r7-selftest-duplicate-v1")
+            .exists(),
+        "the list was refused and a tree exists anyway; the check must run BEFORE the writes, or \
+         the half-built tree is left for the next run to union into"
     );
 }
 
