@@ -8149,11 +8149,15 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
     for class in &reject_classes {
         tokens.push(format!("rejected:{class}"));
     }
-    for reason in [
+    // BOUND, like the reject classes above, so the count below is derived from the
+    // population rather than written beside it.
+    let resource_reasons = [
         ResourceReason::ExecutionSteps,
         ResourceReason::Cancelled,
         ResourceReason::RecursionDepth { limit: 4 },
-    ] {
+    ];
+    let resource_reason_count = resource_reasons.len();
+    for reason in resource_reasons {
         tokens.push(
             resource_usage_facts(&ResourceUsage {
                 reason,
@@ -8254,9 +8258,26 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
         "every kernel rejection class should have routed as a rejection; {rejected} of {} did",
         reject_classes.len()
     );
-    assert!(
-        no_answer >= 1 + StructuralUnit::ALL.len() as u32,
-        "the non-answer routings are missing: {no_answer}"
+    // AND THE THIRD COUNTER WAS A FLOOR THAT OMITTED A THIRD OF ITS OWN
+    // POPULATION. It read `no_answer >= 1 + StructuralUnit::ALL.len()`, which
+    // counts the internal fault and the structural units and forgets the three
+    // resource-exhaustion tokens pushed between them -- so it carried three
+    // tokens of slack and would pass with every resource reason routed
+    // elsewhere.
+    //
+    // The other two counters became exact at e7be44c3, and between them they
+    // catch a MISROUTED token: the match is exhaustive over three arms, so a
+    // resource token routed as a rejection lifts `rejected` past the class count
+    // and reddens there. What they cannot catch is a token routed nowhere -- a
+    // fourth arm, a `continue`, an early return -- because two exact counters and
+    // one floor still balance when the total shrinks. Exact here closes that,
+    // and the three parts are named rather than summed into a literal.
+    assert_eq!(
+        no_answer as usize,
+        1 + resource_reason_count + StructuralUnit::ALL.len(),
+        "the non-answer routings are missing: {no_answer} for one internal fault, \
+         {resource_reason_count} resource reason(s) and {} structural unit(s)",
+        StructuralUnit::ALL.len()
     );
 }
 
