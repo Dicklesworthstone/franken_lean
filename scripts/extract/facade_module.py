@@ -1911,6 +1911,47 @@ def unencodable_text_error(text, what="the facade"):
 
 
 @checked_by_self_test
+def insufficient_space_error(targets):
+    """Refuse before the work, not ten minutes into it.
+
+    Nothing here has ever asked whether there is room. A run writes thirteen probe
+    files into its work directory, several of them the whole facade plus a
+    verification section, then the candidate on every attempt of every round, then
+    the artifacts themselves -- and it discovers a full filesystem by failing
+    somewhere in the middle, after all the pin work, with the facade already
+    replaced and the manifest not. That is the pair-inconsistency f8abaf57 reports,
+    reached the expensive way.
+
+    The floor is DERIVED, not chosen: a run cannot publish an artifact of N bytes
+    with fewer than N bytes free, and the previous artifact is on disk to be
+    measured. Where there is nothing to measure -- a first run -- there is nothing
+    to claim, and this says nothing.
+
+    `targets` is (path, floor_bytes, description). Returns an error string or None.
+    """
+    short = []
+    for path, floor, what in targets:
+        if not floor:
+            continue
+        try:
+            st = os.statvfs(path)
+        except OSError:
+            continue
+        free = st.f_bavail * st.f_frsize
+        if free < floor:
+            short.append(f"{what} needs at least {floor} bytes on {path} and has "
+                         f"{free}")
+    if short:
+        return ("this run cannot finish where it is being asked to write: "
+                + "; ".join(short)
+                + ". The floor is the size of what the last run published, which is "
+                "a lower bound rather than an estimate, and failing this late costs "
+                "the whole pin pass and can leave the facade replaced with the "
+                "manifest still describing the previous run")
+    return None
+
+
+@checked_by_self_test
 def published_bytes_error(out, text, what="the facade"):
     """The file that ships is byte-for-byte the text this run built.
 
@@ -2731,6 +2772,14 @@ def self_test():
     _surrogate = "axiom X : Type\n" + chr(0xD800)
     case("bytes/text-encodable", unencodable_text_error(text), False)
     case("bytes/text-not-encodable", unencodable_text_error(_surrogate), True)
+    case("space/room-available", insufficient_space_error(((work, 1, "a byte"),)),
+         False)
+    case("space/floor-above-free",
+         insufficient_space_error(((work, 1 << 62, "an impossible artifact"),)), True)
+    case("space/no-prior-artifact-says-nothing",
+         insufficient_space_error(((work, 0, "a first run"),)), False)
+    case("space/unreadable-path-says-nothing",
+         insufficient_space_error(((os.path.join(work, "nope"), 1, "gone"),)), False)
     _fifo = os.path.join(work, "fifo-artifact.lean")
     if not os.path.exists(_fifo):
         os.mkfifo(_fifo)
@@ -3164,6 +3213,20 @@ def main():
     demand = demanded_symbols()
     work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-facade-{os.getpid()}")
     os.makedirs(work, exist_ok=True)
+
+    def _prior(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    _space = insufficient_space_error((
+        (os.path.dirname(args.out) or ".", _prior(args.out) + _prior(args.manifest),
+         "the published artifacts"),
+        (work, _prior(args.out), "the probe scratch"),
+    ))
+    if _space:
+        raise SystemExit("REFUSE: " + _space)
     env = {k: v for k, v in os.environ.items() if k not in ("LEAN_PATH", "LEAN_SYSROOT")}
     env["LC_ALL"] = "C"
 
