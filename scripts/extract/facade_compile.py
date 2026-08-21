@@ -221,6 +221,10 @@ the toolchain would report a perfect facade:
     to the declaration rows that record those rendering modes. Type-signature
     provenance cannot be overstated by a stale printer summary.
 
+  * A MANIFEST-STRUCTURAL-REFUSAL JOIN binds the structural-refusal summary to
+    declaration rows carrying a reason. The structural surface cannot hide a
+    failed emission behind an aggregate count without row-level provenance.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1472,6 +1476,23 @@ def main():
             "REFUSE: facade manifest printer join disagrees with its declaration "
             f"rows ({json.dumps(printer_join, sort_keys=True)})"
         )
+    structural_refusal_join = {
+        "structural_refusal_rows": sum(
+            bool(isinstance(row.get("structural_refused_reason"), str)
+                 and row["structural_refused_reason"].strip())
+            for row in manifest_rows
+        ),
+        "summary_structural_refused": manifest_summary.get("structural_refused"),
+    }
+    if (not isinstance(structural_refusal_join["summary_structural_refused"], int)
+            or isinstance(structural_refusal_join["summary_structural_refused"], bool)
+            or structural_refusal_join["summary_structural_refused"] < 0
+            or structural_refusal_join["structural_refusal_rows"]
+            != structural_refusal_join["summary_structural_refused"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-refusal join disagrees with its "
+            f"declaration rows ({json.dumps(structural_refusal_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1653,6 +1674,7 @@ def main():
         "manifest_instance_attribute_join": instance_attribute_join,
         "manifest_private_name_join": private_name_join,
         "manifest_printer_join": printer_join,
+        "manifest_structural_refusal_join": structural_refusal_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
