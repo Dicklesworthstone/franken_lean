@@ -11470,11 +11470,29 @@ impl WholeMathlibReceipt {
         let field = direction.field();
         let mut total = 0u64;
         let mut seen = BTreeSet::new();
+        let mut previous: Option<&str> = None;
         for entry in rows {
             let (family, count) = entry
                 .rsplit_once('=')
                 .ok_or_else(|| format!("`{field}` entry `{entry}` is not `family=count`"))?;
             check_family_token(family, direction)?;
+            // ASCENDING, BECAUSE THE FORMAT SAYS SO. The census is rendered in
+            // `BTreeMap` order precisely so two runs that saw the same families
+            // produce byte-identical rows. The producer sorted; nothing here
+            // required it, so a retained row could carry the same census in any
+            // order and validate -- and byte-identity would quietly be a
+            // property of the producer alone, while any consumer comparing two
+            // retained rows would see a difference that is not one.
+            if let Some(previous) = previous
+                && family < previous
+            {
+                return Err(format!(
+                    "`{field}` lists `{family}` after `{previous}`, so the census is not in \
+                     ascending order. Two runs that saw the same families must produce the same \
+                     bytes, and this row would compare unequal to one describing the same run"
+                ));
+            }
+            previous = Some(family);
             if !seen.insert(family.to_string()) {
                 return Err(format!(
                     "`{field}` names family `{family}` twice; the census would double-count it"
@@ -12089,6 +12107,39 @@ fn the_receipt_producer_maps_every_count_to_its_own_field() {
             "context:import_context_not_faithfully_representable=40000".to_string(),
             "inconclusive:Steps=17".to_string()
         ]
+    );
+
+    // THE PRODUCER SORTS; THE GUARD DID NOT REQUIRE IT. The assertions above pin
+    // the order a receipt is BUILT in. Nothing pinned the order a retained row
+    // may be READ in: confirmed by reading the validator and its census helper,
+    // which between them hold no ordering check at all, so this reordered row
+    // validated before this commit.
+    let mut reordered = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+        spec: &spec,
+        counts: &counts,
+        closure_modules: 10_007,
+        corpus_fixture_hash: "sentinel-fixture-hash",
+        observed_unix_s: 1_786_111_222,
+        wall_ms: 12_345_678,
+    });
+    assert!(
+        reordered.restrictive_families.len() >= 2,
+        "the census must hold at least two families, or reversing it is a no-op and this cell \
+         asserts nothing: {:?}",
+        reordered.restrictive_families
+    );
+    reordered.restrictive_families.reverse();
+    assert_ne!(
+        reordered.restrictive_families, receipt.restrictive_families,
+        "the reversal must actually change the row, or the guard is being asked about the \
+         canonical order it already accepts"
+    );
+    let reordered_reason = reordered
+        .validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit())
+        .expect_err("a census out of canonical order must not be retained");
+    assert!(
+        reordered_reason.contains("ascending"),
+        "the refusal must be about the order, not about a count or a token: {reordered_reason}"
     );
 
     // The class is DERIVED from the counts, not chosen: 11 restrictive rows with
