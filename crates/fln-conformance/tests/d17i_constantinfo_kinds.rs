@@ -4445,3 +4445,93 @@ fn constructors_share_their_inductives_parameter_binder_names_except_under_hygie
          these names"
     );
 }
+
+/// One-name-one-constant, and the `_impl` representation correspondence.
+///
+/// THE FIRST is the law KR-970 enforces at admission — `AlreadyDeclared` — and
+/// nothing on the decode side had checked it. A module storing the same name
+/// twice would give `add_decl` two constants for one name, and whichever
+/// admission order the replay happened to use would decide which one the kernel
+/// saw. Every reference and closure cell in this file would stay green through
+/// that, because they all resolve names against a MAP built from these arrays,
+/// and a map silently keeps the last writer.
+///
+/// Measured: 2,204 exported and 2,314 private names in `Init/Prelude`, 379 and
+/// 530 in `Init/Meta/Defs`, all pairwise distinct at both levels.
+///
+/// THE SECOND explains an exception this file already records. `76c9b8dd` lists
+/// three constructors that are not named under their inductive, all of the form
+/// `Lean.Name.str._impl` under `Lean.Name._impl`. The reason is a systematic
+/// correspondence rather than three oddities: `Lean.Name._impl` is the compiler
+/// REPRESENTATION of `Lean.Name`, it carries the same number of constructors in
+/// the same order, and each is the base constructor's name with `._impl`
+/// appended. So the suffix lands after the CONSTRUCTOR, while the inductive got
+/// it after its own base name — and neither name is a prefix of the other.
+///
+/// Stating it as a correspondence rather than a list means a second
+/// representation pair is checked on arrival rather than being three more
+/// unexplained names.
+#[test]
+fn names_are_unique_and_impl_representations_mirror_their_base() {
+    let lib = lib_or_skip!();
+
+    for module in ["Init.Prelude", "Init.Meta.Defs"] {
+        for level in [Level::Exported, Level::Private] {
+            let (infos, _) = decode_at(&lib, module, level);
+            let names: Vec<String> = infos
+                .iter()
+                .map(|info| info.name().to_display_string())
+                .collect();
+            let distinct: BTreeSet<&String> = names.iter().collect();
+            assert!(
+                names.len() > 300,
+                "{module}: the census must be reached, got {}",
+                names.len()
+            );
+            assert_eq!(
+                names.len(),
+                distinct.len(),
+                "{module}: a repeated constant name gives the kernel two constants for one \
+                 name, and every name-keyed cell in this file would resolve to whichever was \
+                 admitted last"
+            );
+        }
+    }
+
+    // The representation correspondence, stated for any `X._impl` whose base is
+    // also a decoded inductive.
+    let infos = decode_prelude_private(&lib);
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    let mut pairs = 0usize;
+    for (name, representation) in &inductives {
+        let Some(base_name) = name.strip_suffix("._impl") else {
+            continue;
+        };
+        let Some(base) = inductives.get(base_name) else {
+            continue;
+        };
+        assert_eq!(
+            representation.ctors.len(),
+            base.ctors.len(),
+            "{name}: a representation carries one constructor per base constructor"
+        );
+        for (mine, theirs) in representation.ctors.iter().zip(&base.ctors) {
+            assert_eq!(
+                mine.to_display_string(),
+                format!("{}._impl", theirs.to_display_string()),
+                "{name}: each representation constructor is its base constructor with `._impl` \
+                 appended, which is why neither name is a prefix of the other"
+            );
+        }
+        pairs += 1;
+    }
+    assert!(
+        pairs >= 1,
+        "the pin carries a representation pair; without one this correspondence is unexercised"
+    );
+}
