@@ -10965,3 +10965,177 @@ fn no_constructor_field_mentions_its_inductive_in_a_domain() {
          {domains} inspected"
     );
 }
+
+/// A recursive occurrence applies the inductive to the constructor's OWN
+/// parameters — the other half of the positivity story, and thinly exercised.
+///
+/// The positivity cell checks where an occurrence may NOT appear. This checks
+/// what an occurrence that does appear must look like: uniform parameters. A
+/// field of type `List Bool` inside `List`'s own constructor would be a
+/// different inductive family from the one being defined, and the recursor
+/// generated for it would not match.
+///
+/// Measured over every constructor field type in `Init/Prelude`, following each
+/// application spine:
+///
+///   17 occurrences of the inductive stand at the head of a spine, and every
+///     one applies the constructor's own parameter binders, in order, by exact
+///     de Bruijn index
+///   they are spread over seven inductives — `Lean.ParserDescr` ten,
+///     `Lean.Name` two, and one each for `List`, `Nat`, `Nat.le`,
+///     `Nat.le.below` and `Lean.Syntax`
+///
+/// HOW THINLY, because a law nobody can fail is not a law. Only THREE of the
+/// seventeen belong to an inductive with parameters — `List` and `Nat.le` with
+/// one, `Nat.le.below` with two. For the other fourteen the parameter check
+/// ranges over nothing and passes whatever the artifact says. Three occurrences
+/// at two distinct widths is the whole of what this rule is tested by here, and
+/// that is asserted rather than left for a reader to work out from the
+/// distribution.
+///
+/// The walk keys its seen-set on `(node, depth)`. A shared subterm reached at
+/// two binder depths carries different de Bruijn meanings, so an identity-only
+/// key would check the second occurrence against the first one's depth.
+#[test]
+fn a_recursive_occurrence_applies_the_constructors_own_parameters() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: Vec<(String, &ConstructorVal, Vec<&Expr>)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders: Vec<&Expr> = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_type);
+                    current = body;
+                }
+                constructors.push((name, v, binders));
+            }
+            _ => {}
+        }
+    }
+
+    let mut occurrences = 0usize;
+    let mut exercising = 0usize;
+    let mut by_inductive: BTreeMap<String, usize> = BTreeMap::new();
+    let mut widths: BTreeSet<u32> = BTreeSet::new();
+    let mut departures: Vec<(String, usize)> = Vec::new();
+    for (name, ctor, binders) in &constructors {
+        let induct_name = ctor.induct.to_display_string();
+        let Some(induct) = inductives.get(&induct_name) else {
+            continue;
+        };
+        let params = induct.num_params as usize;
+        let start = ctor.num_params as usize;
+
+        for (offset, field_type) in binders[start..start + ctor.num_fields as usize]
+            .iter()
+            .enumerate()
+        {
+            // Depth of the binders enclosing this field inside the constructor.
+            let mut stack: Vec<(&Expr, usize)> = vec![(field_type, start + offset)];
+            let mut seen: BTreeSet<(usize, usize)> = BTreeSet::new();
+            while let Some((current, depth)) = stack.pop() {
+                if !seen.insert((current.allocation_identity(), depth)) {
+                    continue;
+                }
+                match current.node() {
+                    ExprNode::App { .. } | ExprNode::Const { .. } => {
+                        let mut arguments: Vec<&Expr> = Vec::new();
+                        let mut head = current;
+                        while let ExprNode::App { f, a } = head.node() {
+                            arguments.push(a);
+                            head = f;
+                        }
+                        arguments.reverse();
+                        if let ExprNode::Const { name: target, .. } = head.node() {
+                            if target.to_display_string() == induct_name {
+                                occurrences += 1;
+                                *by_inductive.entry(induct_name.clone()).or_default() += 1;
+                                if params > 0 {
+                                    exercising += 1;
+                                    widths.insert(induct.num_params);
+                                }
+                                for position in 0..params.min(arguments.len()) {
+                                    let expected = depth - 1 - position;
+                                    match arguments[position].node() {
+                                        ExprNode::BVar { idx } if *idx as usize == expected => {}
+                                        _ => departures.push((name.clone(), position)),
+                                    }
+                                }
+                            }
+                        }
+                        for argument in arguments {
+                            stack.push((argument, depth));
+                        }
+                    }
+                    ExprNode::ForallE {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::Lam {
+                        binder_type, body, ..
+                    } => {
+                        stack.push((binder_type, depth));
+                        stack.push((body, depth + 1));
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push((type_, depth));
+                        stack.push((value, depth));
+                        stack.push((body, depth + 1));
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        stack.push((expr, depth));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        exercising + (occurrences - exercising),
+        occurrences,
+        "every occurrence either exercises the parameter check or does not"
+    );
+    assert!(
+        departures.is_empty(),
+        "a recursive occurrence must apply the constructor's own parameters, in order: \
+         {departures:?}"
+    );
+    assert_eq!(
+        occurrences, 17,
+        "the recursive-occurrence census in constructor field types"
+    );
+    assert_eq!(
+        by_inductive.values().sum::<usize>(),
+        occurrences,
+        "the per-inductive table must account for every occurrence"
+    );
+    assert_eq!(
+        by_inductive
+            .get("Lean.ParserDescr")
+            .copied()
+            .unwrap_or_default(),
+        10,
+        "the largest group is Lean.ParserDescr"
+    );
+
+    // How thinly the rule is tested, asserted rather than implied.
+    assert_eq!(
+        (exercising, widths.len()),
+        (3, 2),
+        "only three occurrences belong to a parameterised inductive, at two widths — for the \
+         other fourteen the check ranges over nothing"
+    );
+}
