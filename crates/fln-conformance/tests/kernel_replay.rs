@@ -2850,7 +2850,17 @@ struct CorpusCarveOut {
 const CORPUS_CARVE_OUTS: &[CorpusCarveOut] = &[];
 
 fn corpus_carve_out(name: &str) -> Option<&'static CorpusCarveOut> {
-    CORPUS_CARVE_OUTS.iter().find(|row| row.declaration == name)
+    carve_out_in(CORPUS_CARVE_OUTS, name)
+}
+
+/// The same lookup over an explicitly supplied registry.
+///
+/// `CORPUS_CARVE_OUTS` is EMPTY, so `corpus_carve_out` can only ever return
+/// `None` and its semantics are unobservable through the production entry point.
+/// This seam is what lets a planted registry exercise them -- the only way a
+/// guard whose population has been driven to zero can be checked at all.
+fn carve_out_in<'a>(rows: &'a [CorpusCarveOut], name: &str) -> Option<&'a CorpusCarveOut> {
+    rows.iter().find(|row| row.declaration == name)
 }
 
 fn subject_axis(outcome: &UnitOutcome) -> CorpusAxisVerdict {
@@ -4884,6 +4894,101 @@ fn link_fixture_entry(link: &Path, target: &Path) {
             target.display()
         )
     });
+}
+
+/// A D23 carve-out is PER DECLARATION, and the rule is proved on a planted
+/// registry because the real one is empty.
+///
+/// **The guard that already exists here is vacuous.**
+/// `corpus_comparator_preserves_d23_asymmetry_and_no_answer` asserts that every
+/// row of `CORPUS_CARVE_OUTS` carries a non-empty justification. `CORPUS_CARVE_OUTS`
+/// is `&[]`. `all()` over nothing is true, so that assertion passes no matter what
+/// the rule says, and deleting the rule entirely would not redden it. The
+/// carve-out branch in the scorer is unreachable for the same reason: the lookup
+/// cannot return `Some` when there is nothing to find.
+///
+/// **Zero is the right population and it is also why nothing is tested.** No
+/// carve-out should exist -- the bead's history is emphatic that the 265 were
+/// repaired rather than excused -- so the registry must stay empty. But an empty
+/// population makes every rule over it unkillable, and the day someone adds the
+/// first row, the rules governing it will never have run. A planted registry is
+/// the only thing that can carry the check in the meantime.
+///
+/// **What the plant pins, and why each one matters.** D23 says a carve-out is per
+/// declaration with a non-empty Behavior Note. So the lookup must match the whole
+/// name and nothing else: if it matched a PREFIX, one row reading `List` would
+/// silently excuse every `List.*` divergence in the corpus, and the lane would
+/// report carve-outs it never reviewed. Both directions are checked -- a query
+/// that extends a planted name, and a planted name that extends the query --
+/// because a `starts_with` and a `contains` fail differently and only one of the
+/// two probes catches each.
+#[test]
+fn a_carve_out_matches_one_whole_declaration_name_and_nothing_else() {
+    // The REAL registry's rule, restated over the real population. It is
+    // vacuous today by design; it becomes load-bearing the moment a row lands.
+    assert!(
+        CORPUS_CARVE_OUTS
+            .iter()
+            .all(|row| !row.justification.trim().is_empty() && !row.declaration.trim().is_empty()),
+        "every D23 carve-out names a declaration and carries a justification"
+    );
+
+    // THE PLANT. Two rows whose names deliberately overlap, so prefix and
+    // substring matching are both distinguishable from exact matching.
+    const PLANTED: &[CorpusCarveOut] = &[
+        CorpusCarveOut {
+            declaration: "List.map",
+            justification: "planted; this registry is a fixture and governs nothing",
+        },
+        CorpusCarveOut {
+            declaration: "List.mapM",
+            justification: "planted; distinguishes exact matching from a prefix match",
+        },
+    ];
+
+    // Exact hits, each landing on its own row rather than on the first one that
+    // shares a prefix.
+    assert_eq!(
+        carve_out_in(PLANTED, "List.map").map(|row| row.declaration),
+        Some("List.map")
+    );
+    assert_eq!(
+        carve_out_in(PLANTED, "List.mapM").map(|row| row.declaration),
+        Some("List.mapM"),
+        "`List.map` is a prefix of `List.mapM`; a lookup that stopped at the first prefix match \
+         would excuse the wrong declaration"
+    );
+
+    // Misses, in both directions.
+    for absent in [
+        "List",          // a PREFIX of a planted name
+        "List.mapM.aux", // EXTENDS a planted name
+        "List.mapA",     // shares a prefix, matches neither
+        "Array.map",     // unrelated
+        "",              // empty
+    ] {
+        assert!(
+            carve_out_in(PLANTED, absent).is_none(),
+            "`{absent}` matched a carve-out. D23 excuses ONE declaration per row: a lookup that \
+             matched a prefix or a substring would let a single reviewed row silently excuse \
+             every declaration sharing its name, and the lane would report carve-outs nobody \
+             reviewed"
+        );
+    }
+
+    // The justification rule, made killable by a row that violates it -- the
+    // thing the real registry cannot supply.
+    const UNJUSTIFIED: &[CorpusCarveOut] = &[CorpusCarveOut {
+        declaration: "List.map",
+        justification: "   ",
+    }];
+    assert!(
+        UNJUSTIFIED
+            .iter()
+            .any(|row| row.justification.trim().is_empty()),
+        "the planted violation must actually violate the rule, or the check above it is still \
+         vacuous"
+    );
 }
 
 /// The PUBLISHED disagreement count is the sum of the three D23 buckets, and
