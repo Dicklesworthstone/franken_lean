@@ -272,6 +272,40 @@ fn json_name_set(object: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn json_non_empty_name_string_set(array: &str) -> BTreeSet<String> {
+    let marker = "\"name\":";
+    let mut names = BTreeSet::new();
+    let mut cursor = 0_usize;
+
+    while let Some(offset) = array[cursor..].find(marker) {
+        let value_start = cursor + offset + marker.len();
+        assert_eq!(
+            array.as_bytes().get(value_start),
+            Some(&b'"'),
+            "JSON name value is a string: {array}",
+        );
+
+        let mut escaped = false;
+        let mut value_end = None;
+        for (offset, byte) in array.as_bytes()[value_start + 1..].iter().copied().enumerate() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                value_end = Some(value_start + 1 + offset);
+                break;
+            }
+        }
+        let value_end = value_end.expect("JSON name string is closed");
+        assert!(value_end > value_start + 1, "JSON name string is non-empty");
+        names.insert(array[value_start + 1..value_end].to_owned());
+        cursor = value_end + 1;
+    }
+
+    names
+}
+
 fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expected_names: &[&str]) {
     let residuals = json_object_field(json, field);
     let actual_observed = json_usize_field(residuals, "observed");
@@ -315,7 +349,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let private_companion_names = json_array_field(private_companion_residuals, "names");
     let private_companion_name_count = json_array_len(private_companion_names);
     assert_eq!(
-        json_name_set(private_companion_names).len(),
+        json_non_empty_name_string_set(private_companion_names).len(),
         private_companion_name_count,
         "{json}",
     );
