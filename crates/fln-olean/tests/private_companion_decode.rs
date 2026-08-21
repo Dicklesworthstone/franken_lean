@@ -375,6 +375,11 @@ const ARRAY_ALL_DIFF_AUX_AUX_PROOF_1: &str =
     "_private.Init.Data.Array.Basic.0.Array.allDiffAuxAux._proof_1";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_ALL_DIFF_AUX_AUX_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
+/// The generated unfolding helper for `Array.allDiffAuxAux`.
+const ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD: &str =
+    "_private.Init.Data.Array.Basic.0.Array.allDiffAuxAux._sunfold";
+/// The pin's private array stores this helper in the basic module.
+const ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD_MODULE: &str = "Init/Data/Array/Basic";
 /// The private monadic map implementation helper generated for `Array.mapM`.
 const ARRAY_MAP_M_MAP: &str = "_private.Init.Data.Array.Basic.0.Array.mapM.map";
 /// The pin's private array stores this helper in the basic module.
@@ -2306,6 +2311,36 @@ fn array_all_diff_aux_aux_proof_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_ALL_DIFF_AUX_AUX_PROOF_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_all_diff_aux_aux_sunfold_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_all_diff_aux_aux_sunfold_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD.to_owned()),
+        "the private companion of {ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD_MODULE} must retain \
+         {ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD} as {} instead of Defn",
         recovered.kind_name()
     );
 }
