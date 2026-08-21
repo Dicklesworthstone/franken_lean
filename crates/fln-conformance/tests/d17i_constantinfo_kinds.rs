@@ -16381,3 +16381,115 @@ fn the_module_flag_and_the_declaration_count_are_independent() {
         "the companion-less oleans declare constants rather than being empty stubs"
     );
 }
+
+/// No olean is inert: every one either declares something or imports something.
+///
+/// The flag cell crosses `is_module` against the declaration count and finds
+/// them independent. Imports are the other axis, and they are independent of the
+/// flag too — so neither that cell nor the layering cell says anything about
+/// what happens when a module declares nothing. The natural worry is a file that
+/// does neither: structurally valid, in the census, contributing nothing, and
+/// invisible to every cell here because they all measure one array or the other.
+///
+/// There is none. Over all 2,433 exported parts:
+///
+///                     imports > 0    imports 0
+///   declares > 0        2,154            1
+///   declares 0            278            0
+///
+/// THE SINGLETON IS `Init.Prelude`, with 2,204 declarations and no imports. It
+/// is the only olean in the library that stands entirely on its own, which is
+/// what the import-graph cell means by rooting the census at it — asserted here
+/// from the filesystem rather than from the graph, and its 2,204 is the same
+/// figure the axioms-witness cell pins as the library's widest exported array.
+///
+/// THE 278 ARE PURE AGGREGATORS. Every one imports between 1 and 64 modules
+/// while declaring nothing, so they exist to re-export. They are spread across
+/// all four libraries — `Lean` 104, `Init` 84, `Std` 73, `Lake` 17 — and none of
+/// the four leaf executables is one. `Init.olean`, whose 43 edges the aggregator
+/// cell measures, is one of the 84 rather than a special case.
+///
+/// The empty cell is the claim. Both other cells are things a reader might
+/// guess; that nothing is inert is the fact that had to be measured, and it is
+/// exactly what a census built from a directory walk could quietly have wrong.
+///
+/// Anti-vacuity: three of the four cells are populated, and the aggregators'
+/// import counts span 1 to 64, so "imports something" is not a claim about
+/// modules that all import once.
+///
+/// Conservation first: the four cells must account for every exported olean
+/// before the empty one is read as a fact.
+#[test]
+fn no_olean_both_declares_nothing_and_imports_nothing() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut table: BTreeMap<(bool, bool), usize> = BTreeMap::new();
+    let mut import_free: BTreeMap<String, usize> = BTreeMap::new();
+    let mut aggregators: BTreeMap<String, usize> = BTreeMap::new();
+    let mut widths: BTreeSet<usize> = BTreeSet::new();
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let view = module_view(&lib, &module, Level::Exported);
+        let declares = !view.const_names.is_empty();
+        let imports = !view.imports.is_empty();
+        *table.entry((declares, imports)).or_default() += 1;
+        if !imports {
+            import_free.insert(module.clone(), view.const_names.len());
+        }
+        if !declares {
+            *aggregators
+                .entry(module.split('.').next().expect("a module name").to_owned())
+                .or_default() += 1;
+            widths.insert(view.imports.len());
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        table.values().sum::<usize>(),
+        all.exported.len(),
+        "every exported olean must fall in exactly one cell"
+    );
+    assert_eq!(all.exported.len(), 2_433, "the library census");
+
+    assert_eq!(
+        table,
+        BTreeMap::from([
+            ((true, true), 2_154),
+            ((true, false), 1),
+            ((false, true), 278),
+        ]),
+        "no olean declares nothing and imports nothing; the missing cell is the claim"
+    );
+
+    // The one self-standing olean, discovered rather than named.
+    assert_eq!(
+        import_free,
+        BTreeMap::from([("Init.Prelude".to_owned(), 2_204)]),
+        "the only import-free olean is the root the import-graph cell names"
+    );
+
+    // The aggregators, and the spread that keeps the claim non-trivial.
+    assert_eq!(
+        aggregators,
+        BTreeMap::from([
+            ("Init".to_owned(), 84),
+            ("Lake".to_owned(), 17),
+            ("Lean".to_owned(), 104),
+            ("Std".to_owned(), 73),
+        ]),
+        "every library builds aggregators; no leaf executable is one"
+    );
+    assert_eq!(
+        (
+            *widths.iter().next().expect("nonempty"),
+            *widths.iter().next_back().expect("nonempty")
+        ),
+        (1, 64),
+        "their import counts span a real range"
+    );
+}
