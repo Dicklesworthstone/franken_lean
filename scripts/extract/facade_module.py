@@ -1572,6 +1572,43 @@ def unreproduced_family_error(decl, provided, line_map, unreproduced,
     return None
 
 
+def declared_written_error(line_map, inductive_decls):
+    """Everything the manifest calls a declared inductive was actually written as
+    one, and nothing else was.
+
+    `inductive_rows` is sorted(inductive_decls) -- a SET the emitter carries --
+    while form_counts.inductive is derived from the emitter's line map, which is
+    what the artifact contains. They can disagree, and the way they disagree is
+    specific: inductive_block returns None for a row it cannot render, the emit
+    loop falls through to the axiom path, and the name stays in inductive_decls
+    the whole time. The manifest would then advertise a declaration the facade
+    does not carry.
+
+    7b896da4 already checks this, but only for the two rows named in
+    inductive_refusal_not_reproduced. A guard scoped by hand to the rows that
+    happened to be interesting rots as soon as the interesting set moves; this is
+    the same question asked of the whole population.
+
+    Compared by NAME, not by count. Equal counts are not agreement: one row
+    silently falling through while an unrelated one is written keeps the total at
+    60 and changes which 60 they are.
+    """
+    written = {hit[1] for hit in line_map.values()
+               if isinstance(hit, tuple) and hit[0] == "inductive"}
+    decls = set(inductive_decls)
+    claimed = sorted(decls - written)
+    orphan = sorted(written - decls)
+    if claimed or orphan:
+        return (f"the declared-inductive set and the artifact disagree: "
+                f"{len(decls)} rows are listed as declared and {len(written)} are "
+                f"written as inductive blocks. Listed but not written: "
+                f"{claimed[:4]}; written but not listed: {orphan[:4]}. "
+                "inductive_rows and form_counts.inductive are both published from "
+                "these, so one of the two numbers would describe a facade that was "
+                "never emitted")
+    return None
+
+
 def probe_refused_inductives(lean, env, work, text, line_map, decl, deps, blocks):
     """Does a refused inductive still fail against the FINISHED facade?
 
@@ -2467,6 +2504,9 @@ def main():
                                      pin_inductives)
     if _fam:
         raise SystemExit("REFUSE: " + _fam)
+    _decl_written = declared_written_error(line_map, inductive_decls)
+    if _decl_written:
+        raise SystemExit("REFUSE: " + _decl_written)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
