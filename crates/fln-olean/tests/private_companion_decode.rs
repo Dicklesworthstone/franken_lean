@@ -29,6 +29,7 @@
 
 use std::path::PathBuf;
 
+use fln_env::constants::ConstantInfo;
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
@@ -480,6 +481,76 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
                 .iter()
                 .any(|info| info.name().to_display_string() == name),
             "{family} {name} in {relative} remained only a constName instead of decoding to ConstantInfo"
+        );
+    }
+}
+
+#[test]
+fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom() {
+    let lib =
+        lib_or_skip!("private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom");
+
+    // This is deliberately stronger than the name census and the existence cell
+    // above. A decoder that merely manufactures an axiom with the right name
+    // would make the kernel accept its type without checking a recovered body,
+    // recreating the body-stripping half of the same corpus defect. For every
+    // family, establish the RED side on the exported decoder, then the GREEN
+    // side on the private companion decoder: the concrete declaration exists
+    // there and keeps its real ConstantInfo kind.
+    let families: [(&str, fn(&str) -> bool); 4] = [
+        ("match_N", family::match_n),
+        ("_proof_N", family::proof_n),
+        ("eq_N", family::eq_n),
+        (".loop", family::loop_),
+    ];
+
+    for (family, belongs_to_family) in families {
+        let mut representative = None;
+        for relative in init_chain_modules(&lib) {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            if let Some(name) = private
+                .iter()
+                .find(|name| !exported.contains(*name) && belongs_to_family(name))
+            {
+                representative = Some((relative, name.clone()));
+                break;
+            }
+        }
+
+        let (relative, name) = representative.unwrap_or_else(|| {
+            panic!("the pinned Init private companions contain no private-only {family} witness")
+        });
+        let chain = chain_bytes(&lib, &relative);
+        let exported_view = OleanView::parse(&chain.exported)
+            .unwrap_or_else(|error| panic!("{family} {name}: parse exported {relative}: {error}"));
+        let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+            .decode_module_constants()
+            .unwrap_or_else(|error| panic!("{family} {name}: decode exported {relative}: {error}"));
+        assert!(
+            exported_constants
+                .iter()
+                .all(|info| info.name().to_display_string() != name),
+            "{family} {name} unexpectedly reached the exported decoder; the private-companion regression lost its RED side"
+        );
+
+        let private_view =
+            OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+                .unwrap_or_else(|error| {
+                    panic!("{family} {name}: parse private {relative}: {error}")
+                });
+        let private_constants = DeclDecoder::new(&private_view, WalkBudget::default())
+            .decode_module_constants()
+            .unwrap_or_else(|error| panic!("{family} {name}: decode private {relative}: {error}"));
+        let recovered = private_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| {
+                panic!("{family} {name}: private decoder lost the representative in {relative}")
+            });
+        assert!(
+            !matches!(recovered, ConstantInfo::Axiom(_)),
+            "{family} {name}: private companion recovery weakened the declaration to an axiom"
         );
     }
 }
