@@ -8224,3 +8224,120 @@ fn the_ctor_index_family_is_absent_for_every_prop_and_for_fourteen_others() {
         "exactly one toCtorIdx exists at the pin"
     );
 }
+
+/// Inductives with two or more constructors that carry no `ctorIdx`, and
+/// therefore no `ctorElim` either.
+const MULTI_CTOR_WITHOUT_CTOR_IDX: &[&str] = &[
+    "Decidable",
+    "Lean.Name._impl",
+    "Nat.le",
+    "Nat.le.below",
+    "Or",
+];
+
+/// `ctorElim`/`ctorElimType` — a fourth generated family, and the first one
+/// whose presence is decided EXACTLY, by a stored field together with another
+/// generated family.
+///
+/// Twelve inductives in `Init/Prelude` carry a `ctorElim` and twelve carry a
+/// `ctorElimType`, and nothing in this file reads either. They are paired the
+/// way `noConfusion` and `noConfusionType` are: neither ever occurs without the
+/// other, zero one-sided in 127 inductives.
+///
+/// The presence rule is a genuine biconditional, with no counterexample over
+/// the whole module:
+///
+///   `X.ctorElim` exists  IFF  `X` has at least two constructors AND `X`
+///   carries a `ctorIdx`
+///
+/// Both conjuncts are load-bearing and the artifact witnesses each. Seventeen
+/// inductives have two or more constructors; only twelve carry a `ctorIdx`, and
+/// exactly those twelve carry a `ctorElim`. The five that do not are named
+/// above — `Decidable`, `Lean.Name._impl`, `Nat.le`, `Nat.le.below`, `Or` — and
+/// without them the rule would be indistinguishable from "two or more
+/// constructors" alone, which is measurably weaker.
+///
+/// This is the first family here whose presence composes out of things already
+/// pinned rather than needing its own carve-out list. The ctorIdx cell records
+/// fourteen non-Prop inductives with no `ctorIdx` and declines to explain them;
+/// five of those fourteen now do explanatory work, since they are precisely why
+/// this family has twelve members and not seventeen.
+#[test]
+fn the_ctor_eliminator_family_is_paired_and_decided_by_ctor_index_and_arity() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let kinds = kinds(&infos);
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    assert_eq!(
+        inductives.len(),
+        127,
+        "the inductive census must be reached"
+    );
+
+    let mut paired = 0usize;
+    let mut unpaired: Vec<&String> = Vec::new();
+    let mut violations: Vec<(&String, bool, bool, usize)> = Vec::new();
+    let mut multi_ctor = 0usize;
+    let mut multi_without_index: Vec<&String> = Vec::new();
+    let mut arities: BTreeSet<usize> = BTreeSet::new();
+    for (name, induct) in &inductives {
+        let has_elim = kinds.contains_key(&format!("{name}.ctorElim"));
+        let has_elim_type = kinds.contains_key(&format!("{name}.ctorElimType"));
+        let has_index = kinds.contains_key(&format!("{name}.ctorIdx"));
+        let constructors = induct.ctors.len();
+
+        if has_elim != has_elim_type {
+            unpaired.push(name);
+        } else if has_elim {
+            paired += 1;
+            arities.insert(constructors);
+            assert!(
+                !inductive_result_is_prop(induct),
+                "{name}: a Prop cannot carry a ctorElim, since it carries no ctorIdx"
+            );
+        }
+
+        if constructors >= 2 {
+            multi_ctor += 1;
+            if !has_index {
+                multi_without_index.push(name);
+            }
+        }
+        if has_elim != (constructors >= 2 && has_index) {
+            violations.push((name, has_elim, has_index, constructors));
+        }
+    }
+
+    assert!(
+        unpaired.is_empty(),
+        "ctorElim and ctorElimType are generated together; these carry one alone: {unpaired:?}"
+    );
+    assert!(
+        violations.is_empty(),
+        "ctorElim exists exactly when the inductive has two or more constructors and a \
+         ctorIdx; these depart (name, has_elim, has_index, ctors): {violations:?}"
+    );
+    assert_eq!(
+        multi_without_index, MULTI_CTOR_WITHOUT_CTOR_IDX,
+        "the witnesses that the ctorIdx conjunct is load-bearing rather than implied by arity"
+    );
+    assert_eq!(
+        (paired, multi_ctor),
+        (12, 17),
+        "twelve of the seventeen multi-constructor inductives carry the family"
+    );
+    // Non-vacuity: both sides of the biconditional populated, and over a real
+    // spread of constructor counts rather than one shape repeated.
+    assert!(
+        paired < inductives.len()
+            && arities.len() >= 3
+            && *arities.iter().next_back().expect("nonempty") >= 13,
+        "the family must span real arities, got {arities:?}"
+    );
+}
