@@ -50,6 +50,10 @@ the toolchain would report a perfect facade:
   * A DEMANDED-ROLE JOIN makes the manifest's role agree with its disposition:
     emitted and quarantined rows must be explicitly demanded, while Init rows
     must be explicitly substrate. A closure row cannot impersonate a demand.
+  * A CURATED-MODULE JOIN requires every toolchain-api use in the exact-demand
+    artifact to name a declared curated module. Otherwise a use outside the
+    reported slice can affect aggregate controls while disappearing from the
+    per-module evidence.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -127,7 +131,8 @@ def load_demand(path, part):
     elaborated exact-demand artifact (never a lexical scan: `open Lean Meta Elab`
     makes ~95% of real usage unqualified, measured on this same slice)."""
     by_module = defaultdict(set)
-    modules, seen = [], {}
+    modules = None
+    unscoped = []
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             try:
@@ -135,6 +140,8 @@ def load_demand(path, part):
             except json.JSONDecodeError as exc:
                 raise SystemExit(f"REFUSE: {path}:{lineno} is not JSON ({exc})") from exc
             if row.get("kind") == "summary":
+                if modules is not None:
+                    raise SystemExit(f"REFUSE: {path} has multiple summaries")
                 modules = row.get("curated_modules", [])
                 continue
             if row.get("kind") != "symbol":
@@ -143,18 +150,42 @@ def load_demand(path, part):
             if key is None:
                 raise SystemExit(f"REFUSE: {path}:{lineno} carries no census_key")
             cls = part.get('"' + key.replace('"', '\\"') + '"')
-            seen[row["name"]] = cls
             if cls != "toolchain-api":
                 continue
-            for module in row.get("used_by", ()):
+            used_by = row.get("used_by")
+            if (not isinstance(used_by, list) or not used_by
+                    or not all(isinstance(module, str) for module in used_by)):
+                unscoped.append(row["name"])
+                continue
+            for module in used_by:
                 by_module[module].add(row["name"])
-    if not modules:
+    if (not isinstance(modules, list) or not modules
+            or not all(isinstance(module, str) for module in modules)):
         raise SystemExit(f"REFUSE: {path} has no curated_modules summary — the slice "
                          "under test would be undefined")
+    if len(set(modules)) != len(modules):
+        raise SystemExit(f"REFUSE: {path} repeats a curated module — the per-module "
+                         "denominator would be ambiguous")
+    out_of_slice = sorted(set(by_module).difference(modules))
+    if unscoped or out_of_slice:
+        details = []
+        if unscoped:
+            details.append("unscoped=" + ", ".join(sorted(unscoped)[:8]))
+        if out_of_slice:
+            details.append("out-of-slice=" + ", ".join(out_of_slice[:8]))
+        raise SystemExit(
+            "REFUSE: curated-module demand join failed (" + "; ".join(details)
+            + ") — every toolchain-api use must be attributable to one declared "
+            "curated module"
+        )
     if not by_module:
         raise SystemExit("REFUSE: no toolchain-api demand joined — an empty demand "
                          "compiles vacuously and reads as full facade coverage")
-    return modules, by_module, seen
+    module_join = {
+        "curated_modules": len(modules),
+        "toolchain_use_edges": sum(len(names) for names in by_module.values()),
+    }
+    return modules, by_module, module_join
 
 
 def reference_import_lines(text):
@@ -454,7 +485,7 @@ def main():
 
     lean, tag, corpus_commit = pinned_lean()
     part = load_partition()
-    modules, by_module, seen = load_demand(args.demand, part)
+    modules, by_module, module_join = load_demand(args.demand, part)
     work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-compile-{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in ("LEAN_PATH", "LEAN_SYSROOT")}
@@ -577,6 +608,7 @@ def main():
                    input_digest(args.demand),
                    input_digest(PARTITION)],
         "curated_modules": sorted(modules),
+        "curated_module_join": module_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
