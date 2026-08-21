@@ -7015,3 +7015,131 @@ fn a_name_identifies_a_declaration_but_not_the_module_that_declares_it() {
          differ: {disagreeing:?}"
     );
 }
+
+/// What a multiply-declared name agrees on across its declaring modules — and
+/// the one thing it does NOT.
+///
+/// The cell above establishes that 92 names are declared by more than one
+/// module, and checks kind and type agreement for ONE of them, the seven-module
+/// worst case. That leaves 91 names unchecked, on the grounds that decoding all
+/// 600 modules would cost more than the rest of the file. It does not have to:
+/// only 90 modules declare a duplicated name, ~18,600 declarations in total,
+/// which is roughly what decoding `Init/Prelude` eight times costs and this
+/// file already decodes it thirty-one times.
+///
+/// Measured over all 223 declaration sites:
+///
+///   every one of the 92 is a THEOREM. No definition is ever multiply declared,
+///     and that is the precondition everything below depends on
+///   kind, type and universe parameters agree in EVERY module, zero exceptions
+///   values do NOT always agree — 11 of the 92 carry a different proof in
+///     different modules
+///
+/// The tempting statement here is "all 92 agree", and it is false. What makes
+/// the disagreement harmless is precisely that all 92 are theorems: the value
+/// of a theorem is a proof, two proofs of the same proposition are
+/// interchangeable under proof irrelevance, and the kernel never unfolds one to
+/// decide a conversion it could not decide without it. Had even one of the 11
+/// been a `Defn`, a differing value would change definitional unfolding and be
+/// a real conflict rather than a benign regeneration.
+///
+/// So the count 11 is asserted as a NON-ZERO. A decode that lost the difference
+/// — by returning a constant value, or by resolving the name once and reusing
+/// it — would report perfect agreement and pass a cell that only checked for
+/// disagreement in the fields that matter.
+#[test]
+fn multiply_declared_names_agree_on_everything_except_their_proofs() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut declarers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for module in &modules {
+        for name in module_view(&lib, module, Level::Private).const_names {
+            declarers.entry(name).or_default().push(module.clone());
+        }
+    }
+    declarers.retain(|_, owners| owners.len() > 1);
+    let involved: BTreeSet<&String> = declarers.values().flatten().collect();
+    let sites: usize = declarers.values().map(Vec::len).sum();
+    assert_eq!(
+        (declarers.len(), sites, involved.len()),
+        (92, 223, 90),
+        "the duplicated population, its declaration sites, and the modules carrying them"
+    );
+
+    // Decode each involved module once, keeping only the duplicated rows.
+    type Row = (&'static str, Expr, Vec<Name>, Option<Expr>);
+    let mut rows: BTreeMap<&String, Vec<Row>> = BTreeMap::new();
+    for module in &involved {
+        let (infos, _) = decode_at(&lib, module, Level::Private);
+        for info in &infos {
+            let name = info.name().to_display_string();
+            let Some((key, _)) = declarers.get_key_value(&name) else {
+                continue;
+            };
+            let value = match info {
+                ConstantInfo::Thm(v) => Some(v.value.clone()),
+                ConstantInfo::Defn(v) => Some(v.value.clone()),
+                ConstantInfo::Opaque(v) => Some(v.value.clone()),
+                _ => None,
+            };
+            rows.entry(key).or_default().push((
+                kind_of(info),
+                info.constant_val().type_.clone(),
+                info.constant_val().level_params.clone(),
+                value,
+            ));
+        }
+    }
+    assert_eq!(
+        rows.len(),
+        declarers.len(),
+        "every duplicated name must have been decoded"
+    );
+
+    let mut non_theorem: Vec<&&String> = Vec::new();
+    let mut disagreeing: Vec<&&String> = Vec::new();
+    let mut differing_proofs: Vec<&&String> = Vec::new();
+    for (name, found) in &rows {
+        assert_eq!(
+            found.len(),
+            declarers[*name].len(),
+            "{name}: one row per declaring module"
+        );
+        let (kind, type_, levels, value) = &found[0];
+        if *kind != "Thm" {
+            non_theorem.push(name);
+        }
+        if found
+            .iter()
+            .any(|(k, t, l, _)| k != kind || t != type_ || l != levels)
+        {
+            disagreeing.push(name);
+        }
+        if found.iter().any(|(_, _, _, v)| v != value) {
+            differing_proofs.push(name);
+        }
+    }
+
+    assert!(
+        non_theorem.is_empty(),
+        "a multiply-declared DEFINITION would make a differing value a real conflict rather \
+         than a benign regeneration; these are not theorems: {non_theorem:?}"
+    );
+    assert!(
+        disagreeing.is_empty(),
+        "kind, type and universe parameters must agree in every declaring module: {disagreeing:?}"
+    );
+    assert_eq!(
+        differing_proofs.len(),
+        11,
+        "the proofs do NOT all agree, and asserting that they do would be false; a decode that \
+         lost the difference would report perfect agreement"
+    );
+    assert!(
+        differing_proofs.len() < rows.len(),
+        "and the disagreement must be a proper subset, or the type agreement above is being \
+         claimed over declarations that share nothing"
+    );
+}
