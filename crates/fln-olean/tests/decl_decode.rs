@@ -11437,10 +11437,18 @@ fn the_tag_four_node_name() {
 /// `2baabd20` generalised, holds at the boundary too: leaving the structure
 /// does not leave the shapes behind.
 ///
-/// THE MEMBERSHIP CHECK HERE IS NOT THE TAUTOLOGY THE LAST TWO WAVES ASKED FOR.
-/// Membership was reachable - one of the five holders IS in the closure - so
-/// the other four being outside is a measured outcome and not a consequence of
-/// how they were selected.
+/// NOT ONE OF THE FIVE IS IN A CHARACTERISED POPULATION, and the first version
+/// of this cell said one was. It counted the closure as though it were one of
+/// them; the node is in the closure and is a two-field object, which none of
+/// the four populations contains. w189 caught it, and the corrected figure
+/// makes the outward step cleaner: every holder is outside all four, and what
+/// distinguishes the node is closure membership alone.
+///
+/// THAT COSTS THE REACHABILITY ARGUMENT ITS ORIGINAL FORM. I had written that
+/// membership was reachable because one holder had it. None does. What carries
+/// it instead is below: two holders wear the exact shapes of characterised
+/// populations without being members, so membership was shape-reachable and the
+/// misses are a measured outcome rather than something the selection forced.
 ///
 /// POPULATION SCOPE, named because `b28cb524` was a wave lost to leaving it
 /// implicit: the link and all five holders live in `Init/Prelude.olean`. The
@@ -11677,12 +11685,16 @@ fn the_other_references_to_that_name() {
         "exactly one holder is the node in the closure"
     );
     assert_eq!(
-        in_characterised, 1,
-        "and it is the ONLY holder in any population this bead has \
-         characterised - the other four are outside the ten, the 111, the \
-         eight and the spine entirely. Membership was reachable, since that one \
-         holder has it, so this is a measured outcome and not a consequence of \
-         selection"
+        in_characterised, 0,
+        "and NOT ONE holder is in any of the four populations this bead has \
+         characterised - not the ten, the 111, the eight or the spine. The \
+         first version pinned 1, conflating the CLOSURE with those four: the \
+         node is in the closure, but it is a two-field object and none of the \
+         four contains one. w189 caught it. \
+         \
+         So all five are outside, and closure membership is what separates the \
+         node from the other four - not membership in a characterised \
+         population, which none of them has"
     );
 
     assert_eq!(
@@ -11705,5 +11717,281 @@ fn the_other_references_to_that_name() {
          separates the ten from the 111 - and another carries the spine-node \
          shape. Neither is a member. Leaving the structure does not leave the \
          shapes behind"
+    );
+}
+
+/// What the four outside holders belong to - and a name that crosses the root
+/// boundary.
+///
+/// `653365bd` found holders of that name link outside every population this
+/// bead has characterised and named their identity as unmeasured. It said four;
+/// w189 showed it is all five, since the fifth is in the closure and not in any
+/// of the four populations. The
+/// instrument for "what does an object belong to" in this file is the one
+/// `1dd7c288` used: which of `ModuleData`'s roots reaches it.
+///
+/// The five holders sit under THREE DIFFERENT ROOTS:
+///
+///   constNames   one - an array
+///   constants    one - a three-field record at 32 bytes
+///   entries      three - an array, a two-field object, and the node itself
+///
+/// AND THE LINK ITSELF IS REACHABLE FROM BOTH `constants` AND `entries`.
+///
+/// THAT IS A DEPARTURE FROM `1dd7c288`, AND THE SCOPE OF ITS FINDING IS WHAT
+/// MOVES. That cell pinned the third shape as reachable from `entries` and
+/// NEVER from `constants` - zero of 99, against 2,259 of 2,465 for ordinary
+/// cons cells, which is as strong as a zero gets. Nothing about that changes.
+/// What this shows is that the exclusion is a fact about those OBJECTS and not
+/// about the NAMES they reference: the structure stays inside `entries` while
+/// one of its names is also in the declaration graph and in the module's
+/// constant-name array.
+///
+/// So `1dd7c288`'s boundary is a boundary on reachability of objects, not a
+/// partition of the module. I read it as the latter for twenty waves without
+/// ever testing the difference, and nothing in the file distinguished them
+/// until a name was followed outward.
+///
+/// The check could have come out otherwise, which is what makes it evidence:
+/// entries-only was the observed pattern for every object in this descent, so
+/// finding a holder under `constants` is a measured departure and not a
+/// consequence of how holders were selected.
+///
+/// POPULATION SCOPE: the link and all five holders are in `Init/Prelude.olean`,
+/// asserted rather than left implicit, per `b28cb524`.
+#[test]
+fn the_four_outside_holders() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut holders: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut by_root: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut link_roots: BTreeSet<&'static str> = BTreeSet::new();
+    let mut third_shape_in_constants = 0usize;
+    let mut third_shape_total = 0usize;
+    let mut modules_seen: BTreeSet<String> = BTreeSet::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let roots: [(&'static str, BTreeSet<usize>); 5] = [
+            (
+                "imports",
+                reachable_from(bytes, base, word_at(bytes, root + 8)),
+            ),
+            (
+                "constNames",
+                reachable_from(bytes, base, word_at(bytes, root + 16)),
+            ),
+            (
+                "constants",
+                reachable_from(bytes, base, word_at(bytes, root + 24)),
+            ),
+            (
+                "extraConstNames",
+                reachable_from(bytes, base, word_at(bytes, root + 32)),
+            ),
+            (
+                "entries",
+                reachable_from(bytes, base, word_at(bytes, root + 40)),
+            ),
+        ];
+
+        // `1dd7c288`'s population, re-measured here rather than quoted.
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let tail = resolve(second);
+            let cons_shaped =
+                (second & 1 == 1 && second >> 1 == 0) || tail.and_then(shape) == Some((1, 2));
+            if !cons_shaped {
+                third_shape_total += 1;
+                if roots[2].1.contains(&object.off) {
+                    third_shape_in_constants += 1;
+                }
+            }
+            if tail.and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+
+        // Down to the node, and its name link.
+        let mut eight: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            let Some(tail) = resolve(word_at(bytes, node + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            let Some(inner) = resolve(word_at(bytes, tail + 8)) else {
+                continue;
+            };
+            let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3)) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(ten) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                let Some(below) = resolve(word_at(bytes, ten + 8 + 8)) else {
+                    continue;
+                };
+                for k in 0..word_at(bytes, below + 8) {
+                    if let Some(element) = resolve(word_at(bytes, below + 24 + 8 * k as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        eight.insert(element);
+                    }
+                }
+            }
+        }
+        if eight.is_empty() {
+            continue;
+        }
+        modules_seen.insert(module.clone());
+
+        let mut closure: BTreeSet<usize> = BTreeSet::new();
+        let mut stack: Vec<usize> = eight.iter().copied().collect();
+        while let Some(offset) = stack.pop() {
+            if !closure.insert(offset) {
+                continue;
+            }
+            let object = at.get(&offset).expect("a walked object");
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                for slot in 0..usize::from(object.other) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 8 + 8 * slot)) {
+                        stack.push(child);
+                    }
+                }
+            } else if object.tag == abi::TAG_ARRAY {
+                for i in 0..word_at(bytes, offset + 8) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 24 + 8 * i as usize)) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        let node = closure
+            .iter()
+            .copied()
+            .find(|&offset| shape(offset) == Some((4, 2)))
+            .expect("the one `tag 4` node");
+        let link = resolve(word_at(bytes, node + 8)).expect("its name link");
+        for (name, set) in &roots {
+            if set.contains(&link) {
+                link_roots.insert(name);
+            }
+        }
+
+        // Every holder, and which root reaches it.
+        for holder in &objects {
+            let names_it = if holder.tag <= abi::TAG_MAX_CTOR_TAG {
+                (0..usize::from(holder.other))
+                    .any(|slot| resolve(word_at(bytes, holder.off + 8 + 8 * slot)) == Some(link))
+            } else if holder.tag == abi::TAG_ARRAY {
+                (0..word_at(bytes, holder.off + 8)).any(|i| {
+                    resolve(word_at(bytes, holder.off + 24 + 8 * i as usize)) == Some(link)
+                })
+            } else {
+                false
+            };
+            if !names_it {
+                continue;
+            }
+            holders.insert((index, holder.off));
+            for (name, set) in &roots {
+                if set.contains(&holder.off) {
+                    *by_root.entry((*name).to_owned()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            holders.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // Objects, and the population they were drawn from.
+    assert_eq!(holders.len(), 5, "five holder OBJECTS");
+    assert_eq!(
+        modules_seen.len(),
+        1,
+        "all in a single module - the scope is `Init/Prelude.olean`, asserted \
+         rather than left implicit"
+    );
+
+    // What they belong to.
+    assert_eq!(
+        by_root.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("constNames".to_owned(), 1),
+            ("constants".to_owned(), 1),
+            ("entries".to_owned(), 3),
+        ],
+        "the holders sit under THREE different `ModuleData` roots, and each \
+         under exactly one - five holders, five root memberships"
+    );
+    assert_eq!(
+        link_roots.into_iter().collect::<Vec<_>>(),
+        vec!["constants", "entries"],
+        "and the link itself is reachable from BOTH `constants` and `entries`"
+    );
+
+    // What that does and does not do to `1dd7c288`.
+    assert_eq!(
+        (third_shape_in_constants, third_shape_total),
+        (0, 99),
+        "`1dd7c288`'s exclusion is re-measured here and stands: not one of the \
+         99 third-shape objects is reachable from `constants`. What moves is \
+         its SCOPE - the exclusion is a fact about those objects, not a \
+         partition of the module, because one of their names is in the \
+         declaration graph and in the constant-name array. Entries-only was the \
+         observed pattern for every object in this descent, so a holder under \
+         `constants` is a measured departure and not an artefact of selection"
     );
 }
