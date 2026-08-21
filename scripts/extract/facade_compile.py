@@ -1961,6 +1961,16 @@ def main():
             "REFUSE: facade manifest structural-class pin diverges "
             f"({json.dumps(structural_class_pin_join, sort_keys=True)})"
         )
+    field_sets_checked_pin_join = {
+        "summary_field_sets_checked": manifest_summary.get("field_sets_checked"),
+        "pinned_field_sets_checked": 196,
+    }
+    if (field_sets_checked_pin_join["summary_field_sets_checked"]
+            != field_sets_checked_pin_join["pinned_field_sets_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest field-set-check pin diverges "
+            f"({json.dumps(field_sets_checked_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3071,6 +3081,7 @@ def main():
         ),
         "manifest_private_fields_exposed_pin_join": private_fields_exposed_pin_join,
         "manifest_structural_class_pin_join": structural_class_pin_join,
+        "manifest_field_sets_checked_pin_join": field_sets_checked_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
