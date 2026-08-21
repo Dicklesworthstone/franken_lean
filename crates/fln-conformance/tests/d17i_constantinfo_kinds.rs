@@ -13267,3 +13267,151 @@ fn the_distinct_and_total_name_censuses_differ_by_the_multi_declaration_excess()
         "the seven-module name is the one the census cell names"
     );
 }
+
+/// The eight names whose multi-declaration exists only below the exported
+/// surface.
+const PRIVATE_ONLY_MULTI_DECLARED: &[&str] = &[
+    "String.Slice.Pattern.Model.split._unary.induct_unfolding",
+    "String.Slice.Pattern.Model.split.induct_unfolding",
+    "String.Slice.Pos.revSkipWhile._unary.induct_unfolding",
+    "String.Slice.Pos.revSkipWhile.induct_unfolding",
+    "String.Slice.Pos.skipWhile._unary.induct_unfolding",
+    "String.Slice.Pos.skipWhile.induct_unfolding",
+    "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find.congr_simp",
+    "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp",
+];
+
+/// A name's module multiplicity does not change between levels — it either
+/// survives intact or the name is not exported at all.
+///
+/// The reconciliation cell pins the private-level excess at 131 over 92 names.
+/// The exported level has its own excess and nothing measures it: 51,506
+/// occurrences over 51,391 distinct names, 115 surplus across 84 names. Two
+/// numbers, 131 and 115, differing by 16, and the interesting question is which
+/// of the 92 lose their duplication on the way up.
+///
+/// None of them do. Pairing each of the 92 names' exported multiplicity against
+/// its private one gives only these:
+///
+///   (2,2) ×65   (3,3) ×13   (4,4) ×3   (5,5) ×1   (6,6) ×1   (7,7) ×1
+///   (0,2) ×4    (0,4) ×4
+///
+/// so a name is declared by exactly as many modules at both levels, or it is
+/// absent from every exported array. There is no middle case — no name declared
+/// by four modules privately and two publicly. The exported part drops
+/// declarations WHOLESALE, never partially, and that is the property that lets
+/// every level-comparison cell in this file key on names at one level and trust
+/// the other.
+///
+/// THE EIGHT ARE THIS BEAD'S OWN FAMILY: six `induct_unfolding` and two
+/// `congr_simp`, all equation-compiler auxiliaries, which is the population d17i
+/// exists to recover and exactly the kind of declaration that lives only in the
+/// private part. Their private multiplicities are 2 and 4, so they contribute
+/// 4×1 + 4×3 = 16 to the private excess and nothing to the exported one —
+/// which is the whole of the 131 − 115 difference, derived rather than
+/// subtracted.
+///
+/// Monotonicity alone would be implied by the per-module containment already
+/// pinned, so it is not the claim. EQUALITY is not implied: containment permits
+/// a name to be private in one module and public in another, which is precisely
+/// a (2,4) pair, and the artifact simply has none.
+///
+/// Conservation first: the exported classes must reproduce the exported
+/// occurrence and distinct totals before any pair is named.
+#[test]
+fn multi_declaration_survives_the_export_boundary_whole_or_not_at_all() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut exported_occ: BTreeMap<String, usize> = BTreeMap::new();
+    let mut private_occ: BTreeMap<String, usize> = BTreeMap::new();
+    let mut exported_total = 0usize;
+    for module in &modules {
+        let exported = module_view(&lib, module, Level::Exported);
+        exported_total += exported.const_names.len();
+        for name in exported.const_names {
+            *exported_occ.entry(name).or_default() += 1;
+        }
+        for name in module_view(&lib, module, Level::Private).const_names {
+            *private_occ.entry(name).or_default() += 1;
+        }
+    }
+
+    let mut classes: BTreeMap<usize, usize> = BTreeMap::new();
+    for count in exported_occ.values() {
+        *classes.entry(*count).or_default() += 1;
+    }
+
+    // Conservation first, both exported margins.
+    assert_eq!(
+        classes.iter().map(|(m, n)| m * n).sum::<usize>(),
+        exported_total,
+        "the exported classes must reproduce the occurrence total"
+    );
+    assert_eq!(
+        classes.values().sum::<usize>(),
+        exported_occ.len(),
+        "and the distinct total"
+    );
+    assert_eq!(
+        (exported_total, exported_occ.len()),
+        (51_506, 51_391),
+        "the exported census, measured here rather than quoted"
+    );
+    assert_eq!(
+        classes.iter().map(|(m, n)| (m - 1) * n).sum::<usize>(),
+        115,
+        "the exported excess, against 131 at private level"
+    );
+
+    // The cross-level pairing over the privately multi-declared names.
+    let mut pairs: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for (name, private) in &private_occ {
+        if *private > 1 {
+            *pairs
+                .entry((exported_occ.get(name).copied().unwrap_or(0), *private))
+                .or_default() += 1;
+        }
+    }
+    assert_eq!(
+        pairs,
+        BTreeMap::from([
+            ((0, 2), 4),
+            ((0, 4), 4),
+            ((2, 2), 65),
+            ((3, 3), 13),
+            ((4, 4), 3),
+            ((5, 5), 1),
+            ((6, 6), 1),
+            ((7, 7), 1),
+        ]),
+        "every pair is either equal or exported-absent; a partial drop would be a third shape"
+    );
+    assert_eq!(
+        pairs.values().sum::<usize>(),
+        92,
+        "and the pairing covers the 92 the reconciliation cell counts"
+    );
+
+    // The exported-absent eight, and the excess they alone explain.
+    let absent: Vec<&String> = private_occ
+        .iter()
+        .filter(|(name, count)| **count > 1 && !exported_occ.contains_key(*name))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        absent,
+        PRIVATE_ONLY_MULTI_DECLARED.to_vec(),
+        "the names whose duplication never reaches the exported surface"
+    );
+    assert_eq!(
+        pairs
+            .iter()
+            .filter(|((exported, _), _)| *exported == 0)
+            .map(|((_, private), n)| (private - 1) * n)
+            .sum::<usize>(),
+        131 - 115,
+        "they contribute the entire difference between the two excesses"
+    );
+}
