@@ -5780,3 +5780,142 @@ fn private_names_are_the_only_ones_carrying_a_num_component() {
         );
     }
 }
+
+/// The whole nested family, which shares one minor-premise count.
+const NESTED_RECURSOR_FAMILY: &[&str] =
+    &["Lean.Syntax.rec", "Lean.Syntax.rec_1", "Lean.Syntax.rec_2"];
+
+/// ORDER and MULTIPLICITY in a recursor's rule list — what the block cell's
+/// `BTreeSet` comparison necessarily discards.
+///
+/// The block-relations cell already compares a recursor's rule constructors
+/// against its block's constructors, and finds them equal. It compares them as
+/// SETS. A set comparison cannot see either of the two properties the kernel
+/// actually depends on: a second rule for one constructor collapses into the
+/// same set, and any permutation of the rules produces the same set. This cell
+/// asserts only that delta; the set equality is not re-derived here.
+///
+/// The delta is on this bead's own failure class. Our kernel resolves a rule by
+/// searching the list for the constructor's name rather than by indexing it, so
+/// a duplicate rule is not an error — the search takes the first and the second
+/// is unreachable, silently. And a missing rule does not fail to decode and does
+/// not fail to resolve; the recursor simply never reduces, which is a
+/// restrictive divergence of exactly the kind d17i collects.
+///
+/// Measured over `Init/Prelude` at private level, 129 recursors:
+///
+///   127 have `rules` equal to the concatenated `ctors` of their block IN
+///     ORDER, and ZERO have the right constructors in the wrong order — so the
+///     stronger sequence law holds wherever the set law does
+///   0 have two rules for one constructor
+///   the 2 departures are the nested auxiliaries the block cell already names,
+///     whose rules are for `Array.mk` and `List.nil`/`List.cons`
+///
+/// `num_minors` agrees with the rule count for 126, and the three exceptions
+/// are exactly the nested family: each of them stores `num_minors == 7` and
+/// `num_motives == 3` — the totals for the whole family — while their own rule
+/// lists partition those seven as 4 + 1 + 2. So `num_minors` is a property of
+/// the block, not of the recursor, and that is only visible where a block holds
+/// more than one recursor.
+#[test]
+fn a_recursors_rule_list_is_the_constructor_list_of_its_block() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut recursors: BTreeMap<String, &RecursorVal> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Rec(v) => drop(recursors.insert(name, v)),
+            _ => {}
+        }
+    }
+    assert_eq!(recursors.len(), 129, "the recursor census must be reached");
+
+    let mut out_of_correspondence: Vec<&String> = Vec::new();
+    let mut reordered: Vec<&String> = Vec::new();
+    let mut duplicated: Vec<&String> = Vec::new();
+    let mut minors_disagree: Vec<&String> = Vec::new();
+    let mut rule_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut nested_rules = 0usize;
+
+    for (name, rec) in &recursors {
+        let rules: Vec<String> = rec
+            .rules
+            .iter()
+            .map(|rule| rule.ctor.to_display_string())
+            .collect();
+        *rule_counts.entry(rules.len()).or_default() += 1;
+
+        let unique: BTreeSet<&String> = rules.iter().collect();
+        if unique.len() != rules.len() {
+            duplicated.push(name);
+        }
+
+        let mut expected: Vec<String> = Vec::new();
+        for member in &rec.all {
+            if let Some(induct) = inductives.get(&member.to_display_string()) {
+                expected.extend(induct.ctors.iter().map(Name::to_display_string));
+            }
+        }
+        if rules != expected {
+            out_of_correspondence.push(name);
+            // Distinguish a real reordering from a different constructor set:
+            // the first would be a decode defect, the second is the nesting.
+            let (mut a, mut b) = (rules.clone(), expected.clone());
+            a.sort();
+            b.sort();
+            if a == b {
+                reordered.push(name);
+            }
+        }
+        if rec.num_minors as usize != rules.len() {
+            minors_disagree.push(name);
+        }
+        if NESTED_RECURSOR_FAMILY.contains(&name.as_str()) {
+            assert_eq!(
+                (rec.num_minors, rec.num_motives),
+                (7, 3),
+                "{name}: the nested family shares one minor and motive count"
+            );
+            nested_rules += rules.len();
+        }
+    }
+
+    assert!(
+        duplicated.is_empty(),
+        "the kernel resolves a rule by searching for the constructor's name, so a second rule \
+         for one constructor is unreachable rather than an error; these carry one: {duplicated:?}"
+    );
+    assert!(
+        reordered.is_empty(),
+        "no recursor has the right constructors in the wrong order: {reordered:?}"
+    );
+    assert_eq!(
+        out_of_correspondence, NESTED_AUXILIARY_RECURSORS,
+        "only the nested auxiliaries depart from their block's constructor list"
+    );
+    assert_eq!(
+        minors_disagree, NESTED_RECURSOR_FAMILY,
+        "num_minors is a property of the block, so it disagrees with the rule count exactly \
+         where a block holds more than one recursor"
+    );
+    assert_eq!(
+        nested_rules, 7,
+        "the family's three rule lists partition its seven minor premises"
+    );
+
+    // Non-vacuity: a decode returning a uniform rule list would have to hit
+    // every one of these bucket sizes to pass.
+    assert_eq!(
+        (
+            rule_counts.get(&0).copied().unwrap_or_default(),
+            rule_counts.get(&1).copied().unwrap_or_default(),
+            rule_counts.keys().copied().max().unwrap_or_default()
+        ),
+        (3, 108, 13),
+        "the rule-count spread must be real, got {rule_counts:?}"
+    );
+}
