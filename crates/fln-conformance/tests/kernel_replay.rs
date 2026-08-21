@@ -4993,10 +4993,11 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
     // fresh name. This makes it mechanical, and names BOTH file sets when it
     // fires so the collision is obvious rather than merely reported.
     //
-    // Per PROCESS, deliberately. It cannot see a stale tree left by an earlier
-    // run with a different shape -- that hazard is cross-run and stays with the
-    // versioned name and its comment -- but that one is a change somebody makes
-    // on purpose, whereas this one happens by accident.
+    // Per PROCESS, deliberately: this one is about two tests fighting over a
+    // name inside one run. The cross-run half -- a tree left by an EARLIER run
+    // with a different shape, which the next run then unions into -- used to be
+    // this comment's problem to describe and the reader's problem to remember.
+    // It is now the manifest's, below.
     static CLAIMED: OnceLock<Mutex<BTreeMap<String, Vec<String>>>> = OnceLock::new();
     let mut requested = relative_files
         .iter()
@@ -5045,6 +5046,41 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
     // root and a misprovisioned one, and the same one the retained-receipt
     // reader draws between a file that is not there and a file it cannot read.
     // Third place in this file, and the only one where the two were conflated.
+    // THE SHAPE THIS NAME WAS LAST BUILT WITH, RECORDED WHERE THE NEXT RUN CAN
+    // SEE IT. Nothing sweeps these trees, so a fixture whose entry list changes
+    // without its version being bumped UNIONS into the leftovers of the previous
+    // shape: the walk then sees files the current list never mentions, and the
+    // count comes out wrong in whichever test is unlucky. The rule until now was
+    // a comment asking whoever edits a fixture to remember. This makes it
+    // mechanical, and the message names both shapes because "stale fixture" on
+    // its own leaves the reader to work out which entry appeared or vanished.
+    //
+    // BESIDE THE TREE, NOT INSIDE IT. A marker file within `base` would join
+    // every walk of that tree, and one test asserts its fixture directory holds
+    // no entries AT ALL. A sibling path is invisible to `read_dir(base)` and to
+    // every fixture assertion in this file.
+    //
+    // Written through a temporary and renamed, which is atomic on POSIX. Two
+    // tests may legitimately build the same fixture at the same time -- same
+    // name, same contents, allowed by the registry above -- and a plain
+    // truncating write would let one of them read the other's half-written
+    // manifest and report a shape change that never happened.
+    let manifest =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{versioned_name}.manifest"));
+    let recorded = requested.join("\n");
+    if let Ok(previous) = fs::read_to_string(&manifest)
+        && previous != recorded
+    {
+        panic!(
+            "fixture `{versioned_name}` was built by an earlier run as {:?} and is now asked for \
+             as {:?}. Nothing removes these trees, so this build would UNION into that one and \
+             every count taken from the result would be over by whatever the old shape left \
+             behind. Bump the version in the fixture's name",
+            previous.split('\n').collect::<Vec<_>>(),
+            requested
+        );
+    }
+
     fs::create_dir_all(&base)
         .unwrap_or_else(|error| panic!("create fixture tree {}: {error}", base.display()));
     for relative in relative_files {
@@ -5057,6 +5093,14 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
         fs::write(&path, b"")
             .unwrap_or_else(|error| panic!("create fixture file {}: {error}", path.display()));
     }
+
+    static MANIFEST_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = MANIFEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = manifest.with_extension(format!("manifest-{}-{seq}", std::process::id()));
+    fs::write(&staging, recorded.as_bytes())
+        .unwrap_or_else(|error| panic!("write {}: {error}", staging.display()));
+    fs::rename(&staging, &manifest)
+        .unwrap_or_else(|error| panic!("record fixture shape {}: {error}", manifest.display()));
     base
 }
 
@@ -5628,6 +5672,109 @@ fn the_cap_refuses_without_reaching_the_read() {
         b"on-disk-bytes",
         "the one-line wrapper must pass `fs::read`, or the ordering pinned above is about \
          something production does not do"
+    );
+}
+
+/// A fixture rebuilt with a DIFFERENT shape is refused, across runs.
+///
+/// **The hazard was a comment asking people to remember.** The name registry
+/// catches two tests claiming one fixture name inside one process. The other
+/// half -- an earlier RUN having built this name with a different entry list --
+/// outlives the process that could have noticed, and the writer's own comment
+/// said so: the cross-run case "stays with the versioned name and its comment".
+/// Nothing removes these trees, so the next build unions into the leftovers, the
+/// walk sees files the current list never mentions, and the count comes out
+/// wrong in whichever test the interleaving disadvantages.
+///
+/// **Demonstrated on a planted member, because the live population is empty.**
+/// Every fixture name in this file is built with one shape, so the guard would
+/// never run and a guard whose condition nothing satisfies is indistinguishable
+/// from one that no longer works. The stale manifest here is written by hand for
+/// a name no real fixture uses -- the same move the collision self-test makes,
+/// and the only way to see a cross-run failure inside one run.
+///
+/// **The refusal names both shapes.** "Stale fixture" leaves the reader to work
+/// out which entry appeared or vanished, which is the entire question when a
+/// count is off by one.
+///
+/// **The record sits BESIDE the tree, not inside it**, and that is asserted:
+/// a marker file within the fixture directory would join every walk of it, and
+/// `an_empty_library_walks_to_nothing_and_a_missing_one_does_not_walk` requires
+/// its tree to hold no entries at all.
+#[test]
+fn a_fixture_rebuilt_with_a_different_shape_is_refused() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+
+    // GREEN CONTROL FIRST, and it is what makes the refusal below meaningful: an
+    // ordinary build must record its shape, and building the same name with the
+    // same contents again must still be allowed.
+    let ok = write_inventory_fixture("t6r7-selftest-manifest-ok-v1", &["Kept.olean"]);
+    let ok_manifest = tmp.join("t6r7-selftest-manifest-ok-v1.manifest");
+    let recorded = fs::read_to_string(&ok_manifest)
+        .unwrap_or_else(|error| panic!("read {}: {error}", ok_manifest.display()));
+    assert_eq!(
+        recorded, "Kept.olean",
+        "the writer must record the shape it built, or the refusal below is guarding on nothing"
+    );
+    assert!(
+        !ok_manifest.starts_with(&ok),
+        "the record must sit beside the tree at {}, not inside {} where every walk of the fixture \
+         would see it",
+        ok_manifest.display(),
+        ok.display()
+    );
+    assert_eq!(
+        write_inventory_fixture("t6r7-selftest-manifest-ok-v1", &["Kept.olean"]),
+        ok,
+        "the same name with the same contents must still rebuild; a test may build its own \
+         fixture twice"
+    );
+
+    // THE PLANTED PREVIOUS RUN. Written by hand, because a real one cannot
+    // happen twice inside a single process.
+    let stale = tmp.join("t6r7-selftest-manifest-stale-v1.manifest");
+    fs::write(&stale, b"Gone.olean\nKept.olean")
+        .unwrap_or_else(|error| panic!("write {}: {error}", stale.display()));
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let rebuilt = std::panic::catch_unwind(|| {
+        write_inventory_fixture("t6r7-selftest-manifest-stale-v1", &["Kept.olean"])
+    });
+    std::panic::set_hook(previous);
+
+    let payload = rebuilt
+        .err()
+        .unwrap_or_else(|| panic!("a fixture rebuilt with a different shape must be refused"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+
+    // BOTH SHAPES, ASSERTED SEPARATELY. `Gone.olean` is the entry that would
+    // have been left behind and is the whole content of the warning; `Kept.olean`
+    // is in both shapes and proves the message shows the new list rather than
+    // only the difference.
+    assert!(
+        message.contains("Gone.olean"),
+        "the refusal must name what the earlier run left behind: {message}"
+    );
+    assert!(
+        message.contains("Kept.olean"),
+        "the refusal must name the shape being asked for now: {message}"
+    );
+    assert!(
+        message.contains("t6r7-selftest-manifest-stale-v1"),
+        "the refusal must name the fixture: {message}"
+    );
+
+    // AND NOTHING WAS BUILT. The check has to precede the writes, or the stale
+    // tree has already been unioned into by the time anyone is told.
+    assert!(
+        !tmp.join("t6r7-selftest-manifest-stale-v1").exists(),
+        "the rebuild was refused and its tree exists anyway; the shape check must run BEFORE the \
+         files are written"
     );
 }
 
