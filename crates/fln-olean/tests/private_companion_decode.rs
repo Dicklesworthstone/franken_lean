@@ -236,6 +236,10 @@ const INT_ZERO_NE_ONE_MATCH_1_1: &str =
     "_private.Init.Data.Int.Basic.0.Int.zero_ne_one.match_1_1";
 /// The pin's private integer companion stores this definition in Basic.
 const INT_ZERO_NE_ONE_MATCH_1_1_MODULE: &str = "Init/Data/Int/Basic";
+/// The private match implementation for `Int.not`.
+const INT_NOT_MATCH_1: &str = "_private.Init.Data.Int.Bitwise.Basic.0.Int.not.match_1";
+/// The pin's private integer-bitwise companion stores this definition in Basic.
+const INT_NOT_MATCH_1_MODULE: &str = "Init/Data/Int/Bitwise/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1642,6 +1646,33 @@ fn int_zero_ne_one_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {INT_ZERO_NE_ONE_MATCH_1_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn int_not_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("int_not_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, INT_NOT_MATCH_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&INT_NOT_MATCH_1.to_owned()),
+        "the private companion of {INT_NOT_MATCH_1_MODULE} must retain {INT_NOT_MATCH_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == INT_NOT_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {INT_NOT_MATCH_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {INT_NOT_MATCH_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
