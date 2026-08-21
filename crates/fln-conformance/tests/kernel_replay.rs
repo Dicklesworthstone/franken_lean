@@ -273,6 +273,169 @@ fn unit_topological_order(
     (order, cyclic)
 }
 
+/// The replay order respects every edge, scans every member, and breaks ties by
+/// unit index.
+///
+/// **The function that decides replay order had no test.** Its doc makes three
+/// claims -- a unit is admitted only after every unit owning a constant ANY of
+/// its members mention, ties are broken in unit-creation order so the replay is
+/// deterministic, and units in a dependency cycle come back separately -- and
+/// nothing anywhere checked one of them. It runs on the corpus, so on this host
+/// it had never executed at all.
+///
+/// **Getting it wrong is not a crash, it is a wrong diagnosis.** A unit checked
+/// before the unit it depends on is submitted to a kernel whose environment does
+/// not hold that constant yet. The verdict is a missing-constant rejection --
+/// indistinguishable, downstream, from the artifact being incomplete. The replay
+/// would report the corpus as broken and be believed.
+///
+/// **The fixture is synthetic and tiny, and the assertions are on the RELATION,
+/// not on the order that comes out.** A golden list would pass for a function
+/// that had stopped consulting the edges at all, as long as the fixture happened
+/// to be numbered conveniently. The edges are declared here by construction --
+/// each axiom's type either names one constant or is a sort -- so the expected
+/// relation is written independently of `dependencies`, which is the function
+/// under test's own machinery.
+///
+/// **Each assertion kills a specific way of being wrong.**
+/// - `C` before `A` and before the `B, E` block: an implementation that ignored
+///   edges and emitted `0..n` puts `A` first.
+/// - `C` before the `B, E` block specifically: `E` is that unit's SECOND member
+///   and is the only one naming `C`. An implementation scanning just the first
+///   member sees no edge, the block starts ready, and being unit 1 it wins the
+///   tie against unit 2 and comes out first.
+/// - `A` before the block: both are released at the same instant, by `C`. This
+///   is the tie, and it is the whole determinism claim -- a ready set drained in
+///   hash order satisfies every other assertion here.
+#[test]
+fn the_replay_order_respects_every_edge_and_breaks_ties_by_unit_index() {
+    use fln_env::constants::{AxiomVal, ConstantVal};
+
+    fn axiom(name: &str, mentions: Option<&str>) -> ConstantInfo {
+        // A type that names one constant, or a sort, which names none. Nothing
+        // else is needed: `dependencies` reads the type of an axiom and stops.
+        let type_ = match mentions {
+            Some(dep) => Expr::const_(Name::str(Name::anonymous(), dep), Vec::new()),
+            None => Expr::sort(Level::zero()),
+        };
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::str(Name::anonymous(), name),
+                level_params: Vec::new(),
+                type_,
+            },
+            is_unsafe: false,
+        })
+    }
+
+    let infos = vec![
+        axiom("A", Some("C")),
+        axiom("B", None),
+        axiom("E", Some("C")),
+        axiom("C", None),
+        axiom("D", Some("A")),
+    ];
+    // Unit 1 is a BLOCK whose first member names nothing and whose second names
+    // `C`. That asymmetry is the fixture's entire point.
+    let units = vec![vec![0], vec![1, 2], vec![3], vec![4]];
+
+    let (order, cyclic) = unit_topological_order(&infos, &units);
+
+    // TOTAL, AND EACH UNIT EXACTLY ONCE. Without this, every ordering claim
+    // below is satisfiable by dropping the units that would have violated it.
+    assert!(
+        cyclic.is_empty(),
+        "this fixture has no cycle; units {cyclic:?} were reported as cyclic"
+    );
+    assert_eq!(
+        order.len(),
+        units.len(),
+        "every unit must be placed: {order:?}"
+    );
+    assert_eq!(
+        order.iter().copied().collect::<HashSet<_>>().len(),
+        units.len(),
+        "a unit was placed twice: {order:?}"
+    );
+
+    let at = |unit: usize| {
+        order
+            .iter()
+            .position(|&u| u == unit)
+            .unwrap_or_else(|| panic!("unit {unit} is missing from {order:?}"))
+    };
+
+    assert!(
+        at(2) < at(0),
+        "`A` depends on `C`, so unit 2 must precede unit 0. If it does not, the edges are not \
+         being consulted and the replay submits `A` to a kernel that has not admitted `C`: \
+         {order:?}"
+    );
+    assert!(
+        at(2) < at(1),
+        "the block's SECOND member `E` names `C`, so unit 2 must precede unit 1. This is the \
+         assertion that pins `any of its members`: scan only the first member and the block \
+         starts ready, wins the tie against unit 2, and is replayed before its dependency: \
+         {order:?}"
+    );
+    assert!(
+        at(0) < at(3),
+        "`D` depends on `A`, so unit 0 must precede unit 3: {order:?}"
+    );
+    assert!(
+        at(0) < at(1),
+        "units 0 and 1 are released at the same instant, by unit 2, so the tie must be broken by \
+         unit index. A ready set drained in hash order satisfies every other assertion here and \
+         makes the replay order differ between runs of the same corpus: {order:?}"
+    );
+}
+
+/// A dependency cycle is reported, not silently dropped.
+///
+/// **The caller replays `order` and then `cyclic`.** If a cycle made units
+/// vanish from both, they would never be checked and the run would report a
+/// smaller corpus rather than a failure -- the empty-referent shape. So the
+/// separation has to be total, and that is what is asserted: nothing placed,
+/// both units returned, in unit order.
+#[test]
+fn units_in_a_dependency_cycle_come_back_separately_and_in_unit_order() {
+    use fln_env::constants::{AxiomVal, ConstantVal};
+
+    fn mutually_referring(name: &str, dep: &str) -> ConstantInfo {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::str(Name::anonymous(), name),
+                level_params: Vec::new(),
+                type_: Expr::const_(Name::str(Name::anonymous(), dep), Vec::new()),
+            },
+            is_unsafe: false,
+        })
+    }
+
+    let infos = vec![mutually_referring("F", "G"), mutually_referring("G", "F")];
+    let units = vec![vec![0], vec![1]];
+
+    let (order, cyclic) = unit_topological_order(&infos, &units);
+
+    assert!(
+        order.is_empty(),
+        "neither unit can be admitted before the other, so nothing is topologically placed: \
+         {order:?}"
+    );
+    assert_eq!(
+        cyclic,
+        vec![0, 1],
+        "both units must be REPORTED, in unit order. A cycle that dropped its members would \
+         leave them unchecked and the run would look like a smaller corpus rather than a \
+         failure"
+    );
+    assert_eq!(
+        order.len() + cyclic.len(),
+        units.len(),
+        "the two results must partition the units, or some unit is replayed twice or not at all"
+    );
+}
+
 /// Classify a rejected declaration into its reduction-gap sub-family, for the
 /// triage breakdown. Every family here type-checks only under a reduction rule
 /// K1's bootstrap slice does not yet implement (bead franken_lean-zht
