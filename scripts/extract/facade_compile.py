@@ -286,6 +286,10 @@ the toolchain would report a perfect facade:
     to carry a nonempty quarantine reason and every emitted declaration to
     carry none. Emission status cannot become a row-level unexplained gap.
 
+  * A MANIFEST-MODULE-PROVENANCE JOIN requires every declaration to name a
+    nonempty owner module in the Lean, Init, or Std surface. A row cannot lose
+    its source-module provenance or drift outside the native façade boundary.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1744,6 +1748,36 @@ def main():
             f"unexplained={unexplained_withheld_rows[:8]!r}, "
             f"reasoned_emitted={reasoned_emitted_rows[:8]!r})"
         )
+    invalid_module_rows = []
+    manifest_module_counts = Counter()
+    for row in manifest_rows:
+        module = row.get("module")
+        if not isinstance(module, str) or not module:
+            invalid_module_rows.append(row["name"])
+            continue
+        manifest_module_counts[module] += 1
+    manifest_module_namespaces = Counter(
+        module.split(".", 1)[0] for module in manifest_module_counts
+    )
+    manifest_module_join = {
+        "declaration_rows": len(manifest_rows),
+        "module_owners": len(manifest_module_counts),
+        "namespaces": dict(sorted(manifest_module_namespaces.items())),
+        "invalid_module_rows": len(invalid_module_rows),
+        "out_of_surface_namespaces": sum(
+            count for namespace, count in manifest_module_namespaces.items()
+            if namespace not in {"Lean", "Init", "Std"}
+        ),
+    }
+    if (manifest_module_join["declaration_rows"] == 0
+            or manifest_module_join["module_owners"] == 0
+            or manifest_module_join["invalid_module_rows"] != 0
+            or manifest_module_join["out_of_surface_namespaces"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest module-provenance join failed "
+            f"({json.dumps(manifest_module_join, sort_keys=True)}, "
+            f"invalid={invalid_module_rows[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -2180,6 +2214,7 @@ def main():
         "manifest_transparency_fallback_join": manifest_transparency_fallback_join,
         "manifest_structural_fallback_join": manifest_structural_fallback_join,
         "manifest_nonemission_provenance_join": manifest_nonemission_provenance_join,
+        "manifest_module_provenance_join": manifest_module_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
