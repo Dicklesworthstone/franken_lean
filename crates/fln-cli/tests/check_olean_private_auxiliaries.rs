@@ -312,8 +312,15 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let private_companion_missing = json_usize_field(private_companion_residuals, "missing");
     assert_eq!(private_companion_missing, 0, "{json}");
     let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
+    let private_companion_names = json_array_field(private_companion_residuals, "names");
+    let private_companion_name_count = json_array_len(private_companion_names);
     assert_eq!(
-        json_array_len(json_array_field(private_companion_residuals, "names")),
+        json_name_set(private_companion_names).len(),
+        private_companion_name_count,
+        "{json}",
+    );
+    assert_eq!(
+        private_companion_name_count,
         private_companion_observed,
         "{json}",
     );
