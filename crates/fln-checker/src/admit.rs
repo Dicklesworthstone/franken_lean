@@ -2704,8 +2704,8 @@ fn and_recursor_type(
     let proposition = builder.sort_zero();
     let motive_type = and_motive_type(&mut builder, and_name, motive_universe);
     let minor = and_minor_type(&mut builder, and_name, intro);
-    let left = builder.bvar(4);
-    let right = builder.bvar(3);
+    let left = builder.bvar(3);
+    let right = builder.bvar(2);
     let major_type = and_application(&mut builder, and_name, left, right);
     let motive = builder.bvar(3);
     let major = builder.bvar(0);
