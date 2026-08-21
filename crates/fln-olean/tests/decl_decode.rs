@@ -11720,6 +11720,244 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The coarsening merges ten shapes - measuring `ebfa87eb`'s own aside.
+///
+/// `ebfa87eb` closed with "split implies more than one field signature and not
+/// the reverse". The first half is a derivation. THE SECOND HALF IS AN
+/// EXISTENCE CLAIM and I did not measure it: if no shape had many signatures
+/// and one pattern, the distinction would be true and do no work - the
+/// true-but-empty failure that same cell had just named in someone else's
+/// sentence, which is mine.
+///
+/// It is not empty. Over the four modules:
+///
+///   constructor shapes                              36
+///   more than one FIELD SIGNATURE                   25
+///   more than one boxed-or-pointer PATTERN          15
+///   many signatures but exactly ONE pattern         10
+///
+/// and 15 + 10 = 25, asserted as a decomposition rather than three separate
+/// counts. The ten are what the coarsening merges, and they are not marginal:
+/// `tag 5 arity 2` has 33 signatures across 26,394 objects and every one of
+/// them has both slots as pointers; `tag 6 arity 3` has 60 across 10,852. Those
+/// are shapes whose signature varies only in WHICH pointee sits in a slot,
+/// which is exactly the variation a pattern is meant to ignore.
+///
+/// THE DERIVATION HOLDS EMPIRICALLY TOO: zero shapes have more than one pattern
+/// and only one signature. That direction is forced - different patterns are
+/// different signatures - so measuring it is a control on the walk rather than
+/// a discovery, and it is asserted for that reason.
+///
+/// AND `ebfa87eb`'S 15 IS NOT A PREDICATE ARTEFACT. That cell called a slot
+/// scalar when its low bit was set; the signature audit calls a slot scalar
+/// when it does not resolve to a walked object. Those are different tests - an
+/// unresolvable non-boxed word would separate them - and they select the SAME
+/// 15 shapes here. Measured rather than assumed, because I used one predicate
+/// and quoted a number computed with the other.
+///
+/// POPULATION SCOPE: all four modules pooled, which is the signature audit's
+/// population, so the 25 is comparable with its per-shape counts. The
+/// shape-level tallies are identical if Prelude is taken alone - 36, 25, 15,
+/// 10 - even though the object counts are not, and that is asserted too rather
+/// than left as an impression.
+#[test]
+fn the_coarsening_merges_ten_shapes() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    // Two runs over the same walk: every module, then Prelude alone.
+    let mut tallies: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut merged: Vec<(u8, u8, usize, usize)> = Vec::new();
+    let mut predicates_agree = Vec::new();
+
+    for pooled in [true, false] {
+        let chosen: Vec<&(String, Vec<u8>)> = modules
+            .iter()
+            .filter(|(name, _)| pooled || name == "Init/Prelude.olean")
+            .collect();
+
+        let mut signatures: std::collections::BTreeMap<(u8, u8), BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut by_resolve: std::collections::BTreeMap<(u8, u8), BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut by_boxed: std::collections::BTreeMap<(u8, u8), BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut population: std::collections::BTreeMap<(u8, u8), usize> =
+            std::collections::BTreeMap::new();
+
+        for (_, bytes) in chosen {
+            let bytes = bytes.as_slice();
+            let (objects, base) = objects_of(bytes);
+            let at: std::collections::BTreeMap<usize, Obj> =
+                objects.iter().map(|o| (o.off, *o)).collect();
+            let resolve = |word: u64| -> Option<usize> {
+                (word & 1 == 0)
+                    .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                    .flatten()
+                    .filter(|off| at.contains_key(off))
+            };
+            for object in &objects {
+                if object.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let shape = (object.tag, object.other);
+                *population.entry(shape).or_default() += 1;
+                let mut signature = Vec::new();
+                let mut resolved = Vec::new();
+                let mut boxed = Vec::new();
+                for slot in 0..usize::from(object.other) {
+                    let word = word_at(bytes, object.off + 8 + 8 * slot);
+                    match resolve(word) {
+                        // The signature audit's own rule: a slot is scalar when
+                        // it does not resolve to a walked object.
+                        Some(child) => {
+                            let child = at.get(&child).expect("resolved above");
+                            signature.push(format!("{}/{}", child.tag, child.other));
+                            resolved.push("ptr");
+                        }
+                        None => {
+                            signature.push("scalar".to_owned());
+                            resolved.push("scalar");
+                        }
+                    }
+                    // `ebfa87eb`'s rule: a slot is scalar when its low bit is set.
+                    boxed.push(if word & 1 == 1 { "boxed" } else { "ptr" });
+                }
+                signatures
+                    .entry(shape)
+                    .or_default()
+                    .insert(signature.join("|"));
+                by_resolve
+                    .entry(shape)
+                    .or_default()
+                    .insert(resolved.join("|"));
+                by_boxed.entry(shape).or_default().insert(boxed.join("|"));
+            }
+        }
+
+        let many_signatures: BTreeSet<(u8, u8)> = signatures
+            .iter()
+            .filter(|(_, set)| set.len() > 1)
+            .map(|(shape, _)| *shape)
+            .collect();
+        let many_patterns: BTreeSet<(u8, u8)> = by_resolve
+            .iter()
+            .filter(|(_, set)| set.len() > 1)
+            .map(|(shape, _)| *shape)
+            .collect();
+        let split_by_boxed: BTreeSet<(u8, u8)> = by_boxed
+            .iter()
+            .filter(|(_, set)| set.len() > 1)
+            .map(|(shape, _)| *shape)
+            .collect();
+
+        // Shapes the coarsening actually merges.
+        let coarsened: Vec<(u8, u8, usize, usize)> = signatures
+            .iter()
+            .filter(|(shape, set)| set.len() > 1 && !many_patterns.contains(shape))
+            .map(|(shape, set)| {
+                (
+                    shape.0,
+                    shape.1,
+                    set.len(),
+                    *population.get(shape).expect("counted"),
+                )
+            })
+            .collect();
+
+        tallies.push((
+            signatures.len(),
+            many_signatures.len(),
+            many_patterns.len(),
+            coarsened.len(),
+        ));
+        predicates_agree.push(many_patterns == split_by_boxed);
+        // The forced direction: no shape splits by pattern without splitting by
+        // signature.
+        assert!(
+            many_patterns.is_subset(&many_signatures),
+            "a differing pattern is a differing signature by construction; a \
+             counterexample would mean the walk disagrees with itself"
+        );
+        if pooled {
+            merged = coarsened;
+        }
+    }
+
+    // The decomposition, not three loose counts.
+    assert_eq!(
+        tallies[0],
+        (36, 25, 15, 10),
+        "pooled over the four modules: constructor shapes, those with more than \
+         one FIELD SIGNATURE, those with more than one boxed-or-pointer \
+         PATTERN, and those with many signatures but exactly ONE pattern"
+    );
+    assert_eq!(
+        tallies[0].2 + tallies[0].3,
+        tallies[0].1,
+        "15 + 10 = 25, so every multi-signature shape is either split by pattern \
+         or merged by it and none is unaccounted for"
+    );
+
+    // What the coarsening merges, per shape rather than as a total.
+    assert_eq!(
+        merged,
+        vec![
+            (2, 1, 8, 78),
+            (3, 2, 6, 30),
+            (4, 1, 3, 122),
+            (5, 1, 2, 163),
+            (5, 2, 33, 26394),
+            (6, 3, 60, 10852),
+            (8, 4, 3, 8),
+            (9, 1, 2, 61),
+            (10, 2, 4, 83),
+            (11, 3, 2, 150),
+        ],
+        "the ten shapes with many signatures and one pattern, as (tag, arity, \
+         signatures, objects). `ebfa87eb`'s `and not the reverse` is therefore \
+         SUBSTANTIVE and not the true-but-empty kind it had just caught \
+         elsewhere: `tag 5 arity 2` alone merges 33 signatures over 26,394 \
+         objects whose slots are always both pointers"
+    );
+
+    // The predicate `ebfa87eb` used and the one the audit uses agree.
+    assert_eq!(
+        predicates_agree,
+        vec![true, true],
+        "`ebfa87eb` called a slot scalar by its low bit and the signature audit \
+         calls it scalar when it does not resolve. Those are different tests \
+         and they select the SAME shapes here, pooled and in Prelude alone - \
+         measured, because that cell quoted a count computed with the other rule"
+    );
+
+    // Shape-level tallies do not move when the fixtures drop out.
+    assert_eq!(
+        tallies[1],
+        (36, 25, 15, 10),
+        "Prelude alone gives the same four shape-level counts as the pooled \
+         walk, though its object populations are smaller - so the tallies above \
+         are not carried by the fixtures"
+    );
+}
+
 /// Necessary, not sufficient - measuring two sentences `a5e8cb68` left behind.
 ///
 /// That cell asserted two things in prose and measured neither. Both are wrong,
