@@ -477,7 +477,12 @@ def main():
                 explicit_for.add(name)
                 progressed = True
             elif name not in quarantine:
-                quarantine[name] = "printed type is not re-acceptable by the pin"
+                # Carry the pin's OWN message. "not re-acceptable" is a summary of
+                # nothing; the message is what tells a reader that the row failed
+                # because a class became an opaque axiom rather than because a
+                # printer wrapped a line.
+                quarantine[name] = ("pin rejects the printed type -- "
+                                    + blame_msg.get(name, "-"))
                 progressed = True
         if not progressed:
             raise SystemExit(
