@@ -6874,3 +6874,144 @@ fn the_library_under_test_identifies_itself_as_the_pinned_toolchain() {
         "and that one identity must be the pin the file's numbers were measured against"
     );
 }
+
+/// The most-duplicated name at the pin, and every module that declares it.
+const MOST_DUPLICATED_NAME: &str = "InvImage.eq_1";
+const MOST_DUPLICATED_DECLARERS: &[&str] = &[
+    "Init.Data.Iterators.Combinators.Monadic.Attach",
+    "Init.Data.Iterators.Combinators.Monadic.Take",
+    "Init.Data.Iterators.Consumers.Access",
+    "Init.Data.Range.Polymorphic.RangeIterator",
+    "Init.Data.Slice.Array.Iterator",
+    "Init.Data.String.Iterate",
+    "Init.Data.String.Pattern.Basic",
+];
+
+/// A declaration name does NOT identify a module — but it does identify a
+/// declaration, which is what keeps an environment keyed by name well defined.
+///
+/// The scope cell proves, for ONE named declaration, that a `_private` prefix
+/// names the privacy scope rather than the storing module, and lists two
+/// modules that store it. One example establishes the exception exists; it says
+/// nothing about how common it is, and nothing at all about the general
+/// question underneath it — whether a name identifies a declaration across the
+/// library.
+///
+/// Measured over all 600 `Init` modules at private level, 65,273 distinct
+/// declared names:
+///
+///   92 names are declared by MORE THAN ONE module, up to SEVEN for
+///     `InvImage.eq_1`. So the name is not a key for the pair (module,
+///     declaration), and anything keying on it alone collapses those
+///   every one of the 92 is an equation-compiler auxiliary by its tail —
+///     `eq_1`, `congr_simp`, `eq_2`, `eq_def`, `induct_unfolding`, `eq_3` —
+///     which is precisely the family this bead exists to recover
+///   16,189 declarations are `_private`-scoped, and 16,155 of them carry a
+///     scope prefix equal to their declaring module. The 34 that differ are the
+///     population behind the scope cell's single example
+///
+/// The duplication is benign, and that is the load-bearing half: the seven
+/// declarations of `InvImage.eq_1` agree on KIND and on TYPE. The environment
+/// the kernel builds is keyed by name, so a name declared twice with different
+/// content would be either a conflict or a silent shadowing; measured, it is
+/// neither. The census is taken from the header name arrays, and the agreement
+/// is checked by decoding only the seven modules that carry the worst case,
+/// because decoding 600 modules' declarations would cost far more than every
+/// other cell in this file put together.
+#[test]
+fn a_name_identifies_a_declaration_but_not_the_module_that_declares_it() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut declarers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut scoped = 0usize;
+    let mut scope_is_declarer = 0usize;
+    for module in &modules {
+        for name in module_view(&lib, module, Level::Private).const_names {
+            if let Some(rest) = name.strip_prefix("_private.") {
+                scoped += 1;
+                let components: Vec<&str> = rest.split('.').collect();
+                let boundary = components
+                    .iter()
+                    .position(|part| part.chars().all(|c| c.is_ascii_digit()));
+                if let Some(index) = boundary {
+                    if components[..index].join(".") == *module {
+                        scope_is_declarer += 1;
+                    }
+                }
+            }
+            declarers.entry(name).or_default().push(module.clone());
+        }
+    }
+
+    let duplicated: BTreeMap<&String, &Vec<String>> = declarers
+        .iter()
+        .filter(|(_, owners)| owners.len() > 1)
+        .collect();
+    assert_eq!(
+        (declarers.len(), duplicated.len()),
+        (65_273, 92),
+        "the name census and the duplicated population"
+    );
+    assert_eq!(
+        (scoped, scope_is_declarer),
+        (16_189, 16_155),
+        "the private-scope population, of which 34 are stored outside the module their scope \
+         prefix names"
+    );
+
+    // Every duplicated name is an equation-compiler auxiliary, which is what
+    // makes the duplication a regeneration rather than a collision of unrelated
+    // declarations.
+    let stray: Vec<&&String> = duplicated
+        .keys()
+        .filter(|name| {
+            !["eq_def", "congr_simp", "induct_unfolding"]
+                .iter()
+                .any(|tail| name.ends_with(tail))
+                && !name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|tail| tail.starts_with("eq_"))
+        })
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "every multiply-declared name is an equation-compiler auxiliary; these are not: {stray:?}"
+    );
+
+    let worst = duplicated
+        .get(&MOST_DUPLICATED_NAME.to_owned())
+        .expect("the most-duplicated name is declared more than once");
+    assert_eq!(
+        worst.as_slice(),
+        MOST_DUPLICATED_DECLARERS,
+        "the worst case must be exactly these seven modules"
+    );
+
+    // The load-bearing half: those seven are the SAME declaration. A name
+    // declared twice with different content would be a conflict or a silent
+    // shadowing in an environment keyed by name.
+    let mut shapes: Vec<(&'static str, Expr)> = Vec::new();
+    for module in MOST_DUPLICATED_DECLARERS {
+        let (infos, _) = decode_at(&lib, module, Level::Private);
+        let found = infos
+            .iter()
+            .find(|info| info.name().to_display_string() == MOST_DUPLICATED_NAME)
+            .unwrap_or_else(|| panic!("{module} declares {MOST_DUPLICATED_NAME}"));
+        shapes.push((kind_of(found), found.constant_val().type_.clone()));
+    }
+    assert_eq!(shapes.len(), MOST_DUPLICATED_DECLARERS.len());
+    let disagreeing: Vec<&str> = shapes
+        .iter()
+        .zip(MOST_DUPLICATED_DECLARERS)
+        .filter(|((kind, type_), _)| *kind != shapes[0].0 || *type_ != shapes[0].1)
+        .map(|(_, module)| *module)
+        .collect();
+    assert!(
+        disagreeing.is_empty(),
+        "all seven declarations of {MOST_DUPLICATED_NAME} must agree on kind and type; these \
+         differ: {disagreeing:?}"
+    );
+}
