@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use fln_core::expr::{Expr, ExprNode};
+use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::level::LevelView;
 use fln_core::name::Name;
 use fln_env::constants::{
@@ -2764,4 +2764,138 @@ fn every_opaque_carries_a_real_body_and_two_of_them_exist_only_privately() {
         "the opaques with no exported counterpart are the `.loop` auxiliaries this bead named; \
          a new one is a new member of that family and should be adjudicated, not absorbed"
     );
+}
+
+/// The `Expr` payloads every walker in this file steps over.
+///
+/// The field inventory I called complete at comment 2264 was over
+/// `ConstantInfo`. Inside an `Expr` there are stored payloads that every walker
+/// here explicitly skips: a projection's `struct_name` and `idx`, a binder's
+/// `BinderInfo`, a literal's value, `MData`'s map. They are decoded, they are
+/// never read back, and two of them carry a checkable relation.
+///
+/// PROJECTIONS. `Expr::proj` is reduced by the kernel — the matching-projection
+/// pre-pass and `finish_infer_proj` both dispatch on it — so a wrong
+/// `struct_name` or an out-of-range `idx` changes reduction rather than failing
+/// to decode. The relation: `struct_name` must be a decoded inductive with
+/// exactly ONE constructor, and `idx` must be below that constructor's
+/// `num_fields`. Measured over `Init/Prelude` at private level: 207 projection
+/// nodes over roughly 100 distinct structures, indices 0 through 5, zero
+/// violations.
+///
+/// BINDER INFO. Not a relation but a census, and a census is what it needs:
+/// every binder carries one, they are 20,064 `Default`, 8,618 `Implicit` and
+/// 497 `InstImplicit`, and a decode collapsing them to a single value would
+/// change every regenerated recursor type — a `BlockMismatch` with every name
+/// and count in this file still agreeing. Requiring all three to appear is what
+/// makes that collapse fail here.
+#[test]
+fn projection_targets_resolve_and_binder_info_is_not_collapsed() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut single_ctor_fields: BTreeMap<String, u32> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, &ConstructorVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Ctor(v) = info {
+            constructors.insert(info.name().to_display_string(), v);
+        }
+    }
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info
+            && v.ctors.len() == 1
+            && let Some(ctor) = constructors.get(&v.ctors[0].to_display_string())
+        {
+            single_ctor_fields.insert(info.name().to_display_string(), ctor.num_fields);
+        }
+    }
+
+    let mut projections = 0usize;
+    let mut widest_index = 0u64;
+    let mut binders: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for info in &infos {
+        for root in declaration_expressions(info) {
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            let mut stack: Vec<&Expr> = vec![root];
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current.allocation_identity()) {
+                    continue;
+                }
+                match current.node() {
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => {
+                        projections += 1;
+                        widest_index = widest_index.max(*idx);
+                        let name = struct_name.to_display_string();
+                        let fields = single_ctor_fields.get(&name).unwrap_or_else(|| {
+                            panic!(
+                                "projection on `{name}`, which is not a decoded \
+                                 single-constructor inductive"
+                            )
+                        });
+                        assert!(
+                            *idx < u64::from(*fields),
+                            "projection {name}.{idx} is past its constructor's {fields} fields"
+                        );
+                        stack.push(expr);
+                    }
+                    ExprNode::Lam { binder_info, .. } | ExprNode::ForallE { binder_info, .. } => {
+                        *binders.entry(binder_info_name(*binder_info)).or_default() += 1;
+                        if let ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } = current.node()
+                        {
+                            stack.push(binder_type);
+                            stack.push(body);
+                        }
+                    }
+                    ExprNode::App { f, a } => {
+                        stack.push(f);
+                        stack.push(a);
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_);
+                        stack.push(value);
+                        stack.push(body);
+                    }
+                    ExprNode::MData { expr, .. } => stack.push(expr),
+                    ExprNode::BVar { .. }
+                    | ExprNode::FVar { .. }
+                    | ExprNode::MVar { .. }
+                    | ExprNode::Sort { .. }
+                    | ExprNode::Const { .. }
+                    | ExprNode::Lit { .. } => {}
+                }
+            }
+        }
+    }
+
+    assert!(
+        projections >= 150 && widest_index >= 4,
+        "projections must be a real population reaching past index 0 ({projections} nodes, \
+         widest index {widest_index})"
+    );
+    assert!(
+        binders.len() == 3
+            && binders.values().all(|count| *count > 400)
+            && binders["Default"] > 10_000,
+        "all three binder kinds the pin uses must survive decode: {binders:?}"
+    );
+}
+
+fn binder_info_name(info: BinderInfo) -> &'static str {
+    match info {
+        BinderInfo::Default => "Default",
+        BinderInfo::Implicit => "Implicit",
+        BinderInfo::StrictImplicit => "StrictImplicit",
+        BinderInfo::InstImplicit => "InstImplicit",
+    }
 }
