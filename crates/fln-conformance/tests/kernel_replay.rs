@@ -8652,20 +8652,101 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
     // a confidently wrong answer -- it truncated `validate` at the first nested
     // brace and matched code fragments -- which is exactly why the comparison
     // belongs here, where no parsing is involved.
-    for (name, reason, _) in &observed {
-        for (other_name, _, other_expected) in &observed {
+    if let Err(collision) = expectations_are_mutually_exclusive(&observed) {
+        panic!("{collision}");
+    }
+}
+
+/// No cell's refusal may contain another cell's expectation.
+///
+/// **Extracted so it can be shown to fire.** Inline, this ran only over the real
+/// mutant list, where every expectation is currently distinct -- so it never
+/// reported anything, and a broken version of it (comparing a cell only with
+/// itself, say, or skipping on the wrong key) would have gone on reporting
+/// nothing. That is the shape this bead keeps finding, and it applies to the
+/// guards that protect the other guards just as much as to the product.
+fn expectations_are_mutually_exclusive(observed: &[(&str, String, &str)]) -> Result<(), String> {
+    for (name, reason, _) in observed {
+        for (other_name, _, other_expected) in observed {
             if name == other_name {
                 continue;
             }
-            assert!(
-                !reason.contains(other_expected),
-                "the refusal for `{name}` contains `{other_expected}`, which is the expectation \
-                 belonging to `{other_name}`. The two cells cannot tell each other's rule apart, \
-                 so either rule could be deleted and both would still pass. Assert on the part \
-                 that differs"
-            );
+            if reason.contains(other_expected) {
+                return Err(format!(
+                    "the refusal for `{name}` contains `{other_expected}`, which is the \
+                     expectation belonging to `{other_name}`. The two cells cannot tell each \
+                     other's rule apart, so either rule could be deleted and both would still \
+                     pass. Assert on the part that differs"
+                ));
+            }
         }
     }
+    Ok(())
+}
+
+/// The collision detector detects collisions -- and does not report them where
+/// there are none.
+///
+/// **Both polarities, because either alone is satisfiable by a broken check.** A
+/// detector that always returned `Ok` would pass the first case; one that always
+/// returned `Err` would pass the second. Only the pair pins the behaviour.
+///
+/// **The third case is the claim a comment makes elsewhere, made checkable.** The
+/// mutant loop guards against an empty expectation separately, on the grounds
+/// that this detector would flag it as a COLLISION and so blame the wrong thing.
+/// That reasoning is asserted here rather than left as prose: an empty
+/// expectation does produce a collision report, which is precisely why the
+/// narrower guard upstream is worth having.
+#[test]
+fn the_expectation_collision_detector_reports_only_real_collisions() {
+    let distinct: Vec<(&str, String, &str)> = vec![
+        (
+            "alpha",
+            "row records wall_ms: 0 and nothing else".to_string(),
+            "wall_ms: 0",
+        ),
+        (
+            "beta",
+            "row carries an empty target".to_string(),
+            "empty target",
+        ),
+    ];
+    assert!(
+        expectations_are_mutually_exclusive(&distinct).is_ok(),
+        "two cells whose expectations appear in neither other's refusal are not a collision"
+    );
+
+    // `alpha`'s refusal happens to contain `beta`'s expectation.
+    let colliding: Vec<(&str, String, &str)> = vec![
+        (
+            "alpha",
+            "row records wall_ms: 0, and an empty target would also be refused".to_string(),
+            "wall_ms: 0",
+        ),
+        (
+            "beta",
+            "row carries an empty target".to_string(),
+            "empty target",
+        ),
+    ];
+    let report = expectations_are_mutually_exclusive(&colliding)
+        .expect_err("a refusal containing another cell's expectation is a collision");
+    assert!(
+        report.contains("alpha") && report.contains("beta") && report.contains("empty target"),
+        "the report must name both cells and the shared fragment, or it says a collision exists \
+         without saying between what: {report}"
+    );
+
+    // An empty expectation matches every message, so it reads as a collision.
+    let vacuous: Vec<(&str, String, &str)> = vec![
+        ("alpha", "row records wall_ms: 0".to_string(), "wall_ms: 0"),
+        ("beta", "row carries an empty target".to_string(), ""),
+    ];
+    assert!(
+        expectations_are_mutually_exclusive(&vacuous).is_err(),
+        "an empty expectation is contained by every refusal, which is why the mutant loop \
+         refuses one directly rather than leaving this detector to blame a collision"
+    );
 }
 
 /// Validate EVERY row a retained receipt file holds, and say how many there were.
