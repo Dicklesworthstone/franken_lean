@@ -5155,6 +5155,36 @@ fn kr600_803_color_red_refuses_a_forged_constructor_level_parameter_count() {
 }
 
 #[test]
+fn kr600_803_color_blue_refuses_a_forged_constructor_inductive_owner() {
+    let mut entries = enumeration_entries(BinderInfo::Implicit);
+    let constructor = entries[2].declaration();
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Color", "blue"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("NotColor"), 1, 0, 0),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Color.blue constructor inductive-owner verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_color_refuses_a_forged_constructor_index() {
     let mut entries = enumeration_entries(BinderInfo::Implicit);
     let constructor = entries[1].declaration();
