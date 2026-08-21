@@ -1486,6 +1486,18 @@ def main():
             "REFUSE: facade manifest structural field-set pin diverges "
             f"({json.dumps(structural_field_set_join, sort_keys=True)})"
         )
+    projection_type_pin_join = {
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+        "pinned_projection_types_checked": 807,
+    }
+    if (projection_type_pin_join["summary_projection_types_checked"]
+            != projection_type_pin_join["pinned_projection_types_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest projection-type pin diverges "
+            f"({json.dumps(projection_type_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2548,6 +2560,7 @@ def main():
         "manifest_quarantine_summary_join": quarantine_summary_join,
         "manifest_coverage_summary_join": coverage_summary_join,
         "manifest_structural_field_set_join": structural_field_set_join,
+        "manifest_projection_type_pin_join": projection_type_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
