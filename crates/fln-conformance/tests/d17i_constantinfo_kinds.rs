@@ -16493,3 +16493,114 @@ fn no_olean_both_declares_nothing_and_imports_nothing() {
         "their import counts span a real range"
     );
 }
+
+/// `import all` never comes from an aggregator — and an aggregator does not
+/// re-export everything.
+///
+/// The aggregator cell reads `Init.olean`'s 43 edges and finds every one
+/// `import_all` false and `is_exported` true, bar a single meta edge. It is one
+/// module. The inertness cell then shows there are 278 aggregators library-wide,
+/// so the obvious generalisation — an aggregator re-exports what it imports and
+/// never uses `import all` — is now testable over 2,073 edges instead of 43.
+///
+/// Half of it holds and half does not, which is why both are pinned here.
+///
+///   flags on the 2,073 aggregator edges
+///     (false, true,  false)  1,928     (false, false, true)   2
+///     (false, false, false)   141      (false, true,  true)   2
+///
+/// NO AGGREGATOR EDGE CARRIES `import_all`. Not one of 2,073, while all 315
+/// `import_all` edges in the library belong to modules that declare something.
+/// Combined with the flag cell's result that `import_all` excludes
+/// `is_exported`, the shape is now fully determined: `import all` appears only
+/// on non-re-exporting edges of declaring modules. That is an empty cell in this
+/// table and an empty cell in that one, and neither cell alone gives it.
+///
+/// BUT AGGREGATORS DO NOT RE-EXPORT EVERYTHING. 143 of the 2,073 edges have
+/// `is_exported` false — 141 plain and 2 meta — so a module that declares
+/// nothing can still import something privately. `Init.olean` is not
+/// representative here: its 43 edges are all exported, and reading that as the
+/// aggregator pattern would be wrong for one edge in fifteen across the library.
+///
+/// Anti-vacuity: the non-aggregator edges use all SIX flag combinations against
+/// the aggregators' four, so the two missing classes are missing from a table
+/// whose alternatives are demonstrably in use, not from a corpus that never
+/// varies the flags.
+///
+/// Conservation first: the two edge populations must reproduce the library edge
+/// total the layering cell pins, before either flag table is read.
+#[test]
+fn import_all_never_comes_from_an_aggregator() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut aggregator: BTreeMap<(bool, bool, bool), usize> = BTreeMap::new();
+    let mut declaring: BTreeMap<(bool, bool, bool), usize> = BTreeMap::new();
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let view = module_view(&lib, &module, Level::Exported);
+        let table = if view.const_names.is_empty() {
+            &mut aggregator
+        } else {
+            &mut declaring
+        };
+        for import in &view.imports {
+            *table
+                .entry((import.import_all, import.is_exported, import.is_meta))
+                .or_default() += 1;
+        }
+    }
+
+    // Conservation first: against the edge census the layering cell pins.
+    let aggregator_edges: usize = aggregator.values().sum();
+    let declaring_edges: usize = declaring.values().sum();
+    assert_eq!(
+        aggregator_edges + declaring_edges,
+        10_298,
+        "the two populations must reproduce the library edge total"
+    );
+    assert_eq!(
+        (aggregator_edges, declaring_edges),
+        (2_073, 8_225),
+        "the aggregator share of the import graph"
+    );
+
+    // The empty cell: no aggregator uses `import all`.
+    assert!(
+        !aggregator.keys().any(|(import_all, _, _)| *import_all),
+        "an aggregator declares nothing, so `import all` from one would widen a namespace \
+         it does not populate: {aggregator:?}"
+    );
+    assert_eq!(
+        declaring
+            .iter()
+            .filter(|((import_all, _, _), _)| *import_all)
+            .map(|(_, count)| count)
+            .sum::<usize>(),
+        315,
+        "every `import all` edge in the library comes from a module that declares something"
+    );
+
+    // The half that does NOT generalise from Init.olean.
+    assert_eq!(
+        aggregator,
+        BTreeMap::from([
+            ((false, false, false), 141),
+            ((false, false, true), 2),
+            ((false, true, false), 1_928),
+            ((false, true, true), 2),
+        ]),
+        "143 aggregator edges are not re-exports, so Init.olean's all-exported 43 are not \
+         the pattern"
+    );
+
+    // Anti-vacuity: the alternatives are in use elsewhere.
+    assert_eq!(
+        (declaring.len(), aggregator.len()),
+        (6, 4),
+        "declaring modules use all six flag combinations; aggregators use four"
+    );
+}
