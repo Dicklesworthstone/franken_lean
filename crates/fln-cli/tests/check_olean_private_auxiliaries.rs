@@ -501,6 +501,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"arrayMapMGoResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'.go\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
+        "\"privateGoResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'.go\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
         "\"stringExtraUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
@@ -699,6 +702,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private Array.mapM'.go residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private .go residuals: 3 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private .go residual names: _private.Init.Data.Array.BasicAux.0.Array.mapM'.go, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private .go residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
     ));
