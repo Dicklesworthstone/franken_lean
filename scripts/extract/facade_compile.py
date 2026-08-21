@@ -3608,6 +3608,26 @@ def main():
             "REFUSE: facade manifest projection-type count must exceed "
             f"inductive-refusal count ({json.dumps(projection_inductive_refusal_inequality_join, sort_keys=True)})"
         )
+    field_set_structural_refusal_inequality_join = {
+        "summary_field_sets_checked": manifest_summary.get("field_sets_checked"),
+        "summary_structural_refused": manifest_summary.get("structural_refused"),
+    }
+    if (not isinstance(field_set_structural_refusal_inequality_join[
+            "summary_field_sets_checked"], int)
+            or isinstance(field_set_structural_refusal_inequality_join[
+                "summary_field_sets_checked"], bool)
+            or not isinstance(field_set_structural_refusal_inequality_join[
+                "summary_structural_refused"], int)
+            or isinstance(field_set_structural_refusal_inequality_join[
+                "summary_structural_refused"], bool)
+            or field_set_structural_refusal_inequality_join[
+                "summary_field_sets_checked"]
+            <= field_set_structural_refusal_inequality_join[
+                "summary_structural_refused"]):
+        raise SystemExit(
+            "REFUSE: facade manifest field-set count must exceed structural "
+            f"refusal count ({json.dumps(field_set_structural_refusal_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5758,6 +5778,9 @@ def main():
         ),
         "manifest_projection_inductive_refusal_inequality_join": (
             projection_inductive_refusal_inequality_join
+        ),
+        "manifest_field_set_structural_refusal_inequality_join": (
+            field_set_structural_refusal_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
