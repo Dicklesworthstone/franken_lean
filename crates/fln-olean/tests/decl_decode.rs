@@ -6968,3 +6968,258 @@ fn the_membership_gap_decomposes() {
          from both ends"
     );
 }
+
+/// The remaining pooled identities - and the seeds contribute no `tag 2` of
+/// their own.
+///
+/// `8132075a` closed the `tag 1` accounting: 46 memberships less 33 objects is
+/// 13, and the 13 is the shared elements plus the shared wrapped object. Two
+/// pooled quantities the ledger names were left with no such identity - the
+/// slot-3 arrays and the `tag 2` elements - and the single shared `tag 2`
+/// object has never been opened at all. This closes both.
+///
+///   arrays   14 + 33 = 47 memberships, 42 pooled, gap 5 = the shared 5,
+///            and 9 seed-only + 28 interior-only + 5 shared = 42
+///   tag 2     1 + 15 = 16 memberships, 15 pooled, gap 1 = the shared 1,
+///            and 0 + 14 + 1 = 15
+///
+/// Each is asserted twice - once as memberships minus pooled, once as the three
+/// disjoint parts summing to the pooled total - so a drift in any one part
+/// contradicts the other route. `ddfa2317` pins the parts and `243053f8` pins
+/// the pooled totals; nothing tied them, which is the same gap `8132075a`
+/// closed for `tag 1`.
+///
+/// THE SEEDS CONTRIBUTE NO `tag 2` OF THEIR OWN. Seed-only is ZERO: the seed
+/// population has exactly one `tag 2` element and it is the shared one. That is
+/// a categorical absence, asserted as a count rather than described, and it is
+/// why the `tag 2` gap of 1 is the whole of the seeds' contribution rather than
+/// an incidental overlap.
+///
+/// AND THE SHARED `tag 2` IS NOT SPECIAL EITHER. It wraps a `tag 1`, which is
+/// what 9 of the 14 interior-only ones do; the other 5 wrap the other shape. So
+/// it sits in the majority class and nothing marks it out - the third
+/// population where I have asked whether a shared object is distinguished and
+/// found it is not, after `c726dec5` and `ddfa2317`.
+///
+/// One object supports no proportion, so its class membership is pinned and no
+/// inference is drawn from it beyond "not distinguished".
+#[test]
+fn the_remaining_pooled_identities() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut inner: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        let mut arrays: [BTreeSet<usize>; 2] = [BTreeSet::new(), BTreeSet::new()];
+        let mut wrappers: [BTreeSet<usize>; 2] = [BTreeSet::new(), BTreeSet::new()];
+        for (which, population) in [true, false].into_iter().enumerate() {
+            for &node in &all {
+                if seeds.contains(&node) != population {
+                    continue;
+                }
+                let Some(record) = resolve(word_at(bytes, node + 8)) else {
+                    continue;
+                };
+                let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3)) else {
+                    continue;
+                };
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        arrays[which].insert(array);
+                    }
+                }
+            }
+            let group = arrays[which].clone();
+            for array in group {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((2, 1))
+                    {
+                        wrappers[which].insert(element);
+                    }
+                }
+            }
+        }
+
+        let mut count = |key: &str, by: usize| *counts.entry(key.to_owned()).or_default() += by;
+        for (name, sets) in [("arrays", &arrays), ("tag2", &wrappers)] {
+            count(&format!("{name}/seed"), sets[0].len());
+            count(&format!("{name}/interior"), sets[1].len());
+            count(&format!("{name}/pooled"), sets[0].union(&sets[1]).count());
+            count(
+                &format!("{name}/shared"),
+                sets[0].intersection(&sets[1]).count(),
+            );
+            count(
+                &format!("{name}/seed only"),
+                sets[0].difference(&sets[1]).count(),
+            );
+            count(
+                &format!("{name}/interior only"),
+                sets[1].difference(&sets[0]).count(),
+            );
+        }
+
+        // Open the shared `tag 2` object, and the unshared ones for contrast.
+        let shared: BTreeSet<usize> = wrappers[0].intersection(&wrappers[1]).copied().collect();
+        for (name, set) in [
+            ("shared", shared.clone()),
+            (
+                "interior only",
+                wrappers[1]
+                    .difference(&wrappers[0])
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+            ),
+        ] {
+            for object in set {
+                let described = match resolve(word_at(bytes, object + 8)) {
+                    Some(target) => {
+                        let target = at.get(&target).expect("resolved above");
+                        format!("tag {} arity {}", target.tag, target.other)
+                    }
+                    None => "boxed".to_owned(),
+                };
+                *inner.entry(format!("{name}/{described}")).or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            counts.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    let get = |key: &str| counts.get(key).copied().unwrap_or_default();
+
+    assert_eq!(
+        counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("arrays/interior".to_owned(), 33),
+            ("arrays/interior only".to_owned(), 28),
+            ("arrays/pooled".to_owned(), 42),
+            ("arrays/seed".to_owned(), 14),
+            ("arrays/seed only".to_owned(), 9),
+            ("arrays/shared".to_owned(), 5),
+            ("tag2/interior".to_owned(), 15),
+            ("tag2/interior only".to_owned(), 14),
+            ("tag2/pooled".to_owned(), 15),
+            ("tag2/seed".to_owned(), 1),
+            ("tag2/seed only".to_owned(), 0),
+            ("tag2/shared".to_owned(), 1),
+        ],
+        "both quantities, per population and pooled"
+    );
+
+    // Each identity twice: memberships minus pooled, and the parts summing.
+    for name in ["arrays", "tag2"] {
+        let memberships = get(&format!("{name}/seed")) + get(&format!("{name}/interior"));
+        let pooled = get(&format!("{name}/pooled"));
+        let shared = get(&format!("{name}/shared"));
+        assert!(
+            memberships > pooled,
+            "{name}: the gap must be non-zero, or there is no identity to close"
+        );
+        assert_eq!(
+            memberships - pooled,
+            shared,
+            "{name}: memberships less pooled objects is exactly the shared set"
+        );
+        assert_eq!(
+            get(&format!("{name}/seed only")) + get(&format!("{name}/interior only")) + shared,
+            pooled,
+            "{name}: and the three disjoint parts sum to the pooled total - the \
+             same fact by a route that does not use the memberships"
+        );
+    }
+
+    // The categorical absence.
+    assert_eq!(
+        get("tag2/seed only"),
+        0,
+        "the seeds contribute NO `tag 2` of their own: they have exactly one \
+         and it is the shared one, so their whole contribution is the overlap"
+    );
+
+    // Not special, a third time.
+    assert_eq!(
+        inner.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior only/tag 1 arity 1".to_owned(), 9),
+            ("interior only/tag 4 arity 2".to_owned(), 5),
+            ("shared/tag 1 arity 1".to_owned(), 1),
+        ],
+        "the shared `tag 2` wraps a `tag 1`, which is what 9 of the 14 \
+         interior-only ones do - it sits in the majority class and nothing \
+         marks it out, after `c726dec5` and `ddfa2317` found the same"
+    );
+}
