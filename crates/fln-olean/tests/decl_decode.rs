@@ -11720,6 +11720,251 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The arrival context does not discriminate either - and one refinement of two.
+///
+/// `e0dd56f8` ended by saying that where tag, arity and size fail to identify a
+/// constructor, "the field a walk arrived through" succeeds. I wrote that as a
+/// summary and did not measure it. IT IS FALSE, and this cell is the
+/// measurement that says so; the sentence is corrected in the same commit.
+///
+/// Every `(2, 2)` object in Prelude is reached from at least one parent - 1,938
+/// objects across 8,654 arrival edges, none orphaned, so the denominator is the
+/// whole population. Grouping those edges by `(parent tag, parent arity, slot)`
+/// gives EIGHTEEN distinct contexts. SIXTEEN are pure. TWO are not:
+///
+///   parent `(1, 2)` slot 0   ->  583 boxed  and  106 pointer
+///   parent `(1, 1)` slot 0   ->   75 boxed  and   10 pointer
+///
+/// THE AMBIGUITY IS INHERITED, which is the part worth having. Both mixed
+/// parents wear shapes this file has already shown to be ambiguous - `(1, 2)`
+/// is the cons-or-name shape that blocks `list_ptrs`, and `(1, 1)` appears in
+/// `e0dd56f8`'s four-shape family. A parent whose own identity is undecided
+/// cannot decide its child's.
+///
+/// ONE MORE BIT RESOLVES ONE OF THEM AND NOT THE OTHER. Refining the `(1, 2)`
+/// parent by its OWN second field splits the 689 edges into three contexts, all
+/// PURE: a string tail gives 583 boxed, a nil tail 88 pointers, a cons tail 18.
+/// Refining the `(1, 1)` parent by its size does NOT: size 16 is pure with 56
+/// boxed, but size 24 carries 19 boxed AND 10 pointers.
+///
+/// So the answer is partial and is pinned per context rather than as a slogan.
+/// I tried EXACTLY ONE refinement on the `(1, 1)` side - its size - and it
+/// fails; this cell says that and does not say no refinement exists, which
+/// would be a claim about every rule I did not try.
+///
+/// CONTEXTS ARE NOT UNIQUE PER OBJECT EITHER: 414 of the 1,938 are reached from
+/// more than one distinct context, so even a rule keyed on context would have
+/// to agree with itself across arrivals.
+///
+/// Both refinements are pinned with their edge counts reconciled against the
+/// mixed totals they refine - 583 + 88 + 18 against 689, and 56 + 19 + 10
+/// against 85 - so a refinement cannot silently drop edges.
+///
+/// POPULATION SCOPE: `Init/Prelude.olean`, asserted rather than left implicit.
+#[test]
+fn the_arrival_context_does_not_discriminate_either() {
+    let Some(lib) = reference_lib() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(lib.join("Init/Prelude.olean")) else {
+        return;
+    };
+    let bytes = bytes.as_slice();
+
+    let (objects, base) = objects_of(bytes);
+    let at: std::collections::BTreeMap<usize, Obj> = objects.iter().map(|o| (o.off, *o)).collect();
+    let resolve = |word: u64| -> Option<usize> {
+        (word & 1 == 0)
+            .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+            .flatten()
+            .filter(|off| at.contains_key(off))
+    };
+    let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+    // What slot 1 of a `(2, 2)` object holds - the thing a rule would decide.
+    let class = |off: usize| -> &'static str {
+        let word = word_at(bytes, off + 16);
+        if word & 1 == 1 {
+            "boxed"
+        } else if resolve(word).is_some() {
+            "pointer"
+        } else {
+            "unresolved"
+        }
+    };
+    let two_two: BTreeSet<usize> = objects
+        .iter()
+        .filter(|o| (o.tag, o.other) == (2, 2))
+        .map(|o| o.off)
+        .collect();
+
+    // Every arrival edge, grouped by (parent tag, parent arity, slot).
+    let mut contexts: std::collections::BTreeMap<
+        (u8, u8, usize),
+        std::collections::BTreeMap<&'static str, usize>,
+    > = std::collections::BTreeMap::new();
+    let mut edges = 0usize;
+    let mut arrivals: std::collections::BTreeMap<usize, BTreeSet<(u8, u8, usize)>> =
+        std::collections::BTreeMap::new();
+    // The two refinements.
+    let mut by_tail: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeMap<&'static str, usize>,
+    > = std::collections::BTreeMap::new();
+    let mut by_size: std::collections::BTreeMap<
+        u16,
+        std::collections::BTreeMap<&'static str, usize>,
+    > = std::collections::BTreeMap::new();
+
+    for parent in &objects {
+        let slots: Vec<(usize, u64)> = if parent.tag <= abi::TAG_MAX_CTOR_TAG {
+            (0..usize::from(parent.other))
+                .map(|slot| (slot, word_at(bytes, parent.off + 8 + 8 * slot)))
+                .collect()
+        } else if parent.tag == abi::TAG_ARRAY {
+            (0..word_at(bytes, parent.off + 8))
+                .map(|i| (usize::MAX, word_at(bytes, parent.off + 24 + 8 * i as usize)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (slot, word) in slots {
+            let Some(child) = resolve(word) else {
+                continue;
+            };
+            if !two_two.contains(&child) {
+                continue;
+            }
+            edges += 1;
+            let key = (parent.tag, parent.other, slot);
+            *contexts
+                .entry(key)
+                .or_default()
+                .entry(class(child))
+                .or_default() += 1;
+            arrivals.entry(child).or_default().insert(key);
+
+            if (parent.tag, parent.other) == (1, 2) && slot == 0 {
+                let second = word_at(bytes, parent.off + 16);
+                let tail = resolve(second);
+                let kind = if second & 1 == 1 {
+                    if second >> 1 == 0 {
+                        "nil-tail"
+                    } else {
+                        "scalar-tail"
+                    }
+                } else {
+                    match tail.and_then(shape) {
+                        Some((1, 2)) => "cons-tail",
+                        _ if tail.and_then(|t| at.get(&t)).map(|o| o.tag)
+                            == Some(abi::TAG_STRING) =>
+                        {
+                            "string-tail"
+                        }
+                        _ => "other-tail",
+                    }
+                };
+                *by_tail
+                    .entry(kind)
+                    .or_default()
+                    .entry(class(child))
+                    .or_default() += 1;
+            }
+            if (parent.tag, parent.other) == (1, 1) && slot == 0 {
+                *by_size
+                    .entry(parent.cs_sz)
+                    .or_default()
+                    .entry(class(child))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    // The denominator is the whole population.
+    assert_eq!(
+        (two_two.len(), edges, arrivals.len()),
+        (1938, 8654, 1938),
+        "every `(2, 2)` object is reached from at least one parent, so no object \
+         is missing from the context tally"
+    );
+
+    // Sixteen pure, two mixed.
+    let mixed: Vec<((u8, u8, usize), Vec<(&'static str, usize)>)> = contexts
+        .iter()
+        .filter(|(_, classes)| classes.len() > 1)
+        .map(|(key, classes)| (*key, classes.iter().map(|(k, v)| (*k, *v)).collect()))
+        .collect();
+    assert_eq!(
+        (contexts.len(), contexts.len() - mixed.len(), mixed.len()),
+        (18, 16, 2),
+        "arrival contexts, pure ones, and MIXED ones. Two contexts yield both \
+         kinds, so `(parent shape, slot)` does not decide what slot 1 holds - \
+         which is what `e0dd56f8`'s closing sentence claimed it did"
+    );
+    assert_eq!(
+        mixed,
+        vec![
+            ((1, 1, 0), vec![("boxed", 75), ("pointer", 10)]),
+            ((1, 2, 0), vec![("boxed", 583), ("pointer", 106)]),
+        ],
+        "and BOTH mixed parents wear shapes this file has already shown to be \
+         ambiguous - `(1, 2)` is the cons-or-name shape that blocks \
+         `list_ptrs`. The ambiguity is inherited: a parent whose own identity is \
+         undecided cannot decide its child's"
+    );
+
+    // One refinement works.
+    assert_eq!(
+        by_tail
+            .iter()
+            .map(|(k, v)| (*k, v.iter().map(|(c, n)| (*c, *n)).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("cons-tail", vec![("pointer", 18)]),
+            ("nil-tail", vec![("pointer", 88)]),
+            ("string-tail", vec![("boxed", 583)]),
+        ],
+        "refining the `(1, 2)` parent by its OWN second field makes all three \
+         sub-contexts PURE"
+    );
+    assert_eq!(
+        by_tail.values().flat_map(|v| v.values()).sum::<usize>(),
+        689,
+        "and accounts for every one of the 583 + 106 edges it refines, so the \
+         refinement cannot have silently dropped any"
+    );
+
+    // The other does not.
+    assert_eq!(
+        by_size
+            .iter()
+            .map(|(k, v)| (*k, v.iter().map(|(c, n)| (*c, *n)).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+        vec![
+            (16, vec![("boxed", 56)]),
+            (24, vec![("boxed", 19), ("pointer", 10)]),
+        ],
+        "refining the `(1, 1)` parent by its SIZE does not: size 24 still \
+         carries both. EXACTLY ONE refinement was tried here, and it fails - \
+         that is not a claim that no refinement exists, which would be a \
+         statement about every rule I did not try"
+    );
+    assert_eq!(
+        by_size.values().flat_map(|v| v.values()).sum::<usize>(),
+        85,
+        "accounting for every one of the 75 + 10 edges it refines"
+    );
+
+    // Contexts are not unique per object either.
+    assert_eq!(
+        arrivals.values().filter(|set| set.len() > 1).count(),
+        414,
+        "414 of the 1,938 are reached from more than one distinct context, so \
+         even a context-keyed rule would have to agree with itself across \
+         arrivals"
+    );
+}
+
 /// The size rule fails for the numeric-name shape too - and in a worse place.
 ///
 /// `daaaabe2` measured that size 24 does not identify a cons cell: 99 objects
@@ -11766,8 +12011,13 @@ fn the_other_references_to_that_name() {
 ///
 /// WHAT THIS DOES NOT DO: it does not unblock `list_ptrs` and does not propose
 /// a rule. It generalises the block - tag, arity and size together do not
-/// identify a constructor across TYPES, and only the field a walk arrived
-/// through does.
+/// identify a constructor across TYPES.
+///
+/// The first version of this paragraph ended "and only the field a walk arrived
+/// through does". That was written as a summary and never measured, and
+/// `the_arrival_context_does_not_discriminate_either` measures it FALSE: the
+/// parent's shape and slot leave two of eighteen contexts mixed. What actually
+/// disambiguates is not established by either cell.
 ///
 /// POPULATION SCOPE: the cross-tab covers all four modules with the fixtures
 /// participating; the reachability facts are named per module.
