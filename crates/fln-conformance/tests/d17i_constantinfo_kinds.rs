@@ -15547,3 +15547,149 @@ fn the_block_freeze_law_holds_library_wide_with_one_grower_init_never_sees() {
         "growth counts span a real range"
     );
 }
+
+/// The region layout law over the whole library — and the payload model has a
+/// SECOND counterexample `Init` cannot contain.
+///
+/// `the_three_regions_of_a_chain_are_disjoint_and_laid_out_end_to_end` proves
+/// disjointness, ordering, 64 KiB alignment and end-to-end adjacency for the 600
+/// `Init` chains, and refutes the competing "a region covers only the payload
+/// after the 88-byte header" model using one chain, `Init/Data/Nat/ToString`. It
+/// closes by saying that single chain is the entire evidence separating the two
+/// models. Over `Init` that is exactly right. Over the library it is not.
+///
+/// All four properties hold across all 2,431 chains: no overlapping pair, every
+/// chain ordered exported < server < private, every base 64 KiB aligned, every
+/// next base the previous region's end rounded up. And the payload model agrees
+/// on 2,429 — but fails on TWO, not one:
+///
+///   `Init/Data/Nat/ToString`                    exported ends  32 bytes past
+///   `Std/Data/DTreeMap/AdditionalOperations`    exported ends  72 bytes past
+///
+/// THE TWO SHARE A MECHANISM, so the cell pins the condition rather than the
+/// names. A chain discriminates exactly when its exported region ends INSIDE the
+/// first 88 bytes after a 64 KiB boundary: subtract the header and the end falls
+/// back below that boundary, the rounding lands 64 KiB lower, and the prediction
+/// misses the server base. Everywhere else the alignment absorbs the 88 bytes.
+/// The cell asserts that as a biconditional over all 2,431 chains, so the
+/// rarity is explained instead of observed — 88 bytes in 65,536 is 0.13%, and
+/// two hits in 2,431 chains is what that predicts.
+///
+/// A one-witness refutation is fragile: delete that module and the wrong model
+/// becomes indistinguishable from the right one. Two witnesses in different
+/// libraries, plus the condition that generates them, is a refutation that
+/// survives the loss of any single file.
+///
+/// Anti-vacuity: 2,429 chains agree with the payload model, so the two that do
+/// not are a genuine minority rather than the shape of the whole corpus, and the
+/// biconditional has both a populated and an empty side to get right.
+///
+/// Conservation first: every chain must be classified by both models before
+/// either count is named.
+#[test]
+fn the_region_layout_holds_library_wide_and_the_payload_model_has_two_witnesses() {
+    const ALIGN: u64 = 0x1_0000;
+    const HEADER: u64 = 88;
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let align_up = |value: u64| value.div_ceil(ALIGN) * ALIGN;
+    let mut chains = 0usize;
+    let mut whole_file = 0usize;
+    let mut payload_agrees = 0usize;
+    let mut discriminators: BTreeSet<String> = BTreeSet::new();
+    let mut near_boundary: BTreeSet<String> = BTreeSet::new();
+    for path in &all.exported {
+        if !all.private.contains(path) {
+            continue;
+        }
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let stem = lib.join(module.replace('.', "/"));
+        let extents: Vec<(u64, u64)> = ["olean", "olean.server", "olean.private"]
+            .iter()
+            .map(|part| {
+                let p = stem.with_extension(part);
+                let (_, _, base) = header_identity(&p);
+                let size = std::fs::metadata(&p)
+                    .unwrap_or_else(|e| panic!("stat {p:?}: {e}"))
+                    .len();
+                (base, size)
+            })
+            .collect();
+        chains += 1;
+
+        for (i, (base, size)) in extents.iter().enumerate() {
+            for (other, other_size) in extents.iter().skip(i + 1) {
+                assert!(
+                    base + size <= *other || other + other_size <= *base,
+                    "{module}: two regions overlap, so an address resolves into two parts"
+                );
+            }
+        }
+        assert!(
+            extents[0].0 < extents[1].0 && extents[1].0 < extents[2].0,
+            "{module}: the parts must be ordered exported < server < private"
+        );
+        assert!(
+            extents.iter().all(|(base, _)| base % ALIGN == 0),
+            "{module}: every base must be 64 KiB aligned"
+        );
+
+        if extents
+            .windows(2)
+            .all(|pair| align_up(pair[0].0 + pair[0].1) == pair[1].0)
+        {
+            whole_file += 1;
+        }
+        if extents
+            .windows(2)
+            .all(|pair| align_up(pair[0].0 + pair[0].1 - HEADER) == pair[1].0)
+        {
+            payload_agrees += 1;
+        } else {
+            discriminators.insert(module.clone());
+        }
+
+        // The mechanism: the exported region ends inside the header's width
+        // past a boundary.
+        let overshoot = (extents[0].0 + extents[0].1) % ALIGN;
+        if overshoot > 0 && overshoot < HEADER {
+            near_boundary.insert(module);
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        whole_file, chains,
+        "every chain must be laid out end to end under the whole-file model"
+    );
+    assert_eq!(
+        payload_agrees + discriminators.len(),
+        chains,
+        "every chain either agrees with the payload model or refutes it"
+    );
+
+    assert_eq!(
+        (chains, payload_agrees, discriminators.len()),
+        (2_431, 2_429, 2),
+        "the library layout census and the payload model's two counterexamples"
+    );
+    assert_eq!(
+        discriminators,
+        BTreeSet::from([
+            "Init.Data.Nat.ToString".to_owned(),
+            "Std.Data.DTreeMap.AdditionalOperations".to_owned(),
+        ]),
+        "one inside Init and one outside it, so the census sees half the evidence"
+    );
+
+    // The condition generates exactly those two.
+    assert_eq!(
+        near_boundary, discriminators,
+        "a chain refutes the payload model exactly when its exported region ends within the \
+         header's width past a 64 KiB boundary"
+    );
+}
