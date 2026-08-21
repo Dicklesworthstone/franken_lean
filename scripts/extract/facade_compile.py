@@ -3727,6 +3727,9 @@ def main():
     init_provided_inductive_inequality_join = {"summary_init_provided": manifest_summary.get("init_provided"), "summary_inductive_declarations": manifest_summary.get("inductive_declarations")}
     if (not isinstance(init_provided_inductive_inequality_join["summary_init_provided"], int) or isinstance(init_provided_inductive_inequality_join["summary_init_provided"], bool) or not isinstance(init_provided_inductive_inequality_join["summary_inductive_declarations"], int) or isinstance(init_provided_inductive_inequality_join["summary_inductive_declarations"], bool) or init_provided_inductive_inequality_join["summary_init_provided"] <= init_provided_inductive_inequality_join["summary_inductive_declarations"]):
         raise SystemExit("REFUSE: facade manifest Init-provided count must exceed inductive-declaration count " + json.dumps(init_provided_inductive_inequality_join, sort_keys=True))
+    init_provided_structural_refused_inequality_join = {"summary_init_provided": manifest_summary.get("init_provided"), "summary_structural_refused": manifest_summary.get("structural_refused")}
+    if (not isinstance(init_provided_structural_refused_inequality_join["summary_init_provided"], int) or isinstance(init_provided_structural_refused_inequality_join["summary_init_provided"], bool) or not isinstance(init_provided_structural_refused_inequality_join["summary_structural_refused"], int) or isinstance(init_provided_structural_refused_inequality_join["summary_structural_refused"], bool) or init_provided_structural_refused_inequality_join["summary_init_provided"] <= init_provided_structural_refused_inequality_join["summary_structural_refused"]):
+        raise SystemExit("REFUSE: facade manifest Init-provided count must exceed structural-refusal count " + json.dumps(init_provided_structural_refused_inequality_join, sort_keys=True))
     demanded_emitted_init_provided_inequality_join = {"summary_demanded_emitted": manifest_summary.get("demanded_emitted"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"], int) or isinstance(demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"], bool) or not isinstance(demanded_emitted_init_provided_inequality_join["summary_init_provided"], int) or isinstance(demanded_emitted_init_provided_inequality_join["summary_init_provided"], bool) or demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"] <= demanded_emitted_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest emitted-demand count must exceed Init-provided count " + json.dumps(demanded_emitted_init_provided_inequality_join, sort_keys=True))
@@ -6048,6 +6051,9 @@ def main():
         ),
         "manifest_init_provided_inductive_inequality_join": (
             init_provided_inductive_inequality_join
+        ),
+        "manifest_init_provided_structural_refused_inequality_join": (
+            init_provided_structural_refused_inequality_join
         ),
         "manifest_demanded_emitted_init_provided_inequality_join": (
             demanded_emitted_init_provided_inequality_join
