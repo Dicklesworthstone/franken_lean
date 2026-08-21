@@ -182,6 +182,11 @@ the toolchain would report a perfect facade:
     assurance-level prefix. Measured resistance membership cannot drift from the
     confidence boundary that governs how it may be claimed.
 
+  * A MANIFEST-EMITTED-ROW JOIN requires the manifest's measured emitted
+    declaration count to equal the number of declaration rows carrying
+    `emitted=true`. The summary may not claim pin-verified emission for rows
+    that are absent from its own row set.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1246,6 +1251,19 @@ def main():
             "REFUSE: facade manifest emission-verification join failed "
             f"({json.dumps(emission_verification, sort_keys=True)})"
         )
+    emitted_row_join = {
+        "emitted_declaration_rows": sum(
+            row.get("emitted") is True for row in manifest_rows
+        ),
+    }
+    if (emitted_row_join["emitted_declaration_rows"]
+            != emission_verification["declarations_emitted"]):
+        raise SystemExit(
+            "REFUSE: facade manifest emitted-row join disagrees with its "
+            "summary "
+            f"(rows={emitted_row_join['emitted_declaration_rows']}, "
+            f"summary={emission_verification['declarations_emitted']})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1418,6 +1436,7 @@ def main():
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
+        "manifest_emitted_row_join": emitted_row_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
