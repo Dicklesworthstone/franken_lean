@@ -1446,6 +1446,22 @@ def main():
             "REFUSE: facade manifest withdrawal join disagrees with its rows "
             f"({json.dumps(manifest_withdrawal_join, sort_keys=True)})"
         )
+    quarantine_summary_join = {
+        "quarantine_rows": sum(
+            row.get("emitted") is False and row.get("role") == "substrate"
+            for row in manifest_rows
+        ),
+        "summary_quarantined": manifest_summary.get("quarantined"),
+    }
+    if (not isinstance(quarantine_summary_join["summary_quarantined"], int)
+            or isinstance(quarantine_summary_join["summary_quarantined"], bool)
+            or quarantine_summary_join["summary_quarantined"] < 0
+            or quarantine_summary_join["quarantine_rows"]
+            != quarantine_summary_join["summary_quarantined"]):
+        raise SystemExit(
+            "REFUSE: facade manifest quarantine-summary join disagrees with its rows "
+            f"({json.dumps(quarantine_summary_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2505,6 +2521,7 @@ def main():
         "manifest_row_kind_join": manifest_row_kind_join,
         "manifest_claim_class_join": manifest_claim_class_join,
         "manifest_withdrawal_join": manifest_withdrawal_join,
+        "manifest_quarantine_summary_join": quarantine_summary_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
