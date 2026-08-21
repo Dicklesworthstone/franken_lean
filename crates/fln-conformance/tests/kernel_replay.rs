@@ -8015,6 +8015,30 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             },
             "twice",
         ),
+        // NEITHER OF THE NEXT TWO CAN BE PRODUCED BY A RUN, and that is the
+        // point rather than a reason to skip them. Family tokens come from
+        // `UnitOutcome::outcome`, which is never empty, or from the two
+        // `context:` constants; and an ACCEPTED outcome routes to neither
+        // census, so `accepted` can never enter one. The retained file is
+        // append-only and editable by hand, so the guard's job is to refuse rows
+        // no producer would have written -- those are precisely the rows nothing
+        // upstream can be relied on to prevent.
+        (
+            "a family entry with no family name",
+            WholeMathlibReceipt {
+                restrictive_families: vec!["=5".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "names no family",
+        ),
+        (
+            "an agreement counted as a non-answer",
+            WholeMathlibReceipt {
+                no_answer_families: vec!["accepted=40000".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "is the ACCEPTED token",
+        ),
         (
             "a family count that is not a number",
             WholeMathlibReceipt {
