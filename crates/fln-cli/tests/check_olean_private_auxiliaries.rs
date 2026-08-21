@@ -1029,6 +1029,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "the check-olean JSON render paths keep companion loading beside their terminal K2/G1 status",
     );
     assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim() == r##""\"k2Checked\":false,","##
+                    && lines[1].trim() == r##""\"g1Satisfied\":false}}\n""##
+            })
+            .count(),
+        1,
+        "the module-set check-olean JSON render path keeps K2 beside G1 at its split terminator",
+    );
+    assert_eq!(
         [
             cli_source_lines
                 .iter()
