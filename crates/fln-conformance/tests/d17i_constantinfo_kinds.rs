@@ -11139,3 +11139,148 @@ fn a_recursive_occurrence_applies_the_constructors_own_parameters() {
          other fourteen the check ranges over nothing"
     );
 }
+
+/// Each recursive block and the ONE recursor of its family that names itself.
+const SELF_REFERENCING_RECURSOR: &[(&str, &str)] = &[
+    ("Lean.Name", "Lean.Name.rec"),
+    ("Lean.ParserDescr", "Lean.ParserDescr.rec"),
+    ("Lean.Syntax", "Lean.Syntax.rec_2"),
+    ("List", "List.rec"),
+    ("Nat", "Nat.rec"),
+    ("Nat.le", "Nat.le.rec"),
+    ("Nat.le.below", "Nat.le.below.rec"),
+];
+
+/// `is_rec` and self-reference are the same set, counted in two places and
+/// never equated.
+///
+/// Two cells count seven. The motive cell reads `is_rec` and finds seven
+/// recursive inductives. The recursor-levels cell walks iota rules and finds
+/// seven recursors that name themselves. Neither says they are the same seven,
+/// and the equality does not follow from the counts: seven blocks could own
+/// self-referencing recursors while a different seven carried the flag.
+///
+/// They are the same set, in both directions — no block carries `is_rec`
+/// without owning a self-referencing recursor, and none owns one without the
+/// flag. Each such block owns EXACTLY ONE.
+///
+/// THE MAPPING IS NOT THE OBVIOUS ONE, which is why it is pinned by name. The
+/// natural guess is that the self-referencing recursor is the block head's
+/// primary `.rec`. That holds for six of the seven and fails for the nested
+/// family: `Lean.Syntax`'s self-reference lives in `Lean.Syntax.rec_2`, while
+/// `Lean.Syntax.rec` reaches a cycle only through its siblings. A cell that
+/// looked up `format!("{block}.rec")` would find a recursor that does not name
+/// itself and conclude the flag was wrong.
+///
+/// So `is_rec` is not merely consistent with the rules — it identifies which
+/// block owns a self-reference, and the artifact decides which recursor of that
+/// block carries it.
+#[test]
+fn the_recursive_blocks_are_exactly_those_owning_a_self_referencing_recursor() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut recursive: BTreeSet<String> = BTreeSet::new();
+    let mut recursors: BTreeMap<String, &RecursorVal> = BTreeMap::new();
+    let mut inductives = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => {
+                inductives += 1;
+                if v.is_rec {
+                    recursive.insert(name);
+                }
+            }
+            ConstantInfo::Rec(v) => drop(recursors.insert(name, v)),
+            _ => {}
+        }
+    }
+
+    let mut owning: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, rec) in &recursors {
+        let names_itself = rec.rules.iter().any(|rule| {
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            let mut stack: Vec<&Expr> = vec![&rule.rhs];
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current.allocation_identity()) {
+                    continue;
+                }
+                if let ExprNode::Const { name: target, .. } = current.node() {
+                    if target.to_display_string() == **name {
+                        return true;
+                    }
+                }
+                match current.node() {
+                    ExprNode::App { f, a } => {
+                        stack.push(f);
+                        stack.push(a);
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type);
+                        stack.push(body);
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_);
+                        stack.push(value);
+                        stack.push(body);
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        stack.push(expr);
+                    }
+                    _ => {}
+                }
+            }
+            false
+        });
+        if names_itself {
+            let head = rec.all.first().expect("a block head").to_display_string();
+            owning.entry(head).or_default().push(name.clone());
+        }
+    }
+
+    // The equality, both directions, before any count.
+    let flagged: BTreeSet<&String> = recursive.iter().collect();
+    let owners: BTreeSet<&String> = owning.keys().collect();
+    assert_eq!(
+        flagged, owners,
+        "a block carries is_rec exactly when one of its recursors names itself"
+    );
+    assert!(
+        owning.values().all(|group| group.len() == 1),
+        "each recursive block owns exactly one self-referencing recursor: {owning:?}"
+    );
+
+    assert_eq!(
+        owning
+            .iter()
+            .map(|(block, group)| (block.as_str(), group[0].as_str()))
+            .collect::<Vec<(&str, &str)>>(),
+        SELF_REFERENCING_RECURSOR.to_vec(),
+        "each block and the recursor of its family that names itself"
+    );
+    assert_eq!(
+        (recursive.len(), inductives),
+        (7, 127),
+        "the recursive blocks are a small part of the census, so the equality is not trivial"
+    );
+
+    // The primary-recursor shortcut is refuted by a witness rather than warned
+    // against: for one block the self-reference is not in `<block>.rec`.
+    let indirect: Vec<&(&str, &str)> = SELF_REFERENCING_RECURSOR
+        .iter()
+        .filter(|(block, recursor)| *recursor != format!("{block}.rec"))
+        .collect();
+    assert_eq!(
+        indirect,
+        vec![&("Lean.Syntax", "Lean.Syntax.rec_2")],
+        "exactly one block keeps its self-reference outside its primary recursor"
+    );
+}
