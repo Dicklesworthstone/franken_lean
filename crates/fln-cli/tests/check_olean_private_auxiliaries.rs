@@ -2246,5 +2246,11 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &human.stdout, "core-observables Lean.Syntax .loop._unsafe_rec residuals", "core-observables Lean.Syntax .loop._unsafe_rec residual names", 2,
         &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"],
     );
-    assert!(human.stdout.contains("G1 satisfied: no"));
+    assert!(
+        human.stdout.contains("G1 satisfied: no")
+            && !json_bool_field(&json.stdout, "g1Satisfied"),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
+    );
 }
