@@ -1352,4 +1352,129 @@ mod tests {
             "{error:?}"
         );
     }
+
+    /// The pinned Reference stdlib, or `None`. `FLN_REFERENCE_LIB` overrides.
+    fn reference_lib() -> Option<std::path::PathBuf> {
+        if let Ok(dir) = std::env::var("FLN_REFERENCE_LIB") {
+            let path = std::path::PathBuf::from(dir);
+            return path.is_dir().then_some(path);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let path = std::path::PathBuf::from(home)
+            .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
+        path.is_dir().then_some(path)
+    }
+
+    /// Every declaration at the pin that is `_private.`-prefixed, carries an
+    /// `_unsafe_rec` component, AND is declared by the EXPORTED part — the
+    /// exact population a `starts_with("_private.")` provenance test gets
+    /// wrong. `(module, declaration)`, measured over Init.
+    const EXPORTED_UNSAFE_REC_COLLISIONS: &[(&str, &str)] = &[
+        (
+            "Init/Data/List/Sort/Impl",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR₂.run._unsafe_rec",
+        ),
+        (
+            "Init/Data/List/Sort/Impl",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR₂.run'._unsafe_rec",
+        ),
+        (
+            "Init/Data/String/Extra",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+        ),
+        (
+            "Init/Data/String/Extra",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+        ),
+        (
+            "Init/Data/String/Extra",
+            "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.consumeSpaces._unsafe_rec",
+        ),
+        (
+            "Init/Data/String/Extra",
+            "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.saveLine._unsafe_rec",
+        ),
+        (
+            "Init/Prelude",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+        ),
+        (
+            "Init/Prelude",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ),
+    ];
+
+    /// `origin_of` must call these eight `Exported`, because the exported part
+    /// declares them.
+    ///
+    /// They are the counterexample to reading provenance off the name: all
+    /// eight are `_private.`-prefixed and all eight are exported, so a prefix
+    /// test reports them companion-recovered. Two of them
+    /// (`Init.Prelude`'s `getHeadInfo?`/`getTailPos?`) are the pair that failed
+    /// the `.loop` family regression. Pinned here in `src` so the classifier
+    /// cannot be "fixed" back to a name test without this failing.
+    #[test]
+    fn origin_of_classifies_exported_unsafe_rec_prefix_collisions_as_exported() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP origin_of_classifies_exported_unsafe_rec_prefix_collisions_as_exported: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+
+        let mut modules: Vec<&str> = EXPORTED_UNSAFE_REC_COLLISIONS
+            .iter()
+            .map(|(module, _)| *module)
+            .collect();
+        modules.dedup();
+        assert_eq!(modules.len(), 3, "witnesses span three modules at the pin");
+
+        let mut checked = 0_usize;
+        for module in modules {
+            let exported = std::fs::read(lib.join(format!("{module}.olean")))
+                .unwrap_or_else(|error| panic!("read exported {module}: {error}"));
+            let server = std::fs::read(lib.join(format!("{module}.olean.server")))
+                .unwrap_or_else(|error| panic!("read server {module}: {error}"));
+            let private = std::fs::read(lib.join(format!("{module}.olean.private")))
+                .unwrap_or_else(|error| panic!("read private {module}: {error}"));
+            let chained = decode_chain_constants_from_parts(
+                &exported,
+                &server,
+                &private,
+                WalkBudget::default(),
+            )
+            .unwrap_or_else(|error| panic!("chain decode {module}: {error}"));
+
+            for (owner, witness) in EXPORTED_UNSAFE_REC_COLLISIONS {
+                if owner != &module {
+                    continue;
+                }
+                let info = chained
+                    .constants
+                    .iter()
+                    .find(|info| info.name().to_display_string() == *witness)
+                    .unwrap_or_else(|| panic!("{module} no longer declares {witness}"));
+                assert_eq!(
+                    chained.origin_of(info.name()),
+                    Some(ConstantOrigin::Exported),
+                    "{witness} is declared by the exported part; calling it PrivateOnly is the \
+                     prefix misclassification this type exists to prevent"
+                );
+                assert!(
+                    !chained
+                        .private_only()
+                        .any(|other| other.name() == info.name()),
+                    "{witness} must not appear in private_only()"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked,
+            EXPORTED_UNSAFE_REC_COLLISIONS.len(),
+            "every witness must have been reached; a silently shrinking list would make \
+             this test pass while proving less"
+        );
+    }
 }
