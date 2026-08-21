@@ -3721,6 +3721,9 @@ def main():
     init_provided_demanded_init_substrate_inequality_join = {"summary_init_provided": manifest_summary.get("init_provided"), "summary_demanded_init_substrate": manifest_summary.get("demanded_init_substrate")}
     if (not isinstance(init_provided_demanded_init_substrate_inequality_join["summary_init_provided"], int) or isinstance(init_provided_demanded_init_substrate_inequality_join["summary_init_provided"], bool) or not isinstance(init_provided_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], int) or isinstance(init_provided_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], bool) or init_provided_demanded_init_substrate_inequality_join["summary_init_provided"] <= init_provided_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"]):
         raise SystemExit("REFUSE: facade manifest Init-provided count must exceed demanded Init-substrate count " + json.dumps(init_provided_demanded_init_substrate_inequality_join, sort_keys=True))
+    init_provided_private_names_inequality_join = {"summary_init_provided": manifest_summary.get("init_provided"), "summary_private_name_rows": manifest_summary.get("private_name_rows")}
+    if (not isinstance(init_provided_private_names_inequality_join["summary_init_provided"], int) or isinstance(init_provided_private_names_inequality_join["summary_init_provided"], bool) or not isinstance(init_provided_private_names_inequality_join["summary_private_name_rows"], int) or isinstance(init_provided_private_names_inequality_join["summary_private_name_rows"], bool) or init_provided_private_names_inequality_join["summary_init_provided"] <= init_provided_private_names_inequality_join["summary_private_name_rows"]):
+        raise SystemExit("REFUSE: facade manifest Init-provided count must exceed private-name row count " + json.dumps(init_provided_private_names_inequality_join, sort_keys=True))
     demanded_emitted_init_provided_inequality_join = {"summary_demanded_emitted": manifest_summary.get("demanded_emitted"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"], int) or isinstance(demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"], bool) or not isinstance(demanded_emitted_init_provided_inequality_join["summary_init_provided"], int) or isinstance(demanded_emitted_init_provided_inequality_join["summary_init_provided"], bool) or demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"] <= demanded_emitted_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest emitted-demand count must exceed Init-provided count " + json.dumps(demanded_emitted_init_provided_inequality_join, sort_keys=True))
@@ -6036,6 +6039,9 @@ def main():
         ),
         "manifest_init_provided_demanded_init_substrate_inequality_join": (
             init_provided_demanded_init_substrate_inequality_join
+        ),
+        "manifest_init_provided_private_names_inequality_join": (
+            init_provided_private_names_inequality_join
         ),
         "manifest_demanded_emitted_init_provided_inequality_join": (
             demanded_emitted_init_provided_inequality_join
