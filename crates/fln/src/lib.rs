@@ -108,8 +108,8 @@ pub use fln_olean::artifact::{
     SCHEMA_ARTIFACT_SET_MANIFEST, StagedArtifactSet, artifact_byte_hash, artifact_semantic_hash,
     publish_file_atomic, publish_file_atomic_new,
 };
-use fln_olean::decl::DeclDecoder;
 pub use fln_olean::decl::DeclError as OleanDeclarationError;
+use fln_olean::decl::{DeclDecoder, verify_private_superset};
 pub use fln_olean::format::{
     ILEAN_VERSION, OLEAN_ACCEPTED_VERSIONS, PIN_COMMIT as OLEAN_PIN_COMMIT,
     PIN_TAG as OLEAN_PIN_TAG, REGION_ALIGN as OLEAN_REGION_ALIGN,
@@ -657,7 +657,8 @@ pub fn decode_olean_module_artifacts(
     if !module.is_module {
         return Err(OleanDecodeError::UnexpectedCompanionParts);
     }
-    DeclDecoder::new(&public_view, limits.declarations).decode_module_constants()?;
+    let exported_constants =
+        DeclDecoder::new(&public_view, limits.declarations).decode_module_constants()?;
 
     let same_identity = |header: &OleanHeader| {
         header.version == public_view.header.version
@@ -725,6 +726,20 @@ pub fn decode_olean_module_artifacts(
             part: private_part,
             error,
         })?;
+
+    // Returning the private array INSTEAD of the exported one is sound only
+    // because it is a superset. That is a property of the Reference's emitter,
+    // not something the format enforces, and an unguarded assumption here would
+    // silently hand the kernel fewer declarations than the module declares —
+    // franken_lean-timy's failure mode reached by a different cause. The
+    // exported array was decoded above to validate it and was previously
+    // discarded; this makes that work load-bearing instead of adding a pass.
+    verify_private_superset(&exported_constants, &constants).map_err(|error| {
+        OleanDecodeError::CompanionDeclaration {
+            part: private_part,
+            error,
+        }
+    })?;
 
     Ok(DecodedOlean {
         header: public_view.header.clone(),

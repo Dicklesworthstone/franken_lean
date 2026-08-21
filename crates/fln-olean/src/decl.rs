@@ -21,7 +21,7 @@
 //! terms cannot exhaust the stack, and the walk is budgeted. Every failure is
 //! a typed [`DeclError`]; malformed input never panics (FL-INV-07).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
@@ -67,6 +67,17 @@ pub enum DeclError {
     Budget {
         visited: u64,
     },
+    /// A module-system chain's `.olean.private` part does not contain a
+    /// declaration the exported part does.
+    ///
+    /// Reading the private array *instead of* the exported one is sound only
+    /// because it is a superset. A chain that breaks that is a decode that
+    /// silently returns fewer declarations than the module has — the exact
+    /// shape of `franken_lean-timy` — so it is refused rather than returned
+    /// short.
+    PrivatePartIncomplete {
+        missing: Name,
+    },
 }
 
 impl From<RegionError> for DeclError {
@@ -94,6 +105,12 @@ impl std::fmt::Display for DeclError {
                 write!(f, "unsupported at {offset}: {what}")
             }
             DeclError::Budget { visited } => write!(f, "decode budget exhausted at {visited}"),
+            DeclError::PrivatePartIncomplete { missing } => write!(
+                f,
+                "module-system chain is not decodable: the private part omits the exported \
+                 declaration {}",
+                missing.to_display_string()
+            ),
         }
     }
 }
@@ -1042,6 +1059,60 @@ impl<'a> DeclDecoder<'a> {
         }
         Ok(out)
     }
+}
+
+/// Decode the authoritative constant array of one complete module-system chain,
+/// proving that it loses nothing the exported part declared.
+///
+/// Lean writes a module-system module as three regions. The exported `.olean`
+/// carries the public interface; the `.olean.private` part carries the array
+/// Lean's `import all` path reads — definition bodies plus the `_private`
+/// equation-compiler auxiliaries (`match_N`, `_proof_N`, `eq_N`, `.loop`) that
+/// the exported array omits. `franken_lean-timy` is what happens when a decoder
+/// hands the kernel the exported array: the auxiliaries were never produced, so
+/// declarations depending on them were rejected as `UnknownConstant`.
+///
+/// Returning the private array instead is therefore correct — but *only*
+/// because it is a superset, and that property is a fact about the Reference's
+/// emitter rather than anything the format enforces. A consumer that assumes it
+/// silently drops exported declarations the moment it stops holding, which is
+/// timy's own failure mode (decode returning fewer declarations than the module
+/// has) reached by a different cause. This function proves the containment
+/// instead, turning that into a typed [`DeclError::PrivatePartIncomplete`].
+///
+/// The exported array has to be decoded anyway to be validated, so the check
+/// consumes work a caller would otherwise discard rather than adding a pass.
+///
+/// `exported` and `private` must be views of the same chain, the private one
+/// parsed against the exported and server regions via
+/// [`OleanView::parse_with_dependencies`].
+pub fn decode_chain_constants(
+    exported: &OleanView<'_>,
+    private: &OleanView<'_>,
+    budget: WalkBudget,
+) -> DResult<Vec<ConstantInfo>> {
+    let exported_constants = DeclDecoder::new(exported, budget).decode_module_constants()?;
+    let private_constants = DeclDecoder::new(private, budget).decode_module_constants()?;
+    verify_private_superset(&exported_constants, &private_constants)?;
+    Ok(private_constants)
+}
+
+/// Prove that `private` names every declaration `exported` names.
+///
+/// Split out from [`decode_chain_constants`] so a caller that has already
+/// decoded both arrays — as the module-system decode path does, to validate the
+/// exported part — can bind the containment law without decoding anything a
+/// second time. See [`decode_chain_constants`] for why the law matters.
+pub fn verify_private_superset(exported: &[ConstantInfo], private: &[ConstantInfo]) -> DResult<()> {
+    let present: HashSet<&Name> = private.iter().map(ConstantInfo::name).collect();
+    for info in exported {
+        if !present.contains(info.name()) {
+            return Err(DeclError::PrivatePartIncomplete {
+                missing: info.name().clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
