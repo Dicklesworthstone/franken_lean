@@ -263,6 +263,36 @@ open Lean in
       -- constructor telescope so the emitter can rebuild the declaration itself.
       if let ConstantInfo.inductInfo iv := info then
         IO.println s!"IND\t{n}\t{iv.numParams}\t{",".intercalate (iv.ctors.map toString)}"
+        -- AN INDUCTIVE'S PARAMETERS, for every inductive and not only for the
+        -- ones that are structures. Without these the emitter wrote
+        -- `inductive Lean.AssocList where` with no parameters at all, and the
+        -- recursive occurrence `Lean.AssocList α β` in its own constructor became
+        -- "Function expected at" -- which is why all 49 inductives written so far
+        -- are monomorphic enums. The parameter binder kinds come from the
+        -- inductive's OWN type; a constructor makes them implicit.
+        Meta.MetaM.run' <| Meta.forallBoundedTelescope info.type iv.numParams
+            fun ps _ => do
+          for i in [0:ps.size] do
+            let pd <- ps[i]!.fvarId!.getDecl
+            let pty <- withOptions (fun o => o.setBool `pp.fullNames true)
+              (Meta.ppExpr pd.type)
+            let pk := match pd.binderInfo with
+              | BinderInfo.default => "default"
+              | BinderInfo.implicit => "implicit"
+              | BinderInfo.strictImplicit => "strict"
+              | BinderInfo.instImplicit => "inst"
+            IO.println s!"IPARAM\t{n}\t{i}\t{pk}\t{pd.userName}\t{pty}"
+        -- and each constructor's type with those parameters ALREADY BOUND: an
+        -- `inductive` block states constructor types under the header's
+        -- parameters, so the pin's own printing of the full type would re-bind
+        -- them and the kernel would reject the parameter mismatch.
+        for c in iv.ctors do
+          if let some ci := env.find? c then
+            Meta.MetaM.run' <| Meta.forallBoundedTelescope ci.type iv.numParams
+                fun _ body => do
+              let bty <- withOptions (fun o => o.setBool `pp.fullNames true)
+                (Meta.ppExpr body)
+              IO.println s!"CTORB\t{c}\t{bty}"
         if isStructure env n then
           if let some ctor := iv.ctors.head? then
             if let some cinfo := env.find? ctor then
@@ -407,6 +437,8 @@ def probe(lean, env, work, names):
     impl_by = {}
     kind_of = {}
     inductives = {}
+    ind_params = defaultdict(dict)
+    ctor_bodies = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -481,6 +513,14 @@ def probe(lean, env, work, names):
             _, name, idx, kind = line.split("\t", 3)
             pbinders[name][int(idx)] = kind
             current = None
+        elif line.startswith("IPARAM\t"):
+            _, name, idx, kind, user, bty = line.split("\t", 5)
+            ind_params[name][int(idx)] = {"kind": kind, "user": user, "type": bty}
+            current = (ind_params[name][int(idx)], "type")
+        elif line.startswith("CTORB\t"):
+            _, name, bty = line.split("\t", 2)
+            ctor_bodies[name] = bty
+            current = (ctor_bodies, name)
         elif line.startswith("BINDER\t"):
             _, name, idx, kind, user, bty = line.split("\t", 5)
             binders[name][int(idx)] = {"kind": kind, "user": user, "type": bty}
@@ -495,7 +535,7 @@ def probe(lean, env, work, names):
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
             module_of, struct_fields, res_head, priorities, extern_of, impl_by,
-            kind_of, inductives)
+            kind_of, inductives, dict(ind_params), ctor_bodies)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -914,6 +954,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_impl_by = {}
     pin_kind = {}
     pin_inductives = {}
+    pin_ind_params = {}
+    pin_ctor_bodies = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -932,7 +974,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds, rh, prio, ext, iby, knd, ind) = probe(
+         rd, sfy, mod, flds, rh, prio, ext, iby, knd, ind, iprm, cbod) = probe(
             lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
@@ -947,6 +989,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_impl_by.update(iby)
         pin_kind.update(knd)
         pin_inductives.update(ind)
+        pin_ind_params.update(iprm)
+        pin_ctor_bodies.update(cbod)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -985,7 +1029,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
             pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head,
-            pin_priority, pin_extern, pin_impl_by, pin_kind, pin_inductives)
+            pin_priority, pin_extern, pin_impl_by, pin_kind, pin_inductives,
+            pin_ind_params, pin_ctor_bodies)
 
 
 def order(names, deps):
@@ -1124,7 +1169,8 @@ def binder_text(b, deps):
     return f"{open_}{safe_ident(name)} : {ty}{close}"
 
 
-def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map):
+def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map,
+                    iparams, ctor_bodies):
     """Declare a real `inductive`, so the kernel generates its constructors and
     recursor and IOTA-REDUCTION comes back.
 
@@ -1135,14 +1181,24 @@ def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map):
     for the rest.
     """
     binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
+    # THE PARAMETERS COME FROM THE INDUCTIVE'S OWN TYPE. `bs` is the STRUCTURE
+    # constructor telescope and the pin reports it only for rows that are
+    # structures, so every non-structure inductive arrived here with no binders at
+    # all and was written as `inductive Lean.AssocList where` -- no parameters --
+    # which is why `Lean.AssocList α β` in its own constructor read "Function
+    # expected at" and why all 49 rows written before this were monomorphic enums.
+    src = iparams if iparams else bs
     params = []
-    for i, b in sorted(bs.items()):
+    for i, b in sorted(src.items()):
         if i >= iv["num_params"]:
             break
-        b = dict(b, kind=pks.get(i, "default"))
+        if not iparams:
+            b = dict(b, kind=pks.get(i, "default"))
         if b["kind"] != "inst" and needs_rename(b["user"]):
             b = dict(b, user=f"flnp{i}")
         params.append(b)
+    if len(params) != iv["num_params"]:
+        return None
     head = f"inductive {d['decl_name']}{binder}" + (
         (" " + " ".join(binder_text(b, deps) for b in params)) if params else "")
     lines = [head + " where"]
@@ -1151,7 +1207,10 @@ def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map):
     # anchoring rather than pointed at a name that does not exist yet.
     own = {name} | set(iv["ctors"])
     for c in iv["ctors"]:
-        ty = ctypes.get(c)
+        # the constructor's type with the header's parameters ALREADY BOUND; the
+        # pin's printing of the full type re-binds them and the kernel rejects the
+        # parameter mismatch
+        ty = ctor_bodies.get(c) or ctypes.get(c)
         if not ty:
             return None
         short = c.split(".")[-1]
@@ -1253,7 +1312,8 @@ def instance_prio(name, priorities):
 def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
            structural, structs, binders, deps, pbinders, transparent,
            value_explicit_for, companions, priorities, inductives,
-           pin_inductives_ref, types_ref, ind_companions, ctor_companions):
+           pin_inductives_ref, types_ref, ind_companions, ctor_companions,
+           ind_params_ref, ctor_bodies_ref):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -1289,7 +1349,8 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
                                     pin_inductives_ref.get(name) or {},
                                     types_ref, deps.get(name, ()),
                                     pbinders.get(name, {}),
-                                    binders.get(name, {}), deps)
+                                    binders.get(name, {}), deps,
+                                    ind_params_ref.get(name, {}), ctor_bodies_ref)
             if block is not None:
                 d = decl[name]
                 body.append(f"-- role={d['role']} bucket={d['bucket']} inductive "
@@ -1399,7 +1460,8 @@ def main():
      rounds, structs, binders, absent_projections, pbinders,
      pin_reducibility, pin_safety, pin_module,
      pin_fields, pin_res_head, pin_priority, pin_extern,
-     pin_impl_by, pin_kind, pin_inductives) = close_over_types(
+     pin_impl_by, pin_kind, pin_inductives, pin_ind_params,
+     pin_ctor_bodies) = close_over_types(
         lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
@@ -1577,7 +1639,8 @@ def main():
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
          pb2, rd2, sfy2, mod2, flds2, rh2, prio2, ext2,
-         iby2, knd2, ind2) = close_over_types(lean, env, work, extra, census)
+         iby2, knd2, ind2, iprm2, cbod2) = close_over_types(
+            lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
@@ -1592,6 +1655,8 @@ def main():
         pin_impl_by.update(iby2)
         pin_kind.update(knd2)
         pin_inductives.update(ind2)
+        pin_ind_params.update(iprm2)
+        pin_ctor_bodies.update(cbod2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1752,7 +1817,8 @@ def main():
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
                 structural, structs, binders, deps, pbinders, transparent,
             value_explicit_for, companions, pin_priority, inductive_decls,
-            pin_inductives, types, ind_companions, ctor_companions)
+            pin_inductives, types, ind_companions, ctor_companions,
+            pin_ind_params, pin_ctor_bodies)
             candidate = args.out + ".candidate.lean"
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -2161,6 +2227,18 @@ def main():
     # value strings this run actually emitted.
     value_rows = []
     for name in sorted(transparent):
+        if name in provided:
+            # generated, not written from a string by this emitter -- the same
+            # exclusion the type round-trip below already applies, missing here.
+            # `transparent` is the CANDIDATE set: a row the kernel generates from
+            # some other row's block is skipped by the emitter however it was
+            # selected, so ascribing the pin's printed value to it checks a
+            # definition this artifact does not contain. Measured the moment
+            # Lean.Elab.InfoTree became a real inductive: its generated
+            # `casesOn` was still on the transparent list and reported a type
+            # mismatch against the pin's own `casesOn`, which is a disagreement
+            # between two things neither of which this emitter wrote.
+            continue
         d = decl.get(name) or {}
         val = (d.get("valuex") if name in value_explicit_for and d.get("valuex")
                else d.get("value"))
