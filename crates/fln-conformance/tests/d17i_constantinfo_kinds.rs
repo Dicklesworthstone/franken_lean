@@ -8458,3 +8458,129 @@ fn proof_auxiliaries_are_numbered_contiguously_and_match_auxiliaries_are_not() {
         "some family must have more than two members, or contiguity is trivial"
     );
 }
+
+/// The one last-name-component shared by two inductives at the pin.
+const COLLIDING_LAST_COMPONENT: (&str, &[&str]) = ("Raw", &["String.Pos.Raw", "Substring.Raw"]);
+/// The instance whose NAME cannot say which of them it is for, and the
+/// inductive its stored TYPE says it is for.
+const AMBIGUOUS_INSTANCE: (&str, &str) = ("instDecidableEqRaw", "String.Pos.Raw");
+
+/// An instance name projects its type to a LAST NAME COMPONENT, and that
+/// projection is not injective — but the stored type is.
+///
+/// Lean names a derived instance after the type it is for: `instDecidableEqNat`,
+/// `instDecidableEqBool`. The name it embeds is the type's LAST component, not
+/// its full name, so the mapping from inductive to instance name is a
+/// projection — and this file has repeatedly found projections used as
+/// identities that are not injective. This one is not either.
+///
+/// Measured over `Init/Prelude`'s 127 inductives:
+///
+///   126 distinct last components, so the projection collides EXACTLY once:
+///     `Raw` is the last component of both `String.Pos.Raw` and
+///     `Substring.Raw`
+///   13 `instDecidableEq*` instances exist; 12 resolve to exactly one inductive
+///     by last component, and `instDecidableEqRaw` resolves to TWO
+///
+/// So the instance's name does not determine its subject. Anything recovering
+/// "which type is this an instance for" from the name gets a unique answer 12
+/// times and an ambiguous one on the thirteenth — and would most likely take
+/// the first match and be right by luck or wrong silently.
+///
+/// The ending is the useful part: THE ARTIFACT STILL CARRIES THE ANSWER. The
+/// instance's stored type references `String.Pos.Raw` and does not reference
+/// `Substring.Raw`, so the relation the name loses is recoverable from the
+/// declaration itself. That is the same lesson as every other non-injective
+/// projection on this bead — key on the stored relation, not on the name shape
+/// — and this is the first case where the correct key is demonstrated rather
+/// than only recommended.
+#[test]
+fn an_instance_name_does_not_determine_its_type_but_its_stored_type_does() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeSet<String> = BTreeSet::new();
+    let mut instances: BTreeMap<String, &Expr> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        if matches!(info, ConstantInfo::Induct(_)) {
+            inductives.insert(name.clone());
+        }
+        if let Some(suffix) = name.strip_prefix("instDecidableEq") {
+            if !suffix.is_empty() && !suffix.contains('.') {
+                instances.insert(name, &info.constant_val().type_);
+            }
+        }
+    }
+    assert_eq!(
+        inductives.len(),
+        127,
+        "the inductive census must be reached"
+    );
+
+    let mut by_component: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for name in &inductives {
+        let component = name.rsplit('.').next().expect("a name has a component");
+        by_component.entry(component).or_default().push(name);
+    }
+    let colliding: Vec<(&&str, &Vec<&String>)> = by_component
+        .iter()
+        .filter(|(_, owners)| owners.len() > 1)
+        .collect();
+    assert_eq!(
+        by_component.len(),
+        126,
+        "127 inductives carry 126 distinct last components"
+    );
+    let (component, owners) = COLLIDING_LAST_COMPONENT;
+    assert_eq!(
+        colliding.len(),
+        1,
+        "exactly one last component is shared: {colliding:?}"
+    );
+    assert_eq!(
+        (
+            *colliding[0].0,
+            colliding[0]
+                .1
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<&str>>()
+        ),
+        (component, owners.to_vec()),
+        "and it is this one"
+    );
+
+    assert_eq!(instances.len(), 13, "the instance census must be reached");
+    let mut ambiguous: Vec<&String> = Vec::new();
+    for name in instances.keys() {
+        let suffix = name
+            .strip_prefix("instDecidableEq")
+            .expect("filtered above");
+        if by_component
+            .get(suffix)
+            .is_some_and(|owners| owners.len() > 1)
+        {
+            ambiguous.push(name);
+        }
+    }
+    let (instance, subject) = AMBIGUOUS_INSTANCE;
+    assert_eq!(
+        ambiguous,
+        vec![instance],
+        "one instance name resolves to more than one inductive"
+    );
+
+    // The stored type resolves what the name cannot.
+    let referenced = referenced_constants(instances[instance]);
+    let named: Vec<&&str> = owners
+        .iter()
+        .filter(|owner| referenced.contains(**owner))
+        .collect();
+    assert_eq!(
+        named,
+        vec![&subject],
+        "{instance}'s type must name exactly one of the colliding inductives, which is the key \
+         its name fails to be"
+    );
+}
