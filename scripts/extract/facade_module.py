@@ -46,6 +46,7 @@ import re
 import signal
 import builtins
 import contextlib
+import errno
 import subprocess
 import sys
 import tempfile
@@ -1910,6 +1911,31 @@ def publication_registry_error(published, declared):
 
 
 @checked_by_self_test
+def environment_failure(exc):
+    """Is this the machine failing, rather than a guard?
+
+    The self-test writes small files and compares them. If the filesystem is full
+    those writes raise, the case that happened to be running is recorded as a
+    failure, and the report accuses a guard of being broken when nothing is wrong
+    with it -- a false finding, which is worse than no finding and the harder kind
+    to unpick, because every other case around it passed.
+
+    Live while this was written: 3.2 MiB free on the filesystem holding both the
+    artifacts and the scratch, against a 4.3 MiB pre-flight floor. Returns a
+    message when the errno says the environment gave out, and None when the
+    failure is the code's to answer for.
+    """
+    for name in ("ENOSPC", "EDQUOT", "EROFS", "EMFILE", "ENFILE"):
+        code = getattr(errno, name, None)
+        if code is not None and getattr(exc, "errno", None) == code:
+            return (f"the self-test could not run: {name} on "
+                    f"{getattr(exc, 'filename', None)!r}. This is the machine, not "
+                    "a guard -- no verdict is being given about any of them, and "
+                    "the case that was running when it happened is not at fault")
+    return None
+
+
+@checked_by_self_test
 @invoked_by_main
 def unencodable_text_error(text, what="the facade"):
     """The text this run built can actually be written as UTF-8.
@@ -2751,7 +2777,11 @@ def self_test():
     Writes only into a fresh temp directory, never touches the artifacts, and
     never invokes the Reference.
     """
-    work = tempfile.mkdtemp(prefix="fln-l8f-selftest-")
+    try:
+        work = tempfile.mkdtemp(prefix="fln-l8f-selftest-")
+    except OSError as exc:
+        raise SystemExit("REFUSE: " + (environment_failure(exc)
+                                       or f"no temp directory: {exc}")) from exc
     failures, checked = [], []
 
     def _report_divergence_says(_work):
@@ -2764,6 +2794,16 @@ def self_test():
         finally:
             sys.stderr = real
         return buffered.getvalue().strip() or None
+
+    def at(*args, **kwargs):
+        """`_at`, with the environment separated from the verdict."""
+        try:
+            return _at(*args, **kwargs)
+        except OSError as exc:
+            _env = environment_failure(exc)
+            if _env:
+                raise SystemExit("REFUSE: " + _env) from exc
+            raise
 
     def blocked(thunk):
         """The sandbox's own verdict, as an error string the way a guard reports.
@@ -2789,7 +2829,7 @@ def self_test():
                 f"got {'a refusal' if refused else 'a pass'}"
                 + (f" ({got_error})" if got_error else ""))
 
-    def at(tag, payload, *siblings):
+    def _at(tag, payload, *siblings):
         path = os.path.join(work, tag)
         mode, kw = ("wb", {}) if isinstance(payload, bytes) else ("w", {"encoding": "utf-8"})
         with open(path, mode, **kw) as fh:
@@ -2826,6 +2866,13 @@ def self_test():
     #  coverage/main-invokes-every-guard-it-must, below)
 
     _surrogate = "axiom X : Type\n" + chr(0xD800)
+    case("env/enospc-is-not-a-guard-failure",
+         environment_failure(
+             OSError(errno.ENOSPC, "No space left on device", "/x/a.lean")), True)
+    case("env/an-ordinary-error-is-the-codes-fault",
+         environment_failure(OSError(errno.ENOENT, "No such file", "/x")), False)
+    case("env/a-non-oserror-is-the-codes-fault",
+         environment_failure(ValueError("a real bug")), False)
     case("bytes/text-encodable", unencodable_text_error(text), False)
     case("bytes/text-not-encodable", unencodable_text_error(_surrogate), True)
     case("space/floor-doubles-for-the-twin",
