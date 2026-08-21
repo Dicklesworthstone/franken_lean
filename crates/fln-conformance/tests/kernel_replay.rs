@@ -4858,6 +4858,64 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// A DIRECTORY named `*.olean` is traversed, never counted as a module.
+///
+/// **The hazard is an ordering, and orderings rot silently.** The walk tests
+/// `is_dir()` BEFORE it tests the extension, so a directory called
+/// `Nested.olean` is recursed into and only the files beneath it are collected.
+/// Swap those two tests -- a plausible tidy-up, since one reads as "filter by
+/// extension" and the other as "recurse" -- and the directory itself is pushed
+/// onto the olean list. It then projects to a module name like any file would,
+/// so the inventory grows a module that is a FOLDER: a declaration count is
+/// taken for something with no declarations, and the corpus reports a member it
+/// does not have.
+///
+/// **The assertion is the counterfactual, not a total.** Checking only "three
+/// oleans" would fail for many unrelated reasons and would not say WHICH
+/// mistake was made. Under the reordering above the extra module is exactly
+/// `Fixture.Nested` -- the directory's own name with its extension dropped -- so
+/// the test names that string and says what its presence would mean. A count
+/// alone diagnoses nothing; a named counterfactual diagnoses one thing.
+///
+/// **`Nested.olean.Inner` is the correct answer, odd as it reads.** The
+/// projection strips only the FINAL extension, so a directory carrying a dot in
+/// its name contributes both of its dotted parts to the module path. That is
+/// what the pin's own naming would produce for such a tree, and pinning it here
+/// means a future change to the projection cannot quietly redefine it.
+#[test]
+fn a_directory_named_like_an_olean_is_walked_through_not_counted() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-dotted-dir-v1",
+        &["Real.olean", "Nested.olean/Inner.olean", "Plain/Deep.olean"],
+    );
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the dotted-directory fixture must be walkable: {reason}"));
+
+    assert_eq!(
+        oleans.len(),
+        3,
+        "the three FILES are oleans; the directory that merely shares their extension is not. \
+         Found: {oleans:?}"
+    );
+    assert_eq!(
+        modules,
+        vec![
+            "Fixture.Nested.olean.Inner".to_string(),
+            "Fixture.Plain.Deep".to_string(),
+            "Fixture.Real".to_string(),
+        ],
+        "the walk must recurse through a dotted directory and keep only the files below it"
+    );
+    assert!(
+        !modules.iter().any(|name| name == "Fixture.Nested"),
+        "`Fixture.Nested` is present, which means the directory `Nested.olean` was collected as \
+         though it were an olean. That is what happens if the extension test is run before the \
+         is_dir test: the inventory gains a module that is a folder, and a declaration count is \
+         attributed to something with no declarations."
+    );
+}
+
 /// Write an olean whose FILE NAME is not valid UTF-8.
 ///
 /// Only the stem is invalid: the extension stays `olean` so the entry is
