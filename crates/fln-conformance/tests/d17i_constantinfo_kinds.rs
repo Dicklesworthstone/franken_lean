@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use fln_core::expr::{Expr, ExprNode};
+use fln_core::name::Name;
 use fln_env::constants::ConstantInfo;
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
@@ -1261,4 +1262,109 @@ fn a_module_with_imports_is_reference_closed_only_at_private_level() {
          the one this bead observed crossing an import edge: {:?}",
         deficits[1]
     );
+}
+
+/// The NAME references a declaration carries outside its expressions: mutual
+/// sibling lists, an inductive's constructors, a constructor's inductive, a
+/// recursor's block and its rules' constructors.
+///
+/// These are looked up by block admission (the KR-6xx/95x/97x machinery behind
+/// the `BlockMismatch` family), not by defeq, and they are a separate
+/// resolution surface from anything an `Expr` walk can see.
+fn structural_name_references(info: &ConstantInfo) -> Vec<String> {
+    let names = |v: &[Name]| v.iter().map(Name::to_display_string).collect::<Vec<_>>();
+    match info {
+        ConstantInfo::Defn(v) => names(&v.all),
+        ConstantInfo::Thm(v) => names(&v.all),
+        ConstantInfo::Opaque(v) => names(&v.all),
+        ConstantInfo::Induct(v) => {
+            let mut out = names(&v.all);
+            out.extend(names(&v.ctors));
+            out
+        }
+        ConstantInfo::Ctor(v) => vec![v.induct.to_display_string()],
+        ConstantInfo::Rec(v) => {
+            let mut out = names(&v.all);
+            out.extend(v.rules.iter().map(|rule| rule.ctor.to_display_string()));
+            out
+        }
+        ConstantInfo::Axiom(_) | ConstantInfo::Quot(_) => Vec::new(),
+    }
+}
+
+/// The exported part is STRUCTURALLY closed while being EXPRESSION-incomplete,
+/// and that separation is what keeps this bead's two repaired families apart.
+///
+/// This corrects the scope of the two closure cells above. They walk `Expr`
+/// trees, so "does anything the module references fail to resolve" was too
+/// broad a description of what they measured: a declaration also names its
+/// mutual siblings, its constructors, its inductive and its rules' constructors,
+/// and no expression walk reaches any of those. Measured over `Init/Prelude`,
+/// the two surfaces answer differently at the same level:
+///
+///   exported   1,815 structural references, ZERO unresolved
+///              1,321 expression references, SIX unresolved
+///   private    2,171 structural references, ZERO unresolved
+///              1,543 expression references, ZERO unresolved
+///
+/// So the exported part's deficit is entirely in EXPRESSIONS — types and bodies
+/// mentioning private auxiliaries — and never in the block structure. That is
+/// the byte-level counterpart of this bead's own classification finding that
+/// zero of the 228 `BlockMismatch` rows were private or equation-family: block
+/// admission looks up exactly these structural names, and they were all
+/// resolvable even before the companion chain was read. The 228 were an
+/// elimination-rule defect; they could not have been a name-resolution one.
+#[test]
+fn structural_name_references_resolve_at_both_levels_unlike_expression_references() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+
+    let exported_view = OleanView::parse(&exported).expect("parse exported part");
+    let exported_infos = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode exported part");
+    let private_view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    let private_infos = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    for (label, infos, expected_expression_deficit) in [
+        ("exported", &exported_infos, 6usize),
+        ("private", &private_infos, 0),
+    ] {
+        let declared: BTreeSet<String> = infos
+            .iter()
+            .map(|info| info.name().to_display_string())
+            .collect();
+        let structural: BTreeSet<String> =
+            infos.iter().flat_map(structural_name_references).collect();
+        // Anti-vacuity: a declaration set with no structural references would
+        // trivially resolve, and `Init/Prelude` carries hundreds of blocks.
+        assert!(
+            structural.len() > 1_000,
+            "{label}: expected a large structural reference set, got {}",
+            structural.len()
+        );
+        let unresolved: Vec<&String> = structural.difference(&declared).collect();
+        assert!(
+            unresolved.is_empty(),
+            "{label}: block admission looks these up, so an unresolved one is a BlockMismatch \
+             waiting to happen: {unresolved:?}"
+        );
+
+        // The contrast, measured on the same declarations at the same level.
+        let (expression_deficit, _) = unresolved_references(infos);
+        assert_eq!(
+            expression_deficit.len(),
+            expected_expression_deficit,
+            "{label}: the expression surface is the one that moves between levels; if it stops \
+             differing from the structural surface, the two families this bead separated have \
+             stopped being separable by measurement"
+        );
+    }
 }
