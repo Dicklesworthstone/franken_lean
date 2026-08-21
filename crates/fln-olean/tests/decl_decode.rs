@@ -8569,3 +8569,252 @@ fn the_triple_second_field_names() {
          than one root was reachable here"
     );
 }
+
+/// The triples' third field: the ranking INVERTS between the two bases.
+///
+/// `c0a4f175` pinned these expressions per USE - 26, 2, 26, 21, 13, 23 over the
+/// 111 distinct triples - and never on the object basis. That is the same units
+/// gap that reddened `f2da5b0e`, sitting unexamined in a landed cell, so both
+/// bases are measured here and both are named.
+///
+///   shape        uses  objects
+///   tag 3 / 1      26        3
+///   tag 1 / 1      26        4
+///   tag 4 / 2      21        8
+///   tag 5 / 2      13       11
+///   tag 7 / 3      23       21
+///   tag 10 / 2      2        2
+///
+/// PER USE THE TWO ARITY-ONE SHAPES TIE AT THE TOP; PER OBJECT THEY ARE THE
+/// SMALLEST GROUPS. Twenty-six uses of `tag 3` come from three objects, while
+/// twenty-three uses of `tag 7` come from twenty-one. Sharing is concentrated
+/// in the simple expressions and almost absent from the complex ones.
+///
+/// That is not a small-sample artefact - 26 uses against 3 objects and 23
+/// against 21 are both substantial - and it is what a compacted region does:
+/// identical subterms are shared, and a leaf is far more likely to be identical
+/// to another leaf than a three-field node is to another three-field node. It
+/// is also exactly the fact a per-use histogram hides, which is why reading
+/// `c0a4f175`'s row as a description of the value set would have inverted the
+/// ranking.
+///
+/// SIZES ARE ASSERTED HERE, and `2baabd20` is why. I spent thirteen waves
+/// avoiding sizes because `daaaabe2` refuted one as a RULE for `list_ptrs`, and
+/// that audit showed size is the strong characteriser and tag-with-arity the
+/// weak one. Three sizes appear across these six shapes. No rule is proposed
+/// and none is implied.
+///
+/// Depth and node counts are pinned as distributions over the 49 objects,
+/// summing to 49 by construction so a miscount cannot hide in either.
+#[test]
+fn the_triple_third_field_expressions() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    // Which slots of an Expr constructor are themselves expressions.
+    fn expression_children(tag: u8) -> &'static [usize] {
+        match tag {
+            5 => &[0, 1],
+            6 | 7 => &[1, 2],
+            8 => &[1, 2, 3],
+            10 => &[1],
+            11 => &[2],
+            _ => &[],
+        }
+    }
+
+    let mut per_use: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut per_object: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut sizes: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    let mut depths: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut nodes: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut objects_total = 0usize;
+    let mut decoded = 0usize;
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut arrays: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                arrays.insert(array);
+            }
+        }
+        let mut triples: BTreeSet<usize> = BTreeSet::new();
+        for array in arrays {
+            for i in 0..word_at(bytes, array + 8) {
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                    && shape(element) == Some((0, 3))
+                {
+                    triples.insert(element);
+                }
+            }
+        }
+
+        // Per USE, then deduplicate for the object basis.
+        let mut distinct: BTreeSet<usize> = BTreeSet::new();
+        for triple in triples {
+            let word = word_at(bytes, triple + 8 + 8 * 2);
+            let expression = resolve(word).expect("field 2 is a pointer");
+            *per_use.entry(described(expression)).or_default() += 1;
+            distinct.insert(expression);
+        }
+
+        for expression in distinct {
+            objects_total += 1;
+            *per_object.entry(described(expression)).or_default() += 1;
+            *sizes
+                .entry(at.get(&expression).expect("resolved").cs_sz)
+                .or_default() += 1;
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_expr(word_at_pointer(bytes, base, expression))
+                .unwrap_or_else(|e| panic!("{module}: field 2 must be an Expr: {e}"));
+            decoded += 1;
+
+            // Depth and node count over expression children only.
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            let mut deepest = 0usize;
+            let mut stack = vec![(expression, 1usize)];
+            while let Some((node, depth)) = stack.pop() {
+                if !seen.insert(node) {
+                    continue;
+                }
+                deepest = deepest.max(depth);
+                let tag = at.get(&node).expect("a walked object").tag;
+                for &slot in expression_children(tag) {
+                    if let Some(child) = resolve(word_at(bytes, node + 8 + 8 * slot)) {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+            *depths.entry(deepest).or_default() += 1;
+            *nodes.entry(seen.len()).or_default() += 1;
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(
+            objects_total, 0,
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // Both bases, named.
+    assert_eq!(
+        per_use.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 1".to_owned(), 26),
+            ("tag 10 arity 2".to_owned(), 2),
+            ("tag 3 arity 1".to_owned(), 26),
+            ("tag 4 arity 2".to_owned(), 21),
+            ("tag 5 arity 2".to_owned(), 13),
+            ("tag 7 arity 3".to_owned(), 23),
+        ],
+        "per USE, one per distinct triple - `c0a4f175`'s row, reconciled"
+    );
+    assert_eq!(
+        per_object
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 1".to_owned(), 4),
+            ("tag 10 arity 2".to_owned(), 2),
+            ("tag 3 arity 1".to_owned(), 3),
+            ("tag 4 arity 2".to_owned(), 8),
+            ("tag 5 arity 2".to_owned(), 11),
+            ("tag 7 arity 3".to_owned(), 21),
+        ],
+        "per OBJECT - never pinned before, and the ranking INVERTS. Twenty-six \
+         uses of `tag 3` come from three objects; twenty-three uses of `tag 7` \
+         from twenty-one. Sharing is concentrated in the simple expressions"
+    );
+    assert_eq!(objects_total, 49, "the 49 distinct expressions");
+    assert_eq!(decoded, 49, "each accepted by the production `decode_expr`");
+
+    // Sizes, asserted because `2baabd20` showed they carry the weight.
+    assert_eq!(
+        sizes.into_iter().collect::<Vec<_>>(),
+        vec![(24, 7), (32, 21), (48, 21)],
+        "three sizes across the six shapes. No rule is proposed and none is \
+         implied"
+    );
+
+    // Distributions that must sum to the population.
+    assert_eq!(
+        depths.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+        vec![(1, 15), (2, 14), (3, 7), (4, 9), (5, 1), (6, 3)],
+        "expression depth over the 49"
+    );
+    assert_eq!(
+        depths.values().sum::<usize>(),
+        objects_total,
+        "the depth distribution must cover every object"
+    );
+    assert_eq!(
+        nodes.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+        vec![
+            (1, 15),
+            (2, 3),
+            (3, 11),
+            (4, 1),
+            (5, 1),
+            (6, 7),
+            (8, 8),
+            (10, 2),
+            (11, 1)
+        ],
+        "and node count, counting each shared subterm once"
+    );
+    assert_eq!(nodes.values().sum::<usize>(), objects_total, "likewise");
+}
+
+/// The pointer word that reaches `offset`, for handing an object back to a
+/// decoder that takes pointers rather than offsets.
+fn word_at_pointer(_bytes: &[u8], base: u64, offset: usize) -> u64 {
+    base + u64::try_from(offset).expect("in-range")
+}
