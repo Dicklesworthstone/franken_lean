@@ -80,6 +80,97 @@ fn json_object_field<'a>(json: &'a str, field: &str) -> &'a str {
     panic!("JSON object field is closed: {json}");
 }
 
+fn json_array_field<'a>(json: &'a str, field: &str) -> &'a str {
+    let marker = format!("\"{field}\":");
+    let value = json
+        .split_once(&marker)
+        .map(|(_, value)| value)
+        .expect("JSON report contains the requested array field");
+    assert!(value.starts_with('['), "JSON field is an array: {json}");
+
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth = depth.saturating_add(1),
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &value[..=index];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("JSON array field is closed: {json}");
+}
+
+fn json_array_len(array: &str) -> usize {
+    assert!(array.starts_with('[') && array.ends_with(']'));
+
+    let mut object_depth = 0_usize;
+    let mut array_depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut values = 0_usize;
+    let mut value_started = false;
+
+    for byte in array.as_bytes()[1..array.len() - 1].iter().copied() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            byte if byte.is_ascii_whitespace() => {}
+            b'"' => {
+                value_started = true;
+                in_string = true;
+            }
+            b'{' => {
+                value_started = true;
+                object_depth = object_depth.saturating_add(1);
+            }
+            b'}' => object_depth = object_depth.saturating_sub(1),
+            b'[' => {
+                value_started = true;
+                array_depth = array_depth.saturating_add(1);
+            }
+            b']' => array_depth = array_depth.saturating_sub(1),
+            b',' if object_depth == 0 && array_depth == 0 => {
+                assert!(value_started, "JSON array does not have an empty element");
+                values = values.saturating_add(1);
+                value_started = false;
+            }
+            _ => value_started = true,
+        }
+    }
+
+    assert!(
+        !in_string && object_depth == 0 && array_depth == 0,
+        "JSON array is closed",
+    );
+    values.saturating_add(usize::from(value_started))
+}
+
 fn json_usize_field(object: &str, field: &str) -> usize {
     let marker = format!("\"{field}\":");
     let value = object
@@ -221,6 +312,11 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let private_companion_missing = json_usize_field(private_companion_residuals, "missing");
     assert_eq!(private_companion_missing, 0, "{json}");
     let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
+    assert_eq!(
+        json_array_len(json_array_field(private_companion_residuals, "names")),
+        private_companion_observed,
+        "{json}",
+    );
     let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
     assert_eq!(
         private_companion_omitted
