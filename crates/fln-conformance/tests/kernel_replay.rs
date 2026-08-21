@@ -5409,17 +5409,38 @@ fn write_inventory_fixture_with(
     let manifest =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{versioned_name}.manifest"));
     let recorded = requested.join("\n");
-    if let Ok(previous) = fs::read_to_string(&manifest)
-        && previous != recorded
-    {
-        panic!(
+
+    // ABSENT IS NOT THE SAME AS UNREADABLE, AND THIS READ USED TO SAY IT WAS. It
+    // was `if let Ok(previous) = ...`, so EVERY error meant "no record": a
+    // record that exists but cannot be decoded disabled the guard entirely, the
+    // build proceeded on whatever list it was handed, and the write below then
+    // replaced the only evidence that anything had been wrong. Silent, and
+    // self-erasing.
+    //
+    // Absent is the one outcome that earns the quiet arm, because a first build
+    // is the ordinary case and nobody can fix it from the repository. Anything
+    // else is a fault about a file that is there, and it now says so, naming the
+    // file. This is the same line the retained-receipt reader draws, and I made
+    // that argument at length three commits before writing this one the other
+    // way.
+    match fs::read_to_string(&manifest) {
+        Ok(previous) if previous != recorded => panic!(
             "fixture `{versioned_name}` was built by an earlier run as {:?} and is now asked for \
              as {:?}. Nothing removes these trees, so this build would UNION into that one and \
              every count taken from the result would be over by whatever the old shape left \
              behind. Bump the version in the fixture's name",
             previous.split('\n').collect::<Vec<_>>(),
             requested
-        );
+        ),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "fixture `{versioned_name}` has a shape record at {} that exists but could not be \
+             read: {error}. That is not the same as never having been built -- treating it as \
+             absent would build this list over whatever tree the record describes and then \
+             overwrite the record, destroying the only evidence of the mismatch",
+            manifest.display()
+        ),
     }
 
     // RECORDED BEFORE ANYTHING IS BUILT, AND IT USED TO BE RECORDED AFTER. A
@@ -6766,6 +6787,98 @@ fn the_shape_record_is_of_the_request_not_of_the_tree() {
         "the WALK sees both files while the record knows one; that gap is the point of this test, \
          and it is what a tree-hashing record would remove along with five working fixtures: {:?}",
         walked.modules
+    );
+}
+
+/// A shape record that cannot be read is not a shape record that is absent.
+///
+/// **The reader was `if let Ok(...)`, so every error meant "never built".** A
+/// record that exists and cannot be decoded disabled the guard completely: the
+/// build went ahead on whatever list it was handed, and the write that follows
+/// replaced the record -- so the run destroyed the only evidence that anything
+/// had been wrong. Silent and self-erasing, which is the worst pair.
+///
+/// **I had already argued this distinction, three commits before writing it the
+/// other way.** The retained-receipt reader separates a file that is not there
+/// from one it cannot read, for exactly this reason. Knowing a rule and applying
+/// it are different acts, and nothing in my own process caught the second
+/// instance.
+///
+/// **Absent earns the quiet arm and nothing else does.** A first build has no
+/// record and must proceed; that is the ordinary case and nobody can fix it from
+/// the repository. Every other error is a fault about a file that is sitting
+/// right there.
+///
+/// **Demonstrated on a planted corrupt record**, with the corruption asserted to
+/// be real -- a lone invalid byte, which is what a half-finished write leaves --
+/// so the unreadable arm is not being exercised by a file that is merely
+/// unusual. And the record is asserted to SURVIVE the refusal: a guard that
+/// refuses and then overwrites has still destroyed the evidence.
+#[test]
+fn a_shape_record_that_cannot_be_read_is_not_an_absent_one() {
+    const NAME: &str = "t6r7-selftest-record-corrupt-v1";
+    let manifest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{NAME}.manifest"));
+
+    // A lone invalid byte, which is what a half-finished write leaves.
+    const CORRUPT: [u8; 3] = [b'{', 0xFF, b'}'];
+    fs::write(&manifest, CORRUPT)
+        .unwrap_or_else(|error| panic!("plant the corrupt record: {error}"));
+
+    // THE PRECONDITION IS ABOUT THE FILE, NOT ABOUT A LITERAL, and it is read
+    // back from disk to say so. Asserting that the constant fails to decode is
+    // something the compiler folds away -- it warns that the call can only ever
+    // fail -- which is a statement about the source text rather than about the
+    // record the guard will meet.
+    let planted = fs::read(&manifest).unwrap_or_else(|error| panic!("re-read the plant: {error}"));
+    assert!(
+        String::from_utf8(planted).is_err(),
+        "the planted record must genuinely fail to decode, or this test exercises the readable \
+         arm under another name"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| write_inventory_fixture(NAME, &["Any.olean"]));
+    std::panic::set_hook(previous);
+
+    let payload = outcome
+        .err()
+        .unwrap_or_else(|| panic!("a record that cannot be read must not be treated as absent"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("could not be read"),
+        "the refusal must say the record is unreadable, not that the shape changed: {message}"
+    );
+    assert!(
+        message.contains(NAME),
+        "the refusal must name the fixture: {message}"
+    );
+
+    // THE EVIDENCE SURVIVES. The record is written before the tree, so a guard
+    // that refused after writing it would have replaced the corrupt bytes with a
+    // tidy record of the very build it was refusing.
+    assert_eq!(
+        fs::read(&manifest).unwrap_or_else(|error| panic!("re-read the record: {error}")),
+        CORRUPT,
+        "the corrupt record was overwritten by the run that refused it; the fault is now \
+         unreproducible and the next run will see a record it wrote itself"
+    );
+    assert!(
+        !Path::new(env!("CARGO_TARGET_TMPDIR")).join(NAME).exists(),
+        "nothing may be built when the record cannot be read"
+    );
+
+    // GREEN CONTROL: an ABSENT record must still build. Without this the fix
+    // could be refusing every first build in the file and this test would not
+    // know.
+    let fresh = write_inventory_fixture("t6r7-selftest-record-absent-v1", &["Any.olean"]);
+    assert!(
+        fresh.join("Any.olean").is_file(),
+        "a fixture with no record yet is an ordinary first build and must proceed"
     );
 }
 
