@@ -7684,3 +7684,246 @@ fn the_thirteen_times_array() {
          observation and no pattern is claimed from thirteen samples"
     );
 }
+
+/// The categorical zeros, with the denominators they were never given.
+///
+/// `1cc74dd0` declined to call thirteen-of-thirteen a pattern because pairs are
+/// 83 per cent of the population, and I recorded there that I had been
+/// asserting categorical zeros for several waves WITHOUT ever doing that
+/// arithmetic. This is that audit. It is not a new set; it is the strength of
+/// claims already landed, which nothing in the file states.
+///
+/// A zero is only informative against a base rate that makes zero surprising.
+/// Three of this file's zeros, each with its denominator and the rate it should
+/// be read against:
+///
+///   0 of 11   tag-4 third shapes with a pointer head   (`9d365d6a`)
+///             against 71 of 71 for the tag-0 group - a rate of ONE
+///   0 of  1   seed `tag 2` elements wrapping a `tag 4` (`7e65ed09`)
+///             against 5 of 15 for the interior - a rate of about a third
+///   0 of 99   third-shape objects reachable from `constants` (`1dd7c288`)
+///             against 2259 of 2465 cons-shaped cells - a rate of about 0.92
+///
+/// TWO OF THE THREE ARE STRONG AND ONE IS EMPTY. Against a rate of one, zero of
+/// eleven is impossible by chance; against 0.92, zero of ninety-nine is beyond
+/// arithmetic. But `7e65ed09`'s zero is ZERO OF ONE, drawn from a class that
+/// occurs a third of the time, so its chance of arising with no cause at all is
+/// about two in three. It says nothing, and I presented it as a categorical
+/// absence with the same emphasis as the other two.
+///
+/// The cell asserts that denominator of 1 explicitly, so the file records which
+/// of its own claims is content-free rather than leaving a reader to discover
+/// it. That is the honest form: the claim stays, its strength is stated, and
+/// nobody has to re-derive whether it meant anything.
+///
+/// What this does NOT do is retract anything. `7e65ed09`'s zero is a true fact
+/// about the corpus - the seeds' single `tag 2` element does not wrap a
+/// `tag 4`. It is the INFERENCE from it that the denominator forbids.
+#[test]
+fn the_categorical_zeros_have_denominators() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let mut count = |key: &str, by: usize| *counts.entry(key.to_owned()).or_default() += by;
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let declarations = reachable_from(bytes, base, word_at(bytes, root + 24));
+
+        let mut tag0: Vec<usize> = Vec::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let tail = resolve(second);
+            let cons_shaped =
+                (second & 1 == 1 && second >> 1 == 0) || tail.and_then(shape) == Some((1, 2));
+
+            if cons_shaped {
+                // Zero C's comparison group: ordinary cons cells.
+                count("C compare/total", 1);
+                if declarations.contains(&object.off) {
+                    count("C compare/in constants", 1);
+                }
+                continue;
+            }
+
+            // Zero C: the third shape.
+            count("C zero/total", 1);
+            if declarations.contains(&object.off) {
+                count("C zero/in constants", 1);
+            }
+
+            // Zeros A: pointer heads, by which group the tail puts it in.
+            let pointer_head = word_at(bytes, object.off + 8) & 1 == 0;
+            match tail.and_then(shape) {
+                Some((4, 2)) => {
+                    count("A zero/total", 1);
+                    if pointer_head {
+                        count("A zero/pointer heads", 1);
+                    }
+                }
+                Some((0, 2)) => {
+                    count("A compare/total", 1);
+                    if pointer_head {
+                        count("A compare/pointer heads", 1);
+                    }
+                    tag0.push(object.off);
+                }
+                _ => {}
+            }
+        }
+
+        // Zero B: the seeds' `tag 2` elements, against the interior's rate.
+        let records: BTreeSet<usize> = tag0
+            .iter()
+            .filter_map(|&node| resolve(word_at(bytes, node + 8)))
+            .filter(|&head| shape(head) == Some((0, 5)))
+            .collect();
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        for (name, population) in [("B zero", true), ("B compare", false)] {
+            let mut arrays: BTreeSet<usize> = BTreeSet::new();
+            for &node in &all {
+                if seeds.contains(&node) != population {
+                    continue;
+                }
+                let Some(record) = resolve(word_at(bytes, node + 8)) else {
+                    continue;
+                };
+                let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3)) else {
+                    continue;
+                };
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        arrays.insert(array);
+                    }
+                }
+            }
+            let mut wrappers: BTreeSet<usize> = BTreeSet::new();
+            for array in arrays {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((2, 1))
+                    {
+                        wrappers.insert(element);
+                    }
+                }
+            }
+            count(&format!("{name}/total"), wrappers.len());
+            for wrapper in wrappers {
+                if resolve(word_at(bytes, wrapper + 8)).and_then(shape) == Some((4, 2)) {
+                    count(&format!("{name}/wrapping tag4"), 1);
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            counts.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    let get = |key: &str| counts.get(key).copied().unwrap_or_default();
+
+    // Each zero with its denominator and the rate it should be read against.
+    assert_eq!(
+        (get("A zero/pointer heads"), get("A zero/total")),
+        (0, 11),
+        "`9d365d6a`'s zero"
+    );
+    assert_eq!(
+        (get("A compare/pointer heads"), get("A compare/total")),
+        (71, 71),
+        "against a comparison rate of ONE, so zero of eleven cannot arise by \
+         chance - the zero is as strong as a zero gets"
+    );
+
+    assert_eq!(
+        (get("B zero/wrapping tag4"), get("B zero/total")),
+        (0, 1),
+        "`7e65ed09`'s zero is ZERO OF ONE"
+    );
+    assert_eq!(
+        (get("B compare/wrapping tag4"), get("B compare/total")),
+        (5, 15),
+        "against a rate of about a third, so its chance of arising with no \
+         cause is about two in three. It is a true fact about the corpus and it \
+         supports NO inference - and I presented it with the same emphasis as \
+         the other two"
+    );
+    assert_eq!(
+        get("B zero/total"),
+        1,
+        "asserted on its own so the file records which of its claims is \
+         content-free, rather than leaving a reader to work it out"
+    );
+
+    assert_eq!(
+        (get("C zero/in constants"), get("C zero/total")),
+        (0, 99),
+        "`1dd7c288`'s zero"
+    );
+    assert_eq!(
+        (get("C compare/in constants"), get("C compare/total")),
+        (2259, 2465),
+        "against a rate of about 0.92 over 2465 cells, so zero of ninety-nine \
+         is beyond arithmetic - and this one already carried a guard"
+    );
+
+    // Anti-vacuity: a rate comparison needs a comparison group.
+    assert!(
+        get("A compare/total") > 0 && get("B compare/total") > 0 && get("C compare/total") > 0,
+        "each zero needs a non-empty comparison group, or its denominator says \
+         nothing either"
+    );
+}
