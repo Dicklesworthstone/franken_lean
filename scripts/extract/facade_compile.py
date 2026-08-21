@@ -290,6 +290,10 @@ the toolchain would report a perfect facade:
     nonempty owner module in the Lean, Init, or Std surface. A row cannot lose
     its source-module provenance or drift outside the native façade boundary.
 
+  * A MANIFEST-PRIVATE-OWNER JOIN requires every `_private.*` declaration name
+    to encode its row's reported owner module. A stale module field cannot
+    make the private-name provenance map appear consistent by itself.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1778,6 +1782,28 @@ def main():
             f"({json.dumps(manifest_module_join, sort_keys=True)}, "
             f"invalid={invalid_module_rows[:8]!r})"
         )
+    private_owner_rows = [
+        row for row in manifest_rows
+        if row["name"].startswith("_private.")
+    ]
+    private_owner_mismatches = sorted(
+        row["name"] for row in private_owner_rows
+        if not row["name"].startswith(f"_private.{row['module']}.")
+    )
+    manifest_private_owner_join = {
+        "private_rows": len(private_owner_rows),
+        "owner_aligned_rows": len(private_owner_rows) - len(private_owner_mismatches),
+        "owner_mismatches": len(private_owner_mismatches),
+    }
+    if (manifest_private_owner_join["private_rows"] == 0
+            or manifest_private_owner_join["owner_aligned_rows"]
+            != manifest_private_owner_join["private_rows"]
+            or manifest_private_owner_join["owner_mismatches"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest private-owner join failed "
+            f"({json.dumps(manifest_private_owner_join, sort_keys=True)}, "
+            f"mismatches={private_owner_mismatches[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -2215,6 +2241,7 @@ def main():
         "manifest_structural_fallback_join": manifest_structural_fallback_join,
         "manifest_nonemission_provenance_join": manifest_nonemission_provenance_join,
         "manifest_module_provenance_join": manifest_module_join,
+        "manifest_private_owner_join": manifest_private_owner_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
