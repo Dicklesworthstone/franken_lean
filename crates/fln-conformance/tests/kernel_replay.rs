@@ -8759,7 +8759,56 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
     let corpus = suite_lock_corpus_commit();
     let sample = sample_whole_mathlib_receipt();
     if let Err(reason) = sample.validate(&pin, &corpus) {
-        panic!("the green control must satisfy its own guard, but: {reason}");
+        panic!("the green control must satisfy its own guard, but: {reason}")
+    }
+
+    // THE CONTROL SITS EXACTLY ON THREE FLOORS, AND THAT IS THE TEST.
+    //
+    // Each floor is written `value < FLOOR`, so a row AT the floor must be
+    // accepted. Nothing else in this file pins that boundary: every mutant is
+    // far below its floor and would still be refused by a `<=`, and every other
+    // validating receipt sits comfortably above. The only thing distinguishing
+    // `<` from `<=` is that this control's three counts are the floors
+    // themselves -- so the green assertion above is doing double duty, and it
+    // does it silently.
+    //
+    // Pinned here because it is a property of the FIXTURE, not of the guard, and
+    // fixtures get tidied. Someone raising these to rounder or more "realistic"
+    // numbers would remove the only off-by-one check on three floors without
+    // touching an assertion or seeing a red.
+    assert_eq!(
+        (sample.closure_modules, sample.seed_modules, sample.decoded),
+        (
+            WHOLE_MATHLIB_MODULE_FLOOR,
+            WHOLE_MATHLIB_SEED_FLOOR,
+            WHOLE_MATHLIB_DECODED_FLOOR
+        ),
+        "the green control must sit exactly ON each floor: that is what proves the comparison \
+         admits a row at the boundary rather than only above it"
+    );
+    // And one below each is refused -- the other half of the boundary, which the
+    // control alone cannot show.
+    for (name, break_the_floor) in [
+        (
+            "one closure module below the floor",
+            (|receipt: &mut WholeMathlibReceipt| receipt.closure_modules -= 1)
+                as fn(&mut WholeMathlibReceipt),
+        ),
+        ("one seed module below the floor", |receipt| {
+            receipt.seed_modules -= 1
+        }),
+        ("one decoded declaration below the floor", |receipt| {
+            receipt.decoded -= 1;
+            // keep the population conserved so the floor is what fires
+            receipt.unscorable -= 1;
+        }),
+    ] {
+        let mut probe = sample_whole_mathlib_receipt();
+        break_the_floor(&mut probe);
+        assert!(
+            probe.validate(&pin, &corpus).is_err(),
+            "`{name}` was accepted; the floor admits a row beneath it"
+        );
     }
 
     let mutants: Vec<(&str, WholeMathlibReceipt, &str)> = vec![
