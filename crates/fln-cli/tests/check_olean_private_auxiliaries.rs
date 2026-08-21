@@ -586,6 +586,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportLoopResiduals",
+        3,
+        &[
+            "_private.CliPrivateReport.0.loop",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "coreObservablesLoopResiduals",
         3,
         &[
@@ -919,6 +929,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.CliPrivateReport.0.loop._proof_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
             "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
             "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport.loop residuals",
+        "decoded _private CliPrivateReport.loop residual names",
+        3,
+        &[
+            "_private.CliPrivateReport.0.loop",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1",
         ],
     );
     assert_human_named_residuals(
