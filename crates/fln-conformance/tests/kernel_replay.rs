@@ -13813,15 +13813,9 @@ fn assert_string_terminator(key: &str, rest: &str, end: usize) -> Result<(), Str
 /// LINES CONTAINING the phrase against OCCURRENCES of it, which is the same
 /// denominator error one artifact up. The green control for a line stating the
 /// claim twice is there because of it.
-fn claim_sites_hidden_by_a_line_break(text: &str, needle: &str) -> usize {
-    let per_line: usize = text.lines().map(|line| line.matches(needle).count()).sum();
-    let collapsed = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .matches(needle)
-        .count();
-    collapsed.saturating_sub(per_line)
+fn claim_sites_hidden_by_a_line_break(text: &str) -> usize {
+    let per_line: usize = text.lines().map(thread_matrix_claim_count).sum();
+    thread_matrix_claim_count(text).saturating_sub(per_line)
 }
 
 /// Where a stale claim about the matrix straddles a line break.
@@ -13860,11 +13854,16 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
 /// no scope -- so the row that DEFINES the gate is the one site no rule could
 /// see. Whitespace is stripped before the comparison so a spelling cannot hide a
 /// claim.
-fn states_thread_matrix_claim(line: &str) -> bool {
-    line.chars()
+fn thread_matrix_claim_count(text: &str) -> usize {
+    text.chars()
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
-        .contains("{1,8,32}")
+        .matches("{1,8,32}")
+        .count()
+}
+
+fn states_thread_matrix_claim(line: &str) -> bool {
+    thread_matrix_claim_count(line) > 0
 }
 
 fn unscoped_claim_sites(text: &str, qualifiers: &[&str], cadence: &[&str]) -> usize {
@@ -16988,22 +16987,44 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     // at this commit no site in either file is hidden: an empty population needs
     // a planted member or the rule below is unfalsifiable.
     assert_eq!(
-        claim_sites_hidden_by_a_line_break("the matrix runs {1, 8,\n32} threads\n", "{1, 8, 32}"),
+        claim_sites_hidden_by_a_line_break("the matrix runs {1, 8,\n32} threads\n"),
         1,
         "a claim split across a line break must be counted as hidden, or the rule below cannot \
          fire"
     );
     assert_eq!(
-        claim_sites_hidden_by_a_line_break("a {1, 8, 32} claim\n", "{1, 8, 32}"),
+        claim_sites_hidden_by_a_line_break("a {1, 8, 32} claim\n"),
         0,
         "an ordinary statement must not be reported as hidden"
+    );
+    // AND A WRAP IS NOT THE ONLY WAY TO HIDE ONE -- A WRAP PLUS A SPELLING IS.
+    // Measured before this cell: the needle was the literal `{1, 8, 32}`, so a
+    // claim that was BOTH re-spaced AND wrapped scored zero here and zero at the
+    // per-line scan, which is a join neither half of the guard could see. The
+    // real documents carry no such site today (all three score zero hidden), so
+    // this synthetic member is the whole population and the measurement that
+    // separates the rules is: old 0, new 1.
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break("the matrix runs {1,8,\n32} threads\n"),
+        1,
+        "a claim both re-spaced and wrapped is invisible to the per-line scan too, so it must \
+         count as hidden -- matching a literal needle here made the two halves of this guard \
+         recognise different claims"
+    );
+    // AND STRIPPING WHITESPACE MUST NOT MANUFACTURE A CLAIM. Deleting spaces
+    // joins neighbouring text, so a table cell could in principle be read as a
+    // statement nobody made; the intervening characters are what stop it.
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break("| {1,8 | 32} |\n"),
+        0,
+        "whitespace-insensitive counting must not join unrelated text into a claim"
     );
     // AND A LINE STATING IT TWICE IS NOT A HIDDEN SITE. This control exists
     // because my first measurement of the real documents compared lines
     // CONTAINING the phrase against OCCURRENCES of it and reported two hidden
     // sites that do not exist.
     assert_eq!(
-        claim_sites_hidden_by_a_line_break("{1, 8, 32} and {1, 8, 32}\n", "{1, 8, 32}"),
+        claim_sites_hidden_by_a_line_break("{1, 8, 32} and {1, 8, 32}\n"),
         0,
         "two statements on one line are both visible to a per-line scan; counting lines instead \
          of occurrences is what makes them look hidden"
@@ -17115,7 +17136,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
              retracted description while this guard reports green"
         );
         assert_eq!(
-            claim_sites_hidden_by_a_line_break(&text, "{1, 8, 32}"),
+            claim_sites_hidden_by_a_line_break(&text),
             0,
             "{doc} states the {{1, 8, 32}} claim across a line break, where this scan decides per \
              line: neither half states it, so no half is required to name its scope and the \
