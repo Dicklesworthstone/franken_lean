@@ -2462,6 +2462,23 @@ def main():
             "REFUSE: facade manifest extern-implementation probe diverges "
             f"({json.dumps(extern_implementation_probe_join, sort_keys=True)})"
         )
+    closure_structural_refusal_join = {
+        "summary_closure_rounds": manifest_summary.get("closure_rounds"),
+        "summary_structural_refused": manifest_summary.get(
+            "structural_refused"
+        ),
+        "pinned_closure_structural_count": 28,
+    }
+    if (closure_structural_refusal_join["summary_closure_rounds"]
+            != closure_structural_refusal_join[
+                "pinned_closure_structural_count"]
+            or closure_structural_refusal_join["summary_structural_refused"]
+            != closure_structural_refusal_join[
+                "pinned_closure_structural_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest closure-structural count diverges "
+            f"({json.dumps(closure_structural_refusal_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3635,6 +3652,9 @@ def main():
         ),
         "manifest_extern_implementation_probe_join": (
             extern_implementation_probe_join
+        ),
+        "manifest_closure_structural_refusal_join": (
+            closure_structural_refusal_join
         ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
