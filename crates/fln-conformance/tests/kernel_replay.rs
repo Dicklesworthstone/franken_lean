@@ -18714,6 +18714,41 @@ fn a_receipt_that_compared_nothing_is_refused() {
             },
             "per-width timing(s)",
         ),
+        // AND THE LONG SIDE OF BOTH CARDINALITY RULES, WHICH NOTHING REACHED.
+        // Every plant above is EMPTY or SHORT, and `len() != widths.len()`
+        // narrowed to `len() < widths.len()` refuses both of those exactly as
+        // the real rule does -- so that mutant survived the whole table. A row
+        // carrying a fourth digest ran a width it did not declare, or kept a
+        // stale element from a run that did; either way the equality rule then
+        // compares four things and reports agreement about three.
+        (
+            "a fourth digest for three widths",
+            CorpusMatrixReceipt {
+                corpus_digests: {
+                    let mut digests = real.corpus_digests.clone();
+                    digests.push(real.corpus_digests[0].clone());
+                    digests
+                },
+                ..real.clone()
+            },
+            "corpus digest(s)",
+        ),
+        // The extra timing is ONE MILLISECOND on purpose. A duplicate of a real
+        // width would push the widths past the wall and be refused by the
+        // parts-versus-whole rule instead, which is a plant passing for the
+        // wrong reason -- the failure this file has now met three times.
+        (
+            "a fourth timing for three widths",
+            CorpusMatrixReceipt {
+                per_width_ms: {
+                    let mut timings = real.per_width_ms.clone();
+                    timings.push(1);
+                    timings
+                },
+                ..real.clone()
+            },
+            "per-width timing(s)",
+        ),
         (
             "a module left out of the matrix",
             CorpusMatrixReceipt {
