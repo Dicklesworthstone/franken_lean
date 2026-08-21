@@ -5673,6 +5673,17 @@ fn the_one_field_elements_wrap_names() {
 /// population is one object and it wraps a `tag 1`. That is asserted as a count
 /// of zero, the discipline `d8906952` settled for categorical absences.
 ///
+/// THIS CELL WAS RED AT w155 AND THE CAUSE WAS THE SAME CONFUSION IT REPORTS.
+/// The comparison below counts DISTINCT slot-3 carriers, because the walk
+/// gathers them into a set; the first version asserted 26, which is the
+/// REFERENCE count `6a4dba87` pins next to the distinct count of 24. Both
+/// numbers were already in this file, one line apart, and I took the wrong one.
+/// The seeds are 11 either way, so half the assertion matched and the failure
+/// looked like a data disagreement rather than a units error.
+///
+/// The type-distinction claim above is untouched by that: it rests on WHAT the
+/// two populations' fields are, not on how many of them there are.
+///
 /// Slot 1 is boxed four times and a pointer once - the THIRD non-uniform field
 /// found here, after `6a4dba87` and `4277a152`. Five objects support no
 /// proportion, so the two counts are pinned and nothing is said about which
@@ -5854,15 +5865,21 @@ fn the_wrapped_tag_four_objects_are_not_the_slot_three_ones() {
     assert_eq!(
         slot_three_fields.into_iter().collect::<Vec<_>>(),
         vec![
-            ("interior/slot 0 tag 2 arity 2".to_owned(), 26),
-            ("interior/slot 1 tag 246 arity 0".to_owned(), 26),
+            ("interior/slot 0 tag 2 arity 2".to_owned(), 24),
+            ("interior/slot 1 tag 246 arity 0".to_owned(), 24),
             ("seed/slot 0 tag 2 arity 2".to_owned(), 11),
             ("seed/slot 1 tag 246 arity 0".to_owned(), 11),
         ],
         "slot 3's `tag 4` objects hold a NUMBERED name link and an ARRAY. The \
          wrapped ones hold a name link and a boxed-or-pointer field. Same tag, \
          same arity, different type - which is `daaaabe2`'s finding four levels \
-         deeper, and why nothing here is handed to a decoder"
+         deeper, and why nothing here is handed to a decoder. \
+         \
+         These counts are over DISTINCT carriers, because the walk above \
+         collects them into a set: 24 for the interior, not the 26 REFERENCES \
+         `6a4dba87` pins beside them. That cell's own per-slot histogram \
+         already says 24; this cell first asserted 26 and was red until w155. \
+         The seeds are 11 either way, which is why they matched and hid it"
     );
 }
 
