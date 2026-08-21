@@ -180,6 +180,10 @@ const PSIGMA_CASES_ON_ARG_PUSHER_MODULE: &str = "Init/Data/Array/Basic";
 const GET_ELEM_MATCH_1_EQ_1: &str = "_private.Init.Data.Array.Basic.0.GetElem?.match_1.eq_1";
 /// The pin's private array stores this theorem in the Basic module.
 const GET_ELEM_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Array/Basic";
+/// The second generated equation theorem for `GetElem?.match_1`.
+const GET_ELEM_MATCH_1_EQ_2: &str = "_private.Init.Data.Array.Basic.0.GetElem?.match_1.eq_2";
+/// The pin's private array stores this theorem in the Basic module.
+const GET_ELEM_MATCH_1_EQ_2_MODULE: &str = "Init/Data/Array/Basic";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -1634,6 +1638,35 @@ fn get_elem_match_equation_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {GET_ELEM_MATCH_1_EQ_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn get_elem_second_match_equation_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("get_elem_second_match_equation_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, GET_ELEM_MATCH_1_EQ_2_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&GET_ELEM_MATCH_1_EQ_2.to_owned()),
+        "the private companion of {GET_ELEM_MATCH_1_EQ_2_MODULE} must retain \\
+         {GET_ELEM_MATCH_1_EQ_2}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == GET_ELEM_MATCH_1_EQ_2)
+        .unwrap_or_else(|| panic!("private decoder lost {GET_ELEM_MATCH_1_EQ_2}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {GET_ELEM_MATCH_1_EQ_2} as {} instead of Thm",
         recovered.kind_name()
     );
 }
