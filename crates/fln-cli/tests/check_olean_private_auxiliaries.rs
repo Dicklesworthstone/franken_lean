@@ -1928,6 +1928,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
+    let human_authority = match human_line_suffix(&human.stdout, "authority: ") {
+        "K1 + independent checker" => true,
+        authority => panic!("human authority status is the K1/checker authority: {authority}"),
+    };
+    assert_eq!(
+        human_authority,
+        json_bool_field(&json.stdout, "authority"),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
+    );
     assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
         &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
