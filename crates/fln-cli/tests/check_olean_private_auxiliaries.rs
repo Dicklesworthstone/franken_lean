@@ -423,6 +423,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "both check-olean JSON render paths emit extension observation in concat-item strings",
     );
     assert_eq!(
+        cli_source_lines
+            .iter()
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with('"') && line.contains(r#"\"declarationsChecked\":"#)
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths emit declaration counts in concat-item strings",
+    );
+    assert_eq!(
         [
             cli_source_lines
                 .windows(2)
