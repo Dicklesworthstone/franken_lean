@@ -545,3 +545,107 @@ fn every_definition_that_appeared_in_both_restrictive_families_is_restored() {
         );
     }
 }
+
+/// The six `ArtifactIncomplete` rows the Prelude census reports, paired with
+/// the auxiliary each one names as missing.
+///
+/// These six are a live residual of the same part-selection cause, and they are
+/// the last one on this bead's spine that is not merely historical: the census
+/// reports them TODAY. `decode_prelude` reads `Init/Prelude.olean` alone — the
+/// exported part, 2,204 constants — so every private auxiliary those six
+/// non-safe implementation helpers reference is absent from the environment the
+/// census is handed, and it records six declarations with missing references.
+///
+/// THE CENSUS IS NOT WRONG. Given an exported-only environment its finding is
+/// exactly right, and refusing to report a gap it can see is the last thing we
+/// would want it to do. What is incomplete is the INPUT, not the artifact and
+/// not the guard. The pairing below is the evidence for that reading: every one
+/// of the six declarations is a `Defn` in BOTH parts — their bodies were never
+/// missing, so the rows are not about them — while every auxiliary they name is
+/// absent from the exported part and present in the private one.
+///
+/// This is deliberately a measurement and not a repair. Feeding the census the
+/// companion chain moves the pinned 2,204 constant census and the pinned
+/// six-row expectation together, in a 342KB file several panes are editing;
+/// that is a coordinated lane change, not a smallest fix, and it belongs to the
+/// census owner rather than here.
+const ARTIFACT_INCOMPLETE_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "Lean.Name.hash._override",
+        "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+        "Thm",
+    ),
+    (
+        "Lean.Name.num._override",
+        "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        "Thm",
+    ),
+    (
+        "Lean.Syntax.getHeadInfo?._unsafe_rec",
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+        "Defn",
+    ),
+    (
+        "Lean.Syntax.getTailPos?._unsafe_rec",
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        "Defn",
+    ),
+    (
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+        "Defn",
+    ),
+    (
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1",
+        "Defn",
+    ),
+];
+
+#[test]
+fn the_six_artifact_incomplete_rows_name_auxiliaries_the_private_part_supplies() {
+    let lib = lib_or_skip!();
+    let (exported, private) = exported_and_private(&lib, "Init/Prelude");
+
+    for (declaration, auxiliary, auxiliary_kind) in ARTIFACT_INCOMPLETE_ROWS {
+        // The declaration side. A row about a declaration whose own body were
+        // missing would be a different finding with a different remedy, so
+        // this half is what rules that reading out.
+        assert_eq!(
+            exported.get(*declaration).copied(),
+            Some("Defn"),
+            "{declaration}: the census row is not about this declaration being absent"
+        );
+        assert_eq!(
+            private.get(*declaration).copied(),
+            Some("Defn"),
+            "{declaration}: present with a body at both levels"
+        );
+        // The reference side, which is what the row is actually about.
+        assert_eq!(
+            exported.get(*auxiliary).copied(),
+            None,
+            "{auxiliary}: absence from the exported part is why the census records the row"
+        );
+        assert_eq!(
+            private.get(*auxiliary).copied(),
+            Some(*auxiliary_kind),
+            "{auxiliary}: the private part supplies it, so the row is a property of the input"
+        );
+    }
+
+    // Anti-vacuity, and the number the census itself is pinned to. If the
+    // exported census ever stops being 2,204 the pairing above is being read
+    // against a different artifact than the one the six rows were measured on.
+    assert_eq!(
+        exported.len(),
+        2_204,
+        "the exported Prelude census the six ArtifactIncomplete rows were measured against"
+    );
+    assert!(
+        private.len() > exported.len(),
+        "the private part must supply more than the exported census (exported {}, private {})",
+        exported.len(),
+        private.len()
+    );
+}
