@@ -3778,3 +3778,123 @@ fn inductive_arity_matches_its_type_and_constructors_share_its_parameters() {
         "a check that skipped every constructor would report no failures; {compared} compared"
     );
 }
+
+/// The nested auxiliary recursors and the container each one's major premise is
+/// headed by.
+///
+/// Named with their containers rather than excluded by shape: "skip the nested
+/// ones" would accept a nested recursor whose major was headed by anything at
+/// all, which is the failure this relation exists to catch.
+const NESTED_MAJOR_CONTAINERS: &[(&str, &str)] = &[
+    ("Lean.Syntax.rec_1", "Array"),
+    ("Lean.Syntax.rec_2", "List"),
+];
+
+/// Every binder domain of a type, in order.
+fn all_domains(type_: &Expr) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    let mut current = type_;
+    while let ExprNode::ForallE {
+        binder_type, body, ..
+    } = current.node()
+    {
+        out.push(binder_type);
+        current = body;
+    }
+    out
+}
+
+/// What the recursor's telescope CONTAINS, not just how long it is.
+///
+/// `11c4c97d` checked that a recursor's telescope has
+/// `num_params + num_motives + num_minors + num_indices + 1` binders. A
+/// telescope of the right length can still bind the wrong things, and two of its
+/// positions are determined by the block:
+///
+///   the MOTIVE, at index `num_params`, takes the indices and then the major,
+///   so its own telescope is `num_indices + 1`
+///   the MAJOR, the last binder, has a type headed by a block member
+///
+/// Both are what `reduce_recursor` relies on when it locates the major at
+/// `nparams + nmotives + nminors + nindices` and matches its head against the
+/// inductive. A decode that produced the right COUNTS over the wrong binders
+/// passes the length check and breaks reduction.
+///
+/// Measured over `Init/Prelude` at private level: 129 recursors, every motive
+/// telescope exactly `num_indices + 1`; 127 majors headed by a block member.
+///
+/// THE TWO THAT ARE NOT are the nested auxiliaries, and their majors are headed
+/// by the NESTING CONTAINERS — `Array` for `rec_1`, `List` for `rec_2` — which
+/// is what recursing over `Array Syntax` and `List Syntax` means. They are
+/// pinned by container rather than skipped, so a nested recursor whose major
+/// drifted to something else still fails.
+#[test]
+fn the_recursor_telescope_binds_a_motive_and_a_major_of_the_right_shape() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut checked = 0usize;
+    let mut argument_counts: BTreeSet<usize> = BTreeSet::new();
+    for info in &infos {
+        let ConstantInfo::Rec(rec) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        let domains = all_domains(&rec.base.type_);
+        let block: BTreeSet<String> = rec.all.iter().map(Name::to_display_string).collect();
+
+        // The motive sits immediately after the parameters.
+        let motive = domains
+            .get(rec.num_params as usize)
+            .unwrap_or_else(|| panic!("{name}: telescope has no motive binder"));
+        assert_eq!(
+            telescope_length(motive),
+            (rec.num_indices + 1) as usize,
+            "{name}: the motive takes the indices and then the major"
+        );
+
+        // The major is the last binder.
+        let major_index =
+            (rec.num_params + rec.num_motives + rec.num_minors + rec.num_indices) as usize;
+        let major = domains
+            .get(major_index)
+            .unwrap_or_else(|| panic!("{name}: telescope has no major premise"));
+        let mut current = *major;
+        let mut arguments = 0usize;
+        while let ExprNode::App { f, .. } = current.node() {
+            arguments += 1;
+            current = f;
+        }
+        let ExprNode::Const { name: head, .. } = current.node() else {
+            panic!("{name}: the major premise is not headed by a constant");
+        };
+        argument_counts.insert(arguments);
+
+        let head = head.to_display_string();
+        match NESTED_MAJOR_CONTAINERS
+            .iter()
+            .find(|(recursor, _)| *recursor == name)
+        {
+            Some((_, container)) => assert_eq!(
+                head, *container,
+                "{name} recurses over a nesting container, so its major is headed by that \
+                 container and by nothing else"
+            ),
+            None => assert!(
+                block.contains(&head),
+                "{name}: the major premise must be headed by a member of its own block, which \
+                 is what reduce_recursor matches against; got {head}"
+            ),
+        }
+        checked += 1;
+    }
+
+    // Non-vacuity: the major's head is applied to a varying number of arguments,
+    // so this is not one shape repeated.
+    assert!(
+        checked >= 120 && argument_counts.len() >= 4,
+        "the recursor census must be reached with varied majors ({checked} recursors, {} \
+         distinct argument counts)",
+        argument_counts.len()
+    );
+}
