@@ -372,6 +372,28 @@ def probe(lean, env, work, names):
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
+# A field or binder whose name is a Lean KEYWORD parses as that keyword, and the
+# resulting error is a PARSE error, which takes the rest of the file with it: every
+# later declaration goes undeclared and reports as "unknown identifier", so the
+# repair loop blames a dozen innocent rows and never sees the one bad line.
+# Measured on `Lean.NameGenerator.private`, `Lean.Lsp.Range.end`.
+LEAN_KEYWORDS = frozenset("""
+private protected partial unsafe noncomputable opaque abbrev def theorem axiom
+example instance class structure inductive coinductive where extends deriving
+namespace section end open export import prelude variable universe mutual
+attribute macro macro_rules syntax notation infix infixl infixr prefix postfix
+set_option builtin_initialize initialize register_simp_attr
+fun let have show suffices calc match with do if then else for in while repeat
+try catch finally return break continue unless guard at by from this rec
+forall exists sorry admit run_cmd
+""".split())
+
+
+def safe_ident(part):
+    """One name component, written so the pin reads it as a NAME."""
+    if IDENT.match(part) and part not in LEAN_KEYWORDS:
+        return part
+    return "«" + part + "»"
 # A `structure` block generates these alongside the fields. Emitting an axiom for
 # one is a redeclaration; omitting it when the owner is NOT structural loses the
 # row. The list is a claim about the pin's elaborator, and it is CHECKED both ways
@@ -419,12 +441,9 @@ def renderable_name(name):
         return None
     out = []
     for c in comps:
-        if IDENT.match(c):
-            out.append(c)
-        elif c.isdigit():
+        if c.isdigit():
             return None
-        else:
-            out.append("«" + c + "»")
+        out.append(safe_ident(c))
     return ".".join(out)
 
 
@@ -535,6 +554,10 @@ HEADER = [
 ]
 
 
+def writable_binder(name):
+    return bool(IDENT.match(name)) and name not in LEAN_KEYWORDS
+
+
 def binder_text(b, deps):
     """Render one constructor binder. An INACCESSIBLE name (`inst✝`) cannot be
     written back as source, and a field type that mentions one cannot either — the
@@ -585,8 +608,11 @@ def structural_refusal(name, st, bs):
     for i, b in sorted(bs.items()):
         if "\u271d" in b["type"]:
             return "a binder type mentions an inaccessible name"
-        if "\u271d" in b["user"] and b["kind"] != "inst":
-            return "a non-instance binder is inaccessible"
+        # A NON-instance binder's name IS referenced by later binder and field
+        # types, so it cannot be dropped or renamed; such a structure keeps the
+        # axiom form rather than emitting a block that cannot parse.
+        if b["kind"] != "inst" and not writable_binder(b["user"]):
+            return f"binder {b['user']!r} cannot be written as an identifier"
     return None
 
 
@@ -802,6 +828,7 @@ def main():
     structural_full = set(structural)
     ordered, cycle_residue = order(list(types), deps)
     explicit_for, maxexp_for, dropped_attrs, attr_reason = set(), set(), set(), {}
+    defer_count = {}
     text = line_map = emitted = None
     attempts = []
     # QUARANTINE IS NOT MONOTONE. A row can fail an early attempt only because a
@@ -829,6 +856,12 @@ def main():
                                   if not v.startswith("pin rejected")}
             dropped_attrs = set()
             attr_reason = {}
+            # The defer budget is a per-round convergence device, not a global
+            # one. Carrying it across rounds exhausts it before the round that
+            # could actually use it: a row deferred twice in early rounds is then
+            # demoted immediately in every later round, however much the facade
+            # around it has improved.
+            defer_count = {}
         for attempt in range(1, args.max_attempts + 1):
             text, line_map, emitted, attr_count, provided = render(
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
@@ -875,7 +908,31 @@ def main():
                     f"REFUSE: elaboration failed but no error line maps to a "
                     f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
             progressed = False
-            for name in blamed_transparent:
+            # A ROW WHOSE COMPLAINT NAMES A CONSTANT THE FACADE OWES BUT HAS NOT
+            # GOT IN FRONT OF IT IS A VICTIM, NOT A CAUSE. The structural block for
+            # `Lean.Meta.Cache` fails, so the transparent form of
+            # `Lean.Meta.InferTypeCache` reports "Unknown identifier `_root_.…`" in
+            # the SAME attempt, and demoting it there loses the transparency that
+            # `Lean.Meta.MetaM.run` needs three layers up. Victims are deferred
+            # while anything else is being repaired, and acted on only if nothing
+            # else moved — so the loop can never stall on them.
+            missing_dep = re.compile(r"[`\u2018]_root_\.([\w.'!?]+)[`\u2019]")
+            emitted_now = set(emitted) | set(provided)
+
+            def is_victim(nm, tag):
+                if defer_count.get((tag, nm), 0) >= 2:
+                    return False
+                for mm in missing_dep.finditer(blame_msg.get(nm, "")):
+                    dep = mm.group(1)
+                    if dep in decl and dep not in emitted_now:
+                        return True
+                return False
+
+            victims_t = {n for n in blamed_transparent
+                         if n in transparent and is_victim(n, "t")}
+            victims_s = {n for n in blamed_structs
+                         if n in structural and is_victim(n, "s")}
+            for name in blamed_transparent - victims_t:
                 if name in transparent:
                     transparent.discard(name)
                     transparent_refused[name] = ("pin rejected the transparent form "
@@ -884,7 +941,7 @@ def main():
             # A structural block the pin rejects DEMOTES to the axiom form rather than
             # taking the row out of the facade: coverage must never fall because the
             # stronger emission was attempted.
-            for name in blamed_structs:
+            for name in blamed_structs - victims_s:
                 if name in structural:
                     structural.discard(name)
                     structural_refused[name] = ("pin rejected the structural block -- "
@@ -900,6 +957,15 @@ def main():
             # A type that does not round-trip readably gets the explicit printer once;
             # if it still fails it is quarantined with its reason, and the anti-vacuity
             # floor below stops a facade from quarantining its way to green.
+            # QUARANTINE IS THE LAST RESORT, NOT A SAME-PASS ACTION. A row is
+            # blamed in the SAME attempt as the dependency that broke it: the
+            # structural block for `Lean.PersistentHashMap` fails, so
+            # `Lean.Meta.MetaM.run` reports "Unknown identifier
+            # `_root_.Lean.PersistentHashMap.mk`" in the same run. Quarantining
+            # both loses the consumer permanently for a fault that the next
+            # attempt repairs. Deferred rows are collected here and applied only
+            # if nothing else moved.
+            deferred = []
             for name in blamed_axioms:
                 # `X has already been declared` is not a broken stub: it is the
                 # implicitly imported Init substrate ALREADY serving that symbol. The
@@ -938,6 +1004,39 @@ def main():
                     # nothing; the message is what tells a reader that the row failed
                     # because a class became an opaque axiom rather than because a
                     # printer wrapped a line.
+                    deferred.append(name)
+            # A deferred row is retried while SOMETHING ELSE is still being
+            # repaired, and at most twice: the fault that blamed it is usually the
+            # very dependency being fixed in the same pass, but a row that keeps
+            # failing after the facade has settled must still land in the residue
+            # rather than deferring forever.
+            if (victims_t or victims_s) and progressed:
+                for nm in victims_t:
+                    defer_count[("t", nm)] = defer_count.get(("t", nm), 0) + 1
+                for nm in victims_s:
+                    defer_count[("s", nm)] = defer_count.get(("s", nm), 0) + 1
+            elif victims_t or victims_s:
+                # Nothing else moved, so the victims must be acted on or the
+                # attempt makes no progress at all.
+                for nm in victims_t:
+                    transparent.discard(nm)
+                    transparent_refused[nm] = ("pin rejected the transparent form -- "
+                                               + blame_msg.get(nm, "-"))
+                    progressed = True
+                for nm in victims_s:
+                    structural.discard(nm)
+                    structural_refused[nm] = ("pin rejected the structural block -- "
+                                              + blame_msg.get(nm, "-"))
+                    progressed = True
+            if deferred and progressed:
+                for name in list(deferred):
+                    defer_count[name] = defer_count.get(name, 0) + 1
+                    if defer_count[name] > 2:
+                        quarantine[name] = ("pin rejects the printed type -- "
+                                            + blame_msg.get(name, "-"))
+                        deferred.remove(name)
+            elif deferred:
+                for name in deferred:
                     quarantine[name] = ("pin rejects the printed type -- "
                                         + blame_msg.get(name, "-"))
                     progressed = True
