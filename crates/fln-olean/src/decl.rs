@@ -935,11 +935,30 @@ impl<'a> DeclDecoder<'a> {
     /// stores its parent as one object slot (FINDINGS.md item 16).
     fn decode_constant_val(&mut self, ptr: u64) -> DResult<ConstantVal> {
         let off = self.view.deref(ptr)?;
-        let (tag, other, _) = self.view.obj_header(off)?;
+        let (tag, other, cs_sz) = self.view.obj_header(off)?;
         if tag != 0 || other != 3 {
             return Err(DeclError::Shape {
                 offset: off,
                 what: "ConstantVal arity",
+            });
+        }
+        // Checked AFTER the arity rule, so a wrong `other` reports itself as an
+        // arity fault — the ordering `decode_level` had to be corrected to at
+        // f193516d, applied here from the start.
+        //
+        // ConstantVal is three pointer fields — name, levelParams, type — and
+        // no scalars, so the object is exactly 8 + 8*3 bytes. The three reads
+        // below are at `off + 8`, `+ 16` and `+ 24`, all derived from that
+        // layout rather than from the object, so an object of another size
+        // sends them into a neighbour and the name, universe list or TYPE of a
+        // declaration is silently taken from the wrong place.
+        //
+        // Measured over the pin: 215,111 ConstantVal objects, every one tag 0,
+        // other 3, cs_sz 32; all three distributions are singletons.
+        if cs_sz != 32 {
+            return Err(DeclError::Shape {
+                offset: off,
+                what: "ConstantVal object size disagrees with its three-pointer layout",
             });
         }
         Ok(ConstantVal {
@@ -2998,6 +3017,110 @@ mod tests {
                 }
             ),
             "expected the size refusal rather than a Level.Data cross-check: {error:?}"
+        );
+    }
+
+    /// A `ConstantVal` claiming an arity its layout does not have is refused.
+    ///
+    /// No co-planting is needed: `decode_constant_val` had no size law at all
+    /// until this commit, and the one added alongside sits AFTER the arity
+    /// rule, so a wrong `other` still reports itself as an arity fault.
+    #[test]
+    fn a_constant_val_claiming_the_wrong_arity_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+
+        let (tag, other, cs_sz) = view.obj_header(base_off).expect("ConstantVal header");
+        assert_eq!(tag, 0, "a plain structure");
+        assert_eq!(other, 3, "name, levelParams, type");
+        assert_eq!(cs_sz, 32, "and no scalars");
+
+        // Claim two slots where the layout has three, leaving the size alone.
+        let header = view.read_u64(base_off).expect("header word");
+        let planted = (header & !0x00ff_0000_0000_0000) | (2_u64 << 48);
+        bytes[base_off as usize..base_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let (_, other, cs_sz) = view.obj_header(base_off).expect("planted header");
+        assert_eq!((other, cs_sz), (2, 32), "the plant landed as intended");
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a ConstantVal with the wrong arity must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ConstantVal arity",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// And the size law added beside it, which had no counterpart before.
+    #[test]
+    fn a_constant_val_whose_size_contradicts_its_layout_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        // Arity left correct, so only the size law can object.
+        let header = view.read_u64(base_off).expect("header word");
+        let planted = (header & !0x0000_ffff_0000_0000) | (40_u64 << 32);
+        bytes[base_off as usize..base_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let (_, other, cs_sz) = view.obj_header(base_off).expect("planted header");
+        assert_eq!((other, cs_sz), (3, 40), "arity untouched, size wrong");
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a ConstantVal whose size contradicts its layout must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ConstantVal object size disagrees with its three-pointer layout",
+                    ..
+                }
+            ),
+            "{error:?}"
         );
     }
 
