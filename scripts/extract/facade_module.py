@@ -1151,6 +1151,74 @@ def main():
     # A projection the structural block generates IS in the facade; counting only
     # the lines this emitter wrote would understate coverage by every field.
     emitted = emitted + [p for p in sorted(provided) if p in decl]
+
+    # THE MANIFEST MUST NOT CLAIM AN EMISSION IT CANNOT SHOW. Until now `emitted`
+    # was BOOKKEEPING — "this name is not in the quarantine dict" — and every
+    # downstream consumer joins on it. Bookkeeping has been wrong in both
+    # directions here: `Lean.ImportM.Context.casesOn` was recorded unemitted while
+    # it resolved perfectly well (a structural block generates it), and
+    # `Lean.MetavarContext._sizeOf_inst` was recorded as served by Init while Init
+    # does not have it and the name was absent. STRUCTURE_COMPANIONS is likewise a
+    # CLAIM about the pin's elaborator, and the rig that used to catch such drift
+    # from the outside cannot run against a facade with no quarantined demand left.
+    #
+    # So the emitter now asks the pin directly: append a `#check` for every name the
+    # manifest is about to call emitted, to the module TEXT itself — no import and
+    # no olean, because a name declared earlier in the same file is already in
+    # scope — and require every one of them to resolve.
+    claimed = sorted({n for n in emitted
+                      if n not in quarantine and decl[n]["decl_name"]})
+    verify_lines = list(text.rstrip("\n").split("\n"))
+    verify_lines.append("")
+    verify_lines.append("-- EMISSION VERIFICATION (not part of the artifact): every "
+                        "name the manifest calls emitted must resolve here.")
+    verify_map = {}
+    for name in claimed:
+        verify_lines.append(f"#check @{decl[name]['decl_name']}")
+        verify_map[len(verify_lines)] = name
+    verify_path = args.out + ".verify.lean"
+    with open(verify_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(verify_lines) + "\n")
+    proc = subprocess.run([lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false",
+                           verify_path],
+                          capture_output=True, text=True, env=env, timeout=1800)
+    vout = proc.stdout + proc.stderr
+    unresolved_claims = {}
+    base = os.path.basename(verify_path)
+    for m in re.finditer(rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                         vout):
+        name = verify_map.get(int(m.group(1)))
+        if name is not None:
+            unresolved_claims[name] = ((m.group(2) or "-") + ": " + m.group(3))[:200]
+    os.remove(verify_path)
+    if not claimed:
+        raise SystemExit("REFUSE: nothing was claimed emitted, so the emission "
+                         "verification would pass vacuously")
+    # A claim the pin cannot resolve is WITHDRAWN, not argued with. Refusing the
+    # whole artifact over it would block a 1554-row facade for a handful of rows;
+    # keeping the claim would ship a manifest that lies to every downstream join.
+    # The row moves to the quarantine carrying the pin's own message, so the
+    # disposition stays total and the reason is attributable.
+    #
+    # Measured on the first run of this check: 13 such rows, in two families.
+    # Field projections whose name is a Lean KEYWORD (`Lean.Lsp.Range.end`,
+    # `Lean.OLeanEntries.private`) — the structural block declares the field as
+    # «end», and the projection it generates cannot be named back. And
+    # `_private.…` constructors, which are declared under a spelling Lean does not
+    # resolve at all. Both were being counted as coverage.
+    for name, why in unresolved_claims.items():
+        quarantine[name] = ("claimed emitted but the pin cannot resolve it in the "
+                            "generated module -- " + why)
+        decl[name]["emission_withdrawn"] = True
+    if unresolved_claims:
+        # `emitted` is final at this point — provided names included — so a
+        # withdrawn row cannot survive in it. Pruning before the fold (the first
+        # version of this check) let a withdrawn constructor be re-added by the
+        # very next line, leaving a row both emitted and withdrawn.
+        emitted = [n for n in emitted if n not in unresolved_claims]
+    emission_verified = len(claimed) - len(unresolved_claims)
+    emission_withdrawn = len(unresolved_claims)
+
     uncensused = sorted(
         name for name, row in decl.items() if row["role"] == "uncensused-closure"
     )
@@ -1242,6 +1310,10 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "emission_verified": emission_verified,
+        "emission_withdrawn": emission_withdrawn,
+        "emission_verification": "every name the manifest calls emitted was "
+            "resolved by the pin in the generated module itself",
         "cycle_residue": len(cycle_residue),
         "attempts": attempts,
         "imports_reference": False,
@@ -1267,6 +1339,7 @@ def main():
             "transparent_refused_reason": transparent_refused.get(name),
             "emitted": name not in quarantine,
             "quarantine_reason": quarantine.get(name),
+            "emission_withdrawn": bool(decl[name].get("emission_withdrawn")),
             "demanded_outcome": demanded_outcomes.get(name),
             "printer": ("pp.maxexplicit" if name in maxexp_for
                         else "pp.explicit" if name in explicit_for else "pp.fullNames"),
@@ -1300,6 +1373,7 @@ def main():
           f"attrs_dropped={len(dropped_attrs)} quarantined={len(quarantine)} "
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
+          f"verified={emission_verified} withdrawn={emission_withdrawn} "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
 
