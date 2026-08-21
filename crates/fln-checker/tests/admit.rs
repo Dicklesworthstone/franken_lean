@@ -1085,6 +1085,246 @@ fn init_pempty_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// `Init.Or` is proposition-only, so its recursor has no universe parameters
+/// and each branch carries exactly the proposition it introduces.
+fn init_or_entries() -> Vec<ConstantEntry> {
+    let or_name = checker_name("Or");
+    let inl = checker_qualified(&["Or", "inl"]);
+    let inr = checker_qualified(&["Or", "inr"]);
+    let rec = checker_qualified(&["Or", "rec"]);
+    let proposition = || Expr::sort(Level::zero());
+    let or_expr = |left: Expr, right: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(primary_name("Or"), Vec::new()), left),
+            right,
+        )
+    };
+    let inl_expr = |left: Expr, right: Expr, proof: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["Or", "inl"]), Vec::new()),
+                    left,
+                ),
+                right,
+            ),
+            proof,
+        )
+    };
+    let inr_expr = |left: Expr, right: Expr, proof: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["Or", "inr"]), Vec::new()),
+                    left,
+                ),
+                right,
+            ),
+            proof,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            or_expr(bv(1), bv(0)),
+            proposition(),
+        )
+    };
+    let inl_minor_type = || {
+        primary_pi(
+            "h",
+            BinderInfo::Default,
+            bv(2),
+            Expr::app(bv(1), inl_expr(bv(3), bv(2), bv(0))),
+        )
+    };
+    let inr_minor_type = || {
+        primary_pi(
+            "h",
+            BinderInfo::Default,
+            bv(2),
+            Expr::app(bv(2), inr_expr(bv(4), bv(3), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "a",
+        BinderInfo::Implicit,
+        proposition(),
+        primary_pi(
+            "b",
+            BinderInfo::Implicit,
+            proposition(),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive_type(),
+                primary_pi(
+                    "inl",
+                    BinderInfo::Default,
+                    inl_minor_type(),
+                    primary_pi(
+                        "inr",
+                        BinderInfo::Default,
+                        inr_minor_type(),
+                        primary_pi(
+                            "t",
+                            BinderInfo::Default,
+                            or_expr(bv(4), bv(3)),
+                            Expr::app(bv(2), bv(0)),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+    let inl_rule_rhs = Expr::lam(
+        primary_name("a"),
+        proposition(),
+        Expr::lam(
+            primary_name("b"),
+            proposition(),
+            Expr::lam(
+                primary_name("motive"),
+                motive_type(),
+                Expr::lam(
+                    primary_name("inl"),
+                    inl_minor_type(),
+                    Expr::lam(
+                        primary_name("inr"),
+                        inr_minor_type(),
+                        Expr::lam(
+                            primary_name("h"),
+                            bv(4),
+                            Expr::app(bv(2), bv(0)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let inr_rule_rhs = Expr::lam(
+        primary_name("a"),
+        proposition(),
+        Expr::lam(
+            primary_name("b"),
+            proposition(),
+            Expr::lam(
+                primary_name("motive"),
+                motive_type(),
+                Expr::lam(
+                    primary_name("inl"),
+                    inl_minor_type(),
+                    Expr::lam(
+                        primary_name("inr"),
+                        inr_minor_type(),
+                        Expr::lam(
+                            primary_name("h"),
+                            bv(3),
+                            Expr::app(bv(1), bv(0)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            or_name.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&primary_pi(
+                    "a",
+                    BinderInfo::Default,
+                    proposition(),
+                    primary_pi("b", BinderInfo::Default, proposition(), proposition()),
+                )),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    0,
+                    vec![or_name.clone()],
+                    vec![inl.clone(), inr.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            inl.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&primary_pi(
+                    "a",
+                    BinderInfo::Default,
+                    proposition(),
+                    primary_pi(
+                        "b",
+                        BinderInfo::Default,
+                        proposition(),
+                        primary_pi("h", BinderInfo::Default, bv(1), or_expr(bv(2), bv(1))),
+                    ),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(or_name.clone(), 0, 2, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            inr.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&primary_pi(
+                    "a",
+                    BinderInfo::Default,
+                    proposition(),
+                    primary_pi(
+                        "b",
+                        BinderInfo::Default,
+                        proposition(),
+                        primary_pi("h", BinderInfo::Default, bv(0), or_expr(bv(2), bv(1))),
+                    ),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(or_name.clone(), 1, 2, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                Vec::new(),
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![or_name],
+                    2,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(inl, 1, decoded(&inl_rule_rhs)),
+                        RecursorRule::new(inr, 1, decoded(&inr_rule_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
@@ -1304,6 +1544,66 @@ fn kr600_803_init_pempty_refuses_a_forged_recursor_rule() {
                     0,
                     decoded(&Expr::bvar(0).expect("packs")),
                 )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
+fn kr600_803_init_or_proposition_branches_are_reconstructed() {
+    let entries = init_or_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.Or block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 4);
+}
+
+#[test]
+fn kr600_803_init_or_refuses_a_forged_inr_iota_rule() {
+    let mut entries = init_or_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Or", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![
+                    metadata.rules()[0].clone(),
+                    RecursorRule::new(
+                        checker_qualified(&["Or", "inr"]),
+                        1,
+                        decoded(&Expr::bvar(0).expect("packs")),
+                    ),
+                ],
                 metadata.k(),
             ),
         ),
