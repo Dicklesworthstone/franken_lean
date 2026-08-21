@@ -146,6 +146,10 @@ the toolchain would report a perfect facade:
     partition counts plus toolchain API demand to reconstruct the measured
     distinct-constant universe at the pinned Reference epoch.
 
+  * A DECLARATION-BODY JOIN requires the exact-demand artifact's measured
+    declaration count and opaque/theorem body-unavailability census to be
+    well-formed and bounded at the pinned Reference epoch.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -235,6 +239,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
     uncovered = None
     demand_counts = None
     distinct_used_constants = None
+    declared_decls = None
+    unavailable_bodies = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -256,6 +262,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
                 uncovered = row.get("uncovered")
                 demand_counts = row.get("counts")
                 distinct_used_constants = row.get("distinct_used_constants")
+                declared_decls = row.get("decls")
+                unavailable_bodies = row.get("decl_bodies_unavailable")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -335,6 +343,18 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
             f"toolchain_api={declared_toolchain_api_demand!r}, "
             f"distinct_used_constants={distinct_used_constants!r})"
         )
+    if (not isinstance(declared_decls, int) or isinstance(declared_decls, bool)
+            or declared_decls < 0
+            or not isinstance(unavailable_bodies, dict)
+            or set(unavailable_bodies) != {"opaque", "thm"}
+            or any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+                   for count in unavailable_bodies.values())
+            or sum(unavailable_bodies.values()) > declared_decls):
+        raise SystemExit(
+            "REFUSE: exact-demand declaration-body join disagrees with the "
+            f"Reference summary (decls={declared_decls!r}, "
+            f"decl_bodies_unavailable={unavailable_bodies!r})"
+        )
     if uncensused:
         raise SystemExit(
             "REFUSE: exact-demand census-partition join found uncensused symbols "
@@ -381,6 +401,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
         "covered_by_stubs": covered_by_stubs,
         "uncovered": uncovered,
         "distinct_used_constants": distinct_used_constants,
+        "decls": declared_decls,
+        "decl_bodies_unavailable": dict(sorted(unavailable_bodies.items())),
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
