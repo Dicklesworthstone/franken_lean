@@ -76,6 +76,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "loop",
         "eq_def",
     ]);
+    let private_insert_idx_loop_unary_residual = fln::Name::from_components([
+        "_private",
+        "Init",
+        "Prelude",
+        "0",
+        "Lean",
+        "Syntax",
+        "insertIdx",
+        "loop",
+        "_unary",
+    ]);
     let private_eq_n_residual = fln::Name::from_components([
         "_private",
         "CliPrivateReport",
@@ -162,6 +173,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
     private_constants.push(axiom(
+        private_insert_idx_loop_unary_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
         private_eq_n_residual,
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
@@ -233,9 +248,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":13"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":14"));
     assert!(json.stdout.contains(
-        "\"decodedPrivateLoopAuxiliaries\":{\"observed\":6,"
+        "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
     ));
     assert!(json.stdout.contains(
         "\"coreObservablesLoopResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -265,6 +280,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateLoopEqDefResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
+        "\"privateInsertIdxLoopUnaryResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
         "\"coreObservablesLoopUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains("\"g1Satisfied\":false"));
@@ -275,10 +293,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 13 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 14 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
-        "decoded _private.loop auxiliaries: 6 (reporting only; not a G1 claim)"
+        "decoded _private.loop auxiliaries: 7 (reporting only; not a G1 claim)"
     ));
     assert!(human
         .stdout
@@ -367,6 +385,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private .loop.eq_def residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private insertIdx.loop._unary residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private insertIdx.loop._unary residual names: _private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private insertIdx.loop._unary residual names omitted: 0"));
     assert!(human.stdout.contains(
         "core-observables Lean.Syntax .loop._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
     ));

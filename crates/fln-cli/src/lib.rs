@@ -2779,6 +2779,23 @@ fn is_private_loop_eq_def_residual(display: &str) -> bool {
     false
 }
 
+fn is_private_insert_idx_loop_unary_residual(display: &str) -> bool {
+    if !display.starts_with("_private.") {
+        return false;
+    }
+
+    let mut components = display.split('.');
+    while let Some(component) = components.next() {
+        if component == "insertIdx"
+            && components.next() == Some("loop")
+            && components.next() == Some("_unary")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_core_observables_loop_unsafe_rec_residual(display: &str) -> bool {
     CORE_OBSERVABLES_LOOP_UNSAFE_REC_RESIDUAL_PREFIXES
         .iter()
@@ -2887,6 +2904,14 @@ fn render_check_olean_success(
     };
     private_loop_eq_def_residuals
         .observe_matching(&checked.decoded.constants, is_private_loop_eq_def_residual);
+    let mut private_insert_idx_loop_unary_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_insert_idx_loop_unary_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_insert_idx_loop_unary_residual,
+    );
     let mut core_observables_loop_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -2965,6 +2990,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_loop_eq_def_residuals)
     };
+    let private_insert_idx_loop_unary_observed = private_insert_idx_loop_unary_residuals.observed;
+    let private_insert_idx_loop_unary_omitted = private_insert_idx_loop_unary_residuals.omitted();
+    let private_insert_idx_loop_unary_names = if json {
+        render_named_residuals_json(&mut private_insert_idx_loop_unary_residuals)
+    } else {
+        render_named_residuals_human(&mut private_insert_idx_loop_unary_residuals)
+    };
     let core_observables_loop_unsafe_rec_observed =
         core_observables_loop_unsafe_rec_residuals.observed;
     let core_observables_loop_unsafe_rec_omitted =
@@ -2991,6 +3023,7 @@ fn render_check_olean_success(
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
@@ -3032,6 +3065,9 @@ fn render_check_olean_success(
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
+            private_insert_idx_loop_unary_observed,
+            private_insert_idx_loop_unary_names,
+            private_insert_idx_loop_unary_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
@@ -3079,6 +3115,9 @@ fn render_check_olean_success(
                 "decoded _private .loop.eq_def residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.eq_def residual names: {}\n",
                 "decoded _private .loop.eq_def residual names omitted: {}\n",
+                "decoded _private insertIdx.loop._unary residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private insertIdx.loop._unary residual names: {}\n",
+                "decoded _private insertIdx.loop._unary residual names omitted: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: {}\n",
@@ -3123,6 +3162,9 @@ fn render_check_olean_success(
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
+            private_insert_idx_loop_unary_observed,
+            private_insert_idx_loop_unary_names,
+            private_insert_idx_loop_unary_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
@@ -3541,6 +3583,16 @@ fn render_check_olean_set_success(
         private_loop_eq_def_residuals
             .observe_matching(&module.decoded.constants, is_private_loop_eq_def_residual);
     }
+    let mut private_insert_idx_loop_unary_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_insert_idx_loop_unary_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_insert_idx_loop_unary_residual,
+        );
+    }
     let mut core_observables_loop_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3621,6 +3673,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_loop_eq_def_residuals)
     };
+    let private_insert_idx_loop_unary_observed = private_insert_idx_loop_unary_residuals.observed;
+    let private_insert_idx_loop_unary_omitted = private_insert_idx_loop_unary_residuals.omitted();
+    let private_insert_idx_loop_unary_names = if json {
+        render_named_residuals_json(&mut private_insert_idx_loop_unary_residuals)
+    } else {
+        render_named_residuals_human(&mut private_insert_idx_loop_unary_residuals)
+    };
     let core_observables_loop_unsafe_rec_observed =
         core_observables_loop_unsafe_rec_residuals.observed;
     let core_observables_loop_unsafe_rec_omitted =
@@ -3653,6 +3712,7 @@ fn render_check_olean_set_success(
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -3696,6 +3756,9 @@ fn render_check_olean_set_success(
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
+            private_insert_idx_loop_unary_observed,
+            private_insert_idx_loop_unary_names,
+            private_insert_idx_loop_unary_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
@@ -3745,6 +3808,9 @@ fn render_check_olean_set_success(
                 "decoded _private .loop.eq_def residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.eq_def residual names: {}\n",
                 "decoded _private .loop.eq_def residual names omitted: {}\n",
+                "decoded _private insertIdx.loop._unary residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private insertIdx.loop._unary residual names: {}\n",
+                "decoded _private insertIdx.loop._unary residual names omitted: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: {}\n",
@@ -3791,6 +3857,9 @@ fn render_check_olean_set_success(
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
+            private_insert_idx_loop_unary_observed,
+            private_insert_idx_loop_unary_names,
+            private_insert_idx_loop_unary_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
