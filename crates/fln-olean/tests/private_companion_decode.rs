@@ -430,8 +430,8 @@ const ARRAY_MAP_M_MAP_UNSAFE_REC: &str =
 const ARRAY_MAP_M_MAP_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated induction theorem for `Array.mapM.map`.
 const ARRAY_MAP_M_MAP_INDUCT: &str = "_private.Init.Data.Array.Basic.0.Array.mapM.map.induct";
-/// The pin's private array stores this theorem in the basic module.
-const ARRAY_MAP_M_MAP_INDUCT_MODULE: &str = "Init/Data/Array/Basic";
+/// The pin stores this induction theorem in the internal order lemmas module.
+const ARRAY_MAP_M_MAP_INDUCT_MODULE: &str = "Init/Internal/Order/Lemmas";
 /// The private recursion helper generated for `Array.takeWhile`.
 const ARRAY_TAKE_WHILE_GO: &str = "_private.Init.Data.Array.Basic.0.Array.takeWhile.go";
 /// The pin's private array stores this helper in the basic module.
