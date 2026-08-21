@@ -12580,3 +12580,129 @@ fn reducibility_and_safety_leave_four_joint_cells_empty() {
          margins cannot express"
     );
 }
+
+/// Ten of the twelve expression node kinds occur in a stored artifact; `FVar`
+/// and `MVar` never do.
+///
+/// Every walker in this file matches all twelve `ExprNode` variants, and four of
+/// them list `FVar` and `MVar` in a do-nothing arm. Not one asserts that those
+/// arms are unreachable. They are: a free variable is a local-context handle and
+/// a metavariable is an elaboration-time hole, so neither can survive into a
+/// serialised declaration. An artifact carrying one would mean the exporter
+/// leaked elaborator state or the decoder mistook a tag — and today both
+/// failures land in a silent match arm.
+///
+/// WHAT IS PINNED AND WHAT IS DELIBERATELY NOT. The claim is the partition: the
+/// twelve counters reproduce the walked total, and `FVar` and `MVar` are absent
+/// by name. The histogram is NOT pinned, and the reason is worth stating rather
+/// than leaving as a gap. Every other census in this file was measured with an
+/// independent reader before being asserted; I have no independent expression
+/// walker, so any per-kind number here could only come from the decoder this
+/// cell is testing. Asserting those would be circular — the cell would agree
+/// with whatever the decoder did. Conservation and the two zeros do not have
+/// that defect: they are properties no self-consistent decoder satisfies by
+/// accident.
+///
+/// For the same reason the populated set is asserted as a LOWER bound over the
+/// seven kinds another green cell in this file already witnesses on this module,
+/// rather than as the exact ten I expect. `Lit`, `LetE` and `MData` are almost
+/// certainly present, and "almost certainly" is how a wrong universal gets into
+/// a pin; an understated bound cannot redden a correct decode.
+///
+/// The walk covers types, values and recursor rule right-hand sides — the same
+/// surface `declaration_expressions` gives every other cell, which is what makes
+/// the absence claim corpus-wide rather than about types alone.
+///
+/// Conservation first: the per-kind counts must reproduce the number of distinct
+/// nodes visited before any kind is named absent.
+#[test]
+fn stored_expressions_carry_no_free_or_meta_variables() {
+    const CAP: usize = 5_000_000;
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<&Expr> = Vec::new();
+    for info in &infos {
+        stack.extend(declaration_expressions(info));
+    }
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.allocation_identity()) {
+            continue;
+        }
+        assert!(
+            seen.len() < CAP,
+            "node walk exceeded {CAP} distinct nodes; raise the cap rather than pinning a \
+             truncated census"
+        );
+        let kind = match current.node() {
+            ExprNode::BVar { .. } => "BVar",
+            ExprNode::FVar { .. } => "FVar",
+            ExprNode::MVar { .. } => "MVar",
+            ExprNode::Sort { .. } => "Sort",
+            ExprNode::Const { .. } => "Const",
+            ExprNode::Lit { .. } => "Lit",
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+                "App"
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+                "Lam"
+            }
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+                "ForallE"
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+                "LetE"
+            }
+            ExprNode::MData { expr, .. } => {
+                stack.push(expr);
+                "MData"
+            }
+            ExprNode::Proj { expr, .. } => {
+                stack.push(expr);
+                "Proj"
+            }
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+
+    // Conservation first: every visited node landed in exactly one bucket.
+    assert_eq!(
+        counts.values().sum::<usize>(),
+        seen.len(),
+        "the per-kind counts must account for every distinct node visited"
+    );
+
+    // A decode returning nothing would pass the absence claim vacuously, so the
+    // kinds that must be present are named. These seven are exactly the ones
+    // another green cell in this file already witnesses on this module; `Lit`,
+    // `LetE` and `MData` are left unasserted rather than guessed.
+    let populated: BTreeSet<&str> = counts.keys().copied().collect();
+    for kind in ["App", "BVar", "Const", "ForallE", "Lam", "Proj", "Sort"] {
+        assert!(
+            populated.contains(kind),
+            "{kind} must occur in the stored artifact; populated kinds are {populated:?}"
+        );
+    }
+    assert!(
+        !counts.contains_key("FVar") && !counts.contains_key("MVar"),
+        "a stored declaration cannot carry a local-context handle or an elaboration hole; \
+         every walker in this file silently accepts one today"
+    );
+}
