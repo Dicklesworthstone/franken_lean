@@ -178,6 +178,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stdout.contains(
         "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
+    assert!(json.stdout.contains(
+        "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
     assert!(json.stdout.contains("\"g1Satisfied\":false"));
 
     let human = fln_cli::run([OsString::from("check-olean"), exported.into_os_string()]);
@@ -233,5 +236,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private .loop._proof_* residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private .loop.match_1 residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private .loop.match_1 residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private .loop.match_1 residual names omitted: 0"));
     assert!(human.stdout.contains("G1 satisfied: no"));
 }
