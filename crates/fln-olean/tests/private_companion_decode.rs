@@ -130,6 +130,12 @@ const TAIL_POS_LOOP_UNSAFE_REC: &str =
     "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec";
 /// Its companion-only equation-compiler dependency.
 const TAIL_POS_LOOP_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1";
+/// Private proof helpers required by the exported `Lean.Name` hash/number
+/// overrides in the pinned Prelude artifact.
+const NAME_HASH_PROOF_AUXILIARIES: [&str; 2] = [
+    "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+    "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+];
 /// The two tail-recursive merge-sort implementation helpers in the pinned
 /// `Init.Data.List.Sort.Impl` companion delta.
 /// `mergeSortTR₂` helpers that are `_private.`-mangled AND declared by the
@@ -404,6 +410,50 @@ fn prelude_tail_pos_exported_mangled_unsafe_rec_requires_its_private_match_compa
         "companion recovery decoded {TAIL_POS_LOOP_MATCH_1} only as {} instead of a concrete declaration",
         recovered.kind_name()
     );
+}
+
+#[test]
+fn prelude_name_hash_proof_auxiliaries_recover_with_concrete_kinds() {
+    let lib = lib_or_skip!("prelude_name_hash_proof_auxiliaries_recover_with_concrete_kinds");
+    let chain = chain_bytes(&lib, "Init/Prelude");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let private_constants = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode");
+
+    for name in NAME_HASH_PROOF_AUXILIARIES {
+        assert!(
+            !exported_names.contains(&name.to_owned()),
+            "the exported Prelude part must omit the private proof helper {name}"
+        );
+        assert!(
+            private_names.contains(&name.to_owned()),
+            "the Prelude private companion must restore the proof helper {name}"
+        );
+        assert!(
+            exported_constants
+                .iter()
+                .all(|info| info.name().to_display_string() != name),
+            "exported decoder unexpectedly recovered {name}"
+        );
+        let recovered = private_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("private decoder lost {name}"));
+        assert!(
+            is_concrete_recovery(recovered),
+            "private companion decoded {name} only as {} instead of a concrete declaration",
+            recovered.kind_name()
+        );
+    }
 }
 
 #[test]
