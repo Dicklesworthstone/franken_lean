@@ -2399,3 +2399,97 @@ fn level_parameters_are_declared_distinct_and_all_of_them_are_used() {
          the pin declares universes it never mentions"
     );
 }
+
+/// The axioms `Init/Prelude` retains, split by the `is_unsafe` byte.
+///
+/// This is the one decoded field in the file with an INDEPENDENT source of
+/// truth: each of these is declared in `vendor/lean4-src/src/Init/Prelude.lean`,
+/// and the keyword there says which. `unsafe axiom` for the compiler
+/// primitives, plain `axiom` for the two real ones — `Classical.choice` at the
+/// bottom of the `Nonempty` section and `sorryAx` beside the `sorry` support.
+/// Every other cell here checks the artifact against itself; this one checks it
+/// against the source the artifact was built from.
+///
+/// Hand-listed rather than derived from the `.lean` text, deliberately. The
+/// declarations are inconsistently qualified — `unsafe axiom Quot.lcInv` and
+/// `axiom Classical.choice` are written out in full while `lcProof` and
+/// `isScalarObj` are namespace-relative — so a text rule would need exactly the
+/// name-shape reasoning that has silently under-covered three times in this
+/// file. Ten names read at their declaration sites is the safer form, and the
+/// split is what makes it non-vacuous: an all-false decode fails on the eight,
+/// an all-true decode fails on the two.
+const UNSAFE_PRELUDE_AXIOMS: &[&str] = &[
+    "Quot.lcInv",
+    "isScalarObj",
+    "lcAny",
+    "lcCast",
+    "lcErased",
+    "lcProof",
+    "lcUnreachable",
+    "lcVoid",
+];
+const SAFE_PRELUDE_AXIOMS: &[&str] = &["Classical.choice", "sorryAx"];
+
+/// `is_unsafe` on axioms and opaques — the last stored fields nothing reads.
+///
+/// KR-973 refuses a safe context that references an unsafe declaration, so this
+/// byte decides whether a whole class of references is admissible. A decode that
+/// cleared it would make the compiler primitives look like ordinary axioms and
+/// quietly widen what a safe declaration may mention; a decode that set it would
+/// make `Classical.choice` unusable from safe code.
+///
+/// Measured over `Init/Prelude` at private level: 10 axioms, 8 unsafe and 2
+/// safe, matching the vendored declarations; and 14 opaques, of which 2 are
+/// unsafe.
+#[test]
+fn the_unsafe_byte_on_axioms_and_opaques_matches_the_vendored_declarations() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut unsafe_axioms: Vec<String> = Vec::new();
+    let mut safe_axioms: Vec<String> = Vec::new();
+    let mut opaques = 0usize;
+    let mut unsafe_opaques = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Axiom(v) => {
+                if v.is_unsafe {
+                    unsafe_axioms.push(name);
+                } else {
+                    safe_axioms.push(name);
+                }
+            }
+            ConstantInfo::Opaque(v) => {
+                opaques += 1;
+                if v.is_unsafe {
+                    unsafe_opaques += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Sorted: collected in the module's constant order, but the table is the
+    // claim rather than the order.
+    unsafe_axioms.sort();
+    safe_axioms.sort();
+    assert_eq!(
+        unsafe_axioms, UNSAFE_PRELUDE_AXIOMS,
+        "the compiler primitives are `unsafe axiom` in the vendored source; a decode that \
+         cleared this byte would let safe declarations reference them"
+    );
+    assert_eq!(
+        safe_axioms, SAFE_PRELUDE_AXIOMS,
+        "`Classical.choice` and `sorryAx` are plain `axiom` in the vendored source; a decode \
+         that set this byte would make them unusable from safe code"
+    );
+
+    // The opaque half. Both populations are required to be real for the same
+    // reason as above: a uniform byte satisfies one side and fails the other
+    // only if the other side exists.
+    assert!(
+        opaques >= 10 && unsafe_opaques >= 1 && unsafe_opaques < opaques,
+        "the pin carries both safe and unsafe opaques ({unsafe_opaques} unsafe of {opaques})"
+    );
+}
