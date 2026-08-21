@@ -2260,6 +2260,30 @@ def main():
             "REFUSE: facade manifest emitted-demand count must exceed demanded "
             f"Init-substrate count ({json.dumps(emitted_demand_init_substrate_inequality_join, sort_keys=True)})"
         )
+    declaration_projection_inequality_join = {
+        "summary_declarations_emitted": manifest_summary.get(
+            "declarations_emitted"
+        ),
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+    }
+    if (not isinstance(declaration_projection_inequality_join[
+            "summary_declarations_emitted"], int)
+            or isinstance(declaration_projection_inequality_join[
+                "summary_declarations_emitted"], bool)
+            or not isinstance(declaration_projection_inequality_join[
+                "summary_projection_types_checked"], int)
+            or isinstance(declaration_projection_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or declaration_projection_inequality_join[
+                "summary_declarations_emitted"]
+            <= declaration_projection_inequality_join[
+                "summary_projection_types_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest declaration count must exceed projection "
+            f"type count ({json.dumps(declaration_projection_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4230,6 +4254,9 @@ def main():
         ),
         "manifest_emitted_demand_init_substrate_inequality_join": (
             emitted_demand_init_substrate_inequality_join
+        ),
+        "manifest_declaration_projection_inequality_join": (
+            declaration_projection_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
