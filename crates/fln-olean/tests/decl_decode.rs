@@ -11721,6 +11721,206 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The 8-byte tail is not a name hash - it belongs to seven tags.
+///
+/// `b4194cb0` counted the scalar tails and found three widths. The 8-byte one
+/// is the width a name link uses for its `Name.hash`, and the obvious next
+/// question is what is stored there across the corpus. The obvious answer is
+/// wrong.
+///
+/// SEVEN TAGS USE IT. Prelude has 35,349 arity-2 constructors with an 8-byte
+/// tail, spread across tags 0, 1, 2, 3, 4, 5 and 10. Name links - selected by
+/// CONTENT, a tag-1 object whose second slot points at a string, or a tag-2
+/// object whose second slot is a boxed scalar - account for 4,804 plus 1,826,
+/// which is 6,630 of the 35,349. Reading that word as a hash would be wrong for
+/// 81% of the objects that have one; most of them are tag 5, which this file
+/// has measured at 26,179.
+///
+/// I NEARLY WROTE THE WRONG VERSION. My first pass selected every arity-2
+/// constructor with an 8-byte tail and called the population "hash words",
+/// which would have reported 35,349 hashes and a collision census over a field
+/// that is not a hash in four fifths of them. Selecting by shape and describing
+/// by type is the error this whole bead exists to document, and it survived
+/// until the tag histogram made it visible.
+///
+/// WHAT THE HASHES DO. Among the 6,630 real name links, every stored word is
+/// DISTINCT - 4,804 distinct among the string links and 1,826 among the numeric
+/// ones - and none is zero. A 64-bit hash over 6,630 names colliding nowhere is
+/// unsurprising but not guaranteed, and the injectivity is what a decoder
+/// relying on the stored hash as an identity would need.
+///
+/// AND THE GAP CORROBORATES `e0dd56f8` FROM THE OTHER SIDE. Selecting tag-2
+/// 8-byte-tail objects by SHAPE gives 1,874; selecting by CONTENT gives 1,826.
+/// The 48 that differ are exactly the pointer-holding `(2, 2, 32)` population
+/// that cell measured, and `Init.SizeOfLemmas.olean` shows the same thing at
+/// its own scale, 6 against 5. Two routes to one number, arrived at by
+/// different predicates - unlike `b4194cb0`'s fourteen shapes, which agreed
+/// with `49e423e7` by arithmetic and were not corroboration at all.
+///
+/// POPULATION SCOPE: all four modules, constructor objects only, each asserted
+/// by name.
+#[test]
+fn the_eight_byte_tail_is_not_a_name_hash() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut hashes: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+    let mut gaps: Vec<(String, usize, usize)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut tags: BTreeSet<u8> = BTreeSet::new();
+        let mut broad = 0usize;
+        let mut shaped_numeric = 0usize;
+        let mut string_links: Vec<u64> = Vec::new();
+        let mut numeric_links: Vec<u64> = Vec::new();
+
+        for object in &objects {
+            if object.tag > abi::TAG_MAX_CTOR_TAG || object.other != 2 {
+                continue;
+            }
+            // An 8-byte scalar tail, by the arithmetic `b4194cb0` uses.
+            if usize::from(object.cs_sz) - (8 + 8 * 2) != 8 {
+                continue;
+            }
+            broad += 1;
+            tags.insert(object.tag);
+            let second = word_at(bytes, object.off + 16);
+            let tail = word_at(bytes, object.off + 24);
+            if object.tag == 2 {
+                shaped_numeric += 1;
+            }
+            // Selected by CONTENT, not by shape.
+            if object.tag == 1
+                && resolve(second)
+                    .and_then(|off| at.get(&off))
+                    .is_some_and(|target| target.tag == abi::TAG_STRING)
+            {
+                string_links.push(tail);
+            } else if object.tag == 2 && second & 1 == 1 {
+                numeric_links.push(tail);
+            }
+        }
+
+        let distinct_string: BTreeSet<u64> = string_links.iter().copied().collect();
+        let distinct_numeric: BTreeSet<u64> = numeric_links.iter().copied().collect();
+        rows.push((
+            module.clone(),
+            broad,
+            tags.len(),
+            string_links.len(),
+            numeric_links.len(),
+            string_links.len() + numeric_links.len(),
+        ));
+        hashes.push((
+            module.clone(),
+            distinct_string.len(),
+            distinct_numeric.len(),
+            string_links.iter().filter(|word| **word == 0).count(),
+            numeric_links.iter().filter(|word| **word == 0).count(),
+        ));
+        gaps.push((module.clone(), shaped_numeric, numeric_links.len()));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize, usize, usize)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c, d, e)| (m.to_owned(), a, b, c, d, e))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep(vec![
+            ("Init.olean", 54, 2, 53, 1, 54),
+            ("Init.BinderNameHint.olean", 84, 5, 48, 9, 57),
+            ("Init.SizeOfLemmas.olean", 399, 4, 122, 5, 127),
+            ("Init/Prelude.olean", 35349, 7, 4804, 1826, 6630),
+        ]),
+        "per module: arity-2 constructors with an 8-byte scalar tail, the \
+         distinct TAGS they span, then the string and numeric name links \
+         selected BY CONTENT and their total. Prelude spreads that tail across \
+         SEVEN tags and only 6,630 of 35,349 are name links, so reading the \
+         word as a hash would be wrong for four fifths of the objects that have \
+         one"
+    );
+
+    assert_eq!(
+        hashes
+            .iter()
+            .map(|(m, a, b, c, d)| (m.as_str(), *a, *b, *c, *d))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 53, 1, 0, 0),
+            ("Init.BinderNameHint.olean", 48, 9, 0, 0),
+            ("Init.SizeOfLemmas.olean", 122, 5, 0, 0),
+            ("Init/Prelude.olean", 4804, 1826, 0, 0),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "distinct stored words among the string links and among the numeric \
+         ones, then how many of each are zero. Every count matches its \
+         population in the row above, so no two name links in any module share \
+         a stored hash, and none is zero"
+    );
+    for ((_, _, _, strings, numerics, _), (module, distinct_s, distinct_n, ..)) in
+        rows.iter().zip(&hashes)
+    {
+        assert_eq!(
+            (*distinct_s, *distinct_n),
+            (*strings, *numerics),
+            "{module}: distinct stored hashes must equal the link count, or \
+             two names collide"
+        );
+    }
+
+    assert_eq!(
+        gaps.iter()
+            .map(|(m, shaped, content)| (m.as_str(), *shaped, *content, shaped - content))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 1, 1, 0),
+            ("Init.BinderNameHint.olean", 9, 9, 0),
+            ("Init.SizeOfLemmas.olean", 6, 5, 1),
+            ("Init/Prelude.olean", 1874, 1826, 48),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "tag-2 8-byte-tail objects selected by SHAPE, then by CONTENT, then the \
+         gap. The 48 in Prelude and the 1 in `Init.SizeOfLemmas.olean` are \
+         exactly the pointer-holding `(2, 2, 32)` objects `e0dd56f8` measured - \
+         two routes to one number by different predicates, which is what \
+         `b4194cb0`'s agreement with `49e423e7` was NOT, being arithmetic"
+    );
+}
+
 /// Every constructor's scalar tail is 0, 8 or 16 bytes - nothing else.
 ///
 /// An earlier cell derived the scalar-area arithmetic for CONS CELLS -
