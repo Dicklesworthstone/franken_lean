@@ -478,6 +478,11 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "names",
     );
     let decoded_private_loop_name_count = json_array_len(decoded_private_loop_names);
+    assert_eq!(
+        decoded_private_loop_observed > 0,
+        decoded_private_loop_name_count > 0,
+        "{json}",
+    );
     let decoded_private_loop_name_strings =
         json_non_empty_name_strings(decoded_private_loop_names);
     assert!(
