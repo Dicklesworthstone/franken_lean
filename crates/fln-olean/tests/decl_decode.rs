@@ -11721,6 +11721,178 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The five roots, counted from both ends - and no object belongs to all of them.
+///
+/// `ModuleData`'s five array slots are a stored relation this file has used
+/// constantly - `1dd7c288`, `6dff26ff`, `03f23abe` all ask "which roots reach
+/// this?" - and never counted as a whole. This does, from both ends.
+///
+/// THE CONSERVATION IS A DOUBLE COUNT AND IS LABELLED AS ONE. Summing the five
+/// reachable-set sizes and summing each object's root count give the same
+/// number because they are the same sum taken in two orders. It is asserted to
+/// catch a tally that lost or doubled entries, not as a discovery, and the
+/// comment says so - `f4d108f7` made the same admission about edges and the
+/// habit is worth keeping.
+///
+/// THE PARTITION IS THE CONTENT. Every object is reached from exactly k of the
+/// five roots, k in 0..=5, and the six classes sum to the module's object
+/// count. Two of the six are the same in all four modules:
+///
+///   k = 0   exactly ONE object - the `ModuleData` root itself
+///   k = 5   ZERO objects - nothing is reached from all five roots
+///
+/// The k=0 result agrees with `f4d108f7`, which got it from in-degree rather
+/// than from root reachability. Two different computations, same object; that
+/// is corroboration and not a repeat, and it is worth having because a walk
+/// that quietly dropped a root would break one and not the other.
+///
+/// THE ROOTS ARE LARGELY DISJOINT: 82,176 of Prelude's 88,880 objects - 92% -
+/// are reached from exactly one root. Sharing exists but is the exception, and
+/// it never spans the whole set.
+///
+/// AND THE PER-ROOT SIZES ARE NOT COMPARABLE ACROSS MODULES, which is why they
+/// are pinned per module rather than pooled. Prelude's `imports` reaches ONE
+/// object while its `constants` reaches 65,118; `Init.olean`'s `imports`
+/// reaches 130 of its 158 while its `constNames`, `constants` and
+/// `extraConstNames` reach one apiece - the single interned empty array of
+/// `03f23abe`, which is all three of those roots in a module that declares
+/// nothing.
+///
+/// POPULATION SCOPE: all four modules, each asserted by name; every count is
+/// per module.
+#[test]
+fn the_five_roots_partition_the_walk() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut conserved: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut per_root: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut buckets: Vec<(String, Vec<usize>)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+
+        // Five independent walks, one per stored root slot.
+        let reached: Vec<BTreeSet<usize>> = (0..5)
+            .map(|slot| reachable_from(bytes, base, word_at(bytes, root + 8 + 8 * slot)))
+            .collect();
+
+        // End one: the five set sizes. End two: each object's root count.
+        let from_sets: usize = reached.iter().map(BTreeSet::len).sum();
+        let mut counts: Vec<usize> = vec![0; 6];
+        let mut from_objects = 0usize;
+        for object in &objects {
+            let k = reached
+                .iter()
+                .filter(|set| set.contains(&object.off))
+                .count();
+            counts[k] += 1;
+            from_objects += k;
+        }
+        conserved.push((module.clone(), objects.len(), from_sets, from_objects));
+        per_root.push((module.clone(), reached.iter().map(BTreeSet::len).collect()));
+        buckets.push((module.clone(), counts));
+    }
+
+    let keep4 = |all: Vec<(&str, usize, usize, usize)>| -> Vec<(String, usize, usize, usize)> {
+        all.into_iter()
+            .filter(|(m, _, _, _)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c)| (m.to_owned(), a, b, c))
+            .collect()
+    };
+    let keepv = |all: Vec<(&str, Vec<usize>)>| -> Vec<(String, Vec<usize>)> {
+        all.into_iter()
+            .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, v)| (m.to_owned(), v))
+            .collect()
+    };
+
+    // The double count, asserted for what it is.
+    assert_eq!(
+        conserved,
+        keep4(vec![
+            ("Init.olean", 158, 159, 159),
+            ("Init.BinderNameHint.olean", 267, 311, 311),
+            ("Init.SizeOfLemmas.olean", 795, 913, 913),
+            ("Init/Prelude.olean", 88880, 99240, 99240),
+        ]),
+        "objects, then the same total reached two ways: summing the five \
+         reachable-set sizes, and summing each object's root count. They agree \
+         because they are one sum taken in two orders, so this catches a lost \
+         or doubled tally and is not a discovery"
+    );
+
+    // The partition, which is.
+    assert_eq!(
+        buckets,
+        keepv(vec![
+            ("Init.olean", vec![1, 156, 0, 1, 0, 0]),
+            ("Init.BinderNameHint.olean", vec![1, 227, 35, 2, 2, 0]),
+            ("Init.SizeOfLemmas.olean", vec![1, 725, 21, 46, 2, 0]),
+            ("Init/Prelude.olean", vec![1, 82176, 3696, 2356, 651, 0]),
+        ]),
+        "objects reached from exactly k of the five roots, k = 0..=5"
+    );
+    for ((module, objects, ..), (_, counts)) in conserved.iter().zip(&buckets) {
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            *objects,
+            "{module}: the six classes must account for every object"
+        );
+        assert_eq!(
+            counts[0], 1,
+            "{module}: exactly ONE object is reached from no root - the \
+             `ModuleData` root itself. `f4d108f7` gets the same object from \
+             in-degree instead of root reachability, so the two corroborate \
+             rather than repeat"
+        );
+        assert_eq!(
+            counts[5], 0,
+            "{module}: and NOTHING is reached from all five roots"
+        );
+    }
+
+    // Per root, because the shape of the split is not portable.
+    assert_eq!(
+        per_root,
+        keepv(vec![
+            ("Init.olean", vec![130, 1, 1, 1, 26]),
+            ("Init.BinderNameHint.olean", vec![9, 5, 78, 5, 214]),
+            ("Init.SizeOfLemmas.olean", vec![22, 48, 540, 1, 302]),
+            ("Init/Prelude.olean", vec![1, 3008, 65118, 1117, 29996]),
+        ]),
+        "objects reached from each root, in stored slot order - imports, \
+         constNames, constants, extraConstNames, entries. Prelude's `imports` \
+         reaches ONE object and its `constants` 65,118; `Init.olean`'s \
+         `imports` reaches 130 of its 158 while three of its roots reach one \
+         apiece, that one being the interned empty array of `03f23abe`. Pinned \
+         per module because no pooled figure would mean anything"
+    );
+    for ((module, _, from_sets, _), (_, sizes)) in conserved.iter().zip(&per_root) {
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            *from_sets,
+            "{module}: the five per-root sizes must sum to the cross total"
+        );
+    }
+}
+
 /// The other half - and why `963ab2d0`'s answer does not transfer to it.
 ///
 /// `963ab2d0` closed the array-only half by keying on the holding array, and
