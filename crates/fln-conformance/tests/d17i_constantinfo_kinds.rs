@@ -10110,3 +10110,182 @@ fn nearly_every_structure_field_projects_though_not_always_to_a_definition() {
         );
     }
 }
+
+/// A structure projection is implemented by the primitive `Proj` node, at its
+/// own field index.
+///
+/// Two cells touch these pieces and never meet. The projection cell asks which
+/// projections EXIST and under what kind. The `Proj` cell validates the NODES —
+/// that a `struct_name` resolves to a single-constructor inductive and that
+/// `idx` is below its field count. Neither ties a node to the function that
+/// should contain it, so a projection whose body eliminated through the
+/// recursor instead, or projected the wrong field, satisfies both.
+///
+/// Measured over every field of every single-constructor inductive in
+/// `Init/Prelude`, 145 fields:
+///
+///   all 136 fields whose projection is a definition carry a `Proj` node naming
+///     their own inductive at their own ordinal — zero mismatches, and zero
+///     definitions with no `Proj` node at all
+///   6 project to a theorem and are not required to, since a proof-valued
+///     projection need not reduce
+///   3 have no projection, and were named by the cell above
+///
+/// The index is the field's POSITION in the constructor's binder list, so this
+/// ties the ordering that names a projection to the ordering the kernel reduces
+/// it by. Permuting two fields would leave both names and both `Proj` nodes
+/// individually valid and would break exactly this.
+///
+/// It also matters that the node is a `Proj` and not something equivalent:
+/// projection reduction is its own rule in the kernel, distinct from iota, so a
+/// projection defined through the recursor would typecheck and would not reduce
+/// where the kernel expects a projection to.
+///
+/// The partition is asserted by its SUM FIRST and its parts second. A previous
+/// cell here pinned a decomposition that did not add up to its own total, and
+/// the conservation check that would have named the defect ran after the figure
+/// that failed, so the failure reported the symptom instead.
+#[test]
+fn a_structure_projection_is_the_primitive_proj_at_its_own_index() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let declared = kinds(&infos);
+    let mut values: BTreeMap<String, &Expr> = BTreeMap::new();
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<String>)> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Defn(v) => drop(values.insert(name, &v.value)),
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_name, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_name.to_display_string());
+                    current = body;
+                }
+                drop(constructors.insert(name, (v, binders)));
+            }
+            _ => {}
+        }
+    }
+
+    let projections_of = |root: &Expr| -> BTreeSet<(String, u64)> {
+        let mut out = BTreeSet::new();
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut stack: Vec<&Expr> = vec![root];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.allocation_identity()) {
+                continue;
+            }
+            if let ExprNode::Proj {
+                struct_name, idx, ..
+            } = current.node()
+            {
+                out.insert((struct_name.to_display_string(), *idx));
+            }
+            match current.node() {
+                ExprNode::App { f, a } => {
+                    stack.push(f);
+                    stack.push(a);
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push(binder_type);
+                    stack.push(body);
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push(type_);
+                    stack.push(value);
+                    stack.push(body);
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+                _ => {}
+            }
+        }
+        out
+    };
+
+    let mut matching = 0usize;
+    let mut theorems = 0usize;
+    let mut absent = 0usize;
+    let mut fields = 0usize;
+    let mut indices: BTreeSet<u64> = BTreeSet::new();
+    let mut departures: Vec<(String, u64)> = Vec::new();
+    for (name, induct) in &inductives {
+        if induct.ctors.len() != 1 {
+            continue;
+        }
+        let ctor_name = induct.ctors[0].to_display_string();
+        let Some((ctor, binders)) = constructors.get(&ctor_name) else {
+            continue;
+        };
+        let start = ctor.num_params as usize;
+        for (position, field) in binders[start..start + ctor.num_fields as usize]
+            .iter()
+            .enumerate()
+        {
+            fields += 1;
+            let plain = format!("{name}.{field}");
+            let suffix = format!(".{plain}");
+            let resolved = declared
+                .get_key_value(&plain)
+                .or_else(|| {
+                    declared
+                        .iter()
+                        .find(|(candidate, _)| candidate.ends_with(&suffix))
+                })
+                .map(|(candidate, kind)| (candidate.clone(), *kind));
+            match resolved {
+                None => absent += 1,
+                Some((_, "Thm")) => theorems += 1,
+                Some((candidate, _)) => {
+                    let expected = (name.clone(), position as u64);
+                    let found = values
+                        .get(&candidate)
+                        .map(|value| projections_of(value))
+                        .unwrap_or_default();
+                    if found.contains(&expected) {
+                        matching += 1;
+                        indices.insert(position as u64);
+                    } else {
+                        departures.push((candidate, position as u64));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sum first, so a table that does not conserve says so before anything else.
+    assert_eq!(
+        matching + theorems + absent + departures.len(),
+        fields,
+        "every field must fall into exactly one category"
+    );
+    assert!(
+        departures.is_empty(),
+        "a definition-valued projection must contain a Proj node naming its own inductive at \
+         its own field index: {:?}",
+        &departures[..departures.len().min(8)]
+    );
+    assert_eq!(
+        (fields, matching, theorems, absent),
+        (145, 136, 6, 3),
+        "the field population and how each field is projected"
+    );
+    assert!(
+        indices.len() >= 4,
+        "the index match must be exercised beyond the first field, got {indices:?}"
+    );
+}
