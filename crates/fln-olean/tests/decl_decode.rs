@@ -5185,3 +5185,234 @@ fn the_slot_three_shapes_have_a_mixed_field() {
          fields measured so far and not a law"
     );
 }
+
+/// The arrays inside slot 3 - including an EMPTY one, and a second non-uniform
+/// field.
+///
+/// `6a4dba87` found arrays at slot 2 of the `tag 3` shape and slot 1 of the
+/// `tag 4` shape and measured neither. There are four groups, not two: the
+/// order names nine and twenty-four, which are the interior's, and the seeds
+/// contribute six and eleven.
+///
+/// AN EMPTY ARRAY EXISTS, one in each `tag 3` group, and it is the reason this
+/// cell pins array counts and element counts SEPARATELY rather than reporting a
+/// single population. A length-zero array contributes nothing to an element
+/// histogram, so "the elements of these arrays" has a smaller denominator than
+/// "these arrays" - and a cell that only counted elements would describe a set
+/// that silently excludes one of its members. That is the sampler defect this
+/// file has already hit once, at `c48c0813`, arriving now as an empty container
+/// rather than an unclassifiable object.
+///
+/// ONE ELEMENT IS BOXED where all the others are pointers - the interior's
+/// `tag 3` arrays hold 30 pointers and one boxed zero. That is the SECOND
+/// non-uniform field found here, after slot 1 of the `tag 3` shape at
+/// `6a4dba87`, and it confirms what that cell said: uniformity is a property of
+/// the fields measured so far, not a law of the data.
+///
+/// The elements are two one-field shapes across all four groups. Nothing is
+/// decoded: no production decoder in this crate accepts them, and the order
+/// forbids inventing one.
+///
+/// Both populations are kept apart throughout, and each group is counted by
+/// reference and by object, since sharing differs between them - the seeds'
+/// eleven `tag 4` arrays are ten objects, the interior's twenty-four are
+/// twenty-four.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_slot_three_arrays_include_an_empty_one() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut arrays: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut lengths: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut elements: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut element_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for population in ["seed", "interior"] {
+            let mut carriers: BTreeSet<usize> = BTreeSet::new();
+            for node in &all {
+                if (population == "seed") == seeds.contains(node)
+                    && let Some(record) = resolve(word_at(bytes, node + 8))
+                    && let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 3))
+                {
+                    carriers.insert(target);
+                }
+            }
+            for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                let key = format!("{population}/tag {tag} slot {slot}");
+                let mut references = 0usize;
+                let mut distinct: BTreeSet<usize> = BTreeSet::new();
+                for &carrier in &carriers {
+                    if at.get(&carrier).map(|o| (o.tag, o.other)) != Some((tag, arity)) {
+                        continue;
+                    }
+                    references += 1;
+                    if let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot)) {
+                        distinct.insert(array);
+                    }
+                }
+                let entry = arrays.entry(key.clone()).or_default();
+                entry.0 += references;
+                entry.1 += distinct.len();
+
+                for array in distinct {
+                    let length = word_at(bytes, array + 8);
+                    *lengths.entry(format!("{key}/length {length}")).or_default() += 1;
+                    for i in 0..length {
+                        let word = word_at(bytes, array + 24 + 8 * i as usize);
+                        let counts = elements.entry(key.clone()).or_default();
+                        let described = match resolve(word) {
+                            Some(child) => {
+                                counts.0 += 1;
+                                let child = at.get(&child).expect("resolved above");
+                                format!("tag {} arity {}", child.tag, child.other)
+                            }
+                            None => {
+                                counts.1 += 1;
+                                format!("boxed {}", word >> 1)
+                            }
+                        };
+                        *element_shapes
+                            .entry(format!("{key}/{described}"))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            arrays.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        arrays.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 3 slot 2".to_owned(), (9, 9)),
+            ("interior/tag 4 slot 1".to_owned(), (24, 24)),
+            ("seed/tag 3 slot 2".to_owned(), (6, 4)),
+            ("seed/tag 4 slot 1".to_owned(), (11, 10)),
+        ],
+        "four groups, not two: the order names the interior's nine and \
+         twenty-four, and the seeds contribute six and eleven. By reference and \
+         by object, since sharing differs between them"
+    );
+
+    // Lengths, including the empty ones.
+    assert_eq!(
+        lengths.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 3 slot 2/length 0".to_owned(), 1),
+            ("interior/tag 3 slot 2/length 2".to_owned(), 2),
+            ("interior/tag 3 slot 2/length 3".to_owned(), 1),
+            ("interior/tag 3 slot 2/length 4".to_owned(), 2),
+            ("interior/tag 3 slot 2/length 5".to_owned(), 2),
+            ("interior/tag 3 slot 2/length 6".to_owned(), 1),
+            ("interior/tag 4 slot 1/length 1".to_owned(), 5),
+            ("interior/tag 4 slot 1/length 2".to_owned(), 14),
+            ("interior/tag 4 slot 1/length 3".to_owned(), 4),
+            ("interior/tag 4 slot 1/length 4".to_owned(), 1),
+            ("seed/tag 3 slot 2/length 0".to_owned(), 1),
+            ("seed/tag 3 slot 2/length 2".to_owned(), 3),
+            ("seed/tag 4 slot 1/length 1".to_owned(), 4),
+            ("seed/tag 4 slot 1/length 2".to_owned(), 6),
+        ],
+        "an EMPTY array exists in each `tag 3` group, so `these arrays` and \
+         `the elements of these arrays` have different denominators"
+    );
+
+    // Elements: pointers and scalars, separately from the array counts.
+    assert_eq!(
+        elements.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 3 slot 2".to_owned(), (30, 1)),
+            ("interior/tag 4 slot 1".to_owned(), (49, 0)),
+            ("seed/tag 3 slot 2".to_owned(), (6, 0)),
+            ("seed/tag 4 slot 1".to_owned(), (16, 0)),
+        ],
+        "ONE element is boxed where all the others are pointers - the second \
+         non-uniform field found here, after slot 1 of the `tag 3` shape"
+    );
+    assert_eq!(
+        element_shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 3 slot 2/boxed 0".to_owned(), 1),
+            ("interior/tag 3 slot 2/tag 1 arity 1".to_owned(), 20),
+            ("interior/tag 3 slot 2/tag 2 arity 1".to_owned(), 10),
+            ("interior/tag 4 slot 1/tag 1 arity 1".to_owned(), 35),
+            ("interior/tag 4 slot 1/tag 2 arity 1".to_owned(), 14),
+            ("seed/tag 3 slot 2/tag 1 arity 1".to_owned(), 6),
+            ("seed/tag 4 slot 1/tag 1 arity 1".to_owned(), 15),
+            ("seed/tag 4 slot 1/tag 2 arity 1".to_owned(), 1),
+        ],
+        "the elements are two one-field shapes across all four groups; nothing \
+         is decoded, because no decoder here accepts them"
+    );
+}
