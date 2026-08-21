@@ -2553,11 +2553,23 @@ mod tests {
                     num_indices: 2,
                     num_motives: 3,
                     num_minors: 4,
-                    rules: vec![RecursorRule {
-                        ctor: Name::from_components(["Demo", "ctor"]),
-                        nfields: 5,
-                        rhs: Expr::sort(Level::zero()),
-                    }],
+                    // TWO rules, distinct in BOTH their fields. One rule
+                    // proves the list is reachable but says nothing about
+                    // ORDER, and equal `nfields` would let a swap decode
+                    // identically. See
+                    // `the_recursor_rules_keep_their_arity_and_order`.
+                    rules: vec![
+                        RecursorRule {
+                            ctor: Name::from_components(["Demo", "ctor"]),
+                            nfields: 5,
+                            rhs: Expr::sort(Level::zero()),
+                        },
+                        RecursorRule {
+                            ctor: Name::from_components(["Demo", "ctorAux"]),
+                            nfields: 6,
+                            rhs: Expr::sort(Level::zero()),
+                        },
+                    ],
                     // DIFFERENT on purpose, for the same reason the counts
                     // above are: `k` and `isUnsafe` are two adjacent scalar
                     // BYTES read by index, so equal values would make a swap
@@ -2579,6 +2591,108 @@ mod tests {
         )
         .expect("module encodes")
         .bytes
+    }
+
+    /// The recursor's computation rules keep both their ARITY and their ORDER.
+    ///
+    /// The rule list is what the kernel reduces with: rule `i` says how the
+    /// recursor computes on constructor `i`. Reorder the cells and every rule
+    /// is still a well-formed three-field structure pointing at a well-formed
+    /// name and expression, so the `RecursorRule shape` mutant (587119a8)
+    /// cannot see it - the objects are fine, they are just attached to the
+    /// wrong constructors, and the recursor then computes the wrong thing.
+    ///
+    /// ONE RULE WAS NOT ENOUGH, which is why the fixture grew again. A
+    /// single-element list proves the loop is reachable - that is what the
+    /// shape mutant needed - but a list of one has no order to get wrong. And
+    /// two rules with equal `nfields` would let a swap decode identically, so
+    /// the second rule differs in BOTH its fields.
+    #[test]
+    fn the_recursor_rules_keep_their_arity_and_order() {
+        let bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the recursor fixture decodes");
+
+        let ConstantInfo::Rec(recursor) = constants
+            .iter()
+            .find(|info| matches!(info, ConstantInfo::Rec(_)))
+            .expect("the fixture declares a recursor")
+        else {
+            unreachable!("filtered above")
+        };
+
+        let decoded: Vec<(String, u32)> = recursor
+            .rules
+            .iter()
+            .map(|rule| (rule.ctor.to_display_string(), rule.nfields))
+            .collect();
+        assert_eq!(decoded.len(), 2, "the number of computation rules");
+        assert_eq!(
+            decoded,
+            vec![
+                ("Demo.ctor".to_owned(), 5_u32),
+                ("Demo.ctorAux".to_owned(), 6_u32),
+            ],
+            "in that order, each rule keeping its own ctor and field count"
+        );
+
+        // The guard: with one rule, or two identical ones, a swap would decode
+        // identically and everything above would still pass.
+        assert!(
+            decoded.len() > 1 && decoded[0] != decoded[1],
+            "the fixture must keep at least two DISTINCT rules, or a reversal \
+             would decode identically and this cell would prove nothing: \
+             {decoded:?}"
+        );
+
+        // The same order on the wire, walked from the payload's slot 6.
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("RecursorVal pointer"))
+            .expect("RecursorVal object");
+
+        let mut cursor = view.read_u64(val_off + 8 + 8 * 6).expect("rules slot");
+        let mut on_the_wire = Vec::new();
+        while cursor & 1 == 0 {
+            let cell = view.deref(cursor).expect("cons cell");
+            assert_eq!(
+                view.obj_header(cell).expect("cons header").0,
+                1,
+                "List.cons"
+            );
+            let rule_off = view
+                .deref(view.read_u64(cell + 8).expect("head pointer"))
+                .expect("RecursorRule object");
+            let (rule_tag, rule_other, _) = view.obj_header(rule_off).expect("rule header");
+            assert_eq!(
+                (rule_tag, rule_other),
+                (0, 3),
+                "ctor, nfields and rhs - the shape the rule loop requires"
+            );
+            let ctor = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(view.read_u64(rule_off + 8).expect("ctor pointer"))
+                .expect("rule ctor")
+                .to_display_string();
+            on_the_wire.push(ctor);
+            cursor = view.read_u64(cell + 16).expect("tail pointer");
+        }
+        assert_eq!(cursor >> 1, 0, "the list ends in boxed nil");
+        assert_eq!(
+            on_the_wire,
+            decoded
+                .iter()
+                .map(|(ctor, _)| ctor.clone())
+                .collect::<Vec<_>>(),
+            "the decoded rules must be in the order the cells are chained"
+        );
     }
 
     /// The recursor's mutual block keeps both its ARITY and its ORDER.
@@ -2892,7 +3006,7 @@ mod tests {
         assert_eq!(recursor.num_motives, 3, "numMotives is slot 4");
         assert_eq!(recursor.num_minors, 4, "numMinors is slot 5");
 
-        assert_eq!(recursor.rules.len(), 1, "one computation rule");
+        assert_eq!(recursor.rules.len(), 2, "two computation rules");
         assert_eq!(recursor.rules[0].nfields, 5, "and its own field count");
         assert_eq!(
             recursor.rules[0].ctor.to_display_string(),
