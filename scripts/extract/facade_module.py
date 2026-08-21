@@ -52,6 +52,10 @@ ENV_SHARDS = [
     os.path.join(REPO, "contracts", "builtin_environment.002.tsv"),
 ]
 SCHEMA = "fln-facade-module/1"
+# A name the facade never declares and the pin never had. It is checked alongside
+# the real claims so the emission check proves, on every run, that it can still
+# fail — see the decoy handling in main().
+DECOY_NAME = "Fln.EmissionCheck.DecoyThatMustNotResolve"
 COLS = [
     "key", "display", "kind", "module", "levels", "arity", "telescope",
     "sig_root", "res_root", "res_head", "safety", "attrs", "extern",
@@ -1208,6 +1212,13 @@ def main():
     for name in claimed:
         verify_lines.append(f"#check @{decl[name]['decl_name']}")
         verify_map[len(verify_lines)] = name
+    # THE DECOY. Without it this check is unfalsifiable from the inside: if the
+    # error parser stopped matching the pin's diagnostic format, every claim would
+    # come back "resolved" and the manifest would report 1543 verified emissions
+    # having verified nothing. So one name that CANNOT exist rides in the same
+    # elaboration, and the run refuses unless the check catches it.
+    verify_lines.append(f"#check @{DECOY_NAME}")
+    verify_map[len(verify_lines)] = DECOY_NAME
     verify_path = args.out + ".verify.lean"
     with open(verify_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(verify_lines) + "\n")
@@ -1226,6 +1237,17 @@ def main():
     if not claimed:
         raise SystemExit("REFUSE: nothing was claimed emitted, so the emission "
                          "verification would pass vacuously")
+    decoy_reason = unresolved_claims.pop(DECOY_NAME, None)
+    if decoy_reason is None:
+        raise SystemExit(
+            f"REFUSE: the emission check did not notice {DECOY_NAME}, which is "
+            "absent by construction — the check cannot tell a present name from an "
+            "absent one, so the verified count it would report means nothing")
+    if "nknown" not in decoy_reason:
+        raise SystemExit(
+            f"REFUSE: the decoy was flagged for the wrong reason ({decoy_reason!r}) "
+            "— the check must fail it as an unresolved NAME, not as some unrelated "
+            "elaboration error that would also mask a real miss")
     # A claim the pin cannot resolve is WITHDRAWN, not argued with. Refusing the
     # whole artifact over it would block a 1554-row facade for a handful of rows;
     # keeping the claim would ship a manifest that lies to every downstream join.
@@ -1347,7 +1369,10 @@ def main():
         "declarations_emitted_distinct": len(emitted_set),
         "emission_withdrawn": emission_withdrawn,
         "emission_verification": "every name the manifest calls emitted was "
-            "resolved by the pin in the generated module itself",
+            "resolved by the pin in the generated module itself, and a decoy that "
+            "cannot exist was checked alongside them and refused — so the count is "
+            "falsifiable rather than merely reported",
+        "emission_decoy": DECOY_NAME,
         "cycle_residue": len(cycle_residue),
         "attempts": attempts,
         "imports_reference": False,
