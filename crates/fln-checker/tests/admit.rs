@@ -2876,6 +2876,16 @@ fn kr600_803_init_empty_fixture_pins_recursor_levels_motives_minors_and_rules() 
 }
 
 #[test]
+fn kr600_803_init_empty_fixture_pins_eliminator_bvar_closure() {
+    let entries = init_empty_entries();
+    let facts = match inspect(entries[1].declaration().type_(), TermBudget::unlimited()) {
+        TermOutcome::Complete(facts) => facts,
+        other => panic!("fixture eliminator inspection must complete: {other:?}"),
+    };
+    assert_eq!(facts.external_bound_span, 0);
+}
+
+#[test]
 fn kr600_803_init_false_eliminator_is_reconstructed_independently() {
     let entries = init_false_entries();
     let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
