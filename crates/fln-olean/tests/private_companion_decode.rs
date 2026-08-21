@@ -2206,17 +2206,24 @@ fn unary_family_keeps_concrete_members_on_both_chain_origins() {
     let (exported_relative, exported_name) =
         exported_member.expect("the pinned Init exported parts contain an _unary representative");
     let exported_chain = chain_bytes(&lib, &exported_relative);
-    let exported_view = OleanView::parse(&exported_chain.exported)
-        .unwrap_or_else(|error| panic!("_unary {exported_name}: parse exported: {error}"));
-    let exported = DeclDecoder::new(&exported_view, WalkBudget::default())
+    // The exported part may retain only an axiom shell for this name (notably
+    // `Array.zipWithMAux._unary`), while the chain's private region holds the
+    // real body. Origin remains exported because the name was selected from
+    // the exported array; concrete-kind checking belongs to chain decode.
+    let exported_chain_view = OleanView::parse_with_dependencies(
+        &exported_chain.private,
+        &[&exported_chain.exported, &exported_chain.server],
+    )
+    .unwrap_or_else(|error| panic!("_unary {exported_name}: parse chain: {error}"));
+    let exported = DeclDecoder::new(&exported_chain_view, WalkBudget::default())
         .decode_module_constants()
-        .unwrap_or_else(|error| panic!("_unary {exported_name}: decode exported: {error}"))
+        .unwrap_or_else(|error| panic!("_unary {exported_name}: decode chain: {error}"))
         .into_iter()
         .find(|info| info.name().to_display_string() == exported_name)
-        .unwrap_or_else(|| panic!("exported decoder lost _unary {exported_name}"));
+        .unwrap_or_else(|| panic!("chain decoder lost exported _unary {exported_name}"));
     assert!(
         is_concrete_recovery(&exported),
-        "exported _unary {exported_name} decoded only as {} instead of a concrete declaration",
+        "chain decode of exported _unary {exported_name} produced only {} instead of a concrete declaration",
         exported.kind_name()
     );
 
