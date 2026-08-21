@@ -4946,3 +4946,242 @@ fn the_four_field_records_share_a_layout() {
         "the same three shapes on the interior side"
     );
 }
+
+/// Slot 3's three shapes, structurally - and one field that is sometimes a
+/// pointer and sometimes not.
+///
+/// `2d251138` already pins what WAVE 186 asks for: the three shapes and their
+/// seed and interior counts, 34/9/11 against 11/9/26. This is WAVE 187's
+/// stronger question - tags, arities, pointer-or-scalar, and counts, for both
+/// populations kept apart - and it does not decode anything, because no
+/// production decoder in this crate accepts these and inventing one would be
+/// the guess `2d251138` declined to make.
+///
+/// ONE FIELD IS MIXED, AND NOTHING ELSE IN THIS FILE HAS BEEN. Every field
+/// characterised across fourteen waves has been uniformly a pointer or
+/// uniformly a scalar - the 71's 142 pointers, the 17's 34 scalars, the head
+/// records' 345 pointers, the 11's boxed heads. Slot 1 of the `(3, 3)` shape is
+/// neither: among the seeds it is boxed four times and a name link twice, and
+/// among the interior boxed five times and a name link four times.
+///
+/// That matters for how this file reads its own evidence. A uniform
+/// pointer/scalar split has been treated here as evidence the walk is on real
+/// object boundaries - twice, at `84951450` and `a7a7a9e0`. A mixed field is
+/// not counter-evidence, because a constructor with both nullary and
+/// non-nullary cases produces exactly this; but it does mean uniformity is a
+/// property of the FIELDS measured so far and not a law, and a future cell must
+/// not read a mixture as a walker fault.
+///
+/// The rest is layout. The `(2, 3)` shape holds a name link, a boxed value, and
+/// a numbered name link. The `(3, 3)` shape holds a name link, the mixed field,
+/// and an array. The `(4, 2)` shape holds a numbered name link and an array,
+/// with no scalars at all.
+///
+/// No size is asserted, nothing is decoded, and no schema, type or extension is
+/// named.
+#[test]
+fn the_slot_three_shapes_have_a_mixed_field() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    // Keyed "population/shape" and "population/shape/slot" so the two
+    // populations can never be folded together by accident.
+    let mut totals: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut pointer_scalar: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut slots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for population in ["seed", "interior"] {
+            let mut records: BTreeSet<usize> = BTreeSet::new();
+            for node in &all {
+                let seed = seeds.contains(node);
+                if (population == "seed") == seed
+                    && let Some(record) = resolve(word_at(bytes, node + 8))
+                {
+                    records.insert(record);
+                }
+            }
+            // Slot 3 targets, counted by reference and deduplicated.
+            let mut references: Vec<usize> = Vec::new();
+            for record in &records {
+                references.push(
+                    resolve(word_at(bytes, record + 8 + 8 * 3)).expect("slot 3 is a pointer"),
+                );
+            }
+            let mut by_shape: std::collections::BTreeMap<(u8, u8), Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for &target in &references {
+                let object = at.get(&target).expect("a walked object");
+                by_shape
+                    .entry((object.tag, object.other))
+                    .or_default()
+                    .push(target);
+            }
+            for ((tag, arity), group) in by_shape {
+                let key = format!("{population}/tag {tag} arity {arity}");
+                let unique: BTreeSet<usize> = group.iter().copied().collect();
+                let entry = totals.entry(key.clone()).or_default();
+                entry.0 += group.len();
+                entry.1 += unique.len();
+                for object in unique {
+                    for slot in 0..usize::from(arity) {
+                        let word = word_at(bytes, object + 8 + 8 * slot);
+                        let counts = pointer_scalar.entry(key.clone()).or_default();
+                        let described = match resolve(word) {
+                            Some(child) => {
+                                counts.0 += 1;
+                                let child = at.get(&child).expect("resolved above");
+                                format!("tag {} arity {}", child.tag, child.other)
+                            }
+                            None => {
+                                counts.1 += 1;
+                                format!("boxed {}", word >> 1)
+                            }
+                        };
+                        *slots
+                            .entry(format!("{key}/slot {slot} {described}"))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            totals.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // References and distinct objects, per population per shape.
+    assert_eq!(
+        totals.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 2 arity 3".to_owned(), (11, 10)),
+            ("interior/tag 3 arity 3".to_owned(), (9, 9)),
+            ("interior/tag 4 arity 2".to_owned(), (26, 24)),
+            ("seed/tag 2 arity 3".to_owned(), (34, 33)),
+            ("seed/tag 3 arity 3".to_owned(), (9, 6)),
+            ("seed/tag 4 arity 2".to_owned(), (11, 11)),
+        ],
+        "the three shapes by reference and by object, the two populations apart"
+    );
+
+    // Pointer-or-scalar, over the distinct objects.
+    assert_eq!(
+        pointer_scalar.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 2 arity 3".to_owned(), (20, 10)),
+            ("interior/tag 3 arity 3".to_owned(), (22, 5)),
+            ("interior/tag 4 arity 2".to_owned(), (48, 0)),
+            ("seed/tag 2 arity 3".to_owned(), (66, 33)),
+            ("seed/tag 3 arity 3".to_owned(), (14, 4)),
+            ("seed/tag 4 arity 2".to_owned(), (22, 0)),
+        ],
+        "pointers and scalars per shape. The `tag 4` shape has no scalars at \
+         all; the other two do"
+    );
+
+    // The layout, and the mixed field.
+    assert_eq!(
+        slots.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 2 arity 3/slot 0 tag 1 arity 2".to_owned(), 10),
+            ("interior/tag 2 arity 3/slot 1 boxed 0".to_owned(), 5),
+            ("interior/tag 2 arity 3/slot 1 boxed 1".to_owned(), 2),
+            ("interior/tag 2 arity 3/slot 1 boxed 2".to_owned(), 1),
+            ("interior/tag 2 arity 3/slot 1 boxed 3".to_owned(), 1),
+            ("interior/tag 2 arity 3/slot 1 boxed 4".to_owned(), 1),
+            ("interior/tag 2 arity 3/slot 2 tag 2 arity 2".to_owned(), 10),
+            ("interior/tag 3 arity 3/slot 0 tag 1 arity 2".to_owned(), 9),
+            ("interior/tag 3 arity 3/slot 1 boxed 0".to_owned(), 5),
+            ("interior/tag 3 arity 3/slot 1 tag 1 arity 2".to_owned(), 4),
+            (
+                "interior/tag 3 arity 3/slot 2 tag 246 arity 0".to_owned(),
+                9
+            ),
+            ("interior/tag 4 arity 2/slot 0 tag 2 arity 2".to_owned(), 24),
+            (
+                "interior/tag 4 arity 2/slot 1 tag 246 arity 0".to_owned(),
+                24
+            ),
+            ("seed/tag 2 arity 3/slot 0 tag 1 arity 2".to_owned(), 33),
+            ("seed/tag 2 arity 3/slot 1 boxed 0".to_owned(), 29),
+            ("seed/tag 2 arity 3/slot 1 boxed 1".to_owned(), 2),
+            ("seed/tag 2 arity 3/slot 1 boxed 2".to_owned(), 2),
+            ("seed/tag 2 arity 3/slot 2 tag 2 arity 2".to_owned(), 33),
+            ("seed/tag 3 arity 3/slot 0 tag 1 arity 2".to_owned(), 6),
+            ("seed/tag 3 arity 3/slot 1 boxed 0".to_owned(), 4),
+            ("seed/tag 3 arity 3/slot 1 tag 1 arity 2".to_owned(), 2),
+            ("seed/tag 3 arity 3/slot 2 tag 246 arity 0".to_owned(), 6),
+            ("seed/tag 4 arity 2/slot 0 tag 2 arity 2".to_owned(), 11),
+            ("seed/tag 4 arity 2/slot 1 tag 246 arity 0".to_owned(), 11),
+        ],
+        "every slot of every shape. Slot 1 of the `tag 3` shape is BOTH boxed \
+         and a pointer in both populations - the first field in this file that \
+         is not uniformly one or the other, so uniformity is a property of the \
+         fields measured so far and not a law"
+    );
+}
