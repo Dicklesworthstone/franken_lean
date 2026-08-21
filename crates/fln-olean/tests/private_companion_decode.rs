@@ -240,6 +240,10 @@ const INT_ZERO_NE_ONE_MATCH_1_1_MODULE: &str = "Init/Data/Int/Basic";
 const INT_NOT_MATCH_1: &str = "_private.Init.Data.Int.Bitwise.Basic.0.Int.not.match_1";
 /// The pin's private integer-bitwise companion stores this definition in Basic.
 const INT_NOT_MATCH_1_MODULE: &str = "Init/Data/Int/Bitwise/Basic";
+/// The private match implementation for `Bool.exists_bool'`.
+const BOOL_EXISTS_BOOL_MATCH_1_1: &str = "_private.Init.Data.Bool.0.Bool.exists_bool'.match_1_1";
+/// The pin's private Boolean companion stores this definition in its module.
+const BOOL_EXISTS_BOOL_MATCH_1_1_MODULE: &str = "Init/Data/Bool";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1673,6 +1677,34 @@ fn int_not_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {INT_NOT_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn bool_exists_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("bool_exists_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, BOOL_EXISTS_BOOL_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&BOOL_EXISTS_BOOL_MATCH_1_1.to_owned()),
+        "the private companion of {BOOL_EXISTS_BOOL_MATCH_1_1_MODULE} must retain \\
+         {BOOL_EXISTS_BOOL_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == BOOL_EXISTS_BOOL_MATCH_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {BOOL_EXISTS_BOOL_MATCH_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {BOOL_EXISTS_BOOL_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
