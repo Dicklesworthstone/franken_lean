@@ -14567,3 +14567,133 @@ fn no_module_in_the_library_declares_a_name_twice() {
         "the one Init olean outside the census is the aggregator"
     );
 }
+
+/// Name collisions at LIBRARY scope, where 25 of them cross a namespace
+/// boundary.
+///
+/// The cross-module census counts 92 multiply-declared names over the `Init`
+/// closure and concludes the name is not a key for `(module, declaration)`. That
+/// is measured inside one namespace, and it leaves the sharper question
+/// untouched: whether a name can be declared by modules in DIFFERENT top-level
+/// namespaces, which is what an environment loading `Init`, `Std` and `Lean`
+/// together actually faces.
+///
+/// It can. Over all 2,431 chains at private level — 215,111 occurrences,
+/// 214,919 distinct names — 128 names are declared more than once, and the 128
+/// split by how many namespaces they span:
+///
+///   103  within a single namespace
+///    24  across two
+///     1  across three — `String.Pos.Raw.atEnd.eq_1`, declared by `Init`,
+///        `Lake` and `Lean` modules alike
+///
+/// The deepest collision is `Std.IterM.step.eq_1` at ELEVEN modules, against a
+/// maximum of seven inside `Init`.
+///
+/// A NAME'S OWN NAMESPACE DOES NOT SAY WHO DECLARES IT, which those two make
+/// concrete. `Std.IterM.step.eq_1` begins with `Std` and is declared by `Init`
+/// modules as well as `Std` ones; `String.Pos.Raw.atEnd.eq_1` begins with
+/// neither of the three namespaces that declare it. Any tool that routed a name
+/// to a library by its prefix would be wrong about both.
+///
+/// THE INIT CENSUS CANNOT SEE 36 OF THESE. All 92 of its names remain collisions
+/// at library scope — a wider walk cannot un-collide them — so the 128 is 92
+/// plus 36 that involve at least one module outside the closure. The smaller
+/// census is right about what it covers and blind to more than a quarter of the
+/// population.
+///
+/// Conservation first: the surplus occurrences must equal the excess computed
+/// from the multiplicities, and the span classes must exhaust the collisions,
+/// before either census is named.
+#[test]
+fn name_collisions_cross_namespace_boundaries_at_library_scope() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    let mut namespaces: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut declaring: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut total = 0usize;
+    let census: BTreeSet<String> = init_modules(&lib).into_iter().collect();
+    for path in &all.exported {
+        if !all.private.contains(path) {
+            continue;
+        }
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let namespace = module.split('.').next().expect("a module name").to_owned();
+        for name in module_view(&lib, &module, Level::Private).const_names {
+            total += 1;
+            *occurrences.entry(name.clone()).or_default() += 1;
+            namespaces
+                .entry(name.clone())
+                .or_default()
+                .insert(namespace.clone());
+            declaring.entry(name).or_default().insert(module.clone());
+        }
+    }
+
+    let collisions: BTreeMap<&String, usize> = occurrences
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(name, count)| (name, *count))
+        .collect();
+    let excess: usize = collisions.values().map(|count| count - 1).sum();
+
+    // Conservation first, both ways.
+    assert_eq!(
+        excess,
+        total - occurrences.len(),
+        "the multiplicity excess must equal the gap between occurrences and distinct names"
+    );
+    let mut spans: BTreeMap<usize, usize> = BTreeMap::new();
+    for name in collisions.keys() {
+        *spans.entry(namespaces[*name].len()).or_default() += 1;
+    }
+    assert_eq!(
+        spans.values().sum::<usize>(),
+        collisions.len(),
+        "every collision must be classified by how many namespaces it spans"
+    );
+
+    assert_eq!(
+        (total, occurrences.len(), collisions.len(), excess),
+        (215_111, 214_919, 128, 192),
+        "the library name census and its collision population"
+    );
+    assert_eq!(
+        spans,
+        BTreeMap::from([(1, 103), (2, 24), (3, 1)]),
+        "collisions by namespaces spanned; 25 cross a boundary"
+    );
+
+    // The Init census's blind spot, checked rather than inferred from that cell's
+    // pinned 92: a collision is visible there only if two of its declaring
+    // modules are census members.
+    let visible_to_init = collisions
+        .keys()
+        .filter(|name| declaring[**name].intersection(&census).count() > 1)
+        .count();
+    assert_eq!(
+        (visible_to_init, collisions.len() - visible_to_init),
+        (92, 36),
+        "the Init census sees 92 of the 128 and is blind to 36 by construction"
+    );
+
+    // The two the prose names, so a prefix-routing tool is refuted concretely.
+    assert_eq!(
+        namespaces["String.Pos.Raw.atEnd.eq_1"],
+        BTreeSet::from(["Init".to_owned(), "Lake".to_owned(), "Lean".to_owned()]),
+        "the only name three namespaces declare, and none of them is its prefix"
+    );
+    assert_eq!(
+        (
+            collisions[&"Std.IterM.step.eq_1".to_owned()],
+            namespaces["Std.IterM.step.eq_1"].len()
+        ),
+        (11, 2),
+        "the deepest collision, declared under a namespace its name does not name"
+    );
+}
