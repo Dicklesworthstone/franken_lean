@@ -7417,3 +7417,114 @@ fn the_census_omits_the_aggregator_and_the_aggregator_reaches_the_census() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Every axiom the `Init` library still postulates once the private part is
+/// read, and the module that declares it.
+const CORPUS_AXIOMS: &[(&str, &str, bool)] = &[
+    ("Classical.choice", "Init.Prelude", false),
+    ("Lean.ofReduceBool", "Init.Core", false),
+    ("Lean.ofReduceNat", "Init.Core", false),
+    ("Lean.trustCompiler", "Init.Core", false),
+    ("Quot.lcInv", "Init.Prelude", true),
+    ("Quot.sound", "Init.Core", false),
+    ("isScalarObj", "Init.Prelude", true),
+    ("lcAny", "Init.Prelude", true),
+    ("lcCast", "Init.Prelude", true),
+    ("lcErased", "Init.Prelude", true),
+    ("lcProof", "Init.Prelude", true),
+    ("lcUnreachable", "Init.Prelude", true),
+    ("lcVoid", "Init.Prelude", true),
+    ("propext", "Init.Core", false),
+    ("sorryAx", "Init.Prelude", false),
+];
+
+/// The postulate surface of the WHOLE `Init` library, not of two named modules.
+///
+/// The residual-axiom cell walks `RESIDUAL_AXIOMS`, a hand-written table of two
+/// modules, and checks that what stays an `Axiom` at private level in each is
+/// exactly the list beside it. It never asks the question the table implies:
+/// whether any OTHER module postulates anything. The trusted base is the one
+/// thing where "we checked the two modules we wrote down" is not an answer.
+///
+/// Measured over all 600 census modules at private level:
+///
+///   FIFTEEN axiom declarations in total, carrying fifteen distinct names — no
+///     axiom is declared twice, which matters because 92 other names are
+///   they live in exactly TWO modules, `Init.Prelude` with ten and `Init.Core`
+///     with five. The other 598 modules postulate NOTHING
+///   eight are unsafe and seven are safe, so `is_unsafe` is not constant over
+///     the set and a decode collapsing it fails here
+///
+/// The three the project's doctrine names — `propext`, `Quot.sound`,
+/// `Classical.choice` — are all present and all safe, which is the fact that
+/// makes "the same theorems under the same axioms" checkable rather than
+/// aspirational. The eight unsafe ones are compiler-internal (`lc*`,
+/// `isScalarObj`, `Quot.lcInv`) and are asserted unsafe by name, so one of them
+/// turning safe is a change in the trusted base rather than a detail.
+///
+/// COST, stated rather than hidden: this cell decodes all 600 modules at
+/// private level, ~65,000 declarations. That is the heaviest cell in the file —
+/// comparable to the thirty-one `Init/Prelude` decodes the rest of it performs
+/// in total. It is spent on the one claim where a sample cannot substitute for
+/// the population.
+#[test]
+fn the_whole_library_postulates_exactly_fifteen_axioms_in_two_modules() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut found: Vec<(String, String, bool)> = Vec::new();
+    let mut per_module: BTreeMap<&String, usize> = BTreeMap::new();
+    for module in &modules {
+        let (infos, _) = decode_at(&lib, module, Level::Private);
+        for info in &infos {
+            if let ConstantInfo::Axiom(v) = info {
+                found.push((info.name().to_display_string(), module.clone(), v.is_unsafe));
+                *per_module.entry(module).or_default() += 1;
+            }
+        }
+    }
+    found.sort();
+
+    let expected: Vec<(String, String, bool)> = CORPUS_AXIOMS
+        .iter()
+        .map(|(name, module, unsafe_)| ((*name).to_owned(), (*module).to_owned(), *unsafe_))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the complete postulate surface of the Init library, with the module and safety of each"
+    );
+
+    let names: BTreeSet<&String> = found.iter().map(|(name, _, _)| name).collect();
+    assert_eq!(
+        names.len(),
+        found.len(),
+        "no axiom may be declared twice, unlike the 92 names that are"
+    );
+    assert_eq!(
+        per_module
+            .iter()
+            .map(|(module, count)| (module.as_str(), *count))
+            .collect::<Vec<(&str, usize)>>(),
+        vec![("Init.Core", 5), ("Init.Prelude", 10)],
+        "exactly two modules postulate anything, and the other 598 postulate nothing"
+    );
+
+    // The doctrine's three, present and safe.
+    for axiom in ["propext", "Quot.sound", "Classical.choice"] {
+        let row = found
+            .iter()
+            .find(|(name, _, _)| name == axiom)
+            .unwrap_or_else(|| panic!("{axiom} must be postulated at the pin"));
+        assert!(!row.2, "{axiom} must be a safe axiom");
+    }
+
+    // Anti-vacuity: both safety values must occur, or the flag is decoding to a
+    // constant and every `is_unsafe` above is unconstrained.
+    let unsafe_count = found.iter().filter(|(_, _, flag)| *flag).count();
+    assert_eq!(
+        (unsafe_count, found.len() - unsafe_count),
+        (8, 7),
+        "the postulate set must span both safety values"
+    );
+}
