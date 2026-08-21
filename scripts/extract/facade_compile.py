@@ -1771,6 +1771,16 @@ def main():
             "REFUSE: facade manifest distinct-emission pin diverges "
             f"({json.dumps(declarations_emitted_distinct_pin_join, sort_keys=True)})"
         )
+    demanded_pin_join = {
+        "summary_demanded": manifest_summary.get("demanded"),
+        "pinned_demanded": 560,
+    }
+    if (demanded_pin_join["summary_demanded"]
+            != demanded_pin_join["pinned_demanded"]):
+        raise SystemExit(
+            "REFUSE: facade manifest demanded-count pin diverges "
+            f"({json.dumps(demanded_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2860,6 +2870,7 @@ def main():
         "manifest_value_residue_pin_join": value_residue_pin_join,
         "manifest_transparent_declarations_pin_join": transparent_declarations_pin_join,
         "manifest_declarations_emitted_distinct_pin_join": declarations_emitted_distinct_pin_join,
+        "manifest_demanded_pin_join": demanded_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
