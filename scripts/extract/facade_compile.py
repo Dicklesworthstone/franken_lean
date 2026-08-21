@@ -1664,6 +1664,16 @@ def main():
             "REFUSE: facade manifest inductive-declaration pin diverges "
             f"({json.dumps(inductive_declarations_pin_join, sort_keys=True)})"
         )
+    inductive_refused_pin_join = {
+        "summary_inductive_refused": manifest_summary.get("inductive_refused"),
+        "pinned_inductive_refused": 14,
+    }
+    if (inductive_refused_pin_join["summary_inductive_refused"]
+            != inductive_refused_pin_join["pinned_inductive_refused"]):
+        raise SystemExit(
+            "REFUSE: facade manifest inductive-refusal pin diverges "
+            f"({json.dumps(inductive_refused_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2743,6 +2753,7 @@ def main():
         "manifest_bare_names_probed_pin_join": bare_names_probed_pin_join,
         "manifest_class_provided_projections_pin_join": class_provided_projections_pin_join,
         "manifest_inductive_declarations_pin_join": inductive_declarations_pin_join,
+        "manifest_inductive_refused_pin_join": inductive_refused_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
