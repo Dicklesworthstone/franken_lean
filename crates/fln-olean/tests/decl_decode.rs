@@ -9243,3 +9243,234 @@ fn the_slot_three_slots_on_both_bases() {
          control showing the two bases CAN coincide"
     );
 }
+
+/// The two shared seed records, and the one base-rate check that SURVIVES.
+///
+/// `bd0266d2` pins the seed spine's record excess as 2 and never says which
+/// records - the "a histogram entry is not an object" gap `1cc74dd0` closed for
+/// the array hub. An excess of 2 is also ambiguous: one record shared three
+/// ways, or two shared twice. It is two shared twice; the refcounts are 52 ones
+/// and 2 twos.
+///
+/// ALL FOUR HOLDERS HAVE A `tag 4 arity 1` TAIL, and that is six of the
+/// fifty-six seed nodes. Four draws landing entirely inside a class holding
+/// just over a tenth of the population is roughly one chance in seven thousand
+/// six hundred if nothing connects them.
+///
+/// THAT IS THE FIRST TIME THIS ARITHMETIC HAS SUPPORTED A CLAIM RATHER THAN
+/// DISSOLVING ONE. `1cc74dd0` computed the same check and found thirteen of
+/// thirteen inside an eighty-three per cent class - about one in eleven, and
+/// nothing. `1006bd18` found one of three categorical zeros drawn from a
+/// population of one. Here the base rate makes the observation surprising
+/// instead of expected, which is what the check exists to distinguish.
+///
+/// It is a base-rate sanity check and not a significance test: it assumes the
+/// four draws are independent, which is exactly what a shared record might make
+/// false. The honest reading is that the four holders are not a random four,
+/// not that a mechanism has been identified.
+///
+/// The records' own slots are pinned beside the unshared profile so the
+/// comparison has somewhere to stand. Both shared records carry a `tag 5` at
+/// slot 2, where the unshared population is mostly `tag 7` - ten of
+/// fifty-two - but TWO samples support no such claim and none is made.
+///
+/// Addresses carry a guard at the address, the `d7518917` pattern.
+#[test]
+fn the_shared_seed_records() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut refcounts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut shared: Vec<usize> = Vec::new();
+    let mut shared_slots: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut unshared_slots: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut holder_tails: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut all_tails: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut seed_nodes = 0usize;
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |word: u64| -> String {
+            match resolve(word) {
+                Some(child) => {
+                    let child = at.get(&child).expect("resolved above");
+                    format!("tag {} arity {}", child.tag, child.other)
+                }
+                None => format!("boxed {}", word >> 1),
+            }
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        seed_nodes += seeds.len();
+
+        // Which four-field record each seed node carries, and how many carry each.
+        let mut holders: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &node in &seeds {
+            if let Some(record) = resolve(word_at(bytes, node + 8)) {
+                holders.entry(record).or_default().push(node);
+            }
+            *all_tails
+                .entry(described(word_at(bytes, node + 16)))
+                .or_default() += 1;
+        }
+
+        for (&record, nodes) in &holders {
+            *refcounts.entry(nodes.len()).or_default() += 1;
+            let into = if nodes.len() > 1 {
+                shared.push(record);
+                // The guard, at the address about to be pinned.
+                assert_eq!(
+                    shape(record),
+                    Some((0, 4)),
+                    "a pinned shared record must still be the four-field shape"
+                );
+                assert_eq!(
+                    holders.get(&record).map(Vec::len),
+                    Some(nodes.len()),
+                    "and must still carry exactly that many holders"
+                );
+                for &node in nodes {
+                    *holder_tails
+                        .entry(described(word_at(bytes, node + 16)))
+                        .or_default() += 1;
+                }
+                &mut shared_slots
+            } else {
+                &mut unshared_slots
+            };
+            for slot in 0..4usize {
+                *into
+                    .entry(format!(
+                        "slot {slot}/{}",
+                        described(word_at(bytes, record + 8 + 8 * slot))
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            shared.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // Two shared twice, not one shared three ways.
+    assert_eq!(
+        refcounts.into_iter().collect::<Vec<_>>(),
+        vec![(1, 52), (2, 2)],
+        "the excess of 2 `bd0266d2` pins is TWO records shared TWICE, not one \
+         shared three ways - an excess alone cannot say which"
+    );
+    shared.sort_unstable();
+    assert_eq!(
+        shared,
+        vec![0x2afdd0, 0x2b4998],
+        "the shared records, locatable rather than only counted"
+    );
+
+    // The finding, with its base rate beside it.
+    assert_eq!(
+        holder_tails.into_iter().collect::<Vec<_>>(),
+        vec![("tag 4 arity 1".to_owned(), 4)],
+        "all four holders have the same tail shape"
+    );
+    assert_eq!(
+        all_tails.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 44),
+            ("tag 4 arity 1".to_owned(), 6),
+            ("tag 5 arity 1".to_owned(), 6),
+        ],
+        "against six of the fifty-six seed nodes. Four draws landing entirely \
+         inside a class holding just over a tenth is roughly one in seven \
+         thousand six hundred - so unlike `1cc74dd0`'s thirteen-of-thirteen at \
+         one in eleven, the base rate makes this surprising rather than \
+         expected. It is a sanity check assuming independence, not a \
+         significance test"
+    );
+    assert_eq!(seed_nodes, 56, "the population the base rate is over");
+
+    // The slot profiles, with no claim drawn from two samples.
+    assert_eq!(
+        shared_slots.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("slot 0/tag 2 arity 2".to_owned(), 2),
+            ("slot 1/tag 2 arity 2".to_owned(), 2),
+            ("slot 2/tag 5 arity 2".to_owned(), 2),
+            ("slot 3/tag 3 arity 3".to_owned(), 1),
+            ("slot 3/tag 4 arity 2".to_owned(), 1),
+        ],
+        "the two shared records' own slots"
+    );
+    assert_eq!(
+        unshared_slots.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("slot 0/tag 2 arity 2".to_owned(), 52),
+            ("slot 1/tag 1 arity 2".to_owned(), 2),
+            ("slot 1/tag 2 arity 2".to_owned(), 50),
+            ("slot 2/tag 1 arity 1".to_owned(), 4),
+            ("slot 2/tag 4 arity 2".to_owned(), 9),
+            ("slot 2/tag 5 arity 2".to_owned(), 10),
+            ("slot 2/tag 7 arity 3".to_owned(), 29),
+            ("slot 3/tag 2 arity 3".to_owned(), 34),
+            ("slot 3/tag 3 arity 3".to_owned(), 8),
+            ("slot 3/tag 4 arity 2".to_owned(), 10),
+        ],
+        "and the unshared profile beside them. Both shared records carry a \
+         `tag 5` at slot 2 where the unshared population is mostly `tag 7`, but \
+         TWO samples support no such claim and none is made"
+    );
+}
