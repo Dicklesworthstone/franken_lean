@@ -6501,3 +6501,138 @@ fn the_module_census_is_keyed_by_an_injective_path_projection() {
          anything, deepest is {deepest}"
     );
 }
+
+/// The two library modules that carry no companion parts at all.
+const MODULES_WITHOUT_COMPANIONS: &[&str] = &["LeanChecker.olean", "Leanc.olean"];
+
+/// Every `.olean` file under a root, split by which part of the chain it is.
+#[derive(Default)]
+struct ChainCensus {
+    exported: BTreeSet<String>,
+    server: BTreeSet<String>,
+    private: BTreeSet<String>,
+    unknown: Vec<String>,
+}
+
+fn chain_census(lib: &Path, root: &Path) -> ChainCensus {
+    let mut out = ChainCensus::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(lib)
+                .expect("under lib")
+                .to_string_lossy()
+                .into_owned();
+            if let Some(base) = relative.strip_suffix(".server") {
+                if base.ends_with(".olean") {
+                    out.server.insert(base.to_owned());
+                    continue;
+                }
+            }
+            if let Some(base) = relative.strip_suffix(".private") {
+                if base.ends_with(".olean") {
+                    out.private.insert(base.to_owned());
+                    continue;
+                }
+            }
+            if relative.ends_with(".olean") {
+                out.exported.insert(relative);
+            } else if relative.contains(".olean") {
+                out.unknown.push(relative);
+            }
+        }
+    }
+    out
+}
+
+/// Every companion file on disk belongs to a module, the chain has exactly
+/// THREE parts, and the completeness premise is total over `Init` and not over
+/// the library.
+///
+/// The census cell asserts the forward direction — every census module has both
+/// companions — by walking the census and stating the filesystem. That is a
+/// one-way containment. The reverse was never checked, and it is the direction
+/// that mirrors this bead's original defect: an orphan `.olean.private` with no
+/// base `.olean` is a part that EXISTS and can never be read, because
+/// `parse_with_dependencies` is given the exported part as its region. d17i was
+/// a part that existed and was not read; this is the shape where nothing could
+/// read it at all.
+///
+/// Counted from a directory walk rather than from the census, so a name the
+/// projection would have collapsed is still counted here:
+///
+///   `Init` is a three-way bijection — 600 exported, 600 server, 600 private,
+///     with ZERO orphans in either companion and zero bases missing one
+///   the whole library has 2,433 exported and 2,431 of each companion, still
+///     with zero orphans, and exactly TWO bases carry no companion at all:
+///     `LeanChecker` and `Leanc`
+///   NO file carries any other `.olean`-bearing suffix, so the chain is exactly
+///     three parts. A fourth would be invisible to every cell in this file,
+///     since all of them name the three they know
+///
+/// The two exceptions are why the premise is stated over `Init` and must not be
+/// generalised: `Level::Private` is total over the census this file uses and is
+/// NOT total over the library. A cell that widened its scope and kept the
+/// premise would fail on those two, which is the correct outcome and worth
+/// having recorded before someone widens one.
+#[test]
+fn companion_files_belong_to_modules_and_the_chain_has_exactly_three_parts() {
+    let lib = lib_or_skip!();
+
+    let init = chain_census(&lib, &lib.join("Init"));
+    assert_eq!(
+        (
+            init.exported.len(),
+            init.server.len(),
+            init.private.len(),
+            init.unknown.len()
+        ),
+        (600, 600, 600, 0),
+        "the Init chain census"
+    );
+    for (label, part) in [("server", &init.server), ("private", &init.private)] {
+        assert_eq!(
+            part, &init.exported,
+            "Init: the .{label} files and the .olean files must be the same set, in both \
+             directions"
+        );
+    }
+
+    let all = chain_census(&lib, &lib);
+    assert_eq!(
+        (
+            all.exported.len(),
+            all.server.len(),
+            all.private.len(),
+            all.unknown.len()
+        ),
+        (2433, 2431, 2431, 0),
+        "the library chain census"
+    );
+    assert!(
+        all.exported.len() > init.exported.len(),
+        "the library walk must be strictly wider than the Init walk, or the exception below \
+         is asserted over the same files that just satisfied the bijection"
+    );
+
+    for (label, part) in [("server", &all.server), ("private", &all.private)] {
+        let orphans: Vec<&String> = part.difference(&all.exported).collect();
+        assert!(
+            orphans.is_empty(),
+            "a .{label} file with no .olean beside it can never be read: {orphans:?}"
+        );
+        let missing: Vec<&String> = all.exported.difference(part).collect();
+        assert_eq!(
+            missing, MODULES_WITHOUT_COMPANIONS,
+            "exactly two library modules carry no .{label}, so the completeness premise is \
+             total over Init and NOT over the library"
+        );
+    }
+}
