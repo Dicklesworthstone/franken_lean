@@ -1918,6 +1918,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
+    let human_artifact_bytes = human_line_suffix(&human.stdout, "artifact bytes: ")
+        .parse::<usize>()
+        .expect("human artifact-byte count is a usize");
+    assert_eq!(
+        human_artifact_bytes,
+        json_usize_field(&json.stdout, "artifactBytes"),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
+    );
     assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
         &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
