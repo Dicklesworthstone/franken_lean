@@ -2987,7 +2987,28 @@ fn check_family_token(family: &str, direction: FamilyDirection) -> Result<(), St
     }
 }
 
-/// Render a family census in the receipt's canonical form:/// Render a family census in the receipt's canonical form: `token=count`,
+/// Assert a token is refused in `direction`, and refused for the REASON named.
+///
+/// **Why not `is_err()`.** `check_family_token` can refuse for four different
+/// reasons: an empty name, either delimiter, the wrong direction, or the
+/// ACCEPTED token. A bare `is_err()` cannot tell them apart, so it keeps passing
+/// if the rule under test stops working and some other rule refuses the token
+/// instead -- which is how a direction check would go dark while every call site
+/// stayed green. Every refusal assertion on these tokens goes through here so
+/// that cannot happen quietly.
+fn assert_family_token_refused(token: &str, direction: FamilyDirection, because: &str) {
+    let field = direction.field();
+    let reason = match check_family_token(token, direction) {
+        Ok(()) => panic!("`{token}` was accepted as a `{field}` entry"),
+        Err(reason) => reason,
+    };
+    assert!(
+        reason.contains(because),
+        "`{token}` was refused as a `{field}` entry, but not for `{because}`: {reason}"
+    );
+}
+
+/// Render a family census in the receipt's canonical form: `token=count`,
 /// ascending by token (the `BTreeMap` order), so two runs that saw the same
 /// families produce byte-identical rows.
 fn family_census_rows(census: &BTreeMap<String, u64>) -> Vec<String> {
@@ -5104,10 +5125,20 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
                 assert_eq!(token, "accepted");
                 // An agreement belongs to NEITHER census. If it were admitted to
                 // one, agreements would be counted as findings.
-                assert!(
-                    check_family_token(token, FamilyDirection::Restrictive).is_err()
-                        && check_family_token(token, FamilyDirection::NoAnswer).is_err(),
-                    "`{token}` routes as an AGREEMENT but is an acceptable family token"
+                // Each direction refuses it under a DIFFERENT rule, and saying
+                // which is the point: restrictive because it is not a
+                // `rejected:` token, non-answer because `accepted` is named
+                // explicitly. A bare is_err() pair would hide either one going
+                // dark.
+                assert_family_token_refused(
+                    token,
+                    FamilyDirection::Restrictive,
+                    "is not a `rejected:` token",
+                );
+                assert_family_token_refused(
+                    token,
+                    FamilyDirection::NoAnswer,
+                    "is the ACCEPTED token",
                 );
             }
             CorpusAxisVerdict::Rejected(_) => {
@@ -5120,9 +5151,10 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
                          would panic mid-run about family tokens rather than about routing"
                     );
                 }
-                assert!(
-                    check_family_token(token, FamilyDirection::NoAnswer).is_err(),
-                    "`{token}` routes as a REJECTION yet is accepted as a non-answer family"
+                assert_family_token_refused(
+                    token,
+                    FamilyDirection::NoAnswer,
+                    "is a `rejected:` token",
                 );
             }
             CorpusAxisVerdict::NoAnswer(_) => {
@@ -5133,11 +5165,12 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
                          `no_answer_families` -- but the census refuses it there: {reason}"
                     );
                 }
-                assert!(
-                    check_family_token(token, FamilyDirection::Restrictive).is_err(),
-                    "`{token}` routes as a NON-ANSWER yet is accepted as a restrictive family. A \
-                     budget exhaustion counted as a D23 finding reports the kernel as diverging \
-                     where it only ran out of fuel"
+                // A budget exhaustion counted as a D23 finding would report the
+                // kernel as diverging where it only ran out of fuel.
+                assert_family_token_refused(
+                    token,
+                    FamilyDirection::Restrictive,
+                    "is not a `rejected:` token",
                 );
             }
         }
@@ -5770,10 +5803,10 @@ fn every_non_answer_outcome_yields_a_legal_family_token() {
                  {reason}"
             );
         }
-        assert!(
-            check_family_token(token, FamilyDirection::Restrictive).is_err(),
-            "`{token}` was accepted as a RESTRICTIVE family. A non-answer counted as a D23 \
-             finding would report a budget exhaustion as a kernel divergence"
+        assert_family_token_refused(
+            token,
+            FamilyDirection::Restrictive,
+            "is not a `rejected:` token",
         );
     }
 
@@ -7764,11 +7797,7 @@ fn every_kernel_rejection_class_yields_a_legal_family_token() {
         if let Err(reason) = check_family_token(&token, FamilyDirection::Restrictive) {
             panic!("the kernel can reject with `{name}`, but `{token}`: {reason}");
         }
-        assert!(
-            check_family_token(&token, FamilyDirection::NoAnswer).is_err(),
-            "`{token}` was accepted as a NON-ANSWER family; a rejection counted there would say \
-             nothing about kernel completeness while looking like it did"
-        );
+        assert_family_token_refused(&token, FamilyDirection::NoAnswer, "is a `rejected:` token");
     }
 
     // And the two context families the scorer writes, from the other direction.
@@ -7779,10 +7808,11 @@ fn every_kernel_rejection_class_yields_a_legal_family_token() {
         if let Err(reason) = check_family_token(token, FamilyDirection::NoAnswer) {
             panic!("the scorer writes `{token}`, but the guard refuses it: {reason}");
         }
-        assert!(
-            check_family_token(token, FamilyDirection::Restrictive).is_err(),
-            "`{token}` was accepted as a RESTRICTIVE family; a context-construction failure is \
-             not a D23 finding"
+        // A context-construction failure is not a D23 finding.
+        assert_family_token_refused(
+            token,
+            FamilyDirection::Restrictive,
+            "is not a `rejected:` token",
         );
     }
 }
