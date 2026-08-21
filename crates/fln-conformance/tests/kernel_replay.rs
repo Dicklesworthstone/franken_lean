@@ -13848,6 +13848,21 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
     })
 }
 
+/// Claim sites that name neither their scope nor the corpus lane's cadence.
+///
+/// The scanned documents must satisfy both rules per site. The derived scope
+/// applies the same conjunction, so a document outside the list cannot pass by
+/// naming one and omitting the other.
+fn unscoped_claim_sites(text: &str, qualifiers: &[&str], cadence: &[&str]) -> usize {
+    text.lines()
+        .filter(|line| line.contains("{1, 8, 32}"))
+        .filter(|line| {
+            !qualifiers.iter().any(|word| line.contains(word))
+                || !cadence.iter().any(|word| line.contains(word))
+        })
+        .count()
+}
+
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
     let rows = text
         .lines()
@@ -17009,6 +17024,27 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     // document reddens; repairing one of these two does NOT, because the check
     // is `<=` per document rather than an equality. An allowance that reddened a
     // correct repair would be a wall, not a ledger.
+    // A QUALIFIER ALONE IS NOT ENOUGH, and the previous version counted as
+    // though it were. Synthetic, because both live sites name neither.
+    assert_eq!(
+        unscoped_claim_sites(
+            "the Prelude matrix runs {1, 8, 32}\n",
+            &QUALIFIERS,
+            &CADENCE
+        ),
+        1,
+        "a site naming its scope but not the cadence must still count, or the derived scope is \
+         weaker than the list it extends"
+    );
+    assert_eq!(
+        unscoped_claim_sites(
+            "the Prelude matrix runs {1, 8, 32} on demand\n",
+            &QUALIFIERS,
+            &CADENCE
+        ),
+        0,
+        "a site naming both must not count, or the rule refuses honest lines"
+    );
     const UNSCANNED_ALLOWANCE: [(&str, usize); 1] =
         [("COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md", 2)];
     for entry in fs::read_dir(&repo).expect("the repository root must be readable") {
@@ -17020,11 +17056,12 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         let Ok(text) = fs::read_to_string(entry.path()) else {
             continue;
         };
-        let unqualified = text
-            .lines()
-            .filter(|line| line.contains("{1, 8, 32}"))
-            .filter(|line| !QUALIFIERS.iter().any(|word| line.contains(word)))
-            .count();
+        // BOTH HALVES, AS THE SCANNED PATH REQUIRES. This counted only sites
+        // missing a QUALIFIER, while a scanned document must name its scope AND
+        // the corpus lane's cadence. A site carrying `Prelude` but no cadence
+        // therefore dropped out of the count and met neither rule -- a gap
+        // between the two paths, opened by the commit that derived this scope.
+        let unqualified = unscoped_claim_sites(&text, &QUALIFIERS, &CADENCE);
         let allowed = UNSCANNED_ALLOWANCE
             .iter()
             .find(|(doc, _)| *doc == name)
