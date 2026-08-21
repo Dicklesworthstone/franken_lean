@@ -6288,6 +6288,44 @@ fn the_inventory_is_sorted_not_merely_stable_within_one_process() {
     );
 }
 
+/// What a module name MEANS, written out independently of how it is computed.
+///
+/// **Why not just call the projection.** The parallel-vectors test used to
+/// recompute each expected name by calling `module_name_from_path` -- the very
+/// function whose output it was checking. That is a mirror: replace the
+/// projection with a stub returning a constant and both sides change together,
+/// so the assertion holds while the projection is wrong. It survived only
+/// because the injectivity rule inside the walk would fail first, which is
+/// protection by a neighbour rather than by the check itself.
+///
+/// **This is the specification half of the pair.** It states the meaning -- a
+/// module name is its path below the library root, with the trailing `.olean`
+/// removed and the components joined by dots, under the namespace -- using none
+/// of the projection's own machinery. In particular it does NOT use
+/// `Path::with_extension`, so a change to what counts as "the extension" is a
+/// disagreement between the two rather than a change both follow.
+///
+/// Deliberate duplication, like the corpus root path that is written once as a
+/// constant and once as a literal: one side is the implementation, the other is
+/// what the implementation is supposed to mean.
+fn expected_module_name(base: &Path, path: &Path, prefix: &str) -> String {
+    let relative = path
+        .strip_prefix(base)
+        .unwrap_or_else(|_| panic!("{} is not below {}", path.display(), base.display()));
+    let mut parts = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let last = parts
+        .last_mut()
+        .unwrap_or_else(|| panic!("{} has no components", relative.display()));
+    *last = last
+        .strip_suffix(".olean")
+        .unwrap_or_else(|| panic!("the walk collects only `.olean` files, but found `{last}`"))
+        .to_string();
+    format!("{prefix}.{}", parts.join("."))
+}
+
 /// `oleans` and `modules` are PARALLEL: `modules[i]` is the projection of
 /// `oleans[i]`, and the extension match is exact.
 ///
@@ -6367,11 +6405,9 @@ fn the_inventory_vectors_are_parallel_and_the_extension_match_is_exact() {
     // from -- not compared against a list somebody typed.
     assert_eq!(modules.len(), oleans.len());
     for (index, path) in oleans.iter().enumerate() {
-        let expected = qualify_module_name(
-            Some("Fixture"),
-            module_name_from_path(&library, path)
-                .unwrap_or_else(|reason| panic!("project {}: {reason}", path.display())),
-        );
+        // Computed from the path by the SPECIFICATION, not by the projection
+        // under test -- otherwise a stubbed projection would agree with itself.
+        let expected = expected_module_name(&library, path, "Fixture");
         assert_eq!(
             modules[index],
             expected,
