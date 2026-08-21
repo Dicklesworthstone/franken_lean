@@ -304,6 +304,10 @@ const VECTOR_ELIM_AS_ARRAY_MATCH_1: &str =
     "_private.Init.Data.Vector.Basic.0.Vector.elimAsArray.match_1";
 /// The pin's private vector companion stores this definition in Basic.
 const VECTOR_ELIM_AS_ARRAY_MATCH_1_MODULE: &str = "Init/Data/Vector/Basic";
+/// The private match implementation for `Bool.forall_bool'`.
+const BOOL_FORALL_BOOL_MATCH_1_1: &str = "_private.Init.Data.Bool.0.Bool.forall_bool'.match_1_1";
+/// The pin's private Boolean companion stores this definition in its module.
+const BOOL_FORALL_BOOL_MATCH_1_1_MODULE: &str = "Init/Data/Bool";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -2133,6 +2137,34 @@ fn vector_elim_as_array_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {VECTOR_ELIM_AS_ARRAY_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn bool_forall_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("bool_forall_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, BOOL_FORALL_BOOL_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&BOOL_FORALL_BOOL_MATCH_1_1.to_owned()),
+        "the private companion of {BOOL_FORALL_BOOL_MATCH_1_1_MODULE} must retain \\
+         {BOOL_FORALL_BOOL_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == BOOL_FORALL_BOOL_MATCH_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {BOOL_FORALL_BOOL_MATCH_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {BOOL_FORALL_BOOL_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
