@@ -1273,6 +1273,58 @@ impl Default for ChainLimits {
     }
 }
 
+/// The complete `extraConstNames` population of one module-system chain.
+///
+/// UNLIKE `constants`, THIS FIELD HAS NO SUPERSET LAW. The private part is the
+/// authoritative constant array, so [`decode_chain_constants_with_origin`] can
+/// return it alone and prove nothing was lost. `extraConstNames` does not
+/// behave that way: measured across the 2,431 chained modules of the pin, 8
+/// have a private array that is NOT a superset of the exported one, and 652
+/// exported names in total appear in no private array. `Init.Data.Array.QSort.Basic`
+/// is the sharpest case — its private array is SMALLER than its exported one,
+/// 93 against 94, and the two together hold 101 distinct names.
+///
+/// So reading this field from either part alone silently drops names, and a
+/// caller wanting the population has to union them. That is what this does.
+///
+/// SCOPE, so nothing is read into this that it does not say. These are
+/// code-generator names with no `ConstantInfo` behind them anywhere in the
+/// artifact (see [`OleanView::extra_const_names`]). Dropping them cannot
+/// produce an `UnknownConstant` and none of this is kernel-facing; it is a
+/// completeness property of an IR-name population, not of the declarations
+/// `franken_lean-timy` is about.
+///
+/// Order is deterministic: the exported part's names in array order, then the
+/// private part's names not already present, in array order.
+pub fn chain_extra_const_names(
+    exported: &OleanView<'_>,
+    private: &OleanView<'_>,
+    budget: WalkBudget,
+) -> DResult<Vec<Name>> {
+    if !same_chain_identity(exported, private) {
+        return Err(DeclError::ChainPartMismatch {
+            part: OleanChainPart::Private,
+        });
+    }
+
+    let exported_names = exported.extra_const_names(budget)?;
+    let private_names = private.extra_const_names(budget)?;
+
+    let mut seen: HashSet<Name> = HashSet::with_capacity(exported_names.len());
+    let mut union = Vec::new();
+    union
+        .try_reserve_exact(exported_names.len())
+        .map_err(|_| DeclError::Budget {
+            visited: exported_names.len() as u64,
+        })?;
+    for name in exported_names.into_iter().chain(private_names) {
+        if seen.insert(name.clone()) {
+            union.push(name);
+        }
+    }
+    Ok(union)
+}
+
 /// Decode a complete chain's constants with origin, straight from the three
 /// parts' bytes.
 ///
@@ -1588,6 +1640,147 @@ mod tests {
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ),
     ];
+
+    /// `Init.Data.Array.QSort.Basic` is the module where the private
+    /// `extraConstNames` array is SMALLER than the exported one.
+    ///
+    /// Its eight exported-only names are the concrete evidence that this field
+    /// has no superset law, so the union is the only complete reading.
+    const QSORT_EXPORTED_ONLY_EXTRA: [&str; 8] = [
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qpartition._auto_2",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qpartition._auto_4",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qpartition._auto_6",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qpartition.loop",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qsort._auto_2",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qsort._auto_4",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qsort._auto_6",
+        "_private.Init.Data.Array.QSort.Basic.0.Array.qsort.sort",
+    ];
+
+    #[test]
+    fn the_extra_const_names_union_recovers_what_each_part_alone_drops() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the_extra_const_names_union_recovers_what_each_part_alone_drops: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |suffix: &str| {
+            std::fs::read(lib.join(format!("Init/Data/Array/QSort/Basic.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read QSort/Basic{suffix}: {error}"))
+        };
+        let exported = read("");
+        let server = read(".server");
+        let private = read(".private");
+
+        let exported_view = OleanView::parse(&exported).expect("exported parses");
+        let private_view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+            .expect("private parses against its chain");
+
+        let exported_extra = exported_view
+            .extra_const_names(WalkBudget::default())
+            .expect("exported extraConstNames decode");
+        let private_extra = private_view
+            .extra_const_names(WalkBudget::default())
+            .expect("private extraConstNames decode");
+        let union = chain_extra_const_names(&exported_view, &private_view, WalkBudget::default())
+            .expect("the chain's extraConstNames union");
+
+        // The shape of the defect, asserted rather than described: the private
+        // array is SMALLER, so neither part alone is the population.
+        assert_eq!(
+            exported_extra.len(),
+            94,
+            "exported extraConstNames at the pin"
+        );
+        assert_eq!(
+            private_extra.len(),
+            93,
+            "private extraConstNames at the pin"
+        );
+        assert!(
+            private_extra.len() < exported_extra.len(),
+            "this module is the witness because its private array is the smaller one"
+        );
+        assert_eq!(union.len(), 101, "the union at the pin");
+        assert!(
+            union.len() > exported_extra.len() && union.len() > private_extra.len(),
+            "the union must exceed BOTH parts, or it is not recovering anything"
+        );
+
+        let rendered: Vec<String> = union.iter().map(Name::to_display_string).collect();
+        let private_rendered: Vec<String> =
+            private_extra.iter().map(Name::to_display_string).collect();
+        for name in QSORT_EXPORTED_ONLY_EXTRA {
+            // The load-bearing negative: absent from the private part, so
+            // finding it in the union is evidence about the union and not
+            // about the private array already having it.
+            assert!(
+                !private_rendered.contains(&name.to_owned()),
+                "{name} must be absent from the private part, else it witnesses nothing"
+            );
+            assert!(
+                rendered.contains(&name.to_owned()),
+                "{name} is dropped by a private-only reading and must be in the union"
+            );
+        }
+
+        // Deterministic order: exported part first, in its own array order.
+        assert_eq!(
+            rendered[..exported_extra.len()],
+            exported_extra
+                .iter()
+                .map(Name::to_display_string)
+                .collect::<Vec<_>>()[..],
+            "the union must open with the exported names in array order"
+        );
+
+        // No duplicates survived the merge.
+        let mut sorted = rendered.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            union.len(),
+            "the union must not repeat a name"
+        );
+    }
+
+    /// The union door carries the same identity law as the constant doors.
+    #[test]
+    fn the_extra_const_names_union_refuses_a_foreign_private_part() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the_extra_const_names_union_refuses_a_foreign_private_part: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |relative: &str, suffix: &str| {
+            std::fs::read(lib.join(format!("{relative}.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read {relative}{suffix}: {error}"))
+        };
+        let exported = read("Init/Data/Array/QSort/Basic", "");
+        let other_exported = read("Init/Control/MonadAttach", "");
+        let other_server = read("Init/Control/MonadAttach", ".server");
+        let other_private = read("Init/Control/MonadAttach", ".private");
+
+        let exported_view = OleanView::parse(&exported).expect("exported parses");
+        let foreign_view =
+            OleanView::parse_with_dependencies(&other_private, &[&other_exported, &other_server])
+                .expect("the other module's private part parses against its own chain");
+
+        let error = chain_extra_const_names(&exported_view, &foreign_view, WalkBudget::default())
+            .expect_err("a private part from another module must be refused");
+        assert_eq!(
+            error,
+            DeclError::ChainPartMismatch {
+                part: OleanChainPart::Private
+            },
+            "{error:?}"
+        );
+    }
 
     /// The name index must answer exactly what the linear scan it replaced did,
     /// for every declaration of a real module.
