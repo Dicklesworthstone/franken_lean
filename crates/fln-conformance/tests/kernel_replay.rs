@@ -13873,12 +13873,25 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
 /// no scope -- so the row that DEFINES the gate is the one site no rule could
 /// see. Whitespace is stripped before the comparison so a spelling cannot hide a
 /// claim.
-fn thread_matrix_claim_count(text: &str) -> usize {
-    text.chars()
+///
+/// AND NEITHER MAY A SPELLING WITH NO BRACES AT ALL. Requiring the brace form
+/// left a document free to write "compared at 1, 8 and 32 threads per commit",
+/// naming no scope, and be seen by nothing -- the permissive direction, where a
+/// site escapes the rule rather than being wrongly caught by it. The prose form
+/// counts only where the segment also says "thread", because the three numbers
+/// alone are a list of sections, not a claim about determinism.
+fn thread_matrix_claim_count(segment: &str) -> usize {
+    let stripped = segment
+        .chars()
         .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .matches("{1,8,32}")
-        .count()
+        .collect::<String>();
+    let mut sites = stripped.matches("{1,8,32}").count();
+    if segment.to_ascii_lowercase().contains("thread") {
+        for prose in ["1,8and32", "1,8,and32", "1,8or32"] {
+            sites += stripped.matches(prose).count();
+        }
+    }
+    sites
 }
 
 fn states_thread_matrix_claim(line: &str) -> bool {
@@ -17123,9 +17136,27 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         states_thread_matrix_claim("across {1,8,32} threads per commit"),
         "the unspaced spelling must be recognised, or the plan's PG-5 gate row stays invisible"
     );
+    // AND NEITHER MAY A SPELLING WITH NO BRACES. This assertion used to read
+    // `!states_thread_matrix_claim`, pinning a narrowness that WAS the escape: a
+    // document could state the claim in prose, name no scope, and be seen by
+    // nothing. Flipping a control is worth saying out loud -- the old one was
+    // not wrong about false joins, it was wrong about which risk was larger.
     assert!(
-        !states_thread_matrix_claim("across 1, 8 and 32 threads"),
-        "prose about the same numbers is not a statement of the claim"
+        states_thread_matrix_claim("compared at 1, 8 and 32 threads per commit"),
+        "a claim spelled in prose is still the claim, and naming no scope is exactly how it \
+         would have escaped"
+    );
+    assert!(
+        states_thread_matrix_claim("at 1, 8, and 32 threads"),
+        "an Oxford comma is a spelling, not a different claim"
+    );
+    // AND THE BOUND THAT REPLACES IT: THE NUMBERS ALONE ARE NOT A CLAIM. This is
+    // the control against my own widening -- without the "thread" requirement,
+    // any list naming those three numbers becomes a determinism claim.
+    assert!(
+        !states_thread_matrix_claim("see sections 1, 8 and 32 of the plan"),
+        "three numbers in a list are not a statement about thread counts; a widening that reads \
+         them as one invents sites nobody wrote"
     );
     // THREE, NOT TWO, AND THE THIRD WAS ALWAYS THERE. Raising a ledger is the
     // direction that hides rot, so the reason is recorded: the count rose
