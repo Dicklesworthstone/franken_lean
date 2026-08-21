@@ -262,6 +262,11 @@ the toolchain would report a perfect facade:
     closure class, while Init-substrate rows carry none. An un-demanded row
     cannot introduce an unclassified semantic effect.
 
+  * A MANIFEST-SAFETY-TOTALITY JOIN requires every typed declaration to carry
+    a recognized safe or unsafe classification, while Init-substrate rows carry
+    none. Closure-only declarations cannot evade the safety accounting used by
+    the demanded slice.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1502,6 +1507,37 @@ def main():
             f"({json.dumps(manifest_effect_join, sort_keys=True)}, "
             f"unknown={unknown_effect_rows[:8]!r}, init={init_effect_rows[:8]!r})"
         )
+    unknown_safety_rows = []
+    init_safety_rows = []
+    manifest_safety_counts = Counter()
+    for row in manifest_rows:
+        safety = row.get("safety")
+        if row.get("role") == "init-substrate":
+            if safety is not None:
+                init_safety_rows.append(row["name"])
+            continue
+        if safety not in DEMANDED_SAFETIES:
+            unknown_safety_rows.append(row["name"])
+            continue
+        manifest_safety_counts[safety] += 1
+    manifest_safety_join = {
+        "typed_rows": manifest_signature_join["non_init_rows"],
+        "recognized_safety_rows": sum(manifest_safety_counts.values()),
+        "safeties": dict(sorted(manifest_safety_counts.items())),
+        "init_rows": manifest_signature_join["init_rows"],
+        "init_rows_with_safety": len(init_safety_rows),
+        "unknown_safety_rows": len(unknown_safety_rows),
+    }
+    if (manifest_safety_join["typed_rows"] == 0
+            or manifest_safety_join["recognized_safety_rows"]
+            != manifest_safety_join["typed_rows"]
+            or manifest_safety_join["init_rows_with_safety"] != 0
+            or manifest_safety_join["unknown_safety_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest safety-totality join failed "
+            f"({json.dumps(manifest_safety_join, sort_keys=True)}, "
+            f"unknown={unknown_safety_rows[:8]!r}, init={init_safety_rows[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1933,6 +1969,7 @@ def main():
         "manifest_global_provider_join": manifest_provider_join,
         "manifest_type_dependency_totality_join": manifest_type_dependency_join,
         "manifest_effect_totality_join": manifest_effect_join,
+        "manifest_safety_totality_join": manifest_safety_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
