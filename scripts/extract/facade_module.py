@@ -1626,9 +1626,12 @@ _PUBLISHED_VIEW = []
 # with the best-of text, which is right for the end-of-run checks and useless to
 # the exit path: see artifact_divergence_note.
 _FACADE_REPLACED = []
+# What this run declared it would produce, for the same reason and read the same
+# way: the exit path cannot see main's args.
+_DECLARED_VIEW = []
 
 
-def artifact_divergence_note(published, replaced):
+def artifact_divergence_note(published, replaced, declared=()):
     """Did this run replace the facade and then refuse before the manifest?
 
     Every check added over the last several waves runs at the END of main, and a
@@ -1662,15 +1665,28 @@ def artifact_divergence_note(published, replaced):
     # registry, this note was silent for exactly those six: the facade on disk was
     # already this run's, `published` was still empty, and nothing printed. Keyed
     # on the replace, the window it covers starts where the risk starts.
-    kinds = {entry[1] for entry in published.values()}
-    if not replaced or "the manifest" in kinds:
+    # ASKED OF THE DECLARED OUTPUTS, not of a label. This matched the string
+    # "the manifest" against a description written at the registration site 2000
+    # lines away -- the same population written down twice, and coupled in the
+    # dangerous direction: rename it at the registration and this test is false on
+    # every SUCCESSFUL run, so the note fires every time and stops meaning
+    # anything. It also could not grow. A third artifact would leave the note
+    # calling the run finished the moment the manifest landed, whatever happened
+    # to the third.
+    #
+    # The question is whether everything this run promised to produce got
+    # produced, so that is what it now asks.
+    if not replaced or not declared:
+        return None
+    missing = [path for path in declared if path not in published]
+    if not missing:
         return None
     facade = sorted(set(replaced))
-    return (f"THE TWO ARTIFACTS ARE NOW OUT OF STEP. This run replaced {facade} and "
-            "then refused before writing the manifest, so the facade on disk is "
-            "from this run and the manifest still describes the previous one. "
-            "Neither file looks damaged and nothing else will tell you. Regenerate "
-            "before reading either, and do not commit the pair as it stands")
+    return (f"THE ARTIFACTS ARE NOW OUT OF STEP. This run replaced {facade} and "
+            f"then stopped without publishing {missing}, so what is on disk is "
+            "part this run and part the previous one. Nothing looks damaged and "
+            "nothing else will tell you. Regenerate before reading any of it, and "
+            "do not commit the set as it stands")
 
 
 def work_scratch_report(work):
@@ -2543,6 +2559,7 @@ def main():
     # ...and made visible to the exit path, which is the only place that can see a
     # run that published the facade and then refused before the manifest
     _PUBLISHED_VIEW.append(published)
+    _DECLARED_VIEW.append(declared_outputs(args))
     # every scratch path this run creates, recorded where it is created so the
     # leak check's scope can be compared against what actually gets written
     scratch_created = set()
@@ -3733,8 +3750,9 @@ def _report_divergence():
     would be three chances for one of them to drift, which is the defect this
     file already refuses under the name "one word, two definitions".
     """
+    declared = _DECLARED_VIEW[0] if _DECLARED_VIEW else ()
     for published in _PUBLISHED_VIEW:
-        note = artifact_divergence_note(published, _FACADE_REPLACED)
+        note = artifact_divergence_note(published, _FACADE_REPLACED, declared)
         if note:
             print("NOTE: " + note, file=sys.stderr)
 
