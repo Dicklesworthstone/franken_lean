@@ -162,6 +162,10 @@ the toolchain would report a perfect facade:
     terminal generator attempt with zero errors. The facade cannot advertise a
     clean emitted surface while its recorded generation remains unresolved.
 
+  * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
+    the facade manifest. Pin-derived provenance cannot be a self-reported list
+    detached from the actual census and resistance inputs.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -943,6 +947,38 @@ def join_manifest_demanded_outcomes(manifest_rows, summary):
     return actual
 
 
+def join_manifest_input_digests(summary):
+    """Bind manifest provenance entries to current repository input bytes."""
+    entries = summary.get("inputs")
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit("REFUSE: facade manifest has no extraction-input digests")
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SystemExit("REFUSE: facade manifest input entry is not an object")
+        path = entry.get("path")
+        digest = entry.get("sha256")
+        full_path = os.path.abspath(os.path.join(REPO, path)) if isinstance(path, str) else None
+        if (not isinstance(path, str)
+                or os.path.isabs(path)
+                or os.path.commonpath((REPO, full_path)) != REPO
+                or not os.path.isfile(full_path)
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or path in seen):
+            raise SystemExit(
+                f"REFUSE: facade manifest carries an invalid input provenance row {entry!r}"
+            )
+        seen.add(path)
+        actual = input_digest(full_path)["sha256"]
+        if actual != digest:
+            raise SystemExit(
+                "REFUSE: facade manifest input-digest join drifted for "
+                f"{path} (manifest={digest}, actual={actual})"
+            )
+    return {"verified_inputs": len(entries)}
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -1128,6 +1164,7 @@ def main():
             "REFUSE: facade manifest generator-residue join failed "
             f"({json.dumps(generator_residue, sort_keys=True)})"
         )
+    manifest_input_digest_join = join_manifest_input_digests(manifest_summary)
     manifest_outcome_join = join_manifest_demanded_outcomes(
         manifest_rows, manifest_summary
     )
@@ -1278,6 +1315,7 @@ def main():
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
         "manifest_generator_residue_join": generator_residue,
+        "manifest_input_digest_join": manifest_input_digest_join,
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
