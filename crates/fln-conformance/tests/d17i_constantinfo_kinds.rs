@@ -3103,3 +3103,86 @@ fn the_module_header_arrays_grow_between_levels_and_never_shrink() {
         "the extensions only the private level carries"
     );
 }
+
+/// Count the leading `∀` binders of a type.
+fn telescope_length(type_: &Expr) -> usize {
+    let mut current = type_;
+    let mut length = 0usize;
+    while let ExprNode::ForallE { body, .. } = current.node() {
+        length += 1;
+        current = body;
+    }
+    length
+}
+
+/// The stored arities checked against the TYPE they describe.
+///
+/// `cd572cac` compared a recursor's `num_motives` and `num_minors` against its
+/// BLOCK, and `db2ea8b0` compared a rule's `nfields` against its constructor.
+/// Neither compared any of these numbers against the thing they are arities OF.
+/// A constructor's `num_params` and `num_fields` describe its own type's binder
+/// telescope; a recursor's four counts plus its major premise describe its own.
+/// Both are derivable from the decoded type, and a decode that read a count
+/// correctly but the type wrongly — or the reverse — passes every earlier cell.
+///
+/// Measured over `Init/Prelude` at private level: 157 constructors, every
+/// telescope exactly `num_params + num_fields`; 129 recursors, every telescope
+/// exactly `num_params + num_motives + num_minors + num_indices + 1`.
+///
+/// THE RECURSOR RESULT NARROWS AN EARLIER CARVE-OUT, which is the part worth
+/// keeping. The three `Lean.Syntax` recursors are excused in two other cells
+/// because their motive and minor counts describe the nested-EXPANDED block
+/// rather than their `all` list. They need no exception here: their stored
+/// counts match their own type exactly. So those recursors are internally
+/// consistent, and the exception is to a block-derived expectation rather than
+/// to anything about the recursors themselves — a narrower claim than "nested
+/// recursors are different", and the accurate one.
+#[test]
+fn stored_arities_match_the_telescopes_they_describe() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut constructors = 0usize;
+    let mut with_fields = 0usize;
+    let mut recursors = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Ctor(v) => {
+                constructors += 1;
+                if v.num_fields > 0 {
+                    with_fields += 1;
+                }
+                assert_eq!(
+                    telescope_length(&v.base.type_),
+                    (v.num_params + v.num_fields) as usize,
+                    "{name}: type telescope must be exactly its parameters plus its fields"
+                );
+            }
+            ConstantInfo::Rec(v) => {
+                recursors += 1;
+                // Parameters, motives, minor premises, indices, then the major.
+                let expected =
+                    (v.num_params + v.num_motives + v.num_minors + v.num_indices) as usize + 1;
+                assert_eq!(
+                    telescope_length(&v.base.type_),
+                    expected,
+                    "{name}: type telescope must be its four counts plus the major premise. \
+                     Note this needs no nesting exception — the Lean.Syntax recursors are \
+                     internally consistent, and the carve-outs elsewhere are against a \
+                     BLOCK-derived expectation, not against their own type."
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Anti-vacuity: an all-zero read of num_fields would satisfy the
+    // constructor equality for every nullary constructor, which is 16 of 157
+    // here — so the field-bearing majority has to be real.
+    assert!(
+        constructors >= 150 && with_fields >= 130 && recursors >= 120,
+        "the pin's block census must be reached ({constructors} constructors, {with_fields} \
+         with fields, {recursors} recursors)"
+    );
+}
