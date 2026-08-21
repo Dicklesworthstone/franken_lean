@@ -1995,6 +1995,23 @@ fn kr600_803_init_list_refuses_a_forged_cons_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_list_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = init_list_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 2);
+    assert_eq!(metadata.num_parameters(), 1);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 2);
+    assert_eq!(metadata.rules().len(), 2);
+    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["List", "nil"]));
+    assert_eq!(metadata.rules()[0].num_fields(), 0);
+    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["List", "cons"]));
+    assert_eq!(metadata.rules()[1].num_fields(), 2);
+}
+
+#[test]
 fn kr600_803_init_empty_eliminator_is_reconstructed_independently() {
     let entries = init_empty_entries();
     let verdict = admit_inductive(
