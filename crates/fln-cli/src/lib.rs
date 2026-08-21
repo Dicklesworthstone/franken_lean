@@ -53,6 +53,10 @@ const CORE_OBSERVABLES_LOOP_RESIDUAL_PREFIXES: [&str; 2] = [
     "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.",
     "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.",
 ];
+const CORE_OBSERVABLES_LOOP_UNSAFE_REC_RESIDUAL_PREFIXES: [&str; 2] = [
+    "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+    "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+];
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -2728,6 +2732,12 @@ fn is_private_loop_match_one_residual(display: &str) -> bool {
     false
 }
 
+fn is_core_observables_loop_unsafe_rec_residual(display: &str) -> bool {
+    CORE_OBSERVABLES_LOOP_UNSAFE_REC_RESIDUAL_PREFIXES
+        .iter()
+        .any(|prefix| display.starts_with(prefix))
+}
+
 fn render_named_residuals_json(residuals: &mut DecodedNamedResiduals) -> String {
     format!(
         "[{}]",
@@ -2805,6 +2815,14 @@ fn render_check_olean_success(
     };
     private_loop_match_one_residuals
         .observe_matching(&checked.decoded.constants, is_private_loop_match_one_residual);
+    let mut core_observables_loop_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    core_observables_loop_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_core_observables_loop_unsafe_rec_residual,
+    );
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
@@ -2847,6 +2865,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_loop_match_one_residuals)
     };
+    let core_observables_loop_unsafe_rec_observed =
+        core_observables_loop_unsafe_rec_residuals.observed;
+    let core_observables_loop_unsafe_rec_omitted =
+        core_observables_loop_unsafe_rec_residuals.omitted();
+    let core_observables_loop_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut core_observables_loop_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut core_observables_loop_unsafe_rec_residuals)
+    };
     let stdout = if json {
         format!(
             concat!(
@@ -2860,6 +2887,7 @@ fn render_check_olean_success(
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -2888,6 +2916,9 @@ fn render_check_olean_success(
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
+            core_observables_loop_unsafe_rec_observed,
+            core_observables_loop_unsafe_rec_names,
+            core_observables_loop_unsafe_rec_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
@@ -2920,6 +2951,9 @@ fn render_check_olean_success(
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
+                "core-observables Lean.Syntax .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "core-observables Lean.Syntax .loop._unsafe_rec residual names: {}\n",
+                "core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: {}\n",
                 "dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -2949,6 +2983,9 @@ fn render_check_olean_success(
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
+            core_observables_loop_unsafe_rec_observed,
+            core_observables_loop_unsafe_rec_names,
+            core_observables_loop_unsafe_rec_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
@@ -3330,6 +3367,16 @@ fn render_check_olean_set_success(
         private_loop_match_one_residuals
             .observe_matching(&module.decoded.constants, is_private_loop_match_one_residual);
     }
+    let mut core_observables_loop_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        core_observables_loop_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_core_observables_loop_unsafe_rec_residual,
+        );
+    }
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
@@ -3372,6 +3419,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_loop_match_one_residuals)
     };
+    let core_observables_loop_unsafe_rec_observed =
+        core_observables_loop_unsafe_rec_residuals.observed;
+    let core_observables_loop_unsafe_rec_omitted =
+        core_observables_loop_unsafe_rec_residuals.omitted();
+    let core_observables_loop_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut core_observables_loop_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut core_observables_loop_unsafe_rec_residuals)
+    };
     let companion_modules = checked
         .modules
         .iter()
@@ -3391,6 +3447,7 @@ fn render_check_olean_set_success(
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
@@ -3421,6 +3478,9 @@ fn render_check_olean_set_success(
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
+            core_observables_loop_unsafe_rec_observed,
+            core_observables_loop_unsafe_rec_names,
+            core_observables_loop_unsafe_rec_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
@@ -3455,6 +3515,9 @@ fn render_check_olean_set_success(
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
+                "core-observables Lean.Syntax .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "core-observables Lean.Syntax .loop._unsafe_rec residual names: {}\n",
+                "core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: {}\n",
                 "module and declaration dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -3486,6 +3549,9 @@ fn render_check_olean_set_success(
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
+            core_observables_loop_unsafe_rec_observed,
+            core_observables_loop_unsafe_rec_names,
+            core_observables_loop_unsafe_rec_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
