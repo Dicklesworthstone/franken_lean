@@ -1176,6 +1176,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "mergeSortInternalSplitTraversalUnsafeRecResiduals",
+        1,
+        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateFindLeadingSpacesConsumeUnsafeRecResiduals",
         1,
         &[
@@ -1665,6 +1671,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &human.stdout,
         "decoded _private splitRevAt.go._unsafe_rec residuals",
         "decoded _private splitRevAt.go._unsafe_rec residual names",
+        1,
+        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private List.MergeSort internal split traversal _unsafe_rec residuals",
+        "decoded _private List.MergeSort internal split traversal _unsafe_rec residual names",
         1,
         &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"],
     );
