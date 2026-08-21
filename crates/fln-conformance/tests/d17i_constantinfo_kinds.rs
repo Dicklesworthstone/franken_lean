@@ -2998,3 +2998,108 @@ fn the_import_that_licenses_the_cross_module_private_reference_is_declared() {
         );
     }
 }
+
+/// The extension blocks the private part adds and the exported part lacks.
+const PRIVATE_ONLY_EXTENSIONS: &[&str] = &[
+    "Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt",
+    "Lean.declRangeExt",
+    "Lean.docStringExt",
+    "_private.Lean.Compiler.LCNF.Specialize.0.Lean.Compiler.LCNF.Specialize.specCacheExt",
+    "_private.Lean.DocString.Extension.0.Lean.inheritDocStringExt",
+    "_private.Lean.DocString.Extension.0.Lean.moduleDocExt",
+];
+
+/// `extraConstNames` and `entries` — the two module-header arrays left, and the
+/// first of them is a hypothesis this bead already ruled out.
+///
+/// `extraConstNames` was investigated as a candidate source of the missing
+/// equation-compiler auxiliaries and rejected: it holds IR / code-generator
+/// names with no `ConstantInfo` behind them, so nothing there could ever have
+/// become a declaration. The pipeline decodes it to a COUNT and never reads its
+/// contents. Pinning the count is what stops that ruled-out hypothesis being
+/// re-chased on the grounds that "nobody checked".
+///
+/// Measured over `Init/Prelude`: 424 extra names at exported level and 713 at
+/// private, against 2,204 and 2,314 declarations. Both arrays GROW between the
+/// levels, and they are different arrays of different sizes — the auxiliaries
+/// the earlier cells recovered by name came from `constants`, not from here.
+///
+/// The mirror law is asserted from the header rather than from the decoder. A
+/// module stores `constNames` and `constants` as two separate arrays, and
+/// `decode_module_constants` enforces `constNames[i] == constants[i].name`
+/// while walking them; reading the two LENGTHS off the header is an independent
+/// check of the same law, one that does not go through the code enforcing it.
+///
+/// `entries` carries the environment extensions, and the private part is a
+/// strict SUPERSET: 56 blocks exported, 62 private, nothing lost, and the six
+/// additions are the documentation and compiler-cache extensions above. That is
+/// the same shape as every other exported/private result on this bead — the
+/// private level adds, and never removes.
+#[test]
+fn the_module_header_arrays_grow_between_levels_and_never_shrink() {
+    let lib = lib_or_skip!();
+
+    for module in ["Init.Prelude", "Init.Meta.Defs"] {
+        let exported = module_view(&lib, module, Level::Exported);
+        let private = module_view(&lib, module, Level::Private);
+
+        for (label, view) in [("exported", &exported), ("private", &private)] {
+            // The mirror law, read off the header's two array lengths.
+            assert_eq!(
+                view.const_names.len() as u64,
+                view.constants,
+                "{module} [{label}]: constNames and constants must be the same length"
+            );
+            assert!(
+                view.extra_const_names > 0,
+                "{module} [{label}]: extraConstNames is populated at the pin; a zero here would \
+                 make the ruled-out hypothesis untestable rather than ruled out"
+            );
+            assert_ne!(
+                view.extra_const_names, view.constants,
+                "{module} [{label}]: extraConstNames is a DIFFERENT population from constants — \
+                 the recovered auxiliaries came from the latter"
+            );
+        }
+
+        assert!(
+            private.constants > exported.constants
+                && private.extra_const_names > exported.extra_const_names,
+            "{module}: both header arrays grow between the levels (constants {} -> {}, extra {} \
+             -> {})",
+            exported.constants,
+            private.constants,
+            exported.extra_const_names,
+            private.extra_const_names
+        );
+    }
+
+    // Extensions: the private part adds and never removes.
+    let exported = module_view(&lib, "Init.Prelude", Level::Exported);
+    let private = module_view(&lib, "Init.Prelude", Level::Private);
+    let exported_names: BTreeSet<&str> = exported
+        .extensions
+        .iter()
+        .map(|block| block.name.as_str())
+        .collect();
+    let private_names: BTreeSet<&str> = private
+        .extensions
+        .iter()
+        .map(|block| block.name.as_str())
+        .collect();
+    assert!(
+        exported_names.len() >= 50 && !exported_names.is_empty(),
+        "the pin carries a real extension surface, got {}",
+        exported_names.len()
+    );
+    let lost: Vec<&&str> = exported_names.difference(&private_names).collect();
+    assert!(
+        lost.is_empty(),
+        "the private part must not drop an extension the exported part carries: {lost:?}"
+    );
+    let added: Vec<&str> = private_names.difference(&exported_names).copied().collect();
+    assert_eq!(
+        added, PRIVATE_ONLY_EXTENSIONS,
+        "the extensions only the private level carries"
+    );
+}
