@@ -27,6 +27,11 @@ the toolchain would report a perfect facade:
   * A NEGATIVE CONTROL runs the same probe against an EMPTY facade. If it does not
     fail, the whole run refuses: whatever the probe was proving, it was not the
     facade.
+  * A ROW-REMOVAL CONTROL selects a demanded leaf axiom from the generated
+    manifest, removes exactly that declaration from a temporary facade, and
+    requires the matching probe row to become unavailable. This proves the rig
+    can detect a missing generated row rather than merely a completely empty
+    module.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -152,6 +157,52 @@ def build_facade(lean, env, root, source, label):
     return root
 
 
+def choose_row_removal_control(names, manifest_rows):
+    """Choose a demanded axiom whose removal leaves the temporary facade buildable.
+
+    A hard-coded symbol would rot when the exact demand or the generated closure
+    moves. A leaf has no manifest type-level dependents, so deleting its one axiom
+    line tests probe resolution rather than merely breaking a different signature
+    while building the negative-control facade.
+    """
+    dependents = Counter(
+        dep for row in manifest_rows for dep in row.get("type_deps", ())
+    )
+    candidates = sorted(
+        row["name"]
+        for row in manifest_rows
+        if row["name"] in names
+        and row.get("demanded_outcome") == "emitted"
+        and row.get("form") == "axiom"
+        and not row.get("provided_by")
+        and dependents[row["name"]] == 0
+    )
+    if not candidates:
+        raise SystemExit(
+            "REFUSE: no demanded leaf axiom is available for the row-removal "
+            "control — a rig that cannot make one generated row disappear cannot "
+            "prove it detects missing-row drift"
+        )
+    return candidates[0]
+
+
+def write_row_removed_facade(source, destination, name):
+    """Copy `source` while removing exactly one generated axiom declaration."""
+    with open(source, encoding="utf-8") as fh:
+        text = fh.read()
+    pattern = re.compile(
+        rf"^axiom {re.escape(name)}(?:\.\{{[^}}]*\}})? : .*$", re.MULTILINE
+    )
+    candidate, removed = pattern.subn("", text, count=1)
+    if removed != 1:
+        raise SystemExit(
+            f"REFUSE: row-removal control could not remove exactly one axiom for "
+            f"{name} (removed={removed}) — the generated declaration spelling drifted"
+        )
+    with open(destination, "w", encoding="utf-8") as fh:
+        fh.write(candidate)
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -255,13 +306,17 @@ def main():
     env["LC_ALL"] = "C"
 
     sigs = {}
+    manifest_rows = []
     with open(args.module_manifest, encoding="utf-8") as fh:
         for line in fh:
             row = json.loads(line)
-            if row.get("kind") == "decl" and row.get("signature"):
+            if row.get("kind") != "decl":
+                continue
+            manifest_rows.append(row)
+            if row.get("signature"):
                 sigs[row["name"]] = {"signature": row["signature"],
-                                     "level_params": row.get("level_params") or [],
-                                     "form": row.get("form")}
+                                       "level_params": row.get("level_params") or [],
+                                       "form": row.get("form")}
     if not sigs:
         raise SystemExit("REFUSE: the module manifest carries no signatures — the "
                          "run would silently degrade to a name-only check")
@@ -287,6 +342,26 @@ def main():
             f"REFUSE: the facade resolves {ok_facade} of {len(control_names)} names and "
             f"an EMPTY facade resolves {ok_empty} — the probe is measuring the "
             "substrate, not the facade, and no result from it may be published")
+
+    removed_name = choose_row_removal_control(set(control_names), manifest_rows)
+    if v_facade[removed_name] != "available":
+        raise SystemExit(
+            f"REFUSE: row-removal control selected {removed_name}, but the generated "
+            f"facade already reports {v_facade[removed_name]!r}"
+        )
+    removed_src = os.path.join(work, "row_removed.lean")
+    write_row_removed_facade(args.facade, removed_src, removed_name)
+    removed_root = build_facade(
+        lean, env, os.path.join(work, "row_removed"), removed_src, "row-removed"
+    )
+    v_removed, removed_detail, _ = run_probe(
+        lean, removed_root, work, "control_row_removed", [removed_name], sigs
+    )
+    if v_removed[removed_name] == "available":
+        raise SystemExit(
+            f"REFUSE: row-removal control removed {removed_name}, but the probe still "
+            "accepts it — missing generated rows are not observable to this rig"
+        )
 
     rows = []
     per_module = {}
@@ -334,6 +409,12 @@ def main():
         "control_facade_available": ok_facade,
         "control_empty_available": ok_empty,
         "control_delta": ok_facade - ok_empty,
+        "row_removal_control": {
+            "name": removed_name,
+            "generated_verdict": v_facade[removed_name],
+            "removed_verdict": v_removed[removed_name],
+            "removed_diagnostic": removed_detail.get(removed_name),
+        },
         "reference_imported": False,
         "reading": "every toolchain-api constant the curated real mathlib metaprogram "
                    "files actually use, checked at its Reference type against the "
