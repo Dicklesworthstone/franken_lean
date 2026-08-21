@@ -1929,18 +1929,30 @@ def insufficient_space_error(targets):
 
     `targets` is (path, floor_bytes, description). Returns an error string or None.
     """
-    short = []
+    # SUMMED PER FILESYSTEM, because two targets on one device compete for the
+    # same bytes. Checked independently -- which is how this shipped at 10799472 --
+    # a run whose free space sits between the largest single floor and their total
+    # passes the pre-flight and then fails in the middle anyway, which is the one
+    # outcome the check exists to prevent. Measured on this box: the output and the
+    # scratch are both st_dev 66308, so they have never been separate here.
+    by_device = {}
     for path, floor, what in targets:
         if not floor:
             continue
         try:
-            st = os.statvfs(path)
+            device = os.stat(path).st_dev
+            free = (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(path))
         except OSError:
             continue
-        free = st.f_bavail * st.f_frsize
-        if free < floor:
-            short.append(f"{what} needs at least {floor} bytes on {path} and has "
-                         f"{free}")
+        entry = by_device.setdefault(device, {"free": free, "need": 0, "why": []})
+        entry["need"] += floor
+        entry["why"].append(f"{what} {floor} on {path}")
+    short = []
+    for device, entry in sorted(by_device.items()):
+        if entry["free"] < entry["need"]:
+            short.append(f"filesystem {device} holds {entry['free']} bytes free and "
+                         f"this run needs {entry['need']} for "
+                         + " plus ".join(entry["why"]))
     if short:
         return ("this run cannot finish where it is being asked to write: "
                 + "; ".join(short)
@@ -2778,6 +2790,28 @@ def self_test():
          insufficient_space_error(((work, 1 << 62, "an impossible artifact"),)), True)
     case("space/no-prior-artifact-says-nothing",
          insufficient_space_error(((work, 0, "a first run"),)), False)
+    # Two targets on ONE filesystem compete for the same bytes. Each floor here is
+    # a third of what is free, so either alone fits and the two together do not --
+    # the state the old per-target comparison passed.
+    _free = (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(work))
+    _third = max(1, _free // 3)
+    case("space/two-floors-on-one-filesystem-are-summed",
+         insufficient_space_error(((work, _third, "a"), (work, _third, "b"))), False)
+    case("space/summed-floors-exceed-free",
+         insufficient_space_error(
+             ((work, _third * 2, "a"), (work, _third * 2, "b"))), True)
+    # TWO DIFFERENT PATHS on one device must still sum. Keying the grouping by
+    # path instead of by st_dev passes every case above -- they all name the same
+    # path -- and is exactly the mistake that matters here, because the real
+    # targets are contracts/ and TMPDIR, which are different paths on one
+    # filesystem (st_dev 66308 on this box).
+    _sub = os.path.join(work, "same-device-subdir")
+    os.makedirs(_sub, exist_ok=True)
+    case("space/distinct-paths-one-device-are-summed",
+         insufficient_space_error(
+             ((work, _third * 2, "a"), (_sub, _third * 2, "b"))), True)
+    case("space/one-of-those-floors-alone-fits",
+         insufficient_space_error(((work, _third * 2, "a"),)), False)
     case("space/unreadable-path-says-nothing",
          insufficient_space_error(((os.path.join(work, "nope"), 1, "gone"),)), False)
     _fifo = os.path.join(work, "fifo-artifact.lean")
