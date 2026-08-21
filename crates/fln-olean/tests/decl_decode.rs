@@ -6087,3 +6087,336 @@ fn the_element_nesting_terminates() {
          identification where shapes collide"
     );
 }
+
+/// The reconciliation ledger - every stage with its UNIT, and the arithmetic
+/// between them.
+///
+/// The five wrapped objects' second field is already pinned at `7e65ed09` as
+/// `boxed 0` four times and a pointer once, with the seeds at zero; this wave
+/// offers it a third time and it needs no second cell. What this file does need
+/// is the mechanism I named after `5313a5c9`: that red was a number drifting
+/// from a total already pinned twenty lines away, and nothing tied the two
+/// together. This is the tie.
+///
+/// It walks the whole structure once and asserts the identities BETWEEN stages,
+/// which no individual cell can: 71 + 11 + 17 = 99, 57 + 8 + 4 = 69,
+/// 56 + 46 = 102, 54 + 46 = 100, 101 + 1 = 102. A number that drifts in any one
+/// cell now contradicts an identity here rather than passing quietly.
+///
+/// IT ALREADY FOUND TWO THINGS, and both are units rather than errors.
+///
+/// The slot-2 arrays are 69 by REFERENCE and 51 by object, carrying 157
+/// elements counted per reference and 123 per distinct array - and 111 distinct
+/// elements either way. `3b510e62` and `a4de2083` are both right and are
+/// counting different things.
+///
+/// AND THE TWO POPULATIONS ARE NOT DISJOINT BELOW THE RECORDS. `d8906952`
+/// proved the four-field records disjoint - 54 and 46, sharing none - and I
+/// have written "both populations kept apart" in five commits since as though
+/// that separation continued downward. It does not. They share 5 arrays, 12
+/// `tag 1` elements, 1 `tag 2` element and 1 wrapped object. So `2d20e69f`'s 46
+/// is 46 per-population MEMBERSHIPS over 33 distinct objects, which is what its
+/// arithmetic computes and not what its prose implies.
+///
+/// Disjointness proved at one depth is not disjointness, and nothing in this
+/// file said where it stopped.
+#[test]
+fn the_measured_chain_reconciles() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut ledger: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let mut count = |key: &str, by: usize| *ledger.entry(key.to_owned()).or_default() += by;
+
+        // Stage 1: the third shape, split by what its tail is.
+        let (mut tag0, mut tag4, mut boxed) = (Vec::new(), 0usize, 0usize);
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            if second & 1 == 1 {
+                if second >> 1 != 0 {
+                    boxed += 1;
+                }
+                continue;
+            }
+            match resolve(second).and_then(shape) {
+                Some((1, 2)) | None => {}
+                Some((0, 2)) => tag0.push(object.off),
+                Some((4, 2)) => tag4 += 1,
+                Some(_) => {}
+            }
+        }
+        count("1 third/tag0-tailed", tag0.len());
+        count("1 third/tag4-tailed", tag4);
+        count("1 third/boxed-tailed", boxed);
+
+        // Stage 2: head records, by reference and by object.
+        let heads: Vec<usize> = tag0
+            .iter()
+            .filter_map(|&node| resolve(word_at(bytes, node + 8)))
+            .filter(|&head| shape(head) == Some((0, 5)))
+            .collect();
+        let records: BTreeSet<usize> = heads.iter().copied().collect();
+        count("2 heads/references", heads.len());
+        count("2 heads/objects", records.len());
+
+        // Stage 3: slot-2 arrays, in three units.
+        let mut array_references = 0usize;
+        let mut arrays: BTreeSet<usize> = BTreeSet::new();
+        let mut per_reference = 0usize;
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                array_references += 1;
+                arrays.insert(array);
+                per_reference += word_at(bytes, array + 8) as usize;
+            }
+        }
+        let mut per_object = 0usize;
+        let mut elements: BTreeSet<usize> = BTreeSet::new();
+        for &array in &arrays {
+            for i in 0..word_at(bytes, array + 8) {
+                per_object += 1;
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) {
+                    elements.insert(element);
+                }
+            }
+        }
+        count("3 arrays/references", array_references);
+        count("3 arrays/objects", arrays.len());
+        count("3 elements/per array reference", per_reference);
+        count("3 elements/per array object", per_object);
+        count("3 elements/objects", elements.len());
+
+        // Stage 4: slot 4.
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            match resolve(word_at(bytes, record + 8 + 8 * 4)) {
+                Some(target) => match shape(target) {
+                    Some((0, 2)) => {
+                        count("4 slot4/pair", 1);
+                        seeds.insert(target);
+                    }
+                    Some((1, 2)) => count("4 slot4/third shape", 1),
+                    Some((5, 1)) => count("4 slot4/wrapper", 1),
+                    _ => {}
+                },
+                None => {}
+            }
+        }
+
+        // Stage 5: the spine.
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        count("5 spine/seeds", seeds.len());
+        count("5 spine/nodes", all.len());
+        count("5 spine/interior", all.len() - seeds.len());
+
+        // Stage 6/7: four-field records, then their slot-3 arrays and elements,
+        // per population AND pooled.
+        let mut pooled_arrays: BTreeSet<usize> = BTreeSet::new();
+        let mut pooled_first: BTreeSet<usize> = BTreeSet::new();
+        let mut pooled_all_tag1: BTreeSet<usize> = BTreeSet::new();
+        let mut memberships = 0usize;
+        for population in [true, false] {
+            let mut four: BTreeSet<usize> = BTreeSet::new();
+            for &node in &all {
+                if seeds.contains(&node) == population
+                    && let Some(record) = resolve(word_at(bytes, node + 8))
+                {
+                    four.insert(record);
+                }
+            }
+            count(
+                if population {
+                    "6 records/seed"
+                } else {
+                    "6 records/interior"
+                },
+                four.len(),
+            );
+
+            let mut group: BTreeSet<usize> = BTreeSet::new();
+            for &record in &four {
+                let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3)) else {
+                    continue;
+                };
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        group.insert(array);
+                    }
+                }
+            }
+            let mut first: BTreeSet<usize> = BTreeSet::new();
+            let mut second: BTreeSet<usize> = BTreeSet::new();
+            for &array in &group {
+                for i in 0..word_at(bytes, array + 8) {
+                    let word = word_at(bytes, array + 24 + 8 * i as usize);
+                    match resolve(word) {
+                        None => count("7 elements/boxed", 1),
+                        Some(element) => {
+                            count("7 elements/pointer", 1);
+                            match shape(element) {
+                                Some((1, 1)) => {
+                                    first.insert(element);
+                                }
+                                Some((2, 1)) => {
+                                    second.insert(element);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            let wrapped: BTreeSet<usize> = second
+                .iter()
+                .filter_map(|&object| resolve(word_at(bytes, object + 8)))
+                .filter(|&target| shape(target) == Some((1, 1)))
+                .collect();
+            memberships += first.union(&wrapped).count();
+            pooled_arrays.extend(&group);
+            pooled_first.extend(&first);
+            pooled_all_tag1.extend(first.union(&wrapped));
+        }
+        count("8 tag1/memberships", memberships);
+        count("8 tag1/pooled objects", pooled_all_tag1.len());
+        count("8 arrays/pooled objects", pooled_arrays.len());
+        count("8 tag1 elements/pooled objects", pooled_first.len());
+    }
+
+    if !prelude_loaded {
+        assert!(
+            ledger.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    let get = |key: &str| ledger.get(key).copied().unwrap_or_default();
+
+    // Every stage, with its unit named in the key.
+    assert_eq!(
+        ledger
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("1 third/boxed-tailed".to_owned(), 17),
+            ("1 third/tag0-tailed".to_owned(), 71),
+            ("1 third/tag4-tailed".to_owned(), 11),
+            ("2 heads/objects".to_owned(), 69),
+            ("2 heads/references".to_owned(), 71),
+            ("3 arrays/objects".to_owned(), 51),
+            ("3 arrays/references".to_owned(), 69),
+            ("3 elements/objects".to_owned(), 111),
+            ("3 elements/per array object".to_owned(), 123),
+            ("3 elements/per array reference".to_owned(), 157),
+            ("4 slot4/pair".to_owned(), 57),
+            ("4 slot4/third shape".to_owned(), 8),
+            ("4 slot4/wrapper".to_owned(), 4),
+            ("5 spine/interior".to_owned(), 46),
+            ("5 spine/nodes".to_owned(), 102),
+            ("5 spine/seeds".to_owned(), 56),
+            ("6 records/interior".to_owned(), 46),
+            ("6 records/seed".to_owned(), 54),
+            ("7 elements/boxed".to_owned(), 1),
+            ("7 elements/pointer".to_owned(), 101),
+            ("8 arrays/pooled objects".to_owned(), 42),
+            ("8 tag1 elements/pooled objects".to_owned(), 23),
+            ("8 tag1/memberships".to_owned(), 46),
+            ("8 tag1/pooled objects".to_owned(), 33),
+        ],
+        "the whole chain, each number with its unit"
+    );
+
+    // The identities between stages - what no single cell can assert.
+    assert_eq!(
+        get("1 third/tag0-tailed") + get("1 third/tag4-tailed") + get("1 third/boxed-tailed"),
+        99,
+        "the third shape splits three ways and nowhere else"
+    );
+    assert_eq!(
+        get("4 slot4/pair") + get("4 slot4/third shape") + get("4 slot4/wrapper"),
+        get("2 heads/objects"),
+        "slot 4 accounts for every head record"
+    );
+    assert_eq!(
+        get("5 spine/seeds") + get("5 spine/interior"),
+        get("5 spine/nodes"),
+        "the spine is its seeds plus its interior"
+    );
+    assert_eq!(
+        get("6 records/seed") + get("6 records/interior"),
+        100,
+        "one four-field record per spine node, less the two shared head records"
+    );
+    assert_eq!(
+        get("7 elements/pointer") + get("7 elements/boxed"),
+        102,
+        "the slot-3 array elements"
+    );
+
+    // The two unit facts this ledger found.
+    assert_ne!(
+        get("3 elements/per array reference"),
+        get("3 elements/per array object"),
+        "157 and 123 count the same elements through references and through \
+         objects, and both yield 111 distinct - `3b510e62` and `a4de2083` are \
+         counting different things and both are right"
+    );
+    assert_eq!(
+        (get("8 tag1/memberships"), get("8 tag1/pooled objects")),
+        (46, 33),
+        "`2d20e69f`'s 46 is per-population MEMBERSHIPS over 33 distinct \
+         objects. The two populations are NOT disjoint below the four-field \
+         records - `d8906952` proved the RECORDS disjoint, and that is where it \
+         stops: they share 5 arrays and 12 `tag 1` elements"
+    );
+    assert_eq!(
+        (
+            get("8 arrays/pooled objects"),
+            get("8 tag1 elements/pooled objects")
+        ),
+        (42, 23),
+        "pooled against the per-population 14 + 33 arrays and 14 + 21 elements"
+    );
+}
