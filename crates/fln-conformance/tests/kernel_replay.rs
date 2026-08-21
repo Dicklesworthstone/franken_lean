@@ -9623,6 +9623,33 @@ fn the_expectation_collision_detector_reports_only_real_collisions() {
     );
 }
 
+/// Read a retained receipt file: absent, present, or present-and-unreadable.
+///
+/// **Three outcomes, and the guard collapsed two of them.** It matched any
+/// `Err` from `read_to_string` and reported `none_retained` -- so a file that
+/// EXISTS but cannot be read, because a write was interrupted and left invalid
+/// UTF-8, or because its permissions changed, was announced as "no receipt is
+/// retained". That is the green silence this same test was repaired for two
+/// waves ago when the DIRECTORY could move: a passing run stating there is
+/// nothing to check, about evidence that is sitting right there.
+///
+/// Absent is the only outcome that earns the quiet arm, and it is the only one
+/// nobody can fix from the repository. Anything else is a fault about a file
+/// that exists, and the corpus classifier already draws exactly this line for
+/// the corpus root -- it was simply never drawn here.
+fn read_retained_rows(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "the retained receipt file {} exists but could not be read: {error}. That is not the \
+             same as nothing being retained -- an unreadable file is evidence in an unknown \
+             state, and reporting it as absent would hide it",
+            path.display()
+        )),
+    }
+}
+
 /// Validate EVERY row a retained receipt file holds, and say how many there were.
 ///
 /// **Why this is a function rather than a loop inside the guard.** The file is
@@ -9722,6 +9749,63 @@ fn a_receipt_row_is_one_line_even_when_a_field_is_hostile() {
     assert!(
         reason.contains("row 1"),
         "the refusal must blame the hostile row, not its innocent neighbour: {reason}"
+    );
+}
+
+/// Absent, present, and present-but-unreadable are three different answers.
+///
+/// **Demonstrated, because a preventive guard nobody exercises is one whose own
+/// failure modes nobody sees.** All three arms are driven here: a path that is
+/// not there, a readable file, and a file holding bytes that are not UTF-8 --
+/// which is what an interrupted append leaves behind, and the most plausible way
+/// a real retained file becomes unreadable.
+///
+/// The unreadable case must NOT be reported as absent. That is the whole point
+/// of the split, and without this control the difference would be a claim in a
+/// comment.
+#[test]
+fn an_unreadable_retained_file_is_not_reported_as_absent() {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("t6r7-retained-read-v1");
+    fs::create_dir_all(&base).expect("create the retained-read fixture directory");
+
+    // ABSENT.
+    let missing = base.join("not-there.jsonl");
+    assert!(!missing.exists());
+    assert_eq!(
+        read_retained_rows(&missing),
+        Ok(None),
+        "a path that is not there is the one outcome that earns the quiet arm"
+    );
+
+    // PRESENT AND READABLE.
+    let readable = base.join("readable.jsonl");
+    fs::write(&readable, "one row\n").expect("write the readable fixture");
+    assert_eq!(
+        read_retained_rows(&readable),
+        Ok(Some("one row\n".to_string()))
+    );
+
+    // PRESENT AND UNREADABLE: a lone continuation byte is not valid UTF-8, which
+    // is what a half-finished append leaves.
+    let corrupt = base.join("corrupt.jsonl");
+    fs::write(&corrupt, [b'{', 0xFF, b'}', b'\n']).expect("write the corrupt fixture");
+    let fault = read_retained_rows(&corrupt)
+        .expect_err("a file that exists but cannot be decoded is not an absent file");
+    assert!(
+        fault.contains("exists but could not be read"),
+        "the fault must say the file is THERE and unreadable, not that nothing is retained: \
+         {fault}"
+    );
+    assert!(
+        fault.contains("corrupt.jsonl"),
+        "the fault must name the file so it can be inspected: {fault}"
+    );
+
+    // ANTI-VACUITY: the corrupt fixture must really be undecodable, or the case
+    // above would be passing on a file that is merely unusual.
+    assert!(
+        String::from_utf8(fs::read(&corrupt).expect("re-read the corrupt fixture")).is_err(),
+        "the corrupt fixture decodes cleanly, so nothing here exercises the unreadable arm"
     );
 }
 
@@ -9842,9 +9926,9 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
 
     // THE REAL POPULATION, which may legitimately be empty at this commit.
     let path = whole_mathlib_receipt_path(&pin);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) => {
+    let text = match read_retained_rows(&path).unwrap_or_else(|fault| panic!("{fault}")) {
+        Some(text) => text,
+        None => {
             println!(
                 "{{\"schema\":\"fln-t6r7-mathlib-receipt-retention/1\",\"status\":\"none_retained\",\
                  \"pin\":{},\"corpus_commit\":{},\"path\":{},\"reason\":{},\
@@ -9853,7 +9937,7 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
                 json_string(&pin),
                 json_string(&corpus),
                 json_string(&path.display().to_string()),
-                json_string(&error.to_string()),
+                json_string("no such file"),
             );
             return;
         }
