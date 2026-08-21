@@ -17210,6 +17210,39 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
     let code = comment_free(census);
     let code = code.as_str();
 
+    // A DECOY SHAPED LIKE THE THING THIS GUARD SCANS FOR, because the check at
+    // 1afc062c proved the region excludes this function and says nothing about
+    // what would happen if it stopped. The two class checks below are the ones
+    // that would fail SILENTLY rather than loudly.
+    //
+    // The forward scan reads every `schedule_independence=` in the region and
+    // demands a permitted token; the reverse loop demands that each permitted
+    // class actually appear, spelled `schedule_independence=<token>`. Today the
+    // guard's own body contains the prefix and the tokens but never the two
+    // JOINED, so it cannot satisfy either check by accident. Nothing holds that:
+    // one future line quoting a whole row -- in an error message, an example, a
+    // wider assertion -- puts the joined form inside this function, and if the
+    // region ever includes it, `class_token` reads a PERMITTED token from it and
+    // both checks pass while the census below has stopped saying anything.
+    //
+    // So the joined form is planted here deliberately, with a unique prefix so
+    // it can be found, and asserted absent from the region. It is `code` rather
+    // than `census` that must not contain it: comments are stripped before the
+    // scan, so a decoy in a comment would be removed by the very step this is
+    // testing and would prove nothing.
+    const CENSUS_SELF_SATISFACTION_DECOY: &str =
+        "decoy-2f8b schedule_independence=not_measured_in_this_run";
+    assert!(
+        SOURCE.contains(CENSUS_SELF_SATISFACTION_DECOY),
+        "the decoy is gone from this file, so its absence from the search region proves \
+         nothing; a typo here would make the assertion below pass forever"
+    );
+    assert!(
+        !code.contains(CENSUS_SELF_SATISFACTION_DECOY),
+        "the search region contains this guard's own body, so a row spelled out inside the \
+         guard can satisfy both class checks below while the census states nothing"
+    );
+
     // The two censuses make two different claims from two different runs, so the regions
     // below are per test, and the CODE regions deliberately start at `fn` rather than at
     // the doc comment: prose that *describes* a matrix would otherwise satisfy a probe for
