@@ -17554,6 +17554,46 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
          fixture: a cell that passes on a synthetic tree proves the rule fires, not that this \
          scope covers anything"
     );
+    // AND AN ALLOWANCE ROW MUST NAME A DOCUMENT THE WALK ACTUALLY REACHES. The
+    // ledger is keyed by relative path and consulted with a lookup that FALLS
+    // BACK TO ZERO when nothing matches, so a row whose document is renamed,
+    // moved below a skipped directory, or deleted goes quietly dead: the lookup
+    // misses, the allowance silently becomes 0, and the failure that follows
+    // names the document rather than the stale row. Every direction of that rot
+    // reads as a fault in the file being scanned.
+    //
+    // What is NOT asserted, deliberately: that the count still matches what the
+    // document carries. `unqualified <= allowed` is one-way on purpose -- an
+    // equality would redden the correct repair of any of the three sites, which
+    // is a wall rather than a ledger. This checks that the row has a subject,
+    // not that its subject is unchanged.
+    let names_a_scanned_document = |doc: &str| {
+        documents.iter().any(|path| {
+            path.strip_prefix(&repo)
+                .map(|relative| relative.to_string_lossy() == doc)
+                .unwrap_or(false)
+        })
+    };
+    for (doc, count) in UNSCANNED_ALLOWANCE {
+        assert!(
+            names_a_scanned_document(doc),
+            "the allowance ledger forgives {count} unqualified claim site(s) in {doc}, and the \
+             walk does not reach that path: the row is dead, its subject is scanned with an \
+             allowance of zero, and the failure would name the document instead of this row"
+        );
+        assert!(
+            count > 0,
+            "{doc} carries a zero allowance row, which is what every unlisted document already \
+             gets; a row that forgives nothing records nothing"
+        );
+    }
+    // AND THE PREDICATE MUST BE ABLE TO SAY NO. A lookup that answered true for
+    // everything would pass the loop above without reading the ledger at all.
+    assert!(
+        !names_a_scanned_document("COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md.moved"),
+        "the scope check must refuse a path the walk does not reach, or it is not checking \
+         anything"
+    );
     assert!(
         !documents
             .iter()
