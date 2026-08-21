@@ -13870,3 +13870,118 @@ fn the_mirror_law_holds_corpus_wide_and_its_neighbours_do_not() {
         "the largest mirrored pair, so the law is not carried by empty arrays"
     );
 }
+
+/// The import array is a property of the MODULE, identical in all three parts —
+/// which is what `decode_at` has been assuming.
+///
+/// `decode_at` parses the exported part standalone, reads its imports, and then
+/// decodes the PRIVATE part using that list. Its own doc says so. If the private
+/// part carried a different import array — an extra edge, a different flag, the
+/// same modules in another order — every private-level decode in this file would
+/// be resolving against the wrong list, and nothing would report it. The server
+/// cell asserts the exported/server halves of this for THREE modules and calls
+/// it "a property of the module, not of the part". The private half, which is
+/// the one `decode_at` depends on, is asserted nowhere.
+///
+/// It holds. Over all 600 `Init` chains the three parts carry byte-identical
+/// import arrays — same modules, same order, same three flags — with 3,153 edges
+/// in total, which re-derives the edge census two other cells state.
+///
+/// ANTI-VACUITY, because an all-empty or all-constant decode would satisfy a
+/// three-way equality trivially:
+///
+///   the widest list is 46 imports, and exactly ONE module declares none, which
+///     is `Init.Prelude` — the premise the import-free root cell is built on
+///   the flags take FIVE distinct combinations across the 3,153 edges, so the
+///     equality is comparing varied data and not a constant
+///
+/// The flag table also re-derives a figure pinned elsewhere as a margin: the
+/// 1,612 edges with `is_exported` false are 1,379 + 226 + 7 here. A cell that
+/// agrees with two independently pinned censuses while reading a third array is
+/// cheap corroboration that the offsets are right.
+///
+/// Conservation first: the flag classes must account for every edge before any
+/// class is named, and the three parts' arrays are compared only after their
+/// lengths are shown equal.
+#[test]
+fn the_import_array_is_identical_in_all_three_parts_of_every_chain() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let rows = |view: &ModuleDataView| -> Vec<(String, bool, bool, bool)> {
+        view.imports
+            .iter()
+            .map(|import| {
+                (
+                    import.module.to_display_string(),
+                    import.import_all,
+                    import.is_exported,
+                    import.is_meta,
+                )
+            })
+            .collect()
+    };
+
+    let mut edges = 0usize;
+    let mut widest = 0usize;
+    let mut import_free = 0usize;
+    let mut flags: BTreeMap<(bool, bool, bool), usize> = BTreeMap::new();
+    for module in &modules {
+        let exported = rows(&module_view(&lib, module, Level::Exported));
+        let server = rows(&server_module_view(&lib, module));
+        let private = rows(&module_view(&lib, module, Level::Private));
+
+        assert_eq!(
+            (server.len(), private.len()),
+            (exported.len(), exported.len()),
+            "{module}: the three parts must declare the same number of imports"
+        );
+        assert_eq!(
+            (&server, &private),
+            (&exported, &exported),
+            "{module}: the import array must be identical in all three parts, flags included"
+        );
+
+        edges += exported.len();
+        widest = widest.max(exported.len());
+        if exported.is_empty() {
+            import_free += 1;
+        }
+        for (_, import_all, is_exported, is_meta) in &exported {
+            *flags
+                .entry((*import_all, *is_exported, *is_meta))
+                .or_default() += 1;
+        }
+    }
+
+    // Conservation first: the flag classes account for every edge.
+    assert_eq!(
+        flags.values().sum::<usize>(),
+        edges,
+        "every import edge must fall in exactly one flag class"
+    );
+    assert_eq!(edges, 3_153, "the import edge census, re-derived here");
+
+    assert_eq!(
+        (widest, import_free),
+        (46, 1),
+        "the comparison spans real lists, and exactly one module declares none"
+    );
+    assert_eq!(
+        flags.len(),
+        5,
+        "the flags take five combinations, so the equality is not comparing constants"
+    );
+
+    // Cross-check against a figure pinned elsewhere, as a margin of this table.
+    assert_eq!(
+        flags
+            .iter()
+            .filter(|((_, is_exported, _), _)| !*is_exported)
+            .map(|(_, count)| count)
+            .sum::<usize>(),
+        1_612,
+        "the non-exported edge count, which another cell pins independently"
+    );
+}
