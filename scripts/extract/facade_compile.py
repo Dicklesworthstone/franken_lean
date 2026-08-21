@@ -1002,10 +1002,16 @@ def main():
 
     # Mutation control for the source guard above. It is deliberately in-memory:
     # no Reference-importing file is ever handed to the pinned compiler.
-    if not reference_import_lines("import Lean\n"):
+    reference_import_mutants = ("import Lean\n", "import Lean.Meta\n")
+    missed_reference_imports = [
+        mutant.rstrip() for mutant in reference_import_mutants
+        if not reference_import_lines(mutant)
+    ]
+    if missed_reference_imports:
         raise SystemExit(
-            "REFUSE: Reference-import control did not recognize `import Lean` — "
-            "the facade-source oracle guard is ineffective"
+            "REFUSE: Reference-import control did not recognize "
+            + ", ".join(missed_reference_imports)
+            + " — the facade-source oracle guard is ineffective"
         )
 
     root = build_facade(lean, env, os.path.join(work, "facade"), args.facade, "generated")
@@ -1180,7 +1186,7 @@ def main():
             "empty_verdict": quarantine_empty,
         },
         "reference_import_control": {
-            "mutant": "import Lean",
+            "mutants": [mutant.rstrip() for mutant in reference_import_mutants],
             "rejected": True,
         },
         "reference_imported": False,
