@@ -6078,6 +6078,76 @@ fn qualification_prepends_unconditionally_which_is_why_the_walk_guard_is_defensi
     );
 }
 
+/// The inventory is SORTED, not merely stable within one process.
+///
+/// **What the determinism test cannot see.** The receipt-flow test walks one
+/// tree twice and requires the two results to agree. That pins stability, and it
+/// is exactly the case an UNSORTED walk would also pass: both walks would hit
+/// the same `read_dir` in the same process and get the same filesystem order
+/// back. The property that actually matters is stronger -- the order must be the
+/// same on every machine -- because the fixture hash, the module census and the
+/// receipt's counts are all taken from it, and two hosts disagreeing about the
+/// order would disagree about the corpus while both looking self-consistent.
+///
+/// **It rests on three separate `sort` calls** -- one in `walk_olean_inventory`,
+/// two inside the helpers it uses -- and nothing asserted any of them. Removing
+/// any one leaves a walk that is still stable per process and no longer
+/// canonical across hosts, which is the failure mode that does not show up until
+/// two machines compare receipts.
+///
+/// **The fixture is created in reverse-sorted order on purpose.** On filesystems
+/// that hand back entries in creation order -- which is common -- an unsorted
+/// walk returns `Zeta` first, so the assertion has something to catch. That the
+/// creation order differs from the sorted order is asserted rather than assumed,
+/// because a later tidy-up of the file list into alphabetical order would make
+/// this test vacuous without changing a single assertion.
+#[test]
+fn the_inventory_is_sorted_not_merely_stable_within_one_process() {
+    const CREATED: [&str; 5] = [
+        "Zeta.olean",
+        "Mid.olean",
+        "Alpha.olean",
+        "Nested/Zulu.olean",
+        "Nested/Alfa.olean",
+    ];
+    let library = write_inventory_fixture("t6r7-inventory-sorted-v1", &CREATED);
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the sorted fixture must be walkable: {reason}"));
+    assert_eq!(oleans.len(), CREATED.len());
+
+    // ANTI-VACUITY FIRST: if the list above were already alphabetical, an
+    // unsorted walk would satisfy everything below by accident.
+    let mut expected_order = CREATED.to_vec();
+    expected_order.sort_unstable();
+    assert_ne!(
+        CREATED.to_vec(),
+        expected_order,
+        "the fixture must be created OUT of sorted order, or this test cannot tell a sorting \
+         walk from one that returns whatever the filesystem hands it"
+    );
+
+    assert!(
+        oleans.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the olean paths came back unsorted, so the inventory's order is whatever this \
+         filesystem happened to return: {oleans:?}"
+    );
+    assert!(
+        modules.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the module names came back unsorted: {modules:?}"
+    );
+
+    // The first file CREATED must not be the first REPORTED -- the single
+    // observation that separates a sorted walk from a creation-ordered one on
+    // this fixture.
+    assert!(
+        oleans[0].ends_with("Alpha.olean"),
+        "the first reported olean is `{:?}`, but `Alpha.olean` sorts first and `Zeta.olean` was \
+         created first; the walk is reporting creation order",
+        oleans[0]
+    );
+}
+
 /// `oleans` and `modules` are PARALLEL: `modules[i]` is the projection of
 /// `oleans[i]`, and the extension match is exact.
 ///
