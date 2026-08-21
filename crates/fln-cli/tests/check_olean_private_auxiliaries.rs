@@ -403,6 +403,16 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let decoded_private_loop_auxiliaries = json_object_field(json, "decodedPrivateLoopAuxiliaries");
     let decoded_private_loop_observed =
         json_usize_field(decoded_private_loop_auxiliaries, "observed");
+    let decoded_private_loop_name_set = json_non_empty_name_strings(json_array_field(
+        decoded_private_loop_auxiliaries,
+        "names",
+    ))
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert!(
+        decoded_private_loop_name_set.is_subset(&decoded_private_auxiliary_name_set),
+        "{json}",
+    );
     assert!(
         decoded_private_loop_observed <= decoded_private_auxiliaries,
         "{json}",
