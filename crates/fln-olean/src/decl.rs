@@ -1193,6 +1193,15 @@ pub struct ChainConstants {
     pub constants: Vec<ConstantInfo>,
     /// `origins[i]` is the origin of `constants[i]`.
     pub origins: Vec<ConstantOrigin>,
+    /// `strengthened[i]` is true when the exported part declared
+    /// `constants[i]` as a body-less `axiom` and the private part supplies a
+    /// real declaration.
+    ///
+    /// This is the majority case, not an oddity: across the 2,431 chained
+    /// modules of the pin, 84,590 of the 158,583 declarations named by both
+    /// arrays are an axiom in the exported part — 60,640 theorems, 22,177
+    /// definitions and 1,773 opaques — and none runs the other way.
+    strengthened: Vec<bool>,
     /// Declaration name to its position in `constants`.
     ///
     /// Private, because it only means anything while it agrees with
@@ -1211,6 +1220,34 @@ impl ChainConstants {
     /// The declarations the exported part also declared, in `constants` order.
     pub fn exported(&self) -> impl Iterator<Item = &ConstantInfo> {
         self.with_origin(ConstantOrigin::Exported)
+    }
+
+    /// Was this declaration a body-less `axiom` in the exported part?
+    ///
+    /// Answers the question a caller is really asking when it wants to know
+    /// whether a declaration "has a concrete kind": for a name the exported
+    /// part carries, the answer often depends on WHICH PART you look at. The
+    /// exported view of `Array.zipWithMAux._unary`, for instance, is an axiom
+    /// while the chain's is a definition. Decoding the exported part and
+    /// finding an axiom is the decoder being faithful, not losing a body —
+    /// there is no body in those bytes to lose.
+    ///
+    /// `false` for a declaration the exported part did not carry at all; use
+    /// [`ConstantOrigin`] to tell those apart.
+    pub fn was_exported_as_axiom(&self, name: &Name) -> bool {
+        self.position_of(name)
+            .and_then(|index| self.strengthened.get(index).copied())
+            .unwrap_or(false)
+    }
+
+    /// The declarations the private part supplies with a body where the
+    /// exported part had only an axiom.
+    pub fn strengthened_by_the_companion(&self) -> impl Iterator<Item = &ConstantInfo> {
+        self.constants
+            .iter()
+            .zip(&self.strengthened)
+            .filter(|(_, gained)| **gained)
+            .map(|(info, _)| info)
     }
 
     fn with_origin(&self, wanted: ConstantOrigin) -> impl Iterator<Item = &ConstantInfo> {
@@ -1511,6 +1548,23 @@ pub fn decode_chain_constants_with_origin(
         });
     }
 
+    let exported_by_name: HashMap<&Name, &ConstantInfo> =
+        exported_constants.iter().map(|i| (i.name(), i)).collect();
+    let mut strengthened = Vec::new();
+    strengthened
+        .try_reserve_exact(private_constants.len())
+        .map_err(|_| DeclError::Budget {
+            visited: private_constants.len() as u64,
+        })?;
+    for info in &private_constants {
+        strengthened.push(
+            exported_by_name
+                .get(info.name())
+                .is_some_and(|other| matches!(other, ConstantInfo::Axiom(_)))
+                && !matches!(info, ConstantInfo::Axiom(_)),
+        );
+    }
+
     // First occurrence wins, which is what the linear scan this replaces did.
     // The mirror law in `decode_module_constants` and the pin itself both make
     // a repeat within one module's array impossible — zero across all 2,431
@@ -1524,6 +1578,7 @@ pub fn decode_chain_constants_with_origin(
     Ok(ChainConstants {
         constants: private_constants,
         origins,
+        strengthened,
         index,
     })
 }
@@ -2021,6 +2076,94 @@ mod tests {
             "Init.BinderPredicates must carry exported axioms that the private part \
              gives a body, or this test witnesses nothing about the direction"
         );
+    }
+
+    /// `Array.zipWithMAux._unary` is an AXIOM in the exported part and a
+    /// DEFINITION in the chain, and both readings are correct.
+    ///
+    /// A cell asserting that an exported `_unary` member decodes to a concrete
+    /// kind is asserting something untrue of the artifact: those bytes hold an
+    /// `AxiomVal`, so a decoder that produced a definition from them would be
+    /// inventing a body rather than recovering one. The concrete declaration
+    /// lives in the private part, and `was_exported_as_axiom` is how a caller
+    /// asks which of the two it is holding.
+    #[test]
+    fn an_exported_axiom_stays_an_axiom_and_the_companion_supplies_the_body() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP an_exported_axiom_stays_an_axiom_and_the_companion_supplies_the_body: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |suffix: &str| {
+            std::fs::read(lib.join(format!("Init/Data/Array/Basic.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read Init/Data/Array/Basic{suffix}: {error}"))
+        };
+        let exported = read("");
+        let server = read(".server");
+        let private = read(".private");
+        const WITNESS: &str = "Array.zipWithMAux._unary";
+
+        // The exported part, read on its own, really does hold an axiom.
+        let exported_view = OleanView::parse(&exported).expect("exported parses");
+        let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("exported constants decode");
+        let exported_witness = exported_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == WITNESS)
+            .unwrap_or_else(|| panic!("{WITNESS} must be declared by the exported part"));
+        assert!(
+            matches!(exported_witness, ConstantInfo::Axiom(_)),
+            "{WITNESS} is stored as an axiom in the exported part; decoding it as \
+             {} would mean inventing a body",
+            exported_witness.kind_name()
+        );
+
+        // The chain supplies the real declaration.
+        let chained =
+            decode_chain_constants_from_parts(&exported, &server, &private, ChainLimits::default())
+                .expect("Init.Data.Array.Basic's chain decodes");
+        let index = chained
+            .constants
+            .iter()
+            .position(|info| info.name().to_display_string() == WITNESS)
+            .unwrap_or_else(|| panic!("{WITNESS} must be in the chain"));
+        let chained_witness = &chained.constants[index];
+        assert!(
+            matches!(chained_witness, ConstantInfo::Defn(_)),
+            "the chain must give {WITNESS} a body, got {}",
+            chained_witness.kind_name()
+        );
+
+        // It is an EXPORTED name, so origin alone would not have revealed the
+        // difference — which is the whole reason was_exported_as_axiom exists.
+        assert_eq!(chained.origins[index], ConstantOrigin::Exported);
+        assert!(
+            chained.was_exported_as_axiom(chained_witness.name()),
+            "{WITNESS} was an axiom in the exported part and gained a body here"
+        );
+        assert!(
+            chained
+                .strengthened_by_the_companion()
+                .any(|info| info.name().to_display_string() == WITNESS)
+        );
+
+        // Not vacuous: this module carries many such declarations, and a
+        // private-ONLY one is not counted as strengthened.
+        assert!(
+            chained.strengthened_by_the_companion().count() > 1,
+            "Init.Data.Array.Basic carries many exported axioms the companion \
+             gives bodies to"
+        );
+        for info in chained.private_only() {
+            assert!(
+                !chained.was_exported_as_axiom(info.name()),
+                "{} was never in the exported part, so it was not strengthened",
+                info.name().to_display_string()
+            );
+        }
     }
 
     /// The structural companion test is gated on the view HAVING dependency
