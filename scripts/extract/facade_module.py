@@ -1622,9 +1622,13 @@ def pin_acceptance_error(text, accepted):
 # What main has published so far, visible to the exit path below. A list rather
 # than a dict because main owns the dict; this only ever reads it.
 _PUBLISHED_VIEW = []
+# Every path this run has MOVED a candidate onto. Registration happens later and
+# with the best-of text, which is right for the end-of-run checks and useless to
+# the exit path: see artifact_divergence_note.
+_FACADE_REPLACED = []
 
 
-def artifact_divergence_note(published):
+def artifact_divergence_note(published, replaced):
     """Did this run replace the facade and then refuse before the manifest?
 
     Every check added over the last several waves runs at the END of main, and a
@@ -1649,10 +1653,19 @@ def artifact_divergence_note(published):
 
     Returns a note, or None.
     """
+    # ASKED OF THE DISK, NOT OF THE REGISTRY, and the first version of this got it
+    # wrong. Registration happens at line 2834, with the best-of text; the facade
+    # is MOVED onto its path at 2572. Six refusal sites sit between them -- the
+    # conservation join, the axiom-line pin, the declared-set join, the family
+    # join, the declared-vs-written join and the pin-acceptance check -- and they
+    # are the newest checks in the file, so the likeliest to fire. Keyed on the
+    # registry, this note was silent for exactly those six: the facade on disk was
+    # already this run's, `published` was still empty, and nothing printed. Keyed
+    # on the replace, the window it covers starts where the risk starts.
     kinds = {entry[1] for entry in published.values()}
-    if "the facade" not in kinds or "the manifest" in kinds:
+    if not replaced or "the manifest" in kinds:
         return None
-    facade = [path for path, entry in published.items() if entry[1] == "the facade"]
+    facade = sorted(set(replaced))
     return (f"THE TWO ARTIFACTS ARE NOW OUT OF STEP. This run replaced {facade} and "
             "then refused before writing the manifest, so the facade on disk is "
             "from this run and the manifest still describes the previous one. "
@@ -2570,6 +2583,8 @@ def main():
                 if demoted:
                     continue
                 os.replace(candidate, args.out)
+                # the disk changed HERE, whatever the run decides afterwards
+                _FACADE_REPLACED.append(args.out)
                 # Recorded here and nowhere else: this is the only path on which a
                 # rendered text both passed the pin and became the output. The
                 # demotion `continue` above passed the pin too and is deliberately
@@ -3671,7 +3686,7 @@ if __name__ == "__main__":
         # reporting is deliberately last so a fault in it cannot mask the cause.
         if exc.code not in (0, None):
             for _published in _PUBLISHED_VIEW:
-                _note = artifact_divergence_note(_published)
+                _note = artifact_divergence_note(_published, _FACADE_REPLACED)
                 if _note:
                     print("NOTE: " + _note, file=sys.stderr)
         raise
