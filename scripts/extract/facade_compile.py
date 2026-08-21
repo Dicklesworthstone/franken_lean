@@ -3313,6 +3313,28 @@ def main():
             "REFUSE: facade manifest emission-verification count must exceed "
             f"type-roundtrip count ({json.dumps(emission_roundtrip_inequality_join, sort_keys=True)})"
         )
+    emission_transparent_inequality_join = {
+        "summary_emission_verified": manifest_summary.get("emission_verified"),
+        "summary_transparent_declarations": manifest_summary.get(
+            "transparent_declarations"
+        ),
+    }
+    if (not isinstance(emission_transparent_inequality_join[
+            "summary_emission_verified"], int)
+            or isinstance(emission_transparent_inequality_join[
+                "summary_emission_verified"], bool)
+            or not isinstance(emission_transparent_inequality_join[
+                "summary_transparent_declarations"], int)
+            or isinstance(emission_transparent_inequality_join[
+                "summary_transparent_declarations"], bool)
+            or emission_transparent_inequality_join[
+                "summary_emission_verified"]
+            <= emission_transparent_inequality_join[
+                "summary_transparent_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest emission-verification count must exceed "
+            f"transparent-declaration count ({json.dumps(emission_transparent_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5421,6 +5443,9 @@ def main():
         ),
         "manifest_emission_roundtrip_inequality_join": (
             emission_roundtrip_inequality_join
+        ),
+        "manifest_emission_transparent_inequality_join": (
+            emission_transparent_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
