@@ -4886,6 +4886,87 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// A tree with NO oleans walks clean, so "the walk succeeded" carries no
+/// information about whether anything was found -- and the receipt floor is the
+/// only thing that notices.
+///
+/// **Why this is worth an assertion rather than a shrug.** Every check inside
+/// `walk_olean_inventory` is a statement about the entries it found: the prefix
+/// check is an `Option`-guarded loop over the names, the injectivity check
+/// compares two counts, and both are VACUOUSLY satisfied when the population is
+/// empty. `all()` over nothing is true; `0 == 0` is true. So a directory holding
+/// no oleans is not merely accepted, it is accepted by every rule the walk has,
+/// and it is indistinguishable from a corpus by anything the walk returns except
+/// the count itself.
+///
+/// **That is correct, and it is also the whole exposure.** An empty walk must not
+/// be an error -- a subdirectory with no oleans is ordinary, and a walk that
+/// refused one could not recurse. The consequence is that NOTHING in the walk
+/// stands between an empty tree and a whole-Mathlib claim. The floor in
+/// `WholeMathlibReceipt::validate` is the sole guard, and this test pins that by
+/// carrying the empty population all the way to a receipt and requiring the
+/// refusal to name the closure-module floor specifically. Move or relax that
+/// floor and this test goes red, which is the point: today the protection lives
+/// in exactly one place and nothing else would notice its absence.
+///
+/// **The fixture holds a file, deliberately.** A directory with no entries at all
+/// and a directory whose entries are simply not oleans must both walk to nothing,
+/// and the second is the case that actually occurs in a real tree.
+#[test]
+fn a_tree_with_no_oleans_walks_clean_and_only_the_receipt_floor_refuses_it() {
+    let library = write_inventory_fixture("t6r7-inventory-empty-v1", &["notes.txt", "Sub/read.me"]);
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| {
+            panic!(
+                "a tree with no oleans must not be an ERROR -- an ordinary subdirectory holds \
+                 none, and a walk that refused one could not recurse at all: {reason}"
+            )
+        });
+    assert!(
+        oleans.is_empty() && modules.is_empty(),
+        "nothing here is an olean; found {oleans:?} / {modules:?}"
+    );
+
+    // The empty population satisfies the live conservation law too, which is the
+    // same vacuity one level up.
+    let counts = CorpusCounts::default();
+    counts.assert_conservation("empty inventory");
+
+    let spec = CorpusReceiptSpec {
+        bead: "franken_lean-t6r7",
+        corpus_commit: suite_lock_corpus_commit(),
+        seed_modules: modules.len() as u64,
+        receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+    };
+    let receipt = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+        spec: &spec,
+        counts: &counts,
+        closure_modules: oleans.len() as u64,
+        corpus_fixture_hash: "an-empty-tree-is-not-a-corpus",
+        observed_unix_s: 1_786_333_444,
+        wall_ms: 1,
+    });
+    assert_eq!(receipt.closure_modules, 0);
+    assert_eq!(receipt.seed_modules, 0);
+    assert_eq!(receipt.decoded, 0);
+    assert_eq!(receipt.compared, 0);
+
+    let reason = match receipt.validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit()) {
+        Err(reason) => reason,
+        Ok(()) => panic!(
+            "an EMPTY tree was accepted as a whole-Mathlib observation. Zero divergences over zero \
+             modules is the empty-referent row in its purest form, and the walk cannot catch it: \
+             every rule the walk has is vacuously true over an empty population."
+        ),
+    };
+    assert!(
+        reason.contains("closure module(s)") && reason.contains("below the"),
+        "the refusal must come from the size floor, because that is the ONLY rule anywhere that \
+         distinguishes an empty tree from a corpus: {reason}"
+    );
+}
+
 /// A ONE-MODULE set cannot have a cross-module conflict, so the two check-olean
 /// paths must diverge -- and the divergence is a property of SET SIZE, not of the
 /// module.
