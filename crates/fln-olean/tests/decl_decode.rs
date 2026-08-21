@@ -3960,3 +3960,190 @@ fn the_triple_first_field_is_a_numbered_name_family() {
          here names the real base name and is a finding rather than a fault"
     );
 }
+
+/// The 111 DISTINCT triples, decoded - and they weigh differently from the 157
+/// references.
+///
+/// `a4de2083` already decoded these fields and pinned field 1's constructor
+/// split and field 2's expression shapes. It did so over the 157 REFERENCES.
+/// This does it over the 111 distinct objects, and the two disagree:
+///
+///   field 1   97 / 60 by reference, 61 / 50 by object
+///   field 2   61, 2, 30, 23, 16, 25 by reference
+///             26, 2, 26, 21, 13, 23 by object
+///
+/// A reference-weighted histogram counts a shared value once per pointer to it,
+/// so it describes how often a value is USED; an object-weighted one describes
+/// how many values there ARE. Neither is wrong and they answer different
+/// questions, which is precisely why both belong in the file rather than one
+/// silently standing for the other. The gap is not small: field 2's most common
+/// shape by reference is not its most common shape by object.
+///
+/// This is the fourth reference-versus-object distinction in this structure -
+/// after 71-and-69, 69-and-52, and 157-and-111 - and the first where the
+/// deduplication changes a RANKING rather than only a total. The sharing is
+/// heavy: 111 slots reach 51 distinct names in field 1 and 49 distinct
+/// expressions in field 2.
+///
+/// Field 0 is uniform and stays uniform: 31 distinct names across the 111,
+/// the same 31 `3373af3b` found across the 157. A field whose distinct count
+/// does not move under deduplication is one whose sharing is already total.
+///
+/// All 333 fields go through the production decoders - two names and one
+/// expression per record - because a shape histogram alone would be my
+/// arithmetic agreeing with itself.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_distinct_triples_weigh_differently_from_their_references() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut triples = 0usize;
+    let mut names_decoded = 0usize;
+    let mut exprs_decoded = 0usize;
+    let mut first_names: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut second_names: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut expressions: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut second_split: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut expression_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && at.get(&head).map(|h| (h.tag, h.other)) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        // Deduplicate the elements BEFORE reading them. That single `BTreeSet`
+        // is the whole difference from `a4de2083`.
+        let mut distinct: BTreeSet<usize> = BTreeSet::new();
+        for record in records {
+            let array = resolve(word_at(bytes, record + 8 + 8 * 2)).expect("slot 2 is an array");
+            for i in 0..word_at(bytes, array + 8) {
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) {
+                    distinct.insert(element);
+                }
+            }
+        }
+
+        for triple in distinct {
+            triples += 1;
+            for slot in 0..2usize {
+                let field = word_at(bytes, triple + 8 + 8 * slot);
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(field)
+                    .unwrap_or_else(|e| panic!("{module}: field {slot} must be a Name: {e}"));
+                names_decoded += 1;
+                let off = resolve(field).expect("a name link");
+                if slot == 0 {
+                    first_names.insert((index, off));
+                } else {
+                    second_names.insert((index, off));
+                    let link = at.get(&off).expect("resolved above");
+                    *second_split
+                        .entry(format!("tag {} arity {}", link.tag, link.other))
+                        .or_default() += 1;
+                }
+            }
+            let third = word_at(bytes, triple + 8 + 8 * 2);
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_expr(third)
+                .unwrap_or_else(|e| panic!("{module}: field 2 must be an Expr: {e}"));
+            exprs_decoded += 1;
+            let off = resolve(third).expect("an expression");
+            expressions.insert((index, off));
+            let expression = at.get(&off).expect("resolved above");
+            *expression_shapes
+                .entry(format!("tag {} arity {}", expression.tag, expression.other))
+                .or_default() += 1;
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(triples, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(triples, 111, "the distinct triples `a4de2083` counted");
+    assert_eq!(
+        names_decoded, 222,
+        "two names per record, through `decode_name`"
+    );
+    assert_eq!(
+        exprs_decoded, 111,
+        "one expression per record, through `decode_expr`"
+    );
+
+    // Field 0: uniform, and unchanged by deduplication.
+    assert_eq!(
+        first_names.len(),
+        31,
+        "field 0 is uniform and stays uniform - the same 31 names `3373af3b` \
+         found across the 157 references. A distinct count that does not move \
+         under deduplication is one whose sharing was already total"
+    );
+
+    // Fields 1 and 2: the object-weighted answers, which differ from
+    // `a4de2083`'s reference-weighted ones.
+    assert_eq!(
+        second_split.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 2".to_owned(), 61),
+            ("tag 2 arity 2".to_owned(), 50)
+        ],
+        "field 1 by OBJECT, against 97 and 60 by reference"
+    );
+    assert_eq!(second_names.len(), 51, "reaching 51 distinct names");
+    assert_eq!(
+        expression_shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 1".to_owned(), 26),
+            ("tag 10 arity 2".to_owned(), 2),
+            ("tag 3 arity 1".to_owned(), 26),
+            ("tag 4 arity 2".to_owned(), 21),
+            ("tag 5 arity 2".to_owned(), 13),
+            ("tag 7 arity 3".to_owned(), 23),
+        ],
+        "field 2 by OBJECT, against 61, 2, 30, 23, 16 and 25 by reference - the \
+         most common shape is not the same one under the two weightings"
+    );
+    assert_eq!(expressions.len(), 49, "reaching 49 distinct expressions");
+}
