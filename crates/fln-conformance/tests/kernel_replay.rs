@@ -4896,6 +4896,134 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// The ROUTER and the CENSUS agree about what a token means.
+///
+/// **A prose join between two functions, made checkable.** `check_family_token`'s
+/// direction rule is justified in its own doc comment by how `subject_axis`
+/// routes: restrictive families must start with `rejected:` BECAUSE that is
+/// exactly the condition on which an outcome becomes `Rejected`. That reasoning
+/// is correct today and nothing enforces it. `subject_axis` has one call site,
+/// inside the scorer, and no test at all -- so the sentence justifying one rule
+/// depends on the untested behaviour of another.
+///
+/// **What breaks if they drift, and why it is not loud.** Widen `subject_axis` to
+/// `contains("rejected")` and an outcome like `inconclusive:rejected_by_peer`
+/// becomes a Rejected -- its token would then be counted into
+/// `restrictive_families`, where `check_family_token` refuses it, and
+/// `assert_conservation` panics thousands of modules into a run with a message
+/// about family tokens rather than about routing. Narrow it instead and genuine
+/// rejections land in the non-answer census, which is the exact confusion the two
+/// maps were split apart to prevent: a kernel divergence reported as an
+/// exhaustion, in the D23 direction that matters.
+///
+/// **The population is production-derived, not hand-listed.** Rejection tokens
+/// come from the real `RejectClass` variants and non-answer tokens from the real
+/// `resource_usage_facts`, so this checks the strings the lane actually routes.
+#[test]
+fn the_outcome_router_and_the_family_census_agree_on_direction() {
+    let outcome_named = |token: &str| UnitOutcome {
+        lead: "Fixture.Decl".to_string(),
+        kind: "definition",
+        members: 1,
+        outcome: token.to_string(),
+        message: "detail".to_string(),
+        steps_used: 1,
+        max_depth: 1,
+    };
+
+    let mut tokens = vec!["accepted".to_string(), "internal_fault".to_string()];
+    for class in reject_class_variants_from_source() {
+        tokens.push(format!("rejected:{class}"));
+    }
+    for reason in [
+        ResourceReason::ExecutionSteps,
+        ResourceReason::Cancelled,
+        ResourceReason::RecursionDepth { limit: 4 },
+    ] {
+        tokens.push(
+            resource_usage_facts(&ResourceUsage {
+                reason,
+                allowed: 1,
+                observed: 2,
+            })
+            .0,
+        );
+    }
+    for unit in StructuralUnit::ALL {
+        tokens.push(
+            resource_usage_facts(&ResourceUsage {
+                reason: ResourceReason::StructuralBudget { unit },
+                allowed: 1,
+                observed: 2,
+            })
+            .0,
+        );
+    }
+
+    // ANTI-VACUITY: the population must actually contain all three routings, or
+    // the match below checks fewer cases than it appears to.
+    let (mut accepted, mut rejected, mut no_answer) = (0_u32, 0_u32, 0_u32);
+
+    for token in &tokens {
+        match subject_axis(&outcome_named(token)) {
+            CorpusAxisVerdict::Accepted => {
+                accepted += 1;
+                assert_eq!(token, "accepted");
+                // An agreement belongs to NEITHER census. If it were admitted to
+                // one, agreements would be counted as findings.
+                assert!(
+                    check_family_token(token, FamilyDirection::Restrictive).is_err()
+                        && check_family_token(token, FamilyDirection::NoAnswer).is_err(),
+                    "`{token}` routes as an AGREEMENT but is an acceptable family token"
+                );
+            }
+            CorpusAxisVerdict::Rejected(_) => {
+                rejected += 1;
+                if let Err(reason) = check_family_token(token, FamilyDirection::Restrictive) {
+                    panic!(
+                        "`{token}` is routed to Rejected, so the scorer files it in \
+                         `restrictive_families` -- but the census refuses it there: {reason}. The \
+                         router and the census disagree about what this token means, and the lane \
+                         would panic mid-run about family tokens rather than about routing"
+                    );
+                }
+                assert!(
+                    check_family_token(token, FamilyDirection::NoAnswer).is_err(),
+                    "`{token}` routes as a REJECTION yet is accepted as a non-answer family"
+                );
+            }
+            CorpusAxisVerdict::NoAnswer(_) => {
+                no_answer += 1;
+                if let Err(reason) = check_family_token(token, FamilyDirection::NoAnswer) {
+                    panic!(
+                        "`{token}` is routed to NoAnswer, so the scorer files it in \
+                         `no_answer_families` -- but the census refuses it there: {reason}"
+                    );
+                }
+                assert!(
+                    check_family_token(token, FamilyDirection::Restrictive).is_err(),
+                    "`{token}` routes as a NON-ANSWER yet is accepted as a restrictive family. A \
+                     budget exhaustion counted as a D23 finding reports the kernel as diverging \
+                     where it only ran out of fuel"
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        accepted, 1,
+        "exactly one token should route as an agreement"
+    );
+    assert!(
+        rejected >= 17,
+        "every kernel rejection class should have routed as a rejection; {rejected} did"
+    );
+    assert!(
+        no_answer >= 1 + StructuralUnit::ALL.len() as u32,
+        "the non-answer routings are missing: {no_answer}"
+    );
+}
+
 /// A D23 carve-out is PER DECLARATION, and the rule is proved on a planted
 /// registry because the real one is empty.
 ///
