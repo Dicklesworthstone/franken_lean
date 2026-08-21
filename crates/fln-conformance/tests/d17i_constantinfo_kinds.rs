@@ -12199,3 +12199,129 @@ fn the_rule_field_surplus_localises_to_the_nested_block() {
          would swallow a repeat"
     );
 }
+
+/// Every recursor's rules follow its constructors' stored order, and the three
+/// exceptions are exactly characterised.
+///
+/// `cidx` is already bound to a constructor's position in its inductive's
+/// `ctors` list, per constructor. Nothing says the RULES arrive in that order.
+/// They are a separate stored list, and the kernel resolves a rule by searching
+/// for the constructor's name rather than by indexing, so a decode that
+/// reordered them — sorting by name, say, or by the private-part walk — would
+/// leave every existing cell in this file green.
+///
+/// The 129 recursors partition three ways, and the partition is total:
+///
+/// - 124 whose rules are their head's `ctors` list exactly: same names, same
+///   order, same length.
+/// - 2 whose rules name none of their head's constructors at all. These are the
+///   nested family's `rec_1` and `rec_2`, and their rules are the NESTED
+///   block's `ctors` list, again in order — `Array` for one, `List` for the
+///   other.
+/// - 3 with no rules whatsoever: `Empty.rec`, `PEmpty.rec`, `False.rec`, whose
+///   heads have no constructors to rule.
+///
+/// THIS CELL COMPARES RAW WALK ORDER ON PURPOSE, which is the opposite of the
+/// repair one cell above. There, a filtered walk was compared against a
+/// hand-written lexicographic slice and the orders disagreed for no reason in
+/// the artifact. Here BOTH sides are stored lists read from the same pin, so
+/// their order is the fact under test and normalising either side would delete
+/// the cell's content.
+///
+/// Conservation first: the three classes must exhaust the recursors before any
+/// class is described.
+#[test]
+fn the_rules_follow_the_constructors_stored_order() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut ctors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut recursors: Vec<(String, String, Vec<String>)> = Vec::new();
+    for info in &infos {
+        match info {
+            ConstantInfo::Induct(v) => drop(ctors.insert(
+                info.name().to_display_string(),
+                v.ctors.iter().map(Name::to_display_string).collect(),
+            )),
+            ConstantInfo::Rec(v) => recursors.push((
+                info.name().to_display_string(),
+                v.all[0].to_display_string(),
+                v.rules
+                    .iter()
+                    .map(|rule| rule.ctor.to_display_string())
+                    .collect(),
+            )),
+            _ => {}
+        }
+    }
+
+    let mut in_order = 0usize;
+    let mut widest = 0usize;
+    let mut foreign_only: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut ruleless: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, head, rules) in &recursors {
+        let mine = ctors
+            .get(head)
+            .unwrap_or_else(|| panic!("{name} heads at {head}, which must be an inductive"));
+        if rules.is_empty() {
+            ruleless.insert(name.clone(), mine.len());
+        } else if rules == mine {
+            in_order += 1;
+            widest = widest.max(mine.len());
+        } else if rules.iter().all(|c| !mine.contains(c)) {
+            foreign_only.insert(name.clone(), rules.clone());
+        } else {
+            panic!("{name}: rules {rules:?} neither match nor avoid its own ctors {mine:?}");
+        }
+    }
+
+    // Conservation first: the three classes exhaust the recursors.
+    assert_eq!(
+        in_order + foreign_only.len() + ruleless.len(),
+        recursors.len(),
+        "every recursor must fall in exactly one class"
+    );
+    assert_eq!(
+        (
+            recursors.len(),
+            in_order,
+            foreign_only.len(),
+            ruleless.len()
+        ),
+        (129, 124, 2, 3),
+        "the recursor partition this row is stated against"
+    );
+
+    // A decode yielding empty lists everywhere would satisfy `rules == mine`
+    // for all 129; the pin reaches a thirteen-constructor block.
+    assert_eq!(
+        widest, 13,
+        "the widest in-order agreement, so the equality is not met vacuously"
+    );
+
+    // The nested pair rules the nested blocks, in those blocks' own order.
+    assert_eq!(
+        foreign_only,
+        BTreeMap::from([
+            ("Lean.Syntax.rec_1".to_owned(), ctors["Array"].clone()),
+            ("Lean.Syntax.rec_2".to_owned(), ctors["List"].clone()),
+        ]),
+        "the nested recursors rule the nested blocks' constructors, in stored order"
+    );
+    assert_eq!(
+        (ctors["Array"].len(), ctors["List"].len()),
+        (1, 2),
+        "and those two blocks are not empty, which would make the pair vacuous too"
+    );
+
+    // The rule-less recursors are exactly the ones with nothing to rule.
+    assert_eq!(
+        ruleless,
+        BTreeMap::from([
+            ("Empty.rec".to_owned(), 0),
+            ("False.rec".to_owned(), 0),
+            ("PEmpty.rec".to_owned(), 0),
+        ]),
+        "a recursor has no rules exactly when its head has no constructors"
+    );
+}
