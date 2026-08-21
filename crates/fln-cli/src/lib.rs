@@ -2976,6 +2976,10 @@ fn is_private_merge_tr_go_unsafe_rec_residual(display: &str) -> bool {
     display.starts_with("_private.") && display.contains(".mergeTR.go._unsafe_rec")
 }
 
+fn is_private_split_rev_at_go_unsafe_rec_residual(display: &str) -> bool {
+    display.starts_with("_private.") && display.contains(".splitRevAt.go._unsafe_rec")
+}
+
 fn is_core_observables_loop_unsafe_rec_residual(display: &str) -> bool {
     CORE_OBSERVABLES_LOOP_UNSAFE_REC_RESIDUAL_PREFIXES
         .iter()
@@ -3220,6 +3224,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_merge_tr_go_unsafe_rec_residual,
     );
+    let mut private_split_rev_at_go_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_split_rev_at_go_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_split_rev_at_go_unsafe_rec_residual,
+    );
     let mut core_observables_loop_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3447,6 +3459,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_merge_tr_go_unsafe_rec_residuals)
     };
+    let private_split_rev_at_go_unsafe_rec_observed =
+        private_split_rev_at_go_unsafe_rec_residuals.observed;
+    let private_split_rev_at_go_unsafe_rec_omitted =
+        private_split_rev_at_go_unsafe_rec_residuals.omitted();
+    let private_split_rev_at_go_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut private_split_rev_at_go_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut private_split_rev_at_go_unsafe_rec_residuals)
+    };
     let core_observables_loop_unsafe_rec_observed =
         core_observables_loop_unsafe_rec_residuals.observed;
     let core_observables_loop_unsafe_rec_omitted =
@@ -3494,6 +3515,7 @@ fn render_check_olean_success(
                 "\"privateRunUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateGoUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMergeTrGoUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateSplitRevAtGoUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
@@ -3598,6 +3620,9 @@ fn render_check_olean_success(
             private_merge_tr_go_unsafe_rec_observed,
             private_merge_tr_go_unsafe_rec_names,
             private_merge_tr_go_unsafe_rec_omitted,
+            private_split_rev_at_go_unsafe_rec_observed,
+            private_split_rev_at_go_unsafe_rec_names,
+            private_split_rev_at_go_unsafe_rec_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
@@ -3708,6 +3733,9 @@ fn render_check_olean_success(
                 "decoded _private mergeTR.go._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private mergeTR.go._unsafe_rec residual names: {}\n",
                 "decoded _private mergeTR.go._unsafe_rec residual names omitted: {}\n",
+                "decoded _private splitRevAt.go._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private splitRevAt.go._unsafe_rec residual names: {}\n",
+                "decoded _private splitRevAt.go._unsafe_rec residual names omitted: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: {}\n",
@@ -3815,6 +3843,9 @@ fn render_check_olean_success(
             private_merge_tr_go_unsafe_rec_observed,
             private_merge_tr_go_unsafe_rec_names,
             private_merge_tr_go_unsafe_rec_omitted,
+            private_split_rev_at_go_unsafe_rec_observed,
+            private_split_rev_at_go_unsafe_rec_names,
+            private_split_rev_at_go_unsafe_rec_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
@@ -4413,6 +4444,16 @@ fn render_check_olean_set_success(
             is_private_merge_tr_go_unsafe_rec_residual,
         );
     }
+    let mut private_split_rev_at_go_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_split_rev_at_go_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_split_rev_at_go_unsafe_rec_residual,
+        );
+    }
     let mut core_observables_loop_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4642,6 +4683,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_merge_tr_go_unsafe_rec_residuals)
     };
+    let private_split_rev_at_go_unsafe_rec_observed =
+        private_split_rev_at_go_unsafe_rec_residuals.observed;
+    let private_split_rev_at_go_unsafe_rec_omitted =
+        private_split_rev_at_go_unsafe_rec_residuals.omitted();
+    let private_split_rev_at_go_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut private_split_rev_at_go_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut private_split_rev_at_go_unsafe_rec_residuals)
+    };
     let core_observables_loop_unsafe_rec_observed =
         core_observables_loop_unsafe_rec_residuals.observed;
     let core_observables_loop_unsafe_rec_omitted =
@@ -4695,6 +4745,7 @@ fn render_check_olean_set_success(
                 "\"privateRunUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateGoUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMergeTrGoUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateSplitRevAtGoUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -4801,6 +4852,9 @@ fn render_check_olean_set_success(
             private_merge_tr_go_unsafe_rec_observed,
             private_merge_tr_go_unsafe_rec_names,
             private_merge_tr_go_unsafe_rec_omitted,
+            private_split_rev_at_go_unsafe_rec_observed,
+            private_split_rev_at_go_unsafe_rec_names,
+            private_split_rev_at_go_unsafe_rec_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
@@ -4913,6 +4967,9 @@ fn render_check_olean_set_success(
                 "decoded _private mergeTR.go._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private mergeTR.go._unsafe_rec residual names: {}\n",
                 "decoded _private mergeTR.go._unsafe_rec residual names omitted: {}\n",
+                "decoded _private splitRevAt.go._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private splitRevAt.go._unsafe_rec residual names: {}\n",
+                "decoded _private splitRevAt.go._unsafe_rec residual names omitted: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names: {}\n",
                 "core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: {}\n",
@@ -5022,6 +5079,9 @@ fn render_check_olean_set_success(
             private_merge_tr_go_unsafe_rec_observed,
             private_merge_tr_go_unsafe_rec_names,
             private_merge_tr_go_unsafe_rec_omitted,
+            private_split_rev_at_go_unsafe_rec_observed,
+            private_split_rev_at_go_unsafe_rec_names,
+            private_split_rev_at_go_unsafe_rec_omitted,
             core_observables_loop_unsafe_rec_observed,
             core_observables_loop_unsafe_rec_names,
             core_observables_loop_unsafe_rec_omitted,
