@@ -370,6 +370,11 @@ const ARRAY_IS_PREFIX_OF_AUX_PROOF_3: &str =
     "_private.Init.Data.Array.Basic.0.Array.isPrefixOfAux._proof_3";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_IS_PREFIX_OF_AUX_PROOF_3_MODULE: &str = "Init/Data/Array/Basic";
+/// The fourth generated proof theorem for `Array.isPrefixOfAux`.
+const ARRAY_IS_PREFIX_OF_AUX_PROOF_4: &str =
+    "_private.Init.Data.Array.Basic.0.Array.isPrefixOfAux._proof_4";
+/// The pin's private array stores this theorem in the basic module.
+const ARRAY_IS_PREFIX_OF_AUX_PROOF_4_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated recursion helper for `Array.allDiffAuxAux`.
 const ARRAY_ALL_DIFF_AUX_AUX_F: &str =
     "_private.Init.Data.Array.Basic.0.Array.allDiffAuxAux._f";
@@ -2303,6 +2308,36 @@ fn array_is_prefix_of_aux_third_proof_is_decoded_from_its_private_storage_module
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_IS_PREFIX_OF_AUX_PROOF_3} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_is_prefix_of_aux_fourth_proof_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_is_prefix_of_aux_fourth_proof_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_IS_PREFIX_OF_AUX_PROOF_4_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_IS_PREFIX_OF_AUX_PROOF_4.to_owned()),
+        "the private companion of {ARRAY_IS_PREFIX_OF_AUX_PROOF_4_MODULE} must retain \
+         {ARRAY_IS_PREFIX_OF_AUX_PROOF_4}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_IS_PREFIX_OF_AUX_PROOF_4)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_IS_PREFIX_OF_AUX_PROOF_4}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_IS_PREFIX_OF_AUX_PROOF_4} as {} instead of Thm",
         recovered.kind_name()
     );
 }
