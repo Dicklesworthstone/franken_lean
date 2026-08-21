@@ -379,6 +379,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     let cli_source_lines = include_str!("../src/lib.rs").lines().collect::<Vec<_>>();
     assert_eq!(
+        cli_source_lines
+            .iter()
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with('"') && line.contains(r#"\"g1Satisfied\":false"#)
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep G1 unsatisfied in concat-item strings",
+    );
+    assert_eq!(
         [
             cli_source_lines
                 .windows(2)
