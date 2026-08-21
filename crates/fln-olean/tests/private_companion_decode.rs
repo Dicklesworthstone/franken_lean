@@ -291,6 +291,11 @@ const ARRAY_EXT_AUX: &str =
     "_private.Init.Data.Array.Basic.0.Array.ext.extAux";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_EXT_AUX_MODULE: &str = "Init/Data/Array/Basic";
+/// The private search loop generated for `Array.findFinIdx?`.
+const ARRAY_FIND_FIN_IDX_LOOP: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop";
+/// The pin's private array stores this loop in the basic module.
+const ARRAY_FIND_FIN_IDX_LOOP_MODULE: &str = "Init/Data/Array/Basic";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1645,6 +1650,34 @@ fn array_ext_aux_theorem_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_EXT_AUX} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_find_fin_idx_loop_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_find_fin_idx_loop_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_FIND_FIN_IDX_LOOP.to_owned()),
+        "the private companion of {ARRAY_FIND_FIN_IDX_LOOP_MODULE} must retain \
+         {ARRAY_FIND_FIN_IDX_LOOP}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_FIND_FIN_IDX_LOOP}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_FIND_FIN_IDX_LOOP} as {} instead of Defn",
         recovered.kind_name()
     );
 }
