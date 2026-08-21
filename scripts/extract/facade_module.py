@@ -40,6 +40,8 @@ import hashlib
 import json
 import os
 import re
+import builtins
+import contextlib
 import subprocess
 import sys
 import tempfile
@@ -2189,6 +2191,51 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
     return "\n".join(body) + "\n", line_map, emitted, attrs, provided
 
 
+class SelfTestViolation(RuntimeError):
+    """The self-test reached outside its own sandbox."""
+
+
+@contextlib.contextmanager
+def self_test_sandbox(work):
+    """Make the self-test's promise enforceable instead of merely written down.
+
+    aa9f9843 says the self-test "writes only into a fresh temp directory, never
+    touches the artifacts, and never invokes the Reference". That was true when it
+    was written and verified by hand, which is exactly the kind of claim that
+    stops being true quietly: a case added later that opens contracts/ for append,
+    or that shells out to the pin because it needed a real elaboration, would make
+    this entry point destructive or slow with nothing to say so. It is the one
+    command in this file that is safe to run anywhere, and that property is worth
+    more than any single case it runs.
+
+    So during the self-test, a write outside `work` and any subprocess at all are
+    violations. Reads are untouched -- the guards under test read artifacts on
+    purpose -- and everything is restored on the way out.
+    """
+    real_open, real_run = builtins.open, subprocess.run
+    root = os.path.realpath(work) + os.sep
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if any(ch in mode for ch in "wxa+"):
+            target = os.path.realpath(str(file))
+            if not target.startswith(root):
+                raise SelfTestViolation(
+                    f"the self-test tried to open {target} for writing; it may "
+                    f"only write inside {work}")
+        return real_open(file, mode, *args, **kwargs)
+
+    def guarded_run(*args, **kwargs):
+        raise SelfTestViolation(
+            "the self-test tried to start a subprocess; it must never invoke the "
+            "Reference, because it has to stay runnable anywhere in under a second")
+
+    builtins.open, subprocess.run = guarded_open, guarded_run
+    try:
+        yield
+    finally:
+        builtins.open, subprocess.run = real_open, real_run
+
+
 def self_test():
     """Run every publication guard against synthetic states, and refuse on a miss.
 
@@ -2210,6 +2257,14 @@ def self_test():
     work = tempfile.mkdtemp(prefix="fln-l8f-selftest-")
     failures, checked = [], []
 
+    def blocked(thunk):
+        """The sandbox's own verdict, as an error string the way a guard reports."""
+        try:
+            thunk()
+        except SelfTestViolation as exc:
+            return str(exc)
+        return None
+
     def case(name, got_error, want_refusal):
         checked.append(name)
         refused = bool(got_error)
@@ -2229,6 +2284,8 @@ def self_test():
                 fh.write("stale\n")
         return path
 
+    sandbox = self_test_sandbox(work)
+    sandbox.__enter__()
     text = "axiom Fln.SelfTest : Type\n" * 40
     OUT, MAN = os.path.join(work, "f.lean"), os.path.join(work, "f.ndjson")
 
@@ -2294,11 +2351,26 @@ def self_test():
          None if "does not exist" in kept_candidate(os.path.join(work, "no")) else "x",
          False)
 
+    # THE SANDBOX MUST BE ABLE TO FAIL, or it certifies nothing. These two are the
+    # decoys for the enforcement itself: the first is a case that writes an
+    # artifact, the second a case that asks the Reference something, and both are
+    # exactly what a future contributor would add without meaning any harm.
+    case("sandbox/blocks-artifact-write",
+         blocked(lambda: builtins.open("contracts/facade_module.lean", "a")), True)
+    case("sandbox/blocks-reference-call",
+         blocked(lambda: subprocess.run(["true"])), True)
+    case("sandbox/allows-temp-write",
+         blocked(lambda: at("allowed.lean", "fine\n")), False)
+    case("sandbox/allows-artifact-read",
+         blocked(lambda: builtins.open(__file__, "r").close()), False)
+
     if failures:
         raise SystemExit("REFUSE: SELF-TEST FAILED — "
                          + "; ".join(failures[:6])
                          + f" (scratch kept at {work})")
-    print(f"facade-module: SELF-TEST OK — {len(checked)} cases across 7 guards: "
+    sandbox.__exit__(None, None, None)
+    print(f"facade-module: SELF-TEST OK — {len(checked)} cases across 7 guards "
+          f"and its own sandbox: "
           + " ".join(checked), file=sys.stderr)
     print(f"facade-module: self-test scratch kept at {work}; nothing was deleted "
           "and no artifact was read or written", file=sys.stderr)
@@ -3887,6 +3959,16 @@ if __name__ == "__main__":
         if exc.code not in (0, None):
             _report_divergence()
         raise
+    except SelfTestViolation as exc:
+        # A violation that escapes a case reaches here, and 97a0c9fd's rule applies
+        # to it too: this file turns a wrong state into a verdict, not a traceback.
+        # The artifact is untouched either way -- the sandbox refused the write
+        # before it happened -- but a stack trace would read as a broken extractor
+        # rather than a self-test that caught exactly what it was built to catch.
+        raise SystemExit(
+            f"REFUSE: SELF-TEST SANDBOX VIOLATION — {exc}. Nothing was written "
+            "outside the temp directory and the Reference was not invoked; the "
+            "case that tried is the bug") from exc
     except subprocess.TimeoutExpired as exc:
         # FOURTEEN CALL SITES ASK THE REFERENCE A QUESTION with timeout=1800 and
         # not one of them handles the answer never coming. The pin is invoked
