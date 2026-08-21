@@ -2521,7 +2521,16 @@ mod tests {
                 constants: &[ConstantInfo::Rec(RecursorVal {
                     base: ConstantVal {
                         name: Name::from_components(["Demo", "rec"]),
-                        level_params: Vec::new(),
+                        // TWO parameters, and DIFFERENT ones. A count of zero
+                        // is an empty list — boxed nil, no cells at all — so
+                        // nothing about the arity could be asserted; and two
+                        // equal names would make an order reversal decode
+                        // identically. See
+                        // `the_recursor_level_parameters_keep_their_arity_and_order`.
+                        level_params: vec![
+                            Name::from_components(["u"]),
+                            Name::from_components(["v"]),
+                        ],
                         type_: Expr::sort(Level::zero()),
                     },
                     all: Vec::new(),
@@ -2561,6 +2570,105 @@ mod tests {
         )
         .expect("module encodes")
         .bytes
+    }
+
+    /// The recursor's universe parameters keep both their ARITY and their
+    /// ORDER.
+    ///
+    /// `levelParams` is a `List Name` in the payload's `ConstantVal`. Its
+    /// length is the recursor's universe arity, and its order is which
+    /// parameter is which — `Level.param` refers to them positionally once the
+    /// kernel instantiates, so a reversed list is a different declaration that
+    /// no shape rule can object to: every cell is a well-formed cons and every
+    /// head a well-formed `Name`.
+    ///
+    /// A VACUOUS 0 IS NOT A PIN, which is why the fixture had to be enriched
+    /// first. An empty list is scalar-boxed nil with no cells at all, so there
+    /// is no arity to assert and no order to get wrong. Two EQUAL names would
+    /// be almost as bad: the count would be real but a reversal would decode
+    /// identically. The fixture now declares `u` and `v`.
+    ///
+    /// This is the third fixture field in a row that needed distinguishable
+    /// values before it could be asserted on — after the telescope counts
+    /// (a5c0aa5c) and the two flags (0170bbdd).
+    #[test]
+    fn the_recursor_level_parameters_keep_their_arity_and_order() {
+        let bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the recursor fixture decodes");
+
+        let ConstantInfo::Rec(recursor) = constants
+            .iter()
+            .find(|info| matches!(info, ConstantInfo::Rec(_)))
+            .expect("the fixture declares a recursor")
+        else {
+            unreachable!("filtered above")
+        };
+
+        let params: Vec<String> = recursor
+            .base
+            .level_params
+            .iter()
+            .map(Name::to_display_string)
+            .collect();
+        assert_eq!(params.len(), 2, "the recursor's universe arity");
+        assert_eq!(
+            params,
+            vec!["u".to_owned(), "v".to_owned()],
+            "in that order"
+        );
+
+        // The guard: a later edit that emptied the list, or made both names
+        // the same, would leave a cell that asserts nothing about order.
+        assert!(
+            params.len() > 1 && params[0] != params[1],
+            "the fixture must keep at least two DISTINCT parameters, or a \
+             reversal would decode identically and this cell would prove \
+             nothing: {params:?}"
+        );
+
+        // And the same order on the wire, so this pins which cell is which
+        // rather than only that the round trip agrees with itself.
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("RecursorVal pointer"))
+            .expect("RecursorVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+
+        // ConstantVal slot 1 is levelParams.
+        let mut cursor = view.read_u64(base_off + 16).expect("levelParams slot");
+        let mut on_the_wire = Vec::new();
+        while cursor & 1 == 0 {
+            let cell = view.deref(cursor).expect("cons cell");
+            assert_eq!(
+                view.obj_header(cell).expect("cons header").0,
+                1,
+                "List.cons"
+            );
+            let head = view.read_u64(cell + 8).expect("head pointer");
+            on_the_wire.push(
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(head)
+                    .expect("parameter name")
+                    .to_display_string(),
+            );
+            cursor = view.read_u64(cell + 16).expect("tail pointer");
+        }
+        assert_eq!(cursor >> 1, 0, "the list ends in boxed nil");
+        assert_eq!(
+            on_the_wire, params,
+            "the decoded parameters must be in the order the cells are chained"
+        );
     }
 
     /// Each recursor flag is read from its OWN scalar byte.
