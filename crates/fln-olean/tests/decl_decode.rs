@@ -735,3 +735,141 @@ fn a_planted_cons_cell_is_refused_by_the_name_size_rule_the_list_walker_lacks() 
         other => panic!("expected a Name size refusal, got {other}"),
     }
 }
+
+/// RECORDS the cons cell's stored size, derived from the object's own header
+/// rather than written down.
+///
+/// `c48c0813` established that a name link and a cons cell differ in `cs_sz`,
+/// which is what makes the `list_ptrs` repair possible. It deliberately did not
+/// write the cons cell's number: that was the one value I had reasoned to and
+/// not measured, and comments 2285/2286 record what writing such a literal
+/// costs. But a passing test prints nothing, so the measurement existed and the
+/// number stayed unrecorded, and the src repair has been waiting on it.
+///
+/// THE WAY OUT IS NOT TO GUESS BETTER, IT IS TO DERIVE. Every Lean object's
+/// size is its header, plus one word per declared pointer field, plus whatever
+/// scalar area the constructor stores after them. `other` is on the wire. So
+/// the SCALAR AREA WIDTH is measurable per object as
+/// `cs_sz - (8 + 8 * other)`, and it is that width - not the total - that
+/// actually separates the two shapes: a cons cell stores nothing after its two
+/// pointers, a name link stores the `Name.hash` word. `decode_name`'s own
+/// comment states the same arithmetic for its side, as `8 + 8*2 + 8`.
+///
+/// The literal below is therefore ENTAILED rather than asserted: the cell first
+/// proves the scalar width is zero and the arity is two, both from the bytes,
+/// and only then records what that makes the size. If the corpus disagrees the
+/// derivation fails first and names the real number, which is the ordering
+/// `f193516d` had to correct in `decode_level` - a literal checked before the
+/// rule that explains it teaches the reader nothing when it fires.
+///
+/// This records a measurement. It is not the repair, and it does not make one:
+/// `list_ptrs` still reads no size.
+#[test]
+fn the_cons_cell_scalar_area_is_empty_and_that_is_what_fixes_its_size() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+
+    // Corpus scale where the pin is installed; the C3 fixtures alone still
+    // carry enough cells to measure, so a host without it is not skipped.
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+        }
+    }
+
+    let mut cells = 0usize;
+    let mut links = 0usize;
+    let mut cons_widths: BTreeSet<i64> = BTreeSet::new();
+    let mut name_widths: BTreeSet<i64> = BTreeSet::new();
+    let mut cons_sizes: BTreeSet<u16> = BTreeSet::new();
+    let mut cons_arities: BTreeSet<u8> = BTreeSet::new();
+
+    for (_module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+
+        for object in &objects {
+            if (object.tag, object.other) != (1, 2) {
+                continue;
+            }
+            // The scalar area this object stores after its declared pointers.
+            let width = i64::from(object.cs_sz) - (8 + 8 * i64::from(object.other));
+            let second = word_at(bytes, object.off + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            match target {
+                Some(t) if t.tag == abi::TAG_STRING => {
+                    links += 1;
+                    name_widths.insert(width);
+                }
+                Some(t) if (t.tag, t.other) == (1, 2) => {
+                    cells += 1;
+                    cons_widths.insert(width);
+                    cons_sizes.insert(object.cs_sz);
+                    cons_arities.insert(object.other);
+                }
+                None if second & 1 == 1 && second >> 1 == 0 => {
+                    cells += 1;
+                    cons_widths.insert(width);
+                    cons_sizes.insert(object.cs_sz);
+                    cons_arities.insert(object.other);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Anti-vacuity: a measurement over nothing reports whatever it likes.
+    assert!(
+        cells >= 100 && links >= 100,
+        "too few objects to call this a measurement: {cells} cons cells, \
+         {links} name links across {} modules",
+        modules.len()
+    );
+
+    // The derivation, from the wire, before any literal.
+    assert_eq!(
+        cons_widths.len(),
+        1,
+        "a cons cell's scalar area must be one width across the corpus, or \
+         there is no single rule to give `list_ptrs`: {cons_widths:?}"
+    );
+    assert_eq!(
+        cons_widths.iter().next().copied(),
+        Some(0),
+        "a `List.cons` stores head and tail and NOTHING after them; a non-zero \
+         width here would mean the layout is not what the repair assumes"
+    );
+    assert_eq!(
+        name_widths.iter().next().copied(),
+        Some(8),
+        "a `Name.str` link stores the `Name.hash` word after its two pointers - \
+         `decode_name`'s own comment derives this as 8 + 8*2 + 8 - and that \
+         ONE word is the entire difference between the two shapes"
+    );
+    assert_eq!(
+        cons_arities.iter().copied().collect::<Vec<_>>(),
+        vec![2_u8],
+        "and every cons cell declares exactly two pointer fields"
+    );
+
+    // Only now, entailed by the two facts above: header + two pointers + no
+    // scalar area. THIS IS THE RECORDED MEASUREMENT the src repair was waiting
+    // on, over the population counted above.
+    assert_eq!(
+        cons_sizes.iter().copied().collect::<Vec<_>>(),
+        vec![24_u16],
+        "measured `List.cons` stored size across {cells} cells in {} modules",
+        modules.len()
+    );
+}
