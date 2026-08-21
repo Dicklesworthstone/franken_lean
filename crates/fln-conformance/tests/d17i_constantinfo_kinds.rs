@@ -12081,3 +12081,112 @@ fn the_motive_counts_exceed_the_blocks_by_the_nested_familys_duplication() {
         "and the ordinary recursors add nothing to the gap"
     );
 }
+
+/// The rule surplus lives in one block, not spread across the 127.
+///
+/// The previous cell sums the rule side corpus-wide and pins 232 against the
+/// 229-field census, with the three doubly-ruled constructors making up the
+/// difference. That is a statement about a total, and a total cannot say WHERE
+/// the surplus sits: a rule migrating from one block to another leaves 232
+/// unchanged. This cell localises it.
+///
+/// Grouping every rule under its recursor's block head, 126 of the 127 blocks
+/// are exact — their recursors' rules cover their own constructors, once each,
+/// and the covered fields equal the block's own fields. The whole surplus is
+/// `Lean.Syntax`, whose family covers three constructors belonging to other
+/// blocks. The three are exactly the doubly-ruled constructors the previous
+/// cell names, which is what ties the localisation to the total rather than
+/// leaving two independent facts.
+///
+/// WHY "EXACT" IS CHECKED THREE WAYS PER BLOCK. A block passes only with no
+/// foreign constructor, no constructor covered twice, and equal field sums.
+/// Field sums alone would let a block cover a foreign constructor of the same
+/// width as one of its own and still balance; the membership check alone would
+/// miss a duplicate. A model that reads rules as "one per constructor of the
+/// block" is the mutant this kills — it holds for 126 blocks and fails for the
+/// one that matters.
+///
+/// Conservation first: for every block the covered fields must equal its own
+/// fields plus the fields of whatever foreign constructors it covers, before
+/// any count is pinned.
+#[test]
+fn the_rule_field_surplus_localises_to_the_nested_block() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut fields: BTreeMap<String, u32> = BTreeMap::new();
+    let mut own: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut covered: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for info in &infos {
+        match info {
+            ConstantInfo::Ctor(v) => {
+                fields.insert(info.name().to_display_string(), v.num_fields);
+            }
+            ConstantInfo::Induct(v) => drop(own.insert(
+                info.name().to_display_string(),
+                v.ctors.iter().map(Name::to_display_string).collect(),
+            )),
+            ConstantInfo::Rec(v) => covered
+                .entry(v.all[0].to_display_string())
+                .or_default()
+                .extend(v.rules.iter().map(|rule| rule.ctor.to_display_string())),
+            _ => {}
+        }
+    }
+
+    let width = |name: &String| *fields.get(name).unwrap_or(&0) as usize;
+    let mut exact = 0usize;
+    let mut foreign_blocks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (head, rules) in &covered {
+        let mine = own
+            .get(head)
+            .unwrap_or_else(|| panic!("{head} heads a recursor block and must be an inductive"));
+        let foreign: Vec<String> = rules
+            .iter()
+            .filter(|c| !mine.contains(*c))
+            .cloned()
+            .collect();
+
+        // Conservation first, per block: covered == own + foreign.
+        let covered_fields: usize = rules.iter().map(width).sum();
+        let own_fields: usize = mine.iter().map(width).sum();
+        let foreign_fields: usize = foreign.iter().map(width).sum();
+        assert_eq!(
+            covered_fields,
+            own_fields + foreign_fields,
+            "{head}: the covered fields must be its own plus the foreign ones it also rules"
+        );
+
+        let duplicated = rules.len() - rules.iter().collect::<BTreeSet<&String>>().len();
+        if foreign.is_empty() && duplicated == 0 && covered_fields == own_fields {
+            exact += 1;
+        } else {
+            foreign_blocks.insert(head.clone(), foreign);
+        }
+    }
+
+    assert_eq!(
+        (covered.len(), exact),
+        (127, 126),
+        "every block but one rules its own constructors exactly once"
+    );
+    assert_eq!(
+        foreign_blocks,
+        BTreeMap::from([(
+            "Lean.Syntax".to_owned(),
+            DOUBLY_RULED_CONSTRUCTORS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<String>>()
+        )]),
+        "the whole surplus is the nested family, ruling exactly the doubly-ruled constructors"
+    );
+    assert_eq!(
+        (
+            covered["Lean.Syntax"].iter().map(width).sum::<usize>(),
+            own["Lean.Syntax"].iter().map(width).sum::<usize>()
+        ),
+        (12, 9),
+        "and the surplus is three fields, the widths this row is stated against"
+    );
+}
