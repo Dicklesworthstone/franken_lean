@@ -11082,6 +11082,31 @@ fn the_platform_gated_identities_declare_where_they_do_not_run() {
     // does not match itself -- the same escape asymmetry that keeps the
     // assertion inside the loop from finding its own text. Measured after
     // writing: still three.
+    // AND THE SCAN READS ONE SPELLING OF A CONSTRUCT THAT HAS SEVERAL, which is
+    // the defect found one wave ago in a count that read `Err(` and missed the
+    // refusals written with `map_err`. Here the marker is an ATTRIBUTE ORDER.
+    // `#[test]` above `#[cfg(unix)]` is the same test, gated the same way, and
+    // invisible to the scan below -- so a fourth gated test written that way and
+    // left off the list would satisfy the completeness check by being absent from
+    // both sides of it.
+    //
+    // Enumerating spellings is a losing game (a doc comment between the two
+    // attributes is a third form), so the canonical one is pinned instead: the
+    // gate goes immediately above `#[test]`. That makes the single-spelling scan
+    // complete BY RULE rather than by luck, the same move as requiring `dev` or
+    // `release` instead of any non-blank profile.
+    //
+    // Measured: the reverse order occurs zero times today, so this prevents. The
+    // literal below carries escaped newlines, so it cannot match itself -- and if
+    // that ever stopped being true the count would rise and this assertion would
+    // fail loudly rather than quietly.
+    assert_eq!(
+        SOURCE.matches("#[test]\n#[cfg(").count(),
+        0,
+        "a test in this file is gated with `#[cfg(...)]` BELOW `#[test]`. That is the same \
+         test, and the scan below cannot see it: write the gate immediately above `#[test]` so \
+         the platform-gated census stays derivable"
+    );
     let marker = "#[cfg(unix)]\n#[test]\nfn ";
     let mut scanned = Vec::new();
     let mut rest = SOURCE;
