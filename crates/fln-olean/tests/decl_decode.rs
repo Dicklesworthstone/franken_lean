@@ -11721,6 +11721,209 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Tag against arity - tag 7 skips arity two, and arity zero exists.
+///
+/// `d76a2fdc` tabulated tag against tail width. This is the companion table,
+/// tag against declared arity, pinned in full for the same reason: the summary
+/// numbers hide the shape.
+///
+/// THE MARGINALS ARE A DOUBLE COUNT, as before - rows summed and columns summed
+/// are one table added twice, asserted only against a lost or doubled tally.
+///
+/// AND THE 36 NON-EMPTY CELLS ARE NOT A SECOND WITNESS FOR THE 36 SHAPES. A
+/// shape IS a `(tag, arity)` pair, so "non-empty cells" and "distinct shapes"
+/// are one count under two names. `b4194cb0` made this mistake's twin and was
+/// corrected in its own doc; the number agreeing here is arithmetic, not
+/// evidence.
+///
+/// WHAT THE TABLE SHOWS. Arity runs 0 to 8 in Prelude and 0 to 5 in the
+/// fixtures, and TAG 0 SPANS ALL NINE VALUES CONTIGUOUSLY while most tags use
+/// two or three. TAG 7 SKIPS ARITY TWO - 129 objects at arity 1 and 12,869 at
+/// arity 3, nothing between - the only gap in Prelude. That is a different tag
+/// and a different axis from `d76a2fdc`'s tag 6, which skips the middle TAIL
+/// WIDTH; the two holes do not coincide and neither follows from the other.
+///
+/// ARITY ZERO EXISTS: 23 objects in Prelude, constructors with no pointer
+/// fields at all. Their whole content is the scalar tail, so the walk
+/// enumerates them and follows nothing out of them - which is why `f4d108f7`
+/// sees them as leaves rather than as absent.
+///
+/// A RARE CELL WORTH NAMING: tag 1 at arity 3 holds TWO objects against 7,331
+/// at arity 2 in the same tag. A cell four orders of magnitude smaller than its
+/// neighbour is still a real part of the format, which is the argument for
+/// pinning the table rather than its extremes.
+///
+/// POPULATION SCOPE: all four modules, constructor objects only; the full table
+/// is pinned for `Init/Prelude.olean`, the derived facts per module by name.
+#[test]
+fn tag_against_arity() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut shapes: Vec<(String, usize, usize, usize, u8, u8, usize, usize)> = Vec::new();
+    let mut prelude_table: Vec<(u8, Vec<(u8, usize)>)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, _) = objects_of(bytes);
+
+        let mut table: std::collections::BTreeMap<u8, std::collections::BTreeMap<u8, usize>> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            if object.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            *table
+                .entry(object.tag)
+                .or_default()
+                .entry(object.other)
+                .or_default() += 1;
+        }
+
+        let arities: BTreeSet<u8> = table
+            .values()
+            .flat_map(std::collections::BTreeMap::keys)
+            .copied()
+            .collect();
+        let by_rows: usize = table.values().map(|row| row.values().sum::<usize>()).sum();
+        let by_columns: usize = arities
+            .iter()
+            .map(|arity| {
+                table
+                    .values()
+                    .map(|row| row.get(arity).copied().unwrap_or(0))
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(
+            by_rows, by_columns,
+            "{module}: rows summed and columns summed are one table added \
+             twice, so this catches a lost or doubled tally and nothing more"
+        );
+
+        // A tag whose arities are not a contiguous run.
+        let gapped = table
+            .values()
+            .filter(|row| {
+                let first = *row.keys().next().expect("non-empty");
+                let last = *row.keys().next_back().expect("non-empty");
+                usize::from(last - first) + 1 != row.len()
+            })
+            .count();
+        let cells: usize = table.values().map(std::collections::BTreeMap::len).sum();
+        let arity_zero: usize = table
+            .values()
+            .map(|row| row.get(&0).copied().unwrap_or(0))
+            .sum();
+
+        shapes.push((
+            module.clone(),
+            table.len(),
+            cells,
+            by_rows,
+            *arities.iter().next().expect("non-empty"),
+            *arities.iter().next_back().expect("non-empty"),
+            gapped,
+            arity_zero,
+        ));
+        if module == "Init/Prelude.olean" {
+            prelude_table = table
+                .into_iter()
+                .map(|(tag, row)| (tag, row.into_iter().collect()))
+                .collect();
+        }
+    }
+
+    assert_eq!(
+        shapes
+            .iter()
+            .map(|(m, a, b, c, d, e, f, g)| (m.as_str(), *a, *b, *c, *d, *e, *f, *g))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 3, 5, 102, 1, 5, 1, 0),
+            ("Init.BinderNameHint.olean", 8, 17, 200, 0, 5, 2, 1),
+            ("Init.SizeOfLemmas.olean", 9, 16, 691, 0, 5, 1, 3),
+            ("Init/Prelude.olean", 12, 36, 84992, 0, 8, 1, 23),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "per module: tags, NON-EMPTY CELLS, the grand total, the lowest and \
+         highest arity, tags whose arities are not a contiguous run, and \
+         objects of arity ZERO. The 36 cells in Prelude are the 36 shapes of \
+         `b4194cb0` under another name - a shape IS a `(tag, arity)` pair - so \
+         that agreement is arithmetic and not a second witness"
+    );
+
+    if !prelude_loaded {
+        return;
+    }
+    assert_eq!(
+        prelude_table,
+        vec![
+            (
+                0,
+                vec![
+                    (0, 8),
+                    (1, 1226),
+                    (2, 6417),
+                    (3, 5505),
+                    (4, 4742),
+                    (5, 734),
+                    (6, 161),
+                    (7, 152),
+                    (8, 5)
+                ]
+            ),
+            (1, vec![(0, 1), (1, 1905), (2, 7331), (3, 2), (4, 824)]),
+            (2, vec![(0, 14), (1, 71), (2, 1938), (3, 119)]),
+            (3, vec![(1, 46), (2, 30), (3, 482)]),
+            (4, vec![(1, 117), (2, 2455)]),
+            (5, vec![(1, 162), (2, 26179)]),
+            (6, vec![(1, 157), (2, 66), (3, 10832)]),
+            (7, vec![(1, 129), (3, 12869)]),
+            (8, vec![(4, 8)]),
+            (9, vec![(1, 53), (2, 12)]),
+            (10, vec![(1, 7), (2, 83)]),
+            (11, vec![(3, 150)]),
+        ],
+        "the whole table for Prelude. TAG 7 SKIPS ARITY TWO - 129 objects at \
+         one and 12,869 at three, nothing between - the only gap here, and a \
+         different tag and axis from `d76a2fdc`'s tag 6, which skips the middle \
+         TAIL WIDTH. Tag 0 spans all nine arities contiguously. And tag 1 at \
+         arity 3 holds TWO objects against 7,331 at arity 2 in the same tag, so \
+         a cell four orders of magnitude smaller than its neighbour is still a \
+         real part of the format"
+    );
+    assert_eq!(
+        prelude_table
+            .iter()
+            .filter(|(_, row)| {
+                let first = row.first().expect("non-empty").0;
+                let last = row.last().expect("non-empty").0;
+                usize::from(last - first) + 1 != row.len()
+            })
+            .map(|(tag, _)| *tag)
+            .collect::<Vec<_>>(),
+        vec![7],
+        "the gapped tag named rather than counted, so a different one fails"
+    );
+}
+
 /// Tag against tail width - the 16-byte tail lives in three tags of twelve.
 ///
 /// `4e59dc69` ended with a rule for myself: when a population is selected by a
