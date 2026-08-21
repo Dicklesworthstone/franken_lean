@@ -11770,6 +11770,27 @@ impl WholeMathlibReceipt {
 /// binding this path expresses becomes enforceable the first time the lane runs
 /// against a provisioned corpus and its row is committed.
 fn whole_mathlib_receipt_path(pin: &str) -> PathBuf {
+    // THE PIN IS INTERPOLATED INTO A PATH, SO IT HAS TO BE ABLE TO NAME A FILE.
+    // `join` obeys the string it is given: a pin carrying a separator nests the
+    // receipt into a subdirectory, and one carrying `..` leaves the evidence
+    // directory altogether. Measured, both.
+    //
+    // The neighbouring test already requires two epochs not to share a receipt
+    // file, and checks it by comparing two PATHS. That is a lexical test of a
+    // filesystem claim: `v1/../v2` and `v2` compare unequal and resolve to the
+    // same file, so the assertion passes while the property fails.
+    let mut components = Path::new(pin).components();
+    let single = matches!(
+        components.next(),
+        Some(std::path::Component::Normal(name)) if name == std::ffi::OsStr::new(pin)
+    ) && components.next().is_none();
+    assert!(
+        single,
+        "Reference pin `{pin}` is not a single ordinary path component, so it cannot name a \
+         receipt file. A pin with a separator nests the file and one with `..` leaves the \
+         evidence directory; two such pins can resolve to one file while their paths compare \
+         unequal"
+    );
     fln_conformance::checked_manifest_dir!()
         .join("evidence/whole_mathlib_differential")
         .join(format!("{pin}.jsonl"))
@@ -14229,6 +14250,36 @@ fn the_whole_mathlib_receipt_path_is_keyed_by_the_reference_pin() {
         whole_mathlib_receipt_path("v0.0.0"),
         path,
         "two Reference epochs must not share a receipt file"
+    );
+
+    // AND THAT ASSERTION IS LEXICAL WHERE ITS CLAIM IS NOT. Both pins it
+    // compares are ordinary names, so it cannot distinguish "keyed by the pin"
+    // from "keyed by whatever the pin's characters do to a path". Measured:
+    // `v1/../v2` and `v2` build paths that compare UNEQUAL and resolve to the
+    // same file, so the check above would pass while two epochs shared a
+    // receipt.
+    for ordinary in [pin.as_str(), "v0.0.0"] {
+        assert!(
+            !ordinary.contains('/') && !ordinary.contains(".."),
+            "`{ordinary}` must be an ordinary name, or the pair above already covers this and \
+             the cell below distinguishes nothing"
+        );
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let escaping = std::panic::catch_unwind(|| whole_mathlib_receipt_path("v1/../v2"));
+    std::panic::set_hook(previous);
+    let payload = escaping
+        .err()
+        .unwrap_or_else(|| panic!("a pin that is not a single path component must be refused"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("v1/../v2") && message.contains("single ordinary path component"),
+        "the refusal must name the pin and the rule it breaks: {message}"
     );
 }
 
