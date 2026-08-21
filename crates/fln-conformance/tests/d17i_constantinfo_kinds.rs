@@ -9094,46 +9094,63 @@ fn every_gapped_base_is_on_the_decidable_equality_path_by_reference() {
     }
 }
 
-/// The declaration reference graph is acyclic once the non-safe recursive
-/// implementations are removed — and those are exactly the cycles.
+/// The declaration reference graph has cycles, and they are exactly two
+/// populations — neither of which is a defect.
 ///
 /// The import-graph cell establishes acyclicity between MODULES. Between
-/// DECLARATIONS nothing had asked, and it is the sharper question: a cycle in
-/// the reference graph means no order exists in which the kernel could admit
-/// the declarations, since each would need the other already present.
+/// DECLARATIONS nothing had asked, and it is the sharper question: a cycle
+/// means no order exists in which the kernel could admit both declarations,
+/// since each would need the other already present.
 ///
 /// Measured over `Init/Prelude` at private level, 2,314 declarations, walking
-/// every stored expression for the constants it names:
+/// every stored expression each declaration carries — for a recursor that
+/// includes its iota RULE right-hand sides, which is where the second
+/// population comes from:
 ///
-///   the full graph HAS cycles — 32 of them, with 32 distinct participants,
-///     every one a self-loop or a two-step loop among recursive implementations
-///   every participant is a definition whose `DefinitionSafety` is NOT `Safe`,
-///     and they all share the same non-safe variant
-///   removing the non-safe definitions leaves 2,271 declarations and ZERO
-///     cycles, so an admission order exists for everything the kernel would
-///     accept
+///   41 declarations sit on a cycle, and they split exactly: 32 DEFINITIONS
+///     and 9 RECURSORS, summing to 41
+///   all 32 definitions are non-`Safe` and share one safety variant. They are
+///     the recursive implementations that call themselves directly instead of
+///     going through a recursor
+///   the 9 recursors are EXACTLY the recursors whose block head carries
+///     `is_rec` — a biconditional over all 129 recursors in the module, no
+///     counterexample. A recursor's iota rule for a recursive constructor
+///     names the recursor itself, because that is how recursion is written
+///     down; seven recursive inductives yield nine recursors because the
+///     nested `Lean.Syntax` block contributes three
+///
+/// So removing the non-safe definitions does NOT leave an acyclic graph — it
+/// leaves the nine recursors. Removing those too leaves ZERO. The acyclic part
+/// is everything that is neither a non-safe definition nor a recursor of a
+/// recursive block, and each exclusion is derived from a stored field rather
+/// than from a name.
 ///
 /// Being non-safe is necessary but NOT sufficient: 43 definitions are not
-/// `Safe` and only 32 are in a cycle. The other 11 are non-safe and perfectly
-/// well-founded. That is asserted, because "the cycles are the unsafe ones"
-/// invites the converse and the converse is false.
+/// `Safe` and only 32 are on a cycle. The other 11 are non-safe and perfectly
+/// well-founded.
 ///
 /// The safety variant is derived from the decoded declarations rather than
-/// written into the cell. A test that hardcoded which variant the recursive
-/// implementations carry would still pass if the decoder mapped the byte to a
-/// different variant, which is the mistake this measurement nearly made.
+/// written into the cell, so an assertion cannot pass while the decoder maps
+/// the stored byte to a different variant.
 #[test]
-fn the_reference_graph_is_acyclic_once_the_non_safe_definitions_are_removed() {
+fn the_reference_graph_cycles_are_exactly_the_unsafe_recursion_and_the_recursors() {
     let lib = lib_or_skip!();
     let infos = decode_prelude_private(&lib);
     assert_eq!(infos.len(), 2314, "the declaration census must be reached");
 
     let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut safety: BTreeMap<String, DefinitionSafety> = BTreeMap::new();
+    let mut recursors: BTreeMap<String, &RecursorVal> = BTreeMap::new();
+    let mut recursive_blocks: BTreeSet<String> = BTreeSet::new();
     for info in &infos {
         let name = info.name().to_display_string();
-        if let ConstantInfo::Defn(v) = info {
-            safety.insert(name.clone(), v.safety);
+        match info {
+            ConstantInfo::Defn(v) => drop(safety.insert(name.clone(), v.safety)),
+            ConstantInfo::Rec(v) => drop(recursors.insert(name.clone(), v)),
+            ConstantInfo::Induct(v) if v.is_rec => {
+                let _ = recursive_blocks.insert(name.clone());
+            }
+            _ => {}
         }
         let mut referenced = BTreeSet::new();
         for expr in declaration_expressions(info) {
@@ -9142,8 +9159,12 @@ fn the_reference_graph_is_acyclic_once_the_non_safe_definitions_are_removed() {
         edges.insert(name, referenced);
     }
     let declared: BTreeSet<&String> = edges.keys().collect();
+    assert_eq!(
+        (recursors.len(), recursive_blocks.len()),
+        (129, 7),
+        "the recursor and recursive-inductive censuses"
+    );
 
-    // Three-colour DFS over a chosen node set; returns the participants.
     let participants = |nodes: &BTreeSet<&String>| -> BTreeSet<String> {
         let mut colour: BTreeMap<&String, u8> = nodes.iter().map(|name| (*name, 0)).collect();
         let mut found: BTreeSet<String> = BTreeSet::new();
@@ -9169,8 +9190,6 @@ fn the_reference_graph_is_acyclic_once_the_non_safe_definitions_are_removed() {
                     continue;
                 };
                 if colour[next] == 1 {
-                    // `next` is on the current path: everything from it back to
-                    // the head is a cycle, and a self-loop is the length-one case.
                     let start_index = path.iter().position(|on| *on == next).unwrap_or(0);
                     found.extend(path[start_index..].iter().map(|name| (*name).clone()));
                     found.insert(next.clone());
@@ -9188,48 +9207,93 @@ fn the_reference_graph_is_acyclic_once_the_non_safe_definitions_are_removed() {
     };
 
     let cyclic = participants(&declared);
+    let cyclic_definitions: BTreeSet<&String> = cyclic
+        .iter()
+        .filter(|name| safety.contains_key(*name))
+        .collect();
+    let cyclic_recursors: BTreeSet<&String> = cyclic
+        .iter()
+        .filter(|name| recursors.contains_key(*name))
+        .collect();
     assert_eq!(
+        (
+            cyclic.len(),
+            cyclic_definitions.len(),
+            cyclic_recursors.len()
+        ),
+        (41, 32, 9),
+        "the cycle participants split into definitions and recursors"
+    );
+    assert_eq!(
+        cyclic_definitions.len() + cyclic_recursors.len(),
         cyclic.len(),
-        32,
-        "the full graph must carry exactly the cycles measured at the pin"
+        "and nothing else is on a cycle, so the split accounts for every participant"
     );
 
-    // Every participant is a non-safe definition, and they agree on which
-    // variant — derived, not written down.
-    let variants: BTreeSet<&'static str> = cyclic
+    // The definitions: non-safe, and agreeing on which variant.
+    let variants: BTreeSet<&'static str> = cyclic_definitions
         .iter()
-        .map(|name| match safety.get(name) {
-            Some(DefinitionSafety::Safe) => "Safe",
-            Some(DefinitionSafety::Partial) => "Partial",
-            Some(DefinitionSafety::Unsafe) => "Unsafe",
-            None => "not a definition",
+        .map(|name| match safety[*name] {
+            DefinitionSafety::Safe => "Safe",
+            DefinitionSafety::Partial => "Partial",
+            DefinitionSafety::Unsafe => "Unsafe",
         })
         .collect();
     assert_eq!(
         variants.len(),
         1,
-        "the cycle participants must agree on a single safety, got {variants:?}"
+        "the cyclic definitions must agree on a single safety, got {variants:?}"
     );
     assert!(
-        !variants.contains("Safe") && !variants.contains("not a definition"),
-        "and it must be a non-safe definition variant, got {variants:?}"
+        !variants.contains("Safe"),
+        "and it must not be the safe one, got {variants:?}"
     );
 
-    let safe: BTreeSet<&String> = declared
+    // The recursors: exactly those whose block head is recursive.
+    let expected_recursors: BTreeSet<&String> = recursors
         .iter()
-        .filter(|name| !matches!(safety.get(**name), Some(variant) if *variant != DefinitionSafety::Safe))
+        .filter(|(_, rec)| {
+            rec.all
+                .first()
+                .is_some_and(|head| recursive_blocks.contains(&head.to_display_string()))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        cyclic_recursors, expected_recursors,
+        "a recursor sits on a cycle exactly when its block is recursive, because its iota \
+         rule names the recursor itself"
+    );
+
+    // Removing the non-safe definitions is NOT enough; removing the recursive
+    // recursors as well is.
+    let without_unsafe: BTreeSet<&String> = declared
+        .iter()
+        .filter(|name| !matches!(safety.get(**name), Some(v) if *v != DefinitionSafety::Safe))
         .copied()
         .collect();
     assert_eq!(
-        (safe.len(), participants(&safe).len()),
-        (2_271, 0),
-        "removing the non-safe definitions must leave an acyclic graph"
+        (without_unsafe.len(), participants(&without_unsafe).len()),
+        (2_271, 9),
+        "the recursors survive the safety filter"
+    );
+    let acyclic: BTreeSet<&String> = without_unsafe
+        .into_iter()
+        .filter(|name| !expected_recursors.contains(name))
+        .collect();
+    assert_eq!(
+        (acyclic.len(), participants(&acyclic).len()),
+        (2_262, 0),
+        "and removing them leaves an acyclic graph"
     );
 
-    // Necessary but not sufficient: more definitions are non-safe than are cyclic.
-    let non_safe = declared.len() - safe.len();
+    // Necessary but not sufficient.
+    let non_safe = safety
+        .values()
+        .filter(|variant| **variant != DefinitionSafety::Safe)
+        .count();
     assert_eq!(
-        (non_safe, cyclic.len()),
+        (non_safe, cyclic_definitions.len()),
         (43, 32),
         "eleven non-safe definitions are well-founded, so the converse fails"
     );
