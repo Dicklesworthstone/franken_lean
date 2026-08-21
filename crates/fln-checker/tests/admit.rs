@@ -2257,6 +2257,23 @@ fn kr600_803_init_or_refuses_a_forged_inr_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_or_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = init_or_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert!(recursor.level_parameters().is_empty());
+    assert_eq!(metadata.num_parameters(), 2);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 2);
+    assert_eq!(metadata.rules().len(), 2);
+    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Or", "inl"]));
+    assert_eq!(metadata.rules()[0].num_fields(), 1);
+    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Or", "inr"]));
+    assert_eq!(metadata.rules()[1].num_fields(), 1);
+}
+
+#[test]
 fn kr600_803_direct_recursion_reconstructs_iota_and_defers_indirect_fields() {
     let mut forged_rule = nat_entries();
     let recursor = forged_rule[3].declaration();
