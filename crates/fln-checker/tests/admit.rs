@@ -2278,6 +2278,22 @@ fn kr600_803_init_sum_fixture_pins_constructor_indices_parameters_and_fields() {
 }
 
 #[test]
+fn kr600_803_init_sum_fixture_pins_iota_rule_constructors_and_fields() {
+    let entries = init_sum_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for (rule, constructor) in [
+        (&metadata.rules()[0], entries[1].name()),
+        (&metadata.rules()[1], entries[2].name()),
+    ] {
+        assert_eq!(rule.constructor(), constructor);
+        assert_eq!(rule.num_fields(), 1);
+    }
+}
+
+#[test]
 fn kr600_803_init_prod_fixture_pins_constructor_index_parameters_and_fields() {
     let entries = init_prod_entries();
     let constructor = entries[1].declaration();
