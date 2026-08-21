@@ -1474,6 +1474,18 @@ def main():
             "REFUSE: facade manifest coverage-summary join diverges "
             f"({json.dumps(coverage_summary_join, sort_keys=True)})"
         )
+    structural_field_set_join = {
+        "summary_structural_declarations": manifest_summary.get(
+            "structural_declarations"
+        ),
+        "pinned_structural_declarations": 175,
+    }
+    if (structural_field_set_join["summary_structural_declarations"]
+            != structural_field_set_join["pinned_structural_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural field-set pin diverges "
+            f"({json.dumps(structural_field_set_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2535,6 +2547,7 @@ def main():
         "manifest_withdrawal_join": manifest_withdrawal_join,
         "manifest_quarantine_summary_join": quarantine_summary_join,
         "manifest_coverage_summary_join": coverage_summary_join,
+        "manifest_structural_field_set_join": structural_field_set_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
