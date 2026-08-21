@@ -14451,3 +14451,119 @@ fn declaration_expressions_yields_exactly_what_the_kind_census_predicts() {
         "every ConstantInfo kind occurs, so no arm of the helper is untested here"
     );
 }
+
+/// One name, one constant — over the whole library, not just `Init`.
+///
+/// `no_module_declares_a_name_twice_at_either_level` widened this from two
+/// modules to the 600-module `Init` census. KR-970 is not an `Init` law. Every
+/// module the toolchain ever loads must satisfy it, and the library holds four
+/// times as many: 2,431 chains, of which 1,831 are outside the census and were
+/// never checked by anything.
+///
+/// It holds there too. Across all 2,431 chains at both levels — 158,583 exported
+/// names and 215,111 private ones — no module declares a name twice.
+///
+/// The library divides into six top-level namespaces: `Lean` 1,193, `Init` 601,
+/// `Std` 476, `Lake` 159, `LakeMain` 1, `LeanIR` 1. Init's 601 is one MORE than
+/// the census this file uses everywhere else, and the extra is `Init.olean`, the
+/// aggregator the census deliberately omits — so the two counts disagreeing by
+/// exactly one is the aggregator cell's result reappearing from a different
+/// walk.
+///
+/// The two chainless oleans are `LeanChecker` and `Leanc`, which is why the
+/// population is 2,431 rather than 2,433: no companion means no private level to
+/// check. That exclusion is derived from the filesystem here, not listed.
+///
+/// Anti-vacuity: 215,111 names over 2,431 modules is roughly 88 per module, so
+/// uniqueness is a constraint on real arrays rather than on mostly-empty ones,
+/// and the exported and private totals differ by 56,528 so the two levels are
+/// genuinely different populations.
+///
+/// Conservation first: the namespace classes must account for every chain, and
+/// the chains plus the chainless must account for every exported olean, before
+/// any total is named.
+#[test]
+fn no_module_in_the_library_declares_a_name_twice() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let module_name = |path: &String| -> String {
+        path.strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".")
+    };
+
+    let mut chains = 0usize;
+    let mut chainless: BTreeSet<String> = BTreeSet::new();
+    let mut namespaces: BTreeMap<String, usize> = BTreeMap::new();
+    let mut exported_total = 0usize;
+    let mut private_total = 0usize;
+    for path in &all.exported {
+        let module = module_name(path);
+        if !all.private.contains(path) {
+            chainless.insert(module);
+            continue;
+        }
+        chains += 1;
+        *namespaces
+            .entry(module.split('.').next().expect("a module name").to_owned())
+            .or_default() += 1;
+
+        for level in [Level::Exported, Level::Private] {
+            let view = module_view(&lib, &module, level);
+            let distinct: BTreeSet<&String> = view.const_names.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                view.const_names.len(),
+                "{module}: a name is declared twice, so a name-keyed map would keep only the \
+                 last writer"
+            );
+            match level {
+                Level::Exported => exported_total += view.const_names.len(),
+                Level::Private => private_total += view.const_names.len(),
+            }
+        }
+    }
+
+    // Conservation first: the classes account for the library.
+    assert_eq!(
+        namespaces.values().sum::<usize>(),
+        chains,
+        "every chain must fall in exactly one top-level namespace"
+    );
+    assert_eq!(
+        chains + chainless.len(),
+        all.exported.len(),
+        "every exported olean is either a chain or chainless"
+    );
+
+    assert_eq!(
+        (all.exported.len(), chains, chainless.len()),
+        (2_433, 2_431, 2),
+        "the library census and the two oleans with no private level to check"
+    );
+    assert_eq!(
+        namespaces,
+        BTreeMap::from([
+            ("Init".to_owned(), 601),
+            ("Lake".to_owned(), 159),
+            ("LakeMain".to_owned(), 1),
+            ("Lean".to_owned(), 1_193),
+            ("LeanIR".to_owned(), 1),
+            ("Std".to_owned(), 476),
+        ]),
+        "the library's namespace census"
+    );
+    assert_eq!(
+        (exported_total, private_total),
+        (158_583, 215_111),
+        "the library name census at both levels"
+    );
+
+    // Init here is the census plus the aggregator the census omits.
+    assert_eq!(
+        namespaces["Init"] - init_modules(&lib).len(),
+        1,
+        "the one Init olean outside the census is the aggregator"
+    );
+}
