@@ -2624,6 +2624,106 @@ mod tests {
         );
     }
 
+    /// A scalar-boxed `DataValue` is refused.
+    ///
+    /// Every `DataValue` constructor carries a payload — a string, a bool, a
+    /// name, a nat, an int or a syntax handle — so NONE of them is fieldless
+    /// and none is ever boxed. A boxed word in that slot is not a small value;
+    /// it is a slot holding something that is not a `DataValue` at all.
+    ///
+    /// This is the scalar half of the DataValue decode, pairing with the
+    /// `ofBool` arity mutant (466d162b) the way the list and hints pairs were
+    /// taken. Note the asymmetry with those: for `List` and `ReducibilityHints`
+    /// the boxed form is LEGAL and the rule constrains its value, whereas here
+    /// the boxed form is illegal outright — so this cell plants a box where
+    /// those planted a wrong box.
+    ///
+    /// SHADOWING CHECKED. The scalar guard is the FIRST thing
+    /// `decode_data_value` does, ahead of the header read, so nothing inside
+    /// that function precedes it; and the plant leaves the enclosing pair, its
+    /// list cell and the `Expr.mdata` object untouched, so their rules cannot
+    /// fire either. All three headers are re-asserted after the plant.
+    #[test]
+    fn a_scalar_boxed_data_value_is_refused() {
+        let mut bytes = mdata_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified mdata fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let mdata_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("mdata expression");
+        let mdata_header = view.obj_header(mdata_off).expect("mdata header");
+
+        let cell_off = view
+            .deref(view.read_u64(mdata_off + 8).expect("kvmap slot"))
+            .expect("cons cell");
+        let cell_header = view.obj_header(cell_off).expect("cons header");
+        let pair_off = view
+            .deref(view.read_u64(cell_off + 8).expect("head pointer"))
+            .expect("pair object");
+        let pair_header = view.obj_header(pair_off).expect("pair header");
+
+        // The pair's second field is the DataValue, and it must be a pointer.
+        let slot = pair_off as usize + 16;
+        let value_ptr = view.read_u64(pair_off + 16).expect("value pointer");
+        assert_eq!(
+            value_ptr & 1,
+            0,
+            "no DataValue constructor is fieldless, so none is ever boxed"
+        );
+
+        // Box a word in its place.
+        let planted: u64 = (0 << 1) | 1;
+        bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(pair_off).expect("pair after plant"),
+            pair_header,
+            "the pair is untouched, so the KVMap rule cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(cell_off).expect("cell after plant"),
+            cell_header,
+            "the list cell is untouched, so the list rules cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(mdata_off).expect("mdata after plant"),
+            mdata_header,
+            "and the enclosing expression is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a boxed DataValue must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "scalar DataValue",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `DataValue.ofBool` claiming a pointer field is refused.
     ///
     /// `ofBool` carries a single scalar byte and NO pointers, so the decoder
