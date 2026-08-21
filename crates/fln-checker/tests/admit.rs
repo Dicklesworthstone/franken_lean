@@ -996,6 +996,245 @@ fn init_option_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// `Init.List.{u}` exercises a recursive, universe-polymorphic parameterized
+/// family. The `cons` minor premise must carry the recursive hypothesis and
+/// the second rule must rebuild the recursive recursor call.
+fn init_list_entries() -> Vec<ConstantEntry> {
+    let list = checker_name("List");
+    let nil = checker_qualified(&["List", "nil"]);
+    let cons = checker_qualified(&["List", "cons"]);
+    let rec = checker_qualified(&["List", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let parameter_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let list_expr = |parameter: Expr| {
+        Expr::app(
+            Expr::const_(primary_name("List"), vec![u.clone()]),
+            parameter,
+        )
+    };
+    let nil_expr = |parameter: Expr| {
+        Expr::app(
+            Expr::const_(Name::from_components(["List", "nil"]), vec![u.clone()]),
+            parameter,
+        )
+    };
+    let cons_expr = |parameter: Expr, head: Expr, tail: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["List", "cons"]), vec![u.clone()]),
+                    parameter,
+                ),
+                head,
+            ),
+            tail,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            list_expr(bv(0)),
+            Expr::sort(v.clone()),
+        )
+    };
+    let nil_minor_type = || Expr::app(bv(0), nil_expr(bv(1)));
+    let cons_minor_type = || {
+        primary_pi(
+            "head",
+            BinderInfo::Default,
+            bv(2),
+            primary_pi(
+                "tail",
+                BinderInfo::Default,
+                list_expr(bv(3)),
+                primary_pi(
+                    "tail_ih",
+                    BinderInfo::Default,
+                    Expr::app(bv(3), bv(0)),
+                    Expr::app(bv(4), cons_expr(bv(5), bv(2), bv(1))),
+                ),
+            ),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        parameter_type(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "nil",
+                BinderInfo::Default,
+                nil_minor_type(),
+                primary_pi(
+                    "cons",
+                    BinderInfo::Default,
+                    cons_minor_type(),
+                    primary_pi(
+                        "t",
+                        BinderInfo::Default,
+                        list_expr(bv(3)),
+                        Expr::app(bv(2), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+    let nil_rule_rhs = Expr::lam(
+        primary_name("α"),
+        parameter_type(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("nil"),
+                nil_minor_type(),
+                Expr::lam(
+                    primary_name("cons"),
+                    cons_minor_type(),
+                    bv(1),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let recursive_call = {
+        let recursor = Expr::const_(
+            Name::from_components(["List", "rec"]),
+            vec![v.clone(), u.clone()],
+        );
+        [bv(5), bv(4), bv(3), bv(2), bv(0)]
+            .into_iter()
+            .fold(recursor, Expr::app)
+    };
+    let cons_rule_rhs = Expr::lam(
+        primary_name("α"),
+        parameter_type(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("nil"),
+                nil_minor_type(),
+                Expr::lam(
+                    primary_name("cons"),
+                    cons_minor_type(),
+                    Expr::lam(
+                        primary_name("head"),
+                        bv(4),
+                        Expr::lam(
+                            primary_name("tail"),
+                            list_expr(bv(5)),
+                            Expr::app(
+                                Expr::app(Expr::app(bv(1), bv(1)), bv(0)),
+                                recursive_call,
+                            ),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            list.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    parameter_type(),
+                    parameter_type(),
+                )),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![list.clone()],
+                    vec![nil.clone(), cons.clone()],
+                    0,
+                    true,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            nil.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    parameter_type(),
+                    list_expr(bv(0)),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(list.clone(), 0, 1, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            cons.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    parameter_type(),
+                    primary_pi(
+                        "head",
+                        BinderInfo::Default,
+                        bv(0),
+                        primary_pi(
+                            "tail",
+                            BinderInfo::Default,
+                            list_expr(bv(1)),
+                            list_expr(bv(2)),
+                        ),
+                    ),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(list.clone(), 1, 1, 2),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![list],
+                    1,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(nil, 0, decoded(&nil_rule_rhs)),
+                        RecursorRule::new(cons, 2, decoded(&cons_rule_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
 /// `Init.Empty` has no constructor rows, but its recursor still must be
 /// reconstructed rather than treated as an empty success.
 fn init_empty_entries() -> Vec<ConstantEntry> {
@@ -1424,6 +1663,66 @@ fn kr600_803_init_option_refuses_a_forged_some_iota_rule() {
                     RecursorRule::new(
                         checker_qualified(&["Option", "some"]),
                         1,
+                        decoded(&Expr::bvar(0).expect("packs")),
+                    ),
+                ],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
+fn kr600_803_init_list_recursive_parameter_and_iota_rules_are_reconstructed() {
+    let entries = init_list_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.List block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 4);
+}
+
+#[test]
+fn kr600_803_init_list_refuses_a_forged_cons_iota_rule() {
+    let mut entries = init_list_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["List", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![
+                    metadata.rules()[0].clone(),
+                    RecursorRule::new(
+                        checker_qualified(&["List", "cons"]),
+                        2,
                         decoded(&Expr::bvar(0).expect("packs")),
                     ),
                 ],
