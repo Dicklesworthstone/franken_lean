@@ -256,6 +256,11 @@ const ARRAY_UNATTACH_EQ_1: &str =
     "_private.Init.Data.Array.Attach.0.Array.unattach.eq_1";
 /// The pin's private array stores this theorem in the attach module.
 const ARRAY_UNATTACH_EQ_1_MODULE: &str = "Init/Data/Array/Attach";
+/// The private implementation definition for `Array.allDiffAux`.
+const ARRAY_ALL_DIFF_AUX: &str =
+    "_private.Init.Data.Array.Basic.0.Array.allDiffAux";
+/// The pin's private array stores this implementation in the basic module.
+const ARRAY_ALL_DIFF_AUX_MODULE: &str = "Init/Data/Array/Basic";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1418,6 +1423,33 @@ fn array_unattach_equation_theorem_is_decoded_from_its_private_storage_module() 
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_UNATTACH_EQ_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_all_diff_aux_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_all_diff_aux_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_ALL_DIFF_AUX.to_owned()),
+        "the private companion of {ARRAY_ALL_DIFF_AUX_MODULE} must retain {ARRAY_ALL_DIFF_AUX}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_ALL_DIFF_AUX)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_ALL_DIFF_AUX}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_ALL_DIFF_AUX} as {} instead of Defn",
         recovered.kind_name()
     );
 }
