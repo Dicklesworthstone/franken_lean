@@ -264,6 +264,8 @@ const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER: &str = "_private.Init.Data.A
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER_MODULE: &str = "Init/Data/Array/BasicAux";
 const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX: &str = "_private.Init.Data.Array.BasicAux.0.PSigma.casesOn._arg_pusher";
 const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX_MODULE: &str = "Init/Data/Array/BasicAux";
+const ARRAY_ALL_DIFF_AUX_EQ_DEF: &str = "_private.Init.Data.Array.Basic.0.Array.allDiffAux.eq_def";
+const ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE: &str = "Init/Data/Array/Basic";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -2068,6 +2070,9 @@ fn list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storag
 
 #[test]
 fn psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+
+#[test]
+fn array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_ALL_DIFF_AUX_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_ALL_DIFF_AUX_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
