@@ -60,6 +60,9 @@ the toolchain would report a perfect facade:
   * A DEMANDED-EMISSION JOIN makes the manifest's `emitted` bit agree with its
     demanded disposition: emitted rows must say true; Init and quarantined rows
     must say false. The row's stated provenance cannot contradict its outcome.
+  * A STRUCTURAL-PROVIDER JOIN requires every demanded row that claims a
+    `provided_by` structural block to name one emitted class or structure row.
+    Generated projections and transparent wrappers cannot cite a phantom owner.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -335,8 +338,10 @@ def join_demanded_rows(names, manifest_rows):
     signatureless = []
     role_mismatches = []
     emission_mismatches = []
+    provider_mismatches = []
     roles = Counter()
     emission_join = Counter()
+    provider_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -361,10 +366,29 @@ def join_demanded_rows(names, manifest_rows):
                 f"{name}(outcome={outcome}, emitted={row.get('emitted')!r})"
             )
             continue
+        provider = row.get("provided_by")
+        if provider is not None:
+            owners = rows_by_name.get(provider, ())
+            owner = owners[0] if len(owners) == 1 else None
+            if (row.get("form") not in ("class-projection", "transparent-abbrev")
+                    or owner is None
+                    or owner.get("form") not in ("class", "structure")
+                    or owner.get("emitted") is not True):
+                provider_mismatches.append(
+                    f"{name}(provided_by={provider!r})"
+                )
+                continue
+            provider_join["structural"] += 1
+        else:
+            if row.get("form") == "class-projection":
+                provider_mismatches.append(f"{name}(class-projection lacks provided_by)")
+                continue
+            provider_join["direct"] += 1
         dispositions[name] = outcome
         roles[expected_role] += 1
         emission_join["emitted" if expected_emitted else "not_emitted"] += 1
-    if unclassified or signatureless or role_mismatches or emission_mismatches:
+    if (unclassified or signatureless or role_mismatches or emission_mismatches
+            or provider_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -374,11 +398,14 @@ def join_demanded_rows(names, manifest_rows):
             details.append("role-mismatch=" + ", ".join(role_mismatches[:8]))
         if emission_mismatches:
             details.append("emission-mismatch=" + ", ".join(emission_mismatches[:8]))
+        if provider_mismatches:
+            details.append("provider-mismatch=" + ", ".join(provider_mismatches[:8]))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
         )
-    return dispositions, dict(sorted(roles.items())), dict(sorted(emission_join.items()))
+    return (dispositions, dict(sorted(roles.items())),
+            dict(sorted(emission_join.items())), dict(sorted(provider_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -538,9 +565,8 @@ def main():
                          "run would silently degrade to a name-only check")
 
     demand_names = {name for names in by_module.values() for name in names}
-    demand_dispositions, demand_roles, demand_emission = join_demanded_rows(
-        demand_names, manifest_rows
-    )
+    (demand_dispositions, demand_roles, demand_emission,
+     demand_providers) = join_demanded_rows(demand_names, manifest_rows)
 
     # Mutation control for the source guard above. It is deliberately in-memory:
     # no Reference-importing file is ever handed to the pinned compiler.
@@ -647,6 +673,7 @@ def main():
         "demanded_dispositions": disposition_matrix,
         "demanded_role_join": demand_roles,
         "demanded_emission_join": demand_emission,
+        "demanded_provider_join": demand_providers,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
             "init_substrate": disposition_matrix.get("init-substrate", 0),
