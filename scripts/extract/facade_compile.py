@@ -3153,6 +3153,30 @@ def main():
             "REFUSE: facade manifest field-set count must exceed inductive "
             f"declaration count ({json.dumps(field_set_inductive_inequality_join, sort_keys=True)})"
         )
+    projection_kernel_special_inequality_join = {
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+        "summary_kernel_special_population": manifest_summary.get(
+            "kernel_special_population"
+        ),
+    }
+    if (not isinstance(projection_kernel_special_inequality_join[
+            "summary_projection_types_checked"], int)
+            or isinstance(projection_kernel_special_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or not isinstance(projection_kernel_special_inequality_join[
+                "summary_kernel_special_population"], int)
+            or isinstance(projection_kernel_special_inequality_join[
+                "summary_kernel_special_population"], bool)
+            or projection_kernel_special_inequality_join[
+                "summary_projection_types_checked"]
+            <= projection_kernel_special_inequality_join[
+                "summary_kernel_special_population"]):
+        raise SystemExit(
+            "REFUSE: facade manifest projection-type count must exceed kernel "
+            f"special population ({json.dumps(projection_kernel_special_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5240,6 +5264,9 @@ def main():
         ),
         "manifest_field_set_inductive_inequality_join": (
             field_set_inductive_inequality_join
+        ),
+        "manifest_projection_kernel_special_inequality_join": (
+            projection_kernel_special_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
