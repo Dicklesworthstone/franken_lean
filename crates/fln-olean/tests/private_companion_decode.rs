@@ -1087,6 +1087,10 @@ const ARRAY_FOLDL_M_GO_MODULE: &str = "Init/Data/Array/Basic";
 const ARRAY_FOR_IN_GO: &str = "_private.Init.Data.Array.Basic.0.Array.forIn.go";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_FOR_IN_GO_MODULE: &str = "Init/Data/Array/Basic";
+/// The private recursion helper generated for `Array.mapM`.
+const ARRAY_MAP_M_GO_BASIC: &str = "_private.Init.Data.Array.Basic.0.Array.mapM.go";
+/// The pin's private array stores this helper in the basic module.
+const ARRAY_MAP_M_GO_BASIC_MODULE: &str = "Init/Data/Array/Basic";
 /// The private proof generated for `Array.swap`.
 const ARRAY_SWAP_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.swap._proof_1";
 /// The pin's private array stores this proof in the basic module.
@@ -2161,6 +2165,9 @@ fn array_foldl_m_go_is_decoded_from_its_private_storage_module() { let lib = lib
 
 #[test]
 fn array_for_in_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_for_in_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FOR_IN_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FOR_IN_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FOR_IN_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+
+#[test]
+fn array_map_m_basic_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_basic_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_BASIC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_BASIC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_BASIC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
 
 #[test]
 fn array_swap_proof_1_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_swap_proof_1_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_SWAP_PROOF_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_SWAP_PROOF_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_SWAP_PROOF_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
