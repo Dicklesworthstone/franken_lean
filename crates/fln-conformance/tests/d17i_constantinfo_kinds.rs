@@ -15391,3 +15391,159 @@ fn the_splitter_law_and_the_two_array_growth_rates_hold_library_wide() {
          part is not the code-generator store this bead takes it for"
     );
 }
+
+/// The block-freeze law library-wide, and the fourteenth grower `Init` cannot
+/// see.
+///
+/// `a_shared_extension_block_is_frozen_by_the_server_and_grown_by_the_private_part`
+/// measures both steps over the 600-module census and finds the server step an
+/// exact equality. `the_private_part_grows_thirteen_blocks_and_the_axioms_block_is_not_one`
+/// names the thirteen blocks that grow there. Both are `Init`, and extension
+/// entry counts are a third array — independent of `constNames` multiplicities
+/// and of `extraConstNames` alike, so neither of the two library-wide cells
+/// before this one constrains them.
+///
+/// Over all 2,431 chains the shape is identical to `Init`'s:
+///
+///   exported → server   45,123 shared blocks, EVERY ONE EQUAL
+///   server → private    43,608 equal, 6,446 grown, none shrunk
+///   both steps          no block vanishes between levels
+///
+/// But the growing SET is not identical. Fourteen blocks grow, not thirteen, and
+/// the extra one is `Lean.Elab.Term.elabAsElim` — which grows in fifteen modules
+/// and in not one of them is an `Init` module. The census table is correct and
+/// incomplete, so the cell asserts the `Init` thirteen are a subset and that the
+/// difference is exactly that one name, rather than replacing the table with a
+/// wider one that would stop testing the narrower claim.
+///
+/// THE COMPARISON COUNT BINDS A THIRD CELL. 45,123 blocks are compared at the
+/// server step, one per `(chain, block)` pair; the namespace cell counts 45,162
+/// `(module, block)` pairs over all 2,433 exported parts. The 39 missing are the
+/// two chainless oleans, and that same cell pins their namespace vocabularies at
+/// 20 and 19 — each namespace holding exactly one module, so vocabulary IS block
+/// count. 45,123 + 20 + 19 = 45,162, asserted here so three independently
+/// measured numbers have to agree.
+///
+/// Anti-vacuity: growth counts run from 3 to 1,769, so "grown" is not a handful
+/// of edge cases; and the freeze law is stated over 45,123 comparisons rather
+/// than an empty set.
+///
+/// Conservation first: the per-block growth counts must sum to the growth total,
+/// and each step's classes must account for every shared block, before either
+/// law is named.
+#[test]
+fn the_block_freeze_law_holds_library_wide_with_one_grower_init_never_sees() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let sizes = |view: &ModuleDataView| -> BTreeMap<String, u64> {
+        view.extensions
+            .iter()
+            .map(|block| (block.name.clone(), block.entries))
+            .collect()
+    };
+
+    let mut server_step: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut private_step: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut growth: BTreeMap<String, usize> = BTreeMap::new();
+    let mut init_growers: BTreeSet<String> = BTreeSet::new();
+    let mut missing = 0usize;
+    let mut chainless_blocks = 0usize;
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        if !all.private.contains(path) {
+            chainless_blocks += module_view(&lib, &module, Level::Exported).extensions.len();
+            continue;
+        }
+        let from_init = module.split('.').next() == Some("Init");
+        let exported = sizes(&module_view(&lib, &module, Level::Exported));
+        let server = sizes(&server_module_view(&lib, &module));
+        let private = sizes(&module_view(&lib, &module, Level::Private));
+
+        for (step, before, after) in [
+            (&mut server_step, &exported, &server),
+            (&mut private_step, &server, &private),
+        ] {
+            for (name, was) in before {
+                match after.get(name) {
+                    None => missing += 1,
+                    Some(now) if now < was => *step.entry("shrink").or_default() += 1,
+                    Some(now) if now == was => *step.entry("equal").or_default() += 1,
+                    Some(_) => *step.entry("grow").or_default() += 1,
+                }
+            }
+        }
+        for (name, was) in &server {
+            if private.get(name).is_some_and(|now| now > was) {
+                *growth.entry(name.clone()).or_default() += 1;
+                if from_init {
+                    init_growers.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(missing, 0, "no block may vanish between levels");
+    assert_eq!(
+        growth.values().sum::<usize>(),
+        private_step.get("grow").copied().unwrap_or_default(),
+        "the per-block counts must sum to the growth events"
+    );
+
+    assert_eq!(
+        server_step,
+        BTreeMap::from([("equal", 45_123)]),
+        "the server part leaves every inherited block exactly as it found it"
+    );
+    assert_eq!(
+        private_step,
+        BTreeMap::from([("equal", 43_608), ("grow", 6_446)]),
+        "the private part grows blocks and never shrinks one"
+    );
+
+    // Fourteen growers: Init's thirteen, plus exactly one it cannot see.
+    let init_table: BTreeSet<String> = BLOCKS_THE_PRIVATE_PART_GROWS
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    let library: BTreeSet<String> = growth.keys().cloned().collect();
+    assert!(
+        init_table.is_subset(&library),
+        "every block the census finds growing must still grow library-wide"
+    );
+    assert_eq!(
+        library
+            .difference(&init_table)
+            .cloned()
+            .collect::<Vec<String>>(),
+        vec!["Lean.Elab.Term.elabAsElim".to_owned()],
+        "one grower has no Init instance, so the census table is correct and incomplete"
+    );
+    assert!(
+        !init_growers.contains("Lean.Elab.Term.elabAsElim")
+            && growth["Lean.Elab.Term.elabAsElim"] == 15,
+        "and it grows in fifteen modules, none of them Init"
+    );
+
+    // Binds the namespace cell: comparisons plus the chainless pair.
+    assert_eq!(
+        server_step["equal"] + chainless_blocks,
+        45_162,
+        "the server-step comparisons plus the two chainless oleans' blocks are the library's \
+         (module, block) pairs"
+    );
+
+    // Anti-vacuity: growth spans a real range.
+    assert_eq!(
+        (
+            growth.values().copied().min().expect("nonempty"),
+            growth.values().copied().max().expect("nonempty")
+        ),
+        (3, 1_769),
+        "growth counts span a real range"
+    );
+}
