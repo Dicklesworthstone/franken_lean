@@ -42,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RESISTANCE = os.path.join(REPO, "contracts", "facade_resistance.ndjson")
@@ -189,6 +190,27 @@ open Lean in
       IO.println s!"TYPE\t{n}\t{lvls}\t{inst}\t{fmt}"
       IO.println s!"TYPEX\t{n}\t{fmtx}"
       IO.println s!"DEPS\t{n}\t{deps}"
+      -- A STRUCTURE is the one shape an `axiom` cannot stand in for: class-hood
+      -- and field projections are structural facts, not type facts. Report the
+      -- constructor telescope so the emitter can rebuild the declaration itself.
+      if let ConstantInfo.inductInfo iv := info then
+        if isStructure env n then
+          if let some ctor := iv.ctors.head? then
+            if let some cinfo := env.find? ctor then
+              let cdeps := ",".intercalate ((cinfo.type.getUsedConstants.map toString).toList)
+              IO.println s!"STRUCT\t{n}\t{iv.numParams}\t{isClass env n}\t{ctor}"
+              IO.println s!"DEPSC\t{n}\t{cdeps}"
+              Meta.MetaM.run' <| Meta.forallTelescopeReducing cinfo.type fun xs _ => do
+                for i in [0:xs.size] do
+                  let d <- xs[i]!.fvarId!.getDecl
+                  let bty <- withOptions (fun o => o.setBool `pp.fullNames true)
+                    (Meta.ppExpr d.type)
+                  let bk := match d.binderInfo with
+                    | BinderInfo.default => "default"
+                    | BinderInfo.implicit => "implicit"
+                    | BinderInfo.strictImplicit => "strict"
+                    | BinderInfo.instImplicit => "inst"
+                  IO.println s!"BINDER\t{n}\t{i}\t{bk}\t{d.userName}\t{bty}"
     | none => IO.println s!"MISSING\t{n}"
 '''
 
@@ -209,6 +231,7 @@ def probe(lean, env, work, names):
         raise SystemExit(f"REFUSE: the pinned binary refused the probe:\n"
                          f"{(proc.stdout + proc.stderr)[:1200]}")
     types, typesx, levels, insts, deps, missing = {}, {}, {}, {}, {}, []
+    structs, binders = {}, defaultdict(dict)
     current = None
     for line in proc.stdout.splitlines():
         if line.startswith("TYPE\t"):
@@ -223,13 +246,27 @@ def probe(lean, env, work, names):
             _, name, dep_csv = line.split("\t", 2)
             deps[name] = [d for d in dep_csv.split(",") if d]
             current = None
+        elif line.startswith("DEPSC\t"):
+            _, name, dep_csv = line.split("\t", 2)
+            deps[name] = sorted(set(deps.get(name, [])) | {d for d in dep_csv.split(",") if d})
+            current = None
+        elif line.startswith("STRUCT\t"):
+            _, name, nparams, is_class, ctor = line.split("\t", 4)
+            structs[name] = {"num_params": int(nparams),
+                             "is_class": is_class == "true", "ctor": ctor}
+            current = None
+        elif line.startswith("BINDER\t"):
+            _, name, idx, kind, user, bty = line.split("\t", 5)
+            binders[name][int(idx)] = {"kind": kind, "user": user, "type": bty}
+            current = (binders[name][int(idx)], "type")
         elif line.startswith("MISSING\t"):
             missing.append(line.split("\t", 1)[1])
             current = None
         elif current is not None and line.strip():
             d, name = current
             d[name] = d[name] + " " + line.strip()
-    return types, typesx, levels, insts, deps, missing
+    return (types, typesx, levels, insts, deps, missing,
+            structs, {k: v for k, v in binders.items()})
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -262,6 +299,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=8):
     itself declared, unless `Init` provides it — `import Init` is implicit in every
     non-prelude Lean file, so those constants are the shared substrate."""
     types, typesx, levels, insts, deps = {}, {}, {}, {}, {}
+    structs, binders = {}, {}
     known, missing, init_provided = set(), [], set()
     frontier = set(demand)
     rounds = 0
@@ -272,13 +310,23 @@ def close_over_types(lean, env, work, demand, census, max_rounds=8):
                 f"REFUSE: type closure did not converge in {max_rounds} rounds "
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
-        t, tx, lv, ins, dp, ms = probe(lean, env, work, frontier)
+        t, tx, lv, ins, dp, ms, st, bd = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); levels.update(lv)
         insts.update(ins); deps.update(dp)
+        structs.update(st); binders.update(bd)
         missing.extend(ms)
         known |= set(frontier)
         nxt = set()
         for name in frontier:
+            st = structs.get(name)
+            if st:
+                for i, b in sorted(binders.get(name, {}).items()):
+                    if i >= st["num_params"]:
+                        proj = f"{name}.{b['user']}"
+                        if proj not in known:
+                            nxt.add(proj)
+                if st["ctor"] not in known:
+                    nxt.add(st["ctor"])
             for dep in deps.get(name, ()):
                 if dep in known or dep in nxt:
                     continue
@@ -289,7 +337,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=8):
                     continue
                 nxt.add(dep)
         frontier = nxt
-    return types, typesx, levels, insts, deps, missing, init_provided, rounds
+    return (types, typesx, levels, insts, deps, missing, init_provided, rounds,
+            structs, binders)
 
 
 def order(names, deps):
@@ -338,12 +387,86 @@ HEADER = [
 ]
 
 
-def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs):
+def binder_text(b):
+    """Render one constructor binder. An INACCESSIBLE name (`inst✝`) cannot be
+    written back as source, and a field type that mentions one cannot either — the
+    caller refuses structural emission for that structure rather than emitting a
+    line the pin will reject."""
+    name, ty, kind = b["user"], b["type"], b["kind"]
+    if kind == "inst":
+        return f"[{ty}]" if "✝" in name else f"[{name} : {ty}]"
+    open_, close = {"default": ("(", ")"), "implicit": ("{", "}"),
+                    "strict": ("\u2983", "\u2984")}[kind]
+    return f"{open_}{name} : {ty}{close}"
+
+
+def structural_block(name, d, st, bs):
+    """A `class`/`structure` declaration rebuilt from the pin's own constructor
+    telescope. This is the ONE thing an axiom facade cannot do: class-hood and
+    field projections are structural facts, so an opaque `axiom Lean.MonadEnv`
+    makes `[self : Lean.MonadEnv m]` an invalid binder annotation and takes every
+    projection down with it (measured: 29 rows plus 20 instance registrations)."""
+    keyword = "class" if st["is_class"] else "structure"
+    binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
+    params, fields = [], []
+    for i, b in sorted(bs.items()):
+        (params if i < st["num_params"] else fields).append(b)
+    if not fields:
+        return None
+    head = f"{keyword} {d['decl_name']}{binder}" + (
+        (" " + " ".join(binder_text(b) for b in params)) if params else "") + " where"
+    lines = [head]
+    for b in fields:
+        fname = renderable_name(b["user"])
+        if fname is None:
+            return None
+        lines.append(f"  {fname} : {b['type']}")
+    return lines
+
+
+def structural_refusal(name, st, bs):
+    """Why a structure may not be emitted structurally, decided BEFORE the pin is
+    asked, so the reason is a fact rather than a diagnostic."""
+    if not bs:
+        return "no constructor telescope was probed"
+    if all(i < st["num_params"] for i in bs):
+        return "constructor has parameters only, no fields"
+    for i, b in sorted(bs.items()):
+        if "\u271d" in b["type"]:
+            return "a binder type mentions an inaccessible name"
+        if "\u271d" in b["user"] and b["kind"] != "inst":
+            return "a non-instance binder is inaccessible"
+    return None
+
+
+def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
+           structural, structs, binders):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
+    # Everything a structural declaration generates for itself: re-declaring a
+    # projection the `class` block already produces is a redeclaration error.
+    provided = {}
+    for c in structural:
+        st = structs[c]
+        provided[st["ctor"]] = c
+        for i, b in sorted(binders.get(c, {}).items()):
+            if i >= st["num_params"]:
+                provided[f"{c}.{b['user']}"] = c
     for name in ordered:
-        if name in quarantine:
+        if name in quarantine or name in provided:
+            continue
+        if name in structural:
+            block = structural_block(name, decl[name], structs[name],
+                                     binders.get(name, {}))
+            d = decl[name]
+            body.append(f"-- role={d['role']} bucket={d['bucket']} "
+                        f"structural={'class' if structs[name]['is_class'] else 'structure'} "
+                        f"module={d['module']}")
+            for line in block:
+                body.append(line)
+                line_map[len(body)] = ("struct", name)
+            emitted.append(name)
             continue
         d = decl[name]
         ty = d["typex"] if name in explicit_for else d["type"]
@@ -361,19 +484,28 @@ def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs):
         d = decl[name]
         if name in quarantine or not d["instance"] or name in dropped_attrs:
             continue
+        if name in structural:
+            continue
         body.append(f"attribute [instance] {d['decl_name']}")
         line_map[len(body)] = ("attr", name)
         attrs += 1
+    # A parent projection of an `extends` class is an instance in the pin; the
+    # structural block generates the projection but not its registration.
+    for proj, owner in sorted(provided.items()):
+        if proj in decl and decl[proj]["instance"] and proj not in dropped_attrs:
+            body.append(f"attribute [instance] {decl[proj]['decl_name']}")
+            line_map[len(body)] = ("attr", proj)
+            attrs += 1
     for name in sorted(quarantine):
         body.append(f"-- QUARANTINED {name}: {quarantine[name]}")
-    return "\n".join(body) + "\n", line_map, emitted, attrs
+    return "\n".join(body) + "\n", line_map, emitted, attrs, provided
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="the generated Lean facade module")
     ap.add_argument("--manifest", required=True, help="fln-facade-module/1 NDJSON")
-    ap.add_argument("--max-attempts", type=int, default=6)
+    ap.add_argument("--max-attempts", type=int, default=14)
     args = ap.parse_args()
 
     lean, tag = pinned_lean()
@@ -398,8 +530,8 @@ def main():
     if not facade_demand:
         raise SystemExit("REFUSE: every demanded symbol is Init-provided — there "
                          "would be no facade left to emit")
-    types, typesx, levels, insts, deps, missing, init_provided, rounds = close_over_types(
-        lean, env, work, facade_demand, census)
+    (types, typesx, levels, insts, deps, missing, init_provided, rounds,
+     structs, binders) = close_over_types(lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -427,13 +559,27 @@ def main():
             "census": row is not None,
         }
 
+    # Which structures the facade will try to declare AS structures. A refusal
+    # here is a fact decided before the pin is asked; a refusal later is the pin's
+    # own verdict, and both are recorded per row.
+    structural, structural_refused = set(), {}
+    for name, st in structs.items():
+        if name not in decl:
+            continue
+        reason = structural_refusal(name, st, binders.get(name, {}))
+        if reason:
+            structural_refused[name] = reason
+        else:
+            structural.add(name)
+
     ordered, cycle_residue = order(list(types), deps)
     explicit_for, dropped_attrs, attr_reason = set(), set(), {}
     text = line_map = emitted = None
     attempts = []
     for attempt in range(1, args.max_attempts + 1):
-        text, line_map, emitted, attr_count = render(
-            tag, ordered, decl, explicit_for, quarantine, dropped_attrs)
+        text, line_map, emitted, attr_count, provided = render(
+            tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
+            structural, structs, binders)
         candidate = args.out + ".candidate.lean"
         with open(candidate, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -443,26 +589,38 @@ def main():
         errors = len(re.findall(r"\.candidate\.lean:\d+:\d+: error", out))
         attempts.append({"attempt": attempt, "emitted": len(emitted),
                          "attributes": attr_count, "errors": errors,
+                         "structural": len(structural),
                          "quarantined": len(quarantine)})
         if proc.returncode == 0:
             os.replace(candidate, args.out)
             break
-        blamed_axioms, blamed_attrs, blame_msg = set(), set(), {}
+        blamed_axioms, blamed_attrs, blamed_structs, blame_msg = set(), set(), set(), {}
         for m in re.finditer(r"\.candidate\.lean:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out):
             hit = line_map.get(int(m.group(1)))
             if hit is None:
                 continue
-            (blamed_attrs if hit[0] == "attr" else blamed_axioms).add(hit[1])
+            {"attr": blamed_attrs, "struct": blamed_structs}.get(
+                hit[0], blamed_axioms).add(hit[1])
             blame_msg[hit[1]] = ((m.group(2) or "-") + ": " + m.group(3))[:220]
         for m in re.finditer(r"\.candidate\.lean:(\d+):", out):
             hit = line_map.get(int(m.group(1)))
             if hit is not None:
-                (blamed_attrs if hit[0] == "attr" else blamed_axioms).add(hit[1])
-        if not blamed_axioms and not blamed_attrs:
+                {"attr": blamed_attrs, "struct": blamed_structs}.get(
+                    hit[0], blamed_axioms).add(hit[1])
+        if not blamed_axioms and not blamed_attrs and not blamed_structs:
             raise SystemExit(
                 f"REFUSE: elaboration failed but no error line maps to a "
                 f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
         progressed = False
+        # A structural block the pin rejects DEMOTES to the axiom form rather than
+        # taking the row out of the facade: coverage must never fall because the
+        # stronger emission was attempted.
+        for name in blamed_structs:
+            if name in structural:
+                structural.discard(name)
+                structural_refused[name] = ("pin rejected the structural block -- "
+                                            + blame_msg.get(name, "-"))
+                progressed = True
         # An instance registration the facade cannot reproduce is a FINDING: the
         # class itself is an opaque axiom here, so `attribute [instance]` has no
         # class to attach to. Drop it and record it; never silently keep a green.
@@ -503,6 +661,9 @@ def main():
         raise SystemExit(
             f"REFUSE: the facade did not converge in {args.max_attempts} attempts")
 
+    # A projection the structural block generates IS in the facade; counting only
+    # the lines this emitter wrote would understate coverage by every field.
+    emitted = emitted + [p for p in sorted(provided) if p in decl]
     covered = [n for n in emitted if decl[n]["role"] == "demanded"]
     if len(covered) < 0.5 * len(facade_demand):
         raise SystemExit(
@@ -521,6 +682,10 @@ def main():
         "substrate_emitted": sum(1 for n in emitted if decl[n]["role"] == "substrate"),
         "uncensused_emitted": sum(1 for n in emitted if decl[n]["role"] == "uncensused-closure"),
         "init_provided": len(init_provided),
+        "structural_declarations": len(structural),
+        "structural_class": sum(1 for n in structural if structs[n]["is_class"]),
+        "structural_refused": len(structural_refused),
+        "class_provided_projections": len(provided),
         "instance_attrs_kept": sum(1 for n in emitted
                                    if decl[n]["instance"] and n not in dropped_attrs),
         "instance_attrs_dropped": len(dropped_attrs),
@@ -542,7 +707,13 @@ def main():
             "instance": d["instance"],
             "instance_registered": bool(d["instance"]) and name not in dropped_attrs,
             "instance_drop_reason": attr_reason.get(name),
-            "emitted": name not in quarantine,
+            "form": ("class" if name in structural and structs[name]["is_class"]
+                     else "structure" if name in structural
+                     else "class-projection" if name in provided else "axiom"),
+            "provided_by": provided.get(name),
+            "structural_refused_reason": structural_refused.get(name),
+            "emitted": name not in quarantine and (
+                name in provided or name in structural or True),
             "quarantine_reason": quarantine.get(name),
             "printer": "pp.explicit" if name in explicit_for else "pp.fullNames",
             "signature": (d["typex"] if name in explicit_for else d["type"]),
@@ -571,6 +742,7 @@ def main():
           f"covered={len(covered)} substrate={rows[0]['substrate_emitted']} "
           f"init={len(init_provided)} attrs_kept={rows[0]['instance_attrs_kept']} "
           f"attrs_dropped={len(dropped_attrs)} quarantined={len(quarantine)} "
+          f"structural={len(structural)} projections={len(provided)} "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
 
