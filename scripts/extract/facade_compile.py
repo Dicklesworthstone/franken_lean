@@ -174,6 +174,10 @@ the toolchain would report a perfect facade:
     demand totals to agree with both the facade manifest and exact-demand
     denominator. A hashed resistance input cannot still report a stale cohort.
 
+  * A RESISTANCE-RATCHET JOIN requires exactly one ratchet step per risk bucket
+    and their measured memberships to reconstruct the joined resistance cohort.
+    Bucket-level assurance rows cannot drift from their summary total.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1005,6 +1009,7 @@ def join_resistance_demand(manifest_summary, module_join):
     """Cross-bind the resistance cohort to manifest and exact-demand totals."""
     path = os.path.join(REPO, "contracts", "facade_resistance.ndjson")
     summaries = []
+    ratchet_steps = []
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             try:
@@ -1015,6 +1020,8 @@ def join_resistance_demand(manifest_summary, module_join):
                 ) from exc
             if row.get("kind") == "summary":
                 summaries.append(row)
+            elif row.get("kind") == "ratchet-step":
+                ratchet_steps.append(row)
     if len(summaries) != 1:
         raise SystemExit(
             f"REFUSE: resistance-demand join needs exactly one summary, found {len(summaries)}"
@@ -1025,6 +1032,19 @@ def join_resistance_demand(manifest_summary, module_join):
         "unresisting", "demanded_names", "union_demanded", "tactic_files",
     )
     values = {field: summary.get(field) for field in fields}
+    ratchet_members = {}
+    for step in ratchet_steps:
+        bucket = step.get("bucket")
+        members = step.get("members")
+        if (bucket not in DEMANDED_BUCKETS
+                or not isinstance(members, int)
+                or isinstance(members, bool)
+                or members < 0
+                or bucket in ratchet_members):
+            raise SystemExit(
+                f"REFUSE: resistance ratchet-step join found invalid row {step!r}"
+            )
+        ratchet_members[bucket] = members
     if (summary.get("schema") != "fln-facade-resistance/1"
             or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
                    for value in values.values())
@@ -1035,13 +1055,16 @@ def join_resistance_demand(manifest_summary, module_join):
             or values["resisting"] + values["unresisting"] != values["joined"]
             or values["demanded_names"] < values["exact_demanded"]
             or values["union_demanded"] < values["joined"]
-            or values["tactic_files"] == 0):
+            or values["tactic_files"] == 0
+            or set(ratchet_members) != DEMANDED_BUCKETS
+            or sum(ratchet_members.values()) != values["joined"]):
         raise SystemExit(
             "REFUSE: resistance-demand cross join disagrees with its cohorts "
             f"(resistance={json.dumps(values, sort_keys=True)}, "
             f"manifest_demanded={manifest_summary.get('demanded')!r}, "
             f"exact_demanded={module_join['toolchain_distinct_symbols']!r})"
         )
+    values["ratchet_members"] = sum(ratchet_members.values())
     return values
 
 
