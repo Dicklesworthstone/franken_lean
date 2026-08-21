@@ -240,6 +240,9 @@ open Lean in
             if let some cinfo := env.find? ctor then
               let cdeps := ",".intercalate ((cinfo.type.getUsedConstants.map toString).toList)
               IO.println s!"STRUCT\t{n}\t{iv.numParams}\t{isClass env n}\t{ctor}"
+              let flds := ",".intercalate
+                ((getStructureFields env n).map toString).toList
+              IO.println s!"FIELDS\t{n}\t{flds}"
               -- The PARAMETER binder kinds come from the structure's OWN type, not
               -- from the constructor: Lean makes constructor parameters implicit,
               -- so emitting `class C {m : X}` from the ctor telescope makes `C m`
@@ -371,6 +374,7 @@ def probe(lean, env, work, names):
     safety_status = {}
     module_of = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
+    struct_fields = {}
     current = None
     for line in proc.stdout.splitlines():
         if line.startswith("TYPE\t"):
@@ -405,6 +409,10 @@ def probe(lean, env, work, names):
             _, name, dep_csv = line.split("\t", 2)
             deps[name] = sorted(set(deps.get(name, [])) | {d for d in dep_csv.split(",") if d})
             current = None
+        elif line.startswith("FIELDS\t"):
+            _, name, flds = line.split("\t", 2)
+            struct_fields[name] = [f for f in flds.strip().split(",") if f]
+            current = None
         elif line.startswith("STRUCT\t"):
             _, name, nparams, is_class, ctor = line.split("\t", 4)
             structs[name] = {"num_params": int(nparams),
@@ -427,7 +435,7 @@ def probe(lean, env, work, names):
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
-            module_of)
+            module_of, struct_fields)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -764,6 +772,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_reducibility = {}
     pin_safety = {}
     pin_module = {}
+    pin_fields = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -782,13 +791,14 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod) = probe(lean, env, work, frontier)
+         rd, sfy, mod, flds) = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
         pin_reducibility.update(rd)
         pin_safety.update(sfy)
         pin_module.update(mod)
+        pin_fields.update(flds)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -820,7 +830,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         frontier = nxt
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
-            pin_reducibility, pin_safety, pin_module)
+            pin_reducibility, pin_safety, pin_module, pin_fields)
 
 
 def order(names, deps):
@@ -1140,8 +1150,8 @@ def main():
                          "would be no facade left to emit")
     (types, typesx, typesm, levels, insts, deps, missing, init_provided,
      rounds, structs, binders, absent_projections, pbinders,
-     pin_reducibility, pin_safety, pin_module) = close_over_types(
-        lean, env, work, facade_demand, census)
+     pin_reducibility, pin_safety, pin_module,
+     pin_fields) = close_over_types(lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -1240,7 +1250,8 @@ def main():
         if not extra:
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
-         pb2, rd2, sfy2, mod2) = close_over_types(lean, env, work, extra, census)
+         pb2, rd2, sfy2, mod2, flds2) = close_over_types(
+            lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
@@ -1248,6 +1259,7 @@ def main():
         pin_reducibility.update(rd2)
         pin_safety.update(sfy2)
         pin_module.update(mod2)
+        pin_fields.update(flds2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1829,6 +1841,39 @@ def main():
             "REFUSE: facade demand totality lost a symbol while assigning "
             "dispositions"
         )
+    # DOES EACH STRUCTURAL BLOCK CARRY THE REFERENCE'S FIELD SET? Every
+    # projection the facade offers comes from these fields, so a dropped field
+    # silently removes a projection and an invented one offers a projection the
+    # Reference does not have. The type checks cannot see either: they only speak
+    # about projections that exist on BOTH sides. The pin is asked directly
+    # (getStructureFields) and the emitted set is compared name for name.
+    field_set_mismatches = []
+    field_sets_checked = 0
+    for c in sorted(structural):
+        st = structs.get(c) or {}
+        emitted_fields = [b["user"] for i, b in sorted(binders.get(c, {}).items())
+                          if i >= st.get("num_params", 0)]
+        pin_f = pin_fields.get(c)
+        if pin_f is None:
+            field_set_mismatches.append(
+                {"name": c, "pin": None, "emitted": emitted_fields,
+                 "why": "the pin reported no field list for a structure this "
+                        "emitter declared structurally"})
+            continue
+        field_sets_checked += 1
+        if list(pin_f) != list(emitted_fields):
+            field_set_mismatches.append(
+                {"name": c, "pin": list(pin_f), "emitted": emitted_fields,
+                 "why": "emitted field set differs from the Reference's"})
+    if field_set_mismatches:
+        listed = [m["name"] for m in field_set_mismatches[:8]]
+        raise SystemExit(
+            f"REFUSE: {len(field_set_mismatches)} structural declarations do not "
+            f"carry the Reference's field set: {listed} — first: "
+            f"{field_set_mismatches[0]}. Every projection the facade offers comes "
+            "from these fields, so a wrong set is a wrong projection surface that "
+            "no type check can see")
+
     covered = [n for n in emitted if decl[n]["role"] == "demanded"]
     if len(covered) < 0.5 * len(facade_demand):
         raise SystemExit(
@@ -1926,6 +1971,13 @@ def main():
             "becomes _private.privtest.0.Foo.bar. The price is the module count "
             "above, not a redesign of the surface.",
         "emission_verified": emission_verified,
+        "field_sets_checked": field_sets_checked,
+        "field_set_mismatches": field_set_mismatches,
+        "field_set_note": "each structural declaration's emitted field list was "
+            "compared name-for-name against the pin's getStructureFields; a dropped "
+            "field removes a projection and an invented one offers a projection the "
+            "Reference does not have, and neither is visible to a check that only "
+            "compares projections present on both sides",
         "type_roundtrip_checked": roundtrip_checked,
         "type_roundtrip_mismatches": sorted(roundtrip_mismatches),
         "type_roundtrip_note": "each type STRING this emitter wrote was ascribed to "
@@ -2027,6 +2079,7 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
           f"values={values_checked} "
           f"mod_probed={len(pin_module)} mod_drift={len(module_disagreements)} "
