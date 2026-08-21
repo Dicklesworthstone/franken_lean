@@ -12706,3 +12706,120 @@ fn stored_expressions_carry_no_free_or_meta_variables() {
          every walker in this file silently accepts one today"
     );
 }
+
+/// The chain's three regions are DISJOINT, not merely distinctly based.
+///
+/// `the_library_under_test_identifies_itself_as_the_pinned_toolchain` asserts
+/// that one chain's three parts carry three distinct base addresses, and calls
+/// that the mechanism the cross-region pointer graph depends on. Distinct is not
+/// the property that mechanism needs. Two regions can have different bases and
+/// still overlap, and then an address resolves into two parts at once and which
+/// one wins is an implementation accident. Nothing anywhere checks disjointness.
+///
+/// Measured over all 600 `Init` chains, using the header's `base_addr` against
+/// the part's size on disk:
+///
+///   no chain has an overlapping pair, so the region an address belongs to is
+///     always unambiguous
+///   the parts are ordered exported < server < private, without exception
+///   every base is 64 KiB aligned
+///   each next base is EXACTLY the previous region's end rounded up to 64 KiB,
+///     so the three parts are laid out end to end with only alignment padding
+///
+/// A COINCIDENCE THAT WOULD HIDE A WRONG MODEL, and this one is very nearly
+/// invisible. The last law says a region spans the WHOLE file, header included.
+/// The competing model — that a region covers only the payload after the 88-byte
+/// header — gives the same answer for 599 of the 600 chains, because rounding up
+/// to 64 KiB usually absorbs an 88-byte difference. It differs on exactly one:
+/// `Init/Data/Nat/ToString`, whose exported part is 131,104 bytes and so ends 32
+/// bytes PAST a 64 KiB boundary. Take the header off and the end falls back
+/// below that boundary, the rounding lands 64 KiB lower, and the prediction
+/// misses the server base.
+///
+/// That single chain is the entire evidence separating the two models, so the
+/// cell asserts both halves: the true law over all 600, and the false one
+/// failing on that one chain while holding on the rest. Stating the second is
+/// what stops a later reader "simplifying" the extent back to the payload and
+/// finding 599 agreements.
+///
+/// Conservation first: disjointness is checked before any layout law is stated,
+/// because every law below is a refinement of it and would be meaningless if
+/// regions could overlap.
+#[test]
+fn the_three_regions_of_a_chain_are_disjoint_and_laid_out_end_to_end() {
+    const ALIGN: u64 = 0x1_0000;
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let align_up = |value: u64| value.div_ceil(ALIGN) * ALIGN;
+    let mut ordered = 0usize;
+    let mut aligned = 0usize;
+    let mut end_to_end = 0usize;
+    let mut payload_model_agrees = 0usize;
+    let mut payload_model_differs: Vec<String> = Vec::new();
+    for module in &modules {
+        let stem = lib.join(module.replace('.', "/"));
+        let extents: Vec<(u64, u64)> = ["olean", "olean.server", "olean.private"]
+            .iter()
+            .map(|part| {
+                let path = stem.with_extension(part);
+                let (_, _, base) = header_identity(&path);
+                let size = std::fs::metadata(&path)
+                    .unwrap_or_else(|e| panic!("stat {path:?}: {e}"))
+                    .len();
+                (base, size)
+            })
+            .collect();
+
+        // Conservation first: the three intervals must not overlap.
+        for (i, (base, size)) in extents.iter().enumerate() {
+            for (other, other_size) in extents.iter().skip(i + 1) {
+                assert!(
+                    base + size <= *other || other + other_size <= *base,
+                    "{module}: regions [{base:#x}, +{size}) and [{other:#x}, +{other_size}) \
+                     overlap, so an address resolves into two parts at once"
+                );
+            }
+        }
+
+        if extents[0].0 < extents[1].0 && extents[1].0 < extents[2].0 {
+            ordered += 1;
+        }
+        if extents.iter().all(|(base, _)| base % ALIGN == 0) {
+            aligned += 1;
+        }
+        let whole_file = extents
+            .windows(2)
+            .all(|pair| align_up(pair[0].0 + pair[0].1) == pair[1].0);
+        if whole_file {
+            end_to_end += 1;
+        }
+        let payload_only = extents
+            .windows(2)
+            .all(|pair| align_up(pair[0].0 + pair[0].1 - 88) == pair[1].0);
+        if payload_only {
+            payload_model_agrees += 1;
+        } else {
+            payload_model_differs.push(module.clone());
+        }
+    }
+
+    assert_eq!(
+        (ordered, aligned, end_to_end),
+        (600, 600, 600),
+        "every chain is ordered, 64 KiB aligned, and laid out end to end"
+    );
+
+    // The wrong model, and the single chain that refutes it.
+    assert_eq!(
+        payload_model_differs,
+        vec!["Init.Data.Nat.ToString".to_owned()],
+        "the payload-only extent is refuted by exactly one chain in the corpus"
+    );
+    assert_eq!(
+        payload_model_agrees, 599,
+        "and it agrees everywhere else, which is why the one counterexample is the whole \
+         evidence and must not be simplified away"
+    );
+}
