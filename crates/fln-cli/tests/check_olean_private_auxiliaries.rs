@@ -272,9 +272,9 @@ fn json_name_set(object: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn json_non_empty_name_string_set(array: &str) -> BTreeSet<String> {
+fn json_non_empty_name_strings(array: &str) -> Vec<String> {
     let marker = "\"name\":";
-    let mut names = BTreeSet::new();
+    let mut names = Vec::new();
     let mut cursor = 0_usize;
 
     while let Some(offset) = array[cursor..].find(marker) {
@@ -299,7 +299,7 @@ fn json_non_empty_name_string_set(array: &str) -> BTreeSet<String> {
         }
         let value_end = value_end.expect("JSON name string is closed");
         assert!(value_end > value_start + 1, "JSON name string is non-empty");
-        names.insert(array[value_start + 1..value_end].to_owned());
+        names.push(array[value_start + 1..value_end].to_owned());
         cursor = value_end + 1;
     }
 
@@ -348,9 +348,20 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
     let private_companion_names = json_array_field(private_companion_residuals, "names");
     let private_companion_name_count = json_array_len(private_companion_names);
+    let private_companion_name_strings = json_non_empty_name_strings(private_companion_names);
     assert_eq!(
-        json_non_empty_name_string_set(private_companion_names).len(),
+        private_companion_name_strings
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .len(),
         private_companion_name_count,
+        "{json}",
+    );
+    assert!(
+        private_companion_name_strings
+            .windows(2)
+            .all(|names| names[0] < names[1]),
         "{json}",
     );
     assert_eq!(
