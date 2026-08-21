@@ -1081,7 +1081,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                         "t",
                         BinderInfo::Default,
                         list_expr(bv(3)),
-                        Expr::app(bv(2), bv(0)),
+                        Expr::app(bv(3), bv(0)),
                     ),
                 ),
             ),
@@ -1411,7 +1411,7 @@ fn init_or_entries() -> Vec<ConstantEntry> {
                             "t",
                             BinderInfo::Default,
                             or_expr(bv(4), bv(3)),
-                            Expr::app(bv(2), bv(0)),
+                            Expr::app(bv(3), bv(0)),
                         ),
                     ),
                 ),
@@ -1597,7 +1597,7 @@ fn init_and_entries() -> Vec<ConstantEntry> {
         "b", BinderInfo::Implicit, prop(), primary_pi(
             "motive", BinderInfo::Implicit, motive(), primary_pi(
                 "intro", BinderInfo::Default, minor(), primary_pi(
-                    "t", BinderInfo::Default, and_expr(bv(4), bv(3)), Expr::app(bv(2), bv(0)),
+                    "t", BinderInfo::Default, and_expr(bv(4), bv(3)), Expr::app(bv(3), bv(0)),
                 ),
             ),
         ),

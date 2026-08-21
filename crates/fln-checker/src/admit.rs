@@ -2493,7 +2493,7 @@ fn or_recursor_type(or_name: &WireName, inl: &WireName, inr: &WireName) -> Optio
     let left = builder.bvar(4);
     let right = builder.bvar(3);
     let major_type = or_application(&mut builder, or_name, left, right);
-    let motive = builder.bvar(2);
+    let motive = builder.bvar(3);
     let major = builder.bvar(0);
     let mut result = builder.apply(motive, major);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
@@ -2603,7 +2603,7 @@ fn and_recursor_type(and_name: &WireName, intro: &WireName) -> Option<WireExpr> 
     let left = builder.bvar(4);
     let right = builder.bvar(3);
     let major_type = and_application(&mut builder, and_name, left, right);
-    let motive = builder.bvar(2);
+    let motive = builder.bvar(3);
     let major = builder.bvar(0);
     let mut result = builder.apply(motive, major);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
@@ -2753,7 +2753,7 @@ fn list_recursor_type(
     );
     let parameter = builder.bvar(3);
     let major_type = list_application(&mut builder, list, list_universe, parameter);
-    let motive = builder.bvar(2);
+    let motive = builder.bvar(3);
     let major = builder.bvar(0);
     let mut result = builder.apply(motive, major);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
@@ -4482,9 +4482,7 @@ pub fn admit_inductive_with(
             .flat_map(|constructor| constructor.direct_recursive_fields.iter())
             .any(|direct| *direct)
     {
-        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
-            name: name.clone(),
-        });
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
     }
 
     let recursor_name = checker_child(name, "rec");
