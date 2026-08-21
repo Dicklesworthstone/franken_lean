@@ -281,6 +281,11 @@ const ARRAY_ERASE_MATCH_1: &str =
     "_private.Init.Data.Array.Basic.0.Array.erase.match_1";
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_ERASE_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
+/// The generated match definition for `Array.eraseReps`.
+const ARRAY_ERASE_REPS_MATCH_1: &str =
+    "_private.Init.Data.Array.Basic.0.Array.eraseReps.match_1";
+/// The pin's private array stores this match helper in the basic module.
+const ARRAY_ERASE_REPS_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1579,6 +1584,35 @@ fn array_erase_match_definition_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_ERASE_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_erase_reps_match_definition_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_erase_reps_match_definition_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_ERASE_REPS_MATCH_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_ERASE_REPS_MATCH_1.to_owned()),
+        "the private companion of {ARRAY_ERASE_REPS_MATCH_1_MODULE} must retain \
+         {ARRAY_ERASE_REPS_MATCH_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_ERASE_REPS_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_ERASE_REPS_MATCH_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_ERASE_REPS_MATCH_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
