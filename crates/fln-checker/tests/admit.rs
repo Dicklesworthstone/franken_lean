@@ -2199,6 +2199,17 @@ fn kr600_803_init_punit_fixture_pins_recursor_levels_motives_minors_and_rules() 
 }
 
 #[test]
+fn kr600_803_init_punit_fixture_pins_recursor_mutual_family_and_k() {
+    let entries = init_punit_entries();
+    let metadata = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.mutual(), &[checker_name("PUnit")]);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_init_punit_fixture_pins_constructor_and_iota_rule() {
     let entries = init_punit_entries();
     let constructor = entries[1].declaration();
