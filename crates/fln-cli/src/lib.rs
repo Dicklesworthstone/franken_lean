@@ -2917,6 +2917,10 @@ fn is_private_cli_private_report_proof_residual(display: &str) -> bool {
         })
 }
 
+fn is_private_cli_private_report_standalone_proof_n_residual(display: &str) -> bool {
+    is_private_cli_private_report_proof_residual(display) && !display.contains(".loop.")
+}
+
 fn is_lean_name_hash_proof_residual(display: &str) -> bool {
     display
         .strip_prefix(LEAN_NAME_HASH_PROOF_RESIDUAL_PREFIX)
@@ -3377,6 +3381,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_cli_private_report_proof_residual,
     );
+    let mut private_cli_private_report_standalone_proof_n_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_cli_private_report_standalone_proof_n_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_cli_private_report_standalone_proof_n_residual,
+    );
     let mut lean_name_hash_proof_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3776,6 +3788,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_proof_residuals)
     };
+    let private_cli_private_report_standalone_proof_n_observed =
+        private_cli_private_report_standalone_proof_n_residuals.observed;
+    let private_cli_private_report_standalone_proof_n_omitted =
+        private_cli_private_report_standalone_proof_n_residuals.omitted();
+    let private_cli_private_report_standalone_proof_n_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_standalone_proof_n_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_standalone_proof_n_residuals)
+    };
     let lean_name_hash_proof_observed = lean_name_hash_proof_residuals.observed;
     let lean_name_hash_proof_omitted = lean_name_hash_proof_residuals.omitted();
     let lean_name_hash_proof_names = if json {
@@ -4031,6 +4052,7 @@ fn render_check_olean_success(
                 "\"privateInitDataProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitPreludeProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanNameResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4155,6 +4177,9 @@ fn render_check_olean_success(
             private_cli_private_report_proof_observed,
             private_cli_private_report_proof_names,
             private_cli_private_report_proof_omitted,
+            private_cli_private_report_standalone_proof_n_observed,
+            private_cli_private_report_standalone_proof_n_names,
+            private_cli_private_report_standalone_proof_n_omitted,
             lean_name_hash_proof_observed,
             lean_name_hash_proof_names,
             lean_name_hash_proof_omitted,
@@ -4343,6 +4368,9 @@ fn render_check_olean_success(
                 "decoded _private CliPrivateReport _proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport _proof_N residual names: {}\n",
                 "decoded _private CliPrivateReport _proof_N residual names omitted: {}\n",
+                "decoded _private CliPrivateReport standalone _proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport standalone _proof_N residual names: {}\n",
+                "decoded _private CliPrivateReport standalone _proof_N residual names omitted: {}\n",
                 "decoded _private Lean.Name.hash._proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Lean.Name.hash._proof_N residual names: {}\n",
                 "decoded _private Lean.Name.hash._proof_N residual names omitted: {}\n",
@@ -4528,6 +4556,9 @@ fn render_check_olean_success(
             private_cli_private_report_proof_observed,
             private_cli_private_report_proof_names,
             private_cli_private_report_proof_omitted,
+            private_cli_private_report_standalone_proof_n_observed,
+            private_cli_private_report_standalone_proof_n_names,
+            private_cli_private_report_standalone_proof_n_omitted,
             lean_name_hash_proof_observed,
             lean_name_hash_proof_names,
             lean_name_hash_proof_omitted,
@@ -5201,6 +5232,16 @@ fn render_check_olean_set_success(
             is_private_cli_private_report_proof_residual,
         );
     }
+    let mut private_cli_private_report_standalone_proof_n_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_cli_private_report_standalone_proof_n_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_cli_private_report_standalone_proof_n_residual,
+        );
+    }
     let mut lean_name_hash_proof_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -5663,6 +5704,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_proof_residuals)
     };
+    let private_cli_private_report_standalone_proof_n_observed =
+        private_cli_private_report_standalone_proof_n_residuals.observed;
+    let private_cli_private_report_standalone_proof_n_omitted =
+        private_cli_private_report_standalone_proof_n_residuals.omitted();
+    let private_cli_private_report_standalone_proof_n_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_standalone_proof_n_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_standalone_proof_n_residuals)
+    };
     let lean_name_hash_proof_observed = lean_name_hash_proof_residuals.observed;
     let lean_name_hash_proof_omitted = lean_name_hash_proof_residuals.omitted();
     let lean_name_hash_proof_names = if json {
@@ -5924,6 +5974,7 @@ fn render_check_olean_set_success(
                 "\"privateInitDataProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitPreludeProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanNameResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -6050,6 +6101,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_proof_observed,
             private_cli_private_report_proof_names,
             private_cli_private_report_proof_omitted,
+            private_cli_private_report_standalone_proof_n_observed,
+            private_cli_private_report_standalone_proof_n_names,
+            private_cli_private_report_standalone_proof_n_omitted,
             lean_name_hash_proof_observed,
             lean_name_hash_proof_names,
             lean_name_hash_proof_omitted,
@@ -6240,6 +6294,9 @@ fn render_check_olean_set_success(
                 "decoded _private CliPrivateReport _proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport _proof_N residual names: {}\n",
                 "decoded _private CliPrivateReport _proof_N residual names omitted: {}\n",
+                "decoded _private CliPrivateReport standalone _proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport standalone _proof_N residual names: {}\n",
+                "decoded _private CliPrivateReport standalone _proof_N residual names omitted: {}\n",
                 "decoded _private Lean.Name.hash._proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Lean.Name.hash._proof_N residual names: {}\n",
                 "decoded _private Lean.Name.hash._proof_N residual names omitted: {}\n",
@@ -6427,6 +6484,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_proof_observed,
             private_cli_private_report_proof_names,
             private_cli_private_report_proof_omitted,
+            private_cli_private_report_standalone_proof_n_observed,
+            private_cli_private_report_standalone_proof_n_names,
+            private_cli_private_report_standalone_proof_n_omitted,
             lean_name_hash_proof_observed,
             lean_name_hash_proof_names,
             lean_name_hash_proof_omitted,
