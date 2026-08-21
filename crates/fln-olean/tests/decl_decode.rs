@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
 use fln_env::constants::ConstantInfo;
 use fln_olean::decl::{DeclDecoder, DeclError};
 use fln_olean::region::{OleanView, WalkBudget};
@@ -11717,6 +11718,223 @@ fn the_other_references_to_that_name() {
          separates the ten from the 111 - and another carries the spine-node \
          shape. Neither is a member. Leaving the structure does not leave the \
          shapes behind"
+    );
+}
+
+/// The `mpz` literal decodes through the production path - the block `be041416`
+/// retired, taken.
+///
+/// `be041416` found two `TAG_MPZ` objects in Prelude and recorded that the
+/// obstacle I had named for the `mpz` rules - "an object no fixture builds" -
+/// was gone. This takes the pin.
+///
+/// THE VALUE IS 2^64, which is the whole reason the object exists. It is the
+/// smallest natural number that does not fit a `u64`, so it is the smallest one
+/// the boxed-scalar representation cannot carry. Both `mpz` objects in the
+/// module hold that same value, stored as two little-endian limbs `[0, 1]`.
+///
+/// BOTH ARMS OF `decode_nat` ARE EXERCISED HERE, which is what makes this a
+/// test of the branch rather than of one object. Prelude has 53 `Expr.lit`
+/// objects: 35 natural-number literals and 18 strings. Of the 35, THIRTY-THREE
+/// take the scalar arm and TWO take the `mpz` arm, and 33 + 2 is asserted
+/// against the 35 so neither arm can be silently empty. The largest scalar
+/// literal is 2^32 - comfortably inside a `u64` - against the `mpz`'s 2^64, so
+/// the two arms are separated by the representation boundary and not by an
+/// accident of which literals this module happens to contain.
+///
+/// PRODUCTION DECODER, NOT A RE-IMPLEMENTATION. Each literal is decoded with
+/// `DeclDecoder::decode_expr`, and the `mpz` result is checked three ways: it
+/// equals `Expr::lit(Literal::Nat(..))` built from the limbs; its `to_u64` is
+/// NONE, which is the property that forced the `mpz` in the first place; and
+/// its limbs equal the ones this cell reads off the wire independently. The
+/// third is the one that would catch a decoder agreeing with a wrong
+/// expectation.
+///
+/// THE SCALAR CONTROL IS DECODED THE SAME WAY and its `to_u64` is SOME, so the
+/// two arms are distinguished by a property of the decoded value rather than by
+/// where the cell looked.
+///
+/// POPULATION SCOPE: `Init/Prelude.olean` for the literals; the `mpz` object
+/// counts cover all four modules, and the three C3 fixtures are asserted to
+/// have NONE - which is why this pin needs the corpus and could not have been
+/// written against the fixtures alone.
+#[test]
+fn the_mpz_literal_decodes_through_the_production_path() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut mpz_per_module: Vec<(String, usize)> = Vec::new();
+    for (module, bytes) in &modules {
+        let (objects, _) = objects_of(bytes);
+        mpz_per_module.push((
+            module.clone(),
+            objects.iter().filter(|o| o.tag == abi::TAG_MPZ).count(),
+        ));
+    }
+    assert_eq!(
+        mpz_per_module
+            .iter()
+            .map(|(m, n)| (m.as_str(), *n))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 0),
+            ("Init.BinderNameHint.olean", 0),
+            ("Init.SizeOfLemmas.olean", 0),
+            ("Init/Prelude.olean", 2),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "`mpz` objects per module: the three C3 fixtures have NONE, which is why \
+         this pin needs the corpus"
+    );
+
+    if !prelude_loaded {
+        return;
+    }
+    let bytes = modules
+        .last()
+        .map(|(_, bytes)| bytes.as_slice())
+        .expect("Prelude loaded");
+
+    let (objects, base) = objects_of(bytes);
+    let at: std::collections::BTreeMap<usize, Obj> = objects.iter().map(|o| (o.off, *o)).collect();
+    let resolve = |word: u64| -> Option<usize> {
+        (word & 1 == 0)
+            .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+            .flatten()
+            .filter(|off| at.contains_key(off))
+    };
+    let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+    // Classify every `Expr.lit` by the arm its payload takes.
+    let mut strings = 0usize;
+    let mut scalar_arm: Vec<(u64, usize)> = Vec::new();
+    let mut mpz_arm: Vec<usize> = Vec::new();
+    let mut literals = 0usize;
+    for object in &objects {
+        if (object.tag, object.other) != (9, 1) {
+            continue;
+        }
+        literals += 1;
+        let Some(payload) = resolve(word_at(bytes, object.off + 8)) else {
+            continue;
+        };
+        match shape(payload) {
+            Some((1, 1)) => strings += 1,
+            Some((0, 1)) => {
+                let word = word_at(bytes, payload + 8);
+                if word & 1 == 1 {
+                    scalar_arm.push((word >> 1, object.off));
+                } else if resolve(word).and_then(|t| at.get(&t)).map(|o| o.tag)
+                    == Some(abi::TAG_MPZ)
+                {
+                    mpz_arm.push(object.off);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        (literals, strings, scalar_arm.len(), mpz_arm.len()),
+        (53, 18, 33, 2),
+        "`Expr.lit` objects, string literals, and natural-number literals by \
+         arm. Both arms of `decode_nat` are populated in this one module"
+    );
+    assert_eq!(
+        strings + scalar_arm.len() + mpz_arm.len(),
+        literals,
+        "and the three account for every `Expr.lit`, so neither arm's count is \
+         a filtered sample"
+    );
+
+    // The limbs, read off the wire independently of the decoder.
+    let mut wire_limbs: BTreeSet<Vec<u64>> = BTreeSet::new();
+    for &expr in &mpz_arm {
+        let payload = resolve(word_at(bytes, expr + 8)).expect("literal payload");
+        let mpz = resolve(word_at(bytes, payload + 8)).expect("mpz object");
+        let size = usize::try_from(word_at(bytes, mpz + 8) & 0xFFFF_FFFF).expect("limb count");
+        let limbs_at = usize::try_from(word_at(bytes, mpz + 16).wrapping_sub(base)).expect("limbs");
+        wire_limbs.insert(
+            (0..size)
+                .map(|i| word_at(bytes, limbs_at + 8 * i))
+                .collect::<Vec<u64>>(),
+        );
+    }
+    assert_eq!(
+        wire_limbs.iter().cloned().collect::<Vec<_>>(),
+        vec![vec![0_u64, 1]],
+        "both `mpz` objects store the same two little-endian limbs - the value \
+         2^64, the smallest natural the scalar arm cannot carry"
+    );
+
+    // Through the production decoder.
+    let view = OleanView::parse(bytes).expect("Prelude header");
+    let expected = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1])));
+    for &expr in &mpz_arm {
+        let decoded = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_expr(base + u64::try_from(expr).expect("in range"))
+            .expect("the mpz literal decodes");
+        assert_eq!(
+            decoded, expected,
+            "`decode_expr` takes the `mpz` arm and yields the 2^64 literal"
+        );
+        let ExprNode::Lit {
+            literal: Literal::Nat(nat),
+        } = decoded.node()
+        else {
+            panic!("an `Expr.lit` holding a natural number");
+        };
+        assert_eq!(
+            nat.to_u64(),
+            None,
+            "and the decoded value does NOT fit a `u64` - the property that \
+             forces the `mpz` representation, checked on the decoder's own \
+             output rather than on the expectation built beside it"
+        );
+        assert_eq!(
+            nat.limbs_le(),
+            &[0_u64, 1],
+            "with the limbs this cell read off the wire by a separate walk, so \
+             a decoder agreeing with a wrong expectation would still fail here"
+        );
+    }
+
+    // The scalar arm, decoded the same way.
+    let (largest, largest_at) = *scalar_arm
+        .iter()
+        .max_by_key(|(value, _)| *value)
+        .expect("a scalar literal");
+    let decoded = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_expr(base + u64::try_from(largest_at).expect("in range"))
+        .expect("the scalar literal decodes");
+    let ExprNode::Lit {
+        literal: Literal::Nat(nat),
+    } = decoded.node()
+    else {
+        panic!("an `Expr.lit` holding a natural number");
+    };
+    assert_eq!(
+        (largest, nat.to_u64()),
+        (4_294_967_296, Some(4_294_967_296)),
+        "the largest scalar-arm literal is 2^32 and DOES fit a `u64`. The two \
+         arms are told apart by a property of the decoded value, not by where \
+         this cell looked - and 2^32 against 2^64 puts them on opposite sides \
+         of the representation boundary rather than at an arbitrary split"
     );
 }
 
