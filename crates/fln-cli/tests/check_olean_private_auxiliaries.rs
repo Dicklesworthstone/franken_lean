@@ -377,6 +377,13 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths emit the private-companion residual object",
     );
+    assert_eq!(
+        include_str!("../src/lib.rs")
+            .match_indices(r#"\"baseLogicalRoot\":{},\"resultLogicalRoot\":{}"#)
+            .count(),
+        2,
+        "both check-olean JSON render paths emit the logical-root pair",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
