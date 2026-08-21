@@ -78,6 +78,14 @@ pub enum DeclError {
     PrivatePartIncomplete {
         missing: Name,
     },
+    /// A companion part does not carry the exported part's identity stamp, so
+    /// the three regions are not one module's chain.
+    ChainPartMismatch {
+        part: OleanChainPart,
+    },
+    /// A chain was supplied for an artifact that is not a module-system
+    /// module, which has no companions to compose.
+    NotAModuleChain,
 }
 
 impl From<RegionError> for DeclError {
@@ -105,6 +113,16 @@ impl std::fmt::Display for DeclError {
                 write!(f, "unsupported at {offset}: {what}")
             }
             DeclError::Budget { visited } => write!(f, "decode budget exhausted at {visited}"),
+            DeclError::ChainPartMismatch { part } => write!(
+                f,
+                "companion {} does not carry the exported part's identity stamp, so these \
+                 regions are not one module's chain",
+                part.label()
+            ),
+            DeclError::NotAModuleChain => write!(
+                f,
+                "artifact is not a module-system module, so it has no companion chain to compose"
+            ),
             DeclError::PrivatePartIncomplete { missing } => write!(
                 f,
                 "module-system chain is not decodable: the private part omits the exported \
@@ -1205,12 +1223,50 @@ pub fn decode_chain_constants_from_parts(
     budget: WalkBudget,
 ) -> DResult<ChainConstants> {
     let exported_view = OleanView::parse(exported)?;
+    exported_view.shared_audit()?;
+    exported_view.walk(budget)?;
+    if !exported_view.module_data(budget)?.is_module {
+        return Err(DeclError::NotAModuleChain);
+    }
+
     let server_view = OleanView::parse_with_dependencies(server, &[exported])?;
-    // Parsed to prove the middle region is well-formed in its own dependency
-    // address space; its constants are not part of the authoritative array.
-    let _ = &server_view;
     let private_view = OleanView::parse_with_dependencies(private, &[exported, server])?;
+    for (part, view) in [
+        (OleanChainPart::Server, &server_view),
+        (OleanChainPart::Private, &private_view),
+    ] {
+        // Three parts of ONE module share an identity stamp. Without this a
+        // caller can hand in a private companion from a DIFFERENT module: the
+        // regions parse, the pointers resolve, and the result is a coherent-
+        // looking chain describing no module that exists. It would surface as
+        // PrivatePartIncomplete, which names the wrong fault.
+        if view.header.version != exported_view.header.version
+            || view.header.flags != exported_view.header.flags
+            || view.header.lean_version != exported_view.header.lean_version
+            || view.header.githash != exported_view.header.githash
+        {
+            return Err(DeclError::ChainPartMismatch { part });
+        }
+        view.walk(budget)?;
+    }
+
     decode_chain_constants_with_origin(&exported_view, &private_view, budget)
+}
+
+/// Which companion of a module-system chain a fault is attributed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OleanChainPart {
+    Server,
+    Private,
+}
+
+impl OleanChainPart {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Server => ".olean.server",
+            Self::Private => ".olean.private",
+        }
+    }
 }
 
 /// Decode a complete chain and record which part each declaration came from.
@@ -1403,6 +1459,71 @@ mod tests {
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ),
     ];
+
+    /// A chain assembled from two DIFFERENT modules must be refused by identity,
+    /// not decoded into a coherent-looking result for a module that exists
+    /// nowhere.
+    ///
+    /// `decode_chain_constants_from_parts` originally trusted its three
+    /// arguments to belong together. They parse and their pointers resolve
+    /// whatever their provenance, so a mismatched private companion produced a
+    /// chain rather than an error — and the superset law then reported
+    /// `PrivatePartIncomplete`, naming the wrong fault entirely.
+    #[test]
+    fn a_chain_assembled_from_two_modules_is_refused_by_identity() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP a_chain_assembled_from_two_modules_is_refused_by_identity: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |relative: &str, suffix: &str| {
+            std::fs::read(lib.join(format!("{relative}.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read {relative}{suffix}: {error}"))
+        };
+
+        let exported = read("Init/Data/List/ToArrayImpl", "");
+        let server = read("Init/Data/List/ToArrayImpl", ".server");
+        let private = read("Init/Data/List/ToArrayImpl", ".private");
+
+        // Positive control first: the real chain must still decode, or the
+        // refusal below would prove nothing about identity.
+        let ok =
+            decode_chain_constants_from_parts(&exported, &server, &private, WalkBudget::default())
+                .expect("the module's own chain decodes");
+        assert_eq!(
+            ok.constants.len(),
+            6,
+            "Init.Data.List.ToArrayImpl at the pin"
+        );
+
+        // Now the same exported part with ANOTHER module's private companion.
+        // Both are valid module-system artifacts of the same toolchain, so only
+        // a real identity check separates them.
+        let foreign_private = read("Init/Control/MonadAttach", ".private");
+        let error = decode_chain_constants_from_parts(
+            &exported,
+            &server,
+            &foreign_private,
+            WalkBudget::default(),
+        )
+        .expect_err("a private companion from another module must be refused");
+        assert!(
+            !matches!(error, DeclError::PrivatePartIncomplete { .. }),
+            "a mismatched chain must not be reported as a missing declaration: {error:?}"
+        );
+    }
+
+    /// A standalone (non-module-system) artifact has no chain to compose.
+    #[test]
+    fn a_non_module_artifact_is_not_accepted_as_a_chain() {
+        let bytes = axiom_module(false);
+        let error =
+            decode_chain_constants_from_parts(&bytes, &bytes, &bytes, WalkBudget::default())
+                .expect_err("a non-module artifact has no companion chain");
+        assert_eq!(error, DeclError::NotAModuleChain, "{error:?}");
+    }
 
     /// `origin_of` must call these eight `Exported`, because the exported part
     /// declares them.
