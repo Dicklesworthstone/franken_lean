@@ -2206,6 +2206,21 @@ def main():
             "REFUSE: facade manifest emitted-cycle count diverges "
             f"({json.dumps(emitted_cycle_zero_join, sort_keys=True)})"
         )
+    closure_value_zero_join = {
+        "summary_uncensused_closure": manifest_summary.get(
+            "uncensused_closure"
+        ),
+        "summary_value_residue": manifest_summary.get("value_residue"),
+        "pinned_closure_value_count": 0,
+    }
+    if (closure_value_zero_join["summary_uncensused_closure"]
+            != closure_value_zero_join["pinned_closure_value_count"]
+            or closure_value_zero_join["summary_value_residue"]
+            != closure_value_zero_join["pinned_closure_value_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest closure-value count diverges "
+            f"({json.dumps(closure_value_zero_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3342,6 +3357,7 @@ def main():
         "manifest_withdrawn_residue_zero_join": withdrawn_residue_zero_join,
         "manifest_closure_cycle_zero_join": closure_cycle_zero_join,
         "manifest_emitted_cycle_zero_join": emitted_cycle_zero_join,
+        "manifest_closure_value_zero_join": closure_value_zero_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
