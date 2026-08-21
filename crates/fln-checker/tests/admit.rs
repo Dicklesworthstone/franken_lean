@@ -1635,6 +1635,60 @@ fn init_and_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_bool_entries() -> Vec<ConstantEntry> {
+    let bool_name = checker_name("Bool");
+    let false_name = checker_qualified(&["Bool", "false"]);
+    let true_name = checker_qualified(&["Bool", "true"]);
+    let rec = checker_qualified(&["Bool", "rec"]);
+    let u_name = checker_name("u");
+    let u = Level::param(primary_name("u"));
+    let bool_expr = || Expr::const_(primary_name("Bool"), Vec::new());
+    let false_expr = || Expr::const_(Name::from_components(["Bool", "false"]), Vec::new());
+    let true_expr = || Expr::const_(Name::from_components(["Bool", "true"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, bool_expr(), Expr::sort(u.clone()));
+    let false_minor = || Expr::app(bv(0), false_expr());
+    let true_minor = || Expr::app(bv(1), true_expr());
+    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
+        "false", BinderInfo::Default, false_minor(), primary_pi(
+            "true", BinderInfo::Default, true_minor(), primary_pi(
+                "t", BinderInfo::Default, bool_expr(), Expr::app(bv(3), bv(0)),
+            ),
+        ),
+    ));
+    let false_rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
+        primary_name("false"), false_minor(), Expr::lam(
+            primary_name("true"), true_minor(), bv(1), BinderInfo::Default,
+        ), BinderInfo::Default,
+    ), BinderInfo::Default);
+    let true_rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
+        primary_name("false"), false_minor(), Expr::lam(
+            primary_name("true"), true_minor(), bv(0), BinderInfo::Default,
+        ), BinderInfo::Default,
+    ), BinderInfo::Default);
+    vec![
+        ConstantEntry::new(bool_name.clone(), ConstantDeclaration::inductive(
+            Vec::new(), decoded(&Expr::sort(Level::one())), ConstantSafety::Safe,
+            InductiveDeclaration::new(0, 0, vec![bool_name.clone()], vec![false_name.clone(), true_name.clone()], 0, false, false),
+        )),
+        ConstantEntry::new(false_name.clone(), ConstantDeclaration::constructor(
+            Vec::new(), decoded(&bool_expr()), ConstantSafety::Safe,
+            ConstructorDeclaration::new(bool_name.clone(), 0, 0, 0),
+        )),
+        ConstantEntry::new(true_name.clone(), ConstantDeclaration::constructor(
+            Vec::new(), decoded(&bool_expr()), ConstantSafety::Safe,
+            ConstructorDeclaration::new(bool_name.clone(), 1, 0, 0),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            vec![u_name], decoded(&rec_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![bool_name], 0, 0, 1, 2, vec![
+                RecursorRule::new(false_name, 0, decoded(&false_rhs)),
+                RecursorRule::new(true_name, 0, decoded(&true_rhs)),
+            ], false),
+        )),
+    ]
+}
+
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
@@ -1650,6 +1704,28 @@ fn kr600_803_init_and_refuses_a_forged_iota_rule() {
     entries[2] = ConstantEntry::new(checker_qualified(&["And", "rec"]), ConstantDeclaration::recursor(
         declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
         RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["And", "intro"]), 2, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    ));
+    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
+}
+
+#[test]
+fn kr600_803_init_bool_constructors_recursor_and_iota_are_reconstructed() {
+    let entries = init_bool_entries();
+    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    assert!(verdict.is_admitted(), "exact Init.Bool block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_bool_refuses_a_forged_true_iota_rule() {
+    let mut entries = init_bool_entries();
+    let declaration = entries[3].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(checker_qualified(&["Bool", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![
+            metadata.rules()[0].clone(),
+            RecursorRule::new(checker_qualified(&["Bool", "true"]), 0, decoded(&Expr::bvar(0).expect("packs"))),
+        ], metadata.k()),
     ));
     assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
