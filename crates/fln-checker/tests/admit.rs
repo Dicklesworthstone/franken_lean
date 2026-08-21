@@ -1848,6 +1848,21 @@ fn kr600_803_init_punit_refuses_a_forged_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_punit_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = init_punit_entries();
+    let recursor = entries[2].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 2);
+    assert_eq!(metadata.num_parameters(), 0);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 1);
+    assert_eq!(metadata.rules().len(), 1);
+    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["PUnit", "unit"]));
+    assert_eq!(metadata.rules()[0].num_fields(), 0);
+}
+
+#[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
     let verdict = admit_inductive(
