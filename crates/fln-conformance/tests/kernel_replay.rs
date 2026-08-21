@@ -2891,6 +2891,14 @@ struct CorpusCounts {
     no_answer_families: BTreeMap<String, u64>,
 }
 
+/// The two non-answer families that name a CONTEXT-construction failure rather
+/// than a kernel outcome. Spelled once because the scorer writes them and the
+/// guard reasons about them, and a typo in either place would silently create a
+/// third family that no one is counting.
+const FAMILY_NO_DECLARATION_ENVELOPE: &str = "context:subject_has_no_declaration_envelope";
+const FAMILY_UNFAITHFUL_IMPORT_CONTEXT: &str =
+    "context:import_context_not_faithfully_representable";
+
 /// Which side of the D23 split a family census describes. The two are not
 /// interchangeable and the token itself says which it belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3388,7 +3396,7 @@ fn score_accepted_reference_module(
         // (`rejected:`, `inconclusive:`) from a context-construction reason.
         *counts
             .no_answer_families
-            .entry("context:subject_has_no_declaration_envelope".to_string())
+            .entry(FAMILY_NO_DECLARATION_ENVELOPE.to_string())
             .or_default() += subject_omitted.len() as u64;
         eprintln!(
             "kernel_reference_corpus finding: module={} direction=unscorable \
@@ -5237,6 +5245,159 @@ fn whole_mathlib_receipt_path(pin: &str) -> PathBuf {
         .join(format!("{pin}.jsonl"))
 }
 
+/// Read `RejectClass`'s variants out of the kernel's own source.
+///
+/// The list in the test below is written by hand -- there is no way to enumerate
+/// a Rust enum at runtime -- so something has to prove that list is COMPLETE.
+/// This does, and it is also where a payload variant is caught: `Debug` renders
+/// `Foo { a: 1, b: 2 }`, whose commas would split one census entry into several
+/// and whose braces would be re-read as part of a family name.
+fn reject_class_variants_from_source() -> BTreeSet<String> {
+    const SOURCE: &str = include_str!("../../fln-kernel/src/verdict.rs");
+    let start = SOURCE
+        .find("pub enum RejectClass {")
+        .expect("fln-kernel must still declare `pub enum RejectClass`");
+    let body = &SOURCE[start..];
+    let end = body
+        .find("\n}")
+        .expect("the RejectClass declaration must terminate");
+    let mut variants = BTreeSet::new();
+    for line in body[..end].lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        assert!(
+            !line.contains('(') && !line.contains('{'),
+            "RejectClass variant `{line}` carries a payload. Its `Debug` rendering embeds the \
+             field list, whose commas and braces are delimiters in the whole-Mathlib receipt's \
+             family census: one entry would be re-read as several, under names nobody wrote. \
+             Give the variant no payload, or teach the census format to escape one."
+        );
+        let name = line.trim_end_matches(',').trim();
+        assert!(
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric()),
+            "unexpected syntax in the RejectClass declaration: `{line}`"
+        );
+        variants.insert(name.to_string());
+    }
+    variants
+}
+
+/// Every rejection class the kernel can actually produce must yield a family
+/// token this format can carry, and must be refused on the other side of the
+/// census.
+///
+/// **Three mechanisms, because each catches what the others miss.** The `match`
+/// is exhaustive with no wildcard, so adding a variant STOPS THE BUILD until
+/// someone looks at this. The source scan proves the hand-written array is
+/// complete, since a new arm could otherwise be added to the match while the
+/// array kept the old population. And the token check is run against the real
+/// `Debug` rendering rather than against the parsed name, so it tests the string
+/// the lane would actually put in a row.
+#[test]
+fn every_kernel_rejection_class_yields_a_legal_family_token() {
+    use fln_kernel::verdict::RejectClass;
+
+    let all = [
+        RejectClass::LooseBVar,
+        RejectClass::MVarInKernel,
+        RejectClass::UnknownFVar,
+        RejectClass::UnknownConstant,
+        RejectClass::UniverseArityMismatch,
+        RejectClass::UndefinedLevelParam,
+        RejectClass::FunctionExpected,
+        RejectClass::TypeMismatch,
+        RejectClass::SortExpected,
+        RejectClass::InvalidProjection,
+        RejectClass::AlreadyDeclared,
+        RejectClass::DuplicateLevelParams,
+        RejectClass::TheoremNotProp,
+        RejectClass::DefinitionTypeMismatch,
+        RejectClass::NotDefEq,
+        RejectClass::SafetyViolation,
+        RejectClass::BlockMismatch,
+    ];
+
+    // COMPILE-TIME COMPLETENESS. No wildcard, so a new variant is a build error
+    // here rather than a family token nobody checked.
+    for class in all {
+        match class {
+            RejectClass::LooseBVar
+            | RejectClass::MVarInKernel
+            | RejectClass::UnknownFVar
+            | RejectClass::UnknownConstant
+            | RejectClass::UniverseArityMismatch
+            | RejectClass::UndefinedLevelParam
+            | RejectClass::FunctionExpected
+            | RejectClass::TypeMismatch
+            | RejectClass::SortExpected
+            | RejectClass::InvalidProjection
+            | RejectClass::AlreadyDeclared
+            | RejectClass::DuplicateLevelParams
+            | RejectClass::TheoremNotProp
+            | RejectClass::DefinitionTypeMismatch
+            | RejectClass::NotDefEq
+            | RejectClass::SafetyViolation
+            | RejectClass::BlockMismatch => {}
+        }
+    }
+
+    // RUNTIME COMPLETENESS. Binds the array above to the kernel's declaration,
+    // so the array cannot quietly describe a smaller enum than the one that
+    // exists.
+    let listed = all
+        .iter()
+        .map(|class| format!("{class:?}"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        listed.len(),
+        all.len(),
+        "two entries of the array render to the same Debug string"
+    );
+    let declared = reject_class_variants_from_source();
+    assert!(
+        declared.len() >= 17,
+        "the RejectClass scan found only {} variant(s); a scan that parsed nothing would make \
+         every check below vacuous",
+        declared.len()
+    );
+    assert_eq!(
+        listed, declared,
+        "the rejection classes listed in this test have drifted from the kernel's enum"
+    );
+    // The two families this bead's own history is made of, named so a rename
+    // upstream cannot silently empty the check.
+    assert!(declared.contains("BlockMismatch") && declared.contains("DefinitionTypeMismatch"));
+
+    for name in &declared {
+        let token = format!("rejected:{name}");
+        if let Err(reason) = check_family_token(&token, FamilyDirection::Restrictive) {
+            panic!("the kernel can reject with `{name}`, but `{token}`: {reason}");
+        }
+        assert!(
+            check_family_token(&token, FamilyDirection::NoAnswer).is_err(),
+            "`{token}` was accepted as a NON-ANSWER family; a rejection counted there would say \
+             nothing about kernel completeness while looking like it did"
+        );
+    }
+
+    // And the two context families the scorer writes, from the other direction.
+    for token in [
+        FAMILY_NO_DECLARATION_ENVELOPE,
+        FAMILY_UNFAITHFUL_IMPORT_CONTEXT,
+    ] {
+        if let Err(reason) = check_family_token(token, FamilyDirection::NoAnswer) {
+            panic!("the scorer writes `{token}`, but the guard refuses it: {reason}");
+        }
+        assert!(
+            check_family_token(token, FamilyDirection::Restrictive).is_err(),
+            "`{token}` was accepted as a RESTRICTIVE family; a context-construction failure is \
+             not a D23 finding"
+        );
+    }
+}
+
 /// The producer's field mapping, checked with an all-distinct population.
 ///
 /// **The defect this exists for.** Until this test the receipt was assembled by
@@ -5612,6 +5773,33 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 ..sample_whole_mathlib_receipt()
             },
             "no_answer_families triages",
+        ),
+        (
+            "a restrictive row triaged to a non-rejection",
+            WholeMathlibReceipt {
+                agree: 599_990,
+                restrictive_without_carve_out: 10,
+                restrictive_families: vec!["inconclusive:Steps=10".to_string()],
+                class: "refuted_this_run_found_a_restrictive_divergence".to_string(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "is not a `rejected:` token",
+        ),
+        (
+            "a non-answer triaged to a rejection",
+            WholeMathlibReceipt {
+                no_answer_families: vec!["rejected:BlockMismatch=40000".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "is a `rejected:` token",
+        ),
+        (
+            "a family name carrying a delimiter",
+            WholeMathlibReceipt {
+                no_answer_families: vec!["context:a,b=40000".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "as a delimiter",
         ),
         (
             "a family counted twice",
@@ -6154,7 +6342,7 @@ fn run_accepted_corpus_kernel_differential(
             // here rather than left as an untriaged remainder.
             if counts.subject_no_answer != 0 {
                 counts.no_answer_families.insert(
-                    "context:import_context_not_faithfully_representable".to_string(),
+                    FAMILY_UNFAITHFUL_IMPORT_CONTEXT.to_string(),
                     counts.subject_no_answer,
                 );
             }
