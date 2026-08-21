@@ -996,6 +996,49 @@ fn init_option_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// `Init.Empty` has no constructor rows, but its recursor still must be
+/// reconstructed rather than treated as an empty success.
+fn init_empty_entries() -> Vec<ConstantEntry> {
+    let empty = checker_name("Empty");
+    let rec = checker_qualified(&["Empty", "rec"]);
+    let u_name = checker_name("u");
+    let u = Level::param(primary_name("u"));
+    let empty_expr = || Expr::const_(primary_name("Empty"), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = primary_pi("t", BinderInfo::Default, empty_expr(), Expr::sort(u));
+    let recursor_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive_type.clone(),
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            empty_expr(),
+            Expr::app(bv(1), bv(0)),
+        ),
+    );
+    vec![
+        ConstantEntry::new(
+            empty.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, 0, vec![empty.clone()], Vec::new(), 0, false, false),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(vec![empty], 0, 0, 1, 0, Vec::new(), false),
+            ),
+        ),
+    ]
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
@@ -1098,6 +1141,63 @@ fn kr600_803_init_option_refuses_a_forged_some_iota_rule() {
                         decoded(&Expr::bvar(0).expect("packs")),
                     ),
                 ],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
+fn kr600_803_init_empty_eliminator_is_reconstructed_independently() {
+    let entries = init_empty_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.Empty block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 2);
+}
+
+#[test]
+fn kr600_803_init_empty_refuses_a_forged_recursor_rule() {
+    let mut entries = init_empty_entries();
+    let recursor = entries[1].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Empty", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["Empty", "forged"]),
+                    0,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
                 metadata.k(),
             ),
         ),
