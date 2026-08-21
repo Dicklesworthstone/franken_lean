@@ -4723,6 +4723,13 @@ fn walk_olean_inventory(
     oleans.sort();
     let modules = module_names_below(library, module_prefix)?;
 
+    // DEFENSIVE, NOT REACHABLE FROM ANY TREE. Both vectors come from
+    // `collect_present_oleans` over the same root, so their lengths always
+    // agree; no fixture can make this fire. It guards a future
+    // `module_names_below` that filtered, deduped or re-enumerated -- drift in a
+    // helper, not a property of the input. Said plainly so nobody counts it as
+    // input validation, and so a mutation campaign does not record it as a
+    // surviving mutant that ought to have been killed.
     if modules.len() != oleans.len() {
         return Err(format!(
             "{} olean(s) below {} produced {} module name(s); the enumeration and the projection \
@@ -4732,6 +4739,13 @@ fn walk_olean_inventory(
             modules.len()
         ));
     }
+    // ALSO DEFENSIVE, for a reason that is checked rather than assumed:
+    // `qualify_module_name` prepends `{prefix}.` unconditionally, so every name
+    // it returns starts with the prefix and this branch cannot fire on input.
+    // That premise is pinned by
+    // `qualification_prepends_unconditionally_which_is_why_the_walk_guard_is_defensive`;
+    // if it ever stops holding, this guard becomes live and that test goes red
+    // first, which is the order those two should fail in.
     if let Some(prefix) = module_prefix {
         let qualified = format!("{prefix}.");
         if let Some(unqualified) = modules.iter().find(|name| !name.starts_with(&qualified)) {
@@ -5769,6 +5783,70 @@ fn every_non_answer_outcome_yields_a_legal_family_token() {
         tokens.iter().any(|token| token.matches(':').count() >= 2),
         "no token carries a composed tail any more, so the delimiter rule is no longer being \
          exercised against interpolated content: {tokens:?}"
+    );
+}
+
+/// Qualification prepends UNCONDITIONALLY -- the premise that makes the walk's
+/// prefix guard unreachable from any tree.
+///
+/// **Why this is not the existing two-example test.**
+/// `mathlib_olean_paths_are_qualified_before_import_matching` already checks
+/// `qualify_module_name` on one `Some` and one `None` input. Two examples do not
+/// establish the INVARIANT the walk leans on, which is that *every* name comes
+/// back carrying the prefix -- and it is the invariant, not the examples, that
+/// makes the prefix branch in `walk_olean_inventory` dead code rather than a
+/// live check.
+///
+/// **The case a well-meant repair would break.** A name that already begins with
+/// the prefix is qualified again: `Ns.Already` becomes `Ns.Ns.Already`. That
+/// looks like a bug and is not one. The projection is mechanical -- filesystem
+/// depth to dotted name -- and a module genuinely nested at `Ns/Ns/Already.olean`
+/// must produce exactly that. Teaching the qualifier to notice an existing
+/// prefix would silently merge two distinct modules into one name, which is the
+/// non-injectivity the walk refuses two rules later. So the doubling is pinned
+/// deliberately, with the reason attached, rather than left looking like an
+/// oversight somebody should tidy.
+#[test]
+fn qualification_prepends_unconditionally_which_is_why_the_walk_guard_is_defensive() {
+    let names = [
+        "",
+        "Leaf",
+        "A.B.C",
+        "Ns.Already",
+        "Mid.dotted.Leaf",
+        "Nsx",
+        "ns.lowercase",
+    ];
+    for name in names {
+        let qualified = qualify_module_name(Some("Ns"), name.to_string());
+        assert_eq!(
+            qualified,
+            format!("Ns.{name}"),
+            "qualification must be a plain prepend with no special-casing"
+        );
+        assert!(
+            qualified.starts_with("Ns."),
+            "`{qualified}` does not carry the prefix, which is the premise the walk's prefix \
+             guard is dead because of"
+        );
+        // The `None` arm hands the name back untouched.
+        assert_eq!(qualify_module_name(None, name.to_string()), name);
+    }
+
+    // ANTI-VACUITY: the spread must actually contain the awkward shapes, or the
+    // loop above is a list of ordinary names dressed up as an invariant.
+    assert!(
+        names.contains(&"Ns.Already") && names.contains(&"") && names.contains(&"Nsx"),
+        "the spread must include an already-prefixed name, an empty one, and one that merely \
+         starts with the prefix's letters"
+    );
+    // `Nsx` shares the prefix's letters but not its dot, so a guard written with
+    // `starts_with("Ns")` instead of `starts_with("Ns.")` would accept a name
+    // the walk should have rejected.
+    assert_eq!(
+        qualify_module_name(Some("Ns"), "x".to_string()),
+        "Ns.x",
+        "the separator is part of the prefix"
     );
 }
 
