@@ -1832,6 +1832,25 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
+    let human_private_companion_residuals = human_line_suffix(
+        &human.stdout,
+        "decoded _private companion residuals: ",
+    )
+    .split_once(" (")
+    .map(|(count, _)| count)
+    .expect("human private-companion residual summary has a reporting suffix")
+    .parse::<usize>()
+    .expect("human private-companion residual count is a usize");
+    assert_eq!(
+        human_private_companion_residuals,
+        json_usize_field(
+            json_object_field(&json.stdout, "privateCompanionResiduals"),
+            "observed",
+        ),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
+    );
     assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
         &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
