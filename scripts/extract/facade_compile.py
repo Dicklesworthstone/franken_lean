@@ -185,6 +185,11 @@ the toolchain would report a perfect facade:
     artifact row to carry a nonempty reason. The shared-substrate half of the
     no-import proof cannot become an unexplained name exclusion.
 
+  * A MANIFEST-INSTANCE-STATE JOIN requires every registered instance to be
+    emitted and every row with an explicit dropped-instance reason to remain
+    unregistered. Instance metadata cannot claim a registration the façade did
+    not actually emit.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2174,6 +2179,38 @@ def main():
             f"({json.dumps(manifest_init_row_provenance_join, sort_keys=True)}, "
             f"unexplained={unexplained_init_artifact_rows[:8]!r})"
         )
+    unemitted_registered_instances = sorted(
+        row["name"] for row in manifest_rows
+        if row.get("instance_registered") is True and row.get("emitted") is not True
+    )
+    registered_dropped_instances = sorted(
+        row["name"] for row in manifest_rows
+        if isinstance(row.get("instance_drop_reason"), str)
+        and row["instance_drop_reason"].strip()
+        and row.get("instance_registered") is not False
+    )
+    manifest_instance_state_join = {
+        "registered_rows": sum(
+            row.get("instance_registered") is True for row in manifest_rows
+        ),
+        "unemitted_registered_rows": len(unemitted_registered_instances),
+        "dropped_rows": sum(
+            bool(isinstance(row.get("instance_drop_reason"), str)
+                 and row["instance_drop_reason"].strip())
+            for row in manifest_rows
+        ),
+        "registered_dropped_rows": len(registered_dropped_instances),
+    }
+    if (manifest_instance_state_join["registered_rows"] == 0
+            or manifest_instance_state_join["dropped_rows"] == 0
+            or manifest_instance_state_join["unemitted_registered_rows"] != 0
+            or manifest_instance_state_join["registered_dropped_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest instance-state join failed "
+            f"({json.dumps(manifest_instance_state_join, sort_keys=True)}, "
+            f"unemitted={unemitted_registered_instances[:8]!r}, "
+            f"registered_dropped={registered_dropped_instances[:8]!r})"
+        )
     unknown_printer_rows = []
     init_printer_rows = []
     manifest_printer_counts = Counter()
@@ -2417,6 +2454,7 @@ def main():
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "manifest_negative_control_join": manifest_negative_control_join,
         "manifest_init_row_provenance_join": manifest_init_row_provenance_join,
+        "manifest_instance_state_join": manifest_instance_state_join,
         "manifest_printer_totality_join": manifest_printer_totality_join,
         "manifest_projection_closure_join": manifest_projection_closure_join,
         "checked": checked,
