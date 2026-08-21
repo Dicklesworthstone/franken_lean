@@ -1958,6 +1958,13 @@ def published_bytes_error(out, text, what="the facade"):
                 "beside the bytes, and `git commit -o` carries the link, not the "
                 "content. Nothing else here would have noticed: reading through a "
                 "symlink is exactly as successful as reading the file")
+    if os.path.exists(out) and not os.path.isfile(out):
+        return (f"{what} at {out} is not a regular file. Measured: reading a FIFO "
+                "there does not fail, it BLOCKS -- the run hangs with no verdict, "
+                "no traceback and no exit code, which in a checkout several panes "
+                "share is indistinguishable from a run still doing its work. This "
+                "is decided by a stat rather than by opening the path, because "
+                "opening it is the thing that never returns")
     try:
         with open(out, "rb") as fh:
             raw = fh.read()
@@ -2724,6 +2731,19 @@ def self_test():
     _surrogate = "axiom X : Type\n" + chr(0xD800)
     case("bytes/text-encodable", unencodable_text_error(text), False)
     case("bytes/text-not-encodable", unencodable_text_error(_surrogate), True)
+    _fifo = os.path.join(work, "fifo-artifact.lean")
+    if not os.path.exists(_fifo):
+        os.mkfifo(_fifo)
+    case("bytes/fifo-artifact-refused",
+         published_bytes_error(_fifo, text), True)
+    _dir = os.path.join(work, "dir-artifact.lean")
+    os.makedirs(_dir, exist_ok=True)
+    case("bytes/directory-artifact-refused",
+         published_bytes_error(_dir, text), True)
+    case("bytes/missing-file-keeps-its-own-message",
+         None if "not readable" in
+         (published_bytes_error(os.path.join(work, "absent.lean"), text) or "")
+         else "a missing file was reported as the wrong kind of thing", False)
     _real = at("real-target.lean", text)
     _link = os.path.join(work, "linked-artifact.lean")
     if not os.path.islink(_link):
