@@ -1619,6 +1619,47 @@ def pin_acceptance_error(text, accepted):
     return None
 
 
+# What main has published so far, visible to the exit path below. A list rather
+# than a dict because main owns the dict; this only ever reads it.
+_PUBLISHED_VIEW = []
+
+
+def artifact_divergence_note(published):
+    """Did this run replace the facade and then refuse before the manifest?
+
+    Every check added over the last several waves runs at the END of main, and a
+    refusal never reaches them. That is correct for the refusal itself -- a run
+    that cannot answer should stop -- but it leaves something unsaid, and the
+    ordering makes it likely rather than exotic: the facade is moved into place
+    inside the attempt loop, at line 2528, and the manifest is written 1030 lines
+    later at 3558. Fifty-four `raise SystemExit` sites sit in this file and many
+    of them are in that window -- the projection type check, the transparent
+    values, the conservation joins, the family joins.
+
+    When one fires, contracts/facade_module.lean is the NEW facade and
+    contracts/facade_module.ndjson still describes the previous run. The pair is
+    inconsistent, both files look healthy, and nothing says so. This is not a
+    hypothesis: it happened on this bead in waves 63, 200 and 206, and each time
+    the half-updated .lean was read and reasoned about before anyone noticed the
+    manifest had not moved.
+
+    This does NOT swallow the refusal, and it does not touch either file. It says
+    what the run left behind, so the next reader knows the two artifacts are out
+    of step before trusting either.
+
+    Returns a note, or None.
+    """
+    kinds = {entry[1] for entry in published.values()}
+    if "the facade" not in kinds or "the manifest" in kinds:
+        return None
+    facade = [path for path, entry in published.items() if entry[1] == "the facade"]
+    return (f"THE TWO ARTIFACTS ARE NOW OUT OF STEP. This run replaced {facade} and "
+            "then refused before writing the manifest, so the facade on disk is "
+            "from this run and the manifest still describes the previous one. "
+            "Neither file looks damaged and nothing else will tell you. Regenerate "
+            "before reading either, and do not commit the pair as it stands")
+
+
 def work_scratch_report(work):
     """How much this run leaves in its probe directory, and whether it is there.
 
@@ -2448,6 +2489,9 @@ def main():
     # what this run has published, filled in at each write and checked at the end;
     # see publication_registry_error for why this is not four call lines
     published = {}
+    # ...and made visible to the exit path, which is the only place that can see a
+    # run that published the facade and then refused before the manifest
+    _PUBLISHED_VIEW.append(published)
     # every scratch path this run creates, recorded where it is created so the
     # leak check's scope can be compared against what actually gets written
     scratch_created = set()
@@ -3620,4 +3664,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        # A refusal must stay a refusal: this reports and re-raises, and the
+        # reporting is deliberately last so a fault in it cannot mask the cause.
+        if exc.code not in (0, None):
+            for _published in _PUBLISHED_VIEW:
+                _note = artifact_divergence_note(_published)
+                if _note:
+                    print("NOTE: " + _note, file=sys.stderr)
+        raise
