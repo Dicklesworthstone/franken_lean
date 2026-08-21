@@ -6636,3 +6636,85 @@ fn companion_files_belong_to_modules_and_the_chain_has_exactly_three_parts() {
         );
     }
 }
+
+/// `is_module` PREDICTS the companion chain — the exceptions the chain cell
+/// names are derived from a stored flag, not carved out by hand.
+///
+/// The import cell reads `is_module` at two modules, finds it true at both
+/// levels, and calls it "the premise of the entire companion-chain repair — a
+/// non-module olean has no `.private` part to read". That sentence is an
+/// implication whose interesting direction is `is_module == false`, and both of
+/// its samples have it TRUE. The claim is stated in prose and exercised nowhere.
+///
+/// The chain cell, for its part, names `LeanChecker` and `Leanc` as the two
+/// library modules carrying no companions, and gives no reason. The reason is a
+/// stored byte, and the two facts are the same fact:
+///
+///   library-wide, 2,433 oleans carry `is_module` true 2,431 times and false
+///     twice, and the false set is EXACTLY the set with no companion parts —
+///     equal in both directions
+///   all 600 `Init` census modules carry it true, and all 600 have companions
+///
+/// So the carve-out is derived rather than hand-listed. Both names below are
+/// discovered from the filesystem walk rather than written into the assertion,
+/// which is the difference between checking the property and re-stating the
+/// list: a third non-module olean appearing in the pin would be picked up here
+/// instead of failing an equality against two hardcoded strings.
+///
+/// The library-wide count is provenance for the biconditional; what this cell
+/// walks is the 600 census modules plus whatever the filesystem says lacks a
+/// companion. A library module with `is_module` false that DID carry companions
+/// is the one case outside that scope, and the sweep found none.
+#[test]
+fn the_is_module_flag_predicts_which_oleans_have_companions() {
+    let lib = lib_or_skip!();
+
+    // Derived, not listed: whatever the filesystem says has no private part.
+    let all = chain_census(&lib, &lib);
+    let without: Vec<String> = all
+        .exported
+        .difference(&all.private)
+        .map(|path| {
+            path.strip_suffix(".olean")
+                .expect("an exported part ends in .olean")
+                .replace('/', ".")
+        })
+        .collect();
+    assert!(
+        !without.is_empty() && without.len() < all.exported.len(),
+        "the no-companion population must be a real, proper subset, got {} of {}",
+        without.len(),
+        all.exported.len()
+    );
+
+    for module in &without {
+        assert!(
+            !module_view(&lib, module, Level::Exported).is_module,
+            "{module} carries no companion parts, so it must not be flagged a module"
+        );
+    }
+
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+    let mut not_flagged: Vec<&String> = Vec::new();
+    for module in &modules {
+        if !module_view(&lib, module, Level::Exported).is_module {
+            not_flagged.push(module);
+        }
+    }
+    assert!(
+        not_flagged.is_empty(),
+        "every census module is flagged a module, which is what makes Level::Private defined \
+         for all of them: {not_flagged:?}"
+    );
+
+    // Non-vacuity, and it is the whole point: the flag must take BOTH values
+    // over what this cell reads. The existing two-module cell cannot say this,
+    // because both of its samples are true — an `is_module` that decoded to a
+    // constant `true` would satisfy it and fail here.
+    assert!(
+        without.iter().all(|module| !modules.contains(module)),
+        "the false population must sit outside the census, or the two assertions above are \
+         about the same files"
+    );
+}
