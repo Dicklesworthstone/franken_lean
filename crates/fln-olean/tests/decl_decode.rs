@@ -1568,3 +1568,195 @@ fn the_third_shape_tails_are_not_list_tails() {
          `list_ptrs`"
     );
 }
+
+/// Objects reachable from ONE pointer, by the same layout law `objects_of` uses.
+///
+/// Separate from `objects_of` because the question is not what exists but what
+/// a particular root reaches: `ModuleData` has five pointer fields, and the
+/// declaration graph hangs off exactly one of them.
+fn reachable_from(bytes: &[u8], base: u64, start: u64) -> BTreeSet<usize> {
+    const HEADER_SIZE: usize = 88;
+    let deref = |ptr: u64| -> Option<usize> {
+        if ptr & 1 == 1 || ptr == 0 {
+            return None;
+        }
+        let resolved = usize::try_from(ptr.checked_sub(base)?).ok()?;
+        (resolved >= HEADER_SIZE && resolved + 8 <= bytes.len() && resolved % 8 == 0)
+            .then_some(resolved)
+    };
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack = vec![start];
+    while let Some(ptr) = stack.pop() {
+        let Some(off) = deref(ptr) else { continue };
+        if !seen.insert(off) {
+            continue;
+        }
+        let word = word_at(bytes, off);
+        let tag = ((word >> 56) & 0xff) as u8;
+        let other = ((word >> 48) & 0xff) as u8;
+        if tag <= abi::TAG_MAX_CTOR_TAG {
+            for i in 0..other as usize {
+                let field = off + 8 + 8 * i;
+                if field + 8 <= bytes.len() {
+                    stack.push(word_at(bytes, field));
+                }
+            }
+        } else if tag == abi::TAG_ARRAY {
+            let size = word_at(bytes, off + 8);
+            for i in 0..size.min(1 << 16) {
+                let field = off + 24 + 8 * i as usize;
+                if field + 8 <= bytes.len() {
+                    stack.push(word_at(bytes, field));
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// WHICH root reaches the 99: none of them is in the declaration graph.
+///
+/// `2ea2447b` established what they are - constructors of other inductives
+/// sharing `List.cons`'s tag, arity and size, seventeen of them provably not
+/// lists because their tail is a boxed value other than nil. That says the size
+/// can never identify a cons cell. It does not say whether `list_ptrs` can ever
+/// be HANDED one, which is a different question and the one that decides how
+/// much of the blocker is real.
+///
+/// `ModuleData` carries five pointers. `constants` at slot 2 is the declaration
+/// graph `decode_module_constants` walks; `entries` at slot 4 is
+/// `Array (Name x Array EnvExtensionEntry)`, arbitrary serialised payloads from
+/// environment extensions, which the declaration decoder never enters. Measured
+/// over the pinned corpus: all 99 are reachable from `entries` and NONE from
+/// `constants`.
+///
+/// THE ANTI-VACUITY GUARD IS THE WHOLE CELL. A `constants` walk that reached
+/// nothing - a wrong slot, a broken deref - would report zero third-shape
+/// objects in the declaration graph and look like this same result. So the cell
+/// pins how many CONS-SHAPED cells that walk reaches: 2,259 of the 2,465 in the
+/// corpus, against 206 reachable only from `entries`. A walk that finds
+/// thousands of cons cells and none of the third shape has excluded something;
+/// a walk that finds nothing has merely failed.
+///
+/// WHAT THIS DOES NOT ESTABLISH, because the distinction is the point. It is
+/// one corpus at one pin. "Not reachable here" is not "cannot be reached", and
+/// `entries` decoding is itself open work under `franken_lean-0nz` - the moment
+/// those payloads are walked, these objects are in scope for whatever walks
+/// them. This narrows the blocker to a population the declaration decoder does
+/// not currently touch; it does not retire it, and it does not make the size a
+/// discriminator, which `2ea2447b` already settled it is not.
+#[test]
+fn the_third_shape_is_reached_only_through_module_entries() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut third_tails = 0usize;
+    let mut third_in_declarations = 0usize;
+    let mut third_in_entries = 0usize;
+    let mut third_in_neither = 0usize;
+    let mut cons_in_declarations = 0usize;
+    let mut cons_in_entries = 0usize;
+    let mut examples: Vec<String> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root in range");
+        assert_eq!(
+            at.get(&root).map(|o| (o.tag, o.other)),
+            Some((0, 5)),
+            "{module}: ModuleData carries imports, constNames, constants, \
+             extraConstNames and entries"
+        );
+        let declarations = reachable_from(bytes, base, word_at(bytes, root + 24));
+        let entries = reachable_from(bytes, base, word_at(bytes, root + 40));
+
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            let cons_shaped = (second & 1 == 1 && second >> 1 == 0)
+                || target.is_some_and(|t| (t.tag, t.other) == (1, 2));
+
+            if cons_shaped {
+                if declarations.contains(&object.off) {
+                    cons_in_declarations += 1;
+                } else if entries.contains(&object.off) {
+                    cons_in_entries += 1;
+                }
+                continue;
+            }
+
+            third_tails += 1;
+            if declarations.contains(&object.off) {
+                third_in_declarations += 1;
+                if examples.len() < 5 {
+                    examples.push(format!("{module} {:#x}", object.off));
+                }
+            } else if entries.contains(&object.off) {
+                third_in_entries += 1;
+            } else {
+                third_in_neither += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        third_in_declarations + third_in_entries + third_in_neither,
+        third_tails,
+        "every third-shape object must land in exactly one bucket"
+    );
+
+    if !prelude_loaded {
+        assert_eq!(
+            third_tails, 0,
+            "the third shape was not expected in the C3 fixtures alone"
+        );
+        return;
+    }
+
+    // THE GUARD, asserted before the exclusion it makes meaningful: the
+    // declaration walk must demonstrably reach cons cells, or its zero above
+    // says nothing.
+    assert!(
+        cons_in_declarations > 0,
+        "the `constants` walk reached no cons cells at all, so it has not \
+         excluded anything - it has failed"
+    );
+    assert_eq!(
+        (cons_in_declarations, cons_in_entries),
+        (2259, 206),
+        "cons-shaped (1,2,24) cells by root, measured over the pinned corpus"
+    );
+
+    // The remainder, still pinned two-way, and its split.
+    assert_eq!(third_tails, 99, "the same 99 the remainder cell pins");
+    assert_eq!(
+        (third_in_declarations, third_in_entries, third_in_neither),
+        (0, 99, 0),
+        "all of the third shape is reached through `entries` and none through \
+         `constants`. A non-zero first element means `list_ptrs` CAN be handed \
+         one from the declaration graph: {examples:?}"
+    );
+}
