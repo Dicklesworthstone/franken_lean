@@ -2162,3 +2162,104 @@ fn reducibility_hints_decode_across_all_three_shapes_and_respect_the_height_inva
          list should shrink."
     );
 }
+
+/// The recursive inductives at the pin, and the flag that says so.
+const RECURSIVE_INDUCTIVES: &[&str] = &[
+    "Lean.Name",
+    "Lean.ParserDescr",
+    "Lean.Syntax",
+    "List",
+    "Nat",
+    "Nat.le",
+    "Nat.le.below",
+];
+
+/// `is_rec` — a stored flag nothing reads, checked against a property DERIVED
+/// from the constructors rather than against a table alone.
+///
+/// It decides recursor shape: a recursive block's minor premises carry
+/// induction hypotheses, so a wrong flag produces a regenerated recursor that
+/// differs from the decoded one — a `BlockMismatch`, with every name, count and
+/// relation this file already pins still agreeing.
+///
+/// The derivation is the point. A constructor's type ALWAYS mentions its own
+/// inductive, in the result, so "the constructor type references the block" is
+/// true for every inductive and would be a check that cannot fail. The property
+/// that actually distinguishes them is a recursive occurrence in a FIELD: strip
+/// the block's `num_params` leading binders, then look for a block member in the
+/// remaining binders' DOMAINS. Measured that way, `is_rec` agrees with the
+/// derivation for all 127 inductives in `Init/Prelude`, 7 recursive and 120 not.
+///
+/// `is_reflexive` is deliberately NOT asserted here. Every inductive in this
+/// module carries it false, so any assertion about it would be a vacuous zero;
+/// binding it needs a module that actually contains a reflexive type, and
+/// pretending otherwise would put a green where there is no evidence.
+#[test]
+fn the_recursive_flag_matches_a_recursive_occurrence_in_a_constructor_field() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, &ConstructorVal> = BTreeMap::new();
+    for info in &infos {
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(info.name().to_display_string(), v)),
+            ConstantInfo::Ctor(v) => drop(constructors.insert(info.name().to_display_string(), v)),
+            _ => {}
+        }
+    }
+
+    let mut flagged: Vec<String> = Vec::new();
+    for (name, induct) in &inductives {
+        let block: BTreeSet<String> = induct.all.iter().map(Name::to_display_string).collect();
+        let mut occurs = false;
+        for ctor_name in &induct.ctors {
+            let ctor = constructors
+                .get(&ctor_name.to_display_string())
+                .expect("constructor decodes");
+            // Walk the Pi spine, skipping the block's parameters; a recursive
+            // occurrence is a block member in a remaining binder's DOMAIN. The
+            // RESULT is excluded by construction, which is what stops this from
+            // being true for every inductive.
+            let mut current = &ctor.base.type_;
+            let mut depth = 0usize;
+            while let ExprNode::ForallE {
+                binder_type, body, ..
+            } = current.node()
+            {
+                if depth >= induct.num_params as usize
+                    && !referenced_constants(binder_type).is_disjoint(&block)
+                {
+                    occurs = true;
+                    break;
+                }
+                depth += 1;
+                current = body;
+            }
+            if occurs {
+                break;
+            }
+        }
+        assert_eq!(
+            induct.is_rec, occurs,
+            "{name}: stored is_rec={} but a recursive occurrence in a constructor field is {occurs}",
+            induct.is_rec
+        );
+        if induct.is_rec {
+            flagged.push(name.clone());
+        }
+    }
+
+    // Both populations must be real. An all-false decode would satisfy the
+    // agreement above for every non-recursive type, which is most of them.
+    assert!(
+        inductives.len() - flagged.len() > 100,
+        "expected a large non-recursive population alongside the recursive one"
+    );
+    // Sorted: collected from a BTreeMap, but the table is the claim.
+    flagged.sort();
+    assert_eq!(
+        flagged, RECURSIVE_INDUCTIVES,
+        "the recursive inductives at the pin; a new one is a real change in the artifact"
+    );
+}
