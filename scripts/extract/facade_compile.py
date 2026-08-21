@@ -1684,6 +1684,19 @@ def main():
             "REFUSE: facade manifest kernel-special population pin diverges "
             f"({json.dumps(kernel_special_population_pin_join, sort_keys=True)})"
         )
+    kernel_special_as_axiom_pin_join = {
+        "kernel_special_as_axiom_count": (
+            len(manifest_summary.get("kernel_special_as_axiom"))
+            if isinstance(manifest_summary.get("kernel_special_as_axiom"), list) else None
+        ),
+        "pinned_kernel_special_as_axiom_count": 493,
+    }
+    if (kernel_special_as_axiom_pin_join["kernel_special_as_axiom_count"]
+            != kernel_special_as_axiom_pin_join["pinned_kernel_special_as_axiom_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest kernel-special-as-axiom pin diverges "
+            f"({json.dumps(kernel_special_as_axiom_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2765,6 +2778,7 @@ def main():
         "manifest_inductive_declarations_pin_join": inductive_declarations_pin_join,
         "manifest_inductive_refused_pin_join": inductive_refused_pin_join,
         "manifest_kernel_special_population_pin_join": kernel_special_population_pin_join,
+        "manifest_kernel_special_as_axiom_pin_join": kernel_special_as_axiom_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
