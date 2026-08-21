@@ -1619,6 +1619,41 @@ def pin_acceptance_error(text, accepted):
     return None
 
 
+def publication_registry_error(published, declared):
+    """Every artifact this tool declares it produces was published THROUGH the
+    checks, and nothing else was.
+
+    c7e99d76 pointed both checks at both artifacts, but as four hand-written call
+    lines at the end of main. That is the same shape this file has already had to
+    repair twice -- a prefix scan standing in for a population, a suffix list
+    standing in for the scratch set -- and it fails the same way: drop one line, or
+    add a third output, and the missing check is invisible because everything that
+    remains still passes.
+
+    So the artifacts register themselves where they are WRITTEN, the checks run
+    over the registry, and the registry is compared against what argparse declares
+    this tool produces. `--out` and `--manifest` are the contract; anything the
+    contract names must have been published, and anything published must be named
+    by the contract.
+
+    Returns an error string, or None.
+    """
+    missing = sorted(set(declared) - set(published))
+    extra = sorted(set(published) - set(declared))
+    if missing:
+        return (f"this tool declares it produces {len(declared)} artifacts and "
+                f"{len(published)} were published through the checks. Never "
+                f"registered: {missing}. A declared output that no check saw is "
+                "published unverified, and every guard in this run still passes "
+                "because none of them was looking at it")
+    if extra:
+        return (f"an artifact was published that this tool does not declare: "
+                f"{extra}. Either argparse and the writer disagree about what "
+                "ships, or something is being written where a reader will not "
+                "think to look for it")
+    return None
+
+
 def published_bytes_error(out, text, what="the facade"):
     """The file that ships is byte-for-byte the text this run built.
 
@@ -2330,6 +2365,9 @@ def main():
     # still fails is re-quarantined with its current reason, so this can only add.
     best = None
     pin_accepted = set()
+    # what this run has published, filled in at each write and checked at the end;
+    # see publication_registry_error for why this is not four call lines
+    published = {}
     for readmit in range(args.readmit_rounds):
         if readmit:
             if not quarantine and not transparent_refused and not any(
@@ -2665,6 +2703,7 @@ def main():
 
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
+    published[args.out] = (text, "the facade", SCRATCH_SUFFIXES)
 
     # A projection the structural block generates IS in the facade; counting only
     # the lines this emitter wrote would understate coverage by every field.
@@ -3430,6 +3469,8 @@ def main():
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(manifest_text)
     os.replace(tmp, args.manifest)
+    published[args.manifest] = (manifest_text, "the manifest",
+                                MANIFEST_SCRATCH_SUFFIXES)
     print(f"facade-module: demanded={len(demand)} init_substrate={len(init_demanded)} "
           f"facade_demand={len(facade_demand)} emitted={len(emitted)} "
           f"covered={len(covered)} substrate={rows[0]['substrate_emitted']} "
@@ -3465,23 +3506,21 @@ def main():
           f"/{len(private_owners)}mods "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
-    _pub = published_bytes_error(args.out, text)
-    if _pub:
-        raise SystemExit("REFUSE: " + _pub)
-    _leak = leftover_scratch_error(args.out)
-    if _leak:
-        raise SystemExit("REFUSE: " + _leak)
-    # THE MANIFEST CARRIES THE EVIDENCE, and had neither protection. Every number
-    # the last several waves pinned -- the refusal verdicts, the family counts,
-    # form_counts, the declared-vs-written join -- lives in this file and not in
-    # the .lean, so a manifest replaced after this run wrote it leaves all of them
-    # passing while the published evidence belongs to somebody else.
-    _mpub = published_bytes_error(args.manifest, manifest_text, "the manifest")
-    if _mpub:
-        raise SystemExit("REFUSE: " + _mpub)
-    _mleak = leftover_scratch_error(args.manifest, MANIFEST_SCRATCH_SUFFIXES)
-    if _mleak:
-        raise SystemExit("REFUSE: " + _mleak)
+    # THE MANIFEST CARRIES THE EVIDENCE and the facade carries the surface; both
+    # get both checks, and neither is named here. The registry is what makes that
+    # true: an artifact is checked because it was published, not because someone
+    # remembered to add a line for it.
+    _reg = publication_registry_error(published, (args.out, args.manifest))
+    if _reg:
+        raise SystemExit("REFUSE: " + _reg)
+    for _path in sorted(published):
+        _text, _what, _sufs = published[_path]
+        _err = published_bytes_error(_path, _text, _what)
+        if _err:
+            raise SystemExit("REFUSE: " + _err)
+        _err = leftover_scratch_error(_path, _sufs)
+        if _err:
+            raise SystemExit("REFUSE: " + _err)
 
 
 if __name__ == "__main__":
