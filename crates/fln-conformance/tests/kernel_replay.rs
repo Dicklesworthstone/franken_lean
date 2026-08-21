@@ -1340,7 +1340,28 @@ fn module_name_from_path(root: &Path, path: &Path) -> Result<String, String> {
     if parts.is_empty() {
         return Err(format!("empty module name for {}", path.display()));
     }
-    Ok(parts.join("."))
+    // THE PATH'S COMPONENTS ARE NOT THE NAME'S SEGMENTS, and the guard above
+    // inspects the wrong one. `Component::Normal` is never empty, so
+    // `part.is_empty()` cannot fire on anything the parser produces -- while the
+    // JOIN can still mint an empty segment out of perfectly non-empty
+    // components: `x..olean` has extension `olean` and stem `x.`, so `A/x..olean`
+    // projects to `A.x.`, whose last segment has no characters. The hazard the
+    // guard names is real; it was being looked for in the one place it cannot
+    // appear.
+    //
+    // Such a name can never match an import recorded inside an olean, so the
+    // module joins the census, inflates the count, resolves against nothing, and
+    // reads downstream as a corpus with unresolved imports rather than as a file
+    // that should not have been named.
+    let name = parts.join(".");
+    if name.split('.').any(str::is_empty) {
+        return Err(format!(
+            "{} projects to a module name with an empty segment (`{name}`); a segment with no \
+             characters names nothing and can never match an import",
+            path.display()
+        ));
+    }
+    Ok(name)
 }
 
 fn tagged_fixture_hash(tag: &[u8], fields: &[&[u8]]) -> String {
@@ -6128,11 +6149,14 @@ fn every_non_answer_outcome_yields_a_legal_family_token() {
 /// three produce a plausible-looking module name rather than an error, which is
 /// why they are refusals rather than debug assertions.
 ///
-/// **The expectations are chosen for what separates them.** Four of these five
-/// messages share `module path`, two share `module path component in`, and two
-/// share `empty module` -- so asserting on any of those fragments would let one
-/// branch pass in another's place. Each cell below asserts on the words unique
-/// to its own branch.
+/// **The expectations are chosen for what separates them.** Counted over the
+/// fragments in `MESSAGES` below: three share `module path`, two share `module
+/// path component in`, two share `empty module`, and two share `module name` --
+/// so asserting on any of those would let one branch pass in another's place.
+/// Each cell below asserts on the words unique to its own branch. (This
+/// paragraph used to open "four of these five messages share `module path`",
+/// which is a miscount: only three of them contain that phrase. A prose tally
+/// beside a checked list is the half nobody re-derives.)
 #[test]
 fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
     let root = Path::new("/corpus/lib");
@@ -6169,14 +6193,20 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
     // one of the five messages this function can produce, or a cell could pass
     // on a sibling's refusal. The list is the messages themselves, so it cannot
     // drift from them silently.
-    const MESSAGES: [&str; 5] = [
+    const MESSAGES: [&str; 6] = [
         "is outside",
         "non-normal module path component in",
         "non-UTF-8 module path",
         "empty module path component in",
         "empty module name for",
+        "projects to a module name with an empty segment",
     ];
-    for probe in ["is outside", "non-normal", "empty module name"] {
+    for probe in [
+        "is outside",
+        "non-normal",
+        "empty module name",
+        "empty segment",
+    ] {
         assert_eq!(
             MESSAGES.iter().filter(|m| m.contains(probe)).count(),
             1,
@@ -6477,6 +6507,102 @@ fn a_parent_module_makes_path_order_disagree_with_module_name_order() {
             path.display()
         );
     }
+}
+
+/// A stem ending in a dot mints a module name no import can ever match, and the
+/// guard written for exactly that hazard cannot see it.
+///
+/// **The guard inspects the path's components; the name is made of segments.**
+/// `module_name_from_path` refuses a component that `is_empty()`, which reads
+/// like the right rule and is unreachable: a `Component::Normal` produced by the
+/// parser is never empty, so that branch cannot fire on any real path. The JOIN
+/// is where an empty segment comes from. `x..olean` has extension `olean` and
+/// stem `x.`, so `Dotted/x..olean` projected to `Dotted.x.` -- a trailing
+/// segment with no characters -- past both guards, because every component along
+/// the way was non-empty and normal.
+///
+/// **The file really does arrive at the projection**, which is the part worth
+/// checking rather than assuming: `Path::extension` reports `olean` for
+/// `x..olean`, so the walk's exact-extension filter collects it like any other
+/// module. The refusal below is therefore about a file the walk hands over, not
+/// about one the filter already dropped. That is asserted with the collector
+/// itself.
+///
+/// **What the bad name costs is silence, not a crash.** A name with an empty
+/// segment matches no import recorded inside any olean, so the module would join
+/// the census, add one to every count taken from it, and resolve against
+/// nothing. Downstream that reads as a corpus with unresolved imports -- a
+/// corpus-integrity problem -- rather than as a file that should never have been
+/// named.
+///
+/// **Asserted on the part that differs.** `Dotted/..olean` is refused too, but
+/// by the NON-NORMAL branch: its stripped form ends in `..`, which
+/// `Path::components` reports as `ParentDir`. Two neighbouring dotted names,
+/// two different refusals, and a cell that asserted on `refused` alone would
+/// pass on either.
+#[test]
+fn a_stem_ending_in_a_dot_mints_a_name_no_import_can_match() {
+    let library = write_inventory_fixture("t6r7-inventory-empty-segment-v1", &["Dotted/x..olean"]);
+
+    // ANTI-VACUITY, BEFORE THE REFUSAL: the walk's extension filter must collect
+    // this file. If it did not, the projection would never be handed the path
+    // and the refusal below would be a statement about an input that cannot
+    // occur.
+    let mut collected = Vec::new();
+    collect_present_oleans(&library, &mut collected)
+        .unwrap_or_else(|reason| panic!("the fixture must enumerate: {reason}"));
+    assert_eq!(
+        collected.len(),
+        1,
+        "`x..olean` must reach the projection like any other module -- its extension IS `olean` -- \
+         or this test refuses a file the filter already dropped: {collected:?}"
+    );
+
+    // Matched rather than `expect_err`, which would need `OleanInventory: Debug`
+    // and would print the struct. What matters if this ever succeeds is the
+    // NAME it accepted, so the failure says that instead.
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(accepted) => panic!(
+            "a tree that cannot be honestly named was counted instead of refused, as {:?}",
+            accepted.modules
+        ),
+    };
+    assert!(
+        reason.contains("empty segment"),
+        "`empty segment` is what separates this from the `empty module path component` refusal \
+         and from `empty module name for`, both of which also begin `empty module`: {reason}"
+    );
+    assert!(
+        reason.contains("Dotted.x."),
+        "the refusal must show the NAME it would have minted, or the reader has to re-derive the \
+         projection to see what was wrong with it: {reason}"
+    );
+
+    // THE PART THAT DIFFERS. `..olean` strips to `..`, which is a ParentDir
+    // component, so it is refused by the non-normal branch instead. Without this
+    // the cell above could be passing on whichever refusal a dotted name happens
+    // to hit.
+    let root = Path::new("/corpus/lib");
+    let parent_dir = module_name_from_path(root, Path::new("/corpus/lib/Dotted/..olean"))
+        .expect_err("`..olean` strips to a parent-directory component");
+    assert!(
+        parent_dir.contains("non-normal") && !parent_dir.contains("empty segment"),
+        "`Dotted/..olean` must be refused as NON-NORMAL, not as an empty segment; if both dotted \
+         names now take the same branch, one of these cells has stopped testing anything: \
+         {parent_dir}"
+    );
+
+    // GREEN CONTROL: dots INSIDE a component are ordinary and must still name a
+    // module. The new rule is about empty segments, not about dots, and a rule
+    // that refused `Mid.dotted` would reject names a Lean library really uses.
+    assert_eq!(
+        module_name_from_path(root, Path::new("/corpus/lib/Mid.dotted/Leaf.olean"))
+            .unwrap_or_else(|reason| panic!("a dotted directory names a module: {reason}")),
+        "Mid.dotted.Leaf",
+        "a dot inside a component is part of the name, and only a segment with NO characters is \
+         refused"
+    );
 }
 
 /// What a module name MEANS, written out independently of how it is computed.
