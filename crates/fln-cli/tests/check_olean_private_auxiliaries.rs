@@ -93,6 +93,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "0",
         "_sunfold",
     ]);
+    let private_f_residual = fln::Name::from_components([
+        "_private",
+        "CliPrivateReport",
+        "0",
+        "_f",
+    ]);
     let private_loop_proof_residual = fln::Name::from_components([
         "_private",
         "CliPrivateReport",
@@ -161,6 +167,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
     private_constants.push(axiom(
+        private_f_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
         private_loop_proof_residual,
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
@@ -212,7 +222,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":11"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":12"));
     assert!(json.stdout.contains(
         "\"decodedPrivateLoopAuxiliaries\":{\"observed\":5,"
     ));
@@ -227,6 +237,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     ));
     assert!(json.stdout.contains(
         "\"privateUnsafeRecSunfoldResiduals\":{\"observed\":4,\"names\":[{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
+        "\"privateSunfoldFResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.CliPrivateReport.0._f\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -248,7 +261,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 11 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 12 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
         "decoded _private.loop auxiliaries: 5 (reporting only; not a G1 claim)"
@@ -295,6 +308,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private _unsafe_rec/_sunfold residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private _sunfold/_f residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private _sunfold/_f residual names: _private.CliPrivateReport.0._f, _private.CliPrivateReport.0._sunfold"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private _sunfold/_f residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private .loop._proof_* residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
