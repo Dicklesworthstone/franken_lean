@@ -16604,3 +16604,124 @@ fn import_all_never_comes_from_an_aggregator() {
         "declaring modules use all six flag combinations; aggregators use four"
     );
 }
+
+/// `import all` stays inside its namespace far more than the corpus does; meta
+/// barely differs.
+///
+/// The layering cell counts every edge by namespace PAIR and the flag cells
+/// count every edge by FLAG, and neither crosses the two. So nothing says
+/// whether the flagged edges behave like the rest of the graph. `import all`
+/// widens what a module can see, and `is_meta` pulls a module in for
+/// metaprogramming; both are the kind of construct that might reach across a
+/// library boundary, and both might not.
+///
+/// Measured over all 10,298 edges, splitting each population by whether the edge
+/// leaves its source namespace:
+///
+///                    same namespace    crosses
+///   every edge            8,845         1,453
+///   `import_all` (315)      305            10
+///   `is_meta`    (146)      128            18
+///
+/// The three crossing rates are strictly ordered — `import_all` below `is_meta`
+/// below the corpus — and the cell asserts that ordering by CROSS-MULTIPLYING,
+/// never by dividing. Integer division would collapse all three to zero and the
+/// comparison would hold for any table whatever.
+///
+/// `import all` is the outlier. It crosses ten times in 315 against a corpus
+/// rate near one in seven, so it is overwhelmingly a within-library construct:
+/// a module widens its view of its own library, not of another. `is_meta` is
+/// nearly indistinguishable from the background — 18 in 146 against 1,453 in
+/// 10,298 — so metaprogramming imports reach across boundaries about as freely
+/// as ordinary ones. Two flags, opposite answers, and only the comparison shows
+/// it.
+///
+/// THE TWO SUBSETS OVERLAP by fourteen edges, which carry both flags. They are
+/// not a partition of the graph and the cell says so rather than letting the
+/// three rows read as one, since 315 + 146 + 8,845 is not 10,298 and a reader
+/// checking the arithmetic would otherwise find it broken.
+///
+/// Anti-vacuity: both flagged populations DO cross, ten times and eighteen, so
+/// neither row is a "never crosses" claim that a single counterexample would
+/// upend; and the corpus row is the same 10,298 the layering cell pins.
+///
+/// Conservation first: the same-and-crossing split of the whole graph must
+/// reproduce the edge census before either flagged subset is compared to it.
+#[test]
+fn import_all_stays_within_its_namespace_far_more_than_meta_does() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let (mut same, mut cross) = (0usize, 0usize);
+    let (mut all_same, mut all_cross) = (0usize, 0usize);
+    let (mut meta_same, mut meta_cross) = (0usize, 0usize);
+    let mut both = 0usize;
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let source = module.split('.').next().expect("a module name").to_owned();
+        for import in module_view(&lib, &module, Level::Exported).imports {
+            let target = import.module.to_display_string();
+            let crosses = target.split('.').next() != Some(source.as_str());
+            if crosses {
+                cross += 1
+            } else {
+                same += 1
+            }
+            if import.import_all {
+                if crosses {
+                    all_cross += 1
+                } else {
+                    all_same += 1
+                }
+            }
+            if import.is_meta {
+                if crosses {
+                    meta_cross += 1
+                } else {
+                    meta_same += 1
+                }
+            }
+            if import.import_all && import.is_meta {
+                both += 1;
+            }
+        }
+    }
+
+    // Conservation first: the whole graph, against the layering cell's census.
+    assert_eq!(
+        same + cross,
+        10_298,
+        "the crossing split must reproduce the library edge total"
+    );
+    assert_eq!(
+        (same, cross),
+        (8_845, 1_453),
+        "the corpus crossing baseline"
+    );
+    assert_eq!(
+        (all_same, all_cross, meta_same, meta_cross),
+        (305, 10, 128, 18),
+        "the two flagged populations, split the same way"
+    );
+
+    // The subsets overlap, so they are not a partition.
+    assert_eq!(
+        both, 14,
+        "fourteen edges carry both flags and are counted in both rows"
+    );
+
+    // The ordering, cross-multiplied: import_all < meta < corpus.
+    let (all_total, meta_total, corpus) =
+        (all_same + all_cross, meta_same + meta_cross, same + cross);
+    assert!(
+        all_cross * meta_total < meta_cross * all_total,
+        "`import all` must cross proportionally less often than a meta import"
+    );
+    assert!(
+        meta_cross * corpus < cross * meta_total,
+        "and a meta import must cross less often than an average edge"
+    );
+}
