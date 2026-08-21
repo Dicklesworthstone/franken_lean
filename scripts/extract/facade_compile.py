@@ -243,6 +243,10 @@ the toolchain would report a perfect facade:
     intentionally signature-free. A partial signature map cannot degrade rows
     into name-only evidence.
 
+  * A MANIFEST-ROLE-PARTITION JOIN binds every declaration role to the
+    generator's facade-demand, Init-demand, substrate-emission, and quarantine
+    measures. Aggregate totals cannot hide a row that crossed role boundaries.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1350,6 +1354,39 @@ def main():
             "REFUSE: facade manifest signature-totality join failed "
             f"({json.dumps(manifest_signature_join, sort_keys=True)})"
         )
+    manifest_role_counts = Counter(row.get("role") for row in manifest_rows)
+    manifest_role_join = {
+        "demanded_rows": manifest_role_counts["demanded"],
+        "init_substrate_rows": manifest_role_counts["init-substrate"],
+        "substrate_rows": manifest_role_counts["substrate"],
+        "unknown_role_rows": sum(
+            count for role, count in manifest_role_counts.items()
+            if role not in {"demanded", "init-substrate", "substrate"}
+        ),
+        "summary_facade_demand": manifest_summary.get("facade_demand"),
+        "summary_demanded_init_substrate": manifest_summary.get(
+            "demanded_init_substrate"
+        ),
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+        "summary_quarantined": manifest_summary.get("quarantined"),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in (manifest_role_join["summary_facade_demand"],
+                          manifest_role_join["summary_demanded_init_substrate"],
+                          manifest_role_join["summary_substrate_emitted"],
+                          manifest_role_join["summary_quarantined"]))
+            or manifest_role_join["unknown_role_rows"] != 0
+            or manifest_role_join["demanded_rows"]
+            != manifest_role_join["summary_facade_demand"]
+            or manifest_role_join["init_substrate_rows"]
+            != manifest_role_join["summary_demanded_init_substrate"]
+            or manifest_role_join["substrate_rows"]
+            != manifest_role_join["summary_substrate_emitted"]
+            + manifest_role_join["summary_quarantined"]):
+        raise SystemExit(
+            "REFUSE: facade manifest role-partition join disagrees with its "
+            f"summary ({json.dumps(manifest_role_join, sort_keys=True)})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1777,6 +1814,7 @@ def main():
         "manifest_schema_row_join": manifest_schema_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
+        "manifest_role_partition_join": manifest_role_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
