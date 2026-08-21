@@ -184,11 +184,27 @@ open Lean in
       let fmtx <- Meta.MetaM.run' (withOptions
         (fun o => (o.setBool `pp.fullNames true).setBool `pp.explicit true)
         (Meta.ppExpr info.type))
+      -- TIER 3, the maximally explicit rendering. `optParam Lean.Meta.Context { }`
+      -- is unreadable to a facade: `{ }` is structure-instance notation, so
+      -- re-accepting it needs the structure's field DEFAULTS and the instance
+      -- synthesis those defaults perform (Inhabited, EmptyCollection) over types
+      -- the facade holds opaquely. With pp.structureInstances and pp.notation off,
+      -- the same default prints as a fully applied constructor term with every
+      -- instance passed EXPLICITLY -- nothing to synthesize, and every constant in
+      -- it is already in the type's used-constant set and therefore in the closure.
+      let maxOpts : Options -> Options := fun o0 =>
+        let o1 := o0.setBool `pp.fullNames true
+        let o2 := o1.setBool `pp.explicit true
+        let o3 := o2.setBool `pp.structureInstances false
+        let o4 := o3.setBool `pp.notation false
+        o4.setBool `pp.fieldNotation false
+      let fmtm <- Meta.MetaM.run' (withOptions maxOpts (Meta.ppExpr info.type))
       let inst <- Meta.isInstance n
       let lvls := ",".intercalate (info.levelParams.map toString)
       let deps := ",".intercalate ((info.type.getUsedConstants.map toString).toList)
       IO.println s!"TYPE\t{n}\t{lvls}\t{inst}\t{fmt}"
       IO.println s!"TYPEX\t{n}\t{fmtx}"
+      IO.println s!"TYPEM\t{n}\t{fmtm}"
       IO.println s!"DEPS\t{n}\t{deps}"
       -- A STRUCTURE is the one shape an `axiom` cannot stand in for: class-hood
       -- and field projections are structural facts, not type facts. Report the
@@ -228,6 +244,70 @@ open Lean in
 '''
 
 
+VALUE_PROBE = r'''import Lean
+open Lean in
+#eval show CoreM Unit from do
+  let txt <- IO.FS.readFile "@NAMES@"
+  let names := ((txt.splitOn "\n").filter (fun s => s != "")).map String.toName
+  let env <- getEnv
+  for n in names do
+    match env.find? n with
+    | some info =>
+      match info.value? with
+      | some val =>
+        let fmt <- Meta.MetaM.run' (withOptions
+          (fun o => o.setBool `pp.fullNames true) (Meta.ppExpr val))
+        let deps := ",".intercalate ((val.getUsedConstants.map toString).toList)
+        IO.println s!"VALUE\t{n}\t{fmt}"
+        IO.println s!"VDEPS\t{n}\t{deps}"
+      | none => IO.println s!"NOVALUE\t{n}"
+    | none => IO.println s!"NOVALUE\t{n}"
+'''
+
+
+def probe_values(lean, env, work, names):
+    """Print the VALUE of each named constant.
+
+    Only reducible constants are asked for. A reducible definition is an
+    ABBREVIATION in the Reference — `Lean.LMVarId` is `Lean.LevelMVarId`,
+    `Lean.Elab.Term.TermElabM` is its reader/state stack — and the pin therefore
+    accepts `BEq LevelMVarId` where `BEq LMVarId` is wanted. Declared as an opaque
+    axiom, the two become distinct constants with no defeq between them, and every
+    row that depends on the unfolding fails. Emitting these transparently is the
+    facade being FAITHFUL, not the facade being lenient.
+    """
+    if not names:
+        return {}, {}
+    names_path = os.path.join(work, "vnames.txt")
+    with open(names_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(sorted(names)) + "\n")
+    src = os.path.join(work, "vprobe.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(VALUE_PROBE.replace("@NAMES@", names_path))
+    proc = subprocess.run([lean, src], capture_output=True, text=True, env=env,
+                          timeout=1800)
+    if proc.returncode != 0:
+        raise SystemExit(f"REFUSE: the pinned binary refused the value probe:\n"
+                         f"{(proc.stdout + proc.stderr)[:1200]}")
+    values, vdeps = {}, {}
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("VALUE\t"):
+            _, name, val = line.split("\t", 2)
+            values[name] = val
+            current = (values, name)
+        elif line.startswith("VDEPS\t"):
+            _, name, dep_csv = line.split("\t", 2)
+            vdeps[name] = [d for d in dep_csv.split(",") if d]
+            current = None
+        elif line.startswith("NOVALUE\t"):
+            current = None
+        elif current is not None and line.strip():
+            d, name = current
+            d[name] = d[name] + " " + line.strip()
+    return values, vdeps
+
+
 def probe(lean, env, work, names):
     """Ask the pin for the printed type, universes, instance flag and type-level
     dependencies of each name. Multi-line pp output is rejoined here: the printer
@@ -243,7 +323,7 @@ def probe(lean, env, work, names):
     if proc.returncode != 0:
         raise SystemExit(f"REFUSE: the pinned binary refused the probe:\n"
                          f"{(proc.stdout + proc.stderr)[:1200]}")
-    types, typesx, levels, insts, deps, missing = {}, {}, {}, {}, {}, []
+    types, typesx, typesm, levels, insts, deps, missing = {}, {}, {}, {}, {}, {}, []
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     current = None
     for line in proc.stdout.splitlines():
@@ -255,6 +335,10 @@ def probe(lean, env, work, names):
             _, name, ty = line.split("\t", 2)
             typesx[name] = ty
             current = (typesx, name)
+        elif line.startswith("TYPEM\t"):
+            _, name, ty = line.split("\t", 2)
+            typesm[name] = ty
+            current = (typesm, name)
         elif line.startswith("DEPS\t"):
             _, name, dep_csv = line.split("\t", 2)
             deps[name] = [d for d in dep_csv.split(",") if d]
@@ -282,7 +366,7 @@ def probe(lean, env, work, names):
         elif current is not None and line.strip():
             d, name = current
             d[name] = d[name] + " " + line.strip()
-    return (types, typesx, levels, insts, deps, missing,
+    return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()})
 
@@ -339,7 +423,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     standalone. Round after round, every constant appearing in a declared type is
     itself declared, unless `Init` provides it — `import Init` is implicit in every
     non-prelude Lean file, so those constants are the shared substrate."""
-    types, typesx, levels, insts, deps = {}, {}, {}, {}, {}
+    types, typesx, typesm, levels, insts, deps = {}, {}, {}, {}, {}, {}
     structs, binders, pbinders = {}, {}, {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
@@ -358,8 +442,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"REFUSE: type closure did not converge in {max_rounds} rounds "
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
-        t, tx, lv, ins, dp, ms, st, bd, pb = probe(lean, env, work, frontier)
-        types.update(t); typesx.update(tx); levels.update(lv)
+        t, tx, tm, lv, ins, dp, ms, st, bd, pb = probe(lean, env, work, frontier)
+        types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
         for m in ms:
@@ -391,8 +475,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                     continue
                 nxt.add(dep)
         frontier = nxt
-    return (types, typesx, levels, insts, deps, missing, init_provided, rounds,
-            structs, binders, absent_projections, pbinders)
+    return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
+            rounds, structs, binders, absent_projections, pbinders)
 
 
 def order(names, deps):
@@ -496,8 +580,8 @@ def structural_refusal(name, st, bs):
     return None
 
 
-def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
-           structural, structs, binders, deps, pbinders):
+def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
+           structural, structs, binders, deps, pbinders, transparent):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -527,10 +611,20 @@ def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
             emitted.append(name)
             continue
         d = decl[name]
-        ty = d["typex"] if name in explicit_for else d["type"]
+        ty = (d["typem"] if name in maxexp_for
+              else d["typex"] if name in explicit_for else d["type"])
         if ty is None:
             continue
         ty = root_anchor(ty, deps.get(name, ()))
+        if name in transparent:
+            binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
+            body.append(f"-- role={d['role']} bucket={d['bucket']} transparent "
+                        f"module={d['module']}")
+            body.append(f"@[reducible] noncomputable def {d['decl_name']}{binder} : "
+                        f"{ty} := {root_anchor(d['value'], deps.get(name, ()))}")
+            line_map[len(body)] = ("transparent", name)
+            emitted.append(name)
+            continue
         body.append(f"-- role={d['role']} bucket={d['bucket']} effect={d['effect']} "
                     f"module={d['module']}" + (" pp=explicit" if name in explicit_for else ""))
         binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
@@ -565,6 +659,12 @@ def main():
     ap.add_argument("--out", required=True, help="the generated Lean facade module")
     ap.add_argument("--manifest", required=True, help="fln-facade-module/1 NDJSON")
     ap.add_argument("--max-attempts", type=int, default=14)
+    ap.add_argument("--transparency-rounds", type=int, default=4,
+                    help="fixpoint rounds for reducible-alias transparency; a transparent value can name further abbreviations")
+    ap.add_argument("--readmit-rounds", type=int, default=4,
+                    help="how many times to clear the quarantine and let "
+                         "the repair loop re-derive it against the facade "
+                         "as it then stands")
     args = ap.parse_args()
 
     lean, tag = pinned_lean()
@@ -589,13 +689,60 @@ def main():
     if not facade_demand:
         raise SystemExit("REFUSE: every demanded symbol is Init-provided — there "
                          "would be no facade left to emit")
-    (types, typesx, levels, insts, deps, missing, init_provided, rounds,
-     structs, binders, absent_projections, pbinders) = close_over_types(
-        lean, env, work, facade_demand, census)
+    (types, typesx, typesm, levels, insts, deps, missing, init_provided,
+     rounds, structs, binders, absent_projections,
+     pbinders) = close_over_types(lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
             f"{sorted(set(missing))[:8]} — no partial facade is emitted")
+
+    # THE TRANSPARENT SET. A reducible constant is an ABBREVIATION in the
+    # Reference; declaring it opaquely invents a distinction the pin does not have
+    # (`Lean.LMVarId` vs `Lean.LevelMVarId`, `Lean.PHashMap` vs
+    # `Lean.PersistentHashMap`), and every row that needs the unfolding then fails.
+    #
+    # This is a FIXPOINT, not a pass: a transparent value names constants the type
+    # closure never saw, those get declared, and some of THEM are abbreviations
+    # too. Computing the reducible set once misses exactly the second layer —
+    # measured on Lean.Meta.simpGoal, which failed on PHashMap after LMVarId was
+    # already fixed.
+    def is_reducible(n):
+        return ("ReducibilityStatus.reducible"
+                in ((census.get(n) or {}).get("attrs") or ""))
+
+    values, vdeps, reducible = {}, {}, set()
+    value_residue = set()
+    for vround in range(args.transparency_rounds):
+        cand = sorted(n for n in types
+                      if n not in reducible and n not in structs and is_reducible(n))
+        if not cand:
+            break
+        reducible |= set(cand)
+        v, vd = probe_values(lean, env, work, cand)
+        values.update(v)
+        vdeps.update(vd)
+        extra = set()
+        for n, ds in vd.items():
+            for d in ds:
+                if d in types or d in init_provided:
+                    continue
+                row = census.get(d)
+                mod = dotted(row["module"]) if row and row.get("module") else None
+                if mod is not None and (mod == "Init" or mod.startswith("Init.")):
+                    init_provided.add(d)
+                    continue
+                extra.add(d)
+        if not extra:
+            break
+        (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
+         pb2) = close_over_types(lean, env, work, extra, census)
+        value_residue |= set(ms2)
+        types.update(t2); typesx.update(tx2); typesm.update(tm2)
+        levels.update(lv2); insts.update(in2); deps.update(dp2)
+        structs.update(st2); binders.update(bd2); pbinders.update(pb2)
+        init_provided |= ip2; absent_projections |= ap2
+        rounds += r2
 
     decl, quarantine = {}, {}
     for name in sorted(types):
@@ -608,6 +755,8 @@ def main():
             "decl_name": dn or name,
             "type": types[name],
             "typex": typesx.get(name),
+            "typem": typesm.get(name),
+            "value": values.get(name),
             "levels": levels.get(name, ""),
             "instance": insts.get(name, False),
             "role": "demanded" if name in demand else (
@@ -622,7 +771,7 @@ def main():
     # Which structures the facade will try to declare AS structures. A refusal
     # here is a fact decided before the pin is asked; a refusal later is the pin's
     # own verdict, and both are recorded per row.
-    structural, structural_refused = set(), {}
+    structural, structural_refused, transparent_refused = set(), {}, {}
     for name, st in structs.items():
         if name not in decl:
             continue
@@ -632,94 +781,144 @@ def main():
         else:
             structural.add(name)
 
+    transparent = {n for n in reducible if values.get(n) and n in decl}
+    for n in transparent:
+        # A transparent row must be ordered after the constants its VALUE names,
+        # not only after the ones its type names.
+        deps[n] = sorted(set(deps.get(n, [])) | set(vdeps.get(n, [])))
     ordered, cycle_residue = order(list(types), deps)
-    explicit_for, dropped_attrs, attr_reason = set(), set(), {}
+    explicit_for, maxexp_for, dropped_attrs, attr_reason = set(), set(), set(), {}
     text = line_map = emitted = None
     attempts = []
-    for attempt in range(1, args.max_attempts + 1):
-        text, line_map, emitted, attr_count, provided = render(
-            tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
-            structural, structs, binders, deps, pbinders)
-        candidate = args.out + ".candidate.lean"
-        with open(candidate, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        proc = subprocess.run([lean, "-DmaxErrors=4000", candidate],
-                              capture_output=True, text=True, env=env, timeout=1800)
-        out = proc.stdout + proc.stderr
-        errors = len(re.findall(r"\.candidate\.lean:\d+:\d+: error", out))
-        attempts.append({"attempt": attempt, "emitted": len(emitted),
-                         "attributes": attr_count, "errors": errors,
-                         "structural": len(structural),
-                         "quarantined": len(quarantine)})
-        if proc.returncode == 0:
-            os.replace(candidate, args.out)
-            break
-        blamed_axioms, blamed_attrs, blamed_structs, blame_msg = set(), set(), set(), {}
-        for m in re.finditer(r"\.candidate\.lean:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out):
-            hit = line_map.get(int(m.group(1)))
-            if hit is None:
-                continue
-            {"attr": blamed_attrs, "struct": blamed_structs}.get(
-                hit[0], blamed_axioms).add(hit[1])
-            blame_msg[hit[1]] = ((m.group(2) or "-") + ": " + m.group(3))[:220]
-        for m in re.finditer(r"\.candidate\.lean:(\d+):", out):
-            hit = line_map.get(int(m.group(1)))
-            if hit is not None:
-                {"attr": blamed_attrs, "struct": blamed_structs}.get(
+    # QUARANTINE IS NOT MONOTONE. A row can fail an early attempt only because a
+    # dependency was still broken at that moment, and the old loop never looked at
+    # it again — measured: 8 of 16 quarantined rows elaborate cleanly against the
+    # FINISHED facade. Each re-admission round clears the quarantine and lets the
+    # repair loop re-derive it against the facade as it now stands; a row that
+    # still fails is re-quarantined with its current reason, so this can only add.
+    best = None
+    for readmit in range(args.readmit_rounds):
+        if readmit:
+            if not quarantine:
+                break
+            quarantine = {n: r for n, r in quarantine.items()
+                          if decl[n]["type"] is None}
+        for attempt in range(1, args.max_attempts + 1):
+            text, line_map, emitted, attr_count, provided = render(
+                tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
+                structural, structs, binders, deps, pbinders, transparent)
+            candidate = args.out + ".candidate.lean"
+            with open(candidate, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            proc = subprocess.run([lean, "-DmaxErrors=4000", candidate],
+                                  capture_output=True, text=True, env=env, timeout=1800)
+            out = proc.stdout + proc.stderr
+            errors = len(re.findall(r"\.candidate\.lean:\d+:\d+: error", out))
+            attempts.append({"attempt": attempt, "emitted": len(emitted),
+                             "attributes": attr_count, "errors": errors,
+                             "structural": len(structural),
+                             "quarantined": len(quarantine)})
+            if proc.returncode == 0:
+                os.replace(candidate, args.out)
+                break
+            (blamed_axioms, blamed_attrs, blamed_structs, blamed_transparent,
+             blame_msg) = set(), set(), set(), set(), {}
+            for m in re.finditer(r"\.candidate\.lean:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out):
+                hit = line_map.get(int(m.group(1)))
+                if hit is None:
+                    continue
+                {"attr": blamed_attrs, "struct": blamed_structs,
+                 "transparent": blamed_transparent}.get(
                     hit[0], blamed_axioms).add(hit[1])
-        if not blamed_axioms and not blamed_attrs and not blamed_structs:
-            raise SystemExit(
-                f"REFUSE: elaboration failed but no error line maps to a "
-                f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
-        progressed = False
-        # A structural block the pin rejects DEMOTES to the axiom form rather than
-        # taking the row out of the facade: coverage must never fall because the
-        # stronger emission was attempted.
-        for name in blamed_structs:
-            if name in structural:
-                structural.discard(name)
-                structural_refused[name] = ("pin rejected the structural block -- "
-                                            + blame_msg.get(name, "-"))
-                progressed = True
-        # An instance registration the facade cannot reproduce is a FINDING: the
-        # class itself is an opaque axiom here, so `attribute [instance]` has no
-        # class to attach to. Drop it and record it; never silently keep a green.
-        for name in blamed_attrs - dropped_attrs:
-            dropped_attrs.add(name)
-            attr_reason[name] = blame_msg.get(name, "-")
-            progressed = True
-        # A type that does not round-trip readably gets the explicit printer once;
-        # if it still fails it is quarantined with its reason, and the anti-vacuity
-        # floor below stops a facade from quarantining its way to green.
-        for name in blamed_axioms:
-            # `X has already been declared` is not a broken stub: it is the
-            # implicitly imported Init substrate ALREADY serving that symbol. The
-            # facade must not redeclare it, and counting it as a failed stub would
-            # understate coverage by exactly the size of the prelude.
-            if "already been declared" in blame_msg.get(name, ""):
-                if name not in quarantine:
-                    quarantine[name] = "provided by the implicitly imported Init substrate"
-                    decl[name]["role"] = "init-substrate"
+                blame_msg[hit[1]] = ((m.group(2) or "-") + ": " + m.group(3))[:220]
+            # ONLY fall back to bare locations when no `error:` line named a
+            # declaration. A bare-location match also hits `Note:` lines and the
+            # secondary locations of OTHER errors, which quarantines rows that were
+            # never the cause — measured: rows blamed this way elaborate cleanly
+            # against the finished facade with an empty reason string.
+            if not (blamed_axioms or blamed_attrs or blamed_structs):
+                for m in re.finditer(r"\.candidate\.lean:(\d+):", out):
+                    hit = line_map.get(int(m.group(1)))
+                    if hit is not None:
+                        {"attr": blamed_attrs, "struct": blamed_structs,
+                         "transparent": blamed_transparent}.get(
+                            hit[0], blamed_axioms).add(hit[1])
+            if not (blamed_axioms or blamed_attrs or blamed_structs
+                    or blamed_transparent):
+                raise SystemExit(
+                    f"REFUSE: elaboration failed but no error line maps to a "
+                    f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
+            progressed = False
+            for name in blamed_transparent:
+                if name in transparent:
+                    transparent.discard(name)
+                    transparent_refused[name] = ("pin rejected the transparent form "
+                                                 "-- " + blame_msg.get(name, "-"))
                     progressed = True
-                continue
-            if name not in explicit_for and decl[name]["typex"]:
-                explicit_for.add(name)
+            # A structural block the pin rejects DEMOTES to the axiom form rather than
+            # taking the row out of the facade: coverage must never fall because the
+            # stronger emission was attempted.
+            for name in blamed_structs:
+                if name in structural:
+                    structural.discard(name)
+                    structural_refused[name] = ("pin rejected the structural block -- "
+                                                + blame_msg.get(name, "-"))
+                    progressed = True
+            # An instance registration the facade cannot reproduce is a FINDING: the
+            # class itself is an opaque axiom here, so `attribute [instance]` has no
+            # class to attach to. Drop it and record it; never silently keep a green.
+            for name in blamed_attrs - dropped_attrs:
+                dropped_attrs.add(name)
+                attr_reason[name] = blame_msg.get(name, "-")
                 progressed = True
-            elif name not in quarantine:
-                # Carry the pin's OWN message. "not re-acceptable" is a summary of
-                # nothing; the message is what tells a reader that the row failed
-                # because a class became an opaque axiom rather than because a
-                # printer wrapped a line.
-                quarantine[name] = ("pin rejects the printed type -- "
-                                    + blame_msg.get(name, "-"))
-                progressed = True
-        if not progressed:
+            # A type that does not round-trip readably gets the explicit printer once;
+            # if it still fails it is quarantined with its reason, and the anti-vacuity
+            # floor below stops a facade from quarantining its way to green.
+            for name in blamed_axioms:
+                # `X has already been declared` is not a broken stub: it is the
+                # implicitly imported Init substrate ALREADY serving that symbol. The
+                # facade must not redeclare it, and counting it as a failed stub would
+                # understate coverage by exactly the size of the prelude.
+                if "already been declared" in blame_msg.get(name, ""):
+                    if name not in quarantine:
+                        quarantine[name] = "provided by the implicitly imported Init substrate"
+                        decl[name]["role"] = "init-substrate"
+                        progressed = True
+                    continue
+                if name not in explicit_for and decl[name]["typex"]:
+                    explicit_for.add(name)
+                    progressed = True
+                elif name not in maxexp_for and decl[name].get("typem"):
+                    # Tier 3 before quarantine: a row whose default value the readable
+                    # printers render as notation is not an unrenderable row, it is a
+                    # row printed in a dialect the facade cannot re-elaborate.
+                    maxexp_for.add(name)
+                    progressed = True
+                elif name not in quarantine:
+                    # Carry the pin's OWN message. "not re-acceptable" is a summary of
+                    # nothing; the message is what tells a reader that the row failed
+                    # because a class became an opaque axiom rather than because a
+                    # printer wrapped a line.
+                    quarantine[name] = ("pin rejects the printed type -- "
+                                        + blame_msg.get(name, "-"))
+                    progressed = True
+            if not progressed:
+                raise SystemExit(
+                    f"REFUSE: no repair left for {sorted(blamed_axioms | blamed_attrs)[:8]} "
+                    f"(candidate kept at {candidate})")
+        else:
             raise SystemExit(
-                f"REFUSE: no repair left for {sorted(blamed_axioms | blamed_attrs)[:8]} "
-                f"(candidate kept at {candidate})")
-    else:
-        raise SystemExit(
-            f"REFUSE: the facade did not converge in {args.max_attempts} attempts")
+                f"REFUSE: the facade did not converge in {args.max_attempts} attempts")
+        if best is None or len(emitted) > best[0]:
+            best = (len(emitted), text, line_map, list(emitted), attr_count,
+                    provided, dict(quarantine), set(explicit_for), set(maxexp_for),
+                    set(dropped_attrs))
+    if best is None:
+        raise SystemExit("REFUSE: no facade candidate survived")
+    (_, text, line_map, emitted, attr_count, provided, quarantine, explicit_for,
+     maxexp_for, dropped_attrs) = best
+    with open(args.out, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
     # A projection the structural block generates IS in the facade; counting only
     # the lines this emitter wrote would understate coverage by every field.
@@ -742,6 +941,9 @@ def main():
         "substrate_emitted": sum(1 for n in emitted if decl[n]["role"] == "substrate"),
         "uncensused_emitted": sum(1 for n in emitted if decl[n]["role"] == "uncensused-closure"),
         "init_provided": len(init_provided),
+        "transparent_declarations": len(transparent),
+        "reducible_candidates": len(reducible),
+        "value_residue": len(value_residue),
         "structural_declarations": len(structural),
         "private_fields_exposed": sum(
             1 for c in structural
@@ -757,6 +959,7 @@ def main():
                                    if decl[n]["instance"] and n not in dropped_attrs),
         "instance_attrs_dropped": len(dropped_attrs),
         "explicit_printer": len(explicit_for),
+        "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
         "cycle_residue": len(cycle_residue),
         "attempts": attempts,
@@ -774,15 +977,19 @@ def main():
             "instance": d["instance"],
             "instance_registered": bool(d["instance"]) and name not in dropped_attrs,
             "instance_drop_reason": attr_reason.get(name),
-            "form": ("class" if name in structural and structs[name]["is_class"]
+            "form": ("transparent-abbrev" if name in transparent
+                     else "class" if name in structural and structs[name]["is_class"]
                      else "structure" if name in structural
                      else "class-projection" if name in provided else "axiom"),
             "provided_by": provided.get(name),
             "structural_refused_reason": structural_refused.get(name),
+            "transparent_refused_reason": transparent_refused.get(name),
             "emitted": name not in quarantine,
             "quarantine_reason": quarantine.get(name),
-            "printer": "pp.explicit" if name in explicit_for else "pp.fullNames",
-            "signature": (d["typex"] if name in explicit_for else d["type"]),
+            "printer": ("pp.maxexplicit" if name in maxexp_for
+                        else "pp.explicit" if name in explicit_for else "pp.fullNames"),
+            "signature": (d["typem"] if name in maxexp_for
+                          else d["typex"] if name in explicit_for else d["type"]),
             "type_deps": sorted(deps.get(name, ())),
         })
     for name in sorted(init_demanded):
@@ -809,6 +1016,7 @@ def main():
           f"init={len(init_provided)} attrs_kept={rows[0]['instance_attrs_kept']} "
           f"attrs_dropped={len(dropped_attrs)} quarantined={len(quarantine)} "
           f"structural={len(structural)} projections={len(provided)} "
+          f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
 
