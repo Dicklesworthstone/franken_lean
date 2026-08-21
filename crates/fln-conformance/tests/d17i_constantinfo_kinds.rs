@@ -13058,3 +13058,94 @@ fn the_server_parts_documentation_vocabulary_is_six_names_and_often_empty() {
          would enforce corpus-wide"
     );
 }
+
+/// One name, one constant — over all 600 modules, which is where KR-970 has to
+/// hold.
+///
+/// `one_name_one_constant_and_the_impl_representations_agree` checks this on two
+/// modules, and its own doc comment says why it matters: a module storing the
+/// same name twice would hand `add_decl` two constants for one name, and every
+/// reference and closure cell in this file would stay green through it, because
+/// they all resolve names against a MAP and a map silently keeps the last
+/// writer. That argument is about the corpus, not about two modules. Widening it
+/// is the follow-up the previous cell's sampling audit named.
+///
+/// It holds. Across all 600 `Init` chains, at BOTH levels, no module carries a
+/// repeated name: 51,506 exported names and 65,404 private ones, every one
+/// distinct within its own module.
+///
+/// The same walk settles a set relation nothing had pinned. Several cells
+/// compare the two levels and one records that "no name is lost between the
+/// levels", but no cell asserts the containment over the NAME SETS — the
+/// existing checks compare lengths or compare kinds. Exported ⊆ private holds in
+/// all 600, and with uniqueness it turns the level difference into a partition:
+/// the private array is the exported names plus 13,898 private-only ones.
+///
+/// 200 OF THE 600 CONTRIBUTE NOTHING to that 13,898, which is the same
+/// distribution the server-part cell found and the reason this is stated as a
+/// corpus total rather than a per-module law. "The private part adds
+/// declarations" is true of the corpus and false of a third of its modules.
+///
+/// Conservation first, per module: `private = exported + private-only` needs
+/// both uniqueness and containment to even be well posed, so it is asserted
+/// before either total is named.
+#[test]
+fn no_module_declares_a_name_twice_at_either_level() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut exported_total = 0usize;
+    let mut private_total = 0usize;
+    let mut private_only_total = 0usize;
+    let mut modules_that_grow = 0usize;
+    for module in &modules {
+        let exported = module_view(&lib, module, Level::Exported);
+        let private = module_view(&lib, module, Level::Private);
+        let exported_set: BTreeSet<&String> = exported.const_names.iter().collect();
+        let private_set: BTreeSet<&String> = private.const_names.iter().collect();
+
+        // Uniqueness, both levels — the KR-970 premise on the decode side.
+        assert_eq!(
+            exported_set.len(),
+            exported.const_names.len(),
+            "{module}: a name is declared twice at exported level, so a name-keyed map would \
+             silently keep the last writer"
+        );
+        assert_eq!(
+            private_set.len(),
+            private.const_names.len(),
+            "{module}: a name is declared twice at private level"
+        );
+
+        // Containment, then conservation: the levels form a partition.
+        assert!(
+            exported_set.is_subset(&private_set),
+            "{module}: the private part must carry every exported name"
+        );
+        let private_only = private_set.difference(&exported_set).count();
+        assert_eq!(
+            private.const_names.len(),
+            exported.const_names.len() + private_only,
+            "{module}: the private array is the exported names plus the private-only ones"
+        );
+
+        exported_total += exported.const_names.len();
+        private_total += private.const_names.len();
+        private_only_total += private_only;
+        if private_only > 0 {
+            modules_that_grow += 1;
+        }
+    }
+
+    assert_eq!(
+        (exported_total, private_total, private_only_total),
+        (51_506, 65_404, 13_898),
+        "the corpus name census at both levels, and the private-only remainder"
+    );
+    assert_eq!(
+        modules_that_grow, 400,
+        "200 modules contribute nothing to that remainder, so the growth is a corpus fact and \
+         not a per-module law"
+    );
+}
