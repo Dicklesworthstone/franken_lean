@@ -467,6 +467,16 @@ def root_anchor(ty, deps):
         lambda m: ("_root_." + m.group(1)) if m.group(1) in names else m.group(1), ty)
 
 
+def private_owner(name):
+    """The Reference module whose privacy mangling owns this name.
+
+    `_private.Lean.Environment.0.Lean.EnvExtension.mk` -> `Lean.Environment`.
+    """
+    rest = name[len("_private."):]
+    head = rest.split(".0.")[0]
+    return head or "?"
+
+
 def renderable_name(name):
     """A declaration name the facade can actually declare.
 
@@ -870,19 +880,29 @@ def main():
         rounds += r2
 
     decl, quarantine = {}, {}
+    private_owners = {}
     for name in sorted(types):
         row = census.get(name)
         module = dotted(row["module"]) if row and row.get("module") else None
         dn = renderable_name(name)
-        if dn is None:
+        if name.split(".")[0] == "_private":
+            # MEASURED, not asserted. The pin mangles a private declaration as
+            # `_private.<defining module>.0.<name>`: `private axiom Foo.bar` in a
+            # file named privtest.lean becomes `_private.privtest.0.Foo.bar`. The
+            # module name is IN the constant's name, so this row is reproducible
+            # only from a facade module named exactly after the Reference module
+            # that owns it — and this facade is one module. That is a bounded,
+            # priced prerequisite (see private_name_modules in the summary), not an
+            # impossibility.
+            owner = private_owner(name)
+            private_owners[owner] = private_owners.get(owner, 0) + 1
+            quarantine[name] = (
+                "the Reference declares this PRIVATE, and the pin mangles a private "
+                f"name as _private.<defining module>.0.<name>; reproducing it needs "
+                f"a facade module named exactly {owner}, while this facade is a "
+                "single module")
+        elif dn is None:
             quarantine[name] = "name has a component the facade cannot declare"
-        elif name.split(".")[0] == "_private":
-            # Declaring it would elaborate but nothing could ever refer to it: the
-            # Reference hides this constant behind a private name, and a facade
-            # declaration under that spelling is unresolvable.
-            quarantine[name] = ("the Reference declares this under a PRIVATE name; "
-                                "no facade declaration reproduces a nameable "
-                                "equivalent")
         decl[name] = {
             "decl_name": dn or name,
             "type": types[name],
@@ -1365,6 +1385,15 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "private_name_rows": sum(private_owners.values()),
+        "private_name_modules": dict(sorted(private_owners.items())),
+        "private_name_prerequisite":
+            "the pin puts the DEFINING MODULE NAME inside a private constant's "
+            "name, so these rows are reachable only by emitting one facade module "
+            "per owning Reference module, each declaring its own privates with "
+            "`private`. Measured on the pin: `private axiom Foo.bar` in privtest.lean "
+            "becomes _private.privtest.0.Foo.bar. The price is the module count "
+            "above, not a redesign of the surface.",
         "emission_verified": emission_verified,
         "declarations_emitted_distinct": len(emitted_set),
         "emission_withdrawn": emission_withdrawn,
@@ -1440,6 +1469,8 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"private_rows={sum(private_owners.values())}"
+          f"/{len(private_owners)}mods "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
 

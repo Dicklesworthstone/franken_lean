@@ -2254,40 +2254,40 @@ attribute [instance] Lean.MonadError.toMonadExceptOf
 attribute [instance] Lean.MonadError.toMonadRef
 attribute [instance] Lean.MonadLog.toMonadFileMap
 attribute [instance] Lean.Option._sizeOf_inst
--- QUARANTINED _private.Lean.CompactedRegion.0.Lean.CompactedRegion.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Data.Options.0.Lean.Options.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.aconstsImpl: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.constInfo: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.exts?: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.isRealized: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.map: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.normalizedTrie: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.revList: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.size: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.declPrefix: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.mkRaw: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.realizingStack: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.EnvExtension.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.Environment.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.EnvironmentHeader.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.Kernel.Environment.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.env: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.opts: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.realizeMapRef: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.private: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.public: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Language.Basic.0.Lean.Language.Snapshot.Diagnostics.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.ConfigWithKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.DefEqCacheKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.ExprConfigCacheKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.InfoCacheKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Tactic.Simp.Types.0.Lean.Meta.Simp.Context.mk: name has a component the facade cannot declare
+-- QUARANTINED _private.Lean.CompactedRegion.0.Lean.CompactedRegion.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.CompactedRegion, while this facade is a single module
+-- QUARANTINED _private.Lean.Data.Options.0.Lean.Options.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Data.Options, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.aconstsImpl: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.constInfo: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.exts?: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.isRealized: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.map: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.normalizedTrie: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.revList: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.size: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.declPrefix: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.mkRaw: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.realizingStack: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.EnvExtension.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.Environment.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.EnvironmentHeader.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.Kernel.Environment.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.env: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.opts: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.realizeMapRef: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.private: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.public: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Environment, while this facade is a single module
+-- QUARANTINED _private.Lean.Language.Basic.0.Lean.Language.Snapshot.Diagnostics.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Language.Basic, while this facade is a single module
+-- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.ConfigWithKey.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Meta.Basic, while this facade is a single module
+-- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.DefEqCacheKey.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Meta.Basic, while this facade is a single module
+-- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.ExprConfigCacheKey.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Meta.Basic, while this facade is a single module
+-- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.InfoCacheKey.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Meta.Basic, while this facade is a single module
+-- QUARANTINED _private.Lean.Meta.Tactic.Simp.Types.0.Lean.Meta.Simp.Context.mk: the Reference declares this PRIVATE, and the pin mangles a private name as _private.<defining module>.0.<name>; reproducing it needs a facade module named exactly Lean.Meta.Tactic.Simp.Types, while this facade is a single module
