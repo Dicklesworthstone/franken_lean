@@ -8177,3 +8177,187 @@ fn the_not_special_findings_needed_discriminating_power() {
          is auditing"
     );
 }
+
+/// The audit I deferred at `7e65ed09`: none of the identified shapes is unique.
+///
+/// That cell found `(4, 2)` doing duty for two different things and I wrote:
+/// "the identifications at `aec3efd1`, `c7836115`, `a4de2083` and `fffc0e71`
+/// were made where I had no evidence of a collision - which is not the same as
+/// evidence of no collision. Auditing them is bigger than one cell." It is not.
+/// The audit is one scan, and the answer is worse than the deferral implied.
+///
+/// Across the corpus, each shape this file identifies:
+///
+///   (4, 2)    2537 objects   3 field signatures   sizes 24 and 32
+///   (7, 3)   12912 objects  68 field signatures   sizes 40 and 48
+///   (0, 3)    5553 objects  37 field signatures   sizes 32 and 40
+///   (1, 1)    1912 objects   8 field signatures   sizes 16 and 24
+///   (2, 1)      78 objects   8 field signatures   size 16
+///   (2, 2)    1955 objects  15 field signatures   sizes 24 and 32
+///
+/// SIGNATURE COUNT IS THE WEAK MEASURE AND I AM NOT LEANING ON IT. A single
+/// type's fields legitimately hold different subtypes - a `forallE`'s binder
+/// type can be any expression - so 68 signatures at `(7, 3)` is what ONE type
+/// looks like, not evidence of sixty-eight. Reading it as a collision count
+/// would be exactly the over-reading these audits exist to stop.
+///
+/// SIZE COUNT IS THE STRONG ONE. Two distinct stored sizes at the same tag and
+/// arity mean two different scalar-area widths, which is two different LAYOUTS
+/// and cannot be one type. Five of the six shapes have that.
+///
+/// So shape never identified anything, anywhere in this chain. Where the
+/// identification was right - and `aec3efd1`'s `Expr.const` reading matched a
+/// corpus measurement, `c7836115`'s `forallE` matched `49b72dcf`'s 9,547
+/// objects - it was right because the SIZE and the field types agreed, not
+/// because the tag and arity did. The cells that pinned a size were doing more
+/// work than the ones that pinned only tag and arity, and I did not know that
+/// when I wrote them.
+///
+/// This asserts sizes as a measured property of the corpus. It proposes no size
+/// rule for `list_ptrs` and takes no position on one.
+#[test]
+fn the_identified_shapes_are_not_unique() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    const IDENTIFIED: [(u8, u8); 6] = [(4, 2), (7, 3), (0, 3), (1, 1), (2, 1), (2, 2)];
+
+    let mut totals: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut signatures: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut sizes: std::collections::BTreeMap<String, std::collections::BTreeMap<u16, usize>> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if !IDENTIFIED.contains(&(object.tag, object.other)) {
+                continue;
+            }
+            let key = format!("tag {} arity {}", object.tag, object.other);
+            *totals.entry(key.clone()).or_default() += 1;
+            *sizes
+                .entry(key.clone())
+                .or_default()
+                .entry(object.cs_sz)
+                .or_default() += 1;
+
+            let signature: Vec<String> = (0..usize::from(object.other))
+                .map(|slot| {
+                    let word = word_at(bytes, object.off + 8 + 8 * slot);
+                    match resolve(word) {
+                        Some(child) => {
+                            let child = at.get(&child).expect("resolved above");
+                            format!("{}/{}", child.tag, child.other)
+                        }
+                        None => "scalar".to_owned(),
+                    }
+                })
+                .collect();
+            signatures
+                .entry(key)
+                .or_default()
+                .insert(signature.join("|"));
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            totals.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        totals
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 3".to_owned(), 5553),
+            ("tag 1 arity 1".to_owned(), 1912),
+            ("tag 2 arity 1".to_owned(), 78),
+            ("tag 2 arity 2".to_owned(), 1955),
+            ("tag 4 arity 2".to_owned(), 2537),
+            ("tag 7 arity 3".to_owned(), 12912),
+        ],
+        "how many objects in the corpus carry each shape this file identifies - \
+         against the tens this chain examined"
+    );
+
+    // The weak measure, pinned but not leaned on.
+    assert_eq!(
+        signatures
+            .iter()
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 3".to_owned(), 37),
+            ("tag 1 arity 1".to_owned(), 8),
+            ("tag 2 arity 1".to_owned(), 8),
+            ("tag 2 arity 2".to_owned(), 15),
+            ("tag 4 arity 2".to_owned(), 3),
+            ("tag 7 arity 3".to_owned(), 68),
+        ],
+        "field signatures per shape. This is the WEAK measure: one type's fields \
+         legitimately hold different subtypes, so 68 at `(7, 3)` is what one \
+         type looks like and not evidence of sixty-eight"
+    );
+
+    // The strong one: two sizes at one tag and arity is two layouts.
+    let by_size: Vec<(String, Vec<u16>)> = sizes
+        .iter()
+        .map(|(k, v)| (k.clone(), v.keys().copied().collect()))
+        .collect();
+    assert_eq!(
+        by_size,
+        vec![
+            ("tag 0 arity 3".to_owned(), vec![32, 40]),
+            ("tag 1 arity 1".to_owned(), vec![16, 24]),
+            ("tag 2 arity 1".to_owned(), vec![16]),
+            ("tag 2 arity 2".to_owned(), vec![24, 32]),
+            ("tag 4 arity 2".to_owned(), vec![24, 32]),
+            ("tag 7 arity 3".to_owned(), vec![40, 48]),
+        ],
+        "stored sizes per shape. Two distinct sizes at one tag and arity is two \
+         different scalar-area widths - two LAYOUTS, which cannot be one type"
+    );
+    assert_eq!(
+        by_size.iter().filter(|(_, s)| s.len() > 1).count(),
+        5,
+        "five of the six shapes this file identifies carry two layouts, so the \
+         tag and arity never identified anything. Where an identification was \
+         right it was the SIZE and the field types carrying it"
+    );
+
+    // Anti-vacuity: a uniqueness audit over one object per shape proves nothing.
+    assert!(
+        totals.values().all(|&count| count > 50),
+        "each shape needs a population before its uniqueness can be tested"
+    );
+}
