@@ -86,6 +86,17 @@ pub enum DeclError {
     /// A chain was supplied for an artifact that is not a module-system
     /// module, which has no companions to compose.
     NotAModuleChain,
+    /// The private part offers a body-less `axiom` where the exported part
+    /// declared something with a body.
+    ///
+    /// The private array is authoritative because it is the STRONGER view, not
+    /// merely a larger one. Reversed, admitting it would replace a checked
+    /// definition with a postulate the kernel can only agree with.
+    PrivatePartWeakensDeclaration {
+        name: Name,
+        exported_kind: &'static str,
+        private_kind: &'static str,
+    },
     /// The three parts together exceed the caller's byte ceiling.
     ChainTooLarge {
         bytes: usize,
@@ -127,6 +138,16 @@ impl std::fmt::Display for DeclError {
             DeclError::ChainTooLarge { bytes, limit } => write!(
                 f,
                 "module-system chain is {bytes} bytes, over the {limit}-byte ceiling"
+            ),
+            DeclError::PrivatePartWeakensDeclaration {
+                name,
+                exported_kind,
+                private_kind,
+            } => write!(
+                f,
+                "the private part offers {} as {private_kind} where the exported part \
+                 declared a {exported_kind}",
+                name.to_display_string()
             ),
             DeclError::NotAModuleChain => write!(
                 f,
@@ -1506,11 +1527,35 @@ pub fn decode_chain_constants_with_origin(
 /// exported part — can bind the containment law without decoding anything a
 /// second time. See [`decode_chain_constants`] for why the law matters.
 pub fn verify_private_superset(exported: &[ConstantInfo], private: &[ConstantInfo]) -> DResult<()> {
-    let present: HashSet<&Name> = private.iter().map(ConstantInfo::name).collect();
+    let present: HashMap<&Name, &ConstantInfo> =
+        private.iter().map(|info| (info.name(), info)).collect();
     for info in exported {
-        if !present.contains(info.name()) {
+        let Some(counterpart) = present.get(info.name()).copied() else {
             return Err(DeclError::PrivatePartIncomplete {
                 missing: info.name().clone(),
+            });
+        };
+        // Presence is not enough. The two parts routinely disagree about a
+        // shared declaration's KIND, and at the pin the disagreement runs one
+        // way: across 158,583 declarations named by both arrays, 84,590 are an
+        // `axiom` in the exported part and a real declaration in the private
+        // one — 60,640 theorems, 22,177 definitions, 1,773 opaques — and NOT
+        // ONE runs the other way. The exported part is the body-stripped view;
+        // the private part is where the bodies live.
+        //
+        // Taking the private array is therefore the strengthening direction,
+        // and this refuses the reverse. A private part that offered an axiom
+        // where the exported part had a body would hand the kernel a postulate
+        // in place of a definition, and the kernel would AGREE with it rather
+        // than check it — the difference between verification and agreement
+        // that `franken_lean-timy` turns on. Nothing else in this crate looks
+        // at kinds, so nothing else would notice.
+        if matches!(counterpart, ConstantInfo::Axiom(_)) && !matches!(info, ConstantInfo::Axiom(_))
+        {
+            return Err(DeclError::PrivatePartWeakensDeclaration {
+                name: info.name().clone(),
+                exported_kind: info.kind_name(),
+                private_kind: counterpart.kind_name(),
             });
         }
     }
@@ -1847,6 +1892,127 @@ mod tests {
         let absent = Name::from_components(["fln", "not", "a", "declaration"]);
         assert_eq!(chained.position_of(&absent), None);
         assert_eq!(chained.origin_of(&absent), None);
+    }
+
+    fn demo_axiom(name: &str) -> ConstantInfo {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::from_components(name.split('.')),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            is_unsafe: false,
+        })
+    }
+
+    fn demo_theorem(name: &str) -> ConstantInfo {
+        ConstantInfo::Thm(TheoremVal {
+            base: ConstantVal {
+                name: Name::from_components(name.split('.')),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            value: Expr::sort(Level::zero()),
+            all: Vec::new(),
+        })
+    }
+
+    /// The private part may STRENGTHEN a declaration — that is the normal case
+    /// at the pin and must be accepted.
+    #[test]
+    fn the_private_part_may_replace_an_exported_axiom_with_a_real_declaration() {
+        let exported = vec![demo_axiom("Demo.thing")];
+        let private = vec![demo_theorem("Demo.thing")];
+        verify_private_superset(&exported, &private)
+            .expect("axiom -> theorem is the strengthening direction the pin uses everywhere");
+    }
+
+    /// The reverse must be refused: it would hand the kernel a postulate in
+    /// place of a checked declaration.
+    #[test]
+    fn the_private_part_may_not_downgrade_a_declaration_to_an_axiom() {
+        let exported = vec![demo_theorem("Demo.thing")];
+        let private = vec![demo_axiom("Demo.thing")];
+        let error = verify_private_superset(&exported, &private)
+            .expect_err("theorem -> axiom loses the body and must be refused");
+        match &error {
+            DeclError::PrivatePartWeakensDeclaration {
+                name,
+                exported_kind,
+                private_kind,
+            } => {
+                assert_eq!(name.to_display_string(), "Demo.thing");
+                assert_eq!(*exported_kind, "theorem");
+                assert_eq!(*private_kind, "axiom");
+            }
+            other => panic!("expected PrivatePartWeakensDeclaration, got {other:?}"),
+        }
+        assert!(format!("{error}").contains("Demo.thing"));
+    }
+
+    /// An axiom on BOTH sides is not a downgrade.
+    #[test]
+    fn an_axiom_that_was_always_an_axiom_is_not_a_downgrade() {
+        let exported = vec![demo_axiom("Demo.thing")];
+        let private = vec![demo_axiom("Demo.thing")];
+        verify_private_superset(&exported, &private)
+            .expect("an axiom on both sides is unchanged, not weakened");
+    }
+
+    /// The law is inert on the pin, and the reason is the direction of the
+    /// disagreement — asserted, so "it passes" is not mistaken for "there is
+    /// nothing here to see".
+    #[test]
+    fn the_pin_only_ever_strengthens_a_shared_declaration() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the_pin_only_ever_strengthens_a_shared_declaration: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |suffix: &str| {
+            std::fs::read(lib.join(format!("Init/BinderPredicates.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read Init/BinderPredicates{suffix}: {error}"))
+        };
+        let exported = read("");
+        let server = read(".server");
+        let private = read(".private");
+
+        let exported_view = OleanView::parse(&exported).expect("exported parses");
+        let private_view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+            .expect("private parses against its chain");
+        let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("exported constants decode");
+        let private_constants = DeclDecoder::new(&private_view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("private constants decode");
+
+        // The law holds on a real chain.
+        verify_private_superset(&exported_constants, &private_constants)
+            .expect("the pin never downgrades a shared declaration");
+
+        // And it is not holding vacuously: this module really does carry
+        // exported axioms that the private part supplies with a body.
+        let by_name: HashMap<&Name, &ConstantInfo> = private_constants
+            .iter()
+            .map(|info| (info.name(), info))
+            .collect();
+        let strengthened = exported_constants
+            .iter()
+            .filter(|info| matches!(info, ConstantInfo::Axiom(_)))
+            .filter(|info| {
+                by_name
+                    .get(info.name())
+                    .is_some_and(|other| !matches!(other, ConstantInfo::Axiom(_)))
+            })
+            .count();
+        assert!(
+            strengthened > 0,
+            "Init.BinderPredicates must carry exported axioms that the private part \
+             gives a body, or this test witnesses nothing about the direction"
+        );
     }
 
     /// The header stamp alone cannot tell one module's companion from another's,
