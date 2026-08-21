@@ -1801,6 +1801,16 @@ def main():
             "REFUSE: facade manifest explicit-printer pin diverges "
             f"({json.dumps(explicit_printer_pin_join, sort_keys=True)})"
         )
+    maxexplicit_printer_pin_join = {
+        "summary_maxexplicit_printer": manifest_summary.get("maxexplicit_printer"),
+        "pinned_maxexplicit_printer": 5,
+    }
+    if (maxexplicit_printer_pin_join["summary_maxexplicit_printer"]
+            != maxexplicit_printer_pin_join["pinned_maxexplicit_printer"]):
+        raise SystemExit(
+            "REFUSE: facade manifest maxexplicit-printer pin diverges "
+            f"({json.dumps(maxexplicit_printer_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2893,6 +2903,7 @@ def main():
         "manifest_demanded_pin_join": demanded_pin_join,
         "manifest_demanded_init_substrate_pin_join": demanded_init_substrate_pin_join,
         "manifest_explicit_printer_pin_join": explicit_printer_pin_join,
+        "manifest_maxexplicit_printer_pin_join": maxexplicit_printer_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
