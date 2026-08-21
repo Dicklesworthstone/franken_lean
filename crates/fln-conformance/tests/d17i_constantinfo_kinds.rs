@@ -16300,3 +16300,84 @@ fn constant_extension_payloads_are_mostly_single_carrier_accidents() {
          miscounted carriers"
     );
 }
+
+/// `is_module` says nothing about whether an olean declares anything.
+///
+/// `every_olean_in_the_library_agrees_with_its_companion_status` proves the flag
+/// is exactly the companion predicate: false for `LeanChecker` and `Leanc`, true
+/// for the other 2,431. It is natural to read those two as empty stubs — a
+/// non-module, no companions, nothing in it — and every cell in this file skips
+/// them, which leaves that reading unchallenged.
+///
+/// It is wrong. They declare 20 and 5 constants. Meanwhile 278 genuine modules
+/// declare nothing at all. Crossing the two partitions:
+///
+///                      declares > 0    declares 0
+///   is_module true        2,153           278
+///   is_module false           2             0
+///
+/// So the flag and the content are independent in the direction that could
+/// actually be confused: being flagged a non-module does not make an olean
+/// empty, and being empty does not make it a non-module. THE EMPTY CELL IS THE
+/// WHOLE CLAIM — no olean is both.
+///
+/// THE 2,153 AND THE 278 ARE NOT NEW NUMBERS. The axioms-witness cell pins
+/// exactly that split over the 2,431 chains: 2,153 carry `exportedAxiomsExt` and
+/// 278 lack it, the block being present exactly when the module exports a
+/// declaration. Reached here from `constNames` lengths over all 2,433 exported
+/// parts instead, and the two agree because the two chainless oleans both
+/// declare something — they join the 2,153's ROW without entering that cell's
+/// count, which is why the same numbers appear over populations differing by
+/// two. Two cells, two arrays, two populations, one split.
+///
+/// Anti-vacuity: three of the four cells are populated, and the row that refutes
+/// the empty-stub reading rests on declarations actually counted rather than on
+/// their absence.
+///
+/// Conservation first: the four cells must account for every exported olean
+/// before the empty one is read as a fact.
+#[test]
+fn the_module_flag_and_the_declaration_count_are_independent() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut table: BTreeMap<(bool, bool), usize> = BTreeMap::new();
+    let mut chainless: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let view = module_view(&lib, &module, Level::Exported);
+        let declares = !view.const_names.is_empty();
+        *table.entry((view.is_module, declares)).or_default() += 1;
+        if !all.private.contains(path) {
+            chainless.insert(module, view.const_names.len());
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        table.values().sum::<usize>(),
+        all.exported.len(),
+        "every exported olean must fall in exactly one cell"
+    );
+    assert_eq!(all.exported.len(), 2_433, "the library census");
+
+    assert_eq!(
+        table,
+        BTreeMap::from([
+            ((true, true), 2_153),
+            ((true, false), 278),
+            ((false, true), 2),
+        ]),
+        "no olean is both flagged a non-module and empty; the missing cell is the claim"
+    );
+
+    // The two non-modules, discovered from the filesystem and not listed.
+    assert_eq!(
+        chainless,
+        BTreeMap::from([("LeanChecker".to_owned(), 20), ("Leanc".to_owned(), 5)]),
+        "the companion-less oleans declare constants rather than being empty stubs"
+    );
+}
