@@ -4997,3 +4997,141 @@ fn generated_eliminators_are_abbreviations_that_delegate_to_their_recursor() {
         "the generated family is not kind-uniform, and these are the members that depart"
     );
 }
+
+/// Every stored expression is a CLOSED term, and no elaboration-time node
+/// survives into the artifact.
+///
+/// Three `ExprNode` variants are walked past with `{ .. }` at every one of this
+/// file's four walkers and asserted nowhere: `BVar`'s index, `FVar`, `MVar`.
+/// That is the gap the comment above the projection cell already disclosed. It
+/// matters because a de Bruijn index is the one part of a decoded expression
+/// whose corruption is invisible to every other cell here: an off-by-one in
+/// binder nesting still yields a well-typed `Expr`, still resolves every
+/// constant reference, still matches every stored arity, and still round-trips
+/// through the census. It shows up only as an index that escapes its binders.
+///
+/// Measured over `Init/Prelude` at private level, walking every stored
+/// expression — 2,314 types, 1,887 values, 160 recursor rule right-hand sides,
+/// 4,361 roots:
+///
+///   zero loose indices: every `BVar i` sits under at least `i + 1` binders
+///   zero `FVar` and zero `MVar` — free variables and metavariables are
+///     elaboration-time nodes and no stored declaration may contain one
+///   deepest binder nesting 53, largest index 47
+///
+/// The bound is TIGHT, which is what keeps `idx < depth` from being a weak
+/// claim: occurrences sit exactly at `idx == depth - 1`, so it cannot be
+/// narrowed to `idx < depth - 1` without failing.
+///
+/// THE DEDUP IS THE SUBTLE PART. The other walkers key `seen` on
+/// `allocation_identity()` alone, which is right for them — a reference set does
+/// not depend on where a subterm sits. It is WRONG here. A shared subterm is
+/// reachable at more than one depth, and skipping its shallower occurrence
+/// discards exactly the visit where an index would be loose; the walk would run
+/// clean over a corrupted artifact. `seen` is keyed on `(identity, depth)`.
+#[test]
+fn every_stored_expression_is_closed_and_carries_no_elaboration_nodes() {
+    const CAP: usize = 2_000_000;
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut loose: Vec<(String, u32, u32)> = Vec::new();
+    let mut elaboration_nodes: Vec<String> = Vec::new();
+    let mut roots = 0usize;
+    let mut visited = 0usize;
+    let mut max_depth = 0u32;
+    let mut max_index = 0u32;
+    let mut tight = 0usize;
+
+    for info in &infos {
+        let name = info.name().to_display_string();
+        for root in declaration_expressions(info) {
+            roots += 1;
+            let mut seen: BTreeSet<(usize, u32)> = BTreeSet::new();
+            let mut stack: Vec<(&Expr, u32)> = vec![(root, 0)];
+            while let Some((current, depth)) = stack.pop() {
+                if !seen.insert((current.allocation_identity(), depth)) {
+                    continue;
+                }
+                assert!(
+                    seen.len() < CAP,
+                    "{name}: scoped walk exceeded {CAP} node/depth pairs; raise the cap rather \
+                     than trusting a truncated answer"
+                );
+                max_depth = max_depth.max(depth);
+                match current.node() {
+                    ExprNode::BVar { idx } => {
+                        max_index = max_index.max(*idx);
+                        if *idx >= depth {
+                            loose.push((name.clone(), *idx, depth));
+                        } else if *idx + 1 == depth {
+                            tight += 1;
+                        }
+                    }
+                    ExprNode::FVar { .. } | ExprNode::MVar { .. } => {
+                        elaboration_nodes.push(name.clone());
+                    }
+                    ExprNode::App { f, a } => {
+                        stack.push((f, depth));
+                        stack.push((a, depth));
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push((binder_type, depth));
+                        stack.push((body, depth + 1));
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push((type_, depth));
+                        stack.push((value, depth));
+                        stack.push((body, depth + 1));
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        stack.push((expr, depth));
+                    }
+                    ExprNode::Sort { .. } | ExprNode::Const { .. } | ExprNode::Lit { .. } => {}
+                }
+            }
+            visited += seen.len();
+        }
+    }
+
+    assert!(
+        loose.is_empty(),
+        "these indices escape their binders (name, index, binders in scope): {:?}",
+        &loose[..loose.len().min(8)]
+    );
+    assert!(
+        elaboration_nodes.is_empty(),
+        "no stored declaration may contain a free variable or metavariable; these do: {:?}",
+        &elaboration_nodes[..elaboration_nodes.len().min(8)]
+    );
+    assert_eq!(
+        roots, 4361,
+        "every stored expression must be reached (2,314 types, 1,887 values, 160 rule right-hand \
+         sides)"
+    );
+    // The walk must be real, and the bound it checks must be tight. Both of
+    // these are what stop `idx < depth` from passing over an empty or shallow
+    // traversal.
+    assert!(
+        visited > 100_000,
+        "the scoped walk must cover the module, got {visited} node/depth pairs"
+    );
+    assert_eq!(
+        (max_depth, max_index),
+        (53, 47),
+        "the binder nesting and index range are exact, and independent of how the decoder shares \
+         subterms"
+    );
+    assert!(
+        tight > 1_000,
+        "the bound must be tight — indices sitting exactly at depth - 1 are what forbid \
+         narrowing it, got {tight}"
+    );
+}
