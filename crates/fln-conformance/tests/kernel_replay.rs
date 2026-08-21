@@ -5170,6 +5170,34 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
         }
     }
 
+    // ONE ENTRY CANNOT BE BOTH A FILE AND THE DIRECTORY ABOVE ANOTHER. Listing
+    // `Nested` beside `Nested/Leaf.olean` asks for a path to be a file and a
+    // directory at once, and the writer discovers that from the operating system
+    // -- in one of two different ways, depending which entry it reaches first.
+    // Written in this order it dies in `create_dir_all` with `Not a directory`;
+    // written in the other it dies in `fs::write` with `Is a directory`. Two
+    // messages for one authoring mistake, chosen by list order, and neither
+    // names the OTHER entry -- which is the only thing the reader actually needs.
+    //
+    // Refused here so the diagnosis is the same either way and names both. This
+    // is sound only because the guard above already required every component to
+    // be `Normal`: `Path::starts_with` is a component-wise prefix test that does
+    // not resolve `..`, so a `..` entry could otherwise sit below another
+    // lexically while pointing somewhere else entirely.
+    for outer in relative_files {
+        for inner in relative_files {
+            let outer_depth = Path::new(outer).components().count();
+            let inner_depth = Path::new(inner).components().count();
+            assert!(
+                !(outer_depth < inner_depth && Path::new(inner).starts_with(Path::new(outer))),
+                "fixture `{versioned_name}` lists `{outer}`, which is written as a file, and \
+                 `{inner}`, which needs `{outer}` to be a directory. One path cannot be both, so \
+                 the build fails in the filesystem with a message that names only whichever of \
+                 the two it reached second"
+            );
+        }
+    }
+
     // TWO TESTS SHARING A NAME IS INVISIBLE UNTIL IT CORRUPTS A COUNT. Nothing
     // removes these trees, so a second build under the same name UNIONS into the
     // first: one test's walk then sees the other's files, its census comes out
@@ -6047,6 +6075,98 @@ fn a_fixture_list_that_repeats_an_entry_is_refused() {
         "the list was refused and a tree exists anyway; the check must run BEFORE the writes, or \
          the half-built tree is left for the next run to union into"
     );
+}
+
+/// An entry that is a file and another entry's parent directory is refused, the
+/// same way whichever order it is listed in.
+///
+/// **The operating system already refuses it, in two different voices.**
+/// `["Nested", "Nested/Leaf.olean"]` writes the file first and then dies in
+/// `create_dir_all` with `Not a directory`. Swap the two and it creates the
+/// directory first and dies in `fs::write` with `Is a directory`. One authoring
+/// mistake, two diagnoses, selected by the order of a list nobody thinks of as
+/// ordered -- and neither message mentions the entry it collides WITH, which is
+/// the only fact that resolves it.
+///
+/// **So the refusal is asserted for BOTH orders, and asserted to be the same.**
+/// A guard that only caught the order it was written against would leave the
+/// other half exactly as it was, and the half it left is the one whose OS error
+/// happens to be more plausible-looking.
+///
+/// **The green control is the one a string-prefix implementation fails.**
+/// `Nested` is a prefix of `NestedOther.olean` as TEXT and not as a path: the
+/// components are `Nested` and `NestedOther.olean`, which are simply different
+/// names. `Path::starts_with` compares components, so the pair builds; a rule
+/// written with `str::starts_with` would refuse a perfectly ordinary fixture and
+/// nothing else here would notice.
+#[test]
+fn an_entry_that_is_also_another_entrys_directory_is_refused_in_either_order() {
+    // GREEN CONTROL FIRST: a shared text prefix that is not a shared path.
+    let ok = write_inventory_fixture(
+        "t6r7-selftest-parent-ok-v1",
+        &["Nested/Leaf.olean", "NestedOther.olean"],
+    );
+    for entry in ["Nested/Leaf.olean", "NestedOther.olean"] {
+        assert!(
+            ok.join(entry).is_file(),
+            "`{entry}` shares only a text prefix with its sibling and must still be written"
+        );
+    }
+
+    let refuse = |name: &str, entries: &[&str]| -> String {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| write_inventory_fixture(name, entries));
+        std::panic::set_hook(previous);
+        let payload = outcome
+            .err()
+            .unwrap_or_else(|| panic!("`{entries:?}` must be refused, not written"));
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let file_first = refuse(
+        "t6r7-selftest-parent-file-first-v1",
+        &["Nested", "Nested/Leaf.olean"],
+    );
+    let directory_first = refuse(
+        "t6r7-selftest-parent-dir-first-v1",
+        &["Nested/Leaf.olean", "Nested"],
+    );
+
+    // BOTH ENTRIES, IN BOTH ORDERS. Naming only one is what the filesystem
+    // already did.
+    for message in [&file_first, &directory_first] {
+        assert!(
+            message.contains("`Nested`") && message.contains("`Nested/Leaf.olean`"),
+            "the refusal must name BOTH entries; the OS error it replaces named only one: \
+             {message}"
+        );
+    }
+    // AND THE SAME DIAGNOSIS EITHER WAY. Compared after stripping the fixture
+    // names, which are the only part that legitimately differs between the two
+    // calls.
+    assert_eq!(
+        file_first.replace("t6r7-selftest-parent-file-first-v1", "<fixture>"),
+        directory_first.replace("t6r7-selftest-parent-dir-first-v1", "<fixture>"),
+        "the two orders give different diagnoses for the same mistake, which is the behaviour \
+         this guard exists to remove"
+    );
+
+    for name in [
+        "t6r7-selftest-parent-file-first-v1",
+        "t6r7-selftest-parent-dir-first-v1",
+    ] {
+        assert!(
+            !Path::new(env!("CARGO_TARGET_TMPDIR")).join(name).exists(),
+            "`{name}` was refused and a tree exists anyway; the check must run BEFORE the writes, \
+             or the conflicting file is already on disk when the refusal arrives"
+        );
+    }
 }
 
 /// Add a symlink to a fixture tree, idempotently and without removing anything.
