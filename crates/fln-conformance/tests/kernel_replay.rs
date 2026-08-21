@@ -2891,7 +2891,85 @@ struct CorpusCounts {
     no_answer_families: BTreeMap<String, u64>,
 }
 
-/// Render a family census in the receipt's canonical form: `token=count`,
+/// Which side of the D23 split a family census describes. The two are not
+/// interchangeable and the token itself says which it belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FamilyDirection {
+    Restrictive,
+    NoAnswer,
+}
+
+impl FamilyDirection {
+    fn field(self) -> &'static str {
+        match self {
+            FamilyDirection::Restrictive => "restrictive_families",
+            FamilyDirection::NoAnswer => "no_answer_families",
+        }
+    }
+}
+
+/// Everything a family token must be, stated once for the producer and the
+/// reader (bead `franken_lean-t6r7`).
+///
+/// **The counts were bound; the NAMES were not.** `validate` already refused a
+/// census that did not sum to the buckets it described, so a token could be any
+/// string at all -- `banana=14` satisfied every law. That is the same shape as
+/// `ci/BOUNDARY_API.txt`'s discarded no-admission argument recorded in AGENTS.md:
+/// a field checked for presence and then never read.
+///
+/// **The two rules, and why each is derivable rather than invented.**
+///
+/// 1. DELIMITER SAFETY. The receipt serializes a census as `token=count` joined
+///    by `,`. A token containing either delimiter would be re-read as a
+///    different token with a different count, silently -- `rsplit_once('=')`
+///    would take the wrong `=`, and a comma would split one entry into two. No
+///    token produced today contains either (every one is `rejected:<unit enum
+///    variant>`, `inconclusive:<cause>`, `internal_fault`, or a `context:`
+///    reason), so this rule costs nothing now and is what keeps the format
+///    honest when a future `RejectClass` grows a payload whose `Debug` rendering
+///    carries `{ field: value, other: value }`.
+///
+/// 2. DIRECTION. `subject_axis` sends an outcome to `Rejected` if and only if
+///    its token starts with `rejected:`, and to `NoAnswer` otherwise. So every
+///    restrictive family key starts with `rejected:` and no non-answer key ever
+///    does -- not by convention but by the one branch that routes them. A
+///    restrictive row triaged to `inconclusive:Steps` would mean a rejection and
+///    an exhaustion had been counted as the same thing, which is the single
+///    confusion this census was split in two to prevent.
+fn check_family_token(family: &str, direction: FamilyDirection) -> Result<(), String> {
+    let field = direction.field();
+    if family.is_empty() {
+        return Err(format!("`{field}` carries an entry that names no family"));
+    }
+    for delimiter in [',', '='] {
+        if family.contains(delimiter) {
+            return Err(format!(
+                "`{field}` family `{family}` contains the `{delimiter}` this format uses as a \
+                 delimiter; the row would be re-read as a different family with a different count"
+            ));
+        }
+    }
+    let rejected = family.starts_with("rejected:");
+    match direction {
+        FamilyDirection::Restrictive if !rejected => Err(format!(
+            "`{field}` family `{family}` is not a `rejected:` token, but a restrictive row is by \
+             definition one the subject REJECTED; counting it here would merge a rejection with a \
+             non-answer"
+        )),
+        FamilyDirection::NoAnswer if rejected => Err(format!(
+            "`{field}` family `{family}` is a `rejected:` token, but a non-answer is precisely an \
+             outcome that is not a rejection; it says nothing about kernel completeness and must \
+             not be counted as if it did"
+        )),
+        FamilyDirection::NoAnswer if family == "accepted" => Err(format!(
+            "`{field}` family `{family}` is the ACCEPTED token; an accepted row is neither \
+             unscorable nor a non-answer"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Render a family census in the receipt's canonical form:/// Render a family census in the receipt's canonical form: `token=count`,
 /// ascending by token (the `BTreeMap` order), so two runs that saw the same
 /// families produce byte-identical rows.
 fn family_census_rows(census: &BTreeMap<String, u64>) -> Vec<String> {
@@ -2957,6 +3035,20 @@ impl CorpusCounts {
         // triage wearing the shape of a complete one, and the shortfall would
         // be invisible in the summary because both numbers are printed
         // separately and neither is derived from the other.
+        for (family, direction) in self
+            .restrictive_families
+            .keys()
+            .map(|family| (family, FamilyDirection::Restrictive))
+            .chain(
+                self.no_answer_families
+                    .keys()
+                    .map(|family| (family, FamilyDirection::NoAnswer)),
+            )
+        {
+            if let Err(reason) = check_family_token(family, direction) {
+                panic!("{scope}: {reason}");
+            }
+        }
         assert_eq!(
             self.restrictive_families.values().sum::<u64>(),
             self.restrictive_with_carve_out + self.restrictive_without_carve_out,
@@ -4934,16 +5026,15 @@ impl WholeMathlibReceipt {
     }
 
     /// Sum a `token=count` family census back to the number of rows it triages.
-    fn family_total(rows: &[String], field: &str) -> Result<u64, String> {
+    fn family_total(rows: &[String], direction: FamilyDirection) -> Result<u64, String> {
+        let field = direction.field();
         let mut total = 0u64;
         let mut seen = BTreeSet::new();
         for entry in rows {
             let (family, count) = entry
                 .rsplit_once('=')
                 .ok_or_else(|| format!("`{field}` entry `{entry}` is not `family=count`"))?;
-            if family.is_empty() {
-                return Err(format!("`{field}` entry `{entry}` names no family"));
-            }
+            check_family_token(family, direction)?;
             if !seen.insert(family.to_string()) {
                 return Err(format!(
                     "`{field}` names family `{family}` twice; the census would double-count it"
@@ -5082,7 +5173,8 @@ impl WholeMathlibReceipt {
 
         // THE TRIAGE IS TOTAL. A row may not claim a family census that covers
         // fewer rows than the buckets it describes.
-        let restrictive = Self::family_total(&self.restrictive_families, "restrictive_families")?;
+        let restrictive =
+            Self::family_total(&self.restrictive_families, FamilyDirection::Restrictive)?;
         if restrictive != self.restrictive_with_carve_out + self.restrictive_without_carve_out {
             return Err(format!(
                 "restrictive_families triages {restrictive} row(s) but the row records {} \
@@ -5090,7 +5182,7 @@ impl WholeMathlibReceipt {
                 self.restrictive_with_carve_out + self.restrictive_without_carve_out
             ));
         }
-        let no_answer = Self::family_total(&self.no_answer_families, "no_answer_families")?;
+        let no_answer = Self::family_total(&self.no_answer_families, FamilyDirection::NoAnswer)?;
         if no_answer != self.subject_no_answer {
             return Err(format!(
                 "no_answer_families triages {no_answer} row(s) but the row records {} subject \
