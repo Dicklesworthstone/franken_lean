@@ -7786,6 +7786,19 @@ fn sample_whole_mathlib_receipt() -> WholeMathlibReceipt {
     }
 }
 
+/// Cut a row off immediately after `needle`, so the key is present and only its
+/// value's terminator is missing.
+///
+/// The offset is the needle's own length rather than a literal: a hand-counted
+/// `+ 9` is correct exactly until someone edits the needle, and then it is
+/// silently pointing into the middle of a value instead of just past it.
+fn truncate_after(row: &str, needle: &str) -> String {
+    let start = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("the sample row must contain `{needle}`"));
+    row[..start + needle.len()].to_string()
+}
+
 /// The format is strict: a row must re-serialize to the bytes it was read from,
 /// and a reader that cannot reproduce a row must refuse it rather than repair it.
 #[test]
@@ -7832,6 +7845,33 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         (
             "an unknown field smuggled in",
             row.replace("\"class\":", "\"reviewed\":\"yes\",\"class\":"),
+        ),
+        // THE READER HAS THREE EXTRACTOR KINDS AND ONLY ONE WAS PROBED. `text`,
+        // `number` and `array` each refuse a missing key, and `text` and `array`
+        // each refuse an unterminated one -- five branches, of which the
+        // mutations above reached only `number`'s. Checking some members of a
+        // group and not the others is how a gap survives review: the ones that
+        // are checked make the group look covered. The truncation case does hit
+        // one of these, but it cannot say WHICH, so it would pass even if a
+        // single extractor kind were the only one still checking.
+        (
+            "a string field dropped",
+            row.replace(",\"profile\":\"dev\"", ""),
+        ),
+        (
+            "an array field dropped",
+            row.replace(",\"restrictive_families\":[]", ""),
+        ),
+        // Truncated immediately after a value's opening delimiter, so the key IS
+        // found and only its terminator is missing -- the branch a dropped field
+        // can never reach.
+        (
+            "an unterminated string value",
+            truncate_after(&row, "\"class\":\""),
+        ),
+        (
+            "an unterminated array value",
+            truncate_after(&row, "\"restrictive_families\":["),
         ),
     ];
     for (name, damaged) in mutations {
