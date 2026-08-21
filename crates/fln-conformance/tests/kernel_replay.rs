@@ -5527,6 +5527,14 @@ fn write_inventory_fixture_with(
 /// reader to work out which two tests are fighting over the tree. The panic hook
 /// is silenced around the call so a deliberate panic does not look like a
 /// failure in the log, and restored immediately after.
+///
+/// **A second pair exists because the first cannot distinguish the rule from a
+/// cheaper one.** Both of its lists hold a single entry and those entries are
+/// disjoint, so comparing only the first element of each sorted list refuses
+/// them just as a whole-list comparison does. The pair at the end shares
+/// `Alpha.olean` and differs after it: only comparing the whole list refuses it,
+/// and the agreement about the first entry is asserted so the cell cannot drift
+/// into a copy of the one above.
 #[test]
 fn the_fixture_collision_guard_names_both_contents() {
     let previous = std::panic::take_hook();
@@ -5560,6 +5568,56 @@ fn the_fixture_collision_guard_names_both_contents() {
     // own fixture. Without this the guard could be refusing every second call
     // rather than every colliding one, and the check above could not tell.
     write_inventory_fixture("t6r7-selftest-collision-v1", &["first.olean"]);
+
+    // A COLLISION THAT AGREES ABOUT ITS FIRST ENTRY. Both lists above hold ONE
+    // entry and those entries are disjoint, so a rule comparing only the first
+    // element of each sorted list refuses them exactly as the real one does, and
+    // nothing here tells the two apart. The pair below shares `Alpha.olean` and
+    // differs after it, which only a comparison of the whole list refuses.
+    // Measured against both rules, with the two green cases, before this cell
+    // was written.
+    const SHARED_FIRST: &str = "t6r7-selftest-collision-tail-v1";
+    write_inventory_fixture(SHARED_FIRST, &["Alpha.olean", "One.olean"]);
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let tail_differs = std::panic::catch_unwind(|| {
+        write_inventory_fixture(SHARED_FIRST, &["Alpha.olean", "Two.olean"])
+    });
+    std::panic::set_hook(previous);
+
+    let payload = tail_differs.err().unwrap_or_else(|| {
+        panic!("two lists agreeing only about their first entry are still different contents")
+    });
+    let tail_message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        tail_message.contains("One.olean") && tail_message.contains("Two.olean"),
+        "the refusal must name the entries that actually differ, which are not the first ones: \
+         {tail_message}"
+    );
+
+    // THE SHARED ENTRY IS ASSERTED TO BE THE FIRST ONE, in code and after
+    // sorting, because that is the whole property. If the lists were ever edited
+    // so they differed at position zero, the cheap rule would refuse them too and
+    // this cell would silently become a second copy of the one above.
+    let mut left = ["Alpha.olean", "One.olean"];
+    let mut right = ["Alpha.olean", "Two.olean"];
+    left.sort_unstable();
+    right.sort_unstable();
+    assert_eq!(
+        left.first(),
+        right.first(),
+        "the two lists must AGREE about their first entry after sorting, or they do not \
+         distinguish a whole-list comparison from a first-entry one"
+    );
+    assert_ne!(
+        left, right,
+        "and they must still differ somewhere, or there is no collision to refuse"
+    );
 }
 
 /// The walk branch, driven by a fixture instead of by a corpus nobody has.
