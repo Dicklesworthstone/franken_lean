@@ -87,6 +87,22 @@ def checked_by_self_test(fn):
     """Mark a verdict-producing function as one the self-test must exercise."""
     SELF_TEST_REGISTRY.append(fn.__name__)
     return fn
+
+
+# Guards main is required to CALL. Being exercised by the self-test and being
+# invoked by the run are different claims, and only the first was ever checked:
+# measured at 0c014922, main called 20 registered functions and 5 of those
+# invocations were asserted, by a hand-written list. Delete any of the other 15 --
+# the refusal partition, the axiom-line pin, the family join, the acceptance
+# check, the disk pre-flight -- and every case still passes, because each guard is
+# verified as a predicate and nobody asks whether the run still runs it.
+MAIN_REGISTRY = []
+
+
+def invoked_by_main(fn):
+    """Mark a guard whose absence from main would silently lose a check."""
+    MAIN_REGISTRY.append(fn.__name__)
+    return fn
 COLS = [
     "key", "display", "kind", "module", "levels", "arity", "telescope",
     "sig_root", "res_root", "res_head", "safety", "attrs", "extern",
@@ -1480,6 +1496,7 @@ def unmarked_verdict_functions(namespace):
 
 
 @checked_by_self_test
+@invoked_by_main
 def refusal_conservation_error(refused, reproduced, unreproduced):
     """Every recorded refusal must come back either reproduced or not reproduced.
 
@@ -1509,6 +1526,7 @@ def refusal_conservation_error(refused, reproduced, unreproduced):
 
 
 @checked_by_self_test
+@invoked_by_main
 def unreproduced_axiom_error(text, line_map, decl, unreproduced):
     """Pin the claim that a not-reproduced refusal actually COSTS something.
 
@@ -1548,6 +1566,7 @@ def unreproduced_axiom_error(text, line_map, decl, unreproduced):
 
 
 @checked_by_self_test
+@invoked_by_main
 def unreproduced_declared_error(unreproduced, inductive_decls):
     """A row cannot be BOTH declared as an inductive and reported as one the
     artifact only publishes as an axiom.
@@ -1574,6 +1593,7 @@ def unreproduced_declared_error(unreproduced, inductive_decls):
 
 
 @checked_by_self_test
+@invoked_by_main
 def unreproduced_family_error(decl, provided, line_map, unreproduced,
                               pin_inductives):
     """The COST of a not-reproduced refusal is the whole family, not just the head.
@@ -1644,6 +1664,7 @@ MANIFEST_SCRATCH_SUFFIXES = (MANIFEST_TMP_SUFFIX,)
 
 
 @checked_by_self_test
+@invoked_by_main
 def pin_acceptance_error(text, accepted):
     """The text about to be published is one the pin actually accepted.
 
@@ -1749,6 +1770,7 @@ def artifact_divergence_note(published, replaced, declared=()):
 
 
 @checked_by_self_test
+@invoked_by_main
 def work_scratch_report(work):
     """How much this run leaves in its probe directory, and whether it is there.
 
@@ -1794,6 +1816,7 @@ def work_scratch_report(work):
 
 
 @checked_by_self_test
+@invoked_by_main
 def scratch_coverage_error(created, published):
     """Every scratch file this run actually made is one the leak check looks for.
 
@@ -1850,6 +1873,7 @@ def declared_outputs(args):
 
 
 @checked_by_self_test
+@invoked_by_main
 def publication_registry_error(published, declared):
     """Every artifact this tool declares it produces was published THROUGH the
     checks, and nothing else was.
@@ -1886,6 +1910,7 @@ def publication_registry_error(published, declared):
 
 
 @checked_by_self_test
+@invoked_by_main
 def unencodable_text_error(text, what="the facade"):
     """The text this run built can actually be written as UTF-8.
 
@@ -1912,6 +1937,7 @@ def unencodable_text_error(text, what="the facade"):
 
 
 @checked_by_self_test
+@invoked_by_main
 def publication_floor(artifact_bytes):
     """Room for an artifact published through a temporary twin.
 
@@ -1930,6 +1956,7 @@ def publication_floor(artifact_bytes):
 
 
 @checked_by_self_test
+@invoked_by_main
 def insufficient_space_error(targets):
     """Refuse before the work, not ten minutes into it.
 
@@ -1983,6 +2010,7 @@ def insufficient_space_error(targets):
 
 
 @checked_by_self_test
+@invoked_by_main
 def published_bytes_error(out, text, what="the facade"):
     """The file that ships is byte-for-byte the text this run built.
 
@@ -2064,6 +2092,7 @@ def published_bytes_error(out, text, what="the facade"):
 
 
 @checked_by_self_test
+@invoked_by_main
 def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
     """A finished run must leave none of its scratch files beside the artifact.
 
@@ -2100,6 +2129,7 @@ def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
 
 
 @checked_by_self_test
+@invoked_by_main
 def kept_candidate(path):
     """Say what is ACTUALLY at the candidate path, at the moment of saying it.
 
@@ -2126,6 +2156,7 @@ def kept_candidate(path):
 
 
 @checked_by_self_test
+@invoked_by_main
 def declared_written_error(line_map, inductive_decls):
     """Everything the manifest calls a declared inductive was actually written as
     one, and nothing else was.
@@ -2791,14 +2822,8 @@ def self_test():
                 _walk_main(const)
 
     _walk_main(main.__code__)
-    case("coverage/main-invokes-the-encode-guard",
-         None if "unencodable_text_error" in _main_calls
-         else "main never calls unencodable_text_error", False)
-    case("coverage/main-invokes-the-publication-checks",
-         None if {"published_bytes_error", "leftover_scratch_error",
-                  "publication_registry_error"} <= _main_calls
-         else f"main is missing: {sorted({'published_bytes_error', 'leftover_scratch_error', 'publication_registry_error'} - _main_calls)}",
-         False)
+    # (the hand-written list of five that used to live here is now the derived
+    #  coverage/main-invokes-every-guard-it-must, below)
 
     _surrogate = "axiom X : Type\n" + chr(0xD800)
     case("bytes/text-encodable", unencodable_text_error(text), False)
@@ -3210,6 +3235,31 @@ def self_test():
     case("coverage/every-guard-has-a-case",
          f"never exercised: {_missing}" if _missing else None, False)
     _unmarked = unmarked_verdict_functions(globals())
+    # EVERY GUARD MAIN MUST CALL, counted in main's own syntax tree rather than
+    # asked of a set. Replaces the hand-written list of five that stood here.
+    _main_tree = next(
+        _f for _f in ast.parse(builtins.open(__file__, encoding="utf-8").read()).body
+        if isinstance(_f, ast.FunctionDef) and _f.name == "main")
+    _main_call_counts = {}
+    for _n in ast.walk(_main_tree):
+        if isinstance(_n, ast.Call) and getattr(_n.func, "id", None):
+            _main_call_counts[_n.func.id] = _main_call_counts.get(_n.func.id, 0) + 1
+    _absent = sorted(g for g in MAIN_REGISTRY if not _main_call_counts.get(g))
+    case("coverage/main-invokes-every-guard-it-must",
+         f"main never calls: {_absent}" if _absent else None, False)
+    # ...and the tripwire, because a registry is only as good as the discipline of
+    # adding to it: a verdict-shaped function main calls and nobody declared.
+    _undeclared = sorted(
+        name for name in _main_call_counts
+        if name not in MAIN_REGISTRY
+        and any(part in name for part in VERDICT_NAME_PARTS)
+        and name in globals())
+    case("coverage/main-calls-nothing-undeclared",
+         f"main calls but nobody declared: {_undeclared}" if _undeclared else None,
+         False)
+    case("coverage/main-registry-is-not-empty",
+         None if len(MAIN_REGISTRY) >= 10
+         else f"only {len(MAIN_REGISTRY)} guards declared for main", False)
     case("coverage/every-verdict-function-is-marked",
          f"verdict-shaped but unregistered: {_unmarked}" if _unmarked else None,
          False)
