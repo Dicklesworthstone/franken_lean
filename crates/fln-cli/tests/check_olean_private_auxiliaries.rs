@@ -682,6 +682,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportSunfoldFResiduals",
+        2,
+        &[
+            "_private.CliPrivateReport.0._f",
+            "_private.CliPrivateReport.0._sunfold",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateSunfoldResiduals",
         1,
         &["_private.CliPrivateReport.0._sunfold"],
@@ -973,6 +982,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_human_named_residuals(
         &human.stdout, "decoded _private _sunfold/_f residuals", "decoded _private _sunfold/_f residual names", 2,
         &["_private.CliPrivateReport.0._f", "_private.CliPrivateReport.0._sunfold"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport _sunfold/_f residuals",
+        "decoded _private CliPrivateReport _sunfold/_f residual names",
+        2,
+        &[
+            "_private.CliPrivateReport.0._f",
+            "_private.CliPrivateReport.0._sunfold",
+        ],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private _sunfold residuals", "decoded _private _sunfold residual names", 1, &["_private.CliPrivateReport.0._sunfold"]);
     assert_human_named_residuals(
