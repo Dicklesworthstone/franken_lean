@@ -11736,9 +11736,15 @@ fn the_other_references_to_that_name() {
 /// back only 162 of 5,238.
 ///
 /// ONE LEVEL IS THE COMPLETE DEPTH HERE, NOT AN ARBITRARY STOP, and that is
-/// asserted rather than assumed: of every array holding one of these objects,
-/// NONE is itself without a constructor arrival. There is no third level to go
-/// to, so this refinement is finished rather than truncated.
+/// asserted rather than assumed: no BLIND object sits in an array that itself
+/// lacks a constructor arrival. There is no third level to go to, so this
+/// refinement is finished rather than truncated.
+///
+/// Thirteen constructor objects DO sit in such arrays - all in Prelude, all of
+/// shape `(1, 1)` - and every one of them has a constructor arrival of its own,
+/// so none is blind and the argument is untouched. The first version of that
+/// assertion pinned the broad count at zero while its message spoke about the
+/// blind objects; w235 caught the mismatch and both counts are pinned now.
 ///
 /// The decomposition becomes
 ///
@@ -11800,7 +11806,11 @@ fn the_array_holders_own_context_rescues_two_fifths() {
         std::collections::BTreeMap::new();
     let mut ctor_arrivals: std::collections::BTreeMap<(usize, usize), BTreeSet<Context>> =
         std::collections::BTreeMap::new();
-    let mut orphan_arrays = 0usize;
+    // Elements of arrays that themselves have no constructor arrival, and the
+    // two narrower counts that carry this cell's argument.
+    let mut elements_of_rootless_arrays = 0usize;
+    let mut rootless_elements_with_own_context = 0usize;
+    let mut rootless_blind_elements = 0usize;
 
     for (index, (_, bytes)) in modules.iter().enumerate() {
         let bytes = bytes.as_slice();
@@ -11870,7 +11880,14 @@ fn the_array_holders_own_context_rescues_two_fifths() {
                     continue;
                 }
                 match inherited {
-                    None => orphan_arrays += 1,
+                    None => {
+                        elements_of_rootless_arrays += 1;
+                        if has_ctor.contains(&(index, child.0)) {
+                            rootless_elements_with_own_context += 1;
+                        } else if SURVIVORS.contains(&(child.1.tag, child.1.other)) {
+                            rootless_blind_elements += 1;
+                        }
+                    }
                     Some(keys) => {
                         for key in keys {
                             grand_sizes
@@ -11927,11 +11944,25 @@ fn the_array_holders_own_context_rescues_two_fifths() {
         table.push((shape.0, shape.1, blind, contexts, mixed, rescued, still));
     }
 
+    // The claim this cell needs is about the BLIND objects, and the first
+    // version of this assertion counted something much broader.
     assert_eq!(
-        orphan_arrays, 0,
-        "EVERY array holding one of these objects itself has a constructor \
-         arrival, so one level up is the COMPLETE depth for this population and \
-         not an arbitrary place to stop - there is no third level to go to"
+        (
+            elements_of_rootless_arrays,
+            rootless_elements_with_own_context,
+            rootless_blind_elements
+        ),
+        (13, 13, 0),
+        "THIRTEEN constructor objects sit in arrays that themselves have no \
+         constructor arrival - all of them in Prelude and all of shape \
+         `(1, 1)`. The first version of this assertion pinned that count at \
+         ZERO under a message about the blind objects, and w235 caught it: the \
+         message described the narrow question and the code counted the broad \
+         one. Both are pinned now, and the narrow one is what carries the \
+         argument - every one of the thirteen has a constructor arrival of its \
+         own, so NONE is a blind object, and no blind object sits in an array \
+         without a context. One level up is therefore the COMPLETE depth for \
+         this population rather than an arbitrary place to stop"
     );
     assert_eq!(
         table,
