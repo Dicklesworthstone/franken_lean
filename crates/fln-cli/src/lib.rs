@@ -2692,6 +2692,15 @@ fn is_private_eq_def_or_match_residual(display: &str) -> bool {
         })
 }
 
+fn is_private_eq_n_residual(display: &str) -> bool {
+    display.starts_with("_private.")
+        && display.split('.').any(|component| {
+            component
+                .strip_prefix("eq_")
+                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+}
+
 fn is_private_unsafe_rec_or_sunfold_residual(display: &str) -> bool {
     display.starts_with("_private.")
         && display
@@ -2795,6 +2804,11 @@ fn render_check_olean_success(
     };
     private_equation_residuals
         .observe_matching(&checked.decoded.constants, is_private_eq_def_or_match_residual);
+    let mut private_eq_n_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_eq_n_residuals.observe_matching(&checked.decoded.constants, is_private_eq_n_residual);
     let mut private_unsafe_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -2844,6 +2858,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_equation_residuals)
     };
+    let private_eq_n_observed = private_eq_n_residuals.observed;
+    let private_eq_n_omitted = private_eq_n_residuals.omitted();
+    let private_eq_n_names = if json {
+        render_named_residuals_json(&mut private_eq_n_residuals)
+    } else {
+        render_named_residuals_human(&mut private_eq_n_residuals)
+    };
     let private_unsafe_observed = private_unsafe_residuals.observed;
     let private_unsafe_omitted = private_unsafe_residuals.omitted();
     let private_unsafe_names = if json {
@@ -2884,6 +2905,7 @@ fn render_check_olean_success(
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -2907,6 +2929,9 @@ fn render_check_olean_success(
             private_equation_observed,
             private_equation_names,
             private_equation_omitted,
+            private_eq_n_observed,
+            private_eq_n_names,
+            private_eq_n_omitted,
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
@@ -2942,6 +2967,9 @@ fn render_check_olean_success(
                 "decoded _private eq_def/match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private eq_def/match_N residual names: {}\n",
                 "decoded _private eq_def/match_N residual names omitted: {}\n",
+                "decoded _private eq_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private eq_N residual names: {}\n",
+                "decoded _private eq_N residual names omitted: {}\n",
                 "decoded _private _unsafe_rec/_sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _unsafe_rec/_sunfold residual names: {}\n",
                 "decoded _private _unsafe_rec/_sunfold residual names omitted: {}\n",
@@ -2974,6 +3002,9 @@ fn render_check_olean_success(
             private_equation_observed,
             private_equation_names,
             private_equation_omitted,
+            private_eq_n_observed,
+            private_eq_n_names,
+            private_eq_n_omitted,
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
@@ -3341,6 +3372,14 @@ fn render_check_olean_set_success(
         private_equation_residuals
             .observe_matching(&module.decoded.constants, is_private_eq_def_or_match_residual);
     }
+    let mut private_eq_n_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_eq_n_residuals
+            .observe_matching(&module.decoded.constants, is_private_eq_n_residual);
+    }
     let mut private_unsafe_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3398,6 +3437,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_equation_residuals)
     };
+    let private_eq_n_observed = private_eq_n_residuals.observed;
+    let private_eq_n_omitted = private_eq_n_residuals.omitted();
+    let private_eq_n_names = if json {
+        render_named_residuals_json(&mut private_eq_n_residuals)
+    } else {
+        render_named_residuals_human(&mut private_eq_n_residuals)
+    };
     let private_unsafe_observed = private_unsafe_residuals.observed;
     let private_unsafe_omitted = private_unsafe_residuals.omitted();
     let private_unsafe_names = if json {
@@ -3444,6 +3490,7 @@ fn render_check_olean_set_success(
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3469,6 +3516,9 @@ fn render_check_olean_set_success(
             private_equation_observed,
             private_equation_names,
             private_equation_omitted,
+            private_eq_n_observed,
+            private_eq_n_names,
+            private_eq_n_omitted,
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
@@ -3506,6 +3556,9 @@ fn render_check_olean_set_success(
                 "decoded _private eq_def/match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private eq_def/match_N residual names: {}\n",
                 "decoded _private eq_def/match_N residual names omitted: {}\n",
+                "decoded _private eq_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private eq_N residual names: {}\n",
+                "decoded _private eq_N residual names omitted: {}\n",
                 "decoded _private _unsafe_rec/_sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _unsafe_rec/_sunfold residual names: {}\n",
                 "decoded _private _unsafe_rec/_sunfold residual names omitted: {}\n",
@@ -3540,6 +3593,9 @@ fn render_check_olean_set_success(
             private_equation_observed,
             private_equation_names,
             private_equation_omitted,
+            private_eq_n_observed,
+            private_eq_n_names,
+            private_eq_n_omitted,
             private_unsafe_observed,
             private_unsafe_names,
             private_unsafe_omitted,
