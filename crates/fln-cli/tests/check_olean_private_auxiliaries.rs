@@ -438,6 +438,24 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "{json}",
     );
     let decoded_private_loop_auxiliaries = json_object_field(json, "decodedPrivateLoopAuxiliaries");
+    assert_eq!(
+        json_object_key_set(decoded_private_loop_auxiliaries),
+        ["missing", "names", "observed", "omitted"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "{json}",
+    );
+    assert_eq!(
+        json_usize_field(decoded_private_loop_auxiliaries, "omitted"),
+        0,
+        "{json}",
+    );
+    assert_eq!(
+        json_usize_field(decoded_private_loop_auxiliaries, "missing"),
+        0,
+        "{json}",
+    );
     let decoded_private_loop_observed =
         json_usize_field(decoded_private_loop_auxiliaries, "observed");
     let decoded_private_loop_names = json_array_field(

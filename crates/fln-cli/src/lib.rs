@@ -3657,6 +3657,9 @@ fn render_check_olean_success(
     );
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
+    let private_loop_missing = private_loop_auxiliaries
+        .observed
+        .saturating_sub(private_loop_observed);
     let private_loop_names = if json {
         render_named_residuals_json(&mut private_loop_auxiliaries)
     } else {
@@ -4138,7 +4141,7 @@ fn render_check_olean_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateAuxiliaryNames\":{},",
-                "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},",
                 "\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},",
                 "\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4216,6 +4219,7 @@ fn render_check_olean_success(
             private_loop_observed,
             private_loop_names,
             private_loop_omitted,
+            private_loop_missing,
             private_companion_observed,
             private_companion_names,
             private_companion_omitted,
@@ -5720,6 +5724,9 @@ fn render_check_olean_set_success(
     }
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
+    let private_loop_missing = private_loop_auxiliaries
+        .observed
+        .saturating_sub(private_loop_observed);
     let private_loop_names = if json {
         render_named_residuals_json(&mut private_loop_auxiliaries)
     } else {
@@ -6207,7 +6214,7 @@ fn render_check_olean_set_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateAuxiliaryNames\":{},",
-                "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},",
                 "\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},",
                 "\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -6287,6 +6294,7 @@ fn render_check_olean_set_success(
             private_loop_observed,
             private_loop_names,
             private_loop_omitted,
+            private_loop_missing,
             private_companion_observed,
             private_companion_names,
             private_companion_omitted,
