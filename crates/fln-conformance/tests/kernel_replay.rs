@@ -7911,13 +7911,18 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             },
             "zero declarations compared",
         ),
+        // THREE FLOORS SHARE THE PHRASE "below the" -- closure, seed and decoded.
+        // Two of these cells asserted on that bare fragment, so ANY ONE of the
+        // three floors could have been deleted and both cells would still have
+        // passed through a sibling's message. Each now asserts on the noun that
+        // names its own population.
         (
             "empty closure",
             WholeMathlibReceipt {
                 closure_modules: 0,
                 ..sample_whole_mathlib_receipt()
             },
-            "below the",
+            "closure module(s)",
         ),
         (
             "a big closure around a truncated Mathlib",
@@ -7941,7 +7946,11 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 decoded: 1,
                 ..sample_whole_mathlib_receipt()
             },
-            "below the",
+            // `decoded declaration(s)` alone also appears in
+            // `CorpusMatrixReceipt::validate`, a different validator these
+            // mutants never reach; the comma keeps the expectation unique
+            // file-wide rather than merely unique among the rules under test.
+            "decoded declaration(s), below the",
         ),
         (
             "another Reference epoch",
