@@ -282,6 +282,18 @@ open Lean in
               | BinderInfo.strictImplicit => "strict"
               | BinderInfo.instImplicit => "inst"
             IO.println s!"IPARAM\t{n}\t{i}\t{pk}\t{pd.userName}\t{pty}"
+        -- THE HEADER'S RESULT TYPE, with the parameters bound. An indexed family
+        -- carries indices that are NOT parameters -- `Balanced : Impl α β -> Prop`
+        -- -- and a header that states only the parameters leaves the indices
+        -- unbound, so `Balanced t` in a constructor applies a non-function and the
+        -- pin refuses with "Function expected at". This is the signature the pin
+        -- itself would print for the row, minus the part the header already binds.
+        Meta.MetaM.run' <| Meta.forallBoundedTelescope info.type iv.numParams
+            fun _ rest => do
+          let rty <- withOptions (fun o =>
+              (o.setBool `pp.fullNames true).setBool `pp.fieldNotation false)
+            (Meta.ppExpr rest)
+          IO.println s!"IRES\t{n}\t{rty}"
         -- and each constructor's type with those parameters ALREADY BOUND: an
         -- `inductive` block states constructor types under the header's
         -- parameters, so the pin's own printing of the full type would re-bind
@@ -290,7 +302,18 @@ open Lean in
           if let some ci := env.find? c then
             Meta.MetaM.run' <| Meta.forallBoundedTelescope ci.type iv.numParams
                 fun _ body => do
-              let bty <- withOptions (fun o => o.setBool `pp.fullNames true)
+              -- DOT NOTATION DOES NOT RE-ELABORATE HERE. The pin prints a
+              -- constructor body with generalized field notation -- `m.WF` for
+              -- `Std.DHashMap.Raw.WF m` -- and reading it back needs the function
+              -- to have a parameter whose type is the structure the receiver
+              -- belongs to. Against this facade that resolution fails and the pin
+              -- refuses the block with "Invalid field notation: Function `WF`
+              -- does not have a usable parameter of type `Raw ...`", which is the
+              -- whole remaining inductive residue. The notation is a PRINTING
+              -- choice, so it is turned off at the source rather than repaired in
+              -- the string afterwards.
+              let bty <- withOptions (fun o =>
+                  (o.setBool `pp.fullNames true).setBool `pp.fieldNotation false)
                 (Meta.ppExpr body)
               IO.println s!"CTORB\t{c}\t{bty}"
         if isStructure env n then
@@ -439,6 +462,7 @@ def probe(lean, env, work, names):
     inductives = {}
     ind_params = defaultdict(dict)
     ctor_bodies = {}
+    ind_result = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -517,6 +541,10 @@ def probe(lean, env, work, names):
             _, name, idx, kind, user, bty = line.split("\t", 5)
             ind_params[name][int(idx)] = {"kind": kind, "user": user, "type": bty}
             current = (ind_params[name][int(idx)], "type")
+        elif line.startswith("IRES\t"):
+            _, name, rty = line.split("\t", 2)
+            ind_result[name] = rty
+            current = (ind_result, name)
         elif line.startswith("CTORB\t"):
             _, name, bty = line.split("\t", 2)
             ctor_bodies[name] = bty
@@ -535,7 +563,7 @@ def probe(lean, env, work, names):
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
             module_of, struct_fields, res_head, priorities, extern_of, impl_by,
-            kind_of, inductives, dict(ind_params), ctor_bodies)
+            kind_of, inductives, dict(ind_params), ctor_bodies, ind_result)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -956,6 +984,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_inductives = {}
     pin_ind_params = {}
     pin_ctor_bodies = {}
+    pin_ind_result = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -974,7 +1003,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds, rh, prio, ext, iby, knd, ind, iprm, cbod) = probe(
+         rd, sfy, mod, flds, rh, prio, ext, iby, knd, ind, iprm, cbod,
+         ires) = probe(
             lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
@@ -991,6 +1021,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_inductives.update(ind)
         pin_ind_params.update(iprm)
         pin_ctor_bodies.update(cbod)
+        pin_ind_result.update(ires)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -1030,7 +1061,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
             rounds, structs, binders, absent_projections, pbinders,
             pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head,
             pin_priority, pin_extern, pin_impl_by, pin_kind, pin_inductives,
-            pin_ind_params, pin_ctor_bodies)
+            pin_ind_params, pin_ctor_bodies, pin_ind_result)
 
 
 def order(names, deps):
@@ -1170,7 +1201,7 @@ def binder_text(b, deps):
 
 
 def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map,
-                    iparams, ctor_bodies):
+                    iparams, ctor_bodies, ind_result):
     """Declare a real `inductive`, so the kernel generates its constructors and
     recursor and IOTA-REDUCTION comes back.
 
@@ -1199,13 +1230,16 @@ def inductive_block(name, d, iv, ctypes, deps, pks, bs, deps_map,
         params.append(b)
     if len(params) != iv["num_params"]:
         return None
+    own = {name} | set(iv["ctors"])
+    rsig = ind_result.get(name)
     head = f"inductive {d['decl_name']}{binder}" + (
         (" " + " ".join(binder_text(b, deps) for b in params)) if params else "")
+    if rsig:
+        head += " : " + root_anchor(rsig, [x for x in deps if x not in own])
     lines = [head + " where"]
     # the type being declared and its own constructors are in scope UNQUALIFIED
     # inside the block and are not yet at `_root_`, so they are excluded from the
     # anchoring rather than pointed at a name that does not exist yet.
-    own = {name} | set(iv["ctors"])
     for c in iv["ctors"]:
         # the constructor's type with the header's parameters ALREADY BOUND; the
         # pin's printing of the full type re-binds them and the kernel rejects the
@@ -1269,6 +1303,129 @@ def structural_block(name, d, st, bs, deps, pks):
     return lines
 
 
+def probe_generated_ctor_types(lean, env, work, text, decl, deps, owners):
+    """Does the constructor Lean GENERATES carry the Reference's type?
+
+    An `inductive` block that elaborates has only proved that it is well formed.
+    For an indexed family the pin prints a constructor body without pinning the
+    index, so what Lean infers from it here can differ from what the Reference
+    holds, and every consumer then type-checks against a constructor that is not
+    the Reference's. Each generated constructor is ascribed to the pin's own
+    printed type for that constant, and a failure names the OWNING inductive so
+    the caller can demote the whole block.
+
+    The check plants a deliberately wrong ascription of its own: if that does not
+    fail, the check cannot tell a matching type from a mismatched one and its
+    verdicts mean nothing.
+    """
+    lines = list(text.rstrip("\n").split("\n"))
+    lines.append("")
+    lines.append("-- GENERATED CONSTRUCTOR TYPE CHECK (not part of the artifact)")
+    cmap, n = {}, 0
+    for owner in sorted(owners):
+        for c in owners[owner]:
+            d = decl.get(c) or {}
+            ty, dn = d.get("type"), d.get("decl_name")
+            if not ty or not dn:
+                continue
+            lv = d.get("levels") or ""
+            b = (".{" + lv.replace(",", ", ") + "}") if lv else ""
+            lines.append(f"noncomputable def flnic_{n}{b} : "
+                         f"{root_anchor(ty, deps.get(c, ()))} := @{dn}")
+            cmap[len(lines)] = (owner, c)
+            n += 1
+    if not cmap:
+        return {}
+    first = sorted(owners)[0]
+    lines.append(f"noncomputable def flnic_decoy : {TYPE_DECOY_TYPE} := "
+                 f"@{decl[first]['decl_name']}")
+    cmap[len(lines)] = "@@DECOY@@"
+    path = os.path.join(work, "flnic.lean")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    proc = subprocess.run(
+        [lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false", path],
+        capture_output=True, text=True, env=env, timeout=1800)
+    out = proc.stdout + proc.stderr
+    base = os.path.basename(path)
+    bad, decoy_caught = {}, False
+    for m in re.finditer(
+            rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out):
+        hit = cmap.get(int(m.group(1)))
+        if hit is None:
+            continue
+        if hit == "@@DECOY@@":
+            decoy_caught = True
+        else:
+            owner, ctor = hit
+            bad.setdefault(ctor, (owner,
+                                  ((m.group(2) or "-") + ": " + m.group(3))[:200]))
+    if not decoy_caught:
+        raise SystemExit(
+            "REFUSE: the generated-constructor type check did not reject a "
+            f"deliberately wrong ascription ({TYPE_DECOY_TYPE}) — it cannot tell "
+            "a matching constructor from a mismatched one, so every inductive it "
+            "just cleared means nothing")
+    # THE SAME PRINTER LADDER EMISSION USES. A first-tier failure here is very
+    # often the pin's DEFAULT printing of the constant's own type losing an
+    # implicit argument the ascription cannot re-synthesize -- "don't know how to
+    # synthesize implicit argument `β`" on an indexed family's constructor is that
+    # shape, and so was `Lean.Expr.brecOn` when the projection type check first
+    # met it. Demoting a whole inductive on a printing artifact would be a false
+    # negative that no later check could recover, so the maximally explicit
+    # printing gets the second word. This retry carries its own decoy too.
+    retry = [c for c in sorted(bad) if (decl.get(c) or {}).get("typem")]
+    if retry:
+        rl, rmap = list(text.rstrip("\n").split("\n")), {}
+        rl.append("")
+        rl.append("-- GENERATED CONSTRUCTOR RETRY at the maximally explicit printing")
+        for c in retry:
+            d = decl[c]
+            lv = d.get("levels") or ""
+            b = (".{" + lv.replace(",", ", ") + "}") if lv else ""
+            rl.append(f"noncomputable def flnicr_{len(rmap)}{b} : "
+                      f"{root_anchor(d['typem'], deps.get(c, ()))} := "
+                      f"@{d['decl_name']}")
+            rmap[len(rl)] = c
+        rl.append(f"noncomputable def flnicr_decoy : {TYPE_DECOY_TYPE} := "
+                  f"@{decl[retry[0]]['decl_name']}")
+        rmap[len(rl)] = "@@DECOY@@"
+        rpath = os.path.join(work, "flnicr.lean")
+        with open(rpath, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(rl) + "\n")
+        rproc = subprocess.run(
+            [lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false", rpath],
+            capture_output=True, text=True, env=env, timeout=1800)
+        rout = rproc.stdout + rproc.stderr
+        rbase = os.path.basename(rpath)
+        still, rdecoy = {}, False
+        for m in re.finditer(
+                rf"{re.escape(rbase)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                rout):
+            hit = rmap.get(int(m.group(1)))
+            if hit is None:
+                continue
+            if hit == "@@DECOY@@":
+                rdecoy = True
+            else:
+                still[hit] = ((m.group(2) or "-") + ": " + m.group(3))[:200]
+        if not rdecoy:
+            raise SystemExit(
+                "REFUSE: the maximally-explicit retry of the generated-constructor "
+                f"check did not reject a deliberately wrong ascription "
+                f"({TYPE_DECOY_TYPE}) — every constructor it just absolved means "
+                "nothing")
+        for c in retry:
+            if c in still:
+                bad[c] = (bad[c][0], still[c])
+            else:
+                del bad[c]
+    owners_bad = {}
+    for c, (owner, msg) in bad.items():
+        owners_bad.setdefault(owner, msg)
+    return owners_bad
+
+
 def structural_refusal(name, st, bs):
     """Why a structure may not be emitted structurally, decided BEFORE the pin is
     asked, so the reason is a fact rather than a diagnostic."""
@@ -1313,7 +1470,7 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
            structural, structs, binders, deps, pbinders, transparent,
            value_explicit_for, companions, priorities, inductives,
            pin_inductives_ref, types_ref, ind_companions, ctor_companions,
-           ind_params_ref, ctor_bodies_ref):
+           ind_params_ref, ctor_bodies_ref, ind_result_ref):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -1350,7 +1507,8 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
                                     types_ref, deps.get(name, ()),
                                     pbinders.get(name, {}),
                                     binders.get(name, {}), deps,
-                                    ind_params_ref.get(name, {}), ctor_bodies_ref)
+                                    ind_params_ref.get(name, {}), ctor_bodies_ref,
+                                    ind_result_ref)
             if block is not None:
                 d = decl[name]
                 body.append(f"-- role={d['role']} bucket={d['bucket']} inductive "
@@ -1461,7 +1619,7 @@ def main():
      pin_reducibility, pin_safety, pin_module,
      pin_fields, pin_res_head, pin_priority, pin_extern,
      pin_impl_by, pin_kind, pin_inductives, pin_ind_params,
-     pin_ctor_bodies) = close_over_types(
+     pin_ctor_bodies, pin_ind_result) = close_over_types(
         lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
@@ -1639,7 +1797,7 @@ def main():
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
          pb2, rd2, sfy2, mod2, flds2, rh2, prio2, ext2,
-         iby2, knd2, ind2, iprm2, cbod2) = close_over_types(
+         iby2, knd2, ind2, iprm2, cbod2, ires2) = close_over_types(
             lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
@@ -1657,6 +1815,7 @@ def main():
         pin_inductives.update(ind2)
         pin_ind_params.update(iprm2)
         pin_ctor_bodies.update(cbod2)
+        pin_ind_result.update(ires2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1818,7 +1977,7 @@ def main():
                 structural, structs, binders, deps, pbinders, transparent,
             value_explicit_for, companions, pin_priority, inductive_decls,
             pin_inductives, types, ind_companions, ctor_companions,
-            pin_ind_params, pin_ctor_bodies)
+            pin_ind_params, pin_ctor_bodies, pin_ind_result)
             candidate = args.out + ".candidate.lean"
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -1831,6 +1990,32 @@ def main():
                              "structural": len(structural),
                              "quarantined": len(quarantine)})
             if proc.returncode == 0:
+                # THE BLOCK ELABORATING IS NOT THE BLOCK BEING RIGHT. An
+                # `inductive` the pin accepts still has to generate the
+                # Reference's constructors, and for an INDEXED family it may not:
+                # the pin prints a constructor body without pinning the index, so
+                # what Lean infers here can differ from what the Reference has.
+                # Measured on Std.DTreeMap.Internal.Impl.WF, whose generated
+                # `WF.empty` carries a type the pin refuses to accept as the
+                # Reference's. Nothing else in this loop can see it, because the
+                # file compiles. Checked once per SUCCESSFUL attempt, so the cost
+                # is one extra pin run and not one per attempt, and a disagreement
+                # demotes the owner through the same path as any other blame.
+                bad = probe_generated_ctor_types(
+                    lean, env, work, text, decl, deps,
+                    {i: (pin_inductives.get(i) or {}).get("ctors", ())
+                     for i in inductive_decls})
+                demoted = False
+                for owner, msg in (bad or {}).items():
+                    if owner in inductive_decls:
+                        inductive_decls.discard(owner)
+                        inductive_refused[owner] = (
+                            "the pin does not accept the constructor the kernel "
+                            "generates for this block as carrying the "
+                            "Reference's type -- " + msg)
+                        demoted = True
+                if demoted:
+                    continue
                 os.replace(candidate, args.out)
                 break
             (blamed_axioms, blamed_attrs, blamed_structs, blamed_transparent,

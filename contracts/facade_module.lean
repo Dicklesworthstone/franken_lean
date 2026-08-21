@@ -23,27 +23,27 @@ set_option autoImplicit false
 set_option maxRecDepth 8000
 
 -- role=substrate bucket=- inductive module=Lean.Data.AssocList
-inductive Lean.AssocList.{u, v} (α : Type u) (β : Type v) where
+inductive Lean.AssocList.{u, v} (α : Type u) (β : Type v) : Type (max u v) where
   | nil : Lean.AssocList α β
   | cons : α → β → Lean.AssocList α β → Lean.AssocList α β
 -- role=substrate bucket=- inductive module=Lean.Environment
-inductive Lean.AsyncBranch where
+inductive Lean.AsyncBranch : Type where
   | mainEnv : Lean.AsyncBranch
   | asyncEnv : Lean.AsyncBranch
 -- role=substrate bucket=- inductive module=Lean.Attributes
-inductive Lean.AttributeApplicationTime where
+inductive Lean.AttributeApplicationTime : Type where
   | afterTypeChecking : Lean.AttributeApplicationTime
   | afterCompilation : Lean.AttributeApplicationTime
   | beforeElaboration : Lean.AttributeApplicationTime
 -- role=substrate bucket=- effect=pure module=Lean.Attributes
 axiom Lean.AttributeImplCore.ref._autoParam : _root_.Lean.Syntax
 -- role=substrate bucket=- inductive module=Lean.Attributes
-inductive Lean.AttributeKind where
+inductive Lean.AttributeKind : Type where
   | global : Lean.AttributeKind
   | «local» : Lean.AttributeKind
   | «scoped» : Lean.AttributeKind
 -- role=substrate bucket=- inductive module=Lean.Expr
-inductive Lean.BinderInfo where
+inductive Lean.BinderInfo : Type where
   | default : Lean.BinderInfo
   | implicit : Lean.BinderInfo
   | strictImplicit : Lean.BinderInfo
@@ -57,7 +57,7 @@ structure Lean.CompactedRegion where
   bufferOffset : _root_.USize
   root : _root_.NonScalar
 -- role=substrate bucket=- inductive module=Lean.Environment
-inductive Lean.ConstantKind where
+inductive Lean.ConstantKind : Type where
   | defn : Lean.ConstantKind
   | thm : Lean.ConstantKind
   | «axiom» : Lean.ConstantKind
@@ -67,7 +67,7 @@ inductive Lean.ConstantKind where
   | ctor : Lean.ConstantKind
   | recursor : Lean.ConstantKind
 -- role=substrate bucket=- inductive module=Lean.Data.KVMap
-inductive Lean.DataValue where
+inductive Lean.DataValue : Type where
   | ofString : _root_.String → Lean.DataValue
   | ofBool : _root_.Bool → Lean.DataValue
   | ofName : _root_.Lean.Name → Lean.DataValue
@@ -80,7 +80,7 @@ structure Lean.DeclNameGenerator where
   idx : _root_.Nat
   parentIdxs : _root_.List _root_.Nat
 -- role=substrate bucket=- inductive module=Lean.Declaration
-inductive Lean.DefinitionSafety where
+inductive Lean.DefinitionSafety : Type where
   | «unsafe» : Lean.DefinitionSafety
   | safe : Lean.DefinitionSafety
   | «partial» : Lean.DefinitionSafety
@@ -95,7 +95,7 @@ structure Lean.Elab.DecreasingBy where
   ref : _root_.Lean.Syntax
   tactic : _root_.Lean.TSyntax `Lean.Parser.Tactic.tacticSeq
 -- role=substrate bucket=- inductive module=Lean.Elab.InfoTree.Types
-inductive Lean.Elab.DocElabKind where
+inductive Lean.Elab.DocElabKind : Type where
   | role : Lean.Elab.DocElabKind
   | codeBlock : Lean.Elab.DocElabKind
   | directive : Lean.Elab.DocElabKind
@@ -126,7 +126,7 @@ structure Lean.Elab.OptionInfo where
   optionName : _root_.Lean.Name
   declName : _root_.Lean.Name
 -- role=substrate bucket=- inductive module=Lean.Elab.PreDefinition.TerminationHint
-inductive Lean.Elab.PartialFixpointType where
+inductive Lean.Elab.PartialFixpointType : Type where
   | partialFixpoint : Lean.Elab.PartialFixpointType
   | coinductiveFixpoint : Lean.Elab.PartialFixpointType
   | inductiveFixpoint : Lean.Elab.PartialFixpointType
@@ -135,7 +135,7 @@ structure Lean.Elab.Tactic.Context where
   elaborator : _root_.Lean.Name
   recover : _root_.Bool
 -- role=substrate bucket=- inductive module=Lean.Elab.Tactic.RCases
-inductive Lean.Elab.Tactic.RCases.RCasesPatt where
+inductive Lean.Elab.Tactic.RCases.RCasesPatt : Type where
   | paren : _root_.Lean.Syntax → Lean.Elab.Tactic.RCases.RCasesPatt → Lean.Elab.Tactic.RCases.RCasesPatt
   | one : _root_.Lean.Syntax → _root_.Lean.Name → Lean.Elab.Tactic.RCases.RCasesPatt
   | clear : _root_.Lean.Syntax → Lean.Elab.Tactic.RCases.RCasesPatt
@@ -144,7 +144,7 @@ inductive Lean.Elab.Tactic.RCases.RCasesPatt where
   | tuple : _root_.Lean.Syntax → _root_.List Lean.Elab.Tactic.RCases.RCasesPatt → Lean.Elab.Tactic.RCases.RCasesPatt
   | alts : _root_.Lean.Syntax → _root_.List Lean.Elab.Tactic.RCases.RCasesPatt → Lean.Elab.Tactic.RCases.RCasesPatt
 -- role=substrate bucket=- inductive module=Lean.Elab.Tactic.Simp
-inductive Lean.Elab.Tactic.SimpKind where
+inductive Lean.Elab.Tactic.SimpKind : Type where
   | simp : Lean.Elab.Tactic.SimpKind
   | simpAll : Lean.Elab.Tactic.SimpKind
   | dsimp : Lean.Elab.Tactic.SimpKind
@@ -156,12 +156,12 @@ structure Lean.Elab.Term.CalcStepView where
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Term.FixedTermElabRef : Type
 -- role=substrate bucket=- inductive module=Lean.Elab.SyntheticMVars
-inductive Lean.Elab.Term.PostponeBehavior where
+inductive Lean.Elab.Term.PostponeBehavior : Type where
   | yes : Lean.Elab.Term.PostponeBehavior
   | no : Lean.Elab.Term.PostponeBehavior
   | «partial» : Lean.Elab.Term.PostponeBehavior
 -- role=substrate bucket=- inductive module=Lean.Elab.Term.TermElabM
-inductive Lean.Elab.Term.TacticMVarKind where
+inductive Lean.Elab.Term.TacticMVarKind : Type where
   | term : Lean.Elab.Term.TacticMVarKind
   | autoParam : _root_.Lean.Name → Lean.Elab.Term.TacticMVarKind
   | fieldAutoParam : _root_.Lean.Name → _root_.Lean.Name → Lean.Elab.Term.TacticMVarKind
@@ -188,7 +188,7 @@ structure Lean.FileMap where
   source : _root_.String
   positions : _root_.Array _root_.String.Pos.Raw
 -- role=substrate bucket=- inductive module=Lean.Setup
-inductive Lean.IRPhases where
+inductive Lean.IRPhases : Type where
   | runtime : Lean.IRPhases
   | comptime : Lean.IRPhases
   | all : Lean.IRPhases
@@ -226,11 +226,11 @@ structure Lean.Linter.DeprecationEntry where
 -- role=substrate bucket=- effect=pure module=Lean.Linter.Init
 axiom Lean.Linter.LinterSets : Type
 -- role=substrate bucket=- inductive module=Lean.Expr
-inductive Lean.Literal where
+inductive Lean.Literal : Type where
   | natVal : _root_.Nat → Lean.Literal
   | strVal : _root_.String → Lean.Literal
 -- role=substrate bucket=- inductive module=Lean.LocalContext
-inductive Lean.LocalDeclKind where
+inductive Lean.LocalDeclKind : Type where
   | default : Lean.LocalDeclKind
   | implDetail : Lean.LocalDeclKind
   | auxDecl : Lean.LocalDeclKind
@@ -242,7 +242,7 @@ structure Lean.Lsp.Position where
 structure Lean.Lsp.RpcRef where
   p : _root_.USize
 -- role=substrate bucket=- inductive module=Lean.Server.Rpc.Basic
-inductive Lean.Lsp.RpcWireFormat where
+inductive Lean.Lsp.RpcWireFormat : Type where
   | v0 : Lean.Lsp.RpcWireFormat
   | v1 : Lean.Lsp.RpcWireFormat
 -- role=substrate bucket=- structural=structure module=Lean.Data.Lsp.Basic
@@ -254,17 +254,17 @@ structure Lean.MVarId where
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.MVarIdMap : Type → Type
 -- role=substrate bucket=- inductive module=Lean.Message
-inductive Lean.MessageSeverity where
+inductive Lean.MessageSeverity : Type where
   | information : Lean.MessageSeverity
   | warning : Lean.MessageSeverity
   | error : Lean.MessageSeverity
 -- role=substrate bucket=- inductive module=Lean.Meta.CoeAttr
-inductive Lean.Meta.CoeFnType where
+inductive Lean.Meta.CoeFnType : Type where
   | coe : Lean.Meta.CoeFnType
   | coeFun : Lean.Meta.CoeFnType
   | coeSort : Lean.Meta.CoeFnType
 -- role=substrate bucket=- inductive module=Lean.Meta.CongrTheorems
-inductive Lean.Meta.CongrArgKind where
+inductive Lean.Meta.CongrArgKind : Type where
   | fixed : Lean.Meta.CongrArgKind
   | fixedNoParam : Lean.Meta.CongrArgKind
   | eq : Lean.Meta.CongrArgKind
@@ -274,14 +274,14 @@ inductive Lean.Meta.CongrArgKind where
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Eqns
 axiom Lean.Meta.GetEqnsFn : Type
 -- role=substrate bucket=- inductive module=Lean.Meta.Hint
-inductive Lean.Meta.Hint.DiffGranularity where
+inductive Lean.Meta.Hint.DiffGranularity : Type where
   | auto : Lean.Meta.Hint.DiffGranularity
   | char : Lean.Meta.Hint.DiffGranularity
   | word : Lean.Meta.Hint.DiffGranularity
   | all : Lean.Meta.Hint.DiffGranularity
   | none : Lean.Meta.Hint.DiffGranularity
 -- role=substrate bucket=- inductive module=Lean.Meta.Basic
-inductive Lean.Meta.ProjReductionKind where
+inductive Lean.Meta.ProjReductionKind : Type where
   | no : Lean.Meta.ProjReductionKind
   | yes : Lean.Meta.ProjReductionKind
   | yesWithDelta : Lean.Meta.ProjReductionKind
@@ -297,11 +297,11 @@ structure Lean.Meta.SimpCongrTheorem where
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.TryThis
 axiom Lean.Meta.Tactic.TryThis.SuggestionStyle : Type
 -- role=substrate bucket=- inductive module=Lean.Meta.TryThis
-inductive Lean.Meta.Tactic.TryThis.SuggestionText where
+inductive Lean.Meta.Tactic.TryThis.SuggestionText : Type where
   | tsyntax : {kind : _root_.Lean.SyntaxNodeKind} → _root_.Lean.TSyntax kind → Lean.Meta.Tactic.TryThis.SuggestionText
   | string : _root_.String → Lean.Meta.Tactic.TryThis.SuggestionText
 -- role=substrate bucket=- inductive module=Lean.MetavarContext
-inductive Lean.MetavarKind where
+inductive Lean.MetavarKind : Type where
   | natural : Lean.MetavarKind
   | synthetic : Lean.MetavarKind
   | syntheticOpaque : Lean.MetavarKind
@@ -329,7 +329,7 @@ structure Lean.OLeanEntries (α : Type) where
   server : α
   «private» : α
 -- role=substrate bucket=- inductive module=Lean.Data.OpenDecl
-inductive Lean.OpenDecl where
+inductive Lean.OpenDecl : Type where
   | simple : _root_.Lean.Name → _root_.List _root_.Lean.Name → Lean.OpenDecl
   | explicit : _root_.Lean.Name → _root_.Lean.Name → Lean.OpenDecl
 -- role=substrate bucket=- structural=structure module=Lean.Data.Options
@@ -349,7 +349,7 @@ axiom Lean.Parser.ParserFn : Type
 -- role=demanded bucket=R-NONE transparent module=Lean.Data.PersistentArray
 @[reducible] noncomputable def Lean.PersistentArray.initShift : _root_.USize := 5
 -- role=substrate bucket=- inductive module=Lean.Data.PersistentArray
-inductive Lean.PersistentArrayNode.{u} (α : Type u) where
+inductive Lean.PersistentArrayNode.{u} (α : Type u) : Type u where
   | node : _root_.Array (Lean.PersistentArrayNode α) → Lean.PersistentArrayNode α
   | leaf : _root_.Array α → Lean.PersistentArrayNode α
 -- role=substrate bucket=- effect=pure module=Lean.Environment
@@ -359,7 +359,7 @@ structure Lean.PersistentEnvExtensionState (α : Type) (σ : Type) where
   importedEntries : _root_.Array (_root_.Array α)
   state : σ
 -- role=substrate bucket=- inductive module=Lean.Data.PersistentHashMap
-inductive Lean.PersistentHashMap.Entry.{u, v, w} (α : Type u) (β : Type v) (σ : Type w) where
+inductive Lean.PersistentHashMap.Entry.{u, v, w} (α : Type u) (β : Type v) (σ : Type w) : Type (max (max u v) w) where
   | entry : α → β → Lean.PersistentHashMap.Entry α β σ
   | ref : σ → Lean.PersistentHashMap.Entry α β σ
   | null : Lean.PersistentHashMap.Entry α β σ
@@ -378,13 +378,13 @@ structure Lean.ProjectionFunctionInfo where
   i : _root_.Nat
   fromClass : _root_.Bool
 -- role=substrate bucket=- inductive module=Lean.Declaration
-inductive Lean.QuotKind where
+inductive Lean.QuotKind : Type where
   | type : Lean.QuotKind
   | ctor : Lean.QuotKind
   | lift : Lean.QuotKind
   | ind : Lean.QuotKind
 -- role=substrate bucket=- inductive module=Lean.Declaration
-inductive Lean.ReducibilityHints where
+inductive Lean.ReducibilityHints : Type where
   | «opaque» : Lean.ReducibilityHints
   | «abbrev» : Lean.ReducibilityHints
   | regular : _root_.UInt32 → Lean.ReducibilityHints
@@ -395,7 +395,7 @@ axiom Lean.ReservedNameAction : Type
 -- role=substrate bucket=- effect=pure module=Lean.ScopedEnvExtension
 axiom Lean.ScopedEnvExtension.Descr.name._autoParam : _root_.Lean.Syntax
 -- role=substrate bucket=- inductive module=Lean.ScopedEnvExtension
-inductive Lean.ScopedEnvExtension.Entry (α : Type) where
+inductive Lean.ScopedEnvExtension.Entry (α : Type) : Type where
   | global : α → Lean.ScopedEnvExtension.Entry α
   | «scoped» : _root_.Lean.Name → α → Lean.ScopedEnvExtension.Entry α
 -- role=substrate bucket=- structural=structure module=Lean.Server.Rpc.Basic
@@ -424,7 +424,7 @@ axiom Lean.Syntax.getAtomVal : _root_.Lean.Syntax → _root_.String
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Syntax
 axiom Lean.Syntax.reprint : _root_.Lean.Syntax → _root_.Option _root_.String
 -- role=substrate bucket=- inductive module=Lean.Message
-inductive Lean.TraceResult where
+inductive Lean.TraceResult : Type where
   | success : Lean.TraceResult
   | failure : Lean.TraceResult
   | error : Lean.TraceResult
@@ -433,13 +433,13 @@ axiom Lean.isPrivateName : _root_.Lean.Name → _root_.Bool
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Util.Heartbeats
 axiom Lean.withHeartbeats.{u_1} : {m : Type → Type u_1} → {α : Type} → [_root_.Monad m] → [_root_.MonadLiftT _root_.BaseIO m] → m α → m (α × _root_.Nat)
 -- role=substrate bucket=- inductive module=Std.Data.DHashMap.Internal.AssocList.Basic
-inductive Std.DHashMap.Internal.AssocList.{v, u} (α : Type u) (β : α → Type v) where
+inductive Std.DHashMap.Internal.AssocList.{v, u} (α : Type u) (β : α → Type v) : Type (max u v) where
   | nil : Std.DHashMap.Internal.AssocList α β
   | cons : (key : α) → β key → Std.DHashMap.Internal.AssocList α β → Std.DHashMap.Internal.AssocList α β
 -- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Internal.Index pp=explicit
 axiom Std.DHashMap.Internal.mkIdx : (sz : _root_.Nat) → @_root_.LT.lt _root_.Nat _root_.instLTNat (@_root_.OfNat.ofNat _root_.Nat (nat_lit 0) (_root_.instOfNatNat (nat_lit 0))) sz → _root_.UInt64 → @_root_.Subtype _root_.USize fun u => @_root_.LT.lt _root_.Nat _root_.instLTNat u.toNat sz
 -- role=substrate bucket=- inductive module=Std.Data.DTreeMap.Internal.Def
-inductive Std.DTreeMap.Internal.Impl.{u, v} (α : Type u) (β : α → Type v) where
+inductive Std.DTreeMap.Internal.Impl.{u, v} (α : Type u) (β : α → Type v) : Type (max u v) where
   | inner : _root_.Nat → (k : α) → β k → Std.DTreeMap.Internal.Impl α β → Std.DTreeMap.Internal.Impl α β → Std.DTreeMap.Internal.Impl α β
   | leaf : Std.DTreeMap.Internal.Impl α β
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Balanced
@@ -518,7 +518,7 @@ structure Lean.Elab.PartialFixpoint where
 structure Lean.Elab.Tactic.State where
   goals : _root_.List _root_.Lean.MVarId
 -- role=substrate bucket=- inductive module=Lean.Environment
-inductive Lean.EnvExtension.AsyncMode where
+inductive Lean.EnvExtension.AsyncMode : Type where
   | sync : Lean.EnvExtension.AsyncMode
   | «local» : Lean.EnvExtension.AsyncMode
   | mainOnly : Lean.EnvExtension.AsyncMode
@@ -537,7 +537,7 @@ class Lean.KVMap.Value (α : Type) where
 -- role=demanded bucket=R-NONE transparent module=Lean.Level
 @[reducible] noncomputable def Lean.LMVarId : Type := _root_.Lean.LevelMVarId
 -- role=substrate bucket=- inductive module=Lean.Language.Basic
-inductive Lean.Language.SnapshotTask.ReportingRange where
+inductive Lean.Language.SnapshotTask.ReportingRange : Type where
   | inherit : Lean.Language.SnapshotTask.ReportingRange
   | some : _root_.Lean.Syntax.Range → Lean.Language.SnapshotTask.ReportingRange
   | skip : Lean.Language.SnapshotTask.ReportingRange
@@ -578,7 +578,7 @@ structure Lean.Meta.Config where
   zetaUnused : _root_.Bool
   zetaHave : _root_.Bool
 -- role=substrate bucket=- inductive module=Lean.Meta.DiscrTree.Types
-inductive Lean.Meta.DiscrTree.Key where
+inductive Lean.Meta.DiscrTree.Key : Type where
   | star : Lean.Meta.DiscrTree.Key
   | other : Lean.Meta.DiscrTree.Key
   | lit : _root_.Lean.Literal → Lean.Meta.DiscrTree.Key
@@ -587,7 +587,7 @@ inductive Lean.Meta.DiscrTree.Key where
   | arrow : Lean.Meta.DiscrTree.Key
   | proj : _root_.Lean.Name → _root_.Nat → _root_.Nat → Lean.Meta.DiscrTree.Key
 -- role=substrate bucket=- inductive module=Lean.Meta.Tactic.Simp.SimpTheorems
-inductive Lean.Meta.Origin where
+inductive Lean.Meta.Origin : Type where
   | decl : _root_.Lean.Name → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.false → Lean.Meta.Origin
   | fvar : _root_.Lean.FVarId → Lean.Meta.Origin
   | stx : _root_.Lean.Name → _root_.Lean.Syntax → Lean.Meta.Origin
@@ -633,7 +633,7 @@ structure Lean.Options where
   map : _root_.Lean.NameMap _root_.Lean.DataValue
   hasTrace : _root_.Bool
 -- role=substrate bucket=- inductive module=Lean.Parser.Types
-inductive Lean.Parser.FirstTokens where
+inductive Lean.Parser.FirstTokens : Type where
   | epsilon : Lean.Parser.FirstTokens
   | unknown : Lean.Parser.FirstTokens
   | tokens : _root_.List _root_.Lean.Parser.Token → Lean.Parser.FirstTokens
@@ -648,9 +648,9 @@ structure Lean.PersistentArray.{u} (α : Type u) where
 -- role=demanded bucket=R-NONE transparent module=Lean.Data.PersistentArray
 @[reducible] noncomputable def Lean.PersistentArray.branching : _root_.USize := _root_.USize.ofNat (2 ^ Lean.PersistentArray.initShift.toNat)
 -- role=substrate bucket=- inductive module=Lean.Data.PersistentHashMap
-inductive Lean.PersistentHashMap.Node.{u, v} (α : Type u) (β : Type v) where
+inductive Lean.PersistentHashMap.Node.{u, v} (α : Type u) (β : Type v) : Type (max u v) where
   | entries : _root_.Array (_root_.Lean.PersistentHashMap.Entry α β (Lean.PersistentHashMap.Node α β)) → Lean.PersistentHashMap.Node α β
-  | collision : (ks : _root_.Array α) → (vs : _root_.Array β) → ks.size = vs.size → Lean.PersistentHashMap.Node α β
+  | collision : (ks : _root_.Array α) → (vs : _root_.Array β) → _root_.Array.size ks = _root_.Array.size vs → Lean.PersistentHashMap.Node α β
 -- role=substrate bucket=- structural=structure module=Lean.PrettyPrinter.Parenthesizer
 structure Lean.PrettyPrinter.Parenthesizer.State where
   stxTrav : _root_.Lean.Syntax.Traverser
@@ -784,7 +784,7 @@ structure Lean.Language.SnapshotTask (α : Type) where
   cancelTk? : _root_.Option _root_.IO.CancelToken
   task : _root_.Task α
 -- role=substrate bucket=- inductive module=Lean.Level
-inductive Lean.Level where
+inductive Lean.Level : Type where
   | zero : Lean.Level
   | succ : Lean.Level → Lean.Level
   | max : Lean.Level → Lean.Level → Lean.Level
@@ -808,7 +808,7 @@ structure Lean.Meta.ConfigWithKey where
   config : _root_.Lean.Meta.Config
   key : _root_.UInt64
 -- role=substrate bucket=- inductive module=Lean.Meta.DiscrTree.Types
-inductive Lean.Meta.DiscrTree.Trie (α : Type) where
+inductive Lean.Meta.DiscrTree.Trie (α : Type) : Type where
   | node : _root_.Array α → _root_.Array (_root_.Lean.Meta.DiscrTree.Key × Lean.Meta.DiscrTree.Trie α) → Lean.Meta.DiscrTree.Trie α
 -- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types
 axiom Lean.Meta.DiscrTree.instBEqKey : _root_.BEq _root_.Lean.Meta.DiscrTree.Key
@@ -858,13 +858,15 @@ structure Std.DHashMap.Internal.IsHashSelf.{u, v} {α : Type u} {β : α → Typ
 axiom Std.DHashMap.Internal.List.HashesTo.hash_self.{u, v} : ∀ {α : Type u} {β : α → Type v} [inst : _root_.BEq α] [inst_1 : _root_.Hashable α] {l : _root_.List ((a : α) × β a)} {i size : _root_.Nat}, _root_.Std.DHashMap.Internal.List.HashesTo l i size → ∀ (h : 0 < size) (p : (a : α) × β a), p ∈ l → (_root_.Std.DHashMap.Internal.mkIdx size h (_root_.Hashable.hash p.fst)).val.toNat = i
 -- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Internal.Defs
 axiom Std.DHashMap.Internal.List.HashesTo.mk.{u, v} : ∀ {α : Type u} {β : α → Type v} [inst : _root_.BEq α] [inst_1 : _root_.Hashable α] {l : _root_.List ((a : α) × β a)} {i size : _root_.Nat}, (∀ (h : 0 < size) (p : (a : α) × β a), p ∈ l → (_root_.Std.DHashMap.Internal.mkIdx size h (_root_.Hashable.hash p.fst)).val.toNat = i) → _root_.Std.DHashMap.Internal.List.HashesTo l i size
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Balanced
-axiom Std.DTreeMap.Internal.Impl.Balanced.{u, v} : {α : Type u} → {β : α → Type v} → _root_.Std.DTreeMap.Internal.Impl α β → Prop
+-- role=substrate bucket=- inductive module=Std.Data.DTreeMap.Internal.Balanced
+inductive Std.DTreeMap.Internal.Impl.Balanced.{u, v} {α : Type u} {β : α → Type v} : _root_.Std.DTreeMap.Internal.Impl α β → Prop where
+  | leaf : Std.DTreeMap.Internal.Impl.Balanced _root_.Std.DTreeMap.Internal.Impl.leaf
+  | inner : ∀ {sz : _root_.Nat} {k : α} {v : β k} {l r : _root_.Std.DTreeMap.Internal.Impl α β}, Std.DTreeMap.Internal.Impl.Balanced l → Std.DTreeMap.Internal.Impl.Balanced r → _root_.Std.DTreeMap.Internal.Impl.BalancedAtRoot (_root_.Std.DTreeMap.Internal.Impl.size l) (_root_.Std.DTreeMap.Internal.Impl.size r) → sz = _root_.Std.DTreeMap.Internal.Impl.size l + 1 + _root_.Std.DTreeMap.Internal.Impl.size r → Std.DTreeMap.Internal.Impl.Balanced (_root_.Std.DTreeMap.Internal.Impl.inner sz k v l r)
 -- role=substrate bucket=- structural=structure module=Std.Data.TreeMap.Raw.Basic
 structure Std.TreeMap.Raw.{u, v} (α : Type u) (β : Type v) (cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap.Raw._auto_1) where
   inner : _root_.Std.DTreeMap.Raw α (fun x => β) cmp
 -- role=substrate bucket=- inductive module=Lean.Expr
-inductive Lean.Expr where
+inductive Lean.Expr : Type where
   | bvar : _root_.Nat → Lean.Expr
   | fvar : _root_.Lean.FVarId → Lean.Expr
   | mvar : _root_.Lean.MVarId → Lean.Expr
@@ -878,7 +880,7 @@ inductive Lean.Expr where
   | mdata : _root_.Lean.MData → Lean.Expr → Lean.Expr
   | proj : _root_.Lean.Name → _root_.Nat → Lean.Expr → Lean.Expr
 -- role=substrate bucket=- inductive module=Lean.Data.Json.Basic
-inductive Lean.Json where
+inductive Lean.Json : Type where
   | null : Lean.Json
   | bool : _root_.Bool → Lean.Json
   | num : _root_.Lean.JsonNumber → Lean.Json
@@ -926,16 +928,18 @@ structure Std.DHashMap.Internal.Raw.WFImp.{u, v} {α : Type u} {β : α → Type
   distinct : _root_.Std.Internal.List.DistinctKeys (_root_.Std.DHashMap.Internal.toListModel m.buckets)
 -- role=substrate bucket=- transparent module=Std.Data.DHashMap.Internal.Defs
 @[reducible] noncomputable def Std.DHashMap.Internal.Raw₀.{u, v} : (α : Type u) → (α → Type v) → Type (max 0 u v) := fun α β => @_root_.Subtype (_root_.Std.DHashMap.Raw α β) fun m => @_root_.LT.lt _root_.Nat _root_.instLTNat (@_root_.OfNat.ofNat _root_.Nat (nat_lit 0) (_root_.instOfNatNat (nat_lit 0))) (@_root_.Array.size (_root_.Std.DHashMap.Internal.AssocList α β) (@_root_.Std.DHashMap.Raw.buckets α β m))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Balanced
-axiom Std.DTreeMap.Internal.Impl.Balanced.inner.{u, v} : ∀ {α : Type u} {β : α → Type v} {sz : _root_.Nat} {k : α} {v : β k} {l r : _root_.Std.DTreeMap.Internal.Impl α β}, l.Balanced → r.Balanced → _root_.Std.DTreeMap.Internal.Impl.BalancedAtRoot l.size r.size → sz = l.size + 1 + r.size → (_root_.Std.DTreeMap.Internal.Impl.inner sz k v l r).Balanced
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Balanced pp=explicit
-axiom Std.DTreeMap.Internal.Impl.Balanced.leaf.{u, v} : ∀ {α : Type u} {β : α → Type v}, @_root_.Std.DTreeMap.Internal.Impl.Balanced α β (@_root_.Std.DTreeMap.Internal.Impl.leaf α β)
+-- role=substrate bucket=- structural=structure module=Std.Data.DTreeMap.Internal.Operations
+structure Std.DTreeMap.Internal.Impl.BalancedTree.{u, v} (α : Type u) (β : α → Type v) where
+  impl : _root_.Std.DTreeMap.Internal.Impl α β
+  balanced_impl : impl.Balanced
+-- role=substrate bucket=- structural=structure module=Std.Data.DTreeMap.Internal.Operations
+structure Std.DTreeMap.Internal.Impl.SizedBalancedTree.{u, v} (α : Type u) (β : α → Type v) (lb : _root_.Nat) (ub : _root_.Nat) where
+  impl : _root_.Std.DTreeMap.Internal.Impl α β
+  balanced_impl : impl.Balanced
+  lb_le_size_impl : lb ≤ impl.size
+  size_impl_le_ub : impl.size ≤ ub
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.BalancedTree.{u, v} : (α : Type u) → (α → Type v) → Type (max u v)
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.SizedBalancedTree.{u, v} : (α : Type u) → (α → Type v) → _root_.Nat → _root_.Nat → Type (max u v)
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.inter.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (m₁ : _root_.Std.DTreeMap.Internal.Impl α β) → _root_.Std.DTreeMap.Internal.Impl α β → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β m₁ → _root_.Std.DTreeMap.Internal.Impl α β
+axiom Std.DTreeMap.Internal.Impl.inter.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (m₁ : _root_.Std.DTreeMap.Internal.Impl α β) → _root_.Std.DTreeMap.Internal.Impl α β → m₁.Balanced → _root_.Std.DTreeMap.Internal.Impl α β
 -- role=substrate bucket=- structural=structure module=Lean.Declaration
 structure Lean.ConstantVal where
   name : _root_.Lean.Name
@@ -1025,7 +1029,7 @@ structure Lean.Kernel.Diagnostics where
   unfoldCounter : _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
   enabled : _root_.Bool
 -- role=substrate bucket=- inductive module=Lean.LocalContext
-inductive Lean.LocalDecl where
+inductive Lean.LocalDecl : Type where
   | cdecl : _root_.Nat → _root_.Lean.FVarId → _root_.Lean.Name → _root_.Lean.Expr → _root_.Lean.BinderInfo → _root_.Lean.LocalDeclKind → Lean.LocalDecl
   | ldecl : _root_.Nat → _root_.Lean.FVarId → _root_.Lean.Name → _root_.Lean.Expr → _root_.Lean.Expr → _root_.Bool → _root_.Lean.LocalDeclKind → Lean.LocalDecl
 -- role=substrate bucket=- structural=structure module=Lean.MetavarContext
@@ -1116,7 +1120,7 @@ structure Lean.StructureFieldInfo where
   binderInfo : _root_.Lean.BinderInfo
   autoParam? : _root_.Option _root_.Lean.Expr
 -- role=substrate bucket=- inductive module=Lean.Meta.Transform
-inductive Lean.TransformStep where
+inductive Lean.TransformStep : Type where
   | done : _root_.Lean.Expr → Lean.TransformStep
   | visit : _root_.Lean.Expr → Lean.TransformStep
   | «continue» : _root_.optParam (_root_.Option _root_.Lean.Expr) _root_.Option.none → Lean.TransformStep
@@ -1168,33 +1172,25 @@ axiom Std.DHashMap.Internal.Raw₀.inter.{u, v} : {α : Type u} → {β : α →
 -- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Internal.Defs
 axiom Std.DHashMap.Internal.Raw₀.modify.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.BEq α] → [_root_.Hashable α] → [_root_.LawfulBEq α] → _root_.Std.DHashMap.Internal.Raw₀ α β → (a : α) → (β a → β a) → _root_.Std.DHashMap.Internal.Raw₀ α β
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.BalancedTree.impl.{u, v} : {α : Type u} → {β : α → Type v} → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β → _root_.Std.DTreeMap.Internal.Impl α β
+axiom Std.DTreeMap.Internal.Impl.Const.alter.{u, v} : {α : Type u} → {β : Type v} → [_root_.Ord α] → α → (_root_.Option β → _root_.Option β) → (t : _root_.Std.DTreeMap.Internal.Impl α fun x => β) → t.Balanced → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α (fun x => β) (t.size - 1) (t.size + 1)
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.BalancedTree.mk.{u, v} : {α : Type u} → {β : α → Type v} → (impl : _root_.Std.DTreeMap.Internal.Impl α β) → impl.Balanced → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.Const.alter.{u, v} : {α : Type u} → {β : Type v} → [_root_.Ord α] → α → (_root_.Option β → _root_.Option β) → (t : _root_.Std.DTreeMap.Internal.Impl α fun x => β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α (fun x => β) t → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α (fun x => β) (@_root_.HSub.hSub _root_.Nat _root_.Nat _root_.Nat (@_root_.instHSub _root_.Nat _root_.instSubNat) (@_root_.Std.DTreeMap.Internal.Impl.size α (fun x => β) t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1)))) (@_root_.HAdd.hAdd _root_.Nat _root_.Nat _root_.Nat (@_root_.instHAdd _root_.Nat _root_.instAddNat) (@_root_.Std.DTreeMap.Internal.Impl.size α (fun x => β) t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1))))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.Const.mergeWith.{u, v} : {α : Type u} → {β : Type v} → [_root_.Ord α] → (α → β → β → β) → (t₁ : _root_.Std.DTreeMap.Internal.Impl α fun x => β) → (_root_.Std.DTreeMap.Internal.Impl α fun x => β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α (fun x => β) t₁ → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α fun x => β
+axiom Std.DTreeMap.Internal.Impl.Const.mergeWith.{u, v} : {α : Type u} → {β : Type v} → [_root_.Ord α] → (α → β → β → β) → (t₁ : _root_.Std.DTreeMap.Internal.Impl α fun x => β) → (_root_.Std.DTreeMap.Internal.Impl α fun x => β) → t₁.Balanced → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α fun x => β
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.SizedBalancedTree.impl.{u, v} : {α : Type u} → {β : α → Type v} → {lb ub : _root_.Nat} → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β lb ub → _root_.Std.DTreeMap.Internal.Impl α β
+axiom Std.DTreeMap.Internal.Impl.alter.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.Ord α] → [_root_.Std.LawfulEqOrd α] → (k : α) → (_root_.Option (β k) → _root_.Option (β k)) → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (t.size - 1) (t.size + 1)
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.SizedBalancedTree.mk.{u, v} : {α : Type u} → {β : α → Type v} → {lb ub : _root_.Nat} → (impl : _root_.Std.DTreeMap.Internal.Impl α β) → impl.Balanced → lb ≤ impl.size → impl.size ≤ ub → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β lb ub
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.alter.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.Ord α] → [@_root_.Std.LawfulEqOrd α inst] → (k : α) → (_root_.Option (β k) → _root_.Option (β k)) → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (@_root_.HSub.hSub _root_.Nat _root_.Nat _root_.Nat (@_root_.instHSub _root_.Nat _root_.instSubNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1)))) (@_root_.HAdd.hAdd _root_.Nat _root_.Nat _root_.Nat (@_root_.instHAdd _root_.Nat _root_.instAddNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1))))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.containsThenInsert.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Prod _root_.Bool (_root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.HAdd.hAdd _root_.Nat _root_.Nat _root_.Nat (@_root_.instHAdd _root_.Nat _root_.instAddNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1)))))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.containsThenInsertIfNew.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Prod _root_.Bool (_root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.HAdd.hAdd _root_.Nat _root_.Nat _root_.Nat (@_root_.instHAdd _root_.Nat _root_.instAddNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1)))))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.erase.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → α → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (@_root_.HSub.hSub _root_.Nat _root_.Nat _root_.Nat (@_root_.instHSub _root_.Nat _root_.instSubNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1)))) (@_root_.Std.DTreeMap.Internal.Impl.size α β t)
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.filter.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → ((a : α) → β a → _root_.Bool) → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.insert.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.HAdd.hAdd _root_.Nat _root_.Nat _root_.Nat (@_root_.instHAdd _root_.Nat _root_.instAddNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1))))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.insertIfNew.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.HAdd.hAdd _root_.Nat _root_.Nat _root_.Nat (@_root_.instHAdd _root_.Nat _root_.instAddNat) (@_root_.Std.DTreeMap.Internal.Impl.size α β t) (@_root_.OfNat.ofNat _root_.Nat (nat_lit 1) (_root_.instOfNatNat (nat_lit 1))))
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations pp=explicit
-axiom Std.DTreeMap.Internal.Impl.mergeWith.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.Ord α] → [@_root_.Std.LawfulEqOrd α inst] → ((a : α) → β a → β a → β a) → (t₁ : _root_.Std.DTreeMap.Internal.Impl α β) → _root_.Std.DTreeMap.Internal.Impl α β → @_root_.Std.DTreeMap.Internal.Impl.Balanced α β t₁ → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β
+axiom Std.DTreeMap.Internal.Impl.containsThenInsert.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Bool × _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β t.size (t.size + 1)
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
+axiom Std.DTreeMap.Internal.Impl.containsThenInsertIfNew.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Bool × _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β t.size (t.size + 1)
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
+axiom Std.DTreeMap.Internal.Impl.erase.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → α → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β (t.size - 1) t.size
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
+axiom Std.DTreeMap.Internal.Impl.filter.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → ((a : α) → β a → _root_.Bool) → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
+axiom Std.DTreeMap.Internal.Impl.insert.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β t.size (t.size + 1)
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
+axiom Std.DTreeMap.Internal.Impl.insertIfNew.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.Ord α] → (k : α) → β k → (t : _root_.Std.DTreeMap.Internal.Impl α β) → t.Balanced → _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β t.size (t.size + 1)
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
+axiom Std.DTreeMap.Internal.Impl.mergeWith.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.Ord α] → [_root_.Std.LawfulEqOrd α] → ((a : α) → β a → β a → β a) → (t₁ : _root_.Std.DTreeMap.Internal.Impl α β) → _root_.Std.DTreeMap.Internal.Impl α β → t₁.Balanced → _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β
 -- role=substrate bucket=- structural=structure module=Lean.Declaration
 structure Lean.AxiomVal where
   toConstantVal : _root_.Lean.ConstantVal
@@ -1266,7 +1262,7 @@ structure Lean.Meta.Ext.ExtTheorems where
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
 axiom Lean.Meta.Simp.Diagnostics : Type
 -- role=substrate bucket=- inductive module=Lean.Meta.Tactic.Simp.Types
-inductive Lean.Meta.Simp.Step where
+inductive Lean.Meta.Simp.Step : Type where
   | done : _root_.Lean.Meta.Simp.Result → Lean.Meta.Simp.Step
   | visit : _root_.Lean.Meta.Simp.Result → Lean.Meta.Simp.Step
   | «continue» : _root_.optParam (_root_.Option _root_.Lean.Meta.Simp.Result) _root_.Option.none → Lean.Meta.Simp.Step
@@ -1277,7 +1273,7 @@ axiom Lean.Meta.Simp.UsedSimps.mk : @_root_.Lean.PHashMap _root_.Lean.Meta.Origi
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
 axiom Lean.Meta.Simp.UsedSimps.size : _root_.Lean.Meta.Simp.UsedSimps → _root_.Nat
 -- role=substrate bucket=- inductive module=Lean.Meta.Tactic.Simp.SimpTheorems
-inductive Lean.Meta.SimpEntry where
+inductive Lean.Meta.SimpEntry : Type where
   | thm : _root_.Lean.Meta.SimpTheorem → Lean.Meta.SimpEntry
   | toUnfold : _root_.Lean.Name → Lean.Meta.SimpEntry
   | toUnfoldThms : _root_.Lean.Name → _root_.Array _root_.Lean.Name → Lean.Meta.SimpEntry
@@ -1335,18 +1331,10 @@ structure Lean.TheoremVal where
 axiom Lean.instInhabitedLocalDecl : _root_.Inhabited _root_.Lean.LocalDecl
 -- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Raw
 axiom Std.DHashMap.Raw.WF.{u, v} : {α : Type u} → {β : α → Type v} → [_root_.BEq α] → [_root_.Hashable α] → _root_.Std.DHashMap.Raw α β → Prop
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.BalancedTree.balanced_impl.{u, v} : ∀ {α : Type u} {β : α → Type v} (self : _root_.Std.DTreeMap.Internal.Impl.BalancedTree α β), self.impl.Balanced
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.SizedBalancedTree.balanced_impl.{u, v} : ∀ {α : Type u} {β : α → Type v} {lb ub : _root_.Nat} (self : _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β lb ub), self.impl.Balanced
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.SizedBalancedTree.lb_le_size_impl.{u, v} : ∀ {α : Type u} {β : α → Type v} {lb ub : _root_.Nat} (self : _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β lb ub), lb ≤ self.impl.size
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.Operations
-axiom Std.DTreeMap.Internal.Impl.SizedBalancedTree.size_impl_le_ub.{u, v} : ∀ {α : Type u} {β : α → Type v} {lb ub : _root_.Nat} (self : _root_.Std.DTreeMap.Internal.Impl.SizedBalancedTree α β lb ub), self.impl.size ≤ ub
 -- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Internal.WF.Defs
 axiom Std.DTreeMap.Internal.Impl.WF.{u, v} : {α : Type u} → [_root_.Ord α] → {β : α → Type v} → _root_.Std.DTreeMap.Internal.Impl α β → Prop
 -- role=substrate bucket=- inductive module=Lean.Declaration
-inductive Lean.ConstantInfo where
+inductive Lean.ConstantInfo : Type where
   | axiomInfo : _root_.Lean.AxiomVal → Lean.ConstantInfo
   | defnInfo : _root_.Lean.DefinitionVal → Lean.ConstantInfo
   | thmInfo : _root_.Lean.TheoremVal → Lean.ConstantInfo
@@ -1356,7 +1344,7 @@ inductive Lean.ConstantInfo where
   | ctorInfo : _root_.Lean.ConstructorVal → Lean.ConstantInfo
   | recInfo : _root_.Lean.RecursorVal → Lean.ConstantInfo
 -- role=substrate bucket=- inductive module=Lean.Declaration
-inductive Lean.Declaration where
+inductive Lean.Declaration : Type where
   | axiomDecl : _root_.Lean.AxiomVal → Lean.Declaration
   | defnDecl : _root_.Lean.DefinitionVal → Lean.Declaration
   | thmDecl : _root_.Lean.TheoremVal → Lean.Declaration
@@ -1602,7 +1590,7 @@ axiom Lean.ConstantInfo.levelParams : _root_.Lean.ConstantInfo → _root_.List _
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Declaration
 axiom Lean.ConstantInfo.toConstantVal : _root_.Lean.ConstantInfo → _root_.Lean.ConstantVal
 -- role=substrate bucket=- inductive module=Lean.Elab.InfoTree.Types
-inductive Lean.Elab.CompletionInfo where
+inductive Lean.Elab.CompletionInfo : Type where
   | dot : _root_.Lean.Elab.TermInfo → _root_.Option _root_.Lean.Expr → Lean.Elab.CompletionInfo
   | id : _root_.Lean.Syntax → _root_.Lean.Name → _root_.Bool → _root_.Lean.LocalContext → _root_.Option _root_.Lean.Expr → Lean.Elab.CompletionInfo
   | dotId : _root_.Lean.Syntax → _root_.Lean.Name → _root_.Lean.LocalContext → _root_.Option _root_.Lean.Expr → Lean.Elab.CompletionInfo
@@ -1668,8 +1656,9 @@ axiom Std.DTreeMap.inner.{u, v} : {α : Type u} → {β : α → Type v} → {cm
 axiom Std.DTreeMap.mk.{u, v} : {α : Type u} → {β : α → Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} → (inner : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.WF α (@_root_.Ord.mk α cmp) β inner → _root_.Std.DTreeMap α β cmp
 -- role=substrate bucket=- effect=pure module=Std.Data.HashMap.Basic
 axiom Std.HashMap.{u, v} : (α : Type u) → Type v → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
--- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
-axiom Std.TreeMap.{u, v} : (α : Type u) → Type v → _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap._auto_1 → Type (max u v)
+-- role=substrate bucket=- structural=structure module=Std.Data.TreeMap.Basic
+structure Std.TreeMap.{u, v} (α : Type u) (β : Type v) (cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap._auto_1) where
+  inner : _root_.Std.DTreeMap α (fun x => β) cmp
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
 axiom Lean.AsyncConstantInfo.toConstantVal : _root_.Lean.AsyncConstantInfo → _root_.Lean.ConstantVal
 -- role=substrate bucket=- structural=structure module=Lean.Elab.InfoTree.Types
@@ -1745,11 +1734,7 @@ axiom Std.HashMap.mk.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_
 structure Std.HashSet.{u} (α : Type u) [_root_.BEq α] [_root_.Hashable α] where
   inner : _root_.Std.HashMap α _root_.Unit
 -- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
-axiom Std.TreeMap.inner.{u, v} : {α : Type u} → {β : Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap._auto_1} → _root_.Std.TreeMap α β cmp → _root_.Std.DTreeMap α (fun x => β) cmp
--- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
 axiom Std.TreeMap.instEmptyCollection.{u, v} : {α : Type u} → {β : Type v} → {cmp : α → α → _root_.Ordering} → _root_.EmptyCollection (_root_.Std.TreeMap α β cmp)
--- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
-axiom Std.TreeMap.mk.{u, v} : {α : Type u} → {β : Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap._auto_1} → _root_.Std.DTreeMap α (fun x => β) cmp → _root_.Std.TreeMap α β cmp
 -- role=substrate bucket=- transparent module=Lean.Environment
 @[reducible] noncomputable def Lean.ConstMap : Type := _root_.Lean.SMap _root_.Lean.Name _root_.Lean.ConstantInfo
 -- role=substrate bucket=- structural=structure module=Lean.CoreM
@@ -1911,7 +1896,7 @@ structure Lean.Elab.DelabTermInfo where
   mkDocString? : _root_.Option (_root_.Lean.PPContext → _root_.IO _root_.String)
   explicit : _root_.Bool
 -- role=substrate bucket=- inductive module=Lean.Elab.InfoTree.Types
-inductive Lean.Elab.PartialContextInfo where
+inductive Lean.Elab.PartialContextInfo : Type where
   | commandCtx : _root_.Lean.Elab.CommandContextInfo → Lean.Elab.PartialContextInfo
   | parentDeclCtx : _root_.Lean.Name → Lean.Elab.PartialContextInfo
   | autoImplicitCtx : _root_.Array _root_.Lean.Expr → Lean.Elab.PartialContextInfo
@@ -1928,7 +1913,7 @@ axiom Lean.isRec : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.Mon
 -- role=demanded bucket=R-NONE effect=pure module=Lean.MonadEnv
 axiom Lean.setEnv : {m : Type → Type} → [_root_.Lean.MonadEnv m] → _root_.Lean.Environment → m _root_.Unit
 -- role=substrate bucket=- inductive module=Lean.Elab.InfoTree.Types
-inductive Lean.Elab.Info where
+inductive Lean.Elab.Info : Type where
   | ofTacticInfo : _root_.Lean.Elab.TacticInfo → Lean.Elab.Info
   | ofTermInfo : _root_.Lean.Elab.TermInfo → Lean.Elab.Info
   | ofPartialTermInfo : _root_.Lean.Elab.PartialTermInfo → Lean.Elab.Info
@@ -1980,7 +1965,7 @@ axiom Lean.Elab.Info.stx : _root_.Lean.Elab.Info → _root_.Lean.Syntax
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Main
 axiom Lean.Elab.Info.updateContext? : _root_.Option _root_.Lean.Elab.ContextInfo → _root_.Lean.Elab.Info → _root_.Option _root_.Lean.Elab.ContextInfo
 -- role=substrate bucket=- inductive module=Lean.Elab.InfoTree.Types
-inductive Lean.Elab.InfoTree where
+inductive Lean.Elab.InfoTree : Type where
   | context : _root_.Lean.Elab.PartialContextInfo → Lean.Elab.InfoTree → Lean.Elab.InfoTree
   | node : _root_.Lean.Elab.Info → _root_.Lean.PersistentArray Lean.Elab.InfoTree → Lean.Elab.InfoTree
   | hole : _root_.Lean.MVarId → Lean.Elab.InfoTree
@@ -2038,7 +2023,7 @@ class Lean.Elab.MonadInfoTree (m : Type → Type) where
   getInfoState : m _root_.Lean.Elab.InfoState
   modifyInfoState : (_root_.Lean.Elab.InfoState → _root_.Lean.Elab.InfoState) → m _root_.Unit
 -- role=substrate bucket=- inductive module=Lean.Message
-inductive Lean.MessageData where
+inductive Lean.MessageData : Type where
   | ofFormatWithInfos : _root_.Lean.FormatWithInfos → Lean.MessageData
   | ofGoal : _root_.Lean.MVarId → Lean.MessageData
   | ofWidget : _root_.Lean.Widget.WidgetInstance → Lean.MessageData → Lean.MessageData
@@ -2074,7 +2059,7 @@ structure Lean.Elab.Term.LevelMVarErrorInfo where
   ref : _root_.Lean.Syntax
   msgData? : _root_.Option _root_.Lean.MessageData
 -- role=substrate bucket=- inductive module=Lean.Elab.Term.TermElabM
-inductive Lean.Elab.Term.MVarErrorKind where
+inductive Lean.Elab.Term.MVarErrorKind : Type where
   | implicitArg : _root_.Lean.LocalContext → _root_.Lean.Expr → Lean.Elab.Term.MVarErrorKind
   | hole : Lean.Elab.Term.MVarErrorKind
   | custom : _root_.Lean.MessageData → Lean.Elab.Term.MVarErrorKind
@@ -2370,7 +2355,7 @@ axiom Lean.Elab.ContextInfo.runMetaM : {α : Type} → _root_.Lean.Elab.ContextI
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Simp
 axiom Lean.Elab.Tactic.mkSimpOnly : _root_.Lean.Syntax → _root_.Lean.Meta.Simp.UsedSimps → _root_.Lean.Meta.MetaM _root_.Lean.Syntax
 -- role=substrate bucket=- inductive module=Lean.Elab.Term.TermElabM
-inductive Lean.Elab.Term.SyntheticMVarKind where
+inductive Lean.Elab.Term.SyntheticMVarKind : Type where
   | typeClass : _root_.Option _root_.Lean.MessageData → Lean.Elab.Term.SyntheticMVarKind
   | coe : _root_.Option _root_.String → _root_.Lean.Expr → _root_.Lean.Expr → _root_.Option _root_.Lean.Expr → _root_.Option (_root_.Lean.MVarId → _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.MessageData) → Lean.Elab.Term.SyntheticMVarKind
   | tactic : _root_.Lean.Syntax → _root_.Lean.Elab.Term.SavedContext → _root_.Lean.Elab.Term.TacticMVarKind → _root_.optParam _root_.Bool _root_.Bool.false → Lean.Elab.Term.SyntheticMVarKind
@@ -2510,7 +2495,7 @@ structure Lean.Meta.Simp.SimprocEntry where
   toSimprocOLeanEntry : _root_.Lean.Meta.Simp.SimprocOLeanEntry
   proc : _root_.Lean.Meta.Simp.Simproc ⊕ _root_.Lean.Meta.Simp.DSimproc
 -- role=substrate bucket=- inductive module=Lean.Elab.Tactic.Simp
-inductive Lean.Elab.Tactic.Simp.DischargeWrapper where
+inductive Lean.Elab.Tactic.Simp.DischargeWrapper : Type where
   | default : Lean.Elab.Tactic.Simp.DischargeWrapper
   | custom : _root_.IO.Ref _root_.Lean.Elab.Term.State → _root_.Lean.Meta.Simp.Discharge → Lean.Elab.Tactic.Simp.DischargeWrapper
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
@@ -2543,11 +2528,11 @@ structure Lean.Elab.Tactic.TacticFinishedSnapshot where
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Simproc
 axiom Lean.Meta.Simp.getSimprocs : _root_.Lean.Core.CoreM _root_.Lean.Meta.Simp.Simprocs
 -- role=substrate bucket=- inductive module=Lean.Elab.Tactic.Simp
-inductive Lean.Elab.Tactic.ElabSimpArgResult where
+inductive Lean.Elab.Tactic.ElabSimpArgResult : Type where
   | addEntries : _root_.Array _root_.Lean.Meta.SimpEntry → Lean.Elab.Tactic.ElabSimpArgResult
   | addSimproc : _root_.Lean.Name → _root_.Bool → Lean.Elab.Tactic.ElabSimpArgResult
   | addLetToUnfold : _root_.Lean.FVarId → Lean.Elab.Tactic.ElabSimpArgResult
-  | ext : (ext₁? : _root_.Option _root_.Lean.Meta.SimpExtension) → (ext₂? : _root_.Option _root_.Lean.Meta.Simp.SimprocExtension) → (ext₁?.isSome || ext₂?.isSome) = _root_.Bool.true → Lean.Elab.Tactic.ElabSimpArgResult
+  | ext : (ext₁? : _root_.Option _root_.Lean.Meta.SimpExtension) → (ext₂? : _root_.Option _root_.Lean.Meta.Simp.SimprocExtension) → (_root_.Option.isSome ext₁? || _root_.Option.isSome ext₂?) = _root_.Bool.true → Lean.Elab.Tactic.ElabSimpArgResult
   | erase : _root_.Lean.Meta.Origin → Lean.Elab.Tactic.ElabSimpArgResult
   | eraseSimproc : _root_.Lean.Name → Lean.Elab.Tactic.ElabSimpArgResult
   | star : Lean.Elab.Tactic.ElabSimpArgResult
