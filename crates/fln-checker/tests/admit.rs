@@ -5695,6 +5695,32 @@ fn kr600_803_init_option_refuses_a_forged_extra_recursor_rule() {
 }
 
 #[test]
+fn kr600_803_init_option_some_refuses_a_forged_constructor_index() {
+    let mut entries = init_option_entries();
+    let constructor = entries[2].declaration();
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Option", "some"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Option"), 0, 1, 1),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_init_option_refuses_a_forged_num_parameters_count() {
     let mut entries = init_option_entries();
     let declaration = entries[3].declaration();
