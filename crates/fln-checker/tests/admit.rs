@@ -8239,6 +8239,38 @@ fn kr600_803_init_list_nil_refuses_a_forged_constructor_parameter_count() {
 }
 
 #[test]
+fn kr600_803_init_list_nil_refuses_a_forged_constructor_level_parameter_count() {
+    let mut entries = init_list_entries();
+    let constructor = entries[1].declaration();
+    let mut levels = constructor.level_parameters().to_vec();
+    levels.push(checker_name("v"));
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["List", "nil"]),
+        ConstantDeclaration::constructor(
+            levels,
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("List"), 0, 1, 0),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged List.nil constructor level-parameter count verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_init_list_cons_refuses_a_forged_constructor_field_count() {
     let mut entries = init_list_entries();
     let constructor = entries[2].declaration();
