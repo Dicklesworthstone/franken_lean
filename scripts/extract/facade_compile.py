@@ -87,6 +87,9 @@ the toolchain would report a perfect facade:
   * An EXACT-DEMAND SUMMARY JOIN makes the artifact's declared toolchain-api
     distinct-symbol count equal the union rebuilt for this rig's controls. A
     stale summary cannot misstate the compiled denominator.
+  * A CENSUS-COMPLETENESS SUMMARY JOIN requires the exact-demand artifact to
+    report an empty `census_missing` set. A demand denominator with known absent
+    census rows is not eligible for facade coverage evidence.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -166,6 +169,7 @@ def load_demand(path, part):
     by_module = defaultdict(set)
     modules = None
     declared_toolchain_api_demand = None
+    census_missing = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -180,6 +184,7 @@ def load_demand(path, part):
                     raise SystemExit(f"REFUSE: {path} has multiple summaries")
                 modules = row.get("curated_modules", [])
                 declared_toolchain_api_demand = row.get("toolchain_api_demanded")
+                census_missing = row.get("census_missing")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -211,6 +216,13 @@ def load_demand(path, part):
             or isinstance(declared_toolchain_api_demand, bool)):
         raise SystemExit(
             f"REFUSE: {path} summary has no integer toolchain_api_demanded count"
+        )
+    if not isinstance(census_missing, list) or census_missing:
+        detail = (", ".join(str(item) for item in census_missing[:8])
+                  if isinstance(census_missing, list) else repr(census_missing))
+        raise SystemExit(
+            "REFUSE: exact-demand census-completeness join found missing census "
+            f"rows ({detail})"
         )
     if uncensused:
         raise SystemExit(
@@ -252,6 +264,7 @@ def load_demand(path, part):
         "modules_with_demand": len(by_module),
         "toolchain_use_edges": sum(len(names) for names in by_module.values()),
         "toolchain_distinct_symbols": rebuilt_distinct,
+        "census_missing": 0,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
