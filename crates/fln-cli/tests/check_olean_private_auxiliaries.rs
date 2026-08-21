@@ -1095,6 +1095,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "mergeSortInternalMergeUnsafeRecResiduals",
+        2,
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateLoopMatchOneResiduals",
         1,
         &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"],
@@ -1618,6 +1627,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private List.MergeSort internal merge _unsafe_rec residuals",
+        "decoded _private List.MergeSort internal merge _unsafe_rec residual names",
+        2,
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
         ],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private .loop.match_1 residuals", "decoded _private .loop.match_1 residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"]);

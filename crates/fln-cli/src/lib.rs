@@ -3014,6 +3014,10 @@ fn is_merge_sort_companion_only_unsafe_rec_residual(display: &str) -> bool {
     MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS.contains(&display)
 }
 
+fn is_merge_sort_internal_merge_unsafe_rec_residual(display: &str) -> bool {
+    is_merge_sort_companion_only_unsafe_rec_residual(display) && !display.contains(".splitRevAt.")
+}
+
 fn is_private_loop_match_one_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -3520,6 +3524,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_merge_sort_companion_only_unsafe_rec_residual,
     );
+    let mut merge_sort_internal_merge_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    merge_sort_internal_merge_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_merge_sort_internal_merge_unsafe_rec_residual,
+    );
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3960,6 +3972,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut merge_sort_companion_only_unsafe_rec_residuals)
     };
+    let merge_sort_internal_merge_unsafe_rec_observed =
+        merge_sort_internal_merge_unsafe_rec_residuals.observed;
+    let merge_sort_internal_merge_unsafe_rec_omitted =
+        merge_sort_internal_merge_unsafe_rec_residuals.omitted();
+    let merge_sort_internal_merge_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut merge_sort_internal_merge_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut merge_sort_internal_merge_unsafe_rec_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -4120,6 +4141,7 @@ fn render_check_olean_success(
                 "\"privateGoResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"stringExtraUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"mergeSortCompanionOnlyUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"mergeSortInternalMergeUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4285,6 +4307,9 @@ fn render_check_olean_success(
             merge_sort_companion_only_unsafe_rec_observed,
             merge_sort_companion_only_unsafe_rec_names,
             merge_sort_companion_only_unsafe_rec_omitted,
+            merge_sort_internal_merge_unsafe_rec_observed,
+            merge_sort_internal_merge_unsafe_rec_names,
+            merge_sort_internal_merge_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -4482,6 +4507,9 @@ fn render_check_olean_success(
                 "decoded _private List.MergeSort companion-only _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private List.MergeSort companion-only _unsafe_rec residual names: {}\n",
                 "decoded _private List.MergeSort companion-only _unsafe_rec residual names omitted: {}\n",
+                "decoded _private List.MergeSort internal merge _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private List.MergeSort internal merge _unsafe_rec residual names: {}\n",
+                "decoded _private List.MergeSort internal merge _unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -4676,6 +4704,9 @@ fn render_check_olean_success(
             merge_sort_companion_only_unsafe_rec_observed,
             merge_sort_companion_only_unsafe_rec_names,
             merge_sort_companion_only_unsafe_rec_omitted,
+            merge_sort_internal_merge_unsafe_rec_observed,
+            merge_sort_internal_merge_unsafe_rec_names,
+            merge_sort_internal_merge_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -5465,6 +5496,16 @@ fn render_check_olean_set_success(
             is_merge_sort_companion_only_unsafe_rec_residual,
         );
     }
+    let mut merge_sort_internal_merge_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        merge_sort_internal_merge_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_merge_sort_internal_merge_unsafe_rec_residual,
+        );
+    }
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -5934,6 +5975,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut merge_sort_companion_only_unsafe_rec_residuals)
     };
+    let merge_sort_internal_merge_unsafe_rec_observed =
+        merge_sort_internal_merge_unsafe_rec_residuals.observed;
+    let merge_sort_internal_merge_unsafe_rec_omitted =
+        merge_sort_internal_merge_unsafe_rec_residuals.omitted();
+    let merge_sort_internal_merge_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut merge_sort_internal_merge_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut merge_sort_internal_merge_unsafe_rec_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -6100,6 +6150,7 @@ fn render_check_olean_set_success(
                 "\"privateGoResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"stringExtraUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"mergeSortCompanionOnlyUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"mergeSortInternalMergeUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -6267,6 +6318,9 @@ fn render_check_olean_set_success(
             merge_sort_companion_only_unsafe_rec_observed,
             merge_sort_companion_only_unsafe_rec_names,
             merge_sort_companion_only_unsafe_rec_omitted,
+            merge_sort_internal_merge_unsafe_rec_observed,
+            merge_sort_internal_merge_unsafe_rec_names,
+            merge_sort_internal_merge_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -6466,6 +6520,9 @@ fn render_check_olean_set_success(
                 "decoded _private List.MergeSort companion-only _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private List.MergeSort companion-only _unsafe_rec residual names: {}\n",
                 "decoded _private List.MergeSort companion-only _unsafe_rec residual names omitted: {}\n",
+                "decoded _private List.MergeSort internal merge _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private List.MergeSort internal merge _unsafe_rec residual names: {}\n",
+                "decoded _private List.MergeSort internal merge _unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -6662,6 +6719,9 @@ fn render_check_olean_set_success(
             merge_sort_companion_only_unsafe_rec_observed,
             merge_sort_companion_only_unsafe_rec_names,
             merge_sort_companion_only_unsafe_rec_omitted,
+            merge_sort_internal_merge_unsafe_rec_observed,
+            merge_sort_internal_merge_unsafe_rec_names,
+            merge_sort_internal_merge_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
