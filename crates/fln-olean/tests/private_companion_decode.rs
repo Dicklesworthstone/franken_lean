@@ -253,6 +253,11 @@ const OPTION_MAP_ID_MATCH_1_1_MODULE: &str = "Init/Data/Option/Basic";
 const PROD_SWAP_INJ_SIMP_1_1: &str = "_private.Init.Data.Prod.0.Prod.swap_inj._simp_1_1";
 /// The pin's private product companion stores this theorem in its module.
 const PROD_SWAP_INJ_SIMP_1_1_MODULE: &str = "Init/Data/Prod";
+/// The private match implementation for `Sum.lex_inr_inl`.
+const SUM_LEX_INR_INL_MATCH_1_1: &str =
+    "_private.Init.Data.Sum.Basic.0.Sum.lex_inr_inl.match_1_1";
+/// The pin's private sum companion stores this definition in Basic.
+const SUM_LEX_INR_INL_MATCH_1_1_MODULE: &str = "Init/Data/Sum/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1770,6 +1775,34 @@ fn prod_swap_inj_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {PROD_SWAP_INJ_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn sum_lex_inr_inl_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("sum_lex_inr_inl_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, SUM_LEX_INR_INL_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&SUM_LEX_INR_INL_MATCH_1_1.to_owned()),
+        "the private companion of {SUM_LEX_INR_INL_MATCH_1_1_MODULE} must retain \\
+         {SUM_LEX_INR_INL_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == SUM_LEX_INR_INL_MATCH_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {SUM_LEX_INR_INL_MATCH_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {SUM_LEX_INR_INL_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
