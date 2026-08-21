@@ -171,6 +171,11 @@ the toolchain would report a perfect facade:
     falsified Init-substrate checks. A claimed negative control cannot overlap
     the positive universe it is meant to falsify.
 
+  * A MANIFEST-PRINTER-TOTALITY JOIN requires every typed declaration to use
+    one recognized Reference printer mode, while Init-substrate rows carry
+    none. Rows outside the explicit-printer subset cannot lose rendering
+    provenance.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2141,6 +2146,37 @@ def main():
             f"({json.dumps(manifest_negative_control_join, sort_keys=True)}, "
             f"collisions={sorted(forbidden_decoy_names)!r})"
         )
+    unknown_printer_rows = []
+    init_printer_rows = []
+    manifest_printer_counts = Counter()
+    for row in manifest_rows:
+        printer = row.get("printer")
+        if row.get("role") == "init-substrate":
+            if printer is not None:
+                init_printer_rows.append(row["name"])
+            continue
+        if printer not in {"pp.fullNames", "pp.explicit", "pp.maxexplicit"}:
+            unknown_printer_rows.append(row["name"])
+            continue
+        manifest_printer_counts[printer] += 1
+    manifest_printer_totality_join = {
+        "typed_rows": manifest_signature_join["non_init_rows"],
+        "recognized_printer_rows": sum(manifest_printer_counts.values()),
+        "printers": dict(sorted(manifest_printer_counts.items())),
+        "init_rows": manifest_signature_join["init_rows"],
+        "init_rows_with_printer": len(init_printer_rows),
+        "unknown_printer_rows": len(unknown_printer_rows),
+    }
+    if (manifest_printer_totality_join["typed_rows"] == 0
+            or manifest_printer_totality_join["recognized_printer_rows"]
+            != manifest_printer_totality_join["typed_rows"]
+            or manifest_printer_totality_join["init_rows_with_printer"] != 0
+            or manifest_printer_totality_join["unknown_printer_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest printer-totality join failed "
+            f"({json.dumps(manifest_printer_totality_join, sort_keys=True)}, "
+            f"unknown={unknown_printer_rows[:8]!r}, init={init_printer_rows[:8]!r})"
+        )
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
      demand_printers, demand_type_dependencies,
      demand_level_parameters, demand_effects,
@@ -2316,6 +2352,7 @@ def main():
         "resistance_demand_join": resistance_demand_join,
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "manifest_negative_control_join": manifest_negative_control_join,
+        "manifest_printer_totality_join": manifest_printer_totality_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
