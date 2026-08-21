@@ -1754,6 +1754,10 @@ fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
     let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
     assert!(verdict.is_admitted(), "exact Init.And block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 3);
 }
 
 #[test]
