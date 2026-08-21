@@ -5371,6 +5371,130 @@ fn the_walk_helper_is_canonical_before_any_caller_sorts_it() {
     );
 }
 
+/// The 512 MB corpus cap is refused from `stat`, and it had never fired.
+///
+/// **A cap nobody has ever seen refuse anything.** `MAX_PINNED_OLEAN_BYTES` is
+/// read at two sites and, before this test, the only occurrences of the words
+/// `corpus cap` anywhere in `crates/` were the two message literals themselves.
+/// Nothing had ever produced either refusal, so the arithmetic, the comparison
+/// direction and the wording were all unobserved -- the same shape as the empty
+/// carve-out registry and the three unkillable sorts, and the reason a limit
+/// that has never fired is indistinguishable from one that cannot.
+///
+/// **Planting it costs nothing, which is why there was no excuse.** The per-part
+/// check reads `metadata.len()` -- the APPARENT size -- so `File::set_len` makes
+/// a half-gigabyte file that occupies no blocks at all. No corpus, no half a
+/// gigabyte of disk, no half a gigabyte of memory: the refusal happens before
+/// `fs::read` is reached, so nothing ever materialises those bytes. The
+/// sparseness is asserted rather than assumed on unix, because "this fixture is
+/// free" is the claim that decides whether it is safe to leave behind in a tree
+/// that nothing sweeps.
+///
+/// **What this does NOT show, said plainly so nobody reads it as more.**
+///
+/// It does not show the check runs BEFORE the read. Both caps use the same
+/// constant, so the per-part check refuses nothing the aggregate would not also
+/// refuse; its whole value is that it refuses without allocating, and a version
+/// that checked after `fs::read` would return the same `Err` and pass every
+/// assertion here. Distinguishing them needs an observation of allocation or of
+/// a file whose read fails while its stat succeeds, and neither is portable.
+///
+/// It does not pin the comparison DIRECTION. The test file is one byte over, so
+/// `>` and `>=` both refuse it. A cell for exactly `MAX_PINNED_OLEAN_BYTES` would
+/// separate them, and it would have to read half a gigabyte of zeros into a
+/// `Vec` in a test binary that runs its tests in parallel. That is the price, and
+/// it is why the boundary is disclosed rather than tested.
+///
+/// It does not touch the AGGREGATE cap at the second site. That one sums three
+/// decoded parts, so firing it needs a module whose public, server and private
+/// parts all parse -- a corpus artifact, not a fixture tree. It stays unobserved,
+/// and what would produce it is a decodable three-part module fixture, not more
+/// argument.
+#[test]
+fn an_over_cap_module_part_is_refused_and_the_refusal_names_both_numbers() {
+    let library = write_inventory_fixture("t6r7-sparse-over-cap-v1", &[]);
+    let over_cap = library.join("Huge.olean");
+
+    // SPARSE, NOT WRITTEN. `set_len` sets the size and allocates nothing; the
+    // file is created or re-truncated on every run and never removed, like every
+    // other fixture here.
+    let handle = fs::File::create(&over_cap)
+        .unwrap_or_else(|error| panic!("create {}: {error}", over_cap.display()));
+    handle
+        .set_len(MAX_PINNED_OLEAN_BYTES + 1)
+        .unwrap_or_else(|error| panic!("size {}: {error}", over_cap.display()));
+    drop(handle);
+
+    // ANTI-VACUITY ON THE FIXTURE, BOTH WAYS. The apparent size must really be
+    // one byte over -- a `set_len` that silently did nothing would leave an
+    // empty file, which is under the cap and would make the refusal below
+    // impossible to explain -- and the file must really be sparse, or this test
+    // has quietly started costing half a gigabyte per run.
+    let metadata = fs::metadata(&over_cap)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", over_cap.display()));
+    assert_eq!(
+        metadata.len(),
+        MAX_PINNED_OLEAN_BYTES + 1,
+        "the fixture must be exactly one byte over the cap, or the refusal below is about a \
+         different number than this test claims"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let allocated = metadata.blocks() * 512;
+        assert!(
+            allocated < 1024 * 1024,
+            "the over-cap fixture allocated {allocated} bytes on disk. It is supposed to be a \
+             hole: `set_len` reserves no blocks, and a fixture that nothing sweeps must not leave \
+             half a gigabyte behind on every host that runs this suite"
+        );
+    }
+
+    // Matched rather than `expect_err`: the `Ok` arm holds the file's CONTENTS,
+    // and formatting it would print half a gigabyte of zeros into the failure
+    // log at the exact moment the cap stopped working.
+    let reason = match read_corpus_module_part(&over_cap) {
+        Err(reason) => reason,
+        Ok(bytes) => panic!(
+            "a part {} bytes over the {MAX_PINNED_OLEAN_BYTES}-byte cap was read anyway, {} \
+             bytes of it",
+            metadata.len() - MAX_PINNED_OLEAN_BYTES,
+            bytes.len()
+        ),
+    };
+
+    // BOTH NUMBERS, SEPARATELY. A refusal naming only the cap leaves the reader
+    // to stat the file, and one naming only the size leaves them to find the cap
+    // in the source; the whole point of the message is that neither trip is
+    // necessary.
+    assert!(
+        reason.contains(&metadata.len().to_string()),
+        "the refusal must name the size the file actually is: {reason}"
+    );
+    assert!(
+        reason.contains(&MAX_PINNED_OLEAN_BYTES.to_string()),
+        "the refusal must name the cap it exceeded: {reason}"
+    );
+    assert!(
+        reason.contains("Huge.olean"),
+        "the refusal must name the file, or on a corpus-scale sweep it says only that SOMETHING \
+         was too big: {reason}"
+    );
+
+    // GREEN CONTROL. An ordinary part must still be read, and its bytes returned
+    // unchanged -- without this the cap could be refusing everything and every
+    // assertion above would still hold.
+    let ordinary = library.join("Small.olean");
+    fs::write(&ordinary, b"not-really-an-olean")
+        .unwrap_or_else(|error| panic!("write {}: {error}", ordinary.display()));
+    assert_eq!(
+        read_corpus_module_part(&ordinary)
+            .unwrap_or_else(|reason| panic!("a small part must be read: {reason}")),
+        b"not-really-an-olean",
+        "the reader must return the file's bytes; the cap is a limit, not a filter"
+    );
+}
+
 /// Add a symlink to a fixture tree, idempotently and without removing anything.
 ///
 /// `symlink` fails with `AlreadyExists` on a second run, and these fixtures are
