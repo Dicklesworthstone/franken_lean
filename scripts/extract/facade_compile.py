@@ -1860,6 +1860,16 @@ def main():
             "REFUSE: facade manifest instance-priority probe pin diverges "
             f"({json.dumps(instance_priorities_probed_pin_join, sort_keys=True)})"
         )
+    kind_probed_pin_join = {
+        "summary_kind_probed": manifest_summary.get("kind_probed"),
+        "pinned_kind_probed": 2042,
+    }
+    if (kind_probed_pin_join["summary_kind_probed"]
+            != kind_probed_pin_join["pinned_kind_probed"]):
+        raise SystemExit(
+            "REFUSE: facade manifest declaration-kind probe pin diverges "
+            f"({json.dumps(kind_probed_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2959,6 +2969,7 @@ def main():
         "manifest_instance_priorities_probed_pin_join": (
             instance_priorities_probed_pin_join
         ),
+        "manifest_kind_probed_pin_join": kind_probed_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
