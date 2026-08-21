@@ -236,6 +236,16 @@ open Lean in
           | none => pure "-"))
       IO.println s!"RESHEAD\t{n}\t{rh}"
       IO.println s!"EXTERN\t{n}\t{isExtern env n}"
+      let knd := match info with
+        | ConstantInfo.axiomInfo _ => "axiom"
+        | ConstantInfo.defnInfo _ => "def"
+        | ConstantInfo.thmInfo _ => "theorem"
+        | ConstantInfo.opaqueInfo _ => "opaque"
+        | ConstantInfo.quotInfo _ => "quot"
+        | ConstantInfo.inductInfo _ => "inductive"
+        | ConstantInfo.ctorInfo _ => "ctor"
+        | ConstantInfo.recInfo _ => "rec"
+      IO.println s!"KIND\t{n}\t{knd}"
       match Compiler.getImplementedBy? env n with
       | some t => IO.println s!"IMPLBY\t{n}\t{t}"
       | none => pure ()
@@ -394,6 +404,7 @@ def probe(lean, env, work, names):
     priorities = {}
     extern_of = {}
     impl_by = {}
+    kind_of = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -417,6 +428,10 @@ def probe(lean, env, work, names):
         elif line.startswith("SAFE\t"):
             _, name, status = line.split("\t", 2)
             safety_status[name] = status.strip()
+            current = None
+        elif line.startswith("KIND\t"):
+            _, name, knd = line.split("\t", 2)
+            kind_of[name] = knd.strip()
             current = None
         elif line.startswith("IMPLBY\t"):
             _, name, target = line.split("\t", 2)
@@ -472,7 +487,8 @@ def probe(lean, env, work, names):
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
-            module_of, struct_fields, res_head, priorities, extern_of, impl_by)
+            module_of, struct_fields, res_head, priorities, extern_of, impl_by,
+            kind_of)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -865,6 +881,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_priority = {}
     pin_extern = {}
     pin_impl_by = {}
+    pin_kind = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -883,7 +900,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds, rh, prio, ext, iby) = probe(
+         rd, sfy, mod, flds, rh, prio, ext, iby, knd) = probe(
             lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
@@ -896,6 +913,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_priority.update(prio)
         pin_extern.update(ext)
         pin_impl_by.update(iby)
+        pin_kind.update(knd)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -928,7 +946,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
             pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head,
-            pin_priority, pin_extern, pin_impl_by)
+            pin_priority, pin_extern, pin_impl_by, pin_kind)
 
 
 def order(names, deps):
@@ -1270,7 +1288,8 @@ def main():
      rounds, structs, binders, absent_projections, pbinders,
      pin_reducibility, pin_safety, pin_module,
      pin_fields, pin_res_head, pin_priority, pin_extern,
-     pin_impl_by) = close_over_types(lean, env, work, facade_demand, census)
+     pin_impl_by, pin_kind) = close_over_types(
+        lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -1339,6 +1358,16 @@ def main():
     # reconciled against the pin instead of left as two numbers that look like a
     # contradiction.
     impl_by_disagreements = []
+    # WHAT KIND OF DECLARATION DOES THE REFERENCE ACTUALLY HAVE? Some kinds are not
+    # ordinary constants at all: a CONSTRUCTOR and a RECURSOR come from an
+    # inductive and carry the kernel's iota-reduction, and `quot` constants are
+    # kernel primitives. The facade declares such a row as a plain `axiom`, which
+    # has the right TYPE and none of that computation — `Expr.rec` applied to a
+    # constructor reduces in the Reference and is stuck here. Every check landed so
+    # far is blind to it, because every one of them is about types and names. The
+    # kind is now measured, carried per row, and the axiom-declared kernel-special
+    # rows are counted as their own disclosed class.
+    kind_disagreements = []
 
     def is_reducible(n):
         pin = pin_reducibility.get(n)
@@ -1348,6 +1377,17 @@ def main():
                 in ((census.get(n) or {}).get("attrs") or ""))
 
     for n in sorted(types):
+        pin_k = pin_kind.get(n)
+        krow = census.get(n) or {}
+        census_k = krow.get("kind")
+        if pin_k and census_k:
+            # the census spells these its own way; compare the families that map
+            KIND_MAP = {"defn": "def", "thm": "theorem", "induct": "inductive",
+                        "axiom": "axiom", "opaque": "opaque", "quot": "quot",
+                        "ctor": "ctor", "rec": "rec"}
+            if KIND_MAP.get(census_k, census_k) != pin_k:
+                kind_disagreements.append(
+                    {"name": n, "census": census_k, "pin": pin_k})
         pin_ib = pin_impl_by.get(n)
         ibrow = census.get(n) or {}
         if "impl_by" in ibrow:
@@ -1425,7 +1465,7 @@ def main():
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
          pb2, rd2, sfy2, mod2, flds2, rh2, prio2, ext2,
-         iby2) = close_over_types(lean, env, work, extra, census)
+         iby2, knd2) = close_over_types(lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
@@ -1438,6 +1478,7 @@ def main():
         pin_priority.update(prio2)
         pin_extern.update(ext2)
         pin_impl_by.update(iby2)
+        pin_kind.update(knd2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -2122,6 +2163,19 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "kind_probed": len(pin_kind),
+        "kind_census_disagreements": kind_disagreements,
+        "kernel_special_as_axiom": sorted(
+            n for n in emitted_set
+            if pin_kind.get(n) in ("ctor", "rec", "quot")
+            and n not in provided and n not in structural and n not in transparent),
+        "kernel_special_note": "a constructor or recursor carries the kernel's "
+            "iota-reduction and a quot constant is a kernel primitive; declared as "
+            "a plain `axiom` the row has the right TYPE and none of the "
+            "computation, so `Expr.rec` applied to a constructor reduces in the "
+            "Reference and is stuck in the facade. Every other check here is about "
+            "names and types and cannot see it, which is why the class is counted "
+            "and named rather than left implicit.",
         "implemented_by_probed": len(pin_extern),
         "implemented_by_rows": sorted(pin_impl_by),
         "implemented_by_census_disagreements": impl_by_disagreements,
@@ -2267,6 +2321,7 @@ def main():
             "safety": pin_safety.get(name, d["safety"]),
             "extern": pin_extern.get(name),
             "implemented_by": pin_impl_by.get(name),
+            "pin_kind": pin_kind.get(name),
             "extern_source": "pin" if name in pin_extern else None,
             "safety_source": "pin" if name in pin_safety else "census",
             "module": pin_module.get(name, d["module"]),
@@ -2333,6 +2388,7 @@ def main():
           f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
           f"values={values_checked} "
+          f"kind={len(pin_kind)} kind_drift={len(kind_disagreements)} "
           f"implby={len(pin_impl_by)} implby_drift={len(impl_by_disagreements)} "
           f"ext_probed={len(pin_extern)}"
           f"/{sum(1 for v in pin_extern.values() if v)}extern "
