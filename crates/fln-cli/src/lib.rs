@@ -61,6 +61,8 @@ const LEAN_NAME_HASH_PROOF_RESIDUAL_PREFIX: &str =
     "_private.Init.Prelude.0.Lean.Name.hash._proof_";
 const LEAN_NAME_BEQ_MATCH_RESIDUAL_PREFIX: &str =
     "_private.Init.Prelude.0.Lean.Name.beq.match_";
+const LIST_TO_ARRAY_AUX_MATCH_RESIDUAL_PREFIX: &str =
+    "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_";
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -2767,6 +2769,12 @@ fn is_lean_name_beq_match_residual(display: &str) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+fn is_list_to_array_aux_match_residual(display: &str) -> bool {
+    display
+        .strip_prefix(LIST_TO_ARRAY_AUX_MATCH_RESIDUAL_PREFIX)
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn is_private_loop_match_one_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -2934,6 +2942,12 @@ fn render_check_olean_success(
     };
     lean_name_beq_match_residuals
         .observe_matching(&checked.decoded.constants, is_lean_name_beq_match_residual);
+    let mut list_to_array_aux_match_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    list_to_array_aux_match_residuals
+        .observe_matching(&checked.decoded.constants, is_list_to_array_aux_match_residual);
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3040,6 +3054,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut lean_name_beq_match_residuals)
     };
+    let list_to_array_aux_match_observed = list_to_array_aux_match_residuals.observed;
+    let list_to_array_aux_match_omitted = list_to_array_aux_match_residuals.omitted();
+    let list_to_array_aux_match_names = if json {
+        render_named_residuals_json(&mut list_to_array_aux_match_residuals)
+    } else {
+        render_named_residuals_human(&mut list_to_array_aux_match_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -3094,6 +3115,7 @@ fn render_check_olean_success(
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3139,6 +3161,9 @@ fn render_check_olean_success(
             lean_name_beq_match_observed,
             lean_name_beq_match_names,
             lean_name_beq_match_omitted,
+            list_to_array_aux_match_observed,
+            list_to_array_aux_match_names,
+            list_to_array_aux_match_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3198,6 +3223,9 @@ fn render_check_olean_success(
                 "decoded _private Lean.Name.beq.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Lean.Name.beq.match_N residual names: {}\n",
                 "decoded _private Lean.Name.beq.match_N residual names omitted: {}\n",
+                "decoded _private List.toArrayAux.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private List.toArrayAux.match_N residual names: {}\n",
+                "decoded _private List.toArrayAux.match_N residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -3254,6 +3282,9 @@ fn render_check_olean_success(
             lean_name_beq_match_observed,
             lean_name_beq_match_names,
             lean_name_beq_match_omitted,
+            list_to_array_aux_match_observed,
+            list_to_array_aux_match_names,
+            list_to_array_aux_match_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3684,6 +3715,14 @@ fn render_check_olean_set_success(
         lean_name_beq_match_residuals
             .observe_matching(&module.decoded.constants, is_lean_name_beq_match_residual);
     }
+    let mut list_to_array_aux_match_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        list_to_array_aux_match_residuals
+            .observe_matching(&module.decoded.constants, is_list_to_array_aux_match_residual);
+    }
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3800,6 +3839,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut lean_name_beq_match_residuals)
     };
+    let list_to_array_aux_match_observed = list_to_array_aux_match_residuals.observed;
+    let list_to_array_aux_match_omitted = list_to_array_aux_match_residuals.omitted();
+    let list_to_array_aux_match_names = if json {
+        render_named_residuals_json(&mut list_to_array_aux_match_residuals)
+    } else {
+        render_named_residuals_human(&mut list_to_array_aux_match_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -3860,6 +3906,7 @@ fn render_check_olean_set_success(
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3907,6 +3954,9 @@ fn render_check_olean_set_success(
             lean_name_beq_match_observed,
             lean_name_beq_match_names,
             lean_name_beq_match_omitted,
+            list_to_array_aux_match_observed,
+            list_to_array_aux_match_names,
+            list_to_array_aux_match_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3968,6 +4018,9 @@ fn render_check_olean_set_success(
                 "decoded _private Lean.Name.beq.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Lean.Name.beq.match_N residual names: {}\n",
                 "decoded _private Lean.Name.beq.match_N residual names omitted: {}\n",
+                "decoded _private List.toArrayAux.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private List.toArrayAux.match_N residual names: {}\n",
+                "decoded _private List.toArrayAux.match_N residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -4026,6 +4079,9 @@ fn render_check_olean_set_success(
             lean_name_beq_match_observed,
             lean_name_beq_match_names,
             lean_name_beq_match_omitted,
+            list_to_array_aux_match_observed,
+            list_to_array_aux_match_names,
+            list_to_array_aux_match_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,

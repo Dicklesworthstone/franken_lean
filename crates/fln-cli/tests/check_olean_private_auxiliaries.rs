@@ -167,6 +167,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "beq",
         "match_1",
     ]);
+    let list_to_array_aux_match_residual = fln::Name::from_components([
+        "_private",
+        "Init",
+        "Data",
+        "List",
+        "ToArrayImpl",
+        "0",
+        "List",
+        "toArrayAux",
+        "match_1",
+    ]);
     let core_observables_head_loop_unsafe_rec_residual = fln::Name::from_components([
         "_private",
         "Init",
@@ -258,6 +269,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
     private_constants.push(axiom(
+        list_to_array_aux_match_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
         core_observables_head_loop_unsafe_rec_residual,
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
@@ -301,7 +316,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":18"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":19"));
     assert!(json.stdout.contains(
         "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
     ));
@@ -309,7 +324,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"coreObservablesLoopResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateEqDefMatchResiduals\":{\"observed\":5,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateEqDefMatchResiduals\":{\"observed\":6,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateEqNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_1\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -331,6 +346,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     ));
     assert!(json.stdout.contains(
         "\"leanNameBeqMatchResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
+        "\"listToArrayAuxMatchResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -355,7 +373,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 18 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 19 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
         "decoded _private.loop auxiliaries: 7 (reporting only; not a G1 claim)"
@@ -376,10 +394,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("core-observables .loop residual names omitted: 0"));
     assert!(human.stdout.contains(
-        "decoded _private eq_def/match_N residuals: 5 (decoded companion names; reporting only; not a G1 claim)"
+        "decoded _private eq_def/match_N residuals: 6 (decoded companion names; reporting only; not a G1 claim)"
     ));
     assert!(human.stdout.contains(
-        "decoded _private eq_def/match_N residual names: _private.CliPrivateReport.0.eq_def, _private.CliPrivateReport.0.loop.eq_def, _private.CliPrivateReport.0.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"
+        "decoded _private eq_def/match_N residual names: _private.CliPrivateReport.0.eq_def, _private.CliPrivateReport.0.loop.eq_def, _private.CliPrivateReport.0.match_1, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"
     ));
     assert!(human
         .stdout
@@ -447,6 +465,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private Lean.Name.beq.match_N residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private List.toArrayAux.match_N residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private List.toArrayAux.match_N residual names: _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"));
+    assert!(human
+        .stdout
+        .contains("decoded _private List.toArrayAux.match_N residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private .loop.match_1 residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
