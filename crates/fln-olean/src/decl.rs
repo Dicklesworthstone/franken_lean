@@ -2468,6 +2468,125 @@ mod tests {
         );
     }
 
+    /// One axiom whose type is a natural-number LITERAL, so the region contains
+    /// a `Literal` object.
+    ///
+    /// No existing fixture reaches `decode_literal` at all: they are built from
+    /// sorts and binders, and `Expr.lit` is the only constructor that carries a
+    /// literal. The type being a literal is nonsense as Lean, and deliberately
+    /// so — this exercises a decode shape, not an elaboration.
+    fn literal_expr_module() -> Vec<u8> {
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "lit"]),
+                        level_params: Vec::new(),
+                        type_: Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+                    },
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `Literal` that is neither `natVal` nor `strVal` is refused.
+    ///
+    /// This completes `Literal`, whose decode has exactly one rule, the way
+    /// 80dc4134 and ebfd2d85 completed `Level` and `Expr`.
+    ///
+    /// SHADOWING CHECKED. `decode_literal` has no size bind of its own — none
+    /// of the object-size rules from waves 47-57 reach it — and the
+    /// constructor match is the first thing it does with the header. The
+    /// enclosing `Expr.lit` object is untouched by the plant, so the Expr
+    /// constructor, arity and size rules cannot fire either; the cell asserts
+    /// that header afterwards.
+    #[test]
+    fn a_literal_that_is_neither_nat_nor_str_is_refused() {
+        let mut bytes = literal_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified literal fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let lit_expr_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("lit expression");
+
+        let (expr_tag, expr_other, expr_cs) =
+            view.obj_header(lit_expr_off).expect("Expr.lit header");
+        assert_eq!(expr_tag, 9, "Expr.lit");
+        assert!(
+            DeclDecoder::expr_child_slots(expr_tag).is_empty(),
+            "its slot holds a Literal, not an Expr child"
+        );
+
+        // Slot 0 is the Literal itself.
+        let lit_off = view
+            .deref(view.read_u64(lit_expr_off + 8).expect("literal pointer"))
+            .expect("Literal object");
+        let (tag, other, cs_sz) = view.obj_header(lit_off).expect("Literal header");
+        assert_eq!((tag, other), (0, 1), "Literal.natVal carrying one payload");
+
+        // Claim a third constructor. Arity and size are left alone.
+        let header = view.read_u64(lit_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (2_u64 << 56);
+        bytes[lit_off as usize..lit_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(lit_off).expect("header after plant"),
+            (2, other, cs_sz),
+            "only the tag moved"
+        );
+        assert_eq!(
+            view.obj_header(lit_expr_off).expect("owner header"),
+            (expr_tag, expr_other, expr_cs),
+            "and the enclosing Expr.lit is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a literal with an unknown constructor must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Literal ctor",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// An `Expr` whose constructor tag is outside `0..=11` is refused.
     ///
     /// This completes the Shape rules for `Expr`, as 80dc4134 did for `Level`:
