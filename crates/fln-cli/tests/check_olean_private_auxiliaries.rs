@@ -373,6 +373,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateSunfoldResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
+        "\"privateUnsafeRecResiduals\":{\"observed\":4,\"names\":[{\"name\":\"_private.CliPrivateReport.0._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.mergeSortTR._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
         "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
@@ -496,6 +499,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private _sunfold residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private _unsafe_rec residuals: 4 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private _unsafe_rec residual names: _private.CliPrivateReport.0._unsafe_rec, _private.CliPrivateReport.0.mergeSortTR._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private _unsafe_rec residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private .loop._proof_* residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
