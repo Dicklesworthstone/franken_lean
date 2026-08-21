@@ -4886,6 +4886,153 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// Per-module counts ACCUMULATE into a corpus total, families included.
+///
+/// **The one production function on this path with no coverage at all.**
+/// `CorpusCounts::add` has exactly one call site -- inside the corpus driver,
+/// which needs a corpus this host does not have -- so the family merge has never
+/// executed anywhere. Every other test on this bead builds a `CorpusCounts`
+/// directly and asserts over it; none of them ever adds two together, which is
+/// what the lane does once per module for thousands of modules.
+///
+/// **Its failure modes are all quiet at the point of the mistake.** `insert`
+/// instead of `+=` would make a shared family's total equal the LAST module's
+/// count rather than the sum. Merging `restrictive_families` and forgetting
+/// `no_answer_families` -- two near-identical loops, easy to write once -- would
+/// drop most of the corpus's non-answers. Both would be caught eventually by
+/// `assert_conservation` on the total, but only at corpus scale, hours into a run
+/// nobody can currently perform, and reported as a conservation violation rather
+/// than as an accumulator bug.
+///
+/// **The two populations are shaped to discriminate.** They SHARE one family, so
+/// an overwriting merge produces a visibly wrong number rather than a plausible
+/// one; and each carries a family the other lacks, so a merge that dropped either
+/// side loses something nameable. Both conditions are asserted before the merge
+/// is checked, because a merge tested on disjoint or identical censuses proves
+/// almost nothing.
+#[test]
+fn per_module_counts_accumulate_into_a_total_including_their_families() {
+    // The sizes come off two real trees, so the totals below are the sum of two
+    // things that were actually walked rather than two numbers chosen to add up.
+    let first_library =
+        write_inventory_fixture("t6r7-accumulate-a-v1", &["One.olean", "Two.olean"]);
+    let second_library = write_inventory_fixture(
+        "t6r7-accumulate-b-v1",
+        &["Alpha.olean", "Beta/Gamma.olean", "Delta.olean"],
+    );
+    let first_walk = walk_olean_inventory(&first_library, Some("A"))
+        .unwrap_or_else(|reason| panic!("walk the first fixture: {reason}"));
+    let second_walk = walk_olean_inventory(&second_library, Some("B"))
+        .unwrap_or_else(|reason| panic!("walk the second fixture: {reason}"));
+    let (first_seen, second_seen) = (
+        first_walk.modules.len() as u64,
+        second_walk.modules.len() as u64,
+    );
+    assert_eq!((first_seen, second_seen), (2, 3));
+
+    // A module whose import context could not be rebuilt: everything decoded,
+    // nothing compared, every row a non-answer under one family.
+    let mut first = CorpusCounts {
+        decoded: first_seen,
+        unscorable: first_seen,
+        subject_no_answer: first_seen,
+        ..CorpusCounts::default()
+    };
+    first
+        .no_answer_families
+        .insert(FAMILY_UNFAITHFUL_IMPORT_CONTEXT.to_string(), first_seen);
+    first.assert_conservation("first module");
+
+    // A module that was partly compared, found one restrictive divergence, and
+    // could not answer for the rest.
+    let mut second = CorpusCounts {
+        decoded: second_seen,
+        compared: 1,
+        restrictive_without_carve_out: 1,
+        unscorable: 2,
+        subject_no_answer: 2,
+        ..CorpusCounts::default()
+    };
+    second
+        .restrictive_families
+        .insert("rejected:BlockMismatch".to_string(), 1);
+    second
+        .no_answer_families
+        .insert(FAMILY_UNFAITHFUL_IMPORT_CONTEXT.to_string(), 1);
+    second
+        .no_answer_families
+        .insert("inconclusive:Steps".to_string(), 1);
+    second.assert_conservation("second module");
+
+    // ANTI-VACUITY on the merge's inputs, before the merge is checked.
+    assert!(
+        first
+            .no_answer_families
+            .contains_key(FAMILY_UNFAITHFUL_IMPORT_CONTEXT)
+            && second
+                .no_answer_families
+                .contains_key(FAMILY_UNFAITHFUL_IMPORT_CONTEXT),
+        "the two censuses must SHARE a family, or an overwriting merge is indistinguishable from \
+         a summing one"
+    );
+    assert!(
+        !second.no_answer_families.is_empty()
+            && second
+                .no_answer_families
+                .keys()
+                .any(|family| !first.no_answer_families.contains_key(family)),
+        "the second census must carry a family the first lacks, or a merge that dropped one side \
+         would still look complete"
+    );
+    assert!(
+        first.restrictive_families.is_empty() && !second.restrictive_families.is_empty(),
+        "exactly one side must carry a restrictive family, so a dropped merge is nameable"
+    );
+
+    let mut total = CorpusCounts::default();
+    total.add(&first);
+    total.add(&second);
+
+    assert_eq!(total.decoded, first_seen + second_seen);
+    assert_eq!(total.compared, 1);
+    assert_eq!(total.restrictive_without_carve_out, 1);
+    assert_eq!(total.subject_no_answer, first_seen + 2);
+
+    // THE SHARED FAMILY SUMS. Overwriting would leave 1 here, dropping the
+    // second side would leave 2, and both are plausible-looking numbers.
+    assert_eq!(
+        total
+            .no_answer_families
+            .get(FAMILY_UNFAITHFUL_IMPORT_CONTEXT)
+            .copied(),
+        Some(first_seen + 1),
+        "the family both modules reported must be the SUM of what each reported: {:?}",
+        total.no_answer_families
+    );
+    // The families only one side reported must survive the merge.
+    assert_eq!(
+        total.no_answer_families.get("inconclusive:Steps").copied(),
+        Some(1)
+    );
+    assert_eq!(
+        total
+            .restrictive_families
+            .get("rejected:BlockMismatch")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(
+        total.no_answer_families.len(),
+        2,
+        "the merged census gained or lost a family: {:?}",
+        total.no_answer_families
+    );
+
+    // The live law over the accumulated population, which is the thing the lane
+    // actually asserts once per module and once over the corpus.
+    total.assert_conservation("accumulated corpus");
+}
+
 /// The census is CANONICAL: two runs that saw the same families produce
 /// byte-identical rows, whatever order the families were first seen in.
 ///
