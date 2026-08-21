@@ -6267,3 +6267,128 @@ fn reading_the_private_part_changes_bodies_and_never_types() {
         );
     }
 }
+
+/// The import graph over `Init` is closed, acyclic, and has exactly ONE root —
+/// which is the premise the reference-closure cell rests on and never
+/// established.
+///
+/// The closure cell computes `Init/Prelude`'s reference closure precisely
+/// because that module imports nothing, and the import cell asserts it imports
+/// nothing. Neither asks whether it is the ONLY such module. It is, and that
+/// changes what the closure result means: "the import-free root module" is a
+/// definite description over the pin rather than a property `Init.Prelude`
+/// happens to share with others, so the closure is not a sample of a class — it
+/// is the only place the question can be asked without an import closure.
+///
+/// Measured over all 600 `Init` modules and their 3,153 import edges:
+///
+///   ZERO edges name a module outside `Init`, so the graph below is the whole
+///     graph and not a subgraph whose acyclicity would prove less
+///   exactly ONE module imports nothing, and it is `Init.Prelude`
+///   no module imports itself
+///   there is no cycle
+///
+/// Acyclicity is checked by an explicit three-colour DFS rather than by
+/// attempting a topological sort, because a sort that silently dropped
+/// unreachable nodes would report success over the part it managed to order.
+/// Non-vacuity: 17 modules are imported by nobody and the most-imported reaches
+/// 113, so this is neither a chain nor a star.
+#[test]
+fn the_init_import_graph_is_closed_acyclic_and_rooted_at_prelude() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let index: BTreeMap<&str, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    let mut graph: Vec<Vec<usize>> = vec![Vec::new(); modules.len()];
+    let mut in_degree = vec![0usize; modules.len()];
+    let mut edges = 0usize;
+    let mut escaping: Vec<String> = Vec::new();
+    let mut roots: Vec<&String> = Vec::new();
+    let mut self_importing: Vec<&String> = Vec::new();
+
+    for (i, module) in modules.iter().enumerate() {
+        let view = module_view(&lib, module, Level::Exported);
+        if view.imports.is_empty() {
+            roots.push(module);
+        }
+        for import in &view.imports {
+            edges += 1;
+            let name = import.module.to_display_string();
+            match index.get(name.as_str()) {
+                Some(target) => {
+                    if *target == i {
+                        self_importing.push(module);
+                    }
+                    graph[i].push(*target);
+                    in_degree[*target] += 1;
+                }
+                None => escaping.push(format!("{module} -> {name}")),
+            }
+        }
+    }
+
+    assert!(
+        escaping.is_empty(),
+        "no Init module imports outside Init, so the graph is closed: {:?}",
+        &escaping[..escaping.len().min(8)]
+    );
+    assert_eq!(edges, 3_153, "the import edge census must be complete");
+    assert_eq!(
+        roots,
+        vec!["Init.Prelude"],
+        "exactly one module imports nothing, and the closure cell's root is that module"
+    );
+    assert!(
+        self_importing.is_empty(),
+        "no module imports itself: {self_importing:?}"
+    );
+
+    // Three-colour DFS: 0 unvisited, 1 on the current path, 2 finished.
+    let mut colour = vec![0u8; modules.len()];
+    let mut cycles: Vec<String> = Vec::new();
+    for start in 0..modules.len() {
+        if colour[start] != 0 {
+            continue;
+        }
+        colour[start] = 1;
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&mut (node, ref mut cursor)) = stack.last_mut() {
+            let Some(next) = graph[node].get(*cursor).copied() else {
+                colour[node] = 2;
+                stack.pop();
+                continue;
+            };
+            *cursor += 1;
+            match colour[next] {
+                1 => cycles.push(format!("{} -> {}", modules[node], modules[next])),
+                0 => {
+                    colour[next] = 1;
+                    stack.push((next, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        cycles.is_empty(),
+        "the import graph must be acyclic: {:?}",
+        &cycles[..cycles.len().min(8)]
+    );
+    assert!(
+        colour.iter().all(|c| *c == 2),
+        "every module must be visited, or the acyclicity result covers only part of the graph"
+    );
+
+    let sinks = in_degree.iter().filter(|d| **d == 0).count();
+    let busiest = in_degree.iter().copied().max().unwrap_or_default();
+    assert_eq!(
+        (sinks, busiest),
+        (17, 113),
+        "the graph must be a real DAG rather than a chain or a star"
+    );
+}
