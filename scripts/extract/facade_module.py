@@ -782,10 +782,12 @@ def main():
             structural.add(name)
 
     transparent = {n for n in reducible if values.get(n) and n in decl}
+    transparent_full = set(transparent)
     for n in transparent:
         # A transparent row must be ordered after the constants its VALUE names,
         # not only after the ones its type names.
         deps[n] = sorted(set(deps.get(n, [])) | set(vdeps.get(n, [])))
+    structural_full = set(structural)
     ordered, cycle_residue = order(list(types), deps)
     explicit_for, maxexp_for, dropped_attrs, attr_reason = set(), set(), set(), {}
     text = line_map = emitted = None
@@ -799,10 +801,22 @@ def main():
     best = None
     for readmit in range(args.readmit_rounds):
         if readmit:
-            if not quarantine:
+            if not quarantine and not transparent_refused and not any(
+                    v.startswith("pin rejected") for v in structural_refused.values()):
                 break
             quarantine = {n: r for n, r in quarantine.items()
                           if decl[n]["type"] is None}
+            # The stronger FORMS are re-promoted too, for the same reason the
+            # quarantine is cleared: `Lean.PHashMap` was demoted to an axiom
+            # because `Lean.PersistentHashMap` was quarantined at that moment, and
+            # nothing ever looked again once the cause was repaired.
+            transparent = set(transparent_full)
+            transparent_refused = {}
+            structural = set(structural_full)
+            structural_refused = {k: v for k, v in structural_refused.items()
+                                  if not v.startswith("pin rejected")}
+            dropped_attrs = set()
+            attr_reason = {}
         for attempt in range(1, args.max_attempts + 1):
             text, line_map, emitted, attr_count, provided = render(
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
