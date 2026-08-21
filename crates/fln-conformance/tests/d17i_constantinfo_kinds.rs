@@ -6392,3 +6392,112 @@ fn the_init_import_graph_is_closed_acyclic_and_rooted_at_prelude() {
         "the graph must be a real DAG rather than a chain or a star"
     );
 }
+
+/// The module census is keyed by a projection, and the projection is injective
+/// — the identity law underneath both import cells.
+///
+/// `init_modules` turns a file path into a module name by stripping the final
+/// extension and replacing `/` with `.`. Two committed cells resolve every
+/// import edge by looking a name up in the set that projection produces: the
+/// import-row cell checks each edge names a module the pin supplies, and the
+/// graph cell builds its adjacency from a name-to-index map. Neither checks
+/// that the projection is a KEY.
+///
+/// It would fail on one input. A file named `Init/Foo.Bar.olean` projects onto
+/// `Init.Foo.Bar` and collides with `Init/Foo/Bar.olean`, because stripping the
+/// final extension leaves the interior dot in place. A collision does not raise
+/// anything: the name-to-index map silently keeps one member, edges to the other
+/// resolve to the WRONG module, and the acyclicity result would then be about a
+/// graph that is not the pin's. This is the shape this repository has caught
+/// repeatedly — a projection used as an identity with nobody checking that it
+/// is injective.
+///
+/// Measured, and it holds for a reason that is measured rather than structural:
+///
+///   600 files project onto 600 distinct names, and 2,433 across the whole
+///     library project onto 2,433
+///   NO `.olean` basename contains a dot, which is the only collision material
+///     there is. Nothing in the layout forbids one
+///   every census module has both companion parts on disk, so `Level::Private`
+///     is defined for every member — a premise several cells rest on and none
+///     of them states
+#[test]
+fn the_module_census_is_keyed_by_an_injective_path_projection() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let distinct: BTreeSet<&String> = modules.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        modules.len(),
+        "the path projection must be injective, or a lookup keyed on it silently resolves an \
+         edge to the wrong module"
+    );
+
+    // The collision material, counted directly from the filesystem rather than
+    // from the projected names — a duplicate would have already been lost by
+    // the time the names exist.
+    let mut files = 0usize;
+    let mut dotted: Vec<String> = Vec::new();
+    let mut stack = vec![lib.join("Init")];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "olean") {
+                files += 1;
+                let stem = path
+                    .file_stem()
+                    .expect("a file has a stem")
+                    .to_string_lossy()
+                    .into_owned();
+                if stem.contains('.') {
+                    dotted.push(stem);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        files,
+        modules.len(),
+        "the walk and the census must see the same files"
+    );
+    assert!(
+        dotted.is_empty(),
+        "a dot inside a basename is the one input that breaks the projection; these carry \
+         one: {dotted:?}"
+    );
+
+    // Every member is readable at both levels, which the cells that decode at
+    // `Level::Private` assume without saying.
+    let mut incomplete: Vec<String> = Vec::new();
+    for module in &modules {
+        let base = lib.join(format!("{}.olean", module.replace('.', "/")));
+        for part in ["olean.server", "olean.private"] {
+            if !base.with_extension(part).is_file() {
+                incomplete.push(format!("{module}.{part}"));
+            }
+        }
+    }
+    assert!(
+        incomplete.is_empty(),
+        "every census module must carry a complete companion chain: {:?}",
+        &incomplete[..incomplete.len().min(8)]
+    );
+
+    // Non-vacuity: the projection must actually be exercised on nested paths,
+    // not merely on files sitting at the top of the tree.
+    let deepest = modules
+        .iter()
+        .map(|module| module.split('.').count())
+        .max()
+        .unwrap_or_default();
+    assert!(
+        deepest >= 5,
+        "the census must contain deeply nested modules for the separator replacement to mean \
+         anything, deepest is {deepest}"
+    );
+}
