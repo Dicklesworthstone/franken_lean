@@ -1622,7 +1622,7 @@ fn init_and_entries() -> Vec<ConstantEntry> {
         "b", BinderInfo::Implicit, prop(), primary_pi(
             "motive", BinderInfo::Implicit, motive(), primary_pi(
                 "intro", BinderInfo::Default, minor(), primary_pi(
-                    "t", BinderInfo::Default, and_expr(bv(3), bv(2)), Expr::app(bv(3), bv(0)),
+                    "t", BinderInfo::Default, and_expr(bv(3), bv(2)), Expr::app(bv(2), bv(0)),
                 ),
             ),
         ),

@@ -2300,7 +2300,7 @@ fn bool_recursor_type(level_parameter: &WireName) -> Option<WireExpr> {
     let motive = builder.bvar(1);
     let true_minor = builder.apply(motive, true_value);
     let major_type = builder.constant(&checker_atom("Bool"), &[]);
-    let motive = builder.bvar(3);
+    let motive = builder.bvar(2);
     let major = builder.bvar(0);
     let mut result = builder.apply(motive, major);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
