@@ -12325,3 +12325,138 @@ fn the_rules_follow_the_constructors_stored_order() {
         "a recursor has no rules exactly when its head has no constructors"
     );
 }
+
+/// The four mutual groups are not four of a kind, and the safety of their two
+/// halves is stored in two different fields.
+///
+/// `MUTUAL_DEFINITION_GROUPS` pins the four groups by name; nothing says what
+/// KIND their members are. They split evenly: two groups are `Opaque`
+/// declarations, two are `Defn`s. That is the shape a `partial def` leaves
+/// behind — a safe-facing opaque pair, and an `_unsafe_rec` definition pair
+/// carrying the implementation.
+///
+/// The two halves cannot even be compared field-for-field: an `Opaque` records
+/// safety as the BOOLEAN `is_unsafe`, a `Defn` as the three-valued `safety`. So
+/// "is this group unsafe" is answered by reading different fields depending on
+/// which half is asked, and a decode that mapped one onto the other would have
+/// to invent a value.
+///
+/// THE NAME IS NOT THE FLAG, which is the point of pinning this at all. All 32
+/// `_unsafe_rec` definitions carry `Partial`, never `Unsafe`; and none of the 11
+/// genuinely `Unsafe` definitions ends in `_unsafe_rec` — they are the
+/// `_override`, `Imp` and `unsafeCast` family. A tool reading safety off the
+/// suffix is wrong about all 43 declarations, in both directions at once. The
+/// four grouped opaques likewise carry `is_unsafe` FALSE despite sitting under
+/// the same `partial def`.
+///
+/// The existing safety cell bounds this population with inequalities — `safe >
+/// 1_000 && partial >= 30 && unsafe_defs >= 10` — as an anti-vacuity floor. The
+/// exact three-way split has never been pinned.
+///
+/// Conservation first: the three safety classes must exhaust the definitions
+/// before any of the three is named.
+#[test]
+fn the_mutual_groups_split_across_two_kinds_that_record_safety_differently() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut safe = 0usize;
+    let mut partial: BTreeSet<String> = BTreeSet::new();
+    let mut unsafe_defs: BTreeSet<String> = BTreeSet::new();
+    let mut definitions = 0usize;
+    let mut grouped_defn: BTreeSet<String> = BTreeSet::new();
+    let mut grouped_opaque: BTreeSet<String> = BTreeSet::new();
+    let mut opaque_unsafe = 0usize;
+    let mut opaques = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Defn(v) => {
+                definitions += 1;
+                match v.safety {
+                    DefinitionSafety::Safe => safe += 1,
+                    DefinitionSafety::Partial => drop(partial.insert(name.clone())),
+                    DefinitionSafety::Unsafe => drop(unsafe_defs.insert(name.clone())),
+                }
+                if v.all.len() > 1 {
+                    let _ = grouped_defn.insert(name);
+                }
+            }
+            ConstantInfo::Opaque(v) => {
+                opaques += 1;
+                if v.is_unsafe {
+                    opaque_unsafe += 1;
+                }
+                if v.all.len() > 1 {
+                    assert!(!v.is_unsafe, "{name}: a grouped opaque must not be unsafe");
+                    let _ = grouped_opaque.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Conservation first: the three classes exhaust the definitions.
+    assert_eq!(
+        safe + partial.len() + unsafe_defs.len(),
+        definitions,
+        "every definition must fall in exactly one safety class"
+    );
+    assert_eq!(
+        (definitions, safe, partial.len(), unsafe_defs.len()),
+        (1720, 1677, 32, 11),
+        "the exact safety split, which the existing cell only bounds from below"
+    );
+
+    // The four pinned groups split two and two across the kinds. Sorted, because
+    // this side of the comparison is my own table rather than the artifact's.
+    let pinned: BTreeSet<String> = MUTUAL_DEFINITION_GROUPS
+        .iter()
+        .flatten()
+        .map(|n| (*n).to_string())
+        .collect();
+    assert_eq!(
+        grouped_defn
+            .union(&grouped_opaque)
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        pinned,
+        "the grouped members are exactly the pinned groups' members"
+    );
+    assert_eq!(
+        (grouped_defn.len(), grouped_opaque.len()),
+        (4, 4),
+        "two groups of definitions and two of opaques, four members each"
+    );
+
+    // The definition half is Partial, never Unsafe.
+    assert!(
+        grouped_defn.is_subset(&partial),
+        "the grouped definitions are the Partial half of a `partial def`"
+    );
+
+    // A flag that is false everywhere would make the grouped-opaque check above
+    // vacuous; two of the fourteen opaques do carry it.
+    assert_eq!(
+        (opaques, opaque_unsafe),
+        (14, 2),
+        "the opaque unsafe flag is not constant, so the grouped opaques being safe is a fact"
+    );
+
+    // The name is not the flag, in both directions.
+    let suffixed: BTreeSet<String> = partial
+        .iter()
+        .chain(unsafe_defs.iter())
+        .filter(|n| n.ends_with("_unsafe_rec"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        suffixed, partial,
+        "every `_unsafe_rec` definition is Partial and every Partial one is so named — reading \
+         safety off the suffix inverts the answer for all 32"
+    );
+    assert!(
+        !unsafe_defs.iter().any(|n| n.ends_with("_unsafe_rec")),
+        "and no genuinely Unsafe definition carries the suffix: {unsafe_defs:?}"
+    );
+}
