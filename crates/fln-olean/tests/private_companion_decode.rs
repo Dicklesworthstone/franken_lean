@@ -448,6 +448,11 @@ const OPTION_IS_SOME_MERGE_SIMP_1_1: &str =
     "_private.Init.Data.Option.Lemmas.0.Option.isSome_merge._simp_1_1";
 /// The pin's private option companion stores this theorem in Lemmas.
 const OPTION_IS_SOME_MERGE_SIMP_1_1_MODULE: &str = "Init/Data/Option/Lemmas";
+/// The private match implementation for `Option.isSome_filter`.
+const OPTION_IS_SOME_FILTER_MATCH_1_1: &str =
+    "_private.Init.Data.Option.Lemmas.0.Option.isSome_filter.match_1_1";
+/// The pin's private option companion stores this definition in Lemmas.
+const OPTION_IS_SOME_FILTER_MATCH_1_1_MODULE: &str = "Init/Data/Option/Lemmas";
 /// The private stored definition implementing `List.hasDecEq`.
 const LIST_HAS_DEC_EQ: &str = "List.hasDecEq";
 /// The census places the implementation in Prelude's private companion.
@@ -3158,6 +3163,35 @@ fn option_is_some_merge_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_IS_SOME_MERGE_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn option_is_some_filter_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("option_is_some_filter_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, OPTION_IS_SOME_FILTER_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&OPTION_IS_SOME_FILTER_MATCH_1_1.to_owned()),
+        "the private companion of {OPTION_IS_SOME_FILTER_MATCH_1_1_MODULE} must retain \\
+         {OPTION_IS_SOME_FILTER_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == OPTION_IS_SOME_FILTER_MATCH_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_IS_SOME_FILTER_MATCH_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {OPTION_IS_SOME_FILTER_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
