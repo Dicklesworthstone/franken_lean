@@ -246,6 +246,11 @@ const ARRAY_MEM_PMAP_SIMP_1_3: &str =
     "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_3";
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_MEM_PMAP_SIMP_1_3_MODULE: &str = "Init/Data/Array/Attach";
+/// The private implementation definition behind `Array.attachWith`.
+const ARRAY_ATTACH_WITH_IMPL: &str =
+    "_private.Init.Data.Array.Attach.0.Array.attachWithImpl";
+/// The pin's private array stores this implementation in the attach module.
+const ARRAY_ATTACH_WITH_IMPL_MODULE: &str = "Init/Data/Array/Attach";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1352,6 +1357,34 @@ fn array_mem_pmap_third_simp_theorem_is_decoded_from_its_private_storage_module(
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_MEM_PMAP_SIMP_1_3} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_attach_with_impl_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_attach_with_impl_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_ATTACH_WITH_IMPL_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_ATTACH_WITH_IMPL.to_owned()),
+        "the private companion of {ARRAY_ATTACH_WITH_IMPL_MODULE} must retain \
+         {ARRAY_ATTACH_WITH_IMPL}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_ATTACH_WITH_IMPL)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_ATTACH_WITH_IMPL}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_ATTACH_WITH_IMPL} as {} instead of Defn",
         recovered.kind_name()
     );
 }
