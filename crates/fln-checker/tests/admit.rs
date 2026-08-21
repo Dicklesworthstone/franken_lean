@@ -2523,6 +2523,17 @@ fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
 }
 
 #[test]
+fn kr600_803_color_fixture_pins_recursor_mutual_family_and_k() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.mutual(), &[checker_name("Color")]);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_dependent_nonrecursive_fields_are_reconstructed_independently() {
     let entries = dependent_field_inductive_entries();
     let verdict = admit_inductive(
