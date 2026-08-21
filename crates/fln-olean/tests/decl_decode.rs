@@ -11721,6 +11721,240 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The objects no context resolves - and the ranking inverts.
+///
+/// `259eadde` reported 159 "minority objects" and called them small numbers. It
+/// gave no denominator, which is the failure this file keeps catching in itself,
+/// and the figure answers a narrower question than its name suggests. Two
+/// things are wrong with it and one thing is missing.
+///
+/// WHAT 159 ACTUALLY COUNTS is the error rate of a rule that guesses each mixed
+/// context's MAJORITY size. That is a real quantity and it is not the number of
+/// objects a context cannot resolve: an object on the majority side of a mixed
+/// context, with no other arrival, is just as indeterminate. Counted per
+/// object, the indeterminate total is 1,174 - SEVEN TIMES the 159.
+///
+/// AND A WHOLE CATEGORY WAS NEVER COUNTED. 10,262 objects of these six shapes
+/// have NO constructor arrival at all - they are reached only through array
+/// elements, where there is no parent shape or slot to key on. A rule keyed on
+/// constructor context has nothing to work with for 41% of the population, and
+/// no cell before this one could see them, because every cell tallied CONTEXTS
+/// and an object with no context contributes to no tally.
+///
+/// The decomposition, pooled over the six shapes' 24,867 objects:
+///
+///   resolvable through some pure context   13,431
+///   every arrival through a mixed context   1,174
+///   no constructor arrival at all          10,262
+///
+/// so 46% are indeterminate, not the impression "159" left.
+///
+/// THE RANKING INVERTS, WHICH IS THE FINDING. By mixed-context count
+/// (`03c853b1`) and by minority arrivals (`259eadde`), `(1, 2)` is the worst of
+/// the six. By the fraction of its own objects that no context resolves it is
+/// the BEST, at 1.4%; `(0, 2)` is the worst at 89.3% because 5,238 of its 6,506
+/// objects are array-only. Three consecutive cells of mine ranked `(1, 2)`
+/// worst on measures that do not survive the change of unit.
+///
+/// WHAT THIS DOES NOT DO. It does not unblock `list_ptrs`. 110 `(1, 2)` objects
+/// remain indeterminate and a decoder has to be right on every one of them, and
+/// all of this measures STORED SIZE, which is a proxy for the cons-or-name
+/// question rather than that question. What does not survive is my framing that
+/// `(1, 2)` is uniquely bad - it is uniquely bad in contexts and unremarkable
+/// in objects.
+///
+/// POPULATION SCOPE: all four modules pooled, constructor objects only, the six
+/// shapes no refinement in `03c853b1` separated; array arrivals are excluded
+/// from the context notion and counted as their own category rather than
+/// silently dropped.
+#[test]
+fn the_objects_no_context_resolves() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    type Context = (u8, u8, u16, usize);
+    let mut sizes: std::collections::BTreeMap<(u8, u8), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut context_sizes: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut shape_of: std::collections::BTreeMap<(usize, usize), (u8, u8)> =
+        std::collections::BTreeMap::new();
+    let mut ctor_arrivals: std::collections::BTreeMap<(usize, usize), BTreeSet<Context>> =
+        std::collections::BTreeMap::new();
+
+    for (index, (_, bytes)) in modules.iter().enumerate() {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                sizes
+                    .entry((object.tag, object.other))
+                    .or_default()
+                    .insert(object.cs_sz);
+                shape_of.insert((index, object.off), (object.tag, object.other));
+            }
+        }
+        // Only CONSTRUCTOR arrivals give a context; array arrivals do not.
+        for parent in &objects {
+            if parent.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            for slot in 0..usize::from(parent.other) {
+                let word = word_at(bytes, parent.off + 8 + 8 * slot);
+                let Some(child) = resolve(word).and_then(|off| at.get(&off)) else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let key = (parent.tag, parent.other, parent.cs_sz, slot);
+                context_sizes
+                    .entry(((child.tag, child.other), key))
+                    .or_default()
+                    .insert(child.cs_sz);
+                ctor_arrivals
+                    .entry((index, child.off))
+                    .or_default()
+                    .insert(key);
+            }
+        }
+    }
+
+    // The six shapes no refinement separated.
+    let survivors: Vec<(u8, u8)> = sizes
+        .iter()
+        .filter(|(shape, seen)| {
+            seen.len() > 1
+                && context_sizes
+                    .iter()
+                    .any(|((s, _), sizes)| s == *shape && sizes.len() > 1)
+        })
+        .map(|(shape, _)| *shape)
+        .collect();
+    assert_eq!(
+        survivors,
+        vec![(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2)],
+        "the same six shapes, recomputed rather than quoted"
+    );
+
+    // Per shape, the three fates of an object.
+    let mut table: Vec<(u8, u8, usize, usize, usize, usize)> = Vec::new();
+    for shape in &survivors {
+        let mut total = 0usize;
+        let mut resolvable = 0usize;
+        let mut all_mixed = 0usize;
+        let mut no_context = 0usize;
+        for (key, object_shape) in &shape_of {
+            if object_shape != shape {
+                continue;
+            }
+            total += 1;
+            match ctor_arrivals.get(key) {
+                None => no_context += 1,
+                Some(contexts) => {
+                    if contexts.iter().any(|context| {
+                        context_sizes
+                            .get(&(*shape, *context))
+                            .is_some_and(|seen| seen.len() == 1)
+                    }) {
+                        resolvable += 1;
+                    } else {
+                        all_mixed += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            resolvable + all_mixed + no_context,
+            total,
+            "every object of {shape:?} must fall in exactly one of the three"
+        );
+        table.push((shape.0, shape.1, total, resolvable, all_mixed, no_context));
+    }
+    assert_eq!(
+        table,
+        vec![
+            (0, 1, 1350, 584, 277, 489),
+            (0, 2, 6506, 696, 572, 5238),
+            (0, 3, 5553, 2472, 148, 2933),
+            (1, 1, 1912, 317, 6, 1589),
+            (1, 2, 7591, 7481, 97, 13),
+            (2, 2, 1955, 1881, 74, 0),
+        ],
+        "per shape: objects, those resolvable through some PURE context, those \
+         whose every constructor arrival is through a MIXED one, and those with \
+         NO constructor arrival at all. The third column is the category no \
+         earlier cell could see, because they all tallied contexts and an \
+         object with no context contributes to no tally"
+    );
+
+    let pooled = |pick: fn(&(u8, u8, usize, usize, usize, usize)) -> usize| -> usize {
+        table.iter().map(pick).sum()
+    };
+    assert_eq!(
+        (
+            pooled(|row| row.2),
+            pooled(|row| row.3),
+            pooled(|row| row.4),
+            pooled(|row| row.5)
+        ),
+        (24867, 13431, 1174, 10262),
+        "pooled: 46% of these objects are indeterminate under any context rule. \
+         `259eadde`'s 159 is the error count of a rule guessing each context's \
+         MAJORITY - a real quantity, but not this one, and seven times smaller"
+    );
+
+    // The inversion.
+    let mut by_indeterminacy: Vec<((u8, u8), usize)> = table
+        .iter()
+        .map(|row| ((row.0, row.1), (row.4 + row.5) * 1000 / row.2))
+        .collect();
+    by_indeterminacy.sort_by_key(|(_, permille)| *permille);
+    assert_eq!(
+        by_indeterminacy,
+        vec![
+            ((1, 2), 14),
+            ((2, 2), 37),
+            ((0, 3), 554),
+            ((0, 1), 567),
+            ((1, 1), 834),
+            ((0, 2), 892),
+        ],
+        "indeterminate objects per thousand, best first. `(1, 2)` - worst by \
+         mixed-context count in `03c853b1` and by minority arrivals in \
+         `259eadde` - is the BEST of the six here, and `(0, 2)` the worst \
+         because 5,238 of its 6,506 objects are array-only. Three of my cells \
+         ranked `(1, 2)` worst on measures that do not survive the change of \
+         unit"
+    );
+}
+
 /// The ten surviving mixed contexts, enumerated - and what they cost in OBJECTS.
 ///
 /// `03c853b1` ended by saying the six irreducible shapes' mixed contexts "are
@@ -11743,6 +11977,13 @@ fn the_other_references_to_that_name() {
 /// to its MARGIN rather than to its rank: five contexts against one is a factor
 /// of five, but 95 minority objects against 33 is a factor of 2.9.
 /// `03c853b1` reported the first and I have pointed its doc here.
+///
+/// Its rank does not survive a third measure.
+/// `the_objects_no_context_resolves` counts, per OBJECT, how many are left
+/// indeterminate by any context at all, and on that measure `(1, 2)` is the
+/// BEST of the six at 1.4% while `(0, 2)` is the worst at 89%. The 159 below is
+/// also not the count of unresolvable objects - it is the error count of a rule
+/// that guesses each context's majority, and the unresolvable count is 1,174.
 ///
 /// EDGES WOULD HAVE MISLED WORSE STILL. `(1, 2)`'s context under a
 /// `(0, 3, 32)` parent carries 1,586 arrival EDGES but only 40 distinct
