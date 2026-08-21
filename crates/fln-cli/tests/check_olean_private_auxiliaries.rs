@@ -441,6 +441,18 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
+                lines[0].trim() == r##""\"decodedPrivateAuxiliaryNames\":{},","##
+                    && lines[1].trim()
+                        == r##""\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},","##
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep decoded-private names beside loop auxiliaries",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
                 lines[0].trim()
                     == r##""\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},","##
                     && lines[1].trim()
