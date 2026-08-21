@@ -5452,7 +5452,14 @@ fn write_inventory_fixture_with(
              as {:?}. Nothing removes these trees, so this build would UNION into that one and \
              every count taken from the result would be over by whatever the old shape left \
              behind. Bump the version in the fixture's name",
-            previous.split('\n').collect::<Vec<_>>(),
+            // An empty record means a fixture built with NO entries -- three in
+            // this file do. Split naively it renders as `[""]`, which reads as
+            // one entry named nothing rather than as none.
+            if previous.is_empty() {
+                Vec::new()
+            } else {
+                previous.split('\n').collect::<Vec<_>>()
+            },
             requested
         ),
         Ok(_) => {}
@@ -6385,6 +6392,62 @@ fn a_fixture_rebuilt_with_a_different_shape_is_refused() {
     assert!(
         !same_size_tree.join("Kept.olean").exists(),
         "the refused build added its entry to the stale tree anyway, which is the union this \
+         record exists to prevent"
+    );
+
+    // A RECORD THAT IS EMPTY IS STILL A RECORD. Both planted records above hold
+    // text, so a rule that treated an empty one as "never built" -- an easy
+    // reading, since an empty file looks like nothing was written -- refuses
+    // both and cannot be told apart from the real one. Three fixtures in this
+    // file are built with no entries at all and therefore record exactly that,
+    // so the gap is not hypothetical: it would disable the guard for every one
+    // of them.
+    const WAS_EMPTY: &str = "t6r7-selftest-manifest-was-empty-v1";
+    let empty_record = tmp.join(format!("{WAS_EMPTY}.manifest"));
+    let empty_tree = tmp.join(WAS_EMPTY);
+    fs::write(&empty_record, b"").unwrap_or_else(|error| panic!("plant the empty record: {error}"));
+    // The tree that record describes is empty too, but a stale FILE is what a
+    // union would carry in, so one is planted to make the harm visible.
+    fs::create_dir_all(&empty_tree).unwrap_or_else(|error| panic!("plant the stale tree: {error}"));
+    fs::write(empty_tree.join("Left.olean"), b"")
+        .unwrap_or_else(|error| panic!("plant the stale file: {error}"));
+
+    // THE DISCRIMINATING PROPERTY, READ BACK FROM DISK. If this record ever held
+    // text, the easy rule would refuse it too and the cell would stop
+    // distinguishing anything.
+    assert!(
+        fs::read_to_string(&empty_record)
+            .unwrap_or_else(|error| panic!("read the empty record: {error}"))
+            .is_empty(),
+        "the planted record must be EMPTY, which is the whole property this cell turns on"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let from_empty =
+        std::panic::catch_unwind(|| write_inventory_fixture(WAS_EMPTY, &["Kept.olean"]));
+    std::panic::set_hook(previous);
+    let payload = from_empty.err().unwrap_or_else(|| {
+        panic!("a fixture recorded as holding no entries is still a recorded shape")
+    });
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("Kept.olean") && !message.contains("could not be read"),
+        "an empty record must be refused as a SHAPE CHANGE, not as an unreadable file: {message}"
+    );
+    assert!(
+        message.contains("as [] and is now asked for"),
+        "a record of no entries must render as `[]`; `[\"\"]` reads as one entry named nothing: \
+         {message}"
+    );
+
+    assert!(
+        !empty_tree.join("Kept.olean").exists(),
+        "the refused build added its entry to a tree recorded as empty, which is the union the \
          record exists to prevent"
     );
 }
