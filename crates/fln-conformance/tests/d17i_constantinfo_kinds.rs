@@ -7281,3 +7281,106 @@ fn the_import_closure_that_respects_import_all_is_still_total() {
         "exactly one reference is resolved only by the import_all private part"
     );
 }
+
+/// The library-root module the census leaves out, and the two facts that make
+/// leaving it out safe.
+///
+/// `init_modules` walks `lib/Init` and returns 600 dotted names. The module
+/// actually NAMED `Init` is not among them: it lives at `lib/Init.olean`, one
+/// level up, outside the directory the walk descends into. Every corpus-width
+/// result in this file — 600 modules, 3,153 edges, the acyclicity, the
+/// three-way companion bijection — is therefore stated over a set that silently
+/// omits it, and nothing said so.
+///
+/// The omission is safe, for reasons that are measured rather than assumed:
+///
+///   `Init` declares ZERO constants, so no declaration is missing from any
+///     census this file takes
+///   NO census module imports `Init`, which is what the import-graph cell's
+///     "zero edges leave the set" actually depends on — that cell passes
+///     because nobody imports the aggregator, and it never said so
+///
+/// And it is a pure re-export aggregator: 43 import edges, every one of them
+/// `import_all` false and `is_exported` true — no `import all`, no `meta`, no
+/// declarations of its own. 42 of the 43 are distinct; `Init.Try` appears
+/// twice, which is this module's instance of a repeated import row.
+///
+/// Those 43 edges transitively reach ALL 600 census modules. So the census is
+/// exactly what `Init` pulls in, and a module added under `Init/` that the
+/// aggregator could not reach would fail here rather than quietly joining a
+/// corpus nothing imports.
+#[test]
+fn the_census_omits_the_aggregator_and_the_aggregator_reaches_the_census() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+    assert!(
+        !modules.contains(&"Init".to_owned()) && lib.join("Init.olean").is_file(),
+        "the module named Init exists and is deliberately outside the census"
+    );
+
+    let aggregator = module_view(&lib, "Init", Level::Exported);
+    assert_eq!(
+        (aggregator.constants, aggregator.imports.len()),
+        (0, 43),
+        "the aggregator declares nothing and re-exports"
+    );
+    assert!(
+        aggregator
+            .imports
+            .iter()
+            .all(|import| !import.import_all && import.is_exported && !import.is_meta),
+        "every aggregator edge is a plain re-export"
+    );
+    let distinct: BTreeSet<String> = aggregator
+        .imports
+        .iter()
+        .map(|import| import.module.to_display_string())
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        42,
+        "one edge is repeated, which is this module's instance of a duplicated import row"
+    );
+
+    // One pass over the census: the adjacency, and whether anything imports the
+    // aggregator.
+    let census: BTreeSet<&String> = modules.iter().collect();
+    let mut edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut importing_aggregator: Vec<&String> = Vec::new();
+    for module in &modules {
+        let targets: Vec<String> = module_view(&lib, module, Level::Exported)
+            .imports
+            .iter()
+            .map(|import| import.module.to_display_string())
+            .collect();
+        if targets.iter().any(|target| target == "Init") {
+            importing_aggregator.push(module);
+        }
+        edges.insert(module.clone(), targets);
+    }
+    assert!(
+        importing_aggregator.is_empty(),
+        "no census module may import the aggregator, or an edge leaves the set the import-graph \
+         cell calls closed: {importing_aggregator:?}"
+    );
+
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = distinct.iter().cloned().collect();
+    while let Some(current) = queue.pop() {
+        if !census.contains(&current) || !reached.insert(current.clone()) {
+            continue;
+        }
+        queue.extend(edges[&current].iter().cloned());
+    }
+    assert_eq!(
+        reached.len(),
+        modules.len(),
+        "the aggregator must reach every census module; unreachable: {:?}",
+        census
+            .iter()
+            .filter(|module| !reached.contains(**module))
+            .take(8)
+            .collect::<Vec<_>>()
+    );
+}
