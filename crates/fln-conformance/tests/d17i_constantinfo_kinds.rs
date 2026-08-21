@@ -5614,3 +5614,169 @@ fn import_rows_are_keyed_by_neither_the_module_name_nor_reliably_the_row() {
         "five of the eight flag combinations occur at the pin, so no flag decodes to a constant"
     );
 }
+
+/// `(module, names carrying a num component, the index it sits at)`.
+const PRIVATE_NAME_ROWS: &[(&str, usize, usize)] = &[
+    ("Init.Prelude", 113, 3),
+    ("Init.Meta.Defs", 156, 4),
+    ("Init.Data.List.Basic", 73, 5),
+];
+
+/// One stored name's components, root first, as owned values.
+#[derive(Debug, PartialEq, Eq)]
+enum Component {
+    Str(String),
+    Num(u64),
+}
+
+fn name_components(name: &Name) -> (Vec<Component>, bool) {
+    let mut out = Vec::new();
+    let mut overflowed = false;
+    let mut current = name.clone();
+    while !current.is_anonymous() {
+        overflowed |= current.component_overflowed();
+        match current.leaf_view() {
+            fln_core::name::LeafView::Str(text) => out.push(Component::Str(text.to_string())),
+            fln_core::name::LeafView::Num(value) => out.push(Component::Num(value)),
+            fln_core::name::LeafView::Anonymous => break,
+        }
+        current = current.parent();
+    }
+    out.reverse();
+    (out, overflowed)
+}
+
+/// A `Name` is a tree of `str` and `num` components, and this file has read
+/// every one of them through `to_display_string` — a projection that renders a
+/// `num` as bare digits and therefore cannot be inverted.
+///
+/// That matters more here than it looks. Every cell in this file matches names
+/// as strings: `_private.` prefixes, `.splitter` suffixes, `.rec` delegates,
+/// `_impl` correspondences. All of it rests on the display string being a
+/// faithful stand-in for the stored name, and nothing checked that it is. It is
+/// the same shape as the import-row key: a projection used as an identity.
+///
+/// Measured, and the assumption holds — for a reason that is measured rather
+/// than structural. Across the three modules named above, no `str` component
+/// consists of digits, so no `str` component can collide with a `num` one, so
+/// display strings are injective on each module's `constNames`. A single
+/// declaration named with a digit-only string component would break that, and
+/// nothing in the format forbids one. Both facts are asserted: the injectivity,
+/// and the absence of collision material that explains it.
+///
+/// The rest is an exact biconditional, which is worth stating plainly after
+/// three one-way results on this bead:
+///
+///   a name carries a `num` component IFF its first component is `_private`
+///   there is exactly one such component, its value is always 0, and no
+///     component ever overflows
+///   it sits at index `1 + <components in the owning module name>` — 3 for
+///     `Init.Prelude`, 4 for `Init.Meta.Defs`, 5 for `Init.Data.List.Basic`
+///
+/// So the private-name shape the earlier scope cell reads off a string is
+/// actually stored structurally, and the num component's POSITION encodes the
+/// owning module's own component count.
+#[test]
+fn private_names_are_the_only_ones_carrying_a_num_component() {
+    let lib = lib_or_skip!();
+
+    for (module, expect_private, expect_index) in PRIVATE_NAME_ROWS {
+        let (infos, _) = decode_at(&lib, module, Level::Private);
+        assert!(
+            infos.len() > 500,
+            "{module}: the declaration census must be reached, got {}",
+            infos.len()
+        );
+        let module_components = module.split('.').count();
+
+        let mut private = 0usize;
+        let mut mismatched: Vec<String> = Vec::new();
+        let mut numeric_strings: Vec<String> = Vec::new();
+        let mut displays: BTreeSet<String> = BTreeSet::new();
+        let mut total = 0usize;
+        for info in &infos {
+            let name = info.name();
+            let display = name.to_display_string();
+            total += 1;
+            displays.insert(display.clone());
+
+            let (components, overflowed) = name_components(name);
+            assert!(
+                !overflowed,
+                "{module}: {display} carries a num component too large to store"
+            );
+            for component in &components {
+                if let Component::Str(text) = component {
+                    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
+                        numeric_strings.push(display.clone());
+                    }
+                }
+            }
+
+            let scoped = components.first() == Some(&Component::Str("_private".to_owned()));
+            let nums: Vec<usize> = components
+                .iter()
+                .enumerate()
+                .filter_map(|(index, component)| {
+                    matches!(component, Component::Num(_)).then_some(index)
+                })
+                .collect();
+            if scoped != !nums.is_empty() {
+                mismatched.push(display.clone());
+                continue;
+            }
+            if !scoped {
+                continue;
+            }
+            private += 1;
+            assert_eq!(
+                nums.len(),
+                1,
+                "{module}: {display} carries more than one num component"
+            );
+            assert_eq!(
+                nums[0],
+                module_components + 1,
+                "{module}: {display} places its scope index after the module components"
+            );
+            assert_eq!(
+                components[nums[0]],
+                Component::Num(0),
+                "{module}: {display} carries a scope index other than 0"
+            );
+        }
+
+        assert!(
+            mismatched.is_empty(),
+            "{module}: carrying a num component and being `_private`-scoped are the same \
+             property; these disagree: {:?}",
+            &mismatched[..mismatched.len().min(8)]
+        );
+        assert_eq!(
+            private, *expect_private,
+            "{module}: the scoped population must be complete"
+        );
+        assert_eq!(
+            *expect_index,
+            module_components + 1,
+            "{module}: the row's index must be the derived one, not an independent constant"
+        );
+
+        // Why the display projection is safe HERE, stated as the measured fact
+        // it is: there is no collision material. And that it is in fact safe.
+        assert!(
+            numeric_strings.is_empty(),
+            "{module}: a digit-only str component would render like a num one; these do: {:?}",
+            &numeric_strings[..numeric_strings.len().min(8)]
+        );
+        assert_eq!(
+            displays.len(),
+            total,
+            "{module}: display strings must be injective over the declarations"
+        );
+        assert!(
+            private < total,
+            "{module}: the scoped population must be a proper subset, got {private} of {total}"
+        );
+    }
+}
