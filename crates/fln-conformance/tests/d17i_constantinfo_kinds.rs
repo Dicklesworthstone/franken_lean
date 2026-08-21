@@ -4104,3 +4104,106 @@ fn value_carrying_declarations_agree_on_their_mutual_groups() {
          function it implements, and a new group is a new member of that family"
     );
 }
+
+/// Constructors whose name is NOT an extension of their inductive's, with the
+/// inductive each belongs to.
+///
+/// Two distinct shapes, and neither is a defect:
+///
+///   three `_impl` compiler representations, where the `_impl` suffix is applied
+///   to the BASE name rather than appended after the constructor — the inductive
+///   is `Lean.Name._impl` while its constructors are `Lean.Name.str._impl` and
+///   friends, so neither name is a prefix of the other
+///
+///   one genuinely PRIVATE constructor of a PUBLIC inductive:
+///   `_private.Init.Prelude.0.Lean.Macro.State.mk` constructs `Lean.Macro.State`
+const CONSTRUCTORS_NOT_UNDER_THEIR_INDUCTIVE: &[(&str, &str)] = &[
+    ("Lean.Name.anonymous._impl", "Lean.Name._impl"),
+    ("Lean.Name.num._impl", "Lean.Name._impl"),
+    ("Lean.Name.str._impl", "Lean.Name._impl"),
+    (
+        "_private.Init.Prelude.0.Lean.Macro.State.mk",
+        "Lean.Macro.State",
+    ),
+];
+
+/// The name relation between a block's declarations — tested rather than
+/// assumed, and false for constructors.
+///
+/// "A constructor is named under its inductive" is the kind of rule that reads
+/// as obviously true and gets used as a lookup key. This file has been bitten
+/// three times by keying on a name shape instead of a stored relation, so the
+/// rule is worth checking rather than believing.
+///
+/// It holds for RECURSORS without exception: all 129 are their block head's name
+/// extended by exactly `rec`, `rec_1` or `rec_2`, and no other suffix occurs.
+///
+/// It is FALSE for constructors — 4 of 157 are not under their inductive at all,
+/// in the two shapes named above. The private one is the interesting member:
+/// `_private.Init.Prelude.0.Lean.Macro.State.mk` constructs the PUBLIC
+/// `Lean.Macro.State`, so the private-name machinery applies at CONSTRUCTOR
+/// granularity, not only at declaration granularity. Anything resolving a
+/// constructor by prefixing its inductive's name would miss it — and this bead's
+/// whole subject is declarations that went missing because a lookup did not find
+/// them.
+///
+/// The exceptions are pinned by name with their inductives, so a fifth is a
+/// change in the artifact rather than more of the same.
+#[test]
+fn recursors_are_named_under_their_block_but_constructors_are_not_always() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut recursor_suffixes: BTreeSet<String> = BTreeSet::new();
+    let mut recursors = 0usize;
+    let mut constructors = 0usize;
+    let mut outside: Vec<(String, String)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Rec(v) => {
+                recursors += 1;
+                let head = v.all[0].to_display_string();
+                let prefix = format!("{head}.");
+                assert!(
+                    name.starts_with(&prefix),
+                    "{name}: a recursor is named under its block head {head}"
+                );
+                recursor_suffixes.insert(name[prefix.len()..].to_string());
+            }
+            ConstantInfo::Ctor(v) => {
+                constructors += 1;
+                let induct = v.induct.to_display_string();
+                if !name.starts_with(&format!("{induct}.")) {
+                    outside.push((name, induct));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        recursors >= 120 && constructors >= 150,
+        "both censuses must be reached ({recursors} recursors, {constructors} constructors)"
+    );
+    assert_eq!(
+        recursor_suffixes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["rec", "rec_1", "rec_2"],
+        "the only recursor suffixes at the pin; a new one is a new generation shape"
+    );
+
+    outside.sort();
+    let expected: Vec<(String, String)> = CONSTRUCTORS_NOT_UNDER_THEIR_INDUCTIVE
+        .iter()
+        .map(|(ctor, induct)| ((*ctor).to_string(), (*induct).to_string()))
+        .collect();
+    assert_eq!(
+        outside, expected,
+        "the constructors not named under their inductive. This set being NON-EMPTY is the \
+         point: a resolver that reached a constructor by prefixing its inductive's name would \
+         miss every one of them, and one of them is private while its inductive is not."
+    );
+}
