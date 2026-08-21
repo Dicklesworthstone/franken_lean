@@ -655,7 +655,7 @@ fn nat_entries() -> Vec<ConstantEntry> {
     let succ_expr = || Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new());
     let bv = |index| Expr::bvar(index).expect("packs");
     let motive_type = primary_pi("t", BinderInfo::Default, nat_expr(), Expr::sort(u.clone()));
-    let succ_minor_type = |motive_index| {
+    let succ_minor_type = |motive_index: u32| {
         primary_pi(
             "n",
             BinderInfo::Default,
