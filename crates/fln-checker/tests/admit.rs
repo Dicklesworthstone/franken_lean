@@ -4954,6 +4954,32 @@ fn kr600_803_init_nat_zero_refuses_a_forged_constructor_field_count() {
 }
 
 #[test]
+fn kr600_803_init_nat_succ_refuses_a_forged_constructor_field_count() {
+    let mut entries = nat_entries();
+    let constructor = entries[2].declaration();
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Nat", "succ"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Nat"), 1, 0, 2),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_init_nat_refuses_a_forged_num_parameters_count() {
     let mut entries = nat_entries();
     let declaration = entries[3].declaration();
