@@ -1135,6 +1135,36 @@ impl ChainConstants {
     }
 }
 
+/// Decode a complete chain's constants with origin, straight from the three
+/// parts' bytes.
+///
+/// [`decode_chain_constants_with_origin`] takes views, which means every caller
+/// re-derives the same three-step parse: the exported region standalone, the
+/// server region against it, and the private region against both. That order is
+/// not optional — the companions store the earlier regions' compacted addresses
+/// — and getting it wrong yields an out-of-bounds pointer rather than a wrong
+/// answer, so it is a trap that fails loudly but repeatedly.
+///
+/// Every consumer that has needed provenance so far hand-rolled that plumbing,
+/// and each one first reached for the `_private.` name prefix instead, which is
+/// a mangling convention rather than a provenance fact (see [`ConstantOrigin`]).
+/// This is the one-call form, so asking the chain is easier than guessing from
+/// the name.
+pub fn decode_chain_constants_from_parts(
+    exported: &[u8],
+    server: &[u8],
+    private: &[u8],
+    budget: WalkBudget,
+) -> DResult<ChainConstants> {
+    let exported_view = OleanView::parse(exported)?;
+    let server_view = OleanView::parse_with_dependencies(server, &[exported])?;
+    // Parsed to prove the middle region is well-formed in its own dependency
+    // address space; its constants are not part of the authoritative array.
+    let _ = &server_view;
+    let private_view = OleanView::parse_with_dependencies(private, &[exported, server])?;
+    decode_chain_constants_with_origin(&exported_view, &private_view, budget)
+}
+
 /// Decode a complete chain and record which part each declaration came from.
 ///
 /// [`decode_chain_constants`] answers "what does this chain declare". This also

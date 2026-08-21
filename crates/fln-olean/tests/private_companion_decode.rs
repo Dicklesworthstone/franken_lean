@@ -35,7 +35,7 @@ use fln_core::name::Name;
 use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
 use fln_olean::decl::{
     ConstantOrigin, DeclDecoder, DeclError, decode_chain_constants,
-    decode_chain_constants_with_origin,
+    decode_chain_constants_from_parts, decode_chain_constants_with_origin,
 };
 use fln_olean::region::{OleanView, WalkBudget};
 use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
@@ -1390,6 +1390,67 @@ fn the_private_name_prefix_is_not_a_provenance_signal() {
                 .private_only()
                 .any(|info| info.name().to_display_string() == *name),
             "{name} is reported both exported and private-only"
+        );
+    }
+}
+
+#[test]
+fn the_parts_door_agrees_with_the_view_door_and_classifies_the_prelude_witnesses() {
+    let lib = lib_or_skip!(
+        "the_parts_door_agrees_with_the_view_door_and_classifies_the_prelude_witnesses"
+    );
+    let chain = chain_bytes(&lib, "Init/Prelude");
+
+    let from_parts = decode_chain_constants_from_parts(
+        &chain.exported,
+        &chain.server,
+        &chain.private,
+        WalkBudget::default(),
+    )
+    .expect("the parts door decodes the pin's chain");
+
+    // Same answer as the view door, or the convenience is a second
+    // implementation rather than one call site.
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+        .expect("server part parses against the exported region");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against the exported and server regions");
+    let from_views =
+        decode_chain_constants_with_origin(&exported_view, &private_view, WalkBudget::default())
+            .expect("the view door decodes the pin's chain");
+
+    assert_eq!(from_parts.constants.len(), from_views.constants.len());
+    assert_eq!(from_parts.origins, from_views.origins);
+    assert_eq!(from_parts.constants.len(), 2314, "Init.Prelude at the pin");
+    assert_eq!(from_parts.private_only().count(), 110);
+
+    // The two declarations WAVE 12 named. Both are `_private.`-prefixed AND
+    // `.loop.`-bearing AND exported, so a prefix test calls them
+    // companion-recovered. The chain says otherwise, and that is the whole
+    // reason this API exists.
+    let witnesses = [
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+    ];
+    for witness in witnesses {
+        let index = from_parts
+            .constants
+            .iter()
+            .position(|info| info.name().to_display_string() == witness)
+            .unwrap_or_else(|| panic!("{witness} must be in Init.Prelude's chain at the pin"));
+        assert_eq!(
+            from_parts.origins[index],
+            ConstantOrigin::Exported,
+            "{witness} is exported; reporting it private-only is the misclassification \
+             that failed the .loop family"
+        );
+        assert!(
+            !from_parts
+                .private_only()
+                .any(|info| info.name().to_display_string() == witness),
+            "{witness} must not appear in private_only()"
         );
     }
 }
