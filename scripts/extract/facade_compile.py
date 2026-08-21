@@ -66,6 +66,9 @@ the toolchain would report a perfect facade:
   * An UNRESOLVED-QUARANTINE JOIN requires the observed unresolved demanded set
     to equal the manifest's quarantined set, with an explicit quarantine reason
     for every member. The remaining known gap cannot be silently reclassified.
+  * A SIGNATURE-PROVENANCE JOIN requires each non-Init demanded signature to
+    carry a recognized Reference printer label and well-formed universe
+    parameters. A type ascription cannot quietly consume an untyped payload.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -342,9 +345,11 @@ def join_demanded_rows(names, manifest_rows):
     role_mismatches = []
     emission_mismatches = []
     provider_mismatches = []
+    signature_provenance_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
+    printer_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -354,9 +359,20 @@ def join_demanded_rows(names, manifest_rows):
         # Init substrate names are deliberately absent from the generated facade;
         # their availability is separated by the empty-facade control. Every other
         # classified row must carry the Reference signature used for the type probe.
-        if outcome != "init-substrate" and not row.get("signature"):
+        if outcome != "init-substrate" and not isinstance(row.get("signature"), str):
             signatureless.append(name)
             continue
+        if outcome != "init-substrate":
+            printer = row.get("printer")
+            level_params = row.get("level_params")
+            if (printer not in ("pp.fullNames", "pp.explicit", "pp.maxexplicit")
+                    or not isinstance(level_params, list)
+                    or not all(isinstance(level, str) and level for level in level_params)):
+                signature_provenance_mismatches.append(
+                    f"{name}(printer={printer!r}, level_params={level_params!r})"
+                )
+                continue
+            printer_join[printer] += 1
         expected_role = "init-substrate" if outcome == "init-substrate" else "demanded"
         if row.get("role") != expected_role:
             role_mismatches.append(
@@ -391,7 +407,7 @@ def join_demanded_rows(names, manifest_rows):
         roles[expected_role] += 1
         emission_join["emitted" if expected_emitted else "not_emitted"] += 1
     if (unclassified or signatureless or role_mismatches or emission_mismatches
-            or provider_mismatches):
+            or provider_mismatches or signature_provenance_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -403,12 +419,17 @@ def join_demanded_rows(names, manifest_rows):
             details.append("emission-mismatch=" + ", ".join(emission_mismatches[:8]))
         if provider_mismatches:
             details.append("provider-mismatch=" + ", ".join(provider_mismatches[:8]))
+        if signature_provenance_mismatches:
+            details.append("signature-provenance=" + ", ".join(
+                signature_provenance_mismatches[:8]
+            ))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
         )
     return (dispositions, dict(sorted(roles.items())),
-            dict(sorted(emission_join.items())), dict(sorted(provider_join.items())))
+            dict(sorted(emission_join.items())), dict(sorted(provider_join.items())),
+            dict(sorted(printer_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -596,8 +617,8 @@ def main():
                          "run would silently degrade to a name-only check")
 
     demand_names = {name for names in by_module.values() for name in names}
-    (demand_dispositions, demand_roles, demand_emission,
-     demand_providers) = join_demanded_rows(demand_names, manifest_rows)
+    (demand_dispositions, demand_roles, demand_emission, demand_providers,
+     demand_printers) = join_demanded_rows(demand_names, manifest_rows)
 
     # Mutation control for the source guard above. It is deliberately in-memory:
     # no Reference-importing file is ever handed to the pinned compiler.
@@ -710,6 +731,7 @@ def main():
         "demanded_role_join": demand_roles,
         "demanded_emission_join": demand_emission,
         "demanded_provider_join": demand_providers,
+        "demanded_signature_printer_join": demand_printers,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
             "init_substrate": disposition_matrix.get("init-substrate", 0),
