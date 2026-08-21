@@ -67,6 +67,8 @@ const CORE_OBSERVABLES_SYNTAX_MATCH_RESIDUAL_PREFIXES: [&str; 2] = [
     "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_",
     "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_",
 ];
+const ARRAY_MAP_M_PROOF_RESIDUAL_PREFIX: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_";
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -2814,6 +2816,12 @@ fn is_core_observables_syntax_match_residual(display: &str) -> bool {
         })
 }
 
+fn is_array_map_m_proof_residual(display: &str) -> bool {
+    display
+        .strip_prefix(ARRAY_MAP_M_PROOF_RESIDUAL_PREFIX)
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn is_private_loop_match_one_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -3019,6 +3027,12 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_core_observables_syntax_match_residual,
     );
+    let mut array_map_m_proof_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    array_map_m_proof_residuals
+        .observe_matching(&checked.decoded.constants, is_array_map_m_proof_residual);
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3167,6 +3181,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut core_observables_syntax_match_residuals)
     };
+    let array_map_m_proof_observed = array_map_m_proof_residuals.observed;
+    let array_map_m_proof_omitted = array_map_m_proof_residuals.omitted();
+    let array_map_m_proof_names = if json {
+        render_named_residuals_json(&mut array_map_m_proof_residuals)
+    } else {
+        render_named_residuals_human(&mut array_map_m_proof_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -3227,6 +3248,7 @@ fn render_check_olean_success(
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesSyntaxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"arrayMapMProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3290,6 +3312,9 @@ fn render_check_olean_success(
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
+            array_map_m_proof_observed,
+            array_map_m_proof_names,
+            array_map_m_proof_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3367,6 +3392,9 @@ fn render_check_olean_success(
                 "core-observables Lean.Syntax match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax match_N residual names: {}\n",
                 "core-observables Lean.Syntax match_N residual names omitted: {}\n",
+                "decoded _private Array.mapM'._proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private Array.mapM'._proof_N residual names: {}\n",
+                "decoded _private Array.mapM'._proof_N residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -3441,6 +3469,9 @@ fn render_check_olean_success(
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
+            array_map_m_proof_observed,
+            array_map_m_proof_names,
+            array_map_m_proof_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3921,6 +3952,14 @@ fn render_check_olean_set_success(
             is_core_observables_syntax_match_residual,
         );
     }
+    let mut array_map_m_proof_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        array_map_m_proof_residuals
+            .observe_matching(&module.decoded.constants, is_array_map_m_proof_residual);
+    }
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4079,6 +4118,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut core_observables_syntax_match_residuals)
     };
+    let array_map_m_proof_observed = array_map_m_proof_residuals.observed;
+    let array_map_m_proof_omitted = array_map_m_proof_residuals.omitted();
+    let array_map_m_proof_names = if json {
+        render_named_residuals_json(&mut array_map_m_proof_residuals)
+    } else {
+        render_named_residuals_human(&mut array_map_m_proof_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -4145,6 +4191,7 @@ fn render_check_olean_set_success(
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesSyntaxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"arrayMapMProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4210,6 +4257,9 @@ fn render_check_olean_set_success(
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
+            array_map_m_proof_observed,
+            array_map_m_proof_names,
+            array_map_m_proof_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -4289,6 +4339,9 @@ fn render_check_olean_set_success(
                 "core-observables Lean.Syntax match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax match_N residual names: {}\n",
                 "core-observables Lean.Syntax match_N residual names omitted: {}\n",
+                "decoded _private Array.mapM'._proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private Array.mapM'._proof_N residual names: {}\n",
+                "decoded _private Array.mapM'._proof_N residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -4365,6 +4418,9 @@ fn render_check_olean_set_success(
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
+            array_map_m_proof_observed,
+            array_map_m_proof_names,
+            array_map_m_proof_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
