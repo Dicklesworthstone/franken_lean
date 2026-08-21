@@ -2215,7 +2215,17 @@ def self_test_sandbox(work):
     purpose -- and everything is restored on the way out.
     """
     real_open, real_run = builtins.open, subprocess.run
-    root = os.path.realpath(work) + os.sep
+    # The root ITSELF counts as inside. `root` carries a trailing separator so a
+    # prefix test cannot match a sibling like `<work>-other`, but that also means
+    # the temp directory does not match its own prefix -- so the sandbox refused
+    # an operation on the very directory its message invites you to use. Found by
+    # a control in the probe, not by the self-test, whose cases all named a path
+    # UNDER the root and so could not see it.
+    base = os.path.realpath(work)
+    root = base + os.sep
+
+    def inside(target):
+        return target == base or target.startswith(root)
 
     # DESTROYING A FILE IS NOT WRITING TO IT. The sandbox watched
     # `builtins.open` for write modes, and neither `os.remove` nor `os.replace`
@@ -2233,17 +2243,38 @@ def self_test_sandbox(work):
     # path being created SECOND, and a guard that checked the first argument would
     # have refused a symlink to anywhere outside the sandbox while permitting one
     # written on top of an artifact -- backwards, and it would have looked right.
+    # CHANGING A FILE IS NOT ONLY WRITING TO IT EITHER. Measured against the
+    # sandbox as it stood: os.chmod went through and really did change the target
+    # file's mode, os.utime went through, and os.mkdir/os.makedirs happily created
+    # directories outside the temp tree. A chmod is enough to make an artifact
+    # unreadable without altering a byte of it.
+    #
+    # os.renames and os.removedirs were already blocked, which is the argument for
+    # guarding primitives rather than conveniences: both are built out of
+    # os.rename and os.rmdir, so they were covered without being named.
     PATH_OPS = (("remove", (0,)), ("unlink", (0,)), ("rmdir", (0,)),
                 ("rename", (0, 1)), ("replace", (0, 1)),
-                ("truncate", (0,)), ("symlink", (1,)), ("link", (1,)))
-    PROC_OPS = ((subprocess, "Popen"), (os, "system"))
+                ("truncate", (0,)), ("symlink", (1,)), ("link", (1,)),
+                ("chmod", (0,)), ("chown", (0,)), ("utime", (0,)),
+                ("mkdir", (0,)), ("makedirs", (0,)))
+    # ...and subprocess is not the only way to start one. os.posix_spawn went
+    # through, and so did os.fork -- visibly, because the forked child carried on
+    # through the rest of the probe and printed its output a second time. A
+    # self-test that forks the interpreter is not a self-test that runs in under a
+    # second anywhere.
+    PROC_OPS = tuple(
+        (module, opname) for module, opname in (
+            (subprocess, "Popen"), (os, "system"), (os, "posix_spawn"),
+            (os, "posix_spawnp"), (os, "fork"), (os, "forkpty"),
+            (os, "execv"), (os, "execve"), (os, "execvp"), (os, "spawnv"))
+        if hasattr(module, opname))
     saved = {}
 
     def guard_paths(real, opname, indices):
         def wrapper(*args, **kwargs):
             for arg in (args[i] for i in indices if i < len(args)):
                 target = os.path.realpath(str(arg))
-                if not target.startswith(root):
+                if not inside(target):
                     raise SelfTestViolation(
                         f"the self-test called os.{opname} on {target}; it may "
                         f"only touch paths inside {work}, and a file removed or "
@@ -2267,7 +2298,7 @@ def self_test_sandbox(work):
     def guarded_os_open(path, flags, *args, **kwargs):
         if flags & WRITE_FLAGS:
             target = os.path.realpath(str(path))
-            if not target.startswith(root):
+            if not inside(target):
                 raise SelfTestViolation(
                     f"the self-test called os.open on {target} with write intent; "
                     f"it may only write inside {work}, and os.open is the call "
@@ -2284,7 +2315,7 @@ def self_test_sandbox(work):
     def guarded_open(file, mode="r", *args, **kwargs):
         if any(ch in mode for ch in "wxa+"):
             target = os.path.realpath(str(file))
-            if not target.startswith(root):
+            if not inside(target):
                 raise SelfTestViolation(
                     f"the self-test tried to open {target} for writing; it may "
                     f"only write inside {work}")
@@ -2469,6 +2500,25 @@ def self_test():
     case("sandbox/allows-temp-replace",
          blocked(lambda: os.replace(os.path.join(work, "never-created"),
                                     os.path.join(work, "nor-this"))), False)
+    case("sandbox/blocks-chmod",
+         blocked(lambda: os.chmod(outside, 0o600)), True)
+    case("sandbox/blocks-utime",
+         blocked(lambda: os.utime(outside, (0, 0))), True)
+    case("sandbox/blocks-mkdir-outside",
+         blocked(lambda: os.mkdir(outside + ".dir")), True)
+    case("sandbox/blocks-posix-spawn",
+         blocked(lambda: os.posix_spawn("/bin/true", ["/bin/true"], {})), True)
+    # os.fork is the one that has to be refused rather than merely observed: an
+    # unguarded fork ran the remainder of the probe a second time in the child.
+    case("sandbox/blocks-fork", blocked(lambda: os.fork()), True)
+    case("sandbox/allows-temp-mkdir",
+         blocked(lambda: os.mkdir(os.path.join(work, "made-here"))), False)
+    case("sandbox/allows-op-on-temp-root",
+         blocked(lambda: os.chmod(work, 0o700)), False)
+    case("sandbox/blocks-sibling-of-temp-root",
+         blocked(lambda: os.chmod(work + "-not-mine", 0o700)), True)
+    case("sandbox/allows-temp-chmod",
+         blocked(lambda: os.chmod(os.path.join(work, "f.lean"), 0o644)), False)
     case("sandbox/blocks-os-open-write",
          blocked(lambda: os.close(os.open(outside, os.O_WRONLY | os.O_CREAT))), True)
     case("sandbox/blocks-truncate",
