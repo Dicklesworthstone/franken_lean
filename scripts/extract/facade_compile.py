@@ -1766,6 +1766,30 @@ def main():
             "REFUSE: facade manifest projection-type count must exceed field "
             f"set count ({json.dumps(projection_field_set_inequality_join, sort_keys=True)})"
         )
+    projection_roundtrip_inequality_join = {
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+        "summary_type_roundtrip_checked": manifest_summary.get(
+            "type_roundtrip_checked"
+        ),
+    }
+    if (not isinstance(projection_roundtrip_inequality_join[
+            "summary_projection_types_checked"], int)
+            or isinstance(projection_roundtrip_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or not isinstance(projection_roundtrip_inequality_join[
+                "summary_type_roundtrip_checked"], int)
+            or isinstance(projection_roundtrip_inequality_join[
+                "summary_type_roundtrip_checked"], bool)
+            or projection_roundtrip_inequality_join[
+                "summary_projection_types_checked"]
+            <= projection_roundtrip_inequality_join[
+                "summary_type_roundtrip_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest projection-type count must exceed type "
+            f"roundtrip count ({json.dumps(projection_roundtrip_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3670,6 +3694,9 @@ def main():
         ),
         "manifest_projection_field_set_inequality_join": (
             projection_field_set_inequality_join
+        ),
+        "manifest_projection_roundtrip_inequality_join": (
+            projection_roundtrip_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
