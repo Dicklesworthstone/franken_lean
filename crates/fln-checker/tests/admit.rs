@@ -2337,6 +2337,21 @@ fn kr600_803_init_prod_pair_recursor_and_iota_are_reconstructed() {
 }
 
 #[test]
+fn kr600_803_init_prod_fixture_pins_recursor_levels_motives_minors_and_metadata() {
+    let entries = init_prod_entries();
+    let recursor = entries[2].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 3);
+    assert_eq!(metadata.mutual(), &[checker_name("Prod")]);
+    assert_eq!(metadata.num_parameters(), 2);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 1);
+    assert_eq!(metadata.rules().len(), 1);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_init_prod_refuses_a_forged_iota_rule() {
     let mut entries = init_prod_entries();
     let declaration = entries[2].declaration();
