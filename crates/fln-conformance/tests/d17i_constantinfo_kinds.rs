@@ -2598,3 +2598,80 @@ fn the_reflexive_flag_is_bound_where_it_is_true_and_acc_still_refuses_k() {
          proof irrelevance nor K conversion can substitute for reducing a theorem major."
     );
 }
+
+/// `num_nested` — the field that LICENSES two carve-outs in this file, and was
+/// itself never asserted.
+///
+/// `NESTED_AUXILIARY_RECURSORS` and `NESTED_NUMERIC_EXCEPTIONS` both excuse
+/// `Lean.Syntax` recursors from an equality, and both justify it the same way:
+/// the block is nested. Each cell checks that its own exceptions have
+/// `num_nested > 0` — but neither bounds how many nested blocks EXIST. If a
+/// second one appeared, its recursors would be excused by exactly the same
+/// clause, and a genuine defect there would read as more of the same nesting.
+/// A carve-out whose population is unbounded is not a carve-out, it is a hole.
+///
+/// This closes it for the module both cells measure: `Init/Prelude` has exactly
+/// ONE nested inductive, `Lean.Syntax` at depth 2, and all three excused
+/// recursors name that one block. So the exceptions are not a class the artifact
+/// could quietly grow — they are three recursors of a single known block.
+///
+/// The wider measurement, recorded as provenance rather than paid for here: a
+/// scan of all 600 `Init` modules carrying a complete chain finds `num_nested`
+/// nonzero for that same single inductive and no other. Asserting that would
+/// mean decoding roughly 65,000 declarations for one integer, which is not worth
+/// the runtime; asserting it over the module the carve-outs live in is.
+const NESTED_BLOCK: (&str, u32) = ("Lean.Syntax", 2);
+
+#[test]
+fn exactly_one_nested_block_licenses_every_nesting_carve_out_in_this_file() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut nested: Vec<(String, u32)> = Vec::new();
+    let mut recursor_blocks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut inductives = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => {
+                inductives += 1;
+                if v.num_nested > 0 {
+                    nested.push((name, v.num_nested));
+                }
+            }
+            ConstantInfo::Rec(v) => {
+                recursor_blocks.insert(name, v.all.iter().map(Name::to_display_string).collect());
+            }
+            _ => {}
+        }
+    }
+
+    // Anti-vacuity: the scan must actually reach a large inductive population,
+    // or "exactly one nested" is satisfied by having seen almost nothing.
+    assert!(
+        inductives > 100,
+        "expected the pin's inductive census, got {inductives}"
+    );
+    assert_eq!(
+        nested,
+        vec![(NESTED_BLOCK.0.to_string(), NESTED_BLOCK.1)],
+        "a SECOND nested block would be excused by the same clause that excuses Lean.Syntax in \
+         the rules and numeric-observable cells, so its arrival must fail here rather than be \
+         absorbed there"
+    );
+
+    // Every recursor either carve-out excuses must belong to that one block.
+    for recursor in NESTED_AUXILIARY_RECURSORS
+        .iter()
+        .chain(NESTED_NUMERIC_EXCEPTIONS)
+    {
+        let block = recursor_blocks
+            .get(*recursor)
+            .unwrap_or_else(|| panic!("{recursor} must decode as a recursor"));
+        assert_eq!(
+            block,
+            &vec![NESTED_BLOCK.0.to_string()],
+            "{recursor} is excused as nesting, so it must name the one nested block"
+        );
+    }
+}
