@@ -3001,6 +3001,16 @@ fn kr600_803_init_pempty_fixture_pins_recursor_levels_motives_minors_and_rules()
 }
 
 #[test]
+fn kr600_803_init_pempty_fixture_pins_eliminator_bvar_closure() {
+    let entries = init_pempty_entries();
+    let facts = match inspect(entries[1].declaration().type_(), TermBudget::unlimited()) {
+        TermOutcome::Complete(facts) => facts,
+        other => panic!("fixture eliminator inspection must complete: {other:?}"),
+    };
+    assert_eq!(facts.external_bound_span, 0);
+}
+
+#[test]
 fn kr600_803_init_or_proposition_branches_are_reconstructed() {
     let entries = init_or_entries();
     let verdict = admit_inductive(
