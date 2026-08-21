@@ -59,8 +59,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fln_conformance::pin;
@@ -4821,6 +4821,56 @@ fn walk_olean_inventory(
 /// run's leftovers join the population and the counts below stop meaning what
 /// they say.
 fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> PathBuf {
+    // TWO TESTS SHARING A NAME IS INVISIBLE UNTIL IT CORRUPTS A COUNT. Nothing
+    // removes these trees, so a second build under the same name UNIONS into the
+    // first: one test's walk then sees the other's files, its census comes out
+    // wrong, and the failure surfaces as an unexplained count in whichever test
+    // the interleaving happened to disadvantage. Tests run in parallel, so which
+    // one that is need not be stable between runs.
+    //
+    // The rule until now was a comment asking whoever adds a fixture to pick a
+    // fresh name. This makes it mechanical, and names BOTH file sets when it
+    // fires so the collision is obvious rather than merely reported.
+    //
+    // Per PROCESS, deliberately. It cannot see a stale tree left by an earlier
+    // run with a different shape -- that hazard is cross-run and stays with the
+    // versioned name and its comment -- but that one is a change somebody makes
+    // on purpose, whereas this one happens by accident.
+    static CLAIMED: OnceLock<Mutex<BTreeMap<String, Vec<String>>>> = OnceLock::new();
+    let mut requested = relative_files
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .collect::<Vec<_>>();
+    requested.sort();
+    // THE DECISION IS TAKEN UNDER THE LOCK; THE PANIC HAPPENS OUTSIDE IT.
+    // Panicking while the guard is alive poisons the Mutex, and every later
+    // call from every other test in the process would then fail on the poison
+    // rather than on its own merits -- turning one collision into a cascade
+    // across unrelated tests, non-deterministically, because these run in
+    // parallel. The lock is also taken with the poison ignored, so a panic
+    // anywhere else can never disable this registry either.
+    let collision = {
+        let mut claimed = CLAIMED
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match claimed.get(versioned_name) {
+            Some(previous) if *previous != requested => Some(previous.clone()),
+            _ => {
+                claimed.insert(versioned_name.to_string(), requested.clone());
+                None
+            }
+        }
+    };
+    if let Some(previous) = collision {
+        panic!(
+            "fixture `{versioned_name}` is built twice with different contents: {previous:?} \
+             and {requested:?}. Nothing deletes these trees, so the second build unions into \
+             the first and every count taken from either is wrong. Give one of them its own \
+             versioned name"
+        );
+    }
+
     let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(versioned_name);
     for relative in relative_files {
         let path = base.join(relative);
@@ -4833,6 +4883,57 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
             .unwrap_or_else(|error| panic!("create fixture file {}: {error}", path.display()));
     }
     base
+}
+
+/// The fixture-name collision guard actually fires.
+///
+/// **Why this test exists at all.** Every one of the thirteen fixture names in
+/// this file is currently unique, so the guard added beside them never runs. A
+/// guard whose condition is satisfied by the whole live population is
+/// indistinguishable from one that no longer works -- the shape this bead has
+/// found in the empty carve-out registry and in two walk branches. The
+/// difference is that this one CAN be shown to fire, so it is, on a name no real
+/// fixture uses.
+///
+/// **The panic is caught rather than expected.** `#[should_panic]` would consume
+/// the whole test, and the point is to inspect the MESSAGE: it must name both
+/// file sets, because a collision that reports only "duplicate name" leaves the
+/// reader to work out which two tests are fighting over the tree. The panic hook
+/// is silenced around the call so a deliberate panic does not look like a
+/// failure in the log, and restored immediately after.
+#[test]
+fn the_fixture_collision_guard_names_both_contents() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let claimed_twice = std::panic::catch_unwind(|| {
+        write_inventory_fixture("t6r7-selftest-collision-v1", &["first.olean"]);
+        // Same name, different contents: the second build would union into the
+        // first if nothing stopped it.
+        write_inventory_fixture("t6r7-selftest-collision-v1", &["second.olean"]);
+    });
+    std::panic::set_hook(previous);
+
+    let payload =
+        claimed_twice.expect_err("a fixture name reused with different contents must be refused");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("first.olean") && message.contains("second.olean"),
+        "the refusal must name BOTH file sets, or the reader cannot tell which two fixtures \
+         collided: {message}"
+    );
+    assert!(
+        message.contains("t6r7-selftest-collision-v1"),
+        "the refusal must name the fixture: {message}"
+    );
+
+    // AND THE SAME NAME WITH THE SAME CONTENTS IS FINE -- a test may rebuild its
+    // own fixture. Without this the guard could be refusing every second call
+    // rather than every colliding one, and the check above could not tell.
+    write_inventory_fixture("t6r7-selftest-collision-v1", &["first.olean"]);
 }
 
 /// The walk branch, driven by a fixture instead of by a corpus nobody has.
