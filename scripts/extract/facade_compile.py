@@ -2567,6 +2567,28 @@ def main():
             "REFUSE: facade manifest projection-type count must exceed demand "
             f"count ({json.dumps(projection_demand_inequality_join, sort_keys=True)})"
         )
+    projection_emitted_demand_inequality_join = {
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+        "summary_demanded_emitted": manifest_summary.get("demanded_emitted"),
+    }
+    if (not isinstance(projection_emitted_demand_inequality_join[
+            "summary_projection_types_checked"], int)
+            or isinstance(projection_emitted_demand_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or not isinstance(projection_emitted_demand_inequality_join[
+                "summary_demanded_emitted"], int)
+            or isinstance(projection_emitted_demand_inequality_join[
+                "summary_demanded_emitted"], bool)
+            or projection_emitted_demand_inequality_join[
+                "summary_projection_types_checked"]
+            <= projection_emitted_demand_inequality_join[
+                "summary_demanded_emitted"]):
+        raise SystemExit(
+            "REFUSE: facade manifest projection-type count must exceed emitted "
+            f"demand count ({json.dumps(projection_emitted_demand_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4576,6 +4598,9 @@ def main():
         ),
         "manifest_projection_demand_inequality_join": (
             projection_demand_inequality_join
+        ),
+        "manifest_projection_emitted_demand_inequality_join": (
+            projection_emitted_demand_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
