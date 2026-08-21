@@ -11721,6 +11721,217 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The `(4, 1)` layouts ARE separated by context - the positive case.
+///
+/// `ed5d41d5` pinned `(4, 1)` at 122 objects across two stored sizes and used
+/// that to refuse a claim: two sizes are two layouts, so the shape cannot name
+/// one type. It left the obvious question unasked - if shape does not separate
+/// them, does anything?
+///
+/// It does, and this is the first place in this bead where a discriminator
+/// works. TWO of them do, independently:
+///
+///   by the CHILD: size 16 always holds `(0, 4, 40)` or `(0, 1, 24)` in slot 0;
+///   size 24 always holds `(1, 2, 32)`. The two sets are disjoint.
+///
+///   by the PARENT: of the 11 arrival contexts that reach a `(4, 1)` object,
+///   ZERO reach both sizes. Every context determines the size it arrives at.
+///
+/// THE CONTRAST IS MEASURED HERE ON THE SAME FOOTING, not quoted. Asking the
+/// identical question of `(2, 2)` - does the arrival context determine the
+/// stored size - over the identical pooled population gives 19 contexts and ONE
+/// mixed. So discrimination is not impossible in this format; it is
+/// SHAPE-SPECIFIC, and the earlier cells' failures were facts about `(1, 2)`
+/// and `(2, 2)` rather than about the file.
+///
+/// AND THE ONE OFFENDER IS THE FAMILIAR ONE: the single mixed context is
+/// `(1, 2)` slot 0, the cons-or-name shape that blocks `list_ptrs` and that
+/// `a5e8cb68` already found mixing its children's classes. The same parent
+/// spoils both questions.
+///
+/// A CAVEAT THAT THE PER-MODULE COUNTS MAKE VISIBLE rather than leaving in
+/// prose: ALL 106 size-16 objects are in Prelude. The three C3 fixtures
+/// contribute only size-24 objects - three and two, with `Init.olean`
+/// contributing none - so one half of this separation rests on a single module,
+/// and the per-module tally is asserted so that is not hidden by the pooled
+/// figure.
+///
+/// POPULATION SCOPE: all four modules pooled for the context and child tallies,
+/// with the object counts asserted per module.
+#[test]
+fn the_four_one_layouts_are_separated_by_context() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    // Same question of both shapes: does the arrival context fix the size?
+    let mut per_module: Vec<(String, Vec<(u16, usize)>)> = Vec::new();
+    let mut children: std::collections::BTreeMap<
+        u16,
+        std::collections::BTreeMap<(u8, u8, u16), usize>,
+    > = std::collections::BTreeMap::new();
+    let mut contexts_four: std::collections::BTreeMap<(u8, u8, usize), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut contexts_two: std::collections::BTreeMap<(u8, u8, usize), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut two_two_total = 0usize;
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut tally: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+        let mut four: std::collections::BTreeMap<usize, u16> = std::collections::BTreeMap::new();
+        let mut two: std::collections::BTreeMap<usize, u16> = std::collections::BTreeMap::new();
+        for object in &objects {
+            match (object.tag, object.other) {
+                (4, 1) => {
+                    *tally.entry(object.cs_sz).or_default() += 1;
+                    four.insert(object.off, object.cs_sz);
+                    // What it points at.
+                    if let Some(child) = resolve(word_at(bytes, object.off + 8))
+                        && let Some(shape) = at.get(&child)
+                    {
+                        *children
+                            .entry(object.cs_sz)
+                            .or_default()
+                            .entry((shape.tag, shape.other, shape.cs_sz))
+                            .or_default() += 1;
+                    }
+                }
+                (2, 2) => {
+                    two.insert(object.off, object.cs_sz);
+                    two_two_total += 1;
+                }
+                _ => {}
+            }
+        }
+        per_module.push((module.clone(), tally.into_iter().collect()));
+
+        // Arrival contexts for both shapes, in one pass.
+        for parent in &objects {
+            let slots: Vec<(usize, u64)> = if parent.tag <= abi::TAG_MAX_CTOR_TAG {
+                (0..usize::from(parent.other))
+                    .map(|slot| (slot, word_at(bytes, parent.off + 8 + 8 * slot)))
+                    .collect()
+            } else if parent.tag == abi::TAG_ARRAY {
+                (0..word_at(bytes, parent.off + 8))
+                    .map(|i| (usize::MAX, word_at(bytes, parent.off + 24 + 8 * i as usize)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for (slot, word) in slots {
+                let Some(child) = resolve(word) else {
+                    continue;
+                };
+                let key = (parent.tag, parent.other, slot);
+                if let Some(&size) = four.get(&child) {
+                    contexts_four.entry(key).or_default().insert(size);
+                }
+                if let Some(&size) = two.get(&child) {
+                    contexts_two.entry(key).or_default().insert(size);
+                }
+            }
+        }
+    }
+
+    // Per module, so the pooled figure cannot hide where each half lives.
+    assert_eq!(
+        per_module
+            .iter()
+            .map(|(m, t)| (m.as_str(), t.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Init.olean", vec![]),
+            ("Init.BinderNameHint.olean", vec![(24, 3)]),
+            ("Init.SizeOfLemmas.olean", vec![(24, 2)]),
+            ("Init/Prelude.olean", vec![(16, 106), (24, 11)]),
+        ],
+        "`(4, 1)` objects by stored size, per module. ALL 106 of the size-16 \
+         objects are in Prelude and the fixtures contribute only size-24, so \
+         one half of the separation below rests on a single module - asserted \
+         rather than hidden inside the pooled 122"
+    );
+
+    // The child separates them.
+    assert_eq!(
+        children
+            .iter()
+            .map(|(size, shapes)| (
+                *size,
+                shapes.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (16, vec![((0, 1, 24), 4), ((0, 4, 40), 102)]),
+            (24, vec![((1, 2, 32), 16)]),
+        ],
+        "what each `(4, 1)` object holds in slot 0, by its own stored size. The \
+         two sets of child shapes are DISJOINT, so the child alone tells the \
+         layouts apart"
+    );
+
+    // And so does the parent - unlike `(2, 2)`, asked the same way.
+    let mixed_four: Vec<((u8, u8, usize), Vec<u16>)> = contexts_four
+        .iter()
+        .filter(|(_, sizes)| sizes.len() > 1)
+        .map(|(key, sizes)| (*key, sizes.iter().copied().collect()))
+        .collect();
+    let mixed_two: Vec<((u8, u8, usize), Vec<u16>)> = contexts_two
+        .iter()
+        .filter(|(_, sizes)| sizes.len() > 1)
+        .map(|(key, sizes)| (*key, sizes.iter().copied().collect()))
+        .collect();
+    assert_eq!(
+        (contexts_four.len(), mixed_four.len()),
+        (11, 0),
+        "of the arrival contexts reaching a `(4, 1)` object, NONE reaches both \
+         sizes: the parent determines the layout"
+    );
+    assert_eq!(
+        (two_two_total, contexts_two.len(), mixed_two.len()),
+        (1955, 19, 1),
+        "the identical question of `(2, 2)`, over the identical pooled \
+         population, measured here rather than quoted: one context DOES reach \
+         both sizes. So discrimination is not impossible in this format, it is \
+         SHAPE-SPECIFIC - the earlier failures were facts about `(1, 2)` and \
+         `(2, 2)`, not about the walk"
+    );
+    assert_eq!(
+        mixed_two,
+        vec![((1, 2, 0), vec![24, 32])],
+        "and the single offender is the familiar one: `(1, 2)` slot 0, the \
+         cons-or-name shape that blocks `list_ptrs` and that `a5e8cb68` already \
+         found mixing its children's classes. The same parent spoils both \
+         questions"
+    );
+}
+
 /// The rest of the `mpz` family has no witness - with denominators this time.
 ///
 /// `ddb61b49` closed by listing three items of this family as still uncovered:
