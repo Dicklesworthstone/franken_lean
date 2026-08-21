@@ -409,7 +409,34 @@ impl<'a> DeclDecoder<'a> {
                 stack.pop();
                 continue;
             }
-            let (tag, other, _) = self.view.obj_header(off)?;
+            let (tag, other, cs_sz) = self.view.obj_header(off)?;
+            // Every `Level` constructor is its pointer fields followed by ONE
+            // stored `Level.Data` word, so the object is 8 + 8*other + 8 bytes,
+            // already a multiple of 8.
+            //
+            // This is the same law the decoder relies on a few lines below,
+            // where it reads the Data word at `off + 8 + 8*other` and compares
+            // it against our recomputation. That offset comes from the assumed
+            // layout, not from the object: if the object were smaller the read
+            // would run past its end into a neighbour, and if it were larger
+            // there would be stored bytes nobody accounts for. Either way the
+            // mismatch would be reported as a Level.Data cross-check
+            // divergence, blaming the identity layer for a misread — the same
+            // wrong diagnosis the Name size bind (81b0234c) removed.
+            //
+            // Unlike the Name, ConstantInfo and hint binds, this one rests on
+            // the structural argument rather than a corpus census: Level
+            // objects are only reachable by decoding expressions, so counting
+            // them needs the decoder itself, which the code-first override
+            // forbids running. The check cannot reject anything the decoder
+            // could otherwise have read correctly, because any object failing
+            // it makes that Data read out of bounds or leaves bytes unread.
+            if u64::from(cs_sz) != 16 + 8 * u64::from(other) {
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "Level object size disagrees with its pointer-fields-plus-data layout",
+                });
+            }
             let child_count: u64 = match tag {
                 1 => 1,     // succ
                 2 | 3 => 2, // max / imax
@@ -2313,6 +2340,96 @@ mod tests {
         assert!(
             regular > 0,
             "Init.Prelude must carry regular hints, or this test exercises no padding"
+        );
+    }
+
+    /// One axiom whose type is `Sort (u+1)`, so the region contains a real
+    /// `Level.succ` OBJECT. `Level::zero` is scalar-boxed and would give the
+    /// size check nothing to bind.
+    fn succ_level_module() -> Vec<u8> {
+        let level = Level::zero().succ().expect("one successor is in range");
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "lvl"]),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(level),
+                    },
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `Level` whose stored size contradicts its layout is refused before its
+    /// `Data` word is compared.
+    #[test]
+    fn a_level_object_whose_size_contradicts_its_layout_is_refused() {
+        let mut bytes = succ_level_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        // Positive control: the fixture decodes, so the refusal below is the
+        // size rule and not a broken fixture.
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified succ-level fixture decodes");
+
+        // Find the succ object: tag 1, one pointer field, 24 bytes.
+        let arrays = view.module_arrays().expect("constant array");
+        let info_ptr = view
+            .read_u64(arrays.constants.0 + 24)
+            .expect("first ConstantInfo");
+        let info_off = view.deref(info_ptr).expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        // ConstantVal is slot 0 of AxiomVal; its type is the third pointer.
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let sort_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("Sort expression");
+        let level_off = view
+            .deref(view.read_u64(sort_off + 8).expect("level pointer"))
+            .expect("Level object");
+        let (tag, other, cs_sz) = view.obj_header(level_off).expect("Level header");
+        assert_eq!(tag, 1, "Level.succ");
+        assert_eq!(other, 1, "one level child");
+        assert_eq!(cs_sz, 24, "plus the stored Data word");
+
+        // Change the stored size and nothing else.
+        let header = view.read_u64(level_off).expect("header word");
+        let planted = (header & !0x0000_ffff_0000_0000) | (32_u64 << 32);
+        bytes[level_off as usize..level_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted header");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a Level whose size contradicts its layout must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Level object size disagrees with its pointer-fields-plus-data layout",
+                    ..
+                }
+            ),
+            "expected the size refusal rather than a Level.Data cross-check: {error:?}"
         );
     }
 
