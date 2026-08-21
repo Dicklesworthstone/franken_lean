@@ -1753,6 +1753,25 @@ def scratch_coverage_error(created, published):
     return None
 
 
+# THE ARTIFACTS THIS TOOL PRODUCES, named once. Both the argparse declaration and
+# the publication registry read this, because they were two independent lists and
+# a9921467 called that arrangement derived while it was not: `declared` was a
+# literal tuple written at the check, and the two add_argument lines were
+# somewhere else entirely. An output added to argparse and never published is the
+# case that guard's own message describes -- "a declared output that no check saw
+# is published unverified" -- and it was the one case it could not see, because
+# the tuple it compared against did not know the output existed.
+OUTPUT_ARGS = (
+    ("out", "the generated Lean facade module"),
+    ("manifest", "fln-facade-module/1 NDJSON"),
+)
+
+
+def declared_outputs(args):
+    """The paths this tool said it would produce, read off OUTPUT_ARGS."""
+    return tuple(getattr(args, dest) for dest, _ in OUTPUT_ARGS)
+
+
 def publication_registry_error(published, declared):
     """Every artifact this tool declares it produces was published THROUGH the
     checks, and nothing else was.
@@ -2155,8 +2174,8 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True, help="the generated Lean facade module")
-    ap.add_argument("--manifest", required=True, help="fln-facade-module/1 NDJSON")
+    for _dest, _help in OUTPUT_ARGS:
+        ap.add_argument(f"--{_dest}", required=True, help=_help)
     ap.add_argument("--max-attempts", type=int, default=14)
     ap.add_argument("--transparency-rounds", type=int, default=4,
                     help="fixpoint rounds for reducible-alias transparency; a transparent value can name further abbreviations")
@@ -3649,7 +3668,7 @@ def main():
     # get both checks, and neither is named here. The registry is what makes that
     # true: an artifact is checked because it was published, not because someone
     # remembered to add a line for it.
-    _reg = publication_registry_error(published, (args.out, args.manifest))
+    _reg = publication_registry_error(published, declared_outputs(args))
     if _reg:
         raise SystemExit("REFUSE: " + _reg)
     _cov = scratch_coverage_error(scratch_created, published)
