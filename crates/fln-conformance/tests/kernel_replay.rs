@@ -3752,13 +3752,41 @@ fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
         directory.into_os_string(),
     ]);
     assert_eq!(directory_cli.exit_code, 1, "{}", directory_cli.stderr);
+    // THE DIRECTORY CASE NOW STOPS EARLIER THAN IT USED TO, and the expectation
+    // follows the product rather than the product following the expectation.
+    // `check-olean` gained a set-wide declaration scan (`fln/src/lib.rs`,
+    // `ConflictingModuleDeclaration`) that runs BEFORE closed-set import
+    // planning. Two modules in this directory decode to different declarations
+    // sharing a name, so the run is refused there and never reaches the
+    // unresolved-imports refusal this line used to observe. Both classes exit 1,
+    // which is why the exit-code assertion above kept passing while this one
+    // failed.
+    //
+    // THE DETAIL IS ASSERTED, NOT ONLY THE CLASS, and that is the whole care
+    // taken here. `declaration-closure` is a BUCKET: `MissingConstants` and
+    // `DuplicateDeclaration` share it, and both are exactly the companion-
+    // association failures this test exists to catch. Widening the expectation to
+    // the class alone would have made this line accept the defect it guards.
+    // Matching the conflict's own rendering keeps the two apart.
     assert!(
         directory_cli
             .stderr
-            .contains("\"class\":\"unresolved-imports\""),
-        "directory collection must associate every companion pair before closed-set planning: {}",
+            .contains("\"class\":\"declaration-closure\""),
+        "directory collection must be refused by the set-wide declaration scan: {}",
         directory_cli.stderr
     );
+    assert!(
+        directory_cli
+            .stderr
+            .contains("decode to different declarations both named"),
+        "the refusal must be the set-wide NAME CONFLICT specifically. `MissingConstants` and \
+         `DuplicateDeclaration` carry the same class and would mean a companion part was lost or \
+         doubled, which is the regression this test is here to catch: {}",
+        directory_cli.stderr
+    );
+    // Unchanged, and it is this line -- not the class -- that actually witnesses
+    // companion pairing: a directory collection that failed to associate a
+    // module with its parts would complain about a missing `.olean`.
     assert!(!directory_cli.stderr.contains("missing .olean"));
 }
 
