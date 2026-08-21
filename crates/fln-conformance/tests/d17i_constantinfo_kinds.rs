@@ -8856,3 +8856,128 @@ fn the_private_part_adds_only_bodies_and_never_a_type_or_a_postulate() {
         }
     }
 }
+
+/// `(base, the auxiliaries that exist, the indices that do not)` — by full
+/// stored name, not by index arithmetic.
+const GAPPED_MATCH_AUXILIARIES: &[(&str, &[&str], &[&str])] = &[
+    (
+        "List.hasDecEq",
+        &[
+            "List.hasDecEq.match_1",
+            "List.hasDecEq.match_3",
+            "List.hasDecEq.match_5",
+        ],
+        &["List.hasDecEq.match_2", "List.hasDecEq.match_4"],
+    ),
+    (
+        "String.decEq",
+        &["String.decEq.match_1", "String.decEq.match_3"],
+        &["String.decEq.match_2"],
+    ),
+    (
+        "instDecidableEqRaw",
+        &["instDecidableEqRaw.match_1", "instDecidableEqRaw.match_3"],
+        &["instDecidableEqRaw.match_2"],
+    ),
+];
+
+/// The gapped auxiliaries BY NAME, the indices that do not exist at either
+/// level, and the counting walk that the gap defeats.
+///
+/// The numbering cell derives which bases are gapped and pins their index sets.
+/// It never names the stored declarations, and — more importantly — it never
+/// asserts that the missing indices are ABSENT. A decoder that invented
+/// `List.hasDecEq.match_2` would produce the contiguous set `1..5` and satisfy
+/// that cell by ceasing to be a counterexample. This one names all eleven
+/// declarations and requires the four absences.
+///
+/// Every auxiliary listed is confirmed present in the DECODED private companion
+/// as a `Defn`, so the names are not spelled from a pattern; they are read back
+/// from the artifact.
+///
+/// The absences hold at BOTH levels, and that is the fact this bead makes worth
+/// stating. `List.hasDecEq.match_2` is missing from the exported part and
+/// missing from the private companion. The obvious guess when a numbered
+/// auxiliary is absent — that it is one of the bodies the private part
+/// restores, which is exactly what this bead recovered for other auxiliaries —
+/// is WRONG here. Reading the companion chain does not fill these gaps, because
+/// the indices were never generated.
+///
+/// The mutant is stated as a simulation rather than described. A walk that asks
+/// for `match_1`, then `match_2`, and stops at the first absence recovers
+/// exactly ONE auxiliary for each of the three bases: one of three for
+/// `List.hasDecEq`, one of two for the others. That number is asserted.
+#[test]
+fn the_gapped_match_auxiliaries_are_absent_at_both_levels_and_defeat_a_counting_walk() {
+    let lib = lib_or_skip!();
+    let private = kinds(&decode_prelude_private(&lib));
+    let (exported_infos, _) = decode_at(&lib, "Init.Prelude", Level::Exported);
+    let exported = kinds(&exported_infos);
+    assert!(
+        private.len() > exported.len(),
+        "the two levels must be the ones this cell is stated against"
+    );
+
+    for (base, present, absent) in GAPPED_MATCH_AUXILIARIES {
+        assert_eq!(
+            private.get(*base).copied(),
+            Some("Defn"),
+            "{base}: the base declaration must be present in the private companion"
+        );
+
+        // Present, by name, read back from the decoded companion.
+        for auxiliary in *present {
+            assert_eq!(
+                private.get(*auxiliary).copied(),
+                Some("Defn"),
+                "{auxiliary} must be a decoded definition in the private companion"
+            );
+        }
+
+        // Absent, at BOTH levels — the gap is not something a part supplies.
+        for auxiliary in *absent {
+            assert!(
+                !private.contains_key(*auxiliary),
+                "{auxiliary} must not exist in the private companion"
+            );
+            assert!(
+                !exported.contains_key(*auxiliary),
+                "{auxiliary} must not exist in the exported part either, so the gap is not a \
+                 body the private part restores"
+            );
+        }
+
+        // The mutant: count from 1, stop at the first absence.
+        let mut recovered = 0usize;
+        while private.contains_key(&format!("{base}.match_{}", recovered + 1)) {
+            recovered += 1;
+        }
+        assert_eq!(
+            recovered,
+            1,
+            "{base}: a walk counting from 1 stops at the first gap and recovers one of {}",
+            present.len()
+        );
+        assert!(
+            recovered < present.len(),
+            "{base}: and that must be strictly fewer than exist"
+        );
+    }
+
+    // Non-vacuity: one base must have a gap wider than a single index, or the
+    // mutant is only ever killed by an off-by-one.
+    assert!(
+        GAPPED_MATCH_AUXILIARIES
+            .iter()
+            .any(|(_, _, absent)| absent.len() > 1),
+        "at least one base must skip more than one index"
+    );
+    let named: usize = GAPPED_MATCH_AUXILIARIES
+        .iter()
+        .map(|(_, present, absent)| present.len() + absent.len())
+        .sum();
+    assert_eq!(
+        named, 11,
+        "every auxiliary this cell reasons about is named"
+    );
+}
