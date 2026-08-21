@@ -2358,6 +2358,20 @@ fn kr600_803_sum_and_prod_recursor_major_premises_close_the_bvar_span() {
 }
 
 #[test]
+fn kr600_803_sum_and_prod_iota_rhs_close_the_bvar_span() {
+    for recursor in [init_sum_entries().remove(3), init_prod_entries().remove(2)] {
+        let metadata = recursor.declaration().recursor_metadata().expect("fixture recursor metadata");
+        for rule in metadata.rules() {
+            let facts = match inspect(rule.rhs(), TermBudget::unlimited()) {
+                TermOutcome::Complete(facts) => facts,
+                other => panic!("fixture iota inspection must complete: {other:?}"),
+            };
+            assert_eq!(facts.external_bound_span, 0, "{:?} iota RHS leaks a binder", rule.constructor());
+        }
+    }
+}
+
+#[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
     let verdict = admit_inductive(
