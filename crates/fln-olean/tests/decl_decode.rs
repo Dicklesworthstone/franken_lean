@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use fln_env::constants::ConstantInfo;
 use fln_olean::decl::{DeclDecoder, DeclError};
 use fln_olean::region::{OleanView, WalkBudget};
+use fln_rt::abi;
+use fln_rt::region::parse_olean_envelope;
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -359,4 +361,252 @@ fn real_declarations_decode_to_shared_dags_not_expanded_trees() {
          this fixture's declarations genuinely contain no shared subterm (pick another)",
         infos.len()
     );
+}
+
+/// One object in a fixture's pointer graph, with the size word the codec's
+/// list walker discards.
+#[derive(Debug, Clone, Copy)]
+struct Obj {
+    off: usize,
+    tag: u8,
+    other: u8,
+    cs_sz: u16,
+}
+
+fn word_at(bytes: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(bytes[off..off + 8].try_into().expect("in-range read"))
+}
+
+/// Walk every reachable object, same layout law the codec enforces. This is a
+/// local walker on purpose: `OleanView`'s `deref`/`obj_header` are
+/// `pub(crate)`, and an integration test must not grow the crate's public
+/// surface to see bytes it can read itself. `hostile_input.rs` does the same.
+fn objects_of(bytes: &[u8]) -> (Vec<Obj>, u64) {
+    const HEADER_SIZE: usize = 88; // format::OLEAN_HEADER_SIZE
+    let envelope = parse_olean_envelope(bytes).expect("fixture parses");
+    let base = envelope.base_addr;
+    let deref = |ptr: u64| -> Option<usize> {
+        if ptr & 1 == 1 || ptr == 0 {
+            return None;
+        }
+        let resolved = usize::try_from(ptr.checked_sub(base)?).ok()?;
+        (resolved >= HEADER_SIZE && resolved + 8 <= bytes.len() && resolved % 8 == 0)
+            .then_some(resolved)
+    };
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack = vec![word_at(bytes, HEADER_SIZE)];
+    let mut out = Vec::new();
+    while let Some(ptr) = stack.pop() {
+        let Some(off) = deref(ptr) else { continue };
+        if !seen.insert(off) {
+            continue;
+        }
+        let word = word_at(bytes, off);
+        let tag = ((word >> 56) & 0xff) as u8;
+        let other = ((word >> 48) & 0xff) as u8;
+        let cs_sz = ((word >> 32) & 0xffff) as u16;
+        if tag <= abi::TAG_MAX_CTOR_TAG {
+            for i in 0..other as usize {
+                let field = off + 8 + 8 * i;
+                if field + 8 <= bytes.len() {
+                    stack.push(word_at(bytes, field));
+                }
+            }
+        } else if tag == abi::TAG_ARRAY {
+            let size = word_at(bytes, off + 8);
+            for i in 0..size.min(1 << 16) {
+                let field = off + 24 + 8 * i as usize;
+                if field + 8 <= bytes.len() {
+                    stack.push(word_at(bytes, field));
+                }
+            }
+        }
+        out.push(Obj {
+            off,
+            tag,
+            other,
+            cs_sz,
+        });
+    }
+    (out, base)
+}
+
+/// A `Name.str` link and a `List.cons` cell are separated ONLY by their stored
+/// size, and the decoder's list walker does not read it.
+///
+/// `list_ptrs` (`decl.rs`) accepts a cons cell on `tag == 1 && other == 2` and
+/// discards `cs_sz`. `Name.str` is also tag 1 with two pointer fields. So the
+/// rule cannot reject a name where a list belongs, and the confusion is
+/// reachable: `levelParams` is slot 1 of a `ConstantVal` while `induct` - a
+/// `Name` - is slot 1 of the `ConstructorVal` that contains it.
+///
+/// THE CLASSIFICATION HERE DOES NOT USE THE SIZE, which is the whole point. An
+/// object is called a name link when its second field points at a STRING, and a
+/// cons cell when its second field is boxed nil or another cell of the same
+/// shape. That discriminator is independent of `cs_sz`, so the sizes it then
+/// reports are a measurement rather than a restatement of the premise.
+///
+/// This is the corpus measurement `bad3bd20` recorded as missing before
+/// `list_ptrs` could be repaired, made over real pinned declarations. It is not
+/// the repair: nothing here changes `src`.
+#[test]
+fn a_name_link_and_a_cons_cell_collide_on_shape_and_differ_only_in_size() {
+    let mut name_sizes: BTreeSet<u16> = BTreeSet::new();
+    let mut cons_sizes: BTreeSet<u16> = BTreeSet::new();
+    let mut names = 0usize;
+    let mut cells = 0usize;
+
+    for module in [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ] {
+        let bytes = fixture(module);
+        let (objects, base) = objects_of(&bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+
+        for object in &objects {
+            if (object.tag, object.other) != (1, 2) {
+                continue;
+            }
+            let second = word_at(&bytes, object.off + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            match target {
+                // `Name.str prefix component` - the component is a string.
+                Some(t) if t.tag == abi::TAG_STRING => {
+                    names += 1;
+                    name_sizes.insert(object.cs_sz);
+                }
+                // `List.cons head tail` - the tail is another cell...
+                Some(t) if (t.tag, t.other) == (1, 2) => {
+                    cells += 1;
+                    cons_sizes.insert(object.cs_sz);
+                }
+                // ...or boxed `List.nil`.
+                None if second & 1 == 1 && second >> 1 == 0 => {
+                    cells += 1;
+                    cons_sizes.insert(object.cs_sz);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Anti-vacuity: the collision must be real in this corpus, not a shape
+    // two populations could occupy. Both are reached, at the same tag and
+    // arity, and no rule the list walker applies can tell them apart.
+    assert!(
+        names > 0 && cells > 0,
+        "both shapes must occur, or the collision is hypothetical and the \
+         sizes below describe one population: {names} name links, {cells} cons \
+         cells"
+    );
+    assert_eq!(
+        name_sizes.len(),
+        1,
+        "every name link must carry ONE size, or `cs_sz` cannot separate the \
+         two shapes: {name_sizes:?}"
+    );
+    assert_eq!(
+        cons_sizes.len(),
+        1,
+        "every cons cell must carry ONE size, for the same reason: \
+         {cons_sizes:?}"
+    );
+    let name_size = *name_sizes.iter().next().expect("asserted non-empty");
+    let cons_size = *cons_sizes.iter().next().expect("asserted non-empty");
+    assert_ne!(
+        name_size, cons_size,
+        "the stored size is the ONLY field that separates a name link from a \
+         cons cell; if these were equal, no size rule could repair `list_ptrs` \
+         and the hole would need a different fix"
+    );
+    assert!(
+        cons_size < name_size,
+        "a name link is a cons cell's two pointers PLUS the stored hash word, \
+         so it must be the larger of the two: cons {cons_size}, name \
+         {name_size}"
+    );
+    // Already corpus-measured and enforced by `decode_name`'s own size rule,
+    // so this cannot be wrong without that rule being wrong too.
+    assert_eq!(name_size, 32, "Name.str/num link");
+}
+
+/// The decoder consumes a `Name.str` link as a cons cell, and refuses only at
+/// the NEXT hop. A live witness for the hole measured above.
+///
+/// The plant repoints one `ConstantVal`'s `levelParams` - slot 1, the exact
+/// slot a `ConstructorVal`'s `induct` occupies one level out - at a real name
+/// link. If `list_ptrs` read the size, it would refuse AT that link. It does
+/// not: it accepts the link as a cell, takes the name's PREFIX as a list
+/// member, takes the name's STRING as the tail, and fails on the string.
+///
+/// The assertion is the OFFSET, not merely that decoding failed. A cell that
+/// only required an error would pass just as well against a decoder that
+/// refused at the name link for the right reason, and would therefore go on
+/// passing after the repair while silently ceasing to witness anything.
+#[test]
+fn a_planted_name_link_is_consumed_as_a_cons_cell_before_anything_refuses() {
+    let mut bytes = fixture("Init.SizeOfLemmas.olean");
+    let view = OleanView::parse(&bytes).expect("parse");
+    DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("the unmodified fixture decodes");
+
+    let (objects, base) = objects_of(&bytes);
+    let at: std::collections::BTreeMap<usize, Obj> = objects.iter().map(|o| (o.off, *o)).collect();
+
+    // A real `Name.str` link, and the string its second field points at.
+    let (link, string_off) = objects
+        .iter()
+        .find_map(|object| {
+            if (object.tag, object.other) != (1, 2) {
+                return None;
+            }
+            let second = word_at(&bytes, object.off + 16);
+            if second & 1 == 1 {
+                return None;
+            }
+            let off = usize::try_from(second.checked_sub(base)?).ok()?;
+            (at.get(&off)?.tag == abi::TAG_STRING).then_some((*object, off))
+        })
+        .expect("the fixture carries name links");
+
+    // A `ConstantVal`: three pointer fields, no scalars. Its slot 1 is
+    // `levelParams`.
+    let constant_val = objects
+        .iter()
+        .find(|object| (object.tag, object.other) == (0, 3))
+        .copied()
+        .expect("the fixture carries ConstantVals");
+
+    let planted = base + u64::try_from(link.off).expect("in-range");
+    bytes[constant_val.off + 16..constant_val.off + 24].copy_from_slice(&planted.to_le_bytes());
+
+    let view = OleanView::parse(&bytes).expect("the plant changes no header");
+    let error = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect_err("a name where a list belongs must not decode");
+
+    match error {
+        DeclError::Shape { offset, what } => {
+            assert_eq!(
+                what, "List cons",
+                "the refusal comes from the list walker, not from a name rule"
+            );
+            assert_eq!(
+                offset,
+                u64::try_from(string_off).expect("in-range"),
+                "and it names the STRING, which is only reachable by having \
+                 already accepted the name link as a cell and walked to its \
+                 tail. Naming the link itself would mean the walker had \
+                 rejected it on shape - the repair, not the hole."
+            );
+        }
+        other => panic!("expected a List cons shape refusal, got {other}"),
+    }
 }
