@@ -44,6 +44,9 @@ the toolchain would report a perfect facade:
     emitted rows must be facade-only, Init rows must be substrate-only, and
     quarantined rows must be absent. A classified denominator is not enough if
     the generated facade's observed behavior contradicts its classification.
+  * A REFERENCE-IMPORT CONTROL rejects `import Lean` (or `Lean.*`) in the facade
+    source itself. Keeping Reference artifacts out of the temporary root is not
+    sufficient if the source can ask the compiler to find them elsewhere.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -151,7 +154,38 @@ def load_demand(path, part):
     return modules, by_module, seen
 
 
+def reference_import_lines(text):
+    """Return source lines that import Reference Lean modules.
+
+    Imports are line-oriented Lean commands. Strip trailing line comments before
+    tokenizing so the generator's explanatory comments do not trip the guard.
+    The allowed shared substrate is implicit `Init`, never a direct Lean import.
+    """
+    hits = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        command = line.split("--", 1)[0].strip()
+        if not command.startswith("import "):
+            continue
+        targets = command.removeprefix("import ").split()
+        if any(target == "Lean" or target.startswith("Lean.") for target in targets):
+            hits.append(lineno)
+    return hits
+
+
+def refuse_reference_imports(source, label):
+    with open(source, encoding="utf-8") as fh:
+        hits = reference_import_lines(fh.read())
+    if hits:
+        shown = ", ".join(str(line) for line in hits[:8])
+        raise SystemExit(
+            f"REFUSE: the {label} facade source imports Reference Lean at line(s) "
+            f"{shown} — a standalone facade may not import the implementation it "
+            "purports to replace"
+        )
+
+
 def build_facade(lean, env, root, source, label):
+    refuse_reference_imports(source, label)
     os.makedirs(root, exist_ok=True)
     dst = os.path.join(root, "FlnFacade.lean")
     shutil.copyfile(source, dst)
@@ -431,6 +465,14 @@ def main():
     demand_names = {name for names in by_module.values() for name in names}
     demand_dispositions = join_demanded_rows(demand_names, manifest_rows)
 
+    # Mutation control for the source guard above. It is deliberately in-memory:
+    # no Reference-importing file is ever handed to the pinned compiler.
+    if not reference_import_lines("import Lean\n"):
+        raise SystemExit(
+            "REFUSE: Reference-import control did not recognize `import Lean` — "
+            "the facade-source oracle guard is ineffective"
+        )
+
     root = build_facade(lean, env, os.path.join(work, "facade"), args.facade, "generated")
     empty_src = os.path.join(work, "empty.lean")
     with open(empty_src, "w", encoding="utf-8") as fh:
@@ -551,6 +593,10 @@ def main():
             "name": quarantine_name,
             "generated_verdict": quarantine_generated,
             "empty_verdict": quarantine_empty,
+        },
+        "reference_import_control": {
+            "mutant": "import Lean",
+            "rejected": True,
         },
         "reference_imported": False,
         "reading": "every toolchain-api constant the curated real mathlib metaprogram "
