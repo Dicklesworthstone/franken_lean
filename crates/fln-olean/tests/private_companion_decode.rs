@@ -125,6 +125,12 @@ const HEAD_INFO_LOOP_UNSAFE_REC: &str =
 /// Its private-only dependency, which must be recovered from the companion.
 const HEAD_INFO_LOOP_MATCH_1: &str =
     "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1";
+/// The matching public-overlap loop helper for `Lean.Syntax.getTailPos?`.
+const TAIL_POS_LOOP_UNSAFE_REC: &str =
+    "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec";
+/// Its companion-only equation-compiler dependency.
+const TAIL_POS_LOOP_MATCH_1: &str =
+    "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1";
 /// The two tail-recursive merge-sort implementation helpers in the pinned
 /// `Init.Data.List.Sort.Impl` companion delta.
 const MERGE_SORT_TR_UNSAFE_RECS: [&str; 2] = [
@@ -321,6 +327,67 @@ fn prelude_exported_mangled_unsafe_rec_still_requires_its_private_match_companio
     assert!(
         !matches!(recovered, ConstantInfo::Axiom(_)),
         "companion recovery weakened {HEAD_INFO_LOOP_MATCH_1} to an axiom"
+    );
+}
+
+#[test]
+fn prelude_tail_pos_exported_mangled_unsafe_rec_requires_its_private_match_companion() {
+    let lib = lib_or_skip!(
+        "prelude_tail_pos_exported_mangled_unsafe_rec_requires_its_private_match_companion"
+    );
+    let chain = chain_bytes(&lib, "Init/Prelude");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    // This is the second exported `_private.` collision in the Syntax pair.
+    // It proves that companion origin comes from actual part membership, while
+    // its private match_1 dependency must still recover concretely.
+    assert!(
+        exported_names.contains(&TAIL_POS_LOOP_UNSAFE_REC.to_owned()),
+        "Init.Prelude's exported part must retain {TAIL_POS_LOOP_UNSAFE_REC}"
+    );
+    assert!(
+        private_names.contains(&TAIL_POS_LOOP_UNSAFE_REC.to_owned()),
+        "Init.Prelude's private chain must retain {TAIL_POS_LOOP_UNSAFE_REC}"
+    );
+    assert!(
+        !exported_names.contains(&TAIL_POS_LOOP_MATCH_1.to_owned()),
+        "the exported part must omit the companion-only {TAIL_POS_LOOP_MATCH_1}"
+    );
+    assert!(
+        private_names.contains(&TAIL_POS_LOOP_MATCH_1.to_owned()),
+        "the private companion must restore {TAIL_POS_LOOP_MATCH_1}"
+    );
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    assert!(
+        exported_constants
+            .iter()
+            .any(|info| info.name().to_display_string() == TAIL_POS_LOOP_UNSAFE_REC),
+        "exported decoder lost its public-overlap private-mangled tail-position helper"
+    );
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != TAIL_POS_LOOP_MATCH_1),
+        "exported decoder unexpectedly recovered the companion-only tail-position match_1"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == TAIL_POS_LOOP_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {TAIL_POS_LOOP_MATCH_1}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        "companion recovery decoded {TAIL_POS_LOOP_MATCH_1} only as {} instead of a concrete declaration",
+        recovered.kind_name()
     );
 }
 
