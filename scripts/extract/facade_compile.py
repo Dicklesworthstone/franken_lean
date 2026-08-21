@@ -265,6 +265,10 @@ the toolchain would report a perfect facade:
     declaration or an Init-substrate row. A schema-valid but unknown row cannot
     be silently ignored by the compile-rig joins.
 
+  * A MANIFEST-CLAIM-CLASS JOIN requires the source manifest to retain its
+    bounded-model evidence class. A generated coverage artifact cannot silently
+    promote its own evidence level before this rig publishes it.
+
   * A MANIFEST-FORM-TOTALITY JOIN requires every non-Init declaration row to
     use a recognized generator form, and every Init-substrate declaration to
     remain intentionally formless. A form classification cannot disappear
@@ -1413,6 +1417,16 @@ def main():
             f"({json.dumps(manifest_row_kind_join, sort_keys=True)}, "
             f"unexpected={unexpected_manifest_kinds!r})"
         )
+    manifest_claim_class_join = {
+        "manifest_claim_class": manifest_summary.get("claim_class"),
+        "rig_claim_class": "bounded_model",
+    }
+    if (manifest_claim_class_join["manifest_claim_class"]
+            != manifest_claim_class_join["rig_claim_class"]):
+        raise SystemExit(
+            "REFUSE: facade manifest claim-class join disagrees with this rig "
+            f"({json.dumps(manifest_claim_class_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2470,6 +2484,7 @@ def main():
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_schema_row_join": manifest_schema_join,
         "manifest_row_kind_join": manifest_row_kind_join,
+        "manifest_claim_class_join": manifest_claim_class_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
