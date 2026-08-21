@@ -1972,6 +1972,32 @@ fn init_prod_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_except_constructor_entries() -> Vec<ConstantEntry> {
+    let except = checker_name("Except");
+    let error = checker_qualified(&["Except", "error"]);
+    let ok = checker_qualified(&["Except", "ok"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let error_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let ok_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
+    let except_expr = |error: Expr, ok: Expr| Expr::app(
+        Expr::app(Expr::const_(primary_name("Except"), vec![u.clone(), v.clone()]), error), ok,
+    );
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let error_ctor_type = primary_pi("ε", BinderInfo::Default, error_type(), primary_pi(
+        "α", BinderInfo::Default, ok_type(), primary_pi("value", BinderInfo::Default, bv(1), except_expr(bv(2), bv(1))),
+    ));
+    let ok_ctor_type = primary_pi("ε", BinderInfo::Default, error_type(), primary_pi(
+        "α", BinderInfo::Default, ok_type(), primary_pi("value", BinderInfo::Default, bv(0), except_expr(bv(2), bv(1))),
+    ));
+    vec![
+        ConstantEntry::new(error, ConstantDeclaration::constructor(vec![u_name.clone(), v_name.clone()], decoded(&error_ctor_type), ConstantSafety::Safe, ConstructorDeclaration::new(except.clone(), 0, 2, 1))),
+        ConstantEntry::new(ok, ConstantDeclaration::constructor(vec![u_name, v_name], decoded(&ok_ctor_type), ConstantSafety::Safe, ConstructorDeclaration::new(except, 1, 2, 1))),
+    ]
+}
+
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
@@ -2217,6 +2243,19 @@ fn kr600_803_init_prod_fixture_pins_constructor_index_parameters_and_fields() {
     assert_eq!(metadata.num_parameters(), 2);
     assert_eq!(metadata.num_fields(), 2);
     assert_eq!(constructor.level_parameters().len(), 2);
+}
+
+#[test]
+fn kr600_803_init_except_fixture_pins_constructor_indices_parameters_and_fields() {
+    let entries = init_except_constructor_entries();
+    for (entry, expected_index) in [(&entries[0], 0), (&entries[1], 1)] {
+        let metadata = entry.declaration().constructor_metadata().expect("fixture constructor metadata");
+        assert_eq!(metadata.inductive(), &checker_name("Except"));
+        assert_eq!(metadata.index(), expected_index);
+        assert_eq!(metadata.num_parameters(), 2);
+        assert_eq!(metadata.num_fields(), 1);
+        assert_eq!(entry.declaration().level_parameters().len(), 2);
+    }
 }
 
 #[test]
