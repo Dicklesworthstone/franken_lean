@@ -19066,6 +19066,80 @@ fn the_two_validators_diverge_on_available_parallelism_by_decision() {
     );
 }
 
+/// Every number the census counts must reach the receipt that publishes it.
+///
+/// `CorpusCounts` is what the scorer accumulates; `WholeMathlibReceipt` is what gets written
+/// to the evidence file and read back by the guards. The receipt is built field by field from
+/// the counts, and NOTHING JOINS THE TWO SETS. Add a twelfth count -- a new triage bucket, a
+/// second exhaustion class -- and the receipt's struct literal simply will not mention it:
+/// Rust asks for every field of the type being CONSTRUCTED, never for every field of the type
+/// being read. No compile error, no test, and the number is computed on every run and dropped
+/// before anything can be held to it.
+///
+/// That is the mirror-without-a-binding shape this file has now met in four places (the
+/// refusal list at c77d3fb7, the platform-gated census at 0f3309e8, the document tiers, the
+/// class allowance), and it is the one where the loss is a NUMBER rather than a check.
+///
+/// The receipt is a strict superset -- it carries provenance the census has no opinion about
+/// -- so the law is one-way: every count field must appear, and the receipt may have more.
+#[test]
+fn every_census_count_reaches_the_receipt_that_publishes_it() {
+    const SOURCE: &str = include_str!("kernel_replay.rs");
+
+    fn field_names(source: &str, header: &str) -> Vec<String> {
+        let start = source
+            .find(header)
+            .unwrap_or_else(|| panic!("`{header}` must exist to be compared"));
+        let body = &source[start + header.len()..];
+        let end = body
+            .find("\n}")
+            .unwrap_or_else(|| panic!("`{header}` must terminate"));
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                if rest.starts_with(' ') || rest.starts_with('/') || rest.starts_with('#') {
+                    return None;
+                }
+                let (name, _) = rest.split_once(": ")?;
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    let counts = field_names(SOURCE, "struct CorpusCounts {");
+    let receipt = field_names(SOURCE, "struct WholeMathlibReceipt {");
+
+    // ANTI-VACUITY BOTH WAYS. Two empty lists satisfy a subset law, and so does a
+    // scan that read the same struct twice: the receipt carries provenance the
+    // census does not, so it must be STRICTLY larger.
+    assert!(
+        !counts.is_empty() && !receipt.is_empty(),
+        "the field scan found nothing ({} counts, {} receipt fields), so the law below holds \
+         over an empty set",
+        counts.len(),
+        receipt.len()
+    );
+    assert!(
+        receipt.len() > counts.len(),
+        "the receipt does not carry more fields than the census ({} vs {}), so both scans may \
+         have read the same struct",
+        receipt.len(),
+        counts.len()
+    );
+
+    for count in &counts {
+        assert!(
+            receipt.contains(count),
+            "the census counts `{count}` and the receipt does not carry it, so the number is \
+             accumulated on every run and dropped before it can be published, conserved or \
+             contradicted"
+        );
+    }
+}
+
 /// A row that compared nothing must not stand as the observation (bead `franken_lean-p6x1`).
 ///
 /// **The mutant this exists for, and it was live.** Measured at `2ebe03e0`, with both
