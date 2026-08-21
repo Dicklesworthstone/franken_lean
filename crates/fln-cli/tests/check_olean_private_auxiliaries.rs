@@ -453,10 +453,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"coreObservablesLoopResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateEqDefMatchResiduals\":{\"observed\":8,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateEqDefMatchResiduals\":{\"observed\":8,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateMatchNResiduals\":{\"observed\":6,\"names\":[{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateMatchNResiduals\":{\"observed\":6,\"names\":[{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateEqDefResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -562,7 +562,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "decoded _private eq_def/match_N residuals: 8 (decoded companion names; reporting only; not a G1 claim)"
     ));
     assert!(human.stdout.contains(
-        "decoded _private eq_def/match_N residual names: _private.CliPrivateReport.0.eq_def, _private.CliPrivateReport.0.loop.eq_def, _private.CliPrivateReport.0.match_1, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
+        "decoded _private eq_def/match_N residual names: _private.CliPrivateReport.0.eq_def, _private.CliPrivateReport.0.match_1, _private.CliPrivateReport.0.loop.eq_def, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
     ));
     assert!(human
         .stdout
@@ -571,7 +571,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "decoded _private match_N residuals: 6 (decoded companion names; reporting only; not a G1 claim)"
     ));
     assert!(human.stdout.contains(
-        "decoded _private match_N residual names: _private.CliPrivateReport.0.match_1, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
+        "decoded _private match_N residual names: _private.CliPrivateReport.0.match_1, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
     ));
     assert!(human
         .stdout
