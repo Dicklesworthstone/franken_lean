@@ -3246,3 +3246,162 @@ fn the_head_record_slot_three_is_a_pi_type() {
          type written out, not a lone binder"
     );
 }
+
+/// Slot 4 links BACK into the third shape - the population is not 99 unrelated
+/// oddities.
+///
+/// The tag-4 option is offered for the third time and the answer has not
+/// changed: `9d365d6a` pins that not one of the 11 has a pointer head, so there
+/// are no tag-4 head records to classify. Recorded at `c726dec5`, repeated at
+/// `c7836115`, repeated here.
+///
+/// Slot 4 is the last of the five, so this finishes the record. `2475a62f`
+/// pinned that it is the only slot whose shape varies - three shapes where its
+/// neighbours have one - and said nothing about what those shapes are.
+///
+/// EIGHT OF THEM ARE `(1, 2)` OBJECTS THAT ARE THEMSELVES THIRD-SHAPE. Not
+/// merely the same tag and arity: they satisfy the same tail test that defines
+/// the 99, checked here rather than inferred from the header. So a third-shape
+/// object's head record can hold, in its last slot, another third-shape object.
+///
+/// That changes what the population IS. Nine waves have counted, split,
+/// located and characterised the 99 as if they were 99 independent objects that
+/// happened to share a header. They are not independent - at least eight of
+/// them are reachable from another one, through its head record. Whatever these
+/// are, they form a linked structure, and no cell before this one could have
+/// seen that, because every one of them stopped at the first object whose shape
+/// it recognised.
+///
+/// The other two shapes are pinned as counts and nothing more. No type,
+/// extension or schema is named, and no size is asserted anywhere.
+#[test]
+fn the_head_record_slot_four_links_back_into_the_third_shape() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut distinct: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut shapes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut third_shape_again = 0usize;
+    let mut reaches_a_record = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        // The same test that defines the 99, applied to any candidate rather
+        // than only to the objects the outer scan is walking.
+        let is_third_shape = |off: usize| -> bool {
+            if at.get(&off).map(|o| (o.tag, o.other, o.cs_sz)) != Some((1, 2, 24)) {
+                return false;
+            }
+            let second = word_at(bytes, off + 16);
+            if second & 1 == 1 {
+                return second >> 1 != 0;
+            }
+            !resolve(second).is_some_and(|t| at.get(&t).map(|o| (o.tag, o.other)) == Some((1, 2)))
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if !is_third_shape(object.off) {
+                continue;
+            }
+            let Some(tail) = resolve(word_at(bytes, object.off + 16)) else {
+                continue;
+            };
+            if at.get(&tail).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(head) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&head).map(|h| (h.tag, h.other)) == Some((0, 5)) {
+                records.insert(head);
+            }
+        }
+
+        for record in records {
+            references += 1;
+            let word = word_at(bytes, record + 8 + 8 * 4);
+            let Some(off) = resolve(word) else {
+                *shapes
+                    .entry("boxed or unresolvable".to_owned())
+                    .or_default() += 1;
+                continue;
+            };
+            let object = at.get(&off).expect("resolved above");
+            distinct.insert((index, off));
+            *shapes
+                .entry(format!("tag {} arity {}", object.tag, object.other))
+                .or_default() += 1;
+
+            if is_third_shape(off) {
+                third_shape_again += 1;
+            }
+            for slot in 0..usize::from(object.other) {
+                if let Some(child) = resolve(word_at(bytes, off + 8 + 8 * slot))
+                    && at.get(&child).map(|c| (c.tag, c.other)) == Some((0, 5))
+                {
+                    reaches_a_record += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(references, 69, "one slot 4 per distinct head record");
+    assert_eq!(
+        distinct.len(),
+        68,
+        "reaching 68 distinct objects: one is shared"
+    );
+    assert_eq!(
+        shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 57),
+            ("tag 1 arity 2".to_owned(), 8),
+            ("tag 5 arity 1".to_owned(), 4),
+        ],
+        "the three shapes `2475a62f` found varying, now counted"
+    );
+
+    // The finding: the population refers to itself.
+    assert_eq!(
+        third_shape_again, 8,
+        "every `(1, 2)` object at slot 4 is ITSELF third-shape - it satisfies \
+         the same tail test that defines the 99, checked rather than inferred \
+         from the header. The population is linked, not 99 independent objects \
+         that happen to share a header"
+    );
+    assert_eq!(
+        reaches_a_record, 8,
+        "and each reaches a five-field head record in one hop, which is what \
+         being third-shape with a `tag 0` tail means"
+    );
+}
