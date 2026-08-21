@@ -5123,6 +5123,38 @@ fn kr600_803_color_blue_refuses_a_forged_constructor_level_parameter_count() {
 }
 
 #[test]
+fn kr600_803_color_red_refuses_a_forged_constructor_level_parameter_count() {
+    let mut entries = enumeration_entries(BinderInfo::Implicit);
+    let constructor = entries[1].declaration();
+    let mut levels = constructor.level_parameters().to_vec();
+    levels.push(checker_name("u"));
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Color", "red"]),
+        ConstantDeclaration::constructor(
+            levels,
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Color"), 0, 0, 0),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Color.red constructor level-parameter count verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_color_refuses_a_forged_constructor_index() {
     let mut entries = enumeration_entries(BinderInfo::Implicit);
     let constructor = entries[1].declaration();
