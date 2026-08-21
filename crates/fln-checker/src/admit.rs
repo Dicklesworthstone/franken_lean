@@ -4648,7 +4648,7 @@ fn admit_init_unit(
     InductiveVerdict::Admitted(InductiveAdmission { members: vec![name.clone(), unit, recursor_name] })
 }
 
-/// Reconstruct the two-parameter `Init.Sum` block and its eliminator.
+/// Reconstruct a named two-parameter Type coproduct and its eliminator.
 fn admit_init_sum(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
@@ -4657,6 +4657,8 @@ fn admit_init_sum(
     environment_budget: EnvironmentBudget,
     comparison: &mut StructuralComparisonControl,
     cancelled: &mut dyn FnMut() -> bool,
+    left_label: &str,
+    right_label: &str,
 ) -> InductiveVerdict {
     let name = inductive.name();
     let declaration = inductive.declaration();
@@ -4671,8 +4673,8 @@ fn admit_init_sum(
     if metadata.num_nested() != 0 { return InductiveVerdict::Deferred(InductiveSupportLimit::Nested { observed: metadata.num_nested() }); }
     if metadata.is_recursive() { return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive); }
     if metadata.is_reflexive() { return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive); }
-    let inl = checker_child(name, "inl");
-    let inr = checker_child(name, "inr");
+    let inl = checker_child(name, left_label);
+    let inr = checker_child(name, right_label);
     if metadata.constructors() != [inl.clone(), inr.clone()] || declarations.len() != 4 || environment.find(name).is_some() {
         return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { name: name.clone() });
     }
@@ -4709,7 +4711,7 @@ fn admit_init_sum(
     }
     if let Err(verdict) = declared_type_is_a_type(&staged, &recursor_name, recursor.declaration(), &budget, cancelled) { return map_member_preamble(&recursor_name, verdict); }
     if let Err(verdict) = stage_inductive_member(&staged, recursor, environment_budget, cancelled) { return verdict; }
-    InductiveVerdict::Admitted(InductiveAdmission { members: vec![name.clone(), checker_child(name, "inl"), checker_child(name, "inr"), recursor_name] })
+    InductiveVerdict::Admitted(InductiveAdmission { members: vec![name.clone(), checker_child(name, left_label), checker_child(name, right_label), recursor_name] })
 }
 
 /// Reconstruct the two-parameter singleton-constructor `Init.Prod` block.
@@ -5072,6 +5074,17 @@ pub fn admit_inductive_with(
             environment_budget,
             &mut comparison,
             &mut cancelled,
+            "inl",
+            "inr",
+        );
+    }
+    if name == &checker_atom("Except")
+        && declaration.level_parameters().len() == 2
+        && metadata.num_parameters() == 2
+    {
+        return admit_init_sum(
+            environment, declarations, inductive, budget, environment_budget,
+            &mut comparison, &mut cancelled, "error", "ok",
         );
     }
     if name == &checker_atom("Prod")
