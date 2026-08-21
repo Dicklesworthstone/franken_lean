@@ -994,6 +994,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "both check-olean JSON render paths emit the logical-root pair",
     );
     assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
+                    == r##""\"module\":{{\"isModulePart\":{},\"imports\":0,""##
+                    && lines[1].trim()
+                        == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,""##
+            })
+            .count(),
+        1,
+        "the standalone check-olean JSON render path keeps module metadata beside extension status",
+    );
+    assert_eq!(
         [
             cli_source_lines
                 .iter()
