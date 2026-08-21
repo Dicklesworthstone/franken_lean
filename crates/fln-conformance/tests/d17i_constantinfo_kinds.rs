@@ -649,3 +649,108 @@ fn the_six_artifact_incomplete_rows_name_auxiliaries_the_private_part_supplies()
         private.len()
     );
 }
+
+/// The CROSS-MODULE half of the UnknownConstant story, which every pin above
+/// misses.
+///
+/// Everything measured so far compares two parts of ONE module. d17i's sharpest
+/// structural evidence was not that shape: it observed `Init.Meta.Defs`
+/// referencing `_private.Init.Prelude.0.Lean.Name.beq.match_1` while
+/// "Init.Prelude was decoded first with 2,204 declarations". That number is the
+/// EXPORTED census — pinned as an equality above — so the old run had already
+/// processed the owning module and still could not resolve the reference.
+///
+/// The measurement below says why, and it is a property no within-module pin
+/// can state: the auxiliary is absent from BOTH parts of the referencing
+/// module. A module never carries another module's private auxiliary just
+/// because it uses one. Resolution therefore depends entirely on the OWNING
+/// module having been admitted at its private level; decoding the referencing
+/// module perfectly cannot help, and neither can the kernel, which can only
+/// report a name the environment does not hold.
+const CROSS_MODULE_REFERENCE: (&str, &str, &str) = (
+    "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+    "Init/Meta/Defs", // references it
+    "Init/Prelude",   // owns it, at private level only
+);
+
+/// A private name's `_private.<Module>.0.` prefix names the module that owns
+/// the PRIVACY SCOPE, not the module that stores the declaration.
+///
+/// This is the trap in the const above, and it is worth a pin of its own
+/// because the natural repair for a missing `_private.A.0.x` — go and look in
+/// module `A` — is wrong for a real population. `Array.ofFn.go` is private to
+/// `Init/Data/Array/Basic`, so lemmas derived from it inherit that scope in
+/// their names; but `congr_simp` is GENERATED in the modules that trigger it
+/// and is stored there. It is absent from `Init/Data/Array/Basic` at both
+/// levels and present in two other modules' private parts.
+///
+/// Measured across the 600 Init modules carrying a complete chain: 34
+/// declarations are stored in a module other than the one their private prefix
+/// names. So this is a population, not a curiosity, and a resolver keyed on the
+/// prefix silently fails on all of them.
+const SCOPE_IS_NOT_STORAGE: (&str, &str, &[&str]) = (
+    "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp",
+    "Init/Data/Array/Basic", // names the privacy scope; does NOT store it
+    &["Init/Data/Array/Lemmas", "Init/Data/Array/OfFn"], // actually store it
+);
+
+#[test]
+fn a_private_auxiliary_is_never_carried_by_the_module_that_references_it() {
+    let lib = lib_or_skip!();
+    let (auxiliary, referencing, owning) = CROSS_MODULE_REFERENCE;
+
+    let (exported, private) = exported_and_private(&lib, referencing);
+    assert_eq!(
+        exported.get(auxiliary).copied(),
+        None,
+        "{referencing}: a referencing module does not carry the auxiliary at exported level"
+    );
+    assert_eq!(
+        private.get(auxiliary).copied(),
+        None,
+        "{referencing}: nor at private level — this is what makes the reference CROSS-module, \
+         and what no amount of decoding the referencing module can fix"
+    );
+
+    let (exported, private) = exported_and_private(&lib, owning);
+    assert_eq!(
+        exported.get(auxiliary).copied(),
+        None,
+        "{owning}: absent from the exported part, which is why processing this module first at \
+         2,204 declarations still left the reference unresolved"
+    );
+    assert_eq!(
+        private.get(auxiliary).copied(),
+        Some("Defn"),
+        "{owning}: the private level is the only place the auxiliary exists, so admitting the \
+         OWNING module at private level is the necessary condition for resolution"
+    );
+}
+
+#[test]
+fn a_private_name_prefix_names_the_scope_and_not_the_storing_module() {
+    let lib = lib_or_skip!();
+    let (declaration, scope_module, storing_modules) = SCOPE_IS_NOT_STORAGE;
+
+    let (exported, private) = exported_and_private(&lib, scope_module);
+    assert_eq!(
+        exported.get(declaration).copied(),
+        None,
+        "{scope_module} names the privacy scope but must not store the declaration"
+    );
+    assert_eq!(
+        private.get(declaration).copied(),
+        None,
+        "{scope_module}: absent at private level too — resolving this name by going to the \
+         module its prefix names finds nothing"
+    );
+
+    for module in storing_modules {
+        let (_, private) = exported_and_private(&lib, module);
+        assert_eq!(
+            private.get(declaration).copied(),
+            Some("Thm"),
+            "{module}: generated into the module that triggered it, and stored there"
+        );
+    }
+}
