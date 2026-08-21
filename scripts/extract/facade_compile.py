@@ -3736,6 +3736,9 @@ def main():
     type_roundtrip_init_provided_inequality_join = {"summary_type_roundtrip_checked": manifest_summary.get("type_roundtrip_checked"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(type_roundtrip_init_provided_inequality_join["summary_type_roundtrip_checked"], int) or isinstance(type_roundtrip_init_provided_inequality_join["summary_type_roundtrip_checked"], bool) or not isinstance(type_roundtrip_init_provided_inequality_join["summary_init_provided"], int) or isinstance(type_roundtrip_init_provided_inequality_join["summary_init_provided"], bool) or type_roundtrip_init_provided_inequality_join["summary_type_roundtrip_checked"] <= type_roundtrip_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest type-roundtrip count must exceed Init-provided count " + json.dumps(type_roundtrip_init_provided_inequality_join, sort_keys=True))
+    projection_types_type_roundtrip_inequality_join = {"summary_projection_types_checked": manifest_summary.get("projection_types_checked"), "summary_type_roundtrip_checked": manifest_summary.get("type_roundtrip_checked")}
+    if (not isinstance(projection_types_type_roundtrip_inequality_join["summary_projection_types_checked"], int) or isinstance(projection_types_type_roundtrip_inequality_join["summary_projection_types_checked"], bool) or not isinstance(projection_types_type_roundtrip_inequality_join["summary_type_roundtrip_checked"], int) or isinstance(projection_types_type_roundtrip_inequality_join["summary_type_roundtrip_checked"], bool) or projection_types_type_roundtrip_inequality_join["summary_projection_types_checked"] <= projection_types_type_roundtrip_inequality_join["summary_type_roundtrip_checked"]):
+        raise SystemExit("REFUSE: facade manifest projection-type count must exceed type-roundtrip count " + json.dumps(projection_types_type_roundtrip_inequality_join, sort_keys=True))
     declaration_init_substrate_inequality_join = {"summary_declarations_emitted": manifest_summary.get("declarations_emitted"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], int) or isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], bool) or not isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or declaration_init_substrate_inequality_join["summary_declarations_emitted"] <= declaration_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest declaration count must exceed Init-substrate count " + json.dumps(declaration_init_substrate_inequality_join, sort_keys=True))
@@ -5988,6 +5991,9 @@ def main():
         ),
         "manifest_type_roundtrip_init_provided_inequality_join": (
             type_roundtrip_init_provided_inequality_join
+        ),
+        "manifest_projection_types_type_roundtrip_inequality_join": (
+            projection_types_type_roundtrip_inequality_join
         ),
         "manifest_declaration_init_substrate_inequality_join": (
             declaration_init_substrate_inequality_join
