@@ -388,6 +388,11 @@ const ARRAY_OF_FN_GO_F_MODULE: &str = "Init/Data/Array/Basic";
 const ARRAY_OF_FN_GO_SUNFOLD: &str = "_private.Init.Data.Array.Basic.0.Array.ofFn.go._sunfold";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_OF_FN_GO_SUNFOLD_MODULE: &str = "Init/Data/Array/Basic";
+/// The generated unsafe recursion helper for `Array.ofFn.go`.
+const ARRAY_OF_FN_GO_UNSAFE_REC: &str =
+    "_private.Init.Data.Array.Basic.0.Array.ofFn.go._unsafe_rec";
+/// The pin's private array stores this helper in the basic module.
+const ARRAY_OF_FN_GO_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.mem_def`.
 const ARRAY_MEM_DEF_MATCH_1_1: &str =
     "_private.Init.Data.Array.Basic.0.Array.mem_def.match_1_1";
@@ -2341,6 +2346,35 @@ fn array_of_fn_go_sunfold_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_OF_FN_GO_SUNFOLD} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_of_fn_go_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_of_fn_go_unsafe_rec_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_OF_FN_GO_UNSAFE_REC_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_OF_FN_GO_UNSAFE_REC.to_owned()),
+        "the private companion of {ARRAY_OF_FN_GO_UNSAFE_REC_MODULE} must retain \
+         {ARRAY_OF_FN_GO_UNSAFE_REC}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_OF_FN_GO_UNSAFE_REC)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_OF_FN_GO_UNSAFE_REC}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_OF_FN_GO_UNSAFE_REC} as {} instead of Defn",
         recovered.kind_name()
     );
 }
