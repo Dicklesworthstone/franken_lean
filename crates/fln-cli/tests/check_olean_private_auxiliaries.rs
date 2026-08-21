@@ -839,6 +839,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateMergeTrGoUnsafeRecResiduals",
+        1,
+        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "coreObservablesLoopUnsafeRecResiduals",
         2,
         &[
@@ -979,6 +985,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_human_named_residuals(
         &human.stdout, "decoded _private .go._unsafe_rec residuals", "decoded _private .go._unsafe_rec residual names", 2,
         &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private mergeTR.go._unsafe_rec residuals",
+        "decoded _private mergeTR.go._unsafe_rec residual names",
+        1,
+        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec"],
     );
     assert_human_named_residuals(
         &human.stdout, "core-observables Lean.Syntax .loop._unsafe_rec residuals", "core-observables Lean.Syntax .loop._unsafe_rec residual names", 2,
