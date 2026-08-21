@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::lean_hash::string_hash;
@@ -16,6 +17,113 @@ use fln_core::options::KVMap;
 
 fn n(s: &str) -> Name {
     Name::str(Name::anonymous(), s)
+}
+
+/// Locate the pinned Reference library for real `.olean` companion fixtures.
+/// An unprovisioned developer host is a typed absence, not a reason to replace
+/// the pin with a synthetic declaration graph.
+fn reference_lib() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("FLN_REFERENCE_LIB") {
+        let path = PathBuf::from(dir);
+        return path.is_dir().then_some(path);
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
+    path.is_dir().then_some(path)
+}
+
+fn numbered_private_auxiliary(name: &str, prefix: &str) -> bool {
+    name.rsplit('.').next().is_some_and(|segment| {
+        segment
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+/// Regression for `franken_lean-timy`: private equation-compiler declarations
+/// live in a module's `.olean.private` companion, not the exported public part.
+/// The public-only projection must therefore lack these names, while the product
+/// companion-chain decoder must recover each family before any later admission.
+#[test]
+fn complete_olean_chain_restores_all_private_equation_compiler_auxiliary_families() {
+    let Some(reference_lib) = reference_lib() else {
+        return;
+    };
+
+    let modules = [
+        "Init/Prelude",
+        "Init/Data/List/ToArrayImpl",
+        "Init/Data/Array/Basic",
+        "Init/Control/MonadAttach",
+    ];
+    let mut public_names = BTreeSet::new();
+    let mut companion_names = BTreeSet::new();
+
+    for module in modules {
+        let artifact = reference_lib.join(format!("{module}.olean"));
+        let server = artifact.with_extension("olean.server");
+        let private = artifact.with_extension("olean.private");
+        let public_bytes = std::fs::read(&artifact)
+            .unwrap_or_else(|error| panic!("read public {}: {error}", artifact.display()));
+        let server_bytes = std::fs::read(&server)
+            .unwrap_or_else(|error| panic!("read server {}: {error}", server.display()));
+        let private_bytes = std::fs::read(&private)
+            .unwrap_or_else(|error| panic!("read private {}: {error}", private.display()));
+
+        let public_view = fln_olean::region::OleanView::parse(&public_bytes)
+            .unwrap_or_else(|error| panic!("parse public {}: {error}", artifact.display()));
+        public_names.extend(
+            fln_olean::decl::DeclDecoder::new(
+                &public_view,
+                fln_olean::region::WalkBudget::default(),
+            )
+            .decode_module_constants()
+            .unwrap_or_else(|error| panic!("decode public {}: {error}", artifact.display()))
+            .into_iter()
+            .map(|info| info.name().to_display_string()),
+        );
+
+        let total_bytes = public_bytes
+            .len()
+            .checked_add(server_bytes.len())
+            .and_then(|total| total.checked_add(private_bytes.len()))
+            .expect("fixture chain byte count fits usize");
+        let decoded = fln::decode_olean_module_artifacts(
+            &public_bytes,
+            &server_bytes,
+            &private_bytes,
+            fln::OleanDecodeLimits::new(total_bytes),
+        )
+        .unwrap_or_else(|error| panic!("decode complete {module} chain: {error}"));
+        assert!(decoded.companion_parts_loaded, "{module} omitted its companion chain");
+        companion_names.extend(
+            decoded
+                .constants
+                .into_iter()
+                .map(|info| info.name().to_display_string()),
+        );
+    }
+
+    let families: [(&str, fn(&str) -> bool); 4] = [
+        ("match_N", |name| numbered_private_auxiliary(name, "match_")),
+        ("_proof_N", |name| numbered_private_auxiliary(name, "_proof_")),
+        (".loop", |name| name.contains(".loop.")),
+        ("eq_N", |name| numbered_private_auxiliary(name, "eq_")),
+    ];
+    for (family, belongs_to_family) in families {
+        let restored: Vec<_> = companion_names
+            .iter()
+            .filter(|name| name.starts_with("_private.") && belongs_to_family(name))
+            .collect();
+        assert!(
+            !restored.is_empty(),
+            "complete companion decode omitted every private {family} auxiliary"
+        );
+        assert!(
+            restored.iter().all(|name| !public_names.contains(*name)),
+            "{family} regression stopped distinguishing private companion declarations from public declarations: {restored:?}"
+        );
+    }
 }
 
 fn string_case(label: &str) -> Option<String> {
