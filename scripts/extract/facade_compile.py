@@ -190,6 +190,10 @@ the toolchain would report a perfect facade:
     unregistered. Instance metadata cannot claim a registration the façade did
     not actually emit.
 
+  * A MANIFEST-PROVIDER-TYPE-CLOSURE JOIN requires every `provided_by` owner
+    across the full manifest to occur in that row's type dependencies. Structural
+    provenance cannot drift from the declaration's reported type closure.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2211,6 +2215,26 @@ def main():
             f"unemitted={unemitted_registered_instances[:8]!r}, "
             f"registered_dropped={registered_dropped_instances[:8]!r})"
         )
+    provider_type_dependency_mismatches = sorted(
+        row["name"] for row in manifest_rows
+        if row.get("provided_by") is not None
+        and row.get("provided_by") not in row.get("type_deps", [])
+    )
+    manifest_provider_type_closure_join = {
+        "provider_edges": len(provider_edges),
+        "provider_dependency_matches": len(provider_edges)
+        - len(provider_type_dependency_mismatches),
+        "mismatches": len(provider_type_dependency_mismatches),
+    }
+    if (manifest_provider_type_closure_join["provider_edges"] == 0
+            or manifest_provider_type_closure_join["provider_dependency_matches"]
+            != manifest_provider_type_closure_join["provider_edges"]
+            or manifest_provider_type_closure_join["mismatches"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest provider-type-closure join failed "
+            f"({json.dumps(manifest_provider_type_closure_join, sort_keys=True)}, "
+            f"mismatches={provider_type_dependency_mismatches[:8]!r})"
+        )
     unknown_printer_rows = []
     init_printer_rows = []
     manifest_printer_counts = Counter()
@@ -2455,6 +2479,7 @@ def main():
         "manifest_negative_control_join": manifest_negative_control_join,
         "manifest_init_row_provenance_join": manifest_init_row_provenance_join,
         "manifest_instance_state_join": manifest_instance_state_join,
+        "manifest_provider_type_closure_join": manifest_provider_type_closure_join,
         "manifest_printer_totality_join": manifest_printer_totality_join,
         "manifest_projection_closure_join": manifest_projection_closure_join,
         "checked": checked,
