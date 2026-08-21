@@ -5786,6 +5786,91 @@ fn every_non_answer_outcome_yields_a_legal_family_token() {
     );
 }
 
+/// The projection refuses a path it cannot honestly name, and each refusal is
+/// told apart by the part that DIFFERS.
+///
+/// **Why these branches are reachable at all.** Called through the walk,
+/// `module_name_from_path` only ever sees paths `collect_present_oleans` found
+/// beneath the root, so its guards look unreachable like the two in
+/// `walk_olean_inventory`. They are not: the function is `pub` within this file
+/// and is called DIRECTLY by
+/// `the_inventory_vectors_are_parallel_and_the_extension_match_is_exact`, which
+/// recomputes each expected name from its own path. A direct caller can hand it
+/// anything, and a future one will.
+///
+/// **What each refusal protects.** A path outside the root would yield a module
+/// name for a file the corpus does not contain. A `..` component would yield a
+/// name that reads as ordinary while pointing above the tree being inventoried.
+/// A root with nothing below it would yield the empty name, which would collide
+/// with any other empty name and take the injectivity rule down with it. All
+/// three produce a plausible-looking module name rather than an error, which is
+/// why they are refusals rather than debug assertions.
+///
+/// **The expectations are chosen for what separates them.** Four of these five
+/// messages share `module path`, two share `module path component in`, and two
+/// share `empty module` -- so asserting on any of those fragments would let one
+/// branch pass in another's place. Each cell below asserts on the words unique
+/// to its own branch.
+#[test]
+fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
+    let root = Path::new("/corpus/lib");
+
+    // OUTSIDE THE ROOT. `strip_prefix` is lexical, so this is a real caller
+    // error rather than a filesystem question.
+    let reason = module_name_from_path(root, Path::new("/elsewhere/Thing.olean"))
+        .expect_err("a path outside the root cannot be named against it");
+    assert!(
+        reason.contains("is outside"),
+        "the refusal must say the path is not under the root: {reason}"
+    );
+
+    // A NON-NORMAL COMPONENT. `strip_prefix` keeps `..` verbatim, so the
+    // relative path escapes upward while still looking like a module path.
+    let reason = module_name_from_path(root, Path::new("/corpus/lib/../up/Thing.olean"))
+        .expect_err("a `..` component cannot be projected to a module name");
+    assert!(
+        reason.contains("non-normal"),
+        "`non-normal` is the only word separating this from the empty-component \
+         refusal, which shares `module path component in`: {reason}"
+    );
+
+    // NOTHING BELOW THE ROOT AT ALL: the relative path is empty, so there are no
+    // components to join and the name would be the empty string.
+    let reason = module_name_from_path(root, root).expect_err("the root itself names no module");
+    assert!(
+        reason.contains("empty module name"),
+        "`empty module name` is what separates this from the empty-COMPONENT \
+         refusal, which also begins `empty module`: {reason}"
+    );
+
+    // ANTI-VACUITY on the choice of expectations: each must appear in exactly
+    // one of the five messages this function can produce, or a cell could pass
+    // on a sibling's refusal. The list is the messages themselves, so it cannot
+    // drift from them silently.
+    const MESSAGES: [&str; 5] = [
+        "is outside",
+        "non-normal module path component in",
+        "non-UTF-8 module path",
+        "empty module path component in",
+        "empty module name for",
+    ];
+    for probe in ["is outside", "non-normal", "empty module name"] {
+        assert_eq!(
+            MESSAGES.iter().filter(|m| m.contains(probe)).count(),
+            1,
+            "`{probe}` no longer identifies exactly one refusal of this projection"
+        );
+    }
+    // And the fragments deliberately NOT used, so the reason they were rejected
+    // stays visible rather than becoming folklore.
+    for shared in ["module path", "empty module"] {
+        assert!(
+            MESSAGES.iter().filter(|m| m.contains(shared)).count() > 1,
+            "`{shared}` is no longer ambiguous; the cells above could be simplified"
+        );
+    }
+}
+
 /// Qualification prepends UNCONDITIONALLY -- the premise that makes the walk's
 /// prefix guard unreachable from any tree.
 ///
