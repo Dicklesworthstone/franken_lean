@@ -1303,6 +1303,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths keep private find-leading-spaces next-line unsafe-rec residuals beside core-observables loop unsafe-rec residuals",
     );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
+                    == r##""\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+                    && lines[1].trim()
+                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep core-observables loop unsafe-rec residuals beside the logical-root pair",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
