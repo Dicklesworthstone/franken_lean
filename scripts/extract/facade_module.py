@@ -1572,6 +1572,31 @@ def unreproduced_family_error(decl, provided, line_map, unreproduced,
     return None
 
 
+def kept_candidate(path):
+    """Say what is ACTUALLY at the candidate path, at the moment of saying it.
+
+    Both fatal exits below hand a human a path and call the file kept, and
+    neither has ever looked. The claim is not free: the success path ends in
+    `os.replace(candidate, args.out)`, which MOVES the candidate onto the output,
+    so on any healthy run there is no candidate at all -- verified on this
+    checkout, where nothing matching the candidate or verify paths exists and
+    nothing is untracked. A refusal that names a path nobody can open sends the
+    next reader looking for a file that was never there, exactly when they are
+    debugging the failure that produced the message.
+
+    Returns the phrase to interpolate, not a verdict: this reports on a run that
+    is already failing and must never replace its cause with one of its own.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return (f"no candidate was kept -- {path} does not exist, so the facade "
+                "that failed is not on disk to inspect")
+    if size == 0:
+        return f"candidate at {path} is EMPTY (0 bytes), nothing to inspect"
+    return f"candidate kept at {path}, {size} bytes"
+
+
 def declared_written_error(line_map, inductive_decls):
     """Everything the manifest calls a declared inductive was actually written as
     one, and nothing else was.
@@ -2287,7 +2312,7 @@ def main():
                     or blamed_transparent or blamed_inductives):
                 raise SystemExit(
                     f"REFUSE: elaboration failed but no error line maps to a "
-                    f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
+                    f"declaration ({kept_candidate(candidate)}):\n{out[:1500]}")
             progressed = False
             # A ROW WHOSE COMPLAINT NAMES A CONSTANT THE FACADE OWES BUT HAS NOT
             # GOT IN FRONT OF IT IS A VICTIM, NOT A CAUSE. The structural block for
@@ -2438,7 +2463,7 @@ def main():
             if not progressed:
                 raise SystemExit(
                     f"REFUSE: no repair left for {sorted(blamed_axioms | blamed_attrs)[:8]} "
-                    f"(candidate kept at {candidate})")
+                    f"({kept_candidate(candidate)})")
         else:
             raise SystemExit(
                 f"REFUSE: the facade did not converge in {args.max_attempts} attempts")
