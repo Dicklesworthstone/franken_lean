@@ -7362,6 +7362,41 @@ impl WholeMathlibReceipt {
                     .to_string(),
             );
         }
+        if self.bead.trim().is_empty() {
+            return Err(
+                "row carries an empty bead, so a retained observation names no work item and \
+                 cannot be routed to whoever owns it"
+                    .to_string(),
+            );
+        }
+        // PROFILE IS NOT DECORATION: it is what makes `wall_ms` mean anything.
+        // That number is the priced input to the cadence decision that keeps
+        // this lane on demand, and the same corpus takes roughly an order of
+        // magnitude longer under `dev` than under `release`. A row that
+        // mislabels which one it ran under misprices exactly the decision the
+        // receipt exists to inform, while every other field stays true. The
+        // producer can only emit these two, so a third value was not produced by
+        // a run.
+        if self.profile != "dev" && self.profile != "release" {
+            return Err(format!(
+                "row records profile `{}`, but the producer emits only `dev` or `release`. \
+                 `wall_ms` is uninterpretable without knowing which, and it is the number the \
+                 cadence decision rests on",
+                self.profile
+            ));
+        }
+        if self.target.trim().is_empty() {
+            return Err(
+                "row carries an empty target, so it names no host architecture and its timing \
+                 cannot be compared with any other row's"
+                    .to_string(),
+            );
+        }
+        // `available_parallelism` is DELIBERATELY unconstrained, stated here so
+        // the asymmetry above is a decision rather than an oversight: the
+        // producer writes 0 when the host would not report it, so zero is a
+        // legitimate value meaning "unknown" and refusing it would refuse honest
+        // rows from hosts that cannot answer.
 
         // CONTENT. The class must match what the counts actually say: a
         // refutation wearing the clean token is the one failure this format
@@ -7988,6 +8023,30 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 ..sample_whole_mathlib_receipt()
             },
             "corpus_fixture_hash",
+        ),
+        (
+            "no bead attribution",
+            WholeMathlibReceipt {
+                bead: "   ".to_string(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "names no work item",
+        ),
+        (
+            "a profile the producer cannot emit",
+            WholeMathlibReceipt {
+                profile: "fastbuild".to_string(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "only `dev` or `release`",
+        ),
+        (
+            "no host architecture",
+            WholeMathlibReceipt {
+                target: String::new(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "names no host architecture",
         ),
         (
             "no source provenance",
