@@ -340,7 +340,8 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     assert!(report.stderr.is_empty());
 
     let json = &report.stdout;
-    assert!(!json_bool_field(json, "g1Satisfied"), "{json}");
+    let g1_satisfied = json_bool_field(json, "g1Satisfied");
+    assert!(!g1_satisfied, "{json}");
     assert!(json_bool_field(json, "companionPartsLoaded"), "{json}");
     let private_companion_residuals = json_object_field(json, "privateCompanionResiduals");
     assert_eq!(
@@ -385,6 +386,11 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     let decoded_private_auxiliary_name_count = json_array_len(decoded_private_auxiliary_names);
     let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
+    assert!(decoded_private_auxiliaries > 0, "{json}");
+    assert!(
+        decoded_private_auxiliaries == 0 || !g1_satisfied,
+        "{json}",
+    );
     assert_eq!(
         decoded_private_auxiliary_name_count,
         private_companion_observed,
