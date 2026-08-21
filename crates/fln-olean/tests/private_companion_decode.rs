@@ -1315,6 +1315,54 @@ fn loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 }
 
 #[test]
+fn go_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib = lib_or_skip!("go_private_auxiliary_requires_the_companion_and_keeps_its_real_kind");
+
+    // `.go` is a separately emitted recursion helper, not merely another
+    // numbered equation or proof name. Select an actual private-only member
+    // before proving its exported omission and concrete companion recovery.
+    let (relative, name) = init_chain_modules(&lib)
+        .into_iter()
+        .find_map(|relative| {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::go(name))
+                .map(|name| (relative, name.clone()))
+        })
+        .expect("the pinned Init private companions contain a private-only .go witness");
+    let chain = chain_bytes(&lib, &relative);
+
+    let exported_view = OleanView::parse(&chain.exported)
+        .unwrap_or_else(|error| panic!(".go {name}: parse exported {relative}: {error}"));
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!(".go {name}: decode exported {relative}: {error}"));
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != name),
+        ".go {name}: exported decoder unexpectedly has the private auxiliary"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap_or_else(|error| panic!(".go {name}: parse private {relative}: {error}"));
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!(".go {name}: decode private {relative}: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == name)
+        .unwrap_or_else(|| panic!(".go {name}: private decoder lost it in {relative}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        ".go {name}: companion recovery decoded only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
 fn verified_chain_decode_returns_the_private_superset_on_the_real_pin() {
     let lib = lib_or_skip!("verified_chain_decode_returns_the_private_superset_on_the_real_pin");
     let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
