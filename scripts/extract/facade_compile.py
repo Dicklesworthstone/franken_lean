@@ -3745,6 +3745,9 @@ def main():
     kernel_special_transparent_values_inequality_join = {"summary_kernel_special_population": manifest_summary.get("kernel_special_population"), "summary_transparent_values_checked": manifest_summary.get("transparent_values_checked")}
     if (not isinstance(kernel_special_transparent_values_inequality_join["summary_kernel_special_population"], int) or isinstance(kernel_special_transparent_values_inequality_join["summary_kernel_special_population"], bool) or not isinstance(kernel_special_transparent_values_inequality_join["summary_transparent_values_checked"], int) or isinstance(kernel_special_transparent_values_inequality_join["summary_transparent_values_checked"], bool) or kernel_special_transparent_values_inequality_join["summary_kernel_special_population"] <= kernel_special_transparent_values_inequality_join["summary_transparent_values_checked"]):
         raise SystemExit("REFUSE: facade manifest kernel-special population must exceed transparent-value count " + json.dumps(kernel_special_transparent_values_inequality_join, sort_keys=True))
+    emission_field_sets_inequality_join = {"summary_emission_verified": manifest_summary.get("emission_verified"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
+    if (not isinstance(emission_field_sets_inequality_join["summary_emission_verified"], int) or isinstance(emission_field_sets_inequality_join["summary_emission_verified"], bool) or not isinstance(emission_field_sets_inequality_join["summary_field_sets_checked"], int) or isinstance(emission_field_sets_inequality_join["summary_field_sets_checked"], bool) or emission_field_sets_inequality_join["summary_emission_verified"] <= emission_field_sets_inequality_join["summary_field_sets_checked"]):
+        raise SystemExit("REFUSE: facade manifest emission-verification count must exceed field-set count " + json.dumps(emission_field_sets_inequality_join, sort_keys=True))
     declaration_init_substrate_inequality_join = {"summary_declarations_emitted": manifest_summary.get("declarations_emitted"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], int) or isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], bool) or not isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or declaration_init_substrate_inequality_join["summary_declarations_emitted"] <= declaration_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest declaration count must exceed Init-substrate count " + json.dumps(declaration_init_substrate_inequality_join, sort_keys=True))
@@ -6006,6 +6009,9 @@ def main():
         ),
         "manifest_kernel_special_transparent_values_inequality_join": (
             kernel_special_transparent_values_inequality_join
+        ),
+        "manifest_emission_field_sets_inequality_join": (
+            emission_field_sets_inequality_join
         ),
         "manifest_declaration_init_substrate_inequality_join": (
             declaration_init_substrate_inequality_join
