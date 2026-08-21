@@ -923,14 +923,23 @@ def main():
         else:
             raise SystemExit(
                 f"REFUSE: the facade did not converge in {args.max_attempts} attempts")
-        if best is None or len(emitted) > best[0]:
-            best = (len(emitted), text, line_map, list(emitted), attr_count,
+        # RANK BY WHAT THE SPIKE MEASURES, not by how many lines were written. A
+        # round can emit more declarations overall while covering fewer DEMANDED
+        # rows (measured: 1557 emitted / 579 curated-demand checks beat by 1543
+        # emitted / 580). The demanded surface is the deliverable; the closure is
+        # scaffolding for it.
+        round_covered = sum(
+            1 for n in set(emitted) | {p for p in provided if p in decl}
+            if decl[n]["role"] == "demanded")
+        key = (round_covered, len(emitted))
+        if best is None or key > best[0]:
+            best = (key, text, line_map, list(emitted), attr_count,
                     provided, dict(quarantine), set(explicit_for), set(maxexp_for),
-                    set(dropped_attrs))
+                    set(dropped_attrs), set(structural), set(transparent))
     if best is None:
         raise SystemExit("REFUSE: no facade candidate survived")
     (_, text, line_map, emitted, attr_count, provided, quarantine, explicit_for,
-     maxexp_for, dropped_attrs) = best
+     maxexp_for, dropped_attrs, structural, transparent) = best
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
 
