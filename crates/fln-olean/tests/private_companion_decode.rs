@@ -161,6 +161,8 @@ const STRING_REMOVE_LEADING_SPACES_EXPORTED_UNSAFE_RECS: [&str; 2] = [
     "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.consumeSpaces._unsafe_rec",
     "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.saveLine._unsafe_rec",
 ];
+/// A private unary helper nested under Prelude's syntax insertion loop.
+const INSERT_IDX_LOOP_UNARY: &str = "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary";
 /// The two tail-recursive merge-sort implementation helpers in the pinned
 /// `Init.Data.List.Sort.Impl` companion delta.
 /// `mergeSortTR₂` helpers that are `_private.`-mangled AND declared by the
@@ -747,6 +749,50 @@ fn string_remove_leading_spaces_exported_mangled_helpers_remain_concrete() {
             chained.kind_name()
         );
     }
+}
+
+#[test]
+fn prelude_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib = lib_or_skip!(
+        "prelude_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_kind"
+    );
+    let chain = chain_bytes(&lib, "Init/Prelude");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        !exported_names.contains(&INSERT_IDX_LOOP_UNARY.to_owned()),
+        "the exported Prelude part must omit {INSERT_IDX_LOOP_UNARY}"
+    );
+    assert!(
+        private_names.contains(&INSERT_IDX_LOOP_UNARY.to_owned()),
+        "the Prelude private companion must restore {INSERT_IDX_LOOP_UNARY}"
+    );
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != INSERT_IDX_LOOP_UNARY),
+        "exported decoder unexpectedly recovered {INSERT_IDX_LOOP_UNARY}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == INSERT_IDX_LOOP_UNARY)
+        .unwrap_or_else(|| panic!("private decoder lost {INSERT_IDX_LOOP_UNARY}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        "private companion decoded {INSERT_IDX_LOOP_UNARY} only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
 }
 
 #[test]
