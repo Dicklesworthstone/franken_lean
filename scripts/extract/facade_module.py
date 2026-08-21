@@ -1492,6 +1492,31 @@ def unreproduced_axiom_error(text, line_map, decl, unreproduced):
     return None
 
 
+def unreproduced_declared_error(unreproduced, inductive_decls):
+    """A row cannot be BOTH declared as an inductive and reported as one the
+    artifact only publishes as an axiom.
+
+    This is the same claim e35e3521 pins against the emitted BYTES, checked here
+    against the emitter's own SET -- `inductive_rows` in the manifest is exactly
+    `sorted(inductive_decls)`. The two can disagree, and the way they disagree is
+    specific: inductive_block returns None for a row it cannot render, the emit
+    loop falls through to the axiom path, and the name stays in inductive_decls
+    the whole time. `inductive_rows` would then claim a declaration the artifact
+    does not contain, and a not-reproduced row -- one already known to be
+    borderline -- is exactly the kind of row that reaches that path.
+
+    Returns an error string, or None.
+    """
+    both = sorted(set(unreproduced) & set(inductive_decls))
+    if both:
+        return (f"{len(both)} rows are listed as declared inductives and at the "
+                f"same time reported as accepted-but-published-as-an-axiom: "
+                f"{both[:4]}. inductive_rows and "
+                "inductive_refusal_not_reproduced contradict each other, so one "
+                "of the two is describing a facade that was never written")
+    return None
+
+
 def probe_refused_inductives(lean, env, work, text, line_map, decl, deps, blocks):
     """Does a refused inductive still fail against the FINISHED facade?
 
@@ -2380,6 +2405,9 @@ def main():
     _cost = unreproduced_axiom_error(text, line_map, decl, unreproduced)
     if _cost:
         raise SystemExit("REFUSE: " + _cost)
+    _dual = unreproduced_declared_error(unreproduced, inductive_decls)
+    if _dual:
+        raise SystemExit("REFUSE: " + _dual)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
