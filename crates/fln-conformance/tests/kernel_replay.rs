@@ -7154,6 +7154,73 @@ fn the_corpus_gate_refuses_three_reachable_shapes_distinctly() {
     );
 }
 
+/// Three identities are UNIX-ONLY, and off unix they are ABSENT rather than
+/// failing.
+///
+/// **A coverage cliff nothing announced.** The symlinked-file, symlinked-
+/// directory and non-UTF-8 refusals each need an input `std::os::unix` alone can
+/// construct, so all three carry `#[cfg(unix)]`. On any other platform they do
+/// not fail, do not skip, and do not appear: the suite is simply three
+/// identities smaller and every run is green. This repository targets Windows
+/// too -- `windows_functional_ci.rs` exists -- so that is a live gap, and until
+/// now the only record of it was the attribute itself.
+///
+/// **A vanished test is worse than a skipping one.** Everything else on this
+/// bead that cannot run says so in a typed row: the corpus walk when the corpus
+/// is absent, the retention guard when no receipt is retained. These three said
+/// nothing, because a test that was never compiled has nowhere to say it from.
+/// This row is where they say it.
+///
+/// **The list is bound to the file rather than remembered.** Each name must
+/// still exist and must still carry its gate; renaming or ungating one without
+/// updating this fails here rather than quietly leaving the row describing tests
+/// that are gone. That is the same binding the rejection-class scan uses, and it
+/// is cheap: presence, not parsing.
+#[test]
+fn the_platform_gated_identities_declare_where_they_do_not_run() {
+    const GATED: [&str; 3] = [
+        "the_inventory_walk_refuses_an_entry_whose_name_is_not_utf8",
+        "the_inventory_walk_refuses_a_symlinked_file_entry",
+        "the_inventory_walk_refuses_a_symlinked_directory_entry",
+    ];
+    const SOURCE: &str = include_str!("kernel_replay.rs");
+
+    for name in GATED {
+        assert!(
+            SOURCE.contains(&format!("fn {name}()")),
+            "`{name}` is named here but no longer exists; this row would describe a test that is \
+             gone"
+        );
+        assert!(
+            SOURCE.contains(&format!("#[cfg(unix)]\n#[test]\nfn {name}()")),
+            "`{name}` is no longer gated as this row claims. If it became portable, remove it \
+             from the list; if the gate moved, the row is now describing the wrong thing"
+        );
+    }
+
+    if cfg!(unix) {
+        println!(
+            "{{\"schema\":\"fln-t6r7-platform-gated/1\",\"status\":\"active\",\"gated\":{},\
+             \"claims\":\"these three identities RAN on this platform\"}}",
+            GATED.len()
+        );
+    } else {
+        println!(
+            "{{\"schema\":\"fln-t6r7-platform-gated/1\",\"status\":\"absent\",\"gated\":{},\
+             \"unverified\":[{}],\
+             \"claims\":\"NOTHING about symlinked entries or undecodable names on this platform. \
+             The three identities below were not compiled, so a green run here does not cover \
+             them.\"}}",
+            GATED.len(),
+            GATED
+                .iter()
+                .map(|name| json_string(name))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+}
+
 /// A TRIPWIRE ON A DISCLOSURE, not a check of the product.
 ///
 /// **What is being disclosed.** Two code paths in this file have never executed
