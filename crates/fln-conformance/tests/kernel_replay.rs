@@ -8803,6 +8803,14 @@ fn every_non_answer_outcome_yields_a_legal_family_token() {
 /// three produce a plausible-looking module name rather than an error, which is
 /// why they are refusals rather than debug assertions.
 ///
+/// **The outside-the-root case gets two paths, because one of them cannot
+/// distinguish the rule from its cheap version.** A wholly foreign path is
+/// refused by any prefix test. A SIBLING whose directory name extends the
+/// root's -- `/corpus/libextra` against `/corpus/lib` -- is refused only by a
+/// component-wise one. Without the second, a projection written with
+/// `str::starts_with` passes this test while minting `extra.Thing` for a file in
+/// a neighbouring library.
+///
 /// **The expectations are chosen for what separates them.** Counted over the
 /// fragments in `MESSAGES` below: three share `module path`, two share `module
 /// path component in`, two share `empty module`, and two share `module name` --
@@ -8822,6 +8830,36 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
     assert!(
         reason.contains("is outside"),
         "the refusal must say the path is not under the root: {reason}"
+    );
+
+    // OUTSIDE THE ROOT BY A PATH TEST, INSIDE IT BY A STRING TEST. The decoy
+    // above shares no leading text with the root, so a projection written with
+    // `to_str().starts_with(root)` -- the classic wrong way to strip a prefix --
+    // refuses it exactly as `strip_prefix` does and cannot be told apart. A
+    // SIBLING whose name extends the root's can: `/corpus/libextra` starts with
+    // `/corpus/lib` as text and is not below it as a path.
+    //
+    // What the string version would mint is the point. Measured: it strips the
+    // root's characters, leaving `extra/Thing.olean`, and names the module
+    // `extra.Thing` -- a module named after a fragment of a neighbouring
+    // directory's name, which resolves against no import and belongs to no
+    // library.
+    const SIBLING: &str = "/corpus/libextra/Thing.olean";
+    assert!(
+        SIBLING.starts_with(root.to_str().unwrap_or_default()),
+        "the sibling must match the root as TEXT, or it does not distinguish a string prefix from \
+         a path prefix"
+    );
+    assert!(
+        !"/elsewhere/Thing.olean".starts_with(root.to_str().unwrap_or_default()),
+        "the decoy above must NOT match as text; that is why it cannot tell the two apart"
+    );
+    let sibling = module_name_from_path(root, Path::new(SIBLING))
+        .expect_err("a sibling whose name merely extends the root's is not below it");
+    assert!(
+        sibling.contains("is outside"),
+        "the sibling must be refused for being outside the root, like any other foreign path: \
+         {sibling}"
     );
 
     // A NON-NORMAL COMPONENT. `strip_prefix` keeps `..` verbatim, so the
