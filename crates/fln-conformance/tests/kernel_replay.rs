@@ -4791,6 +4791,33 @@ impl CorpusMatrixReceipt {
                     .to_string(),
             );
         }
+        // AND THE SAME KIND CHECK AS THE CORPUS HASH, ONE FIELD DOWN. This
+        // records WHICH lane source produced the row, and emptiness was the only
+        // rule: `hand-run`, `the-lane` or `v1` would all pass as provenance.
+        // Measured 64 lowercase hex on the committed row, from a producer that
+        // digests the lane's own source.
+        //
+        // WHAT THIS FIELD CANNOT BE BOUND TO, AND THE NUMBER IS THE ARGUMENT.
+        // The producer hashes `include_str!("kernel_replay.rs")` -- this whole
+        // file. 165 commits have touched it since the observation was taken, so
+        // the recorded digest has been stale for 165 commits and this cell makes
+        // it 166. Comparing it against the current source would redden
+        // permanently and be bypassed, which is the failure the PG-5 waiver's
+        // own doc-comment prices and rejects for the invalidating cone. The
+        // field is provenance BY RECORD, never a check, and saying so here stops
+        // a later reader from "finishing" it into a wall.
+        if self.lane_source_digest_at_run.len() != 64
+            || !self
+                .lane_source_digest_at_run
+                .chars()
+                .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        {
+            return Err(format!(
+                "row names its producing source as `{}`, which is not a 64-character lowercase \
+                 hex digest. A label records nothing a later reader could resolve to a source",
+                self.lane_source_digest_at_run
+            ));
+        }
 
         // CONTENT.
         if self.diverging_modules != 0 {
@@ -18479,6 +18506,22 @@ fn a_receipt_that_compared_nothing_is_refused() {
                 ..real.clone()
             },
             "empty lane_source_digest_at_run",
+        ),
+        (
+            "a producing source named rather than digested",
+            CorpusMatrixReceipt {
+                lane_source_digest_at_run: "the-corpus-matrix-lane".to_string(),
+                ..real.clone()
+            },
+            "not a 64-character lowercase hex digest",
+        ),
+        (
+            "a producing source digest in the wrong case",
+            CorpusMatrixReceipt {
+                lane_source_digest_at_run: real.lane_source_digest_at_run.to_ascii_uppercase(),
+                ..real.clone()
+            },
+            "not a 64-character lowercase hex digest",
         ),
         // The checks that existed before this repair. They are planted too, so a future
         // rewrite of `validate` cannot quietly drop one while the new mutants keep dying.
