@@ -1851,12 +1851,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_companion_parts_loaded = human_line_suffix(
+    let human_companion_parts_loaded = match human_line_suffix(
         &human.stdout,
         "companion artifact parts loaded: ",
-    )
-    .parse::<bool>()
-    .expect("human companion-parts loaded status is a bool");
+    ) {
+        "yes" => true,
+        "no" => false,
+        status => panic!("human companion-parts loaded status is a yes/no value: {status}"),
+    };
     assert_eq!(
         human_companion_parts_loaded,
         json_bool_field(&json.stdout, "companionPartsLoaded"),
