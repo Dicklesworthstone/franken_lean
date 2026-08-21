@@ -13784,7 +13784,10 @@ fn every_olean_in_the_library_agrees_with_its_companion_status() {
 /// as a law.
 ///
 /// Anti-vacuity: an all-zero decode satisfies `names == constants` everywhere,
-/// so the widest pair is pinned. The zero-extra population is itself the
+/// so the widest pair is pinned — at `Init.Data.UInt.Lemmas`, 2,468, NOT at
+/// `Init.Prelude`. Prelude is the module almost every cell in this file reads,
+/// which made it easy to assume it was also the largest; its private array is
+/// 2,314 and only the THIRD biggest, behind `Init.Data.SInt.Lemmas` at 2,372. The zero-extra population is itself the
 /// evidence that empty arrays occur and are not a decode failure.
 ///
 /// Conservation first: every module-level must land in exactly one of the
@@ -13798,6 +13801,7 @@ fn the_mirror_law_holds_corpus_wide_and_its_neighbours_do_not() {
 
     let mut checks = 0usize;
     let mut widest = 0u64;
+    let mut widest_module = String::new();
     let mut empty_extra = 0usize;
     let mut extra_equals_constants = 0usize;
     let mut equal_and_non_empty = 0usize;
@@ -13815,7 +13819,10 @@ fn the_mirror_law_holds_corpus_wide_and_its_neighbours_do_not() {
                 view.constants,
                 "{module}: constNames and constants must be the same length"
             );
-            widest = widest.max(view.constants);
+            if view.constants > widest {
+                widest = view.constants;
+                widest_module = module.clone();
+            }
             if view.extra_const_names == 0 {
                 empty_extra += 1;
             }
@@ -13866,8 +13873,11 @@ fn the_mirror_law_holds_corpus_wide_and_its_neighbours_do_not() {
         "and the growth claim, which holds for two thirds of the corpus and not for it"
     );
     assert_eq!(
-        widest, 2_314,
-        "the largest mirrored pair, so the law is not carried by empty arrays"
+        (widest_module.as_str(), widest),
+        ("Init.Data.UInt.Lemmas", 2_468),
+        "the largest mirrored pair, so the law is not carried by empty arrays — named as well \
+         as counted, because a bare count invites substituting a familiar number for a \
+         measured one"
     );
 }
 
