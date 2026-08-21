@@ -5162,10 +5162,34 @@ fn write_inventory_fixture_with(
     //
     // Three distinct reasons, because a single "bad fixture name" would let any
     // of the three pass in another's place.
+    //
+    // AND IT MUST BE THE NAME, NOT MERELY PARSE AS ONE. The rule above reads the
+    // name as a PATH; the shape record is built from it as a STRING, with
+    // `format!("{versioned_name}.manifest")`. `Spelled/` satisfies the path
+    // reading -- one `Normal` component -- and the two uses then disagree:
+    // `join` gives the tree `<tmp>/Spelled`, while the format gives
+    // `<tmp>/Spelled/.manifest`, which is INSIDE that tree rather than beside
+    // it. Measured, both halves.
+    //
+    // A record inside the tree joins every walk of it, which is what the
+    // sibling-path assertion in the manifest test exists to prevent. Worse,
+    // `Spelled` and `Spelled/` are the same tree -- `Path` equality is by
+    // components -- but different registry keys and different record paths, so
+    // the two guards that exist to catch two fixtures sharing one tree each see
+    // two unrelated fixtures.
     let name_fault = {
         let mut components = Path::new(versioned_name).components();
         match (components.next(), components.next()) {
-            (Some(std::path::Component::Normal(_)), None) => None,
+            (Some(std::path::Component::Normal(name)), None)
+                if name == std::ffi::OsStr::new(versioned_name) =>
+            {
+                None
+            }
+            (Some(std::path::Component::Normal(_)), None) => Some(
+                "reads as one ordinary component but is not spelled as one, so the tree is \
+                 joined from the path and the shape record is formatted from the string, and \
+                 the two land in different places",
+            ),
             (None, _) => Some(
                 "names nothing at all, so the fixture tree would BE the shared temporary \
                  directory and its population would be every other fixture in this package",
@@ -6473,6 +6497,95 @@ fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
         !tmp.join("nested").exists(),
         "`nested/name` was refused and a tree appeared anyway; the name check must run before \
          anything is created"
+    );
+}
+
+/// A name that PARSES as one component is not the same as one SPELLED that way.
+///
+/// **The name is read as a path and used as a string.** The rule added with the
+/// name check asks `Path::components()` for exactly one `Normal`. The shape
+/// record is built with `format!("{name}.manifest")`. `Spelled/` satisfies the
+/// path reading and breaks the string one: the tree is `<tmp>/Spelled`, the
+/// record is `<tmp>/Spelled/.manifest` -- INSIDE the tree instead of beside it,
+/// which is exactly what the manifest test's sibling assertion exists to
+/// prevent. A record inside a fixture joins every walk of it.
+///
+/// **And the two guards that would catch it are the two it slips past.**
+/// `Spelled` and `Spelled/` name the same tree, because `Path` equality is by
+/// components. They are different registry keys, because that map is keyed by
+/// the string. They have different record paths, because those are formatted
+/// from the string too. So two fixtures could share one tree while the name
+/// registry and the shape record each see two unrelated fixtures -- the precise
+/// situation both were written to make impossible.
+///
+/// **Fourth instance of one shape, arriving through the parameter hardened last
+/// time.** The empty-component rule inspected the path's components while the
+/// name is made of segments; the containment check compared a lexical prefix
+/// while the question was where a write lands; the duplicate guard keyed a set
+/// on strings while the filesystem keys on paths. Here the same argument is read
+/// one way and written another, and the check I added for it a few commits ago
+/// only covered the reading.
+///
+/// **Every claim here is asserted lexically**, so nothing rests on my having
+/// read `Path`'s documentation correctly.
+#[test]
+fn a_fixture_name_must_be_spelled_as_one_component_not_merely_parse_as_one() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+
+    // THE MECHANISM, IN FOUR LINES, NO FILESYSTEM. One tree, two spellings; and
+    // the record beside it for one spelling and inside it for the other.
+    assert_eq!(
+        tmp.join("Spelled/"),
+        tmp.join("Spelled"),
+        "the two spellings must name the SAME tree, or there is no shared tree for the registry \
+         to miss"
+    );
+    assert_ne!(
+        "Spelled/", "Spelled",
+        "and they must differ as text, or the registry could not key them apart"
+    );
+    assert!(
+        tmp.join("Spelled/.manifest")
+            .starts_with(tmp.join("Spelled/")),
+        "the trailing spelling must put the shape record INSIDE the tree; that is the whole \
+         defect"
+    );
+    assert!(
+        !tmp.join("Spelled.manifest")
+            .starts_with(tmp.join("Spelled")),
+        "the ordinary spelling must keep the record beside the tree, or the fix has no green side"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| write_inventory_fixture("Spelled/", &["Any.olean"]));
+    std::panic::set_hook(previous);
+    let payload = outcome
+        .err()
+        .unwrap_or_else(|| panic!("a name that only parses as one component must be refused"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+
+    // ON THE WORDS UNIQUE TO THIS BRANCH. The name check has four reasons now
+    // and they share a sentence shape; a cell that only asserted "refused" would
+    // pass on any of the other three.
+    assert!(
+        message.contains("not spelled as one"),
+        "the refusal must be about the spelling, not about the name having no components or \
+         climbing out: {message}"
+    );
+    assert!(
+        !message.contains("names nothing at all") && !message.contains("climb out"),
+        "this must not be passing on a sibling branch's refusal: {message}"
+    );
+
+    assert!(
+        !tmp.join("Spelled").exists(),
+        "the name was refused and its tree exists anyway; the check must run before anything is \
+         created"
     );
 }
 
