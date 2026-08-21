@@ -4535,3 +4535,83 @@ fn names_are_unique_and_impl_representations_mirror_their_base() {
         "the pin carries a representation pair; without one this correspondence is unexercised"
     );
 }
+
+/// The constant array is NOT in dependency order, and something has to know it.
+///
+/// Every other cell in this file treats the module's declarations as a set. They
+/// are stored as an ARRAY, and `decode_module_constants` returns them in that
+/// order — so the tempting simplification, for any consumer, is to admit them in
+/// the order they arrive.
+///
+/// That would fail immediately. Measured over `Init/Prelude` at private level:
+/// 6,680 references point FORWARD, to a declaration stored later in the same
+/// array. The very first declaration is one of them — `HXor.recOn` sits at index
+/// 0 and references `HXor` at index 2048 — so sequential admission does not
+/// survive its own first step, and it fails as `UnknownConstant`, which is this
+/// bead's own reject class.
+///
+/// This is why `OleanCheckLimits` carries `max_dependency_presentations` to
+/// bound "the iterative walk used to recover a deterministic declaration order":
+/// the artifact does not supply an admission order, and the pipeline recovers
+/// one. Nothing recorded that the recovery is load-bearing rather than a
+/// convenience.
+///
+/// So this cell asserts a NEGATIVE, which is unusual here and deliberate. The
+/// floor is on forward references EXISTING in bulk: if a future change made the
+/// array dependency-ordered, this fails and someone re-reads the ordering
+/// machinery on purpose rather than discovering by accident that it had become
+/// dead code. And if the array is ever consumed in order, the failure is not
+/// subtle — it is 6,680 unknown constants.
+#[test]
+fn the_constant_array_is_not_in_dependency_order() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let position: BTreeMap<String, usize> = infos
+        .iter()
+        .enumerate()
+        .map(|(index, info)| (info.name().to_display_string(), index))
+        .collect();
+
+    let mut forward = 0usize;
+    let mut intra_module = 0usize;
+    let mut first_forward: Option<(String, String, usize)> = None;
+    for (index, info) in infos.iter().enumerate() {
+        let mut referenced = BTreeSet::new();
+        for expr in declaration_expressions(info) {
+            referenced.append(&mut referenced_constants(expr));
+        }
+        for name in &referenced {
+            let Some(target) = position.get(name) else {
+                continue;
+            };
+            intra_module += 1;
+            if *target > index {
+                forward += 1;
+                if first_forward.is_none() {
+                    first_forward = Some((info.name().to_display_string(), name.clone(), *target));
+                }
+            }
+        }
+    }
+
+    // Anti-vacuity: a reference scan that found nothing would report zero
+    // forward references and satisfy a naive "is it ordered" check instead.
+    assert!(
+        intra_module > 10_000,
+        "the scan must reach the module's intra-module references, got {intra_module}"
+    );
+    assert!(
+        forward > 1_000,
+        "the stored order is not a dependency order and consumers must not assume it is; \
+         {forward} forward references"
+    );
+    let (referrer, target, target_index) =
+        first_forward.expect("a forward reference must exist to name");
+    assert!(
+        target_index > 1_000,
+        "the first forward reference reaches far down the array — {referrer} to {target} at \
+         index {target_index} — so admitting in array order fails at the first declaration, \
+         with UnknownConstant"
+    );
+}
