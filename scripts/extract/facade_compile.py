@@ -3715,6 +3715,9 @@ def main():
     declaration_init_substrate_inequality_join = {"summary_declarations_emitted": manifest_summary.get("declarations_emitted"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], int) or isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], bool) or not isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or declaration_init_substrate_inequality_join["summary_declarations_emitted"] <= declaration_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest declaration count must exceed Init-substrate count " + json.dumps(declaration_init_substrate_inequality_join, sort_keys=True))
+    declaration_init_provided_inequality_join = {"summary_declarations_emitted": manifest_summary.get("declarations_emitted"), "summary_init_provided": manifest_summary.get("init_provided")}
+    if (not isinstance(declaration_init_provided_inequality_join["summary_declarations_emitted"], int) or isinstance(declaration_init_provided_inequality_join["summary_declarations_emitted"], bool) or not isinstance(declaration_init_provided_inequality_join["summary_init_provided"], int) or isinstance(declaration_init_provided_inequality_join["summary_init_provided"], bool) or declaration_init_provided_inequality_join["summary_declarations_emitted"] <= declaration_init_provided_inequality_join["summary_init_provided"]):
+        raise SystemExit("REFUSE: facade manifest declaration count must exceed Init-provided count " + json.dumps(declaration_init_provided_inequality_join, sort_keys=True))
     kernel_special_init_substrate_inequality_join = {"summary_kernel_special_population": manifest_summary.get("kernel_special_population"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(kernel_special_init_substrate_inequality_join["summary_kernel_special_population"], int) or isinstance(kernel_special_init_substrate_inequality_join["summary_kernel_special_population"], bool) or not isinstance(kernel_special_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(kernel_special_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or kernel_special_init_substrate_inequality_join["summary_kernel_special_population"] <= kernel_special_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest kernel-special population must exceed Init-substrate count " + json.dumps(kernel_special_init_substrate_inequality_join, sort_keys=True))
@@ -5940,6 +5943,9 @@ def main():
         ),
         "manifest_declaration_init_substrate_inequality_join": (
             declaration_init_substrate_inequality_join
+        ),
+        "manifest_declaration_init_provided_inequality_join": (
+            declaration_init_provided_inequality_join
         ),
         "manifest_kernel_special_init_substrate_inequality_join": (
             kernel_special_init_substrate_inequality_join
