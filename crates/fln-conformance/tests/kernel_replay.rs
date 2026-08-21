@@ -2987,6 +2987,32 @@ fn check_family_token(family: &str, direction: FamilyDirection) -> Result<(), St
     }
 }
 
+/// Add retained-row counts without trusting them to be addable.
+///
+/// **A `Result` that panics is not a `Result`.** `validate` promises to REFUSE a
+/// bad row; the retained file is append-only and editable by hand, so its
+/// numbers are attacker-controlled in the only sense that matters here. Two
+/// fields near `u64::MAX` make an unchecked `+` overflow, and in a debug build
+/// -- which is how these tests run -- that ABORTS. The guard would then die with
+/// "attempt to add with overflow" instead of saying the row does not conserve:
+/// a panic where a refusal was promised, and a diagnosis pointing at arithmetic
+/// rather than at the row.
+///
+/// The label is carried so the refusal says WHICH sum overflowed, since several
+/// of them add attacker-supplied numbers.
+fn checked_sum(what: &str, values: &[u64]) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    for value in values {
+        total = total.checked_add(*value).ok_or_else(|| {
+            format!(
+                "`{what}` overflows a u64 in this row. A retained receipt is editable by hand, so \
+                 its counts are not to be trusted into arithmetic"
+            )
+        })?;
+    }
+    Ok(total)
+}
+
 /// Assert a token is refused in `direction`, and refused for the REASON named.
 ///
 /// **Why not `is_err()`.** `check_family_token` can refuse for four different
@@ -8027,7 +8053,7 @@ impl WholeMathlibReceipt {
                     "`{field}` entry `{entry}` counts zero rows; an empty family is not a triage"
                 ));
             }
-            total += parsed;
+            total = checked_sum(field, &[total, parsed])?;
         }
         Ok(total)
     }
@@ -8123,24 +8149,34 @@ impl WholeMathlibReceipt {
 
         // CONSERVATION. The producer asserts these live; the row re-states them
         // so a hand-edited file cannot quietly contradict the run it claims.
-        if self.decoded != self.compared + self.unscorable {
+        let population = checked_sum("compared + unscorable", &[self.compared, self.unscorable])?;
+        if self.decoded != population {
             return Err(format!(
                 "row does not conserve its own population: decoded {} != compared {} + \
                  unscorable {}",
                 self.decoded, self.compared, self.unscorable
             ));
         }
-        let buckets = self.agree
-            + self.unsoundly_permissive
-            + self.restrictive_with_carve_out
-            + self.restrictive_without_carve_out;
+        let buckets = checked_sum(
+            "the D23 direction buckets",
+            &[
+                self.agree,
+                self.unsoundly_permissive,
+                self.restrictive_with_carve_out,
+                self.restrictive_without_carve_out,
+            ],
+        )?;
         if self.compared != buckets {
             return Err(format!(
                 "row does not conserve the D23 direction buckets: compared {} != {buckets}",
                 self.compared
             ));
         }
-        if self.unscorable != self.oracle_skipped + self.subject_no_answer {
+        let unscorable_split = checked_sum(
+            "the unscorable split",
+            &[self.oracle_skipped, self.subject_no_answer],
+        )?;
+        if self.unscorable != unscorable_split {
             return Err(format!(
                 "row does not split its unscorable population: unscorable {} != oracle_skipped \
                  {} + subject_no_answer {}. This is the only law that binds oracle_skipped at \
@@ -8154,11 +8190,18 @@ impl WholeMathlibReceipt {
         // fewer rows than the buckets it describes.
         let restrictive =
             Self::family_total(&self.restrictive_families, FamilyDirection::Restrictive)?;
-        if restrictive != self.restrictive_with_carve_out + self.restrictive_without_carve_out {
+        let restrictive_rows = checked_sum(
+            "the restrictive comparisons",
+            &[
+                self.restrictive_with_carve_out,
+                self.restrictive_without_carve_out,
+            ],
+        )?;
+        if restrictive != restrictive_rows {
             return Err(format!(
                 "restrictive_families triages {restrictive} row(s) but the row records {} \
                  restrictive comparison(s); a partial triage must not be filed as a complete one",
-                self.restrictive_with_carve_out + self.restrictive_without_carve_out
+                restrictive_rows
             ));
         }
         let no_answer = Self::family_total(&self.no_answer_families, FamilyDirection::NoAnswer)?;
@@ -9134,6 +9177,28 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             // contains that word too. `wall_ms: 0` is what belongs to this rule
             // alone.
             "wall_ms: 0",
+        ),
+        // OVERFLOW IS A REFUSAL, NOT A PANIC. Each of these makes one sum in
+        // `validate` exceed u64, and each must name ITS OWN sum -- the messages
+        // differ only in the label, so a cell asserting on `overflows a u64`
+        // alone would pass for either.
+        (
+            "the population sum overflows",
+            WholeMathlibReceipt {
+                compared: u64::MAX,
+                unscorable: 1,
+                ..sample_whole_mathlib_receipt()
+            },
+            "`compared + unscorable` overflows",
+        ),
+        (
+            "the direction buckets overflow",
+            WholeMathlibReceipt {
+                agree: u64::MAX,
+                unsoundly_permissive: 1,
+                ..sample_whole_mathlib_receipt()
+            },
+            "`the D23 direction buckets` overflows",
         ),
         (
             "population does not conserve",
