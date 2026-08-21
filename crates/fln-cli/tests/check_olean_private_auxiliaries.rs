@@ -536,9 +536,22 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "{}",
         json.stdout,
     );
-    assert!(json.stdout.contains(
-        "\"privateMatchNResiduals\":{\"observed\":6,\"names\":[{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    let private_match_n = json_object_field(&json.stdout, "privateMatchNResiduals");
+    assert_eq!(json_usize_field(private_match_n, "observed"), 6, "{}", json.stdout);
+    assert_eq!(json_usize_field(private_match_n, "omitted"), 0, "{}", json.stdout);
+    assert_eq!(
+        json_name_set(private_match_n),
+        BTreeSet::from([
+            "_private.CliPrivateReport.0.match_1".to_owned(),
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1".to_owned(),
+        ]),
+        "{}",
+        json.stdout,
+    );
     assert!(json.stdout.contains(
         "\"privateEqDefResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
