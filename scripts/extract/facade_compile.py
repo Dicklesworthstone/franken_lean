@@ -3757,6 +3757,9 @@ def main():
     emission_field_sets_inequality_join = {"summary_emission_verified": manifest_summary.get("emission_verified"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
     if (not isinstance(emission_field_sets_inequality_join["summary_emission_verified"], int) or isinstance(emission_field_sets_inequality_join["summary_emission_verified"], bool) or not isinstance(emission_field_sets_inequality_join["summary_field_sets_checked"], int) or isinstance(emission_field_sets_inequality_join["summary_field_sets_checked"], bool) or emission_field_sets_inequality_join["summary_emission_verified"] <= emission_field_sets_inequality_join["summary_field_sets_checked"]):
         raise SystemExit("REFUSE: facade manifest emission-verification count must exceed field-set count " + json.dumps(emission_field_sets_inequality_join, sort_keys=True))
+    quarantine_structural_refused_inequality_join = {"summary_quarantined": manifest_summary.get("quarantined"), "summary_structural_refused": manifest_summary.get("structural_refused")}
+    if (not isinstance(quarantine_structural_refused_inequality_join["summary_quarantined"], int) or isinstance(quarantine_structural_refused_inequality_join["summary_quarantined"], bool) or not isinstance(quarantine_structural_refused_inequality_join["summary_structural_refused"], int) or isinstance(quarantine_structural_refused_inequality_join["summary_structural_refused"], bool) or quarantine_structural_refused_inequality_join["summary_quarantined"] <= quarantine_structural_refused_inequality_join["summary_structural_refused"]):
+        raise SystemExit("REFUSE: facade manifest quarantine count must exceed structural-refusal count " + json.dumps(quarantine_structural_refused_inequality_join, sort_keys=True))
     transparent_declarations_field_sets_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
     if (not isinstance(transparent_declarations_field_sets_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_declarations_field_sets_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_declarations_field_sets_inequality_join["summary_field_sets_checked"], int) or isinstance(transparent_declarations_field_sets_inequality_join["summary_field_sets_checked"], bool) or transparent_declarations_field_sets_inequality_join["summary_transparent_declarations"] <= transparent_declarations_field_sets_inequality_join["summary_field_sets_checked"]):
         raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed field-set count " + json.dumps(transparent_declarations_field_sets_inequality_join, sort_keys=True))
@@ -6048,6 +6051,9 @@ def main():
         ),
         "manifest_emission_field_sets_inequality_join": (
             emission_field_sets_inequality_join
+        ),
+        "manifest_quarantine_structural_refused_inequality_join": (
+            quarantine_structural_refused_inequality_join
         ),
         "manifest_transparent_declarations_field_sets_inequality_join": (
             transparent_declarations_field_sets_inequality_join
