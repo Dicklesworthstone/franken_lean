@@ -172,6 +172,9 @@ const STRING_REMOVE_LEADING_SPACES_EXPORTED_UNSAFE_RECS: [&str; 2] = [
 const INSERT_IDX_LOOP_UNARY: &str = "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop._unary";
 /// The module that actually declares it.
 const INSERT_IDX_LOOP_UNARY_MODULE: &str = "Init/Data/Array/Basic";
+/// A private unary helper emitted for `Array.zipWithMAux` in the same module.
+const ARRAY_ZIP_WITH_M_AUX_UNARY: &str =
+    "_private.Init.Data.Array.Basic.0.Array.zipWithMAux._unary";
 /// A private-mangled unary equation helper deliberately exported by the pinned
 /// array-sort lemmas module.
 const SUBARRAY_MERGE_SORT_UNARY_EQ_DEF: &str =
@@ -803,6 +806,49 @@ fn array_basic_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_k
     assert!(
         is_concrete_recovery(&recovered),
         "private companion decoded {INSERT_IDX_LOOP_UNARY} only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_zip_with_m_aux_unary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib =
+        lib_or_skip!("array_zip_with_m_aux_unary_requires_the_companion_and_keeps_its_real_kind");
+    let chain = chain_bytes(&lib, INSERT_IDX_LOOP_UNARY_MODULE);
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        !exported_names.contains(&ARRAY_ZIP_WITH_M_AUX_UNARY.to_owned()),
+        "the exported part of {INSERT_IDX_LOOP_UNARY_MODULE} must omit {ARRAY_ZIP_WITH_M_AUX_UNARY}"
+    );
+    assert!(
+        private_names.contains(&ARRAY_ZIP_WITH_M_AUX_UNARY.to_owned()),
+        "the private companion of {INSERT_IDX_LOOP_UNARY_MODULE} must restore {ARRAY_ZIP_WITH_M_AUX_UNARY}"
+    );
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != ARRAY_ZIP_WITH_M_AUX_UNARY),
+        "exported decoder unexpectedly recovered {ARRAY_ZIP_WITH_M_AUX_UNARY}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_ZIP_WITH_M_AUX_UNARY)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_ZIP_WITH_M_AUX_UNARY}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        "private companion decoded {ARRAY_ZIP_WITH_M_AUX_UNARY} only as {} instead of a concrete declaration",
         recovered.kind_name()
     );
 }
