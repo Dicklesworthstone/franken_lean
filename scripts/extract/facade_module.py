@@ -1619,6 +1619,50 @@ def pin_acceptance_error(text, accepted):
     return None
 
 
+def work_scratch_report(work):
+    """How much this run leaves in its probe directory, and whether it is there.
+
+    The leftover checks look BESIDE the published artifacts. They were never wrong
+    about that, but it is a third of the story: thirteen probe sites write Lean
+    source into a work directory instead, several of them the whole facade plus a
+    verification section, and nothing has ever looked at it. The directory is keyed
+    by pid and nothing removes it, so every run leaves one behind. Measured on this
+    box while writing this: 107 directories, 626 files, 15.3 MiB by st_blocks --
+    invisible per run, because no single run mentions it.
+
+    This does not delete anything. A run has no business quietly removing files a
+    reader may be halfway through, and the accumulation is a disclosure problem
+    rather than a correctness one. What IS a correctness problem is the directory
+    being absent or empty at the end: every pin-side answer in this run came from
+    a file written there, so if those files are not there they went somewhere this
+    run does not know about, and the answers belong to some other file.
+
+    Returns (error_or_None, files, bytes).
+    """
+    try:
+        entries = sorted(os.listdir(work))
+    except OSError as exc:
+        return (f"the probe work directory {work} is not there at the end of the "
+                f"run ({exc.__class__.__name__}). Every pin-side check in this run "
+                "writes its Lean source there, so its absence means those files "
+                "went somewhere this run cannot account for", 0, 0)
+    if not entries:
+        return (f"the probe work directory {work} is empty. Every pin-side check "
+                "in this run writes Lean source into it, so an empty directory "
+                "means they wrote somewhere else, and a probe whose source is not "
+                "where this run put it answers about some other file", 0, 0)
+    total = 0
+    for name in entries:
+        try:
+            st = os.stat(os.path.join(work, name))
+        except OSError:
+            continue
+        # st_blocks, not st_size: apparent size is wrong in both directions on
+        # this filesystem, and the point of the number is the disk it holds
+        total += st.st_blocks * 512
+    return None, len(entries), total
+
+
 def scratch_coverage_error(created, published):
     """Every scratch file this run actually made is one the leak check looks for.
 
@@ -3559,6 +3603,12 @@ def main():
     _cov = scratch_coverage_error(scratch_created, published)
     if _cov:
         raise SystemExit("REFUSE: " + _cov)
+    _werr, _wfiles, _wbytes = work_scratch_report(work)
+    if _werr:
+        raise SystemExit("REFUSE: " + _werr)
+    print(f"facade-module: probe scratch left in {work}: {_wfiles} files, "
+          f"{_wbytes} bytes (st_blocks). Nothing removes it and it is keyed by "
+          f"pid, so this is one directory per run", file=sys.stderr)
     for _path in sorted(published):
         _text, _what, _sufs = published[_path]
         _err = published_bytes_error(_path, _text, _what)
