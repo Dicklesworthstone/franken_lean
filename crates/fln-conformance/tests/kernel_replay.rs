@@ -9545,6 +9545,36 @@ fn the_whole_mathlib_receipt_path_is_keyed_by_the_reference_pin() {
         "the receipt file must be named for the pin it observes: {}",
         path.display()
     );
+
+    // THE DIRECTORY IS HALF THE ADDRESS, AND ONLY THE FILENAME WAS PINNED.
+    //
+    // The retention guard reads this path; the producer advertises it. Move the
+    // directory and nothing fails: the guard finds no file, takes its
+    // `none_retained` arm, and reports that NO receipt is retained -- for a
+    // corpus run that retained one, which is now sitting unread in the old
+    // location. A green run saying "nothing to check" about evidence that
+    // exists is worse than a red.
+    //
+    // The two components are written here as literals rather than taken from
+    // the helper, for the same reason the corpus root is: one side is the
+    // implementation, the other is the address it is supposed to have.
+    let containing = path.parent().expect("the receipt path has a directory");
+    assert_eq!(
+        containing.file_name().and_then(|name| name.to_str()),
+        Some("whole_mathlib_differential"),
+        "retained receipts must live in the directory the guard reads and the producer names: {}",
+        path.display()
+    );
+    assert_eq!(
+        containing
+            .parent()
+            .and_then(|evidence| evidence.file_name())
+            .and_then(|name| name.to_str()),
+        Some("evidence"),
+        "the receipt directory must sit under `evidence/`, beside the other retained artifacts: \
+         {}",
+        path.display()
+    );
     assert_ne!(
         whole_mathlib_receipt_path("v0.0.0"),
         path,
