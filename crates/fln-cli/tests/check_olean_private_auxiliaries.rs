@@ -306,6 +306,16 @@ fn json_non_empty_name_strings(array: &str) -> Vec<String> {
     names
 }
 
+fn json_name_strings_are_subsequence(names: &[String], decoded_names: &[String]) -> bool {
+    let mut next_name = 0_usize;
+    for decoded_name in decoded_names {
+        if next_name < names.len() && names[next_name].as_str() == decoded_name.as_str() {
+            next_name = next_name.saturating_add(1);
+        }
+    }
+    next_name == names.len()
+}
+
 fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expected_names: &[&str]) {
     let residuals = json_object_field(json, field);
     let actual_observed = json_usize_field(residuals, "observed");
@@ -379,10 +389,12 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         decoded_private_auxiliaries,
         "{json}",
     );
-    let decoded_private_auxiliary_name_set =
-        json_non_empty_name_strings(decoded_private_auxiliary_names)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    let decoded_private_auxiliary_name_strings =
+        json_non_empty_name_strings(decoded_private_auxiliary_names);
+    let decoded_private_auxiliary_name_set = decoded_private_auxiliary_name_strings
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
         decoded_private_auxiliary_name_set.len(),
         decoded_private_auxiliary_name_count,
@@ -390,6 +402,13 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     assert!(
         private_companion_name_set.is_subset(&decoded_private_auxiliary_name_set),
+        "{json}",
+    );
+    assert!(
+        json_name_strings_are_subsequence(
+            &private_companion_name_strings,
+            &decoded_private_auxiliary_name_strings,
+        ),
         "{json}",
     );
     assert_eq!(
