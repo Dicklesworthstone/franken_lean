@@ -67,6 +67,25 @@ DECOY_NAME = "Fln.EmissionCheck.DecoyThatMustNotResolve"
 # printed type. A deliberately WRONG ascription rides along so the check proves, on
 # every run, that it can still fail.
 TYPE_DECOY_TYPE = "Nat -> Nat -> Nat -> Nat -> Nat"
+
+# Functions the self-test must exercise. A DECLARATION rather than a naming
+# convention: 4dbc3d32 collected this population with `name.endswith("_error")`,
+# which quietly meant that artifact_divergence_note, work_scratch_report,
+# kept_candidate, process_state_drift and restore_process_state were exercised but
+# never DEMANDED -- delete their cases and the coverage check still passed. The
+# suffix was doing the job of a declaration, and it drew the boundary in the wrong
+# place because it was never asked to draw one.
+SELF_TEST_REGISTRY = []
+# Names that look like a verdict producer. Not the population -- the population is
+# the registry above -- but the tripwire for someone adding one of these and
+# forgetting to mark it.
+VERDICT_NAME_PARTS = ("_error", "_note", "_report", "_drift")
+
+
+def checked_by_self_test(fn):
+    """Mark a verdict-producing function as one the self-test must exercise."""
+    SELF_TEST_REGISTRY.append(fn.__name__)
+    return fn
 COLS = [
     "key", "display", "kind", "module", "levels", "arity", "telescope",
     "sig_root", "res_root", "res_head", "safety", "attrs", "extern",
@@ -601,6 +620,7 @@ UNWRITABLE_CHARS = frozenset(
     " \t\n\r.«»✝()[]{}⟨⟩,:;`\"@|=<>#$%^&*+-/\\~")
 
 
+@checked_by_self_test
 def writable_component(part):
     # The hand-written rules are the CANDIDATE filter; the pin's own refusals
     # (MEASURED_UNWRITABLE, populated before anything is rendered) are the verdict.
@@ -610,6 +630,7 @@ def writable_component(part):
             and part not in MEASURED_UNWRITABLE)
 
 
+@checked_by_self_test
 def safe_ident(part):
     """One name component, written so the pin reads it as a NAME."""
     if writable_component(part):
@@ -922,6 +943,7 @@ def probe_companions(lean, env, work):
 TOKEN = re.compile(r"(?<![\w.\u00ab\u00bb])([A-Za-z_][\w'!?]*(?:\.[A-Za-z_][\w'!?]*)*)(?![\w.])")
 
 
+@checked_by_self_test
 def root_anchor(ty, deps):
     """Prefix every constant occurrence in a printed type with `_root_.`.
 
@@ -944,6 +966,7 @@ def root_anchor(ty, deps):
         lambda m: ("_root_." + m.group(1)) if m.group(1) in names else m.group(1), ty)
 
 
+@checked_by_self_test
 def private_owner(name):
     """The Reference module whose privacy mangling owns this name.
 
@@ -954,6 +977,7 @@ def private_owner(name):
     return head or "?"
 
 
+@checked_by_self_test
 def renderable_name(name):
     """A declaration name the facade can actually declare.
 
@@ -1071,6 +1095,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
             pin_ind_params, pin_ctor_bodies, pin_ind_result)
 
 
+@checked_by_self_test
 def order(names, deps):
     """Wave-based Kahn with a declared tie-break (name), so the emitted order is
     deterministic. A cycle is disclosed as residue and appended in name order —
@@ -1169,6 +1194,7 @@ def writable_binder(name):
     return writable_component(name)
 
 
+@checked_by_self_test
 def needs_rename(name):
     """A binder name that no amount of ESCAPING can make usable.
 
@@ -1182,6 +1208,7 @@ def needs_rename(name):
     return (not name) or ("\u271d" in name) or any(ch.isspace() for ch in name)
 
 
+@checked_by_self_test
 def binder_text(b, deps):
     """Render one constructor binder so the pin reads it as a binder.
 
@@ -1433,24 +1460,6 @@ def probe_generated_ctor_types(lean, env, work, text, decl, deps, owners):
     return owners_bad
 
 
-# Functions the self-test must exercise. A DECLARATION rather than a naming
-# convention: 4dbc3d32 collected this population with `name.endswith("_error")`,
-# which quietly meant that artifact_divergence_note, work_scratch_report,
-# kept_candidate, process_state_drift and restore_process_state were exercised but
-# never DEMANDED -- delete their cases and the coverage check still passed. The
-# suffix was doing the job of a declaration, and it drew the boundary in the wrong
-# place because it was never asked to draw one.
-SELF_TEST_REGISTRY = []
-# Names that look like a verdict producer. Not the population -- the population is
-# the registry above -- but the tripwire for someone adding one of these and
-# forgetting to mark it.
-VERDICT_NAME_PARTS = ("_error", "_note", "_report", "_drift")
-
-
-def checked_by_self_test(fn):
-    """Mark a verdict-producing function as one the self-test must exercise."""
-    SELF_TEST_REGISTRY.append(fn.__name__)
-    return fn
 
 
 def unmarked_verdict_functions(namespace):
@@ -2844,6 +2853,88 @@ def self_test():
          blocked(lambda: at("allowed.lean", "fine\n")), False)
     case("sandbox/allows-artifact-read",
          blocked(lambda: builtins.open(__file__, "r").close()), False)
+
+    # WHAT THE BYTES SAY, which nothing here has ever checked. Every guard on this
+    # bead asks whether the published bytes are the bytes this run built and
+    # whether the run reported honestly; none of them asks whether the bytes are
+    # RIGHT. These eight helpers decide that, and four are the sites of faults
+    # this bead actually shipped and had to repair. Each case below is one of
+    # those faults, frozen.
+
+    # root_anchor with an EMPTY dependency list returns the string untouched.
+    # That is the wave-200 fault verbatim: constructor types were anchored with
+    # the inductive's own deps, which for `X : Type` is nothing, so every name in
+    # every constructor was left to one-module shadowing and eight inductives
+    # refused with "Function expected at".
+    case("content/root-anchor-empty-deps-is-a-no-op",
+         None if root_anchor("Foo Bar", ()) == "Foo Bar" else "anchored anyway",
+         False)
+    case("content/root-anchor-prefixes-listed-tokens",
+         None if root_anchor("Option String", ["Option"]) == "_root_.Option String"
+         else f"got {root_anchor('Option String', ['Option'])!r}", False)
+    case("content/root-anchor-leaves-unlisted-tokens",
+         None if "_root_.String" not in root_anchor("Option String", ["Option"])
+         else "anchored a token that was never a dependency", False)
+
+    # renderable_name refuses a numeric component. That is the private-name trap:
+    # `_private.Lean.Environment.0.Lean...` is not a declarable name, and a run
+    # that tried to write one produced "unexpected identifier after decimal point".
+    case("content/renderable-refuses-numeric-component",
+         None if renderable_name("_private.Lean.Environment.0.Lean.X") is None
+         else "accepted a numeric component", False)
+    case("content/renderable-accepts-an-ordinary-name",
+         None if renderable_name("Lean.Expr") == "Lean.Expr" else "rejected it",
+         False)
+
+    # safe_ident ESCAPES a keyword; it must never rename one. Renaming `end` to a
+    # generated identifier changed a structure's field names away from the
+    # Reference's and removed the projection entirely.
+    case("content/keyword-is-escaped-not-renamed",
+         None if safe_ident("end") == "«end»" else f"got {safe_ident('end')!r}",
+         False)
+    case("content/ordinary-component-untouched",
+         None if safe_ident("map") == "map" else "escaped an ordinary name", False)
+    case("content/keyword-is-not-writable",
+         None if not writable_component("end") else "keyword called writable",
+         False)
+
+    # needs_rename is TRUE only for a name no escaping can fix. A keyword is not
+    # one of those, and treating it as one was the same defect from the other side.
+    case("content/needs-rename-false-for-keyword",
+         None if not needs_rename("end") else "would rename a keyword", False)
+    case("content/needs-rename-true-for-dagger",
+         None if needs_rename("inst✝") else "kept an inaccessible name", False)
+    case("content/needs-rename-true-for-whitespace",
+         None if needs_rename("a b") else "kept a name carrying whitespace", False)
+
+    # order puts a dependency before its dependent, and DISCLOSES a cycle as
+    # residue rather than inventing an order for it.
+    _ordered, _residue = order(["B", "A"], {"B": ["A"]})
+    case("content/order-puts-dependencies-first",
+         None if _ordered.index("A") < _ordered.index("B") else "wrong order", False)
+    case("content/order-reports-no-false-cycle",
+         None if not _residue else f"invented a cycle: {_residue}", False)
+    _cyc_ordered, _cyc_residue = order(["X", "Y"], {"X": ["Y"], "Y": ["X"]})
+    case("content/order-discloses-a-real-cycle",
+         None if sorted(_cyc_residue) == ["X", "Y"] else "swallowed a cycle", False)
+    case("content/order-still-emits-a-cycles-members",
+         None if sorted(_cyc_ordered) == ["X", "Y"] else "dropped a row", False)
+
+    # private_owner names the module whose mangling owns a private name.
+    case("content/private-owner",
+         None if private_owner("_private.Lean.Environment.0.Lean.X")
+         == "Lean.Environment" else
+         f"got {private_owner('_private.Lean.Environment.0.Lean.X')!r}", False)
+
+    # binder_text drops an unwritable instance-binder name rather than emitting a
+    # parse error: `[inst._@...hyg.4 : BEq a]` took the rest of the file with it.
+    case("content/inst-binder-keeps-a-writable-name",
+         None if binder_text({"user": "self", "type": "T", "kind": "inst"}, ())
+         == "[self : T]" else "lost a writable instance name", False)
+    case("content/inst-binder-drops-an-unwritable-name",
+         None if binder_text({"user": "inst✝", "type": "T", "kind": "inst"},
+                             ()) == "[T]" else "emitted an unwritable binder name",
+         False)
 
     # THE FIVE JOINS THAT CHECK THE ARTIFACT'S OWN CONTENT, which this self-test
     # has never once called. Synthetic inputs, in the same shape the real run
