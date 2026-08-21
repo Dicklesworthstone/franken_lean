@@ -36,6 +36,7 @@ use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::Name;
 use fln_env::constants::{
     ConstantInfo, ConstructorVal, DefinitionSafety, InductiveVal, QuotKind, RecursorVal,
+    ReducibilityHints,
 };
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
@@ -2036,4 +2037,128 @@ fn decode_prelude_private(lib: &Path) -> Vec<ConstantInfo> {
     DeclDecoder::new(&view, WalkBudget::default())
         .decode_module_constants()
         .expect("decode private part")
+}
+
+/// Definitions whose stored height does NOT exceed the tallest `Regular`
+/// definition their value references.
+///
+/// UNADJUDICATED. These are named so a fifth one fails, not because they are
+/// known to be correct. Three are structure-instance definitions sitting at
+/// height 1 over much taller bodies — `Lean.Name.instBEq` (1) over
+/// `Lean.Name.beq` (11), `Lean.instHashableName` (1) over `Lean.Name.hash` (7),
+/// `Lean.Macro.instInhabitedState` (1) over its own `.default` (2) — and the
+/// fourth does not fit that shape at all: `Lean.Name.append` stores 12 while
+/// referencing `Lean.extractMacroScopes` at 14.
+///
+/// These are the rows whose height is at or BELOW the tallest reference, which
+/// is the direction that matters: lazy delta unfolds the taller side first, so
+/// a height failing to dominate its dependencies inverts the intended order.
+/// Heights that merely OVERSHOOT the exact successor are a different and
+/// harmless case, deliberately not listed: `Nat.div.go` and `Nat.modCore.go`
+/// store 5 over a tallest reference of 2, which is what well-founded recursion
+/// auxiliaries do.
+///
+/// THE DISCRIMINATING CHECK, which I could not run here: ask the pinned Lean
+/// binary for these four constants' `ReducibilityHints` and compare. If the pin
+/// reports the same values, the height invariant simply is not universal and
+/// this list is a fact about Lean; if it reports different ones, decode is
+/// misreading the hint word and that is a defect for `fln-olean`. Nothing in
+/// this file can tell those apart, and asserting the list either way would be
+/// claiming an answer I do not have.
+const UNADJUDICATED_HEIGHT_ROWS: &[&str] = &[
+    "Lean.Macro.instInhabitedState",
+    "Lean.Name.append",
+    "Lean.Name.instBEq",
+    "Lean.instHashableName",
+];
+
+/// `ReducibilityHints` — the stored field that drives unfolding ORDER, and the
+/// last one in a `ConstantInfo` that nothing here reads.
+///
+/// `definition_height` consumes it directly: `Regular(h)` returns `h`, `Abbrev`
+/// returns `u32::MAX`, `Opaque` returns 0. Those numbers decide which side lazy
+/// delta unfolds first, so a mis-decoded hint does not fail to resolve and does
+/// not fail to typecheck — it changes reduction ORDER across the whole corpus.
+/// It is also the field immediately beside the `Thm` arm added at `e7cdcbbc`,
+/// which is a good reason to have it measured rather than assumed.
+///
+/// Measured over `Init/Prelude` at private level: 1,171 `Abbrev`, 511
+/// `Regular`, 38 `Opaque`; heights spanning 1 through 17 with every value in
+/// that range present; and of the 291 definitions whose value references another
+/// `Regular` definition, 285 hit Lean's height invariant `h == 1 + max`
+/// exactly, 2 overshoot it, and the 4 rows above are the only ones that fail to
+/// dominate their references at all.
+#[test]
+fn reducibility_hints_decode_across_all_three_shapes_and_respect_the_height_invariant() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut heights: BTreeMap<String, u32> = BTreeMap::new();
+    let mut abbrev = 0usize;
+    let mut opaque = 0usize;
+    let mut values: BTreeMap<String, &Expr> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Defn(v) = info {
+            let name = info.name().to_display_string();
+            match v.hints {
+                ReducibilityHints::Regular(h) => drop(heights.insert(name.clone(), h)),
+                ReducibilityHints::Abbrev => abbrev += 1,
+                ReducibilityHints::Opaque => opaque += 1,
+            }
+            values.insert(name, &v.value);
+        }
+    }
+
+    // All three shapes must actually occur. A decoder that returned one constant
+    // hint for everything would satisfy every comparison below.
+    assert!(
+        abbrev > 500 && heights.len() > 300 && opaque > 10,
+        "the pin exercises all three hint shapes ({abbrev} abbrev, {} regular, {opaque} opaque)",
+        heights.len()
+    );
+    let distinct: BTreeSet<u32> = heights.values().copied().collect();
+    assert!(
+        distinct.len() >= 15 && *distinct.iter().next().expect("nonempty") == 1,
+        "heights must be a real range starting at 1, got {} distinct values",
+        distinct.len()
+    );
+
+    let mut departures: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+    let mut exact = 0usize;
+    for (name, height) in &heights {
+        let referenced = referenced_constants(values[name]);
+        let tallest = referenced
+            .iter()
+            .filter_map(|r| heights.get(r))
+            .copied()
+            .max();
+        let Some(tallest) = tallest else { continue };
+        compared += 1;
+        if *height <= tallest {
+            departures.push(name.clone());
+        } else if *height == tallest + 1 {
+            exact += 1;
+        }
+    }
+    assert!(
+        compared > 250,
+        "the height invariant must be exercised over the pin's definitions, got {compared}"
+    );
+    // Floor, not an equality: a height that OVERSHOOTS still dominates its
+    // references, so it is not an anomaly, and pinning it as one would make
+    // well-founded-recursion auxiliaries look like defects.
+    assert!(
+        exact >= 280,
+        "most definitions should sit exactly one above their tallest reference, got {exact} of {compared}"
+    );
+    // Sorted: collected by walking a BTreeMap, but the table is the claim.
+    departures.sort();
+    assert_eq!(
+        departures, UNADJUDICATED_HEIGHT_ROWS,
+        "the definitions departing from `height == 1 + max referenced height` are an open \
+         question, not a cleared one. A NEW name here needs adjudicating against the pinned \
+         binary before it is added; a name disappearing means the invariant tightened and the \
+         list should shrink."
+    );
 }
