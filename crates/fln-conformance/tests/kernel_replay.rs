@@ -6780,9 +6780,28 @@ fn the_corpus_classifier_distinguishes_an_absent_root_from_a_wrong_one() {
     match classify_mathlib_corpus_input_at(present_but_wrong.clone()) {
         MathlibCorpusInput::Misprovisioned { root, reason } => {
             assert_eq!(root, present_but_wrong);
+            // NOT MERELY NON-EMPTY. Checking that a reason exists and then never
+            // reading it is the shape AGENTS.md records for the discarded
+            // no-admission arguments -- a field validated for presence and
+            // consumed by nothing. It matters here because this root can be
+            // refused for two different KINDS of reason, and only one of them
+            // exercises the check this control exists for.
+            //
+            // An IDENTITY refusal (wrong revision, or not a checkout at all) is
+            // the gate doing its job. A SHAPE refusal -- "not a real directory"
+            // -- would mean the gate misread a real directory as something else,
+            // and the control would be passing while testing nothing about
+            // corpus identity. Both identity spellings are accepted because a
+            // git-less export legitimately produces the second.
             assert!(
-                !reason.trim().is_empty(),
-                "a misprovisioned classification must say what is wrong"
+                reason.contains("corpus commit") || reason.contains("readable git checkout"),
+                "the refusal must be about this root's IDENTITY as a corpus, not something \
+                 incidental: {reason}"
+            );
+            assert!(
+                !reason.contains("must be a real directory"),
+                "a real directory was refused for not being one, so the gate misread its input \
+                 and this control is not exercising the corpus-identity check: {reason}"
             );
         }
         MathlibCorpusInput::Absent { .. } => panic!(
@@ -8636,10 +8655,18 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
         pin: format!("{pin}-not-this-epoch"),
         ..sample_whole_mathlib_receipt()
     };
-    assert!(
-        forged.validate(&pin, &corpus).is_err(),
+    let forged_reason = forged.validate(&pin, &corpus).expect_err(
         "the guard accepted a receipt filed under another Reference epoch; with no retained \
-         rows to check, this planted pair is the ONLY thing keeping this test honest"
+             rows to check, this planted pair is the ONLY thing keeping this test honest",
+    );
+    // AND REFUSED FOR THE PIN, not for something incidental about the sample.
+    // A bare `is_err()` here would keep passing if the planted row started
+    // failing on, say, a floor -- and since this pair is the only live check
+    // when no receipt has been retained, that would leave the epoch binding
+    // completely unexercised while the test stayed green.
+    assert!(
+        forged_reason.contains("epoch") && forged_reason.contains("not-this-epoch"),
+        "the refusal must name the epoch mismatch and the offending pin: {forged_reason}"
     );
 
     // THE REAL POPULATION, which may legitimately be empty at this commit.
