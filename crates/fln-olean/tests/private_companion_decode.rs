@@ -210,6 +210,11 @@ const BYTE_ARRAY_VALIDATE_UTF8_EQ_FALSE_IFF_SIMP_1_1: &str =
     "_private.Init.Data.String.Basic.0.ByteArray.validateUTF8_eq_false_iff._simp_1_1";
 /// The pin's private string companion stores this theorem in the Basic module.
 const BYTE_ARRAY_VALIDATE_UTF8_EQ_FALSE_IFF_SIMP_1_1_MODULE: &str = "Init/Data/String/Basic";
+/// The private simp theorem for left-append string-position validity.
+const STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1: &str =
+    "_private.Init.Data.String.Basic.0.String.Pos.Raw.IsValid.append_left._simp_1_1";
+/// The pin's private string companion stores this theorem in the Basic module.
+const STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1_MODULE: &str = "Init/Data/String/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1442,6 +1447,40 @@ fn byte_array_utf8_validation_simp_is_decoded_from_its_private_storage_module() 
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {BYTE_ARRAY_VALIDATE_UTF8_EQ_FALSE_IFF_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn string_pos_raw_append_left_simp_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "string_pos_raw_append_left_simp_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1.to_owned()),
+        "the private companion of {STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1_MODULE} \
+         must retain {STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| {
+            info.name().to_display_string() == STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1
+        })
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
