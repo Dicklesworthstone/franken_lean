@@ -1885,6 +1885,32 @@ def publication_registry_error(published, declared):
 
 
 @checked_by_self_test
+def unencodable_text_error(text, what="the facade"):
+    """The text this run built can actually be written as UTF-8.
+
+    The mirror of c26448fe, which turned a DECODE crash into a refusal and left
+    the encode side alone. Measured: a text carrying a lone surrogate makes both
+    published_bytes_error and pin_acceptance_error raise UnicodeEncodeError rather
+    than return a verdict, and the very first encode is earlier still -- writing
+    the candidate -- so the run dies on a stack trace before any check speaks.
+
+    Checked once, where the text is first written, because everything downstream
+    encodes the same string: the candidate, the digest recorded at the replace,
+    the published artifact and the manifest.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return (f"the text this run built for {what} cannot be written as UTF-8 "
+                f"({exc.reason} at offset {exc.start}, character {exc.object[exc.start]!r}). "
+                "Every use of it encodes the same string -- the candidate, the "
+                "acceptance digest, the published file and the manifest -- so this "
+                "would have surfaced as a traceback from whichever encoded it "
+                "first, naming no artifact and giving no verdict")
+    return None
+
+
+@checked_by_self_test
 def published_bytes_error(out, text, what="the facade"):
     """The file that ships is byte-for-byte the text this run built.
 
@@ -2664,6 +2690,32 @@ def self_test():
     case("bytes/identical", published_bytes_error(at("f.lean", text), text), False)
     # An empty artifact matches empty text, so this check was vacuous exactly
     # where it mattered most.
+    # THE PREDICATE IS ONE THING, MAIN CALLING IT IS ANOTHER. The self-test cannot
+    # run main -- that needs the pin -- so a mutant deleting the call site survives
+    # every case about the predicate. The call is a fact about main's code object,
+    # which is checkable without running it, using the same walk unexercised_guards
+    # already does.
+    _main_calls = set()
+
+    def _walk_main(code):
+        _main_calls.update(code.co_names)
+        for const in code.co_consts:
+            if hasattr(const, "co_names"):
+                _walk_main(const)
+
+    _walk_main(main.__code__)
+    case("coverage/main-invokes-the-encode-guard",
+         None if "unencodable_text_error" in _main_calls
+         else "main never calls unencodable_text_error", False)
+    case("coverage/main-invokes-the-publication-checks",
+         None if {"published_bytes_error", "leftover_scratch_error",
+                  "publication_registry_error"} <= _main_calls
+         else f"main is missing: {sorted({'published_bytes_error', 'leftover_scratch_error', 'publication_registry_error'} - _main_calls)}",
+         False)
+
+    _surrogate = "axiom X : Type\n" + chr(0xD800)
+    case("bytes/text-encodable", unencodable_text_error(text), False)
+    case("bytes/text-not-encodable", unencodable_text_error(_surrogate), True)
     case("bytes/empty-artifact-refused",
          published_bytes_error(at("empty.lean", ""), ""), True)
     case("bytes/empty-text-against-real-file",
@@ -3470,6 +3522,9 @@ def main():
             pin_ind_params, pin_ctor_bodies, pin_ind_result)
             candidate = args.out + CANDIDATE_SUFFIX
             scratch_created.add((args.out, candidate))
+            _enc = unencodable_text_error(text)
+            if _enc:
+                raise SystemExit("REFUSE: " + _enc)
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
             proc = subprocess.run([lean, "-DmaxErrors=4000", candidate],
