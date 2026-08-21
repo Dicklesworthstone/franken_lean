@@ -3676,6 +3676,9 @@ def main():
     transparent_quarantine_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_quarantined": manifest_summary.get("quarantined")}
     if (not isinstance(transparent_quarantine_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_quarantine_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_quarantine_inequality_join["summary_quarantined"], int) or isinstance(transparent_quarantine_inequality_join["summary_quarantined"], bool) or transparent_quarantine_inequality_join["summary_transparent_declarations"] <= transparent_quarantine_inequality_join["summary_quarantined"]):
         raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed quarantine count " + json.dumps(transparent_quarantine_inequality_join, sort_keys=True))
+    roundtrip_quarantine_inequality_join = {"summary_type_roundtrip_checked": manifest_summary.get("type_roundtrip_checked"), "summary_quarantined": manifest_summary.get("quarantined")}
+    if (not isinstance(roundtrip_quarantine_inequality_join["summary_type_roundtrip_checked"], int) or isinstance(roundtrip_quarantine_inequality_join["summary_type_roundtrip_checked"], bool) or not isinstance(roundtrip_quarantine_inequality_join["summary_quarantined"], int) or isinstance(roundtrip_quarantine_inequality_join["summary_quarantined"], bool) or roundtrip_quarantine_inequality_join["summary_type_roundtrip_checked"] <= roundtrip_quarantine_inequality_join["summary_quarantined"]):
+        raise SystemExit("REFUSE: facade manifest type-roundtrip count must exceed quarantine count " + json.dumps(roundtrip_quarantine_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5853,6 +5856,9 @@ def main():
         ),
         "manifest_transparent_quarantine_inequality_join": (
             transparent_quarantine_inequality_join
+        ),
+        "manifest_roundtrip_quarantine_inequality_join": (
+            roundtrip_quarantine_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
