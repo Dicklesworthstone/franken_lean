@@ -331,11 +331,33 @@ impl<'a> DeclDecoder<'a> {
             }
             self.charge()?;
             chain.push(off);
-            let (tag, other, _) = self.view.obj_header(off)?;
+            let (tag, other, cs_sz) = self.view.obj_header(off)?;
             if !(tag == 1 || tag == 2) || other != 2 {
                 return Err(DeclError::Shape {
                     offset: off,
                     what: "Name ctor",
+                });
+            }
+            // A `Name.str`/`Name.num` link is two pointer fields — the prefix
+            // and the component — followed by the stored `Name.hash` word, so
+            // the object is exactly 8 + 8*2 + 8 bytes.
+            //
+            // The hash is already cross-checked against our recomputation, but
+            // that check reads it from `off + 24`, an offset derived from the
+            // layout rather than from the object. If the object were not this
+            // shape, the word compared would be some other field and a
+            // disagreement would be reported as a hash divergence — a finding
+            // pointing at the identity layer for what is really a misread.
+            // `cs_sz` is the stored size that can contradict the layout
+            // independently, and it was discarded here.
+            //
+            // Measured over the pin: 5,842,155 Name objects reached from the
+            // constNames and extraConstNames arrays, every one with other == 2
+            // and cs_sz == 32.
+            if cs_sz != 32 {
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "Name object size disagrees with its two-pointer-plus-hash layout",
                 });
             }
             ptr = self.view.read_u64(off + 8)?;
@@ -2291,6 +2313,54 @@ mod tests {
         assert!(
             regular > 0,
             "Init.Prelude must carry regular hints, or this test exercises no padding"
+        );
+    }
+
+    /// A `Name` link whose stored size contradicts its layout is refused
+    /// before its hash is compared.
+    ///
+    /// Without this the planted object would be read as a Name anyway and the
+    /// word at `+24` compared as `Name.hash`, so the failure would surface as
+    /// a cross-check divergence and point at the identity layer instead of at
+    /// the misread.
+    #[test]
+    fn a_name_object_whose_size_contradicts_its_layout_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let name_ptr = view
+            .read_u64(arrays.const_names.0 + 24)
+            .expect("first constName");
+        let name_off = view.deref(name_ptr).expect("Name object");
+
+        // Positive control, and the layout the mutant depends on.
+        let (tag, other, cs_sz) = view.obj_header(name_off).expect("Name header");
+        assert!(tag == 1 || tag == 2, "a Name link");
+        assert_eq!(other, 2, "prefix and component");
+        assert_eq!(cs_sz, 32, "plus the stored hash");
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        // Change the stored size and nothing else: both pointers and the hash
+        // word stay exactly where they were.
+        let header = view.read_u64(name_off).expect("header word");
+        let planted = (header & !0x0000_ffff_0000_0000) | (40_u64 << 32);
+        bytes[name_off as usize..name_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted header");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a Name whose size contradicts its layout must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Name object size disagrees with its two-pointer-plus-hash layout",
+                    ..
+                }
+            ),
+            "expected the size refusal rather than a hash cross-check: {error:?}"
         );
     }
 
