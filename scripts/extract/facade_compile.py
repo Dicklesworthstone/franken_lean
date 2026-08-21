@@ -229,6 +229,11 @@ the toolchain would report a perfect facade:
     Init-substrate row to carry the pinned manifest schema. A trusted summary
     cannot make mixed-epoch data rows appear compatible by itself.
 
+  * A MANIFEST-FORM-TOTALITY JOIN requires every non-Init declaration row to
+    use a recognized generator form, and every Init-substrate declaration to
+    remain intentionally formless. A form classification cannot disappear
+    outside the demanded subset.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1287,6 +1292,33 @@ def main():
             "REFUSE: facade manifest schema-row join disagrees with the pinned "
             f"summary ({json.dumps(manifest_schema_join, sort_keys=True)})"
         )
+    malformed_forms = sorted(
+        row["name"] for row in manifest_rows
+        if (row.get("role") == "init-substrate" and row.get("form") is not None)
+        or (row.get("role") != "init-substrate"
+            and row.get("form") not in DEMANDED_FORMS)
+    )
+    manifest_form_join = {
+        "declaration_rows": len(manifest_rows),
+        "recognized_form_rows": sum(
+            row.get("form") in DEMANDED_FORMS for row in manifest_rows
+        ),
+        "init_formless_rows": sum(
+            row.get("role") == "init-substrate" and row.get("form") is None
+            for row in manifest_rows
+        ),
+        "malformed_rows": len(malformed_forms),
+    }
+    if (manifest_form_join["declaration_rows"] == 0
+            or manifest_form_join["recognized_form_rows"]
+            + manifest_form_join["init_formless_rows"]
+            != manifest_form_join["declaration_rows"]
+            or manifest_form_join["malformed_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest form-totality join failed "
+            f"({json.dumps(manifest_form_join, sort_keys=True)}, "
+            f"malformed={malformed_forms[:8]!r})"
+        )
     totality = {
         "uncensused_closure": manifest_summary.get("uncensused_closure"),
         "uncensused_emitted": manifest_summary.get("uncensused_emitted"),
@@ -1685,6 +1717,7 @@ def main():
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_schema_row_join": manifest_schema_join,
+        "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
         "manifest_emitted_row_join": emitted_row_join,
