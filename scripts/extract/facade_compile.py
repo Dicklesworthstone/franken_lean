@@ -130,6 +130,10 @@ the toolchain would report a perfect facade:
     transparent candidates to agree with their form and refusal metadata. The
     rig must not conflate a value-preserving abbreviation with an opaque axiom.
 
+  * A DISPOSITION-MUTATION CONTROL relabels one facade-only emitted demand as
+    Init substrate in memory and requires the disposition matrix to refuse. The
+    matrix is proved sensitive to a wrong demanded-row classification.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -709,6 +713,28 @@ def enforce_disposition_matrix(dispositions, generated, empty):
     return dict(sorted(Counter(dispositions.values()).items()))
 
 
+def run_disposition_mutation_control(dispositions, generated, empty):
+    """Prove the disposition matrix rejects a one-row classification mutation."""
+    candidates = sorted(
+        name for name, outcome in dispositions.items() if outcome == "emitted"
+    )
+    if not candidates:
+        raise SystemExit(
+            "REFUSE: disposition mutation control found no emitted demand to mutate"
+        )
+    name = candidates[0]
+    mutated = dict(dispositions)
+    mutated[name] = "init-substrate"
+    try:
+        enforce_disposition_matrix(mutated, generated, empty)
+    except SystemExit:
+        return name
+    raise SystemExit(
+        f"REFUSE: disposition mutation control relabeled {name}, but the matrix "
+        "still accepted the contradictory Init-substrate classification"
+    )
+
+
 def join_unresolved_quarantine(dispositions, manifest_rows, verdicts, diagnostics):
     """Bind every observed unresolved demanded name to one justified quarantine."""
     rows_by_name = {row["name"]: row for row in manifest_rows}
@@ -1026,6 +1052,9 @@ def main():
     disposition_matrix = enforce_disposition_matrix(
         demand_dispositions, v_facade, v_empty
     )
+    disposition_mutation_control = run_disposition_mutation_control(
+        demand_dispositions, v_facade, v_empty
+    )
     unresolved_quarantine_join = join_unresolved_quarantine(
         demand_dispositions, manifest_rows, v_facade, facade_detail
     )
@@ -1120,6 +1149,11 @@ def main():
             "emitted": disposition_matrix.get("emitted", 0),
             "init_substrate": disposition_matrix.get("init-substrate", 0),
             "quarantined": disposition_matrix.get("quarantined", 0),
+        },
+        "disposition_mutation_control": {
+            "name": disposition_mutation_control,
+            "mutated_disposition": "init-substrate",
+            "rejected": True,
         },
         "unresolved_quarantine_join": unresolved_quarantine_join,
         "available": verdict_counts["available"],
