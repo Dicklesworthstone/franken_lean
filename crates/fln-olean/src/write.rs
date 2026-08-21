@@ -1303,8 +1303,14 @@ mod tests {
                 base: base("Demo.ind", &type_),
                 num_params: u32::MAX,
                 num_indices: 2,
-                all: vec![name("Demo.ind")],
-                ctors: vec![name("Demo.ind.mk")],
+                // TWO distinct names in each list. A single-element list
+                // proves the cons loop is reachable but has no ORDER to get
+                // wrong, and `all` and `ctors` are adjacent List Name slots
+                // (3 and 4), so a codec that crossed them would round-trip
+                // clean. See
+                // `the_inductive_name_lists_keep_their_arity_and_order_on_the_wire`.
+                all: vec![name("Demo.ind"), name("Demo.ind.mutual")],
+                ctors: vec![name("Demo.ind.mk"), name("Demo.ind.mk2")],
                 num_nested: 3,
                 is_rec: true,
                 is_unsafe: true,
@@ -1382,6 +1388,141 @@ mod tests {
         assert_eq!(
             decoder.decode_module_constants().expect("constants"),
             constants
+        );
+    }
+
+    /// An inductive's `all` and `ctors` keep their ARITY and their ORDER, and
+    /// the claim is made against the WIRE rather than against the round trip.
+    ///
+    /// `complete_module_roundtrips_every_constant_variant_and_import_flag`
+    /// compares decoded constants to the values that were encoded, which is
+    /// symmetric-blind: an encoder that reverses a name list and a decoder that
+    /// reverses it back agree with each other, and the equality holds while
+    /// both are wrong. Nothing in that test reads a byte the codec did not also
+    /// write, so the only way to separate the two is to walk the cons chain
+    /// directly.
+    ///
+    /// The fixture also could not have shown it. Both lists held a single name
+    /// until this commit, and a list of one has no order to get wrong - the
+    /// same insufficiency that made the recursor's rule list unpinnable before
+    /// `191a5783`, arriving here for a second pair of fields.
+    ///
+    /// `all` and `ctors` are the sharper case, because they are BOTH
+    /// `List Name` and they are ADJACENT - slots 3 and 4 of the payload. A
+    /// codec that read one for the other produces two well-formed name lists
+    /// and no arity, size or constructor rule can object, so this cell asserts
+    /// the two are not equal to each other as well as walking each.
+    #[test]
+    fn the_inductive_name_lists_keep_their_arity_and_order_on_the_wire() {
+        let type_ = Expr::sort(Level::param(name("u")));
+        let all = vec![name("Demo.ind"), name("Demo.ind.mutual")];
+        let ctors = vec![name("Demo.ind.mk"), name("Demo.ind.mk2")];
+
+        // The guard: with one member, or two equal ones, a reversal would be
+        // invisible; with `all == ctors` the slot confusion would be too.
+        assert_eq!(all.len(), 2, "two members, or there is no order");
+        assert_eq!(ctors.len(), 2, "two members, or there is no order");
+        assert_ne!(all[0], all[1], "the members must be distinguishable");
+        assert_ne!(ctors[0], ctors[1], "the members must be distinguishable");
+        assert_ne!(
+            all, ctors,
+            "the two lists must differ, or reading slot 4 for slot 3 would \
+             produce the right answer by accident"
+        );
+
+        // One constant, so the constants array's element 0 is unambiguous.
+        let constants = vec![ConstantInfo::Induct(InductiveVal {
+            base: base("Demo.ind", &type_),
+            num_params: 1,
+            num_indices: 2,
+            all: all.clone(),
+            ctors: ctors.clone(),
+            num_nested: 3,
+            is_rec: true,
+            is_unsafe: false,
+            is_reflexive: true,
+        })];
+
+        let encoded = encode_module(
+            ModuleWriteInput {
+                is_module: true,
+                imports: &[],
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            header(),
+            WriteBudget::default(),
+        )
+        .expect("encode module");
+
+        let view = OleanView::parse(&encoded.bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        assert_eq!(
+            view.obj_header(info_off).expect("ConstantInfo header").0,
+            5,
+            "ConstantInfo.inductInfo"
+        );
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("InductiveVal pointer"))
+            .expect("InductiveVal object");
+
+        // Walk one `List Name` from a payload slot, on the wire.
+        let walk = |slot: u64| -> Vec<String> {
+            let mut cursor = view.read_u64(val_off + 8 + 8 * slot).expect("list slot");
+            let mut names = Vec::new();
+            while cursor & 1 == 0 {
+                let cell = view.deref(cursor).expect("cons cell");
+                assert_eq!(
+                    view.obj_header(cell).expect("cons header").0,
+                    1,
+                    "List.cons"
+                );
+                let head = view.read_u64(cell + 8).expect("head pointer");
+                names.push(
+                    DeclDecoder::new(&view, WalkBudget::default())
+                        .decode_name(head)
+                        .expect("member name")
+                        .to_display_string(),
+                );
+                cursor = view.read_u64(cell + 16).expect("tail pointer");
+            }
+            assert_eq!(cursor >> 1, 0, "the list ends in boxed nil");
+            names
+        };
+
+        let all_on_the_wire = walk(3);
+        let ctors_on_the_wire = walk(4);
+        assert_eq!(
+            all_on_the_wire,
+            vec!["Demo.ind".to_owned(), "Demo.ind.mutual".to_owned()],
+            "the mutual block, in the order it was given"
+        );
+        assert_eq!(
+            ctors_on_the_wire,
+            vec!["Demo.ind.mk".to_owned(), "Demo.ind.mk2".to_owned()],
+            "the constructors, in the order they were given; constructor i is \
+             identified by its POSITION, so a reversal renames every one"
+        );
+
+        // And the decoder agrees with the bytes rather than with the encoder.
+        let mut decoder = DeclDecoder::new(&view, WalkBudget::default());
+        let decoded = decoder.decode_module_constants().expect("constants");
+        let ConstantInfo::Induct(inductive) = &decoded[0] else {
+            panic!("the fixture declares one inductive")
+        };
+        let display =
+            |names: &[Name]| -> Vec<String> { names.iter().map(Name::to_display_string).collect() };
+        assert_eq!(display(&inductive.all), all_on_the_wire, "`all` as chained");
+        assert_eq!(
+            display(&inductive.ctors),
+            ctors_on_the_wire,
+            "`ctors` as chained"
         );
     }
 
