@@ -69,6 +69,9 @@ the toolchain would report a perfect facade:
   * A SIGNATURE-PROVENANCE JOIN requires each non-Init demanded signature to
     carry a recognized Reference printer label and well-formed universe
     parameters. A type ascription cannot quietly consume an untyped payload.
+  * A TYPE-ASCRIPTION JOIN requires every emitted or quarantined demand to enter
+    the typed probe, while every Init-substrate demand remains name-only. The
+    manifest disposition and the probe's actual checking mode must agree.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -498,6 +501,30 @@ def join_unresolved_quarantine(dispositions, manifest_rows, verdicts, diagnostic
     return joined
 
 
+def join_type_ascriptions(dispositions, sigs):
+    """Make the probe's type-ascription set match demanded dispositions exactly."""
+    expected_typed = {
+        name for name, outcome in dispositions.items() if outcome != "init-substrate"
+    }
+    actual_typed = set(sigs).intersection(dispositions)
+    missing = sorted(expected_typed.difference(actual_typed))
+    unexpected = sorted(actual_typed.difference(expected_typed))
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing-typed=" + ", ".join(missing[:8]))
+        if unexpected:
+            details.append("unexpected-typed=" + ", ".join(unexpected[:8]))
+        raise SystemExit(
+            "REFUSE: demanded type-ascription join failed (" + "; ".join(details)
+            + ") — the probe's type-checking mode disagrees with its disposition"
+        )
+    return {
+        "typed": len(actual_typed),
+        "name_only_init": len(dispositions) - len(actual_typed),
+    }
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -619,6 +646,7 @@ def main():
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
      demand_printers) = join_demanded_rows(demand_names, manifest_rows)
+    type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
 
     # Mutation control for the source guard above. It is deliberately in-memory:
     # no Reference-importing file is ever handed to the pinned compiler.
@@ -732,6 +760,7 @@ def main():
         "demanded_emission_join": demand_emission,
         "demanded_provider_join": demand_providers,
         "demanded_signature_printer_join": demand_printers,
+        "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
             "init_substrate": disposition_matrix.get("init-substrate", 0),
