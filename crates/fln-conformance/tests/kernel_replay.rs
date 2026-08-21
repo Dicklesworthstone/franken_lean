@@ -8959,6 +8959,82 @@ fn a_stem_ending_in_a_dot_mints_a_name_no_import_can_match() {
     );
 }
 
+/// An empty segment in the MIDDLE of a name, which the trailing decoy cannot
+/// distinguish.
+///
+/// **The neighbouring test's stem puts the empty segment last.**
+/// `Dotted/x..olean` projects to `Dotted.x.`, so the cheap version of the rule --
+/// "refuse a name that ends in a dot" -- refuses it too, and every assertion
+/// there passes for either implementation. One decoy, two rules, nothing between
+/// them.
+///
+/// **`Dotted/a..b.olean` projects to `Dotted.a..b`.** The doubled dot is in the
+/// middle, the name does not end in a dot, and only a rule that looks at EVERY
+/// segment refuses it. Measured against both rules, with two green names, before
+/// this cell was written.
+///
+/// **Both halves of the input are asserted from the entry itself.** Its stem must
+/// still contain a doubled dot -- or it mints no empty segment and the cell tests
+/// nothing -- and it must NOT end in one, or the cheap rule refuses it again and
+/// the cell quietly becomes a second copy of its neighbour. Both are read off the
+/// entry with `Path::file_stem`, not restated as literals.
+///
+/// **Why an empty segment anywhere is the same defect.** A name with a gap in it
+/// matches no import recorded in any olean, whichever end the gap is at. The
+/// module joins the census, adds one to every count, and resolves against
+/// nothing.
+#[test]
+fn an_empty_segment_in_the_middle_of_a_name_is_refused_too() {
+    const ENTRY: &str = "Dotted/a..b.olean";
+
+    // THE INPUT'S TWO PROPERTIES, READ OFF THE ENTRY. Not asserted as literals:
+    // if the fixture list is edited, these are what redden.
+    let stem = Path::new(ENTRY)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_else(|| panic!("`{ENTRY}` has no usable stem"));
+    assert!(
+        stem.contains(".."),
+        "`{stem}` must run two dots together, or the projection mints no empty segment at all"
+    );
+    assert!(
+        !stem.ends_with('.'),
+        "`{stem}` must NOT end in a dot, or a rule that only checks the last segment refuses it \
+         too and this cell stops distinguishing anything"
+    );
+
+    let library = write_inventory_fixture("t6r7-inventory-empty-segment-mid-v1", &[ENTRY]);
+
+    // ANTI-VACUITY: the file must reach the projection, exactly as in the
+    // trailing case. `a..b.olean` has extension `olean` like any other module.
+    let mut collected = Vec::new();
+    collect_present_oleans(&library, &mut collected)
+        .unwrap_or_else(|reason| panic!("the fixture must enumerate: {reason}"));
+    assert_eq!(
+        collected.len(),
+        1,
+        "the entry must be collected, or the refusal below is about a file the filter dropped: \
+         {collected:?}"
+    );
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(accepted) => panic!(
+            "a name with a gap in the middle was counted instead of refused, as {:?}",
+            accepted.modules
+        ),
+    };
+    assert!(
+        reason.contains("empty segment"),
+        "the refusal must name the empty segment: {reason}"
+    );
+    assert!(
+        reason.contains("Dotted.a..b"),
+        "the refusal must show the name it would have minted, so the gap is visible without \
+         re-running the projection: {reason}"
+    );
+}
+
 /// A fixture entry that leaves the tree is refused BEFORE anything is written.
 ///
 /// **The parameter is called `relative_files` and nothing made it so.**
