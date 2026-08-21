@@ -209,6 +209,10 @@ the toolchain would report a perfect facade:
     measures. The no-import substrate proof cannot quietly omit one of its
     enumerated inputs.
 
+  * A MANIFEST-INSTANCE-ATTRIBUTE JOIN binds the generator-wide kept and
+    dropped instance-attribute counts to their declaration rows. The summary
+    cannot erase an unregistered attribute or invent a successful registration.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1394,6 +1398,29 @@ def main():
             "REFUSE: facade manifest Init-substrate join disagrees with its "
             f"enumerated rows ({json.dumps(init_substrate_join, sort_keys=True)})"
         )
+    instance_attribute_join = {
+        "registered_instance_rows": sum(
+            row.get("instance_registered") is True for row in manifest_rows
+        ),
+        "dropped_instance_rows": sum(
+            bool(isinstance(row.get("instance_drop_reason"), str)
+                 and row["instance_drop_reason"].strip())
+            for row in manifest_rows
+        ),
+        "summary_instance_attrs_kept": manifest_summary.get("instance_attrs_kept"),
+        "summary_instance_attrs_dropped": manifest_summary.get("instance_attrs_dropped"),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in (instance_attribute_join["summary_instance_attrs_kept"],
+                          instance_attribute_join["summary_instance_attrs_dropped"]))
+            or instance_attribute_join["registered_instance_rows"]
+            != instance_attribute_join["summary_instance_attrs_kept"]
+            or instance_attribute_join["dropped_instance_rows"]
+            != instance_attribute_join["summary_instance_attrs_dropped"]):
+        raise SystemExit(
+            "REFUSE: facade manifest instance-attribute join disagrees with its "
+            f"declaration rows ({json.dumps(instance_attribute_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1572,6 +1599,7 @@ def main():
         "manifest_structural_join": structural_join,
         "manifest_substrate_emission_join": substrate_emission_join,
         "manifest_init_substrate_join": init_substrate_join,
+        "manifest_instance_attribute_join": instance_attribute_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
