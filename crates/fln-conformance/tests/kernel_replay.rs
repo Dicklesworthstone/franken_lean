@@ -13075,6 +13075,48 @@ fn the_expectation_collision_detector_reports_only_real_collisions() {
         "an empty expectation is contained by every refusal, which is why the mutant loop \
          refuses one directly rather than leaving this detector to blame a collision"
     );
+
+    // THE COLLISION IN THE OTHER DIRECTION. Both cases above put the containment
+    // the same way round -- the FIRST cell's refusal holding the SECOND cell's
+    // expectation -- so a scan over ordered pairs `i < j` reports both of them
+    // and cannot be told apart from one over EVERY ordered pair. Measured before
+    // this case was added: distinct ok/ok, forward REPORTS/REPORTS, vacuous
+    // REPORTS/REPORTS, and this one REPORTS/ok.
+    //
+    // A collision is symmetric -- two cells that cannot tell each other's rule
+    // apart are in that state whichever refusal happens to quote the other -- so
+    // a detector that only looked one way would miss half of them, and the half
+    // it missed would be silent rather than loud.
+    let backward: Vec<(&str, String, &str)> = vec![
+        ("alpha", "row records wall_ms: 0".to_string(), "wall_ms: 0"),
+        (
+            "beta",
+            "row carries an empty target, and wall_ms: 0 would also be refused".to_string(),
+            "empty target",
+        ),
+    ];
+    // THE DIRECTION IS ASSERTED, NOT ASSUMED. If a later edit made alpha's
+    // refusal mention `empty target` as well, a one-directional scan would
+    // report this case too and it would quietly become a copy of the first.
+    assert!(
+        !backward[0].1.contains(backward[1].2),
+        "the first cell's refusal must NOT contain the second's expectation, or this is the \
+         forward case again"
+    );
+    assert!(
+        backward[1].1.contains(backward[0].2),
+        "the second cell's refusal must contain the first's expectation, or there is no collision \
+         here at all"
+    );
+    let backward_report = expectations_are_mutually_exclusive(&backward)
+        .expect_err("which cell's refusal quotes the other cannot change whether they collide");
+    assert!(
+        backward_report.contains("alpha")
+            && backward_report.contains("beta")
+            && backward_report.contains("wall_ms: 0"),
+        "the report must name both cells and the shared fragment, whichever way round the \
+         containment runs: {backward_report}"
+    );
 }
 
 /// Read a retained receipt file: absent, present, or present-and-unreadable.
