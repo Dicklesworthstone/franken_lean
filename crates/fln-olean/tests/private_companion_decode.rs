@@ -284,6 +284,8 @@ const ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC: &str = "_private.Init.Data.Array.Ba
 const ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
 const ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop.match_1";
 const ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
+const INSERT_IDX_LOOP: &str = "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop";
+const INSERT_IDX_LOOP_MODULE: &str = "Init/Data/Array/Basic";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -2118,6 +2120,9 @@ fn array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_mod
 
 #[test]
 fn array_for_in_unsafe_loop_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_for_in_unsafe_loop_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+
+#[test]
+fn insert_idx_loop_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("insert_idx_loop_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, INSERT_IDX_LOOP_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&INSERT_IDX_LOOP.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == INSERT_IDX_LOOP).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
