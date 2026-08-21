@@ -332,6 +332,14 @@ mod family {
             .skip(1)
             .any(|component| *component == "loop")
     }
+
+    /// A `go` recursion component anywhere but the head.
+    pub fn go(name: &str) -> bool {
+        components(name)
+            .iter()
+            .skip(1)
+            .any(|component| *component == "go")
+    }
 }
 
 /// Enumerate every module under `Init` that has a complete companion chain.
@@ -437,14 +445,15 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 5] = [
+    let families: [(&str, fn(&str) -> bool); 6] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
         ("eq_def", family::eq_def),
         (".loop", family::loop_),
+        (".go", family::go),
     ];
-    let mut representatives: [Option<(String, String)>; 5] = [None, None, None, None, None];
+    let mut representatives: [Option<(String, String)>; 6] = [None, None, None, None, None, None];
 
     for relative in init_chain_modules(&lib) {
         let chain = chain_bytes(&lib, &relative);
@@ -502,12 +511,13 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 5] = [
+    let families: [(&str, fn(&str) -> bool); 6] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
         ("eq_def", family::eq_def),
         (".loop", family::loop_),
+        (".go", family::go),
     ];
 
     for (family, belongs_to_family) in families {
