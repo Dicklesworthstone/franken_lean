@@ -2731,6 +2731,22 @@ fn kr600_803_init_or_fixture_pins_recursor_levels_motives_minors_and_rules() {
 }
 
 #[test]
+fn kr600_803_init_or_fixture_pins_constructor_indices_parameters_and_fields() {
+    let entries = init_or_entries();
+    for (entry, expected_index) in [(&entries[1], 0), (&entries[2], 1)] {
+        let metadata = entry
+            .declaration()
+            .constructor_metadata()
+            .expect("fixture constructor metadata");
+        assert_eq!(metadata.inductive(), &checker_name("Or"));
+        assert_eq!(metadata.index(), expected_index);
+        assert_eq!(metadata.num_parameters(), 2);
+        assert_eq!(metadata.num_fields(), 1);
+        assert!(entry.declaration().level_parameters().is_empty());
+    }
+}
+
+#[test]
 fn kr600_803_direct_recursion_reconstructs_iota_and_defers_indirect_fields() {
     let mut forged_rule = nat_entries();
     let recursor = forged_rule[3].declaration();
