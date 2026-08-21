@@ -6875,6 +6875,20 @@ fn the_library_under_test_identifies_itself_as_the_pinned_toolchain() {
     );
 }
 
+/// Multiply-declared names the recognised equation-compiler tails do not match.
+///
+/// Disclosed as a remainder rather than absorbed into the pattern. Their tails
+/// — `fun_cases_unfolding` and `congr_eq_N` — come from the functional-induction
+/// and congruence machinery, which is adjacent to the equation compiler but not
+/// the same generator, and widening the tail list to swallow them would also
+/// swallow a real collision between unrelated declarations. A fourth such name
+/// appearing in the pin fails here, which is the point of listing them.
+const MULTI_DECLARED_NOT_EQUATION_SHAPED: &[&str] = &[
+    "String.utf8EncodeChar.fun_cases_unfolding",
+    "_private.Init.Data.String.Slice.0.String.Slice.Pos.skipWhile.match_1.congr_eq_1",
+    "_private.Init.Data.String.Slice.0.String.Slice.Pos.skipWhile.match_1.congr_eq_2",
+];
+
 /// The most-duplicated name at the pin, and every module that declares it.
 const MOST_DUPLICATED_NAME: &str = "InvImage.eq_1";
 const MOST_DUPLICATED_DECLARERS: &[&str] = &[
@@ -6903,9 +6917,12 @@ const MOST_DUPLICATED_DECLARERS: &[&str] = &[
 ///   92 names are declared by MORE THAN ONE module, up to SEVEN for
 ///     `InvImage.eq_1`. So the name is not a key for the pair (module,
 ///     declaration), and anything keying on it alone collapses those
-///   every one of the 92 is an equation-compiler auxiliary by its tail —
-///     `eq_1`, `congr_simp`, `eq_2`, `eq_def`, `induct_unfolding`, `eq_3` —
-///     which is precisely the family this bead exists to recover
+///   89 of the 92 are equation-compiler auxiliaries by their tail — `eq_1` ×36,
+///     `congr_simp` ×24, `eq_2` ×9, `eq_def` ×9, `induct_unfolding` ×6,
+///     `eq_3` ×4, `eq_4` ×1 — which is the family this bead exists to recover.
+///     THREE are not matched by those tails and are pinned by name below,
+///     because a pattern widened to cover them would also cover a genuine
+///     collision of unrelated declarations
 ///   16,189 declarations are `_private`-scoped, and 16,155 of them carry a
 ///     scope prefix equal to their declaring module. The 34 that differ are the
 ///     population behind the scope cell's single example
@@ -6964,7 +6981,7 @@ fn a_name_identifies_a_declaration_but_not_the_module_that_declares_it() {
     // Every duplicated name is an equation-compiler auxiliary, which is what
     // makes the duplication a regeneration rather than a collision of unrelated
     // declarations.
-    let stray: Vec<&&String> = duplicated
+    let stray: Vec<&str> = duplicated
         .keys()
         .filter(|name| {
             !["eq_def", "congr_simp", "induct_unfolding"]
@@ -6975,10 +6992,12 @@ fn a_name_identifies_a_declaration_but_not_the_module_that_declares_it() {
                     .next()
                     .is_some_and(|tail| tail.starts_with("eq_"))
         })
+        .map(|name| name.as_str())
         .collect();
-    assert!(
-        stray.is_empty(),
-        "every multiply-declared name is an equation-compiler auxiliary; these are not: {stray:?}"
+    assert_eq!(
+        stray, MULTI_DECLARED_NOT_EQUATION_SHAPED,
+        "the multiply-declared names the recognised equation-compiler tails do NOT match are \
+         these three and no others"
     );
 
     let worst = duplicated
