@@ -142,7 +142,11 @@ fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expecte
     );
 }
 
-fn assert_json_private_companion_residual_report(json: &str) {
+fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOutput) {
+    assert_eq!(report.exit_code, 0, "{}", report.stderr);
+    assert!(report.stderr.is_empty());
+
+    let json = &report.stdout;
     assert!(!json_bool_field(json, "g1Satisfied"), "{json}");
     assert!(
         json_usize_field(
@@ -680,8 +684,6 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         OsString::from("--json"),
         exported.clone().into_os_string(),
     ]);
-    assert_eq!(json.exit_code, 0, "{}", json.stderr);
-    assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
     assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":29"));
     let private_companion_names = &[
@@ -1365,7 +1367,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ],
     );
-    assert_json_private_companion_residual_report(&json.stdout);
+    assert_json_private_companion_residual_report(&json);
 
     let human = fln_cli::run([OsString::from("check-olean"), exported.into_os_string()]);
     assert_eq!(human.exit_code, 0, "{}", human.stderr);
