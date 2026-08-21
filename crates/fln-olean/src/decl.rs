@@ -3315,6 +3315,83 @@ mod tests {
         );
     }
 
+    /// A `Level` whose constructor tag is outside `1..=5` is refused.
+    ///
+    /// This completes the Shape rules for `Level`: the arity (f193516d), the
+    /// param/mvar arity (cb87680c), the object size (7498bf87) and the
+    /// post-order law (ba83b952) all have mutants, and the constructor was the
+    /// last without one.
+    ///
+    /// SHADOWING CHECKED. After the ordering cleanup at f193516d the sequence
+    /// in `decode_level` is constructor, then arity, then param/mvar arity,
+    /// then the size bind — so the constructor rule is FIRST and nothing of
+    /// mine precedes it. Before that cleanup the size bind ran first and this
+    /// plant would have been reported as a size disagreement, which is the
+    /// same shadowing that made the Level arity rule untestable.
+    #[test]
+    fn a_level_with_an_unknown_constructor_is_refused() {
+        let mut bytes = succ_level_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified succ fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let sort_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("Sort expression");
+        let level_off = view
+            .deref(view.read_u64(sort_off + 8).expect("level pointer"))
+            .expect("Level object");
+
+        let (tag, other, cs_sz) = view.obj_header(level_off).expect("Level header");
+        assert!(
+            (1..=5).contains(&tag),
+            "the fixture's level is a known constructor, not tag {tag}"
+        );
+        assert_eq!(tag, 1, "Level.succ");
+
+        // Claim a sixth constructor the type does not have. Arity and size are
+        // left alone, so neither of those rules can be what fires.
+        let header = view.read_u64(level_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (6_u64 << 56);
+        bytes[level_off as usize..level_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(level_off).expect("header after plant"),
+            (6, other, cs_sz),
+            "only the tag moved"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a level with an unknown constructor must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Level ctor",
+                    ..
+                }
+            ),
+            "expected the constructor refusal rather than an arity or size one: {error:?}"
+        );
+    }
+
     /// A `Level.param` claiming an arity other than one is refused.
     ///
     /// The source comment on this rule records why it matters: both the eager
