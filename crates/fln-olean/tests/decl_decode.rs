@@ -8818,3 +8818,188 @@ fn the_triple_third_field_expressions() {
 fn word_at_pointer(_bytes: &[u8], base: u64, offset: usize) -> u64 {
     base + u64::try_from(offset).expect("in-range")
 }
+
+/// Which of this file's other histograms invert - and one of them does.
+///
+/// `d40f5aba` found the triples' third field ranked one way per use and the
+/// opposite way per object. That raises an obvious question about every other
+/// per-use histogram here, and the question had never been asked. Three are
+/// checked on both bases:
+///
+///   field 0   uses 111, objects 31       one value; cannot invert
+///   field 1   uses 61 / 50               objects 16 / 35     INVERTS
+///   slot 4    uses 57 / 8 / 4            objects 56 / 8 / 4  does not
+///
+/// FIELD 1 INVERTS, AND I PINNED ONLY ITS USE BASIS AT `2a2d8234`. Per use the
+/// string links dominate, 61 to 50; per object the numbered links do, 35 to 16.
+/// The majority kind flips. That cell described the field from the use basis
+/// alone - including the contrast with field 0's single kind - two waves after
+/// `88fb5754` cost a wave to exactly this.
+///
+/// The 16 and 35 sum to the 51 distinct objects `2a2d8234` pins, so the object
+/// basis reconciles with a landed total while the use basis it was compared
+/// against does not describe the same thing.
+///
+/// FIELD 0 CANNOT INVERT AND THAT IS NOT A RESULT. It takes one value, so its
+/// two bases are trivially in the same order - the single-valued case
+/// `f2da5b0e` taught me to recognise, arriving in a ranking rather than a
+/// comparison. It is reported so the audit's coverage is visible, not as
+/// evidence of anything.
+///
+/// SLOT 4 GENUINELY DOES NOT INVERT: three values, substantial counts, and the
+/// order holds. That matters for this cell's own honesty - an audit where every
+/// multi-valued histogram inverted would not distinguish "I checked" from "the
+/// check always says yes". One inverts, one does not, so the test discriminates.
+#[test]
+fn the_other_histograms_checked_for_inversion() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut uses: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut objects_by_kind: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut seen: BTreeSet<(usize, &'static str, usize)> = BTreeSet::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        let mut record = |histogram: &'static str, offset: usize| {
+            let kind = described(offset);
+            *uses.entry(format!("{histogram}/use/{kind}")).or_default() += 1;
+            if seen.insert((index, histogram, offset)) {
+                *objects_by_kind
+                    .entry(format!("{histogram}/object/{kind}"))
+                    .or_default() += 1;
+            }
+        };
+
+        // Slot 4: one use per head record, targets possibly shared.
+        for &head in &records {
+            if let Some(target) = resolve(word_at(bytes, head + 8 + 8 * 4)) {
+                record("slot4", target);
+            }
+        }
+
+        // Fields 0 and 1: one use per distinct triple.
+        let mut arrays: BTreeSet<usize> = BTreeSet::new();
+        for &head in &records {
+            if let Some(array) = resolve(word_at(bytes, head + 8 + 8 * 2)) {
+                arrays.insert(array);
+            }
+        }
+        let mut triples: BTreeSet<usize> = BTreeSet::new();
+        for array in arrays {
+            for i in 0..word_at(bytes, array + 8) {
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                    && shape(element) == Some((0, 3))
+                {
+                    triples.insert(element);
+                }
+            }
+        }
+        for triple in triples {
+            for (histogram, slot) in [("field0", 0usize), ("field1", 1)] {
+                if let Some(target) = resolve(word_at(bytes, triple + 8 + 8 * slot)) {
+                    record(histogram, target);
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(uses.is_empty(), "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(
+        uses.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("field0/use/tag 2 arity 2".to_owned(), 111),
+            ("field1/use/tag 1 arity 2".to_owned(), 61),
+            ("field1/use/tag 2 arity 2".to_owned(), 50),
+            ("slot4/use/tag 0 arity 2".to_owned(), 57),
+            ("slot4/use/tag 1 arity 2".to_owned(), 8),
+            ("slot4/use/tag 5 arity 1".to_owned(), 4),
+        ],
+        "each histogram per USE - the basis this file pinned for all three"
+    );
+    assert_eq!(
+        objects_by_kind.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("field0/object/tag 2 arity 2".to_owned(), 31),
+            ("field1/object/tag 1 arity 2".to_owned(), 16),
+            ("field1/object/tag 2 arity 2".to_owned(), 35),
+            ("slot4/object/tag 0 arity 2".to_owned(), 56),
+            ("slot4/object/tag 1 arity 2".to_owned(), 8),
+            ("slot4/object/tag 5 arity 1".to_owned(), 4),
+        ],
+        "and per OBJECT. FIELD 1 INVERTS: 61 to 50 by use, 16 to 35 by object, \
+         so the majority link kind flips. `2a2d8234` pinned only the use basis \
+         and described the field from it"
+    );
+
+    // The reconciliation the use basis cannot offer.
+    assert_eq!(
+        16 + 35,
+        51,
+        "field 1's object counts sum to the 51 distinct name objects \
+         `2a2d8234` pins"
+    );
+
+    // Coverage, and the guard that makes the audit discriminating.
+    assert_eq!(
+        (61 > 50, 16 < 35),
+        (true, true),
+        "field 1's order reverses between the bases"
+    );
+    assert_eq!(
+        (57 > 8 && 8 > 4, 56 > 8 && 8 > 4),
+        (true, true),
+        "slot 4's does NOT - three values, substantial counts, same order. An \
+         audit where every multi-valued histogram inverted could not \
+         distinguish having checked from a check that always says yes"
+    );
+}
