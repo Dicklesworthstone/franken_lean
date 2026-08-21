@@ -137,6 +137,26 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "0",
         "_proof_2",
     ]);
+    let lean_name_hash_proof_one_residual = fln::Name::from_components([
+        "_private",
+        "Init",
+        "Prelude",
+        "0",
+        "Lean",
+        "Name",
+        "hash",
+        "_proof_1",
+    ]);
+    let lean_name_hash_proof_two_residual = fln::Name::from_components([
+        "_private",
+        "Init",
+        "Prelude",
+        "0",
+        "Lean",
+        "Name",
+        "hash",
+        "_proof_2",
+    ]);
     let core_observables_head_loop_unsafe_rec_residual = fln::Name::from_components([
         "_private",
         "Init",
@@ -216,6 +236,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
     private_constants.push(axiom(
+        lean_name_hash_proof_one_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
+        lean_name_hash_proof_two_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
         core_observables_head_loop_unsafe_rec_residual,
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
@@ -259,7 +287,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":15"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":17"));
     assert!(json.stdout.contains(
         "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
     ));
@@ -282,7 +310,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
-        "\"privateStandaloneProofNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
+        "\"privateStandaloneProofNResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.CliPrivateReport.0._proof_2\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
+        "\"leanNameHashProofResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
@@ -307,7 +338,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 15 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 17 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
         "decoded _private.loop auxiliaries: 7 (reporting only; not a G1 claim)"
@@ -373,14 +404,23 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("decoded _private .loop._proof_* residual names omitted: 0"));
     assert!(human.stdout.contains(
-        "decoded standalone _private _proof_N residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+        "decoded standalone _private _proof_N residuals: 3 (decoded companion names; reporting only; not a G1 claim)"
     ));
     assert!(human
         .stdout
-        .contains("decoded standalone _private _proof_N residual names: _private.CliPrivateReport.0._proof_2"));
+        .contains("decoded standalone _private _proof_N residual names: _private.CliPrivateReport.0._proof_2, _private.Init.Prelude.0.Lean.Name.hash._proof_1, _private.Init.Prelude.0.Lean.Name.hash._proof_2"));
     assert!(human
         .stdout
         .contains("decoded standalone _private _proof_N residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private Lean.Name.hash._proof_N residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private Lean.Name.hash._proof_N residual names: _private.Init.Prelude.0.Lean.Name.hash._proof_1, _private.Init.Prelude.0.Lean.Name.hash._proof_2"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private Lean.Name.hash._proof_N residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private .loop.match_1 residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
