@@ -1301,6 +1301,39 @@ fn init_false_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_true_entries() -> Vec<ConstantEntry> {
+    let true_name = checker_name("True");
+    let intro = checker_qualified(&["True", "intro"]);
+    let rec = checker_qualified(&["True", "rec"]);
+    let true_expr = || Expr::const_(primary_name("True"), Vec::new());
+    let intro_expr = || Expr::const_(Name::from_components(["True", "intro"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, true_expr(), Expr::sort(Level::zero()));
+    let minor = || Expr::app(bv(0), intro_expr());
+    let recursor_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
+        "intro", BinderInfo::Default, minor(), primary_pi(
+            "t", BinderInfo::Default, true_expr(), Expr::app(bv(2), bv(0)),
+        ),
+    ));
+    let rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
+        primary_name("intro"), minor(), bv(0), BinderInfo::Default,
+    ), BinderInfo::Default);
+    vec![
+        ConstantEntry::new(true_name.clone(), ConstantDeclaration::inductive(
+            Vec::new(), decoded(&Expr::sort(Level::zero())), ConstantSafety::Safe,
+            InductiveDeclaration::new(0, 0, vec![true_name.clone()], vec![intro.clone()], 0, false, false),
+        )),
+        ConstantEntry::new(intro.clone(), ConstantDeclaration::constructor(
+            Vec::new(), decoded(&true_expr()), ConstantSafety::Safe,
+            ConstructorDeclaration::new(true_name.clone(), 0, 0, 0),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            Vec::new(), decoded(&recursor_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![true_name], 0, 0, 1, 1, vec![RecursorRule::new(intro, 0, decoded(&rhs))], false),
+        )),
+    ]
+}
+
 /// `Init.PEmpty.{u}` keeps its family universe and eliminator universe
 /// separate. The exact recursor is what prevents an empty row set from being a
 /// vacuous admission.
@@ -5298,6 +5331,53 @@ fn kr600_803_init_false_fixture_pins_eliminator_bvar_closure() {
         other => panic!("fixture eliminator inspection must complete: {other:?}"),
     };
     assert_eq!(facts.external_bound_span, 0);
+}
+
+#[test]
+fn kr600_803_init_true_refuses_a_forged_extra_recursor_rule() {
+    let mut entries = init_true_entries();
+    let baseline = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(baseline.is_admitted(), "exact Init.True block: {baseline:?}");
+
+    let declaration = entries[2].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    let mut rules = metadata.rules().to_vec();
+    rules.push(metadata.rules()[0].clone());
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["True", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                rules,
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
 }
 
 #[test]
