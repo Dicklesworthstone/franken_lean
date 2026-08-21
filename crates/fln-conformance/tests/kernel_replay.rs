@@ -4653,6 +4653,190 @@ fn classify_mathlib_corpus_input_at(root: PathBuf) -> MathlibCorpusInput {
     }
 }
 
+/// What one inventory walk observed: the built olean set and the canonical
+/// module names it projects to.
+struct OleanInventory {
+    oleans: Vec<PathBuf>,
+    modules: Vec<String>,
+}
+
+/// Enumerate a built olean tree and project it to canonical module names,
+/// checking the two properties that hold for ANY such tree.
+///
+/// **Why this is a function and not four assertions inside the walk.** Every
+/// property below was previously asserted inline in the corpus walk, which can
+/// only execute on a host that has the corpus -- and no host has it. So the
+/// checks were written but unreachable, and "unreachable" and "correct" look
+/// identical from here. Taking a library root as a parameter is what lets a
+/// three-file fixture drive the same code, including its failure.
+///
+/// It returns `Err` rather than panicking for the same reason: a control has to
+/// be able to assert that a bad tree is REFUSED, and an assertion inside cannot
+/// be caught.
+///
+/// This reads no file contents. It stats, filters by extension, and joins path
+/// components; decoding is the `#[ignore]`d sweep's job.
+fn walk_olean_inventory(
+    library: &Path,
+    module_prefix: Option<&str>,
+) -> Result<OleanInventory, String> {
+    let mut oleans = Vec::new();
+    collect_present_oleans(library, &mut oleans)?;
+    oleans.sort();
+    let modules = module_names_below(library, module_prefix)?;
+
+    if modules.len() != oleans.len() {
+        return Err(format!(
+            "{} olean(s) below {} produced {} module name(s); the enumeration and the projection \
+             disagree about the population",
+            oleans.len(),
+            library.display(),
+            modules.len()
+        ));
+    }
+    if let Some(prefix) = module_prefix {
+        let qualified = format!("{prefix}.");
+        if let Some(unqualified) = modules.iter().find(|name| !name.starts_with(&qualified)) {
+            return Err(format!(
+                "module `{unqualified}` is not qualified with `{prefix}`; an unqualified name \
+                 cannot be matched against the imports recorded inside an olean"
+            ));
+        }
+    }
+    // THE PROJECTION MUST BE INJECTIVE. `path -> module name` is a projection,
+    // and a projection used as an identity without anyone checking injectivity
+    // is a defect this repository has already found seven times. It is
+    // constructible here rather than theoretical: `A/B.olean` and `A.B.olean`
+    // both project to `A.B`, so two real files can collapse to one name, the
+    // inventory silently under-counts, and the shortfall looks exactly like a
+    // smaller corpus.
+    let distinct = modules.iter().collect::<BTreeSet<_>>();
+    if distinct.len() != oleans.len() {
+        return Err(format!(
+            "{} olean(s) below {} projected to {} distinct module name(s); the module name is \
+             being used as an identity and it is not injective over this tree",
+            oleans.len(),
+            library.display(),
+            distinct.len()
+        ));
+    }
+    Ok(OleanInventory { oleans, modules })
+}
+
+/// Build a tiny olean tree for the inventory controls.
+///
+/// **Empty files are the right fixture here.** `walk_olean_inventory` stats,
+/// filters by extension and joins path components; it never opens a file. A
+/// fixture with real olean bytes would suggest this exercises decoding, which it
+/// does not and must not -- decoding the corpus is the `#[ignore]`d sweep.
+///
+/// **Nothing is deleted.** The tree is written under `CARGO_TARGET_TMPDIR`,
+/// which Cargo provides per test target and which lives inside the ignored
+/// `target/` directory, never the source tree. Files are created or truncated,
+/// never removed, so a run leaves no removal behind and needs no cleanup rights.
+/// Because stale entries are therefore never swept, each fixture shape carries a
+/// version in its directory name: CHANGE THE SHAPE, BUMP THE NAME, or a previous
+/// run's leftovers join the population and the counts below stop meaning what
+/// they say.
+fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> PathBuf {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(versioned_name);
+    for relative in relative_files {
+        let path = base.join(relative);
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| panic!("fixture entry {relative} has no parent directory"));
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|error| panic!("create fixture dir {}: {error}", parent.display()));
+        fs::write(&path, b"")
+            .unwrap_or_else(|error| panic!("create fixture file {}: {error}", path.display()));
+    }
+    base
+}
+
+/// The walk branch, driven by a fixture instead of by a corpus nobody has.
+///
+/// **Why this exists.** Every property of the walk was, until now, reachable
+/// only on a host with `/data/tmp/mathlib4-corpus`, and no host has it. The walk
+/// test therefore always took its skip arm, so the enumeration, the extension
+/// filter, the namespace qualification and the injectivity check were written
+/// but never executed -- and code that never executes is indistinguishable from
+/// code that is wrong. Three empty files make the success path reachable.
+///
+/// **What it deliberately does NOT do.** It does not touch, create, or stand in
+/// for the Mathlib corpus, and passing it is not evidence about Mathlib. It says
+/// the walk's tree-shape logic behaves on a tree whose right answer is known by
+/// construction.
+#[test]
+fn the_inventory_walk_runs_on_a_fixture_tree_without_a_corpus() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-ok-v1",
+        &[
+            "Alpha.olean",
+            "Nested/Beta.olean",
+            "Nested/Gamma.olean",
+            // Neither of these is an olean, and both are shaped to catch a
+            // filter written as "contains" rather than "extension is": a
+            // companion part and an ordinary file.
+            "Alpha.olean.server",
+            "ignored.txt",
+        ],
+    );
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the fixture tree must be walkable: {reason}"));
+
+    assert_eq!(
+        oleans.len(),
+        3,
+        "the walk must enumerate exactly the three `.olean` files; a companion part and a text \
+         file are not oleans. Found: {oleans:?}"
+    );
+    assert_eq!(
+        modules,
+        vec![
+            "Fixture.Alpha".to_string(),
+            "Fixture.Nested.Beta".to_string(),
+            "Fixture.Nested.Gamma".to_string(),
+        ],
+        "the walk must recurse into subdirectories, drop the extension, join components with \
+         `.`, qualify with the namespace, and return the result in canonical path order"
+    );
+}
+
+/// The injectivity check is not decorative: a tree that violates it is REFUSED.
+///
+/// **The collision is real, not contrived.** `module_name_from_path` strips the
+/// root, drops the final extension and joins the remaining components with `.`,
+/// so `A/B.olean` and `A.B.olean` both project to `A.B`. Two distinct files, one
+/// module name. Without the check the inventory would report one module where
+/// two files exist, under-counting by exactly as much as it collided -- and an
+/// under-count is invisible, because a smaller number looks like a smaller
+/// corpus rather than like a bug.
+///
+/// This is the negative half of the control above. A guard that has only ever
+/// been shown to accept good input has not been shown to do anything.
+#[test]
+fn the_inventory_walk_refuses_a_non_injective_projection() {
+    let library =
+        write_inventory_fixture("t6r7-inventory-collision-v1", &["A/B.olean", "A.B.olean"]);
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(OleanInventory { oleans, modules }) => panic!(
+            "the walk ACCEPTED a tree whose projection collides: {} olean(s) became {:?}. Two \
+             files sharing one module name means the inventory under-counts, and nothing \
+             downstream can tell that from a smaller corpus.",
+            oleans.len(),
+            modules
+        ),
+    };
+    assert!(
+        reason.contains("not injective"),
+        "the refusal must name the non-injectivity rather than some incidental mismatch: \
+         {reason}"
+    );
+}
+
 /// The corpus root is EXACTLY the documented host path, compared whole.
 ///
 /// **Why a literal and not the constant.** The path is written out again here by
@@ -4901,13 +5085,13 @@ fn the_whole_mathlib_inventory_walks_the_corpus_or_names_what_is_missing() {
             );
         }
         MathlibCorpusInput::Present { root, library } => {
-            let mut paths = Vec::new();
-            collect_present_oleans(&library, &mut paths)
-                .expect("enumerate the built whole-Mathlib olean set");
-            paths.sort();
-            let modules = module_names_below(&library, Some("Mathlib"))
-                .expect("derive canonical module names for the built Mathlib corpus");
-
+            // The tree-shape properties are checked by `walk_olean_inventory`,
+            // which a fixture also drives, so they are reachable without the
+            // corpus. Only the SIZE floor is corpus-specific and stays here.
+            let OleanInventory { oleans, modules } =
+                walk_olean_inventory(&library, Some("Mathlib")).unwrap_or_else(|reason| {
+                    panic!("the built whole-Mathlib olean tree is not walkable: {reason}")
+                });
             assert!(
                 modules.len() as u64 >= WHOLE_MATHLIB_SEED_FLOOR,
                 "the whole-Mathlib inventory found only {} module(s) under {}; a truncated \
@@ -4915,26 +5099,7 @@ fn the_whole_mathlib_inventory_walks_the_corpus_or_names_what_is_missing() {
                 modules.len(),
                 library.display()
             );
-            assert!(
-                modules.iter().all(|name| name.starts_with("Mathlib.")),
-                "every module below the Mathlib olean root must be namespace-qualified before \
-                 its imports can be resolved"
-            );
-            // THE PROJECTION MUST BE INJECTIVE. `path -> module name` is a
-            // projection, and a projection keyed as an identity without anyone
-            // checking injectivity is a defect this repository has already
-            // found seven times. Two oleans collapsing to one name would make
-            // the inventory silently under-count and the shortfall would look
-            // exactly like a smaller corpus.
-            let distinct = modules.iter().collect::<BTreeSet<_>>();
-            assert_eq!(
-                distinct.len(),
-                paths.len(),
-                "{} olean(s) projected to {} distinct module name(s); the name is being used as \
-                 an identity and it is not injective over this corpus",
-                paths.len(),
-                distinct.len()
-            );
+            let paths = oleans;
 
             println!(
                 "{{\"schema\":\"fln-t6r7-mathlib-inventory/1\",\"status\":\"walked\",\
