@@ -226,6 +226,11 @@ const ARRAY_TO_LIST_ATTACH_WITH_SIMP_1: &str =
     "_private.Init.Data.Array.Attach.0.Array.toList_attachWith._simp_1";
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_TO_LIST_ATTACH_WITH_SIMP_1_MODULE: &str = "Init/Data/Array/Attach";
+/// The generated simp theorem for `Array.mem_unattach`.
+const ARRAY_MEM_UNATTACH_SIMP_1_2: &str =
+    "_private.Init.Data.Array.Attach.0.Array.mem_unattach._simp_1_2";
+/// The pin's private array stores this simp theorem in the attach module.
+const ARRAY_MEM_UNATTACH_SIMP_1_2_MODULE: &str = "Init/Data/Array/Attach";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1213,6 +1218,36 @@ fn array_to_list_attach_with_simp_theorem_is_decoded_from_its_private_storage_mo
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_TO_LIST_ATTACH_WITH_SIMP_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_mem_unattach_simp_theorem_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_mem_unattach_simp_theorem_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_MEM_UNATTACH_SIMP_1_2_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_MEM_UNATTACH_SIMP_1_2.to_owned()),
+        "the private companion of {ARRAY_MEM_UNATTACH_SIMP_1_2_MODULE} must retain \
+         {ARRAY_MEM_UNATTACH_SIMP_1_2}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MEM_UNATTACH_SIMP_1_2)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_MEM_UNATTACH_SIMP_1_2}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_MEM_UNATTACH_SIMP_1_2} as {} instead of Thm",
         recovered.kind_name()
     );
 }
