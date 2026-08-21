@@ -566,6 +566,57 @@ def probe_init_substrate(lean, env, work, names):
     return sorted(failed.items()), len(names)
 
 
+PIN_PRESENCE_DECOY = "Fln.PresenceCheck.DecoyTheReferenceLacks"
+
+
+def probe_pin_presence(lean, env, work, names):
+    """Which names does the FACADE offer that the Reference does not have?
+
+    Every other check here runs one way: the facade is asked to live up to the
+    Reference. Nothing asked the converse, and the converse is where a facade goes
+    PERMISSIVE — offering a name upstream code could never have used, so a probe
+    passes against the facade and the same code is refused by the real toolchain.
+    One class of this is already known and disclosed (a structural block turns the
+    Reference's private fields into public projections); this measures the whole
+    set instead of assuming that class is all of it.
+
+    Each claimed name is `#check`ed in the PIN, alongside a decoy that the pin
+    certainly lacks — so a probe that silently stopped reporting cannot pass as
+    "the facade invents nothing".
+    """
+    names = sorted(n for n in set(names) if renderable_name(n))
+    if not names:
+        return set(), 0
+    lines = ["import Lean"]
+    line_map = {}
+    for n in names:
+        lines.append(f"#check @{renderable_name(n)}")
+        line_map[len(lines)] = n
+    lines.append(f"#check @{PIN_PRESENCE_DECOY}")
+    line_map[len(lines)] = PIN_PRESENCE_DECOY
+    src = os.path.join(work, "pin_presence.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    proc = subprocess.run([lean, "-DmaxErrors=100000", src], capture_output=True,
+                          text=True, env=env, timeout=1800)
+    out = proc.stdout + proc.stderr
+    base = os.path.basename(src)
+    absent = set()
+    for m in re.finditer(rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                         out):
+        n = line_map.get(int(m.group(1)))
+        if n is not None:
+            absent.add(n)
+    if PIN_PRESENCE_DECOY not in absent:
+        raise SystemExit(
+            f"REFUSE: the pin-presence probe did not notice {PIN_PRESENCE_DECOY}, "
+            "which the Reference certainly lacks — it cannot tell a name the pin "
+            "has from one it does not, so 'the facade invents nothing' would be a "
+            "green it never earned")
+    absent.discard(PIN_PRESENCE_DECOY)
+    return absent, len(names)
+
+
 def probe_type_roundtrip(lean, env, work, rows):
     """Does each emitted TYPE STRING denote the Reference's own type?
 
@@ -1804,6 +1855,22 @@ def main():
             "the pin on defeq; one that unfolds to something else is a silent "
             "disagreement exactly where agreement was the point")
 
+    # THE CONVERSE DIRECTION: what does the facade offer that the pin lacks?
+    facade_only, presence_checked = probe_pin_presence(lean, env, work, claimed)
+    # The known-permissive class: a structural block generates a public projection
+    # for a field whose projection the Reference keeps private. Those were measured
+    # when the closure was built (the pin had no constant under that name) and are
+    # already disclosed as private_fields_exposed.
+    expected_permissive = sorted(facade_only & set(absent_projections))
+    unexplained_facade_only = sorted(facade_only - set(absent_projections))
+    if unexplained_facade_only:
+        raise SystemExit(
+            f"REFUSE: the facade offers {len(unexplained_facade_only)} names the "
+            f"Reference does not have, and they are not the known private-field "
+            f"class: {unexplained_facade_only[:8]} — a facade that invents a name "
+            "is permissive in the one direction no consumer can detect: code "
+            "type-checks against it and the real toolchain refuses the same code")
+
     decoy_reason = unresolved_claims.pop(DECOY_NAME, None)
     if decoy_reason is None:
         raise SystemExit(
@@ -2015,6 +2082,19 @@ def main():
             "becomes _private.privtest.0.Foo.bar. The price is the module count "
             "above, not a redesign of the surface.",
         "emission_verified": emission_verified,
+        "pin_presence_checked": presence_checked,
+        "facade_only_names": expected_permissive,
+        "facade_only_unexplained": unexplained_facade_only,
+        "pin_presence_note": "every name the facade CLAIMS was #checked in the "
+            "PIN, so the permissive direction is measured rather than assumed: a "
+            "name the facade has and the Reference lacks lets code type-check here "
+            "and be refused by the real toolchain. SCOPE, so an empty list is not "
+            "read as more than it is: this covers the claimed set only. The "
+            "projections a structural block generates for the Reference's PRIVATE "
+            "fields are not in it — the pin has no constant under those names, so "
+            "they were never probed and never claimed — and they are counted "
+            "separately as private_fields_exposed, which is not zero. Anything "
+            "permissive outside that known class refuses.",
         "field_sets_checked": field_sets_checked,
         "field_set_mismatches": field_set_mismatches,
         "field_set_note": "each structural declaration's emitted field list was "
@@ -2123,6 +2203,7 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"presence={presence_checked}/{len(expected_permissive)}permissive "
           f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
           f"values={values_checked} "
