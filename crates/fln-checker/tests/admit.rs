@@ -1039,6 +1039,52 @@ fn init_empty_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// `Init.PEmpty.{u}` keeps its family universe and eliminator universe
+/// separate. The exact recursor is what prevents an empty row set from being a
+/// vacuous admission.
+fn init_pempty_entries() -> Vec<ConstantEntry> {
+    let pempty = checker_name("PEmpty");
+    let rec = checker_qualified(&["PEmpty", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let pempty_expr = || Expr::const_(primary_name("PEmpty"), vec![u.clone()]);
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = primary_pi("t", BinderInfo::Default, pempty_expr(), Expr::sort(v));
+    let recursor_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive_type.clone(),
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            pempty_expr(),
+            Expr::app(bv(1), bv(0)),
+        ),
+    );
+    vec![
+        ConstantEntry::new(
+            pempty.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&Expr::sort(u)),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(0, 0, vec![pempty.clone()], Vec::new(), 0, false, false),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(vec![pempty], 0, 0, 1, 0, Vec::new(), false),
+            ),
+        ),
+    ]
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
@@ -1195,6 +1241,66 @@ fn kr600_803_init_empty_refuses_a_forged_recursor_rule() {
                 metadata.num_minors(),
                 vec![RecursorRule::new(
                     checker_qualified(&["Empty", "forged"]),
+                    0,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
+fn kr600_803_init_pempty_universes_and_eliminator_are_reconstructed() {
+    let entries = init_pempty_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "exact Init.PEmpty block: {verdict:?}"
+    );
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 2);
+}
+
+#[test]
+fn kr600_803_init_pempty_refuses_a_forged_recursor_rule() {
+    let mut entries = init_pempty_entries();
+    let recursor = entries[1].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["PEmpty", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["PEmpty", "forged"]),
                     0,
                     decoded(&Expr::bvar(0).expect("packs")),
                 )],
