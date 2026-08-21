@@ -462,6 +462,10 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "{json}",
     );
     assert!(
+        decoded_private_loop_name_set.is_subset(&private_companion_name_set),
+        "{json}",
+    );
+    assert!(
         decoded_private_loop_name_set.is_subset(&decoded_private_auxiliary_name_set),
         "{json}",
     );
