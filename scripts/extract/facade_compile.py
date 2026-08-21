@@ -154,6 +154,10 @@ the toolchain would report a perfect facade:
     to be empty. Symbols absent at the pinned Reference epoch cannot silently
     remain in a compile-demand denominator.
 
+  * A MANIFEST-EMISSION-VERIFICATION JOIN requires the facade manifest's
+    pin-measured verified-emission count to equal its emitted-declaration count.
+    A generated façade cannot overstate verification of its own rows.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1084,6 +1088,21 @@ def main():
             "REFUSE: facade manifest totality join failed "
             f"({json.dumps(totality, sort_keys=True)})"
         )
+    emission_verification = {
+        "declarations_emitted": manifest_summary.get("declarations_emitted"),
+        "emission_verified": manifest_summary.get("emission_verified"),
+        "emission_withdrawn": manifest_summary.get("emission_withdrawn"),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in emission_verification.values())
+            or emission_verification["emission_verified"]
+            != emission_verification["declarations_emitted"]
+            or emission_verification["emission_withdrawn"]
+            > emission_verification["declarations_emitted"]):
+        raise SystemExit(
+            "REFUSE: facade manifest emission-verification join failed "
+            f"({json.dumps(emission_verification, sort_keys=True)})"
+        )
     manifest_outcome_join = join_manifest_demanded_outcomes(
         manifest_rows, manifest_summary
     )
@@ -1232,6 +1251,7 @@ def main():
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_totality_join": totality,
+        "manifest_emission_verification_join": emission_verification,
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
