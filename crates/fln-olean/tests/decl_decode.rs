@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use fln_env::constants::ConstantInfo;
@@ -23,6 +24,120 @@ fn fixture(name: &str) -> Vec<u8> {
         data.err()
     );
     data.expect("asserted above")
+}
+
+/// Locate real pinned `.olean` companion chains. A host without the pin cannot
+/// run this corpus regression, but must not replace it with a synthetic graph:
+/// the omission occurred only across the Reference module-system sidecars.
+fn reference_lib() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("FLN_REFERENCE_LIB") {
+        let path = PathBuf::from(dir);
+        return path.is_dir().then_some(path);
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
+    path.is_dir().then_some(path)
+}
+
+/// The four modules named in the `franken_lean-timy` investigation contain the
+/// equation-compiler families that public-only decoding had omitted.
+fn companion_and_public_names() -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+    let reference_lib = reference_lib()?;
+    let modules = [
+        "Init/Prelude",
+        "Init/Data/List/ToArrayImpl",
+        "Init/Data/Array/Basic",
+        "Init/Control/MonadAttach",
+    ];
+    let mut public_names = BTreeSet::new();
+    let mut private_names = BTreeSet::new();
+
+    for module in modules {
+        let artifact = reference_lib.join(format!("{module}.olean"));
+        let server = artifact.with_extension("olean.server");
+        let private = artifact.with_extension("olean.private");
+        let public_bytes = std::fs::read(&artifact)
+            .unwrap_or_else(|error| panic!("read public {}: {error}", artifact.display()));
+        let server_bytes = std::fs::read(&server)
+            .unwrap_or_else(|error| panic!("read server {}: {error}", server.display()));
+        let private_bytes = std::fs::read(&private)
+            .unwrap_or_else(|error| panic!("read private {}: {error}", private.display()));
+
+        let public_view = OleanView::parse(&public_bytes)
+            .unwrap_or_else(|error| panic!("parse public {}: {error}", artifact.display()));
+        public_names.extend(
+            DeclDecoder::new(&public_view, WalkBudget::default())
+                .decode_module_constants()
+                .unwrap_or_else(|error| panic!("decode public {}: {error}", artifact.display()))
+                .into_iter()
+                .map(|info| info.name().to_display_string()),
+        );
+
+        let private_view = OleanView::parse_with_dependencies(
+            &private_bytes,
+            &[public_bytes.as_slice(), server_bytes.as_slice()],
+        )
+        .unwrap_or_else(|error| panic!("parse private {}: {error}", private.display()));
+        private_names.extend(
+            DeclDecoder::new(&private_view, WalkBudget::default())
+                .decode_module_constants()
+                .unwrap_or_else(|error| panic!("decode private {}: {error}", private.display()))
+                .into_iter()
+                .map(|info| info.name().to_display_string()),
+        );
+    }
+
+    Some((public_names, private_names))
+}
+
+fn numbered_private_auxiliary(name: &str, prefix: &str) -> bool {
+    name.rsplit('.').next().is_some_and(|segment| {
+        segment
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+fn assert_private_auxiliary_family(family: &str, belongs_to_family: impl Fn(&str) -> bool) {
+    let Some((public_names, private_names)) = companion_and_public_names() else {
+        return;
+    };
+    let restored: Vec<_> = private_names
+        .iter()
+        .filter(|name| name.starts_with("_private.") && belongs_to_family(name))
+        .collect();
+    assert!(
+        !restored.is_empty(),
+        "complete private companion decode omitted every {family} auxiliary"
+    );
+    assert!(
+        restored.iter().all(|name| !public_names.contains(*name)),
+        "{family} auxiliary leaked into the public projection instead of being restored from the private companion: {restored:?}"
+    );
+}
+
+#[test]
+fn private_companion_decodes_match_n_auxiliaries() {
+    assert_private_auxiliary_family("match_N", |name| {
+        numbered_private_auxiliary(name, "match_")
+    });
+}
+
+#[test]
+fn private_companion_decodes_proof_n_auxiliaries() {
+    assert_private_auxiliary_family("_proof_N", |name| {
+        numbered_private_auxiliary(name, "_proof_")
+    });
+}
+
+#[test]
+fn private_companion_decodes_loop_auxiliaries() {
+    assert_private_auxiliary_family(".loop", |name| name.contains(".loop."));
+}
+
+#[test]
+fn private_companion_decodes_eq_n_auxiliaries() {
+    assert_private_auxiliary_family("eq_N", |name| numbered_private_auxiliary(name, "eq_"));
 }
 
 #[test]
