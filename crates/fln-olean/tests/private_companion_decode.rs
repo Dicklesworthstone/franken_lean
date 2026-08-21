@@ -158,6 +158,11 @@ const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_F: &str =
     "_private.Init.Data.Array.BasicAux.0.List.of_toArrayAux_eq_toArrayAux._f";
 /// The pin's private array stores this helper in the BasicAux module.
 const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_F_MODULE: &str = "Init/Data/Array/BasicAux";
+/// The first private match definition for `List.of_toArrayAux_eq_toArrayAux`.
+const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.of_toArrayAux_eq_toArrayAux.match_1_1";
+/// The pin's private array stores this definition in the BasicAux module.
+const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1_MODULE: &str = "Init/Data/Array/BasicAux";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1048,6 +1053,39 @@ fn list_of_to_array_aux_helper_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_F} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn list_of_to_array_aux_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("list_of_to_array_aux_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1.to_owned()),
+        "the private companion of {LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1_MODULE} must retain \
+         {LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| {
+            info.name().to_display_string() == LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1
+        })
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
