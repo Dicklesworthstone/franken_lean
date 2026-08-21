@@ -419,6 +419,14 @@ mod family {
     pub fn private_f(name: &str) -> bool {
         last_component_suffix(name, "_f").is_some_and(str::is_empty)
     }
+
+    /// `Array.shrink.loop._f` — nested helper from the array shrink loop.
+    pub fn array_shrink_loop_f(name: &str) -> bool {
+        let parts = components(name);
+        parts.len() >= 5
+            && parts.last() == Some(&"_f")
+            && parts.windows(3).any(|window| window == ["Array", "shrink", "loop"])
+    }
 }
 
 /// Enumerate every module under `Init` that has a complete companion chain.
@@ -869,6 +877,64 @@ fn loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
     assert!(
         !matches!(recovered, ConstantInfo::Axiom(_)),
         ".loop._proof_1 {name}: companion recovery weakened the declaration to an axiom"
+    );
+}
+
+#[test]
+fn array_shrink_loop_f_requires_the_companion_and_keeps_its_real_kind() {
+    let lib = lib_or_skip!("array_shrink_loop_f_requires_the_companion_and_keeps_its_real_kind");
+
+    // The core observable names this nested `_f` specifically. A broad suffix
+    // match could select some other helper, so bind the RED/green cell to the
+    // Array.shrink.loop path as well as the terminal private helper name.
+    let (relative, name) = init_chain_modules(&lib)
+        .into_iter()
+        .find_map(|relative| {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::array_shrink_loop_f(name))
+                .map(|name| (relative, name.clone()))
+        })
+        .expect(
+            "the pinned Init private companions contain an Array.shrink.loop._f witness",
+        );
+    let chain = chain_bytes(&lib, &relative);
+
+    let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
+        panic!("Array.shrink.loop._f {name}: parse exported {relative}: {error}")
+    });
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| {
+            panic!("Array.shrink.loop._f {name}: decode exported {relative}: {error}")
+        });
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != name),
+        "Array.shrink.loop._f {name}: exported decoder unexpectedly has the private auxiliary"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap_or_else(|error| {
+                panic!("Array.shrink.loop._f {name}: parse private {relative}: {error}")
+            });
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| {
+            panic!("Array.shrink.loop._f {name}: decode private {relative}: {error}")
+        })
+        .into_iter()
+        .find(|info| info.name().to_display_string() == name)
+        .unwrap_or_else(|| {
+            panic!("Array.shrink.loop._f {name}: private decoder lost it in {relative}")
+        });
+    assert!(
+        !matches!(recovered, ConstantInfo::Axiom(_)),
+        "Array.shrink.loop._f {name}: companion recovery weakened the declaration to an axiom"
     );
 }
 
