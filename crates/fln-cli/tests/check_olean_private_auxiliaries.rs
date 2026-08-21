@@ -377,19 +377,24 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths emit the private-companion residual object",
     );
+    let cli_source_lines = include_str!("../src/lib.rs").lines().collect::<Vec<_>>();
     assert_eq!(
         [
-            include_str!("../src/lib.rs")
-                .match_indices(
-                    r#"\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"
-                "\"module\":"#,
-                )
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim() == r#""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"#
+                        && lines[1].trim()
+                            == r#""\"module\":{{\"isModulePart\":{},\"imports\":0,"#
+                })
                 .count(),
-            include_str!("../src/lib.rs")
-                .match_indices(
-                    r#"\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"
-                "\"extensionBlocksObserved\":{},"#,
-                )
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim() == r#""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"#
+                        && lines[1].trim()
+                            == r#""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,"#
+                })
                 .count(),
         ],
         [1, 1],
