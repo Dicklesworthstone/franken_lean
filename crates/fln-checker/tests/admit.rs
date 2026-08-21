@@ -2646,6 +2646,36 @@ fn kr600_803_init_bool_refuses_a_forged_constructor_field_count() {
 }
 
 #[test]
+fn kr600_803_init_bool_false_refuses_a_forged_constructor_field_count() {
+    let mut entries = init_bool_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Bool", "false"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Bool"), 0, 0, 1),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Init.Bool.false constructor field-count verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_init_bool_true_refuses_a_forged_constructor_field_count() {
     let mut entries = init_bool_entries();
     let constructor = entries[2].declaration();
