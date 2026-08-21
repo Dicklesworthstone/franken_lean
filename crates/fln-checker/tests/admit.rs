@@ -4201,6 +4201,47 @@ fn kr600_803_init_prod_refuses_a_forged_extra_recursor_rule() {
 }
 
 #[test]
+fn kr600_803_init_prod_refuses_a_forged_k() {
+    let mut entries = init_prod_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Prod", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                metadata.rules().to_vec(),
+                true,
+            ),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
+        "forged Init.Prod recursor k verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_init_prod_mk_refuses_a_forged_constructor_index() {
     let mut entries = init_prod_entries();
     let constructor = entries[1].declaration();
