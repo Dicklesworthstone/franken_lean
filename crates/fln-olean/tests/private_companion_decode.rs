@@ -313,6 +313,11 @@ const OPTION_SOME_GET_MATCH_1_1: &str =
     "_private.Init.Data.Option.Basic.0.Option.some_get.match_1_1";
 /// The pin's private option companion stores this definition in Basic.
 const OPTION_SOME_GET_MATCH_1_1_MODULE: &str = "Init/Data/Option/Basic";
+/// The private match implementation for `Option.isNone_filter`.
+const OPTION_IS_NONE_FILTER_MATCH_1_1: &str =
+    "_private.Init.Data.Option.Lemmas.0.Option.isNone_filter.match_1_1";
+/// The pin's private option companion stores this definition in Lemmas.
+const OPTION_IS_NONE_FILTER_MATCH_1_1_MODULE: &str = "Init/Data/Option/Lemmas";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -2198,6 +2203,35 @@ fn option_some_get_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {OPTION_SOME_GET_MATCH_1_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn option_is_none_filter_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("option_is_none_filter_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, OPTION_IS_NONE_FILTER_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&OPTION_IS_NONE_FILTER_MATCH_1_1.to_owned()),
+        "the private companion of {OPTION_IS_NONE_FILTER_MATCH_1_1_MODULE} must retain \\
+         {OPTION_IS_NONE_FILTER_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == OPTION_IS_NONE_FILTER_MATCH_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_IS_NONE_FILTER_MATCH_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {OPTION_IS_NONE_FILTER_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
