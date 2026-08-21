@@ -7485,3 +7485,202 @@ fn the_sharing_excesses_account_for_every_gap() {
          right and its explanation was wrong, which is worse than none"
     );
 }
+
+/// The thirteen-times array, as an object rather than as arithmetic.
+///
+/// `bd0266d2` found it only as a refcount histogram entry: one array carrying
+/// twelve of the eighteen excess. A histogram entry is not an object - it
+/// cannot be opened, and nothing said which array it was. This pins it by
+/// address, re-derives its refcount from the bytes at that address, and reads
+/// what it holds.
+///
+/// IT IS NOT SPECIAL. Its length is 2, which is the MODAL length across the 51
+/// arrays - 18 of them are that length, 17 without it. Its two elements are the
+/// same `(Name, Name, Expr)` triples every other array holds. Nothing about the
+/// object distinguishes it from the arrays referenced once; only the count of
+/// pointers into it does. That is the fourth population here where I have asked
+/// whether a heavily shared object is marked out and found it is not, after
+/// `c726dec5`, `ddfa2317` and `75a1373c`.
+///
+/// ITS THIRTEEN REFERRERS ARE ALL SLOT-4 PAIRS - thirteen of thirteen, with
+/// zero of the other two shapes - against a population that is 57 pairs, 8
+/// third-shape and 4 wrappers. THAT IS PINNED AND NOT CHARACTERISED. Pairs are
+/// 83 per cent of the records, so thirteen draws landing entirely inside them
+/// is an unremarkable outcome; calling it a pattern would be reading thirteen
+/// samples as a finding. Both counts are asserted side by side so a reader can
+/// see the base rate next to the observation.
+///
+/// The address carries a guard, the `d7518917` pattern: the cell goes to the
+/// pinned offset and re-establishes that the object there is an array of that
+/// length with exactly that many pointers into it. A pinned constant nothing
+/// re-derives rots quietly.
+#[test]
+fn the_thirteen_times_array() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut hubs: Vec<(usize, usize, u64)> = Vec::new();
+    let mut elements: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut lengths: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut referrers: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut population: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        // Which array each record points at, and how many point at each.
+        let mut by_array: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                by_array.entry(array).or_default().push(record);
+            }
+        }
+        for (&array, holders) in &by_array {
+            let length = word_at(bytes, array + 8);
+            *lengths.entry(format!("all/length {length}")).or_default() += 1;
+            if holders.len() == 1 {
+                *lengths
+                    .entry(format!("referenced once/length {length}"))
+                    .or_default() += 1;
+            }
+            if holders.len() > 2 {
+                hubs.push((array, holders.len(), length));
+            }
+        }
+
+        // The population's slot-4 shapes, for the base rate.
+        for &record in &records {
+            let target = resolve(word_at(bytes, record + 8 + 8 * 4));
+            *population
+                .entry(target.map_or("boxed".to_owned(), &described))
+                .or_default() += 1;
+        }
+
+        // The hub, opened, with a guard at its address.
+        for &(array, count, length) in &hubs {
+            assert_eq!(
+                at.get(&array).map(|o| o.tag),
+                Some(abi::TAG_ARRAY),
+                "the pinned hub must still be an array"
+            );
+            assert_eq!(
+                by_array.get(&array).map(Vec::len),
+                Some(count),
+                "and must still carry exactly that many references"
+            );
+            for i in 0..length {
+                let element =
+                    resolve(word_at(bytes, array + 24 + 8 * i as usize)).expect("a hub element");
+                *elements.entry(described(element)).or_default() += 1;
+            }
+            for &record in by_array.get(&array).expect("the holders") {
+                let target = resolve(word_at(bytes, record + 8 + 8 * 4));
+                *referrers
+                    .entry(target.map_or("boxed".to_owned(), &described))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(hubs.is_empty(), "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Exactly one array is referenced more than twice, and this is it.
+    assert_eq!(
+        hubs,
+        vec![(0x2aee08, 13, 2)],
+        "the hub by address, reference count and length - `bd0266d2` found it \
+         only as a histogram entry, which cannot be opened"
+    );
+
+    // Not special: modal length, ordinary contents.
+    assert_eq!(
+        lengths.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("all/length 1".to_owned(), 16),
+            ("all/length 2".to_owned(), 18),
+            ("all/length 3".to_owned(), 5),
+            ("all/length 4".to_owned(), 4),
+            ("all/length 5".to_owned(), 8),
+            ("referenced once/length 1".to_owned(), 14),
+            ("referenced once/length 2".to_owned(), 13),
+            ("referenced once/length 3".to_owned(), 5),
+            ("referenced once/length 4".to_owned(), 4),
+            ("referenced once/length 5".to_owned(), 8),
+        ],
+        "the hub's length of 2 is the MODAL length across the 51 arrays, so \
+         nothing about its shape marks it out"
+    );
+    assert_eq!(
+        elements.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 3".to_owned(), 2)],
+        "and it holds the same triples every other array holds"
+    );
+
+    // Pinned, not characterised.
+    assert_eq!(
+        referrers.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 2".to_owned(), 13)],
+        "all thirteen referrers are slot-4 pairs"
+    );
+    assert_eq!(
+        population.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 57),
+            ("tag 1 arity 2".to_owned(), 8),
+            ("tag 5 arity 1".to_owned(), 4),
+        ],
+        "against a population that is 57 pairs of 69. Thirteen draws landing \
+         entirely inside a class holding 83 per cent of the records is an \
+         unremarkable outcome, so the base rate is pinned beside the \
+         observation and no pattern is claimed from thirteen samples"
+    );
+}
