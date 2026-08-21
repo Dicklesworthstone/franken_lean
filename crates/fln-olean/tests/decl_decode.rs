@@ -4322,3 +4322,202 @@ fn the_slot_four_other_shapes_interlock() {
          reason not to guess"
     );
 }
+
+/// The spine, TRAVERSED - and it is none of the three things I would have
+/// guessed.
+///
+/// `241893a7` found that 44 of 56 two-field objects hold another of their own
+/// kind and deliberately refused to say what that builds, because `3575962c`
+/// had just caught me inferring "a chain or a tree" from an edge count when the
+/// truth was eight disjoint pairs. This is the traversal that settles it.
+///
+/// IT IS NOT ANY OF THEM. Not disjoint pairs, not a chain, and not a tree:
+///
+///   seeds reached from slot 4    56
+///   nodes after closing on field 1   102
+///   edges    62
+///   in-degree   56 nodes at 0, 43 at 1, 2 at 2, and ONE at 15
+///   roots    56, longest walk 6 edges, no cycles
+///
+/// A tree has in-degree at most one everywhere. A node with fifteen incoming
+/// edges is a confluence: fifteen distinct walks arrive at the same object and
+/// share everything after it. So the structure is a DAG that CONVERGES, which
+/// is what a compacted region does to lists that share a suffix.
+///
+/// THE CONVERGENCE IS PROVED TWICE, by design. Once by the in-degree histogram,
+/// and once by arithmetic that does not depend on it: walking from every root
+/// visits 119 nodes counted with multiplicity, over a node set of 102. Walks
+/// that overlap are the same thing as edges that converge, and two independent
+/// routes to it means a mistake in either one is caught.
+///
+/// THE NODE SET NEARLY DOUBLES UNDER CLOSURE - 56 seeds become 102 nodes. The
+/// spine extends well past what slot 4 reaches, so 46 of these objects were
+/// invisible to every previous cell. Counting the objects a field ADMITS never
+/// finds them; only following the edges does, which is the same lesson as
+/// `3575962c` arriving from the other side: there the inference overstated the
+/// structure, here it would have understated the population.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_pair_spine_is_a_converging_dag() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut seeds = 0usize;
+    let mut nodes = 0usize;
+    let mut edges = 0usize;
+    let mut roots = 0usize;
+    let mut cycles = 0usize;
+    let mut longest = 0usize;
+    let mut visits = 0usize;
+    let mut in_degrees: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    let mut walk_lengths: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+
+        // Seeds: the two-field objects slot 4 points at.
+        let mut here: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                here.insert(target);
+            }
+        }
+        seeds += here.len();
+
+        // Close on field 1. The node set is NOT the seed set.
+        let mut all = here.clone();
+        let mut frontier: Vec<usize> = here.into_iter().collect();
+        let mut successor: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+            {
+                successor.insert(node, target);
+                if all.insert(target) {
+                    frontier.push(target);
+                }
+            }
+        }
+        nodes += all.len();
+        edges += successor.len();
+
+        let mut incoming: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for target in successor.values() {
+            *incoming.entry(*target).or_default() += 1;
+        }
+        for &node in &all {
+            *in_degrees
+                .entry(incoming.get(&node).copied().unwrap_or(0))
+                .or_default() += 1;
+        }
+
+        for &node in &all {
+            if incoming.contains_key(&node) {
+                continue;
+            }
+            roots += 1;
+            let mut walked: BTreeSet<usize> = BTreeSet::new();
+            let mut cursor = node;
+            let mut length = 0usize;
+            visits += 1;
+            while let Some(&next) = successor.get(&cursor) {
+                if !walked.insert(cursor) {
+                    cycles += 1;
+                    break;
+                }
+                cursor = next;
+                length += 1;
+                visits += 1;
+            }
+            *walk_lengths.entry(length).or_default() += 1;
+            longest = longest.max(length);
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(nodes, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert!(edges > 0, "with no edges every claim below is vacuous");
+    assert_eq!(
+        (seeds, nodes),
+        (56, 102),
+        "the node set nearly doubles under closure: 46 of these objects are not \
+         reached from slot 4 at all, and no cell that counted what a field \
+         ADMITS could have found them"
+    );
+    assert_eq!(edges, 62, "the field-1 links");
+
+    // Not a tree, not chains: something has fifteen parents.
+    assert_eq!(
+        in_degrees.into_iter().collect::<Vec<_>>(),
+        vec![(0, 56), (1, 43), (2, 2), (15, 1)],
+        "a tree has in-degree at most one everywhere. A node with fifteen \
+         incoming edges is a confluence"
+    );
+    assert_eq!(cycles, 0, "and nothing closes, so it is a DAG");
+    assert_eq!(
+        (roots, longest),
+        (56, 6),
+        "56 roots, and the longest walk is six edges"
+    );
+    assert_eq!(
+        walk_lengths.into_iter().collect::<Vec<_>>(),
+        vec![(0, 12), (1, 33), (2, 6), (3, 4), (6, 1)],
+        "walk lengths from each root"
+    );
+
+    // The convergence, proved a second way that does not use in-degree.
+    assert_eq!(
+        (visits, nodes),
+        (119, 102),
+        "walking from every root visits 119 nodes counted with multiplicity \
+         over a node set of 102, so the walks OVERLAP - which is the same fact \
+         as the in-degree histogram, reached without it"
+    );
+}
