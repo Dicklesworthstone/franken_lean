@@ -2491,6 +2491,38 @@ def self_test_sandbox(work):
             setattr(module, opname, original)
 
 
+def unexercised_guards(namespace, entry):
+    """Guard predicates this module defines that the self-test never calls.
+
+    The self-test has always said how many cases it runs and never what it
+    covers, and those are different numbers. Measured when this was written: of
+    ten `*_error` predicates in this file, FIVE were never called by it --
+    refusal_conservation_error, unreproduced_axiom_error,
+    unreproduced_declared_error, unreproduced_family_error and
+    declared_written_error, which are exactly the five joins from the waves that
+    checked the artifact's own content. Each was verified once, by hand, in a
+    scratch script that is not in the tree; the self-test was reporting a green
+    that never touched them.
+
+    Derived rather than listed, so it cannot go out of date: the population is
+    every `*_error` callable in the namespace, and a guard added tomorrow is
+    demanded to have a case the moment it appears. Walks nested code objects too,
+    because most of these are called from inside a lambda.
+    """
+    seen = set()
+
+    def walk(code):
+        seen.update(code.co_names)
+        for const in code.co_consts:
+            if hasattr(const, "co_names"):
+                walk(const)
+
+    walk(entry.__code__)
+    defined = {name for name, value in namespace.items()
+               if name.endswith("_error") and callable(value)}
+    return sorted(defined - seen)
+
+
 def self_test():
     """Run every publication guard against synthetic states, and refuse on a miss.
 
@@ -2753,6 +2785,56 @@ def self_test():
     case("sandbox/allows-artifact-read",
          blocked(lambda: builtins.open(__file__, "r").close()), False)
 
+    # THE FIVE JOINS THAT CHECK THE ARTIFACT'S OWN CONTENT, which this self-test
+    # has never once called. Synthetic inputs, in the same shape the real run
+    # builds, so each predicate is exercised on a state that must pass and the
+    # state it exists to refuse.
+    _un = ["Owner.WF"]
+    case("joins/conservation-partitions",
+         refusal_conservation_error({"a": 1, "b": 2}, {"a": "why"}, ["b"]), False)
+    case("joins/conservation-row-dropped",
+         refusal_conservation_error({"a": 1, "b": 2}, {"a": "why"}, []), True)
+
+    _txt = "-- header\naxiom Owner.WF : Type\naxiom Other : Type\n"
+    _lm = {2: ("axiom", "Owner.WF"), 3: ("axiom", "Other")}
+    _decl = {"Owner.WF": {"decl_name": "Owner.WF"}, "Other": {"decl_name": "Other"}}
+    case("joins/axiom-line-present",
+         unreproduced_axiom_error(_txt, _lm, _decl, _un), False)
+    case("joins/axiom-line-missing",
+         unreproduced_axiom_error(_txt, {3: ("axiom", "Other")}, _decl, _un), True)
+    case("joins/axiom-line-points-elsewhere",
+         unreproduced_axiom_error(_txt, {3: ("axiom", "Owner.WF")}, _decl, _un), True)
+
+    case("joins/declared-disjoint",
+         unreproduced_declared_error(_un, {"Other"}), False)
+    case("joins/declared-contradiction",
+         unreproduced_declared_error(_un, {"Owner.WF"}), True)
+
+    _pin = {"Owner.WF": {"ctors": ["Owner.WF.mk"]}}
+    _fam_decl = {"Owner.WF.mk": {}}
+    _fam_lm = {9: ("axiom", "Owner.WF.mk")}
+    case("joins/family-all-axioms",
+         unreproduced_family_error(_fam_decl, set(), _fam_lm, _un, _pin), False)
+    case("joins/family-ctor-claimed-generated",
+         unreproduced_family_error(_fam_decl, {"Owner.WF.mk"}, _fam_lm, _un, _pin),
+         True)
+    case("joins/family-ctor-missing-from-closure",
+         unreproduced_family_error({}, set(), _fam_lm, _un, _pin), True)
+
+    case("joins/declared-equals-written",
+         declared_written_error({1: ("inductive", "X")}, {"X"}), False)
+    case("joins/listed-but-not-written",
+         declared_written_error({1: ("inductive", "X")}, {"X", "Y"}), True)
+    case("joins/written-but-not-listed",
+         declared_written_error({1: ("inductive", "X"), 2: ("inductive", "Z")},
+                                {"X"}), True)
+
+    # ...and the reason the five above were missing for nineteen waves: nothing
+    # compared what this file DEFINES against what the self-test CALLS.
+    _missing = unexercised_guards(globals(), self_test)
+    case("coverage/every-guard-has-a-case",
+         f"never exercised: {_missing}" if _missing else None, False)
+
     # A PLANTED FAILURE, BECAUSE THE HARNESS HAS NEVER BEEN CHECKED EITHER. Every
     # case above routes its verdict through `case`, and `case` had nothing
     # watching it: gutting its comparison makes all 65 cases pass and the command
@@ -2788,7 +2870,12 @@ def self_test():
               f"{len(failures)} failures recorded): {failures[:4]}", file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"facade-module: SELF-TEST OK — {len(checked)} cases across 7 guards "
+    # The guard count is COUNTED, not typed. It read "7 guards" while the file
+    # defined ten `*_error` predicates, five of which this self-test had never
+    # called -- the number was written down once and then stopped being true.
+    _guards = sum(1 for name, value in globals().items()
+                  if name.endswith("_error") and callable(value))
+    print(f"facade-module: SELF-TEST OK — {len(checked)} cases across {_guards} guards "
           f"and its own sandbox: "
           + " ".join(checked), file=sys.stderr)
     print(f"facade-module: self-test scratch kept at {work}; nothing was deleted "
