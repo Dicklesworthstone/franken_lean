@@ -998,9 +998,9 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .windows(2)
             .filter(|lines| {
                 lines[0].trim()
-                    == r##""\"module\":{{\"isModulePart\":{},\"imports\":0,""##
+                    == r##""\"module\":{{\"isModulePart\":{},\"imports\":0,","##
                     && lines[1].trim()
-                        == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,""##
+                        == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,","##
             })
             .count(),
         1,
