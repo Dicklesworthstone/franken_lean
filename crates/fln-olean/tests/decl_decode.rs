@@ -6715,3 +6715,256 @@ fn the_shared_objects_are_not_special() {
          offered"
     );
 }
+
+/// The membership gap, DECOMPOSED - and the pooling question answered the other
+/// way this time.
+///
+/// `243053f8` pins 46 per-population memberships against 33 distinct `tag 1`
+/// objects and never says why they differ by 13. Stating both numbers is not
+/// accounting for the difference between them, and an unexplained gap is where
+/// a miscount hides: any error in either figure would still leave "46 and 33"
+/// looking like two facts rather than one contradiction.
+///
+/// The gap decomposes exactly: 46 - 33 = 13 = 12 shared elements + 1 shared
+/// wrapped object. Both routes are asserted, so a drift in either overlap
+/// contradicts the arithmetic instead of passing.
+///
+/// AND THE POOLING QUESTION HAD TO BE ASKED AGAIN, because the last time I
+/// assumed the answer I was wrong. `2d20e69f` pins that the element `tag 1`s
+/// and the wrapped `tag 1`s do not overlap - PER POPULATION, zero in each. At
+/// `243053f8` I learned that per-population disjointness is not pooled
+/// disjointness: the seeds and the interior share objects below the four-field
+/// records even though their records are disjoint.
+///
+/// So the same question here has to be measured, not inherited. It is measured,
+/// and this time the answer is the OTHER one: pooled overlap is zero as well,
+/// so 23 + 10 = 33 exactly.
+///
+/// THAT ASYMMETRY IS THE POINT. The lesson from `243053f8` is not "disjointness
+/// never extends" - here it does. It is that whether it extends is a SEPARATE
+/// QUESTION each time, with no default answer, and the only way to hold that
+/// discipline is to measure the pooled case even when the per-population one is
+/// already pinned.
+#[test]
+fn the_membership_gap_decomposes() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        let mut elements: [BTreeSet<usize>; 2] = [BTreeSet::new(), BTreeSet::new()];
+        let mut wrapped: [BTreeSet<usize>; 2] = [BTreeSet::new(), BTreeSet::new()];
+        for (which, population) in [true, false].into_iter().enumerate() {
+            let mut arrays: BTreeSet<usize> = BTreeSet::new();
+            for &node in &all {
+                if seeds.contains(&node) != population {
+                    continue;
+                }
+                let Some(record) = resolve(word_at(bytes, node + 8)) else {
+                    continue;
+                };
+                let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3)) else {
+                    continue;
+                };
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        arrays.insert(array);
+                    }
+                }
+            }
+            let mut wrappers: BTreeSet<usize> = BTreeSet::new();
+            for array in arrays {
+                for i in 0..word_at(bytes, array + 8) {
+                    let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                        continue;
+                    };
+                    match shape(element) {
+                        Some((1, 1)) => {
+                            elements[which].insert(element);
+                        }
+                        Some((2, 1)) => {
+                            wrappers.insert(element);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for wrapper in wrappers {
+                if let Some(target) = resolve(word_at(bytes, wrapper + 8))
+                    && shape(target) == Some((1, 1))
+                {
+                    wrapped[which].insert(target);
+                }
+            }
+        }
+
+        let mut count = |key: &str, by: usize| *counts.entry(key.to_owned()).or_default() += by;
+        // Per population, as `2d20e69f` measures it.
+        for (which, name) in [(0usize, "seed"), (1, "interior")] {
+            count(
+                &format!("1 per population/{name} membership"),
+                elements[which].union(&wrapped[which]).count(),
+            );
+            count(
+                &format!("1 per population/{name} element-wrapped overlap"),
+                elements[which].intersection(&wrapped[which]).count(),
+            );
+        }
+        // Pooled - the question that must be asked again rather than inherited.
+        let pooled_elements: BTreeSet<usize> = elements[0].union(&elements[1]).copied().collect();
+        let pooled_wrapped: BTreeSet<usize> = wrapped[0].union(&wrapped[1]).copied().collect();
+        count("2 pooled/elements", pooled_elements.len());
+        count("2 pooled/wrapped", pooled_wrapped.len());
+        count(
+            "2 pooled/element-wrapped overlap",
+            pooled_elements.intersection(&pooled_wrapped).count(),
+        );
+        count(
+            "2 pooled/all tag1",
+            pooled_elements.union(&pooled_wrapped).count(),
+        );
+        // The two components of the gap.
+        count(
+            "3 shared/elements",
+            elements[0].intersection(&elements[1]).count(),
+        );
+        count(
+            "3 shared/wrapped",
+            wrapped[0].intersection(&wrapped[1]).count(),
+        );
+    }
+
+    if !prelude_loaded {
+        assert!(
+            counts.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    let get = |key: &str| counts.get(key).copied().unwrap_or_default();
+
+    assert_eq!(
+        counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "1 per population/interior element-wrapped overlap".to_owned(),
+                0
+            ),
+            ("1 per population/interior membership".to_owned(), 31),
+            (
+                "1 per population/seed element-wrapped overlap".to_owned(),
+                0
+            ),
+            ("1 per population/seed membership".to_owned(), 15),
+            ("2 pooled/all tag1".to_owned(), 33),
+            ("2 pooled/element-wrapped overlap".to_owned(), 0),
+            ("2 pooled/elements".to_owned(), 23),
+            ("2 pooled/wrapped".to_owned(), 10),
+            ("3 shared/elements".to_owned(), 12),
+            ("3 shared/wrapped".to_owned(), 1),
+        ],
+        "per population, pooled, and the two overlaps"
+    );
+
+    // The pooling question, measured rather than inherited.
+    assert_eq!(
+        get("2 pooled/element-wrapped overlap"),
+        0,
+        "`2d20e69f` pins this as zero PER POPULATION. At `243053f8` \
+         per-population disjointness turned out not to imply the pooled kind, \
+         so it is measured here rather than inherited - and this time it does \
+         hold, which is why neither answer can be a default"
+    );
+    assert_eq!(
+        get("2 pooled/elements") + get("2 pooled/wrapped"),
+        get("2 pooled/all tag1"),
+        "so the pooled sets add exactly: 23 + 10 = 33"
+    );
+
+    // The gap, decomposed, by two routes.
+    let memberships =
+        get("1 per population/seed membership") + get("1 per population/interior membership");
+    assert_eq!(memberships, 46, "the memberships `243053f8` pins");
+    assert!(
+        memberships > get("2 pooled/all tag1"),
+        "the gap must be non-zero, or this cell decomposes nothing"
+    );
+    assert_eq!(
+        memberships - get("2 pooled/all tag1"),
+        13,
+        "46 memberships over 33 objects"
+    );
+    assert_eq!(
+        get("3 shared/elements") + get("3 shared/wrapped"),
+        13,
+        "and the 13 is exactly the shared elements plus the shared wrapped \
+         object - the gap `243053f8` states and does not account for, closed \
+         from both ends"
+    );
+}
