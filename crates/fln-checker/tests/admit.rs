@@ -2520,6 +2520,22 @@ fn kr600_803_init_nat_fixture_pins_iota_rule_constructors_and_fields() {
 }
 
 #[test]
+fn kr600_803_init_nat_fixture_pins_iota_rhs_closure() {
+    let entries = nat_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for rule in metadata.rules() {
+        let facts = match inspect(rule.rhs(), TermBudget::unlimited()) {
+            TermOutcome::Complete(facts) => facts,
+            other => panic!("fixture iota inspection must complete: {other:?}"),
+        };
+        assert_eq!(facts.external_bound_span, 0);
+    }
+}
+
+#[test]
 fn kr600_803_init_option_universes_parameters_and_rules_are_reconstructed() {
     let entries = init_option_entries();
     let verdict = admit_inductive(
