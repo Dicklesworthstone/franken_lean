@@ -1216,6 +1216,21 @@ impl ChainConstants {
 /// a mangling convention rather than a provenance fact (see [`ConstantOrigin`]).
 /// This is the one-call form, so asking the chain is easier than guessing from
 /// the name.
+///
+/// CHAIN LAWS, kept aligned with the product door
+/// (`fln::decode_olean_module_artifacts`): the exported part is audited,
+/// walked, and required to be a module-system module; each companion must carry
+/// the exported part's identity stamp, and is walked and `ModuleData`-decoded.
+/// The private array is then decoded and proven a superset.
+///
+/// ONE DELIBERATE DIVERGENCE. The product door also runs the full declaration
+/// decoder over the SERVER part and discards the result. This does not, because
+/// it would be re-decoding the exported array: across all 2,431 chained modules
+/// of the pin, the server part's `constNames` is never different from the
+/// exported part's, and the arrays it points at live in the exported region.
+/// The server region is still walked and `ModuleData`-decoded here, so its
+/// object graph and root contract are checked; only the redundant second pass
+/// over declarations the exported decode already validated is skipped.
 pub fn decode_chain_constants_from_parts(
     exported: &[u8],
     server: &[u8],
@@ -1248,6 +1263,11 @@ pub fn decode_chain_constants_from_parts(
             return Err(DeclError::ChainPartMismatch { part });
         }
         view.walk(budget)?;
+        // `walk` proves every pointer, string and bignum in the region is
+        // sound, but it is generic over the object graph and knows nothing of
+        // the `ModuleData` contract. The root constructor shape, the imports
+        // array and the extension block table are only checked here.
+        view.module_data(budget)?;
     }
 
     decode_chain_constants_with_origin(&exported_view, &private_view, budget)
