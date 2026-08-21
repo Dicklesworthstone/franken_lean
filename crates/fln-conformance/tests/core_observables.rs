@@ -34,16 +34,25 @@ fn reference_lib() -> Option<PathBuf> {
 
 fn numbered_private_auxiliary(name: &str, prefix: &str) -> bool {
     name.rsplit('.').next().is_some_and(|segment| {
-        segment
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        segment.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
     })
 }
 
-/// Regression for `franken_lean-timy`: private equation-compiler declarations
-/// live in a module's `.olean.private` companion, not the exported public part.
-/// The public-only projection must therefore lack these names, while the product
-/// companion-chain decoder must recover each family before any later admission.
+/// Regression for `franken_lean-timy`: the equation-compiler auxiliaries the
+/// exported `.olean` omits must be recovered from the `.olean.private`
+/// companion before any later admission.
+///
+/// PROVENANCE IS TAKEN FROM THE CHAIN, NOT FROM THE NAME. `_private.` is Lean's
+/// mangling for a private-SCOPED declaration and says nothing about which part
+/// carries it: at the pin, 2,336 of the 51,506 declarations in Init's exported
+/// parts are `_private.`-prefixed. Two of them are in this fixture's own module
+/// set -- `_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec`
+/// and the matching `getTailPos?` -- so selecting by prefix classifies exported
+/// declarations as companion-recovered and this regression fails on `.loop` for
+/// a reason that has nothing to do with decode. `ConstantOrigin::PrivateOnly`
+/// is the decoded fact; do not reintroduce a string test here.
 #[test]
 fn complete_olean_chain_restores_all_private_equation_compiler_auxiliary_families() {
     let Some(reference_lib) = reference_lib() else {
@@ -57,7 +66,7 @@ fn complete_olean_chain_restores_all_private_equation_compiler_auxiliary_familie
         "Init/Control/MonadAttach",
     ];
     let mut public_names = BTreeSet::new();
-    let mut companion_names = BTreeSet::new();
+    let mut private_only_names = BTreeSet::new();
 
     for module in modules {
         let artifact = reference_lib.join(format!("{module}.olean"));
@@ -95,33 +104,52 @@ fn complete_olean_chain_restores_all_private_equation_compiler_auxiliary_familie
             fln::OleanDecodeLimits::new(total_bytes),
         )
         .unwrap_or_else(|error| panic!("decode complete {module} chain: {error}"));
-        assert!(decoded.companion_parts_loaded, "{module} omitted its companion chain");
-        companion_names.extend(
-            decoded
-                .constants
-                .into_iter()
+        assert!(
+            decoded.companion_parts_loaded,
+            "{module} omitted its companion chain"
+        );
+
+        // Ask the decoder which declarations the exported part did NOT declare,
+        // rather than guessing from the name.
+        let private_view = fln_olean::region::OleanView::parse_with_dependencies(
+            &private_bytes,
+            &[&public_bytes, &server_bytes],
+        )
+        .unwrap_or_else(|error| panic!("parse private {}: {error}", private.display()));
+        let chained = fln_olean::decl::decode_chain_constants_with_origin(
+            &public_view,
+            &private_view,
+            fln_olean::region::WalkBudget::default(),
+        )
+        .unwrap_or_else(|error| panic!("origin decode {module}: {error}"));
+        private_only_names.extend(
+            chained
+                .private_only()
                 .map(|info| info.name().to_display_string()),
         );
     }
 
     let families: [(&str, fn(&str) -> bool); 4] = [
         ("match_N", |name| numbered_private_auxiliary(name, "match_")),
-        ("_proof_N", |name| numbered_private_auxiliary(name, "_proof_")),
+        ("_proof_N", |name| {
+            numbered_private_auxiliary(name, "_proof_")
+        }),
         (".loop", |name| name.contains(".loop.")),
         ("eq_N", |name| numbered_private_auxiliary(name, "eq_")),
     ];
     for (family, belongs_to_family) in families {
-        let restored: Vec<_> = companion_names
+        let restored: Vec<_> = private_only_names
             .iter()
-            .filter(|name| name.starts_with("_private.") && belongs_to_family(name))
+            .filter(|name| belongs_to_family(name))
             .collect();
         assert!(
             !restored.is_empty(),
-            "complete companion decode omitted every private {family} auxiliary"
+            "complete companion decode recovered no {family} auxiliary from the private companion"
         );
         assert!(
             restored.iter().all(|name| !public_names.contains(*name)),
-            "{family} regression stopped distinguishing private companion declarations from public declarations: {restored:?}"
+            "{family}: a declaration reported private-only is also in the independently \
+             decoded exported projection, so ConstantOrigin disagrees with it: {restored:?}"
         );
     }
 }
