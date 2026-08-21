@@ -9474,3 +9474,207 @@ fn the_shared_seed_records() {
          TWO samples support no such claim and none is made"
     );
 }
+
+/// The six `tag 4 arity 1` tails - uniform, and not self-references.
+///
+/// `241893a7` opened the `(0, 2)` and `(5, 1)` spine tails and pinned `(4, 1)`
+/// as a count only. `a23b6daa` then found all four shared-record holders have
+/// exactly this tail, four of the six, so these are the objects that finding
+/// points at and nobody has looked inside them.
+///
+/// THEY ARE UNIFORM. Six references to six objects, no sharing, one size, and
+/// every one wraps a single four-field record. The four implicated by
+/// `a23b6daa` and the two that are not have IDENTICAL profiles.
+///
+/// SO THAT COMPARISON HAS NO DISCRIMINATING POWER, and this cell says so rather
+/// than reporting "they are the same" as a result. The property is uniform
+/// across all six, so it could not have separated them however they were
+/// arranged - the vacuity `f2da5b0e` found in one of four earlier "not special"
+/// findings, checked here before the claim instead of three waves after it.
+/// Nothing about these objects explains why four of six hold shared records.
+///
+/// THE INNER RECORD IS NEVER THE NODE'S OWN RECORD - zero of six. That zero is
+/// worth its denominator, per `1006bd18`: it is not surprising in itself, since
+/// an arbitrary pick from about a hundred records would miss almost always.
+/// What it does is refute a specific reading. The obvious guess for a one-field
+/// wrapper sitting on a node is that it points back at that node's own record,
+/// which would give six of six; it gives none, so these wrap something else and
+/// the six inner records are six further distinct objects.
+///
+/// The nodes' own records reproduce `a23b6daa`'s two shared records and their
+/// exact holders - `0x2afdd0` from two nodes and `0x2b4998` from two others -
+/// which is a free cross-check that this cell and that one are walking the same
+/// structure.
+#[test]
+fn the_six_tag_four_tails() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut distinct: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut inner_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut inner_distinct: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut implicated: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut unimplicated: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut inner_is_own_record = 0usize;
+    let mut shared_records: BTreeSet<usize> = BTreeSet::new();
+    let mut holders_of_shared = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+
+        // Which seed nodes share a four-field record - `a23b6daa`'s finding.
+        let mut holders: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &node in &seeds {
+            if let Some(record) = resolve(word_at(bytes, node + 8)) {
+                holders.entry(record).or_default().push(node);
+            }
+        }
+        let sharing: BTreeSet<usize> = holders
+            .iter()
+            .filter(|(_, nodes)| nodes.len() > 1)
+            .flat_map(|(record, nodes)| {
+                shared_records.insert(*record);
+                nodes.iter().copied()
+            })
+            .collect();
+        holders_of_shared += sharing.len();
+
+        for &node in &seeds {
+            let Some(tail) = resolve(word_at(bytes, node + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            references += 1;
+            distinct.insert((index, tail));
+
+            let inner = resolve(word_at(bytes, tail + 8)).expect("the wrapped field");
+            *inner_shapes.entry(described(inner)).or_default() += 1;
+            inner_distinct.insert((index, inner));
+
+            let into = if sharing.contains(&node) {
+                &mut implicated
+            } else {
+                &mut unimplicated
+            };
+            *into.entry(described(inner)).or_default() += 1;
+
+            if resolve(word_at(bytes, node + 8)) == Some(inner) {
+                inner_is_own_record += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Uniform, and unshared.
+    assert_eq!(
+        (references, distinct.len()),
+        (6, 6),
+        "six references to six objects - these wrappers are not shared"
+    );
+    assert_eq!(
+        inner_shapes.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 4".to_owned(), 6)],
+        "and every one wraps a four-field record"
+    );
+    assert_eq!(
+        inner_distinct.len(),
+        6,
+        "six distinct inner records, one per wrapper"
+    );
+
+    // The comparison that cannot discriminate, said as such.
+    assert_eq!(
+        (
+            implicated.into_iter().collect::<Vec<_>>(),
+            unimplicated.into_iter().collect::<Vec<_>>(),
+        ),
+        (
+            vec![("tag 0 arity 4".to_owned(), 4)],
+            vec![("tag 0 arity 4".to_owned(), 2)],
+        ),
+        "the four `a23b6daa` implicates and the two it does not have IDENTICAL \
+         profiles. The property is uniform across all six, so it could not have \
+         separated them however they were arranged - this is a vacuous \
+         comparison and is reported as one, not as a finding that they match"
+    );
+
+    // The zero, with what it is evidence against.
+    assert_eq!(
+        inner_is_own_record, 0,
+        "the wrapped record is NEVER the node's own record. Not surprising in \
+         itself - an arbitrary pick from about a hundred records would miss \
+         almost always - but it refutes the obvious reading of a one-field \
+         wrapper on a node as pointing back at that node's record, which would \
+         give six of six"
+    );
+
+    // Free cross-check against `a23b6daa`.
+    assert_eq!(
+        (shared_records.len(), holders_of_shared),
+        (2, 4),
+        "two shared records between four holders, reproducing `a23b6daa` from \
+         this cell's own walk"
+    );
+}
