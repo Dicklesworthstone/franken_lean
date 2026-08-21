@@ -267,6 +267,11 @@ the toolchain would report a perfect facade:
     none. Closure-only declarations cannot evade the safety accounting used by
     the demanded slice.
 
+  * A MANIFEST-LEVEL-PARAMETER-TOTALITY JOIN requires every typed declaration
+    to carry a well-formed, duplicate-free universe-parameter list whose names
+    occur in its signature, while Init-substrate rows carry none. Closure-only
+    signatures cannot introduce unbound universe binders.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1538,6 +1543,50 @@ def main():
             f"({json.dumps(manifest_safety_join, sort_keys=True)}, "
             f"unknown={unknown_safety_rows[:8]!r}, init={init_safety_rows[:8]!r})"
         )
+    malformed_level_parameter_rows = []
+    duplicate_level_parameter_rows = []
+    unbound_level_parameter_rows = []
+    level_parameter_count = 0
+    parameterized_rows = 0
+    for row in manifest_rows:
+        parameters = row.get("level_params")
+        if row.get("role") == "init-substrate":
+            if parameters not in (None, []):
+                malformed_level_parameter_rows.append(row["name"])
+            continue
+        if (not isinstance(parameters, list)
+                or not all(isinstance(parameter, str) and parameter
+                           for parameter in parameters)):
+            malformed_level_parameter_rows.append(row["name"])
+            continue
+        level_parameter_count += len(parameters)
+        if parameters:
+            parameterized_rows += 1
+        if len(parameters) != len(set(parameters)):
+            duplicate_level_parameter_rows.append(row["name"])
+        signature = row["signature"]
+        if any(parameter not in signature for parameter in parameters):
+            unbound_level_parameter_rows.append(row["name"])
+    manifest_level_parameter_join = {
+        "typed_rows": manifest_signature_join["non_init_rows"],
+        "parameterized_rows": parameterized_rows,
+        "level_parameters": level_parameter_count,
+        "init_rows": manifest_signature_join["init_rows"],
+        "malformed_rows": len(malformed_level_parameter_rows),
+        "duplicate_parameter_rows": len(duplicate_level_parameter_rows),
+        "unbound_parameter_rows": len(unbound_level_parameter_rows),
+    }
+    if (manifest_level_parameter_join["typed_rows"] == 0
+            or manifest_level_parameter_join["malformed_rows"] != 0
+            or manifest_level_parameter_join["duplicate_parameter_rows"] != 0
+            or manifest_level_parameter_join["unbound_parameter_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest level-parameter-totality join failed "
+            f"({json.dumps(manifest_level_parameter_join, sort_keys=True)}, "
+            f"malformed={malformed_level_parameter_rows[:8]!r}, "
+            f"duplicates={duplicate_level_parameter_rows[:8]!r}, "
+            f"unbound={unbound_level_parameter_rows[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1970,6 +2019,7 @@ def main():
         "manifest_type_dependency_totality_join": manifest_type_dependency_join,
         "manifest_effect_totality_join": manifest_effect_join,
         "manifest_safety_totality_join": manifest_safety_join,
+        "manifest_level_parameter_totality_join": manifest_level_parameter_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
