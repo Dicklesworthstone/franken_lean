@@ -2283,3 +2283,164 @@ fn the_tag_four_third_shape_tails_are_expr_const_nodes() {
         "the declNames, decoded by the production decoder"
     );
 }
+
+/// The remaining 17 hold NO POINTERS AT ALL - both fields are boxed scalars.
+///
+/// `2ea2447b` pins that 17 of the 99 have a boxed tail other than nil, and
+/// argues from that alone that they cannot be list cells. `aec3efd1` and
+/// `84951450` characterised the other 82 by their tails. Every cell in this
+/// file has read a third-shape object's TAIL; not one has read its HEAD. So the
+/// 99 have been described entirely through one of their two fields, and the
+/// other has never been looked at.
+///
+/// It is not empty. All 17 carry a boxed HEAD as well - values 4 through 14 -
+/// so between them the 17 objects contain thirty-four fields and not one
+/// pointer.
+///
+/// THAT IS THE MIRROR OF THE 71, and the pair is the argument. There, 142
+/// fields were ALL pointers into objects the walk had independently visited,
+/// which is not what a misreading walker produces. Here, 34 fields are ALL
+/// scalars, which is also not what a misreading walker produces - a walk that
+/// had drifted off a real object boundary would find a mixture, because
+/// arbitrary words are pointer-shaped about as often as they are not. Two
+/// populations, each internally uniform in opposite ways, is a much harder
+/// thing to fake than either alone.
+///
+/// A boxed head is legal for a real `List.cons` - `List Nat` stores small
+/// naturals unboxed in the head slot - so the head says nothing on its own
+/// about whether these are lists. The tail already settled that. What the head
+/// adds is that these objects are LEAF constructors: they reference nothing, so
+/// no walk of them can reach anything, and the question of what they contain is
+/// answered completely by the two scalars pinned below.
+#[test]
+fn the_boxed_tail_third_shape_objects_hold_no_pointers() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut third_tails = 0usize;
+    let mut remainder = 0usize;
+    let mut in_entries = 0usize;
+    let mut in_declarations = 0usize;
+    let mut fields = 0usize;
+    let mut pointer_fields = 0usize;
+    let mut tails: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut heads: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root in range");
+        let entries = reachable_from(bytes, base, word_at(bytes, root + 40));
+        let declarations = reachable_from(bytes, base, word_at(bytes, root + 24));
+
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let tail = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            if (second & 1 == 1 && second >> 1 == 0)
+                || tail.is_some_and(|t| (t.tag, t.other) == (1, 2))
+            {
+                continue;
+            }
+            third_tails += 1;
+
+            // The remainder: a BOXED tail that is not nil. The other 82 have
+            // pointer tails and are characterised elsewhere.
+            if second & 1 == 0 {
+                continue;
+            }
+            remainder += 1;
+            *tails.entry(second >> 1).or_default() += 1;
+            if entries.contains(&object.off) {
+                in_entries += 1;
+            }
+            if declarations.contains(&object.off) {
+                in_declarations += 1;
+            }
+
+            // Both fields, which is what has never been read.
+            for slot in 0..usize::from(object.other) {
+                fields += 1;
+                let word = word_at(bytes, object.off + 8 + 8 * slot);
+                if word & 1 == 0 {
+                    pointer_fields += 1;
+                } else if slot == 0 {
+                    *heads.entry(word >> 1).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(third_tails, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Kept two-way: the whole population, and this leftover of it.
+    assert_eq!(third_tails, 99, "the same 99 the remainder cell pins");
+    assert_eq!(
+        remainder, 17,
+        "99 less the 71 `tag 0` tails and the 11 `tag 4` tails"
+    );
+    assert_eq!(
+        (in_entries, in_declarations),
+        (17, 0),
+        "reached through `entries`, never through `constants`"
+    );
+
+    // The claim: no pointers anywhere in them.
+    assert_eq!(
+        (fields, pointer_fields),
+        (34, 0),
+        "seventeen objects, two fields each, and not one pointer. A walk that \
+         had drifted off a real object boundary would find a MIXTURE - \
+         arbitrary words are pointer-shaped about as often as not - so uniform \
+         scalars are evidence these are real objects, exactly as the 71's \
+         uniform pointers were"
+    );
+
+    assert_eq!(
+        tails.into_iter().collect::<Vec<_>>(),
+        vec![(1, 6), (2, 4), (3, 2), (4, 2), (5, 2), (6, 1)],
+        "the boxed tail values `2ea2447b` pins, here as numbers rather than \
+         formatted strings"
+    );
+    assert_eq!(
+        heads.into_iter().collect::<Vec<_>>(),
+        vec![
+            (4, 1),
+            (5, 1),
+            (6, 2),
+            (7, 2),
+            (8, 3),
+            (9, 1),
+            (10, 3),
+            (11, 1),
+            (12, 1),
+            (13, 1),
+            (14, 1),
+        ],
+        "the boxed HEAD values, which nothing had read before"
+    );
+}
