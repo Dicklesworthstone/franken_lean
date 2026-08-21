@@ -11721,6 +11721,212 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The string triple, checked against its own bytes - not a double count.
+///
+/// A string object stores THREE numbers: `m_size` (bytes, terminator included),
+/// `m_capacity`, and `m_length` (UTF-8 characters). The last is the interesting
+/// one, because it can be recomputed from the payload and compared - so unlike
+/// the conservations in `f4d108f7` and `5e57207b`, which were one sum taken in
+/// two orders, this one has a STORED side and a COMPUTED side that could
+/// genuinely disagree.
+///
+/// THEY DO NOT. Every string's `m_length` equals the number of non-continuation
+/// bytes in its payload, in all four modules - 1,452 of 1,452 in Prelude. Every
+/// string is NUL-terminated, and every one has `m_capacity` equal to `m_size`,
+/// so a compacted region carries no slack.
+///
+/// THE PARTITION THAT MAKES IT NON-VACUOUS. If every string were ASCII then
+/// `m_length` would always be `m_size - 1` and the agreement would prove
+/// nothing about anyone's decoder. Splitting on that: Prelude has 1,402 ASCII
+/// strings and 50 with multi-byte characters, and the two sum to the 1,452.
+/// `Init.BinderNameHint.olean` has 3 and `Init.SizeOfLemmas.olean` 1.
+///
+/// `Init.olean` HAS NONE, so for that module the check IS vacuous, and saying
+/// so is the point of counting per module rather than pooling. A pooled 54
+/// would have hidden that one of the four modules cannot fail this assertion.
+///
+/// THE DECOMPOSITION, per module: payload body bytes = characters +
+/// continuation bytes. Prelude's 13,431 body bytes are 13,345 characters and 86
+/// continuation bytes; `Init.olean`'s 415 are 415 and ZERO. The continuation
+/// count is the exact measure of how much work `m_length` is doing, and among
+/// Prelude's 50 multi-byte strings 36 contain a THREE-byte character.
+///
+/// POPULATION SCOPE: all four modules, each asserted by name; every count is
+/// per module.
+#[test]
+fn the_string_triple_agrees_with_its_bytes() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut decomposition: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut three_byte = 0usize;
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, _) = objects_of(bytes);
+
+        let mut strings = 0usize;
+        let mut agree = 0usize;
+        let mut terminated = 0usize;
+        let mut capacity_tight = 0usize;
+        let mut ascii = 0usize;
+        let mut multibyte = 0usize;
+        let mut payload_bytes = 0usize;
+        let mut body_bytes = 0usize;
+        let mut characters = 0usize;
+        let mut continuation = 0usize;
+
+        for object in &objects {
+            if object.tag != abi::TAG_STRING {
+                continue;
+            }
+            strings += 1;
+            let size = usize::try_from(word_at(bytes, object.off + 8)).expect("m_size");
+            let capacity = usize::try_from(word_at(bytes, object.off + 16)).expect("m_capacity");
+            let length = usize::try_from(word_at(bytes, object.off + 24)).expect("m_length");
+            payload_bytes += size;
+            if capacity == size {
+                capacity_tight += 1;
+            }
+            if size == 0 {
+                continue;
+            }
+            let payload = &bytes[object.off + 32..object.off + 32 + size];
+            if payload[size - 1] == 0 {
+                terminated += 1;
+            }
+            // The body is the payload without its terminator; a UTF-8
+            // character starts at every byte that is not a continuation byte.
+            let body = &payload[..size - 1];
+            body_bytes += body.len();
+            let recomputed = body.iter().filter(|byte| (**byte & 0xC0) != 0x80).count();
+            characters += length;
+            continuation += body.len() - recomputed;
+            if recomputed == length {
+                agree += 1;
+            }
+            if length == size - 1 {
+                ascii += 1;
+            } else {
+                multibyte += 1;
+                // A three-byte character is a lead byte with the top three
+                // bits set and the fourth clear.
+                if body.iter().any(|byte| *byte & 0xF0 == 0xE0) {
+                    three_byte += 1;
+                }
+            }
+        }
+        rows.push((
+            module.clone(),
+            strings,
+            agree,
+            terminated,
+            capacity_tight,
+            ascii,
+            multibyte,
+            payload_bytes,
+        ));
+        decomposition.push((module.clone(), body_bytes, characters, continuation));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize, usize, usize, usize, usize)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c, d, e, f, g)| (m.to_owned(), a, b, c, d, e, f, g))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep(vec![
+            ("Init.olean", 51, 51, 51, 51, 51, 0, 466),
+            ("Init.BinderNameHint.olean", 43, 43, 43, 43, 40, 3, 379),
+            ("Init.SizeOfLemmas.olean", 78, 78, 78, 78, 77, 1, 612),
+            (
+                "Init/Prelude.olean",
+                1452,
+                1452,
+                1452,
+                1452,
+                1402,
+                50,
+                14883
+            ),
+        ]),
+        "per module: strings; those whose stored `m_length` equals the \
+         character count RECOMPUTED from the payload; those NUL-terminated; \
+         those with `m_capacity` equal to `m_size`; then the ASCII and \
+         multi-byte split, and the payload bytes. The `m_length` check has a \
+         stored side and a computed side, so unlike `f4d108f7` and `5e57207b` \
+         it is not one sum taken in two orders"
+    );
+    for (module, strings, _, _, _, ascii, multibyte, _) in &rows {
+        assert_eq!(
+            ascii + multibyte,
+            *strings,
+            "{module}: every string is ASCII or multi-byte and nothing else"
+        );
+    }
+
+    assert_eq!(
+        decomposition
+            .iter()
+            .map(|(m, b, c, k)| (m.as_str(), *b, *c, *k))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 415, 415, 0),
+            ("Init.BinderNameHint.olean", 336, 333, 3),
+            ("Init.SizeOfLemmas.olean", 534, 533, 1),
+            ("Init/Prelude.olean", 13431, 13345, 86),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "body bytes, characters and continuation bytes per module"
+    );
+    for (module, body, characters, continuation) in &decomposition {
+        assert_eq!(
+            characters + continuation,
+            *body,
+            "{module}: every body byte either starts a character or continues \
+             one"
+        );
+    }
+    assert_eq!(
+        decomposition
+            .first()
+            .map(|(_, _, _, continuation)| *continuation),
+        Some(0),
+        "`Init.olean` has NO continuation bytes, so for that module the \
+         `m_length` agreement above is VACUOUS - it cannot fail. Counting per \
+         module rather than pooling is what makes that visible; a pooled 90 \
+         would have hidden it"
+    );
+    if prelude_loaded {
+        assert_eq!(
+            three_byte, 36,
+            "and 36 of Prelude's 50 multi-byte strings contain a THREE-byte \
+             character, so `m_length` is doing real work there rather than \
+             tracking a handful of two-byte accents"
+        );
+    }
+}
+
 /// The five roots, counted from both ends - and no object belongs to all of them.
 ///
 /// `ModuleData`'s five array slots are a stored relation this file has used
