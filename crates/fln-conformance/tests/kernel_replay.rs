@@ -7997,21 +7997,48 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
-    let mutations: Vec<(&str, String)> = vec![
-        ("schema moved", row.replace("receipt/1", "receipt/2")),
-        ("truncated", row[..row.len() / 2].to_string()),
-        ("field dropped", row.replace(",\"wall_ms\":11000000", "")),
+    // EACH CELL NAMES THE REFUSAL IT EXPECTS. Until now every one of these
+    // asserted only `is_err()`, and `from_row` has SEVEN distinct refusal kinds
+    // -- so a reader that rejected everything at the schema check would have
+    // satisfied all twelve while five of those kinds did nothing at all. Same
+    // defect the receipt mutants had two waves ago, in the other half of this
+    // test.
+    let mutations: Vec<(&str, String, &str)> = vec![
+        (
+            "schema moved",
+            row.replace("receipt/1", "receipt/2"),
+            "receipt schema is",
+        ),
+        // DELIBERATELY NON-SPECIFIC, and said so rather than dressed up: the cut
+        // lands wherever half the row happens to be, so which field goes missing
+        // is not a property worth pinning. It asserts only that SOMETHING was
+        // missing, which is all a random truncation can honestly claim.
+        ("truncated", row[..row.len() / 2].to_string(), "missing"),
+        (
+            "field dropped",
+            row.replace(",\"wall_ms\":11000000", ""),
+            "missing numeric field `wall_ms`",
+        ),
         (
             "seed count dropped",
             row.replace(",\"seed_modules\":8000", ""),
+            "missing numeric field `seed_modules`",
         ),
         (
+            // The needle still matches, so the field is FOUND; the value simply
+            // no longer starts with a digit and parses to nothing.
             "whitespace introduced",
             row.replace("\"decoded\":", "\"decoded\": "),
+            "field `decoded` is not a u64",
         ),
+        // THESE THREE SHARE ONE CAUSE ON PURPOSE. Each parses cleanly and is
+        // caught only by re-serialization, so they are told apart by their INPUT
+        // rather than their message -- the one place on this bead where a shared
+        // fragment is correct rather than a collapsed cell.
         (
             "count reworded but not re-serialized",
             row.replace("\"compared\":600000", "\"compared\":0600000"),
+            "not in canonical form",
         ),
         // A KEY CARRIED TWICE. The extractors take the FIRST occurrence, so a
         // second copy appended later is invisible to the reader while being the
@@ -8023,6 +8050,7 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         (
             "a field carried twice",
             row.replace("\"class\":", "\"compared\":0,\"class\":"),
+            "not in canonical form",
         ),
         // The same argument for a key the format does not define at all: the
         // row must be CLOSED, or arbitrary content could ride along in a
@@ -8030,6 +8058,7 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         (
             "an unknown field smuggled in",
             row.replace("\"class\":", "\"reviewed\":\"yes\",\"class\":"),
+            "not in canonical form",
         ),
         // THE READER HAS THREE EXTRACTOR KINDS AND ONLY ONE WAS PROBED. `text`,
         // `number` and `array` each refuse a missing key, and `text` and `array`
@@ -8042,10 +8071,12 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         (
             "a string field dropped",
             row.replace(",\"profile\":\"dev\"", ""),
+            "missing string field `profile`",
         ),
         (
             "an array field dropped",
             row.replace(",\"restrictive_families\":[]", ""),
+            "missing array field `restrictive_families`",
         ),
         // Truncated immediately after a value's opening delimiter, so the key IS
         // found and only its terminator is missing -- the branch a dropped field
@@ -8053,19 +8084,52 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         (
             "an unterminated string value",
             truncate_after(&row, "\"class\":\""),
+            "unterminated string field `class`",
         ),
         (
             "an unterminated array value",
             truncate_after(&row, "\"restrictive_families\":["),
+            "unterminated array field `restrictive_families`",
         ),
     ];
-    for (name, damaged) in mutations {
+    let mut refusals: Vec<(&str, String)> = Vec::new();
+    for (name, damaged, expected) in mutations {
+        let reason = match WholeMathlibReceipt::from_row(&damaged) {
+            Ok(_) => panic!(
+                "a receipt with `{name}` was accepted; the reader must refuse what it cannot \
+                 reproduce byte for byte"
+            ),
+            Err(reason) => reason,
+        };
         assert!(
-            WholeMathlibReceipt::from_row(&damaged).is_err(),
-            "a receipt with `{name}` was accepted; the reader must refuse what it cannot \
-             reproduce byte for byte"
+            reason.contains(expected),
+            "`{name}` was refused, but for the wrong reason: expected a message naming \
+             `{expected}`, got `{reason}`"
         );
+        refusals.push((name, reason));
     }
+
+    // THE FOUR EXTRACTOR CELLS MUST PRODUCE FOUR DIFFERENT REFUSALS. Two name a
+    // missing key and two an unterminated value; two of them concern the same
+    // field. If any pair collapsed to one message, that pair would no longer be
+    // distinguishing the branch each is named for -- and two of these four are
+    // the only probe their branch has.
+    let extractor_cells = [
+        "a string field dropped",
+        "an array field dropped",
+        "an unterminated string value",
+        "an unterminated array value",
+    ];
+    let distinct = refusals
+        .iter()
+        .filter(|(name, _)| extractor_cells.contains(name))
+        .map(|(_, reason)| reason.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        extractor_cells.len(),
+        "the extractor cells did not produce distinct refusals: {distinct:?}"
+    );
 }
 
 /// The guard's content rules, run over forged rows.
