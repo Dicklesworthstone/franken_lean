@@ -17271,6 +17271,29 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
     let oracle_code = &code[oracle_start..matrix_item_start];
     let matrix_code = &code[matrix_start..matrix_end];
 
+    // AND EVERY CLASS TOKEN MUST FALL IN ONE OF THOSE TWO REGIONS. Assertion 5
+    // below says each token is "earned by the code in its own region", which
+    // presumes every token HAS one. Nothing checked that. The forward scan runs
+    // over the whole region, so a census row printed anywhere else in this file
+    // -- a new test, a helper, a lane added later -- has its token measured
+    // against the permitted list and its CODE measured against nothing. The
+    // permission would be granted and the thing it permits earned by no run.
+    //
+    // Measured: four tokens, two in each region, none outside. This is the
+    // conservation half of the split, and the split has had none until now: the
+    // ordering assertion above proves the two regions do not overlap, and this
+    // proves they do not leave anything out.
+    for (offset, _) in code.match_indices("schedule_independence=") {
+        let in_oracle = (oracle_start..matrix_item_start).contains(&offset);
+        let in_matrix = (matrix_start..matrix_end).contains(&offset);
+        assert!(
+            in_oracle || in_matrix,
+            "a census at byte {offset} states a schedule-independence class outside both \
+             regions this guard knows how to check, so its class is permitted by the list \
+             below while no code is ever asked to earn it"
+        );
+    }
+
     // 1. Each SUMMARY row carries its class INLINE, because the numbers are what gets
     //    quoted out of this file and a standalone CLAIM-CLASS row does not travel with
     //    them.
