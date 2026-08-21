@@ -118,6 +118,10 @@ the toolchain would report a perfect facade:
     recognized safety label. A risk bucket without an explicit safety boundary
     is not a complete classification for compilation evidence.
 
+  * An INSTANCE-REGISTRATION JOIN requires demanded instance rows to agree with
+    registration and drop-reason metadata. A name/type probe cannot claim an
+    instance surface whose manifest lifecycle is contradictory.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -444,6 +448,7 @@ def join_demanded_rows(names, manifest_rows):
     effect_mismatches = []
     bucket_mismatches = []
     safety_mismatches = []
+    instance_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
@@ -453,6 +458,7 @@ def join_demanded_rows(names, manifest_rows):
     effect_join = Counter()
     bucket_join = Counter()
     safety_join = Counter()
+    instance_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -482,6 +488,22 @@ def join_demanded_rows(names, manifest_rows):
                 safety_mismatches.append(f"{name}(safety={safety!r})")
                 continue
             safety_join[safety] += 1
+            instance = row.get("instance")
+            registered = row.get("instance_registered")
+            drop_reason = row.get("instance_drop_reason")
+            if instance is True and registered is True and drop_reason is None:
+                instance_join["registered"] += 1
+            elif (instance is True and registered is False
+                  and isinstance(drop_reason, str) and drop_reason.strip()):
+                instance_join["dropped"] += 1
+            elif instance is False and registered is False and drop_reason is None:
+                instance_join["not_instance"] += 1
+            else:
+                instance_mismatches.append(
+                    f"{name}(instance={instance!r}, registered={registered!r}, "
+                    f"drop_reason={drop_reason!r})"
+                )
+                continue
             printer = row.get("printer")
             level_params = row.get("level_params")
             if (printer not in ("pp.fullNames", "pp.explicit", "pp.maxexplicit")
@@ -561,7 +583,7 @@ def join_demanded_rows(names, manifest_rows):
             or provider_mismatches or provider_dependency_mismatches
             or signature_provenance_mismatches or type_dependency_shape_mismatches
             or level_parameter_mismatches or effect_mismatches or bucket_mismatches
-            or safety_mismatches):
+            or safety_mismatches or instance_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -595,6 +617,8 @@ def join_demanded_rows(names, manifest_rows):
             details.append("bucket=" + ", ".join(bucket_mismatches[:8]))
         if safety_mismatches:
             details.append("safety=" + ", ".join(safety_mismatches[:8]))
+        if instance_mismatches:
+            details.append("instance=" + ", ".join(instance_mismatches[:8]))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
@@ -603,7 +627,8 @@ def join_demanded_rows(names, manifest_rows):
             dict(sorted(emission_join.items())), dict(sorted(provider_join.items())),
             dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())),
             dict(sorted(level_parameter_join.items())), dict(sorted(effect_join.items())),
-            dict(sorted(bucket_join.items())), dict(sorted(safety_join.items())))
+            dict(sorted(bucket_join.items())), dict(sorted(safety_join.items())),
+            dict(sorted(instance_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -902,7 +927,8 @@ def main():
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
      demand_printers, demand_type_dependencies,
      demand_level_parameters, demand_effects,
-     demand_buckets, demand_safeties) = join_demanded_rows(
+     demand_buckets, demand_safeties,
+     demand_instances) = join_demanded_rows(
          demand_names, manifest_rows
      )
     type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
@@ -1044,6 +1070,7 @@ def main():
         "demanded_effect_join": demand_effects,
         "demanded_bucket_join": demand_buckets,
         "demanded_safety_join": demand_safeties,
+        "demanded_instance_join": demand_instances,
         "type_dependency_target_join": type_dependency_target_join,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
