@@ -112,8 +112,10 @@ fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expecte
     let residuals = json_object_field(json, field);
     let actual_observed = json_usize_field(residuals, "observed");
     let actual_names = json_name_set(residuals);
+    let decoded_name_entries = residuals.matches("\"name\":\"").count();
     assert_eq!(actual_observed, observed, "{json}");
     assert_eq!(actual_observed, actual_names.len(), "{field}: {json}");
+    assert_eq!(decoded_name_entries, actual_names.len(), "{field}: {json}");
     assert_eq!(json_usize_field(residuals, "omitted"), 0, "{json}");
     assert_eq!(
         actual_names,
