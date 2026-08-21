@@ -11944,14 +11944,38 @@ fn the_objects_no_context_resolves() {
             ((0, 3), 554),
             ((0, 1), 567),
             ((1, 1), 834),
-            ((0, 2), 892),
+            ((0, 2), 893),
         ],
         "indeterminate objects per thousand, best first. `(1, 2)` - worst by \
          mixed-context count in `03c853b1` and by minority arrivals in \
          `259eadde` - is the BEST of the six here, and `(0, 2)` the worst \
          because 5,238 of its 6,506 objects are array-only. Three of my cells \
          ranked `(1, 2)` worst on measures that do not survive the change of \
-         unit"
+         unit. \
+         `(0, 2)` was pinned at 892 in the first version and w233 caught it: I \
+         took 89.3% from a float and wrote it out as a per-mille, where the \
+         integer division here gives 893. Every other figure in this cell came \
+         from the walk; this was the one column I derived in my head"
+    );
+
+    // The finding is an ORDERING, and it is pinned as one as well as by value,
+    // so it does not rest solely on six hand-checkable literals.
+    assert!(
+        by_indeterminacy
+            .windows(2)
+            .all(|pair| pair[0].1 <= pair[1].1),
+        "the vector above must stay sorted, or `best first` is not what it says"
+    );
+    assert_eq!(
+        (
+            by_indeterminacy.first().expect("six shapes").0,
+            by_indeterminacy.last().expect("six shapes").0
+        ),
+        ((1, 2), (0, 2)),
+        "and the INVERSION is the finding: the shape three earlier cells called \
+         the worst is the least indeterminate of the six, and the worst is \
+         `(0, 2)`, which none of them singled out. That holds whatever the \
+         exact per-mille figures are"
     );
 }
 
