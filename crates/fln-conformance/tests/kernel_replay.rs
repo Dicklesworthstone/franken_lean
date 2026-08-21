@@ -17359,6 +17359,30 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
         "observed_once_not_an_invariant",
         "refuted_this_run_found_a_width_disagreement",
     ];
+    // AND THE SCAN BELOW READS ONE SPELLING OF THE KEY. It finds rows by the
+    // literal `schedule_independence=`, so a row stating its class any other way
+    // -- as a JSON key, with a space before the `=`, or as part of a longer name
+    // -- is not a row as far as this guard is concerned. It would be checked by
+    // nothing, and the reverse loop below would go on being satisfied by the
+    // rows that still use the old spelling.
+    //
+    // This file already speaks a SECOND vocabulary for the same idea: the
+    // retained receipts declare their class as a `class` field, and three rows
+    // in the scanned region carry one. Those are validated elsewhere, by the
+    // receipt validators, so nothing is escaping today -- but a census row
+    // written in the receipts' spelling would fall between the two, and the two
+    // spellings sitting in one file is what makes that likely rather than
+    // hypothetical.
+    //
+    // Measured: every one of the four occurrences of the word in the region is
+    // in the scanned form. The rule binds the WORD to the FORM, so a new
+    // spelling reddens here instead of disappearing.
+    assert_eq!(
+        code.matches("schedule_independence").count(),
+        code.matches("schedule_independence=").count(),
+        "a census states its schedule-independence class in a spelling this scan does not \
+         read, so the class allowance below never sees it"
+    );
     let mut cursor = code;
     while let Some(offset) = cursor.find("schedule_independence=") {
         let rest = &cursor[offset + "schedule_independence=".len()..];
