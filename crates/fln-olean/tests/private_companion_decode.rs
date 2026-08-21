@@ -285,6 +285,11 @@ const BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1: &str =
     "_private.Init.Data.ByteArray.Basic.0.ByteArray.fastAppend_eq._simp_1_1";
 /// The pin's private byte-array companion stores this theorem in Basic.
 const BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1_MODULE: &str = "Init/Data/ByteArray/Basic";
+/// The private simp theorem for `Dyadic.neg_add_cancel`.
+const DYADIC_NEG_ADD_CANCEL_SIMP_1_1: &str =
+    "_private.Init.Data.Dyadic.Basic.0.Dyadic.neg_add_cancel._simp_1_1";
+/// The pin's private dyadic companion stores this theorem in Basic.
+const DYADIC_NEG_ADD_CANCEL_SIMP_1_1_MODULE: &str = "Init/Data/Dyadic/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1999,6 +2004,36 @@ fn byte_array_fast_append_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn dyadic_neg_add_cancel_simp_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("dyadic_neg_add_cancel_simp_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, DYADIC_NEG_ADD_CANCEL_SIMP_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&DYADIC_NEG_ADD_CANCEL_SIMP_1_1.to_owned()),
+        "the private companion of {DYADIC_NEG_ADD_CANCEL_SIMP_1_1_MODULE} must retain \\
+         {DYADIC_NEG_ADD_CANCEL_SIMP_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == DYADIC_NEG_ADD_CANCEL_SIMP_1_1)
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {DYADIC_NEG_ADD_CANCEL_SIMP_1_1}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {DYADIC_NEG_ADD_CANCEL_SIMP_1_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
