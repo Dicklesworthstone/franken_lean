@@ -236,6 +236,9 @@ open Lean in
           | none => pure "-"))
       IO.println s!"RESHEAD\t{n}\t{rh}"
       IO.println s!"EXTERN\t{n}\t{isExtern env n}"
+      match Compiler.getImplementedBy? env n with
+      | some t => IO.println s!"IMPLBY\t{n}\t{t}"
+      | none => pure ()
       match env.getModuleIdxFor? n with
       | some idx => IO.println s!"MOD\t{n}\t{env.header.moduleNames[idx.toNat]!}"
       | none => pure ()
@@ -390,6 +393,7 @@ def probe(lean, env, work, names):
     res_head = {}
     priorities = {}
     extern_of = {}
+    impl_by = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -413,6 +417,10 @@ def probe(lean, env, work, names):
         elif line.startswith("SAFE\t"):
             _, name, status = line.split("\t", 2)
             safety_status[name] = status.strip()
+            current = None
+        elif line.startswith("IMPLBY\t"):
+            _, name, target = line.split("\t", 2)
+            impl_by[name] = target.strip()
             current = None
         elif line.startswith("EXTERN\t"):
             _, name, flag = line.split("\t", 2)
@@ -464,7 +472,7 @@ def probe(lean, env, work, names):
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
-            module_of, struct_fields, res_head, priorities, extern_of)
+            module_of, struct_fields, res_head, priorities, extern_of, impl_by)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -856,6 +864,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_res_head = {}
     pin_priority = {}
     pin_extern = {}
+    pin_impl_by = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -874,7 +883,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds, rh, prio, ext) = probe(lean, env, work, frontier)
+         rd, sfy, mod, flds, rh, prio, ext, iby) = probe(
+            lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
@@ -885,6 +895,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_res_head.update(rh)
         pin_priority.update(prio)
         pin_extern.update(ext)
+        pin_impl_by.update(iby)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -917,7 +928,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
             pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head,
-            pin_priority, pin_extern)
+            pin_priority, pin_extern, pin_impl_by)
 
 
 def order(names, deps):
@@ -1258,8 +1269,8 @@ def main():
     (types, typesx, typesm, levels, insts, deps, missing, init_provided,
      rounds, structs, binders, absent_projections, pbinders,
      pin_reducibility, pin_safety, pin_module,
-     pin_fields, pin_res_head, pin_priority, pin_extern) = close_over_types(
-        lean, env, work, facade_demand, census)
+     pin_fields, pin_res_head, pin_priority, pin_extern,
+     pin_impl_by) = close_over_types(lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -1319,6 +1330,15 @@ def main():
     # artifact. The pin is asked (isExtern) and the census's column is checked
     # against it.
     extern_disagreements = []
+    # THE OTHER HALF OF R-EXTERN. Last wave recorded that @[implemented_by] was not
+    # probed because `Lean.getImplementedBy?` does not resolve in this pin. That
+    # was true of the NAME and false of the capability: the accessor is
+    # `Lean.Compiler.getImplementedBy?`. A disclosure like that is an excuse until
+    # the scan is re-run with the right needle, so it is re-run here — and with it
+    # the resistance census's R-EXTERN bucket (extern OR implemented_by) can be
+    # reconciled against the pin instead of left as two numbers that look like a
+    # contradiction.
+    impl_by_disagreements = []
 
     def is_reducible(n):
         pin = pin_reducibility.get(n)
@@ -1328,6 +1348,19 @@ def main():
                 in ((census.get(n) or {}).get("attrs") or ""))
 
     for n in sorted(types):
+        pin_ib = pin_impl_by.get(n)
+        ibrow = census.get(n) or {}
+        if "impl_by" in ibrow:
+            # The census stores this as a STRUCTURAL KEY, the pin as a dotted
+            # name: `a/s"Lean"/s"Expr"/s"app"/s"_override"` is
+            # `Lean.Expr.app._override`. Comparing the raw strings made all 14
+            # rows look like drift when not one of them differs.
+            census_ib = ibrow.get("impl_by")
+            census_ib = (None if census_ib in ("", "-", None)
+                         else (dotted(census_ib) or census_ib))
+            if (census_ib or None) != (pin_ib or None):
+                impl_by_disagreements.append(
+                    {"name": n, "census": census_ib, "pin": pin_ib})
         pin_ext = pin_extern.get(n)
         erow = census.get(n) or {}
         if pin_ext is not None and "extern" in erow:
@@ -1391,8 +1424,8 @@ def main():
         if not extra:
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
-         pb2, rd2, sfy2, mod2, flds2, rh2, prio2, ext2) = close_over_types(
-            lean, env, work, extra, census)
+         pb2, rd2, sfy2, mod2, flds2, rh2, prio2, ext2,
+         iby2) = close_over_types(lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
@@ -1404,6 +1437,7 @@ def main():
         pin_res_head.update(rh2)
         pin_priority.update(prio2)
         pin_extern.update(ext2)
+        pin_impl_by.update(iby2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -2088,6 +2122,17 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "implemented_by_probed": len(pin_extern),
+        "implemented_by_rows": sorted(pin_impl_by),
+        "implemented_by_census_disagreements": impl_by_disagreements,
+        "r_extern_union_rows": sorted(
+            set(n for n, v in pin_extern.items() if v) | set(pin_impl_by)),
+        "r_extern_union_note": "R-EXTERN in the resistance census is a UNION: a row "
+            "is bucketed there when it carries an extern entry OR an "
+            "@[implemented_by]. Reporting only the C externs made 4 look like it "
+            "contradicted 44. Both halves are now measured from the pin, so the "
+            "union is a number this artifact can state rather than a gap between "
+            "two artifacts.",
         "extern_probed": len(pin_extern),
         "extern_rows": sorted(n for n, v in pin_extern.items() if v),
         "extern_census_disagreements": extern_disagreements,
@@ -2221,6 +2266,7 @@ def main():
             "bucket": d["bucket"], "effect": d["effect"],
             "safety": pin_safety.get(name, d["safety"]),
             "extern": pin_extern.get(name),
+            "implemented_by": pin_impl_by.get(name),
             "extern_source": "pin" if name in pin_extern else None,
             "safety_source": "pin" if name in pin_safety else "census",
             "module": pin_module.get(name, d["module"]),
@@ -2287,6 +2333,7 @@ def main():
           f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
           f"values={values_checked} "
+          f"implby={len(pin_impl_by)} implby_drift={len(impl_by_disagreements)} "
           f"ext_probed={len(pin_extern)}"
           f"/{sum(1 for v in pin_extern.values() if v)}extern "
           f"ext_drift={len(extern_disagreements)} "
