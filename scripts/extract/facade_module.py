@@ -1187,8 +1187,18 @@ def structural_block(name, d, st, bs, deps, pks):
         (params if i < st["num_params"] else fields).append(b)
     if not fields:
         return None
+    # THE ROW'S OWN NAME IS NOT AT `_root_` YET. Inside `structure X where` the
+    # name X refers to the declaration being elaborated, and `_root_.X` names
+    # nothing at all, so a field whose type mentions X was anchored into
+    # "Unknown identifier `_root_.Lean.Language.SnapshotTree`" and the whole block
+    # was refused. That is 14 of the 24 structures wave 65 measured falling back
+    # to `axiom` and taking their constructors with them. The inductive path was
+    # given exactly this exclusion when it was written; the structural path, which
+    # is older, never was. Filtering can only affect a row whose own name appears
+    # in its own block, and such a row cannot currently be elaborating.
+    sdeps = [x for x in deps if x != name]
     head = f"{keyword} {d['decl_name']}{binder}" + (
-        (" " + " ".join(binder_text(b, deps) for b in params)) if params else "") + " where"
+        (" " + " ".join(binder_text(b, sdeps) for b in params)) if params else "") + " where"
     lines = [head]
     for b in fields:
         # A field name is a SINGLE component: escaping the whole string is right,
@@ -1196,7 +1206,7 @@ def structural_block(name, d, st, bs, deps, pks):
         fname = safe_ident(b["user"])
         if not fname:
             return None
-        lines.append(f"  {fname} : {root_anchor(b['type'], deps)}")
+        lines.append(f"  {fname} : {root_anchor(b['type'], sdeps)}")
     return lines
 
 

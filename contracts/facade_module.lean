@@ -2286,8 +2286,10 @@ structure Lean.Language.Snapshot where
   infoTree? : _root_.Option _root_.Lean.Elab.InfoTree
   traces : _root_.Lean.TraceState
   isFatal : _root_.Bool
--- role=substrate bucket=- effect=pure module=Lean.Language.Basic
-axiom Lean.Language.SnapshotTree : Type
+-- role=substrate bucket=- structural=structure module=Lean.Language.Basic
+structure Lean.Language.SnapshotTree where
+  element : _root_.Lean.Language.Snapshot
+  children : _root_.Array (_root_.Lean.Language.SnapshotTask Lean.Language.SnapshotTree)
 -- role=substrate bucket=- structural=structure module=Lean.CoreM
 structure Lean.Core.State where
   env : _root_.Lean.Environment
@@ -2316,12 +2318,6 @@ structure Lean.Elab.Command.State where
 structure Lean.Language.DynamicSnapshot where
   val : _root_.Dynamic
   tree : _root_.Thunk _root_.Lean.Language.SnapshotTree
--- role=substrate bucket=- effect=pure module=Lean.Language.Basic
-axiom Lean.Language.SnapshotTree.children : _root_.Lean.Language.SnapshotTree → _root_.Array (_root_.Lean.Language.SnapshotTask _root_.Lean.Language.SnapshotTree)
--- role=substrate bucket=- effect=pure module=Lean.Language.Basic
-axiom Lean.Language.SnapshotTree.element : _root_.Lean.Language.SnapshotTree → _root_.Lean.Language.Snapshot
--- role=substrate bucket=- effect=pure module=Lean.Language.Basic
-axiom Lean.Language.SnapshotTree.mk : _root_.Lean.Language.Snapshot → _root_.Array (_root_.Lean.Language.SnapshotTask _root_.Lean.Language.SnapshotTree) → _root_.Lean.Language.SnapshotTree
 -- role=demanded bucket=R-NONE transparent module=Lean.CoreM
 @[reducible] noncomputable def Lean.Core.CoreM : Type → Type := _root_.ReaderT _root_.Lean.Core.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Core.State (_root_.EIO _root_.Lean.Exception))
 -- role=substrate bucket=- structural=structure module=Lean.CoreM
@@ -2618,8 +2614,13 @@ inductive Lean.Elab.Tactic.ElabSimpArgResult where
   | eraseSimproc : _root_.Lean.Name → Lean.Elab.Tactic.ElabSimpArgResult
   | star : Lean.Elab.Tactic.ElabSimpArgResult
   | none : Lean.Elab.Tactic.ElabSimpArgResult
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot : Type
+-- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
+structure Lean.Elab.Tactic.TacticParsedSnapshot where
+  toSnapshot : _root_.Lean.Language.Snapshot
+  stx : _root_.Lean.Syntax
+  inner? : _root_.Option (_root_.Lean.Language.SnapshotTask Lean.Elab.Tactic.TacticParsedSnapshot)
+  finished : _root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticFinishedSnapshot
+  next : _root_.Array (_root_.Lean.Language.SnapshotTask Lean.Elab.Tactic.TacticParsedSnapshot)
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.Rewrite
 axiom Lean.Meta.Simp.mkDefaultMethodsCore : _root_.Lean.Meta.Simp.SimprocsArray → _root_.Lean.Meta.Simp.Methods
 -- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Main pp=explicit
@@ -2630,18 +2631,6 @@ structure Lean.Elab.Tactic.MkSimpContextResult where
   simprocs : _root_.Lean.Meta.Simp.SimprocsArray
   dischargeWrapper : _root_.Lean.Elab.Tactic.Simp.DischargeWrapper
   simpArgs : _root_.Array (_root_.Lean.Syntax × _root_.Lean.Elab.Tactic.ElabSimpArgResult)
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot.finished : _root_.Lean.Elab.Tactic.TacticParsedSnapshot → _root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticFinishedSnapshot
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot.inner? : _root_.Lean.Elab.Tactic.TacticParsedSnapshot → _root_.Option (_root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticParsedSnapshot)
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot.mk : _root_.Lean.Language.Snapshot → _root_.Lean.Syntax → _root_.Option (_root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticParsedSnapshot) → _root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticFinishedSnapshot → _root_.Array (_root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticParsedSnapshot) → _root_.Lean.Elab.Tactic.TacticParsedSnapshot
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot.next : _root_.Lean.Elab.Tactic.TacticParsedSnapshot → _root_.Array (_root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticParsedSnapshot)
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot.stx : _root_.Lean.Elab.Tactic.TacticParsedSnapshot → _root_.Lean.Syntax
--- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Tactic.TacticParsedSnapshot.toSnapshot : _root_.Lean.Elab.Tactic.TacticParsedSnapshot → _root_.Lean.Language.Snapshot
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
 structure Lean.Elab.Term.Context where
   declName? : _root_.Option _root_.Lean.Name
