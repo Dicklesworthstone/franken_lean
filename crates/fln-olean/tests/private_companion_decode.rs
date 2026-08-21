@@ -251,6 +251,11 @@ const ARRAY_ATTACH_WITH_IMPL: &str =
     "_private.Init.Data.Array.Attach.0.Array.attachWithImpl";
 /// The pin's private array stores this implementation in the attach module.
 const ARRAY_ATTACH_WITH_IMPL_MODULE: &str = "Init/Data/Array/Attach";
+/// The private equation theorem generated for `Array.unattach`.
+const ARRAY_UNATTACH_EQ_1: &str =
+    "_private.Init.Data.Array.Attach.0.Array.unattach.eq_1";
+/// The pin's private array stores this theorem in the attach module.
+const ARRAY_UNATTACH_EQ_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1385,6 +1390,34 @@ fn array_attach_with_impl_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_ATTACH_WITH_IMPL} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_unattach_equation_theorem_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_unattach_equation_theorem_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_UNATTACH_EQ_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_UNATTACH_EQ_1.to_owned()),
+        "the private companion of {ARRAY_UNATTACH_EQ_1_MODULE} must retain {ARRAY_UNATTACH_EQ_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_UNATTACH_EQ_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_UNATTACH_EQ_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_UNATTACH_EQ_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
