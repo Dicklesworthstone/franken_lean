@@ -2332,6 +2332,30 @@ def main():
             "REFUSE: facade manifest projection-type count must exceed explicit "
             f"value count ({json.dumps(projection_explicit_value_inequality_join, sort_keys=True)})"
         )
+    roundtrip_transparent_declaration_inequality_join = {
+        "summary_type_roundtrip_checked": manifest_summary.get(
+            "type_roundtrip_checked"
+        ),
+        "summary_transparent_declarations": manifest_summary.get(
+            "transparent_declarations"
+        ),
+    }
+    if (not isinstance(roundtrip_transparent_declaration_inequality_join[
+            "summary_type_roundtrip_checked"], int)
+            or isinstance(roundtrip_transparent_declaration_inequality_join[
+                "summary_type_roundtrip_checked"], bool)
+            or not isinstance(roundtrip_transparent_declaration_inequality_join[
+                "summary_transparent_declarations"], int)
+            or isinstance(roundtrip_transparent_declaration_inequality_join[
+                "summary_transparent_declarations"], bool)
+            or roundtrip_transparent_declaration_inequality_join[
+                "summary_type_roundtrip_checked"]
+            <= roundtrip_transparent_declaration_inequality_join[
+                "summary_transparent_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest roundtrip count must exceed transparent "
+            f"declaration count ({json.dumps(roundtrip_transparent_declaration_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4311,6 +4335,9 @@ def main():
         ),
         "manifest_projection_explicit_value_inequality_join": (
             projection_explicit_value_inequality_join
+        ),
+        "manifest_roundtrip_transparent_declaration_inequality_join": (
+            roundtrip_transparent_declaration_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
