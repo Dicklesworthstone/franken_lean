@@ -6670,7 +6670,9 @@ fn companion_files_belong_to_modules_and_the_chain_has_exactly_three_parts() {
 /// The library-wide count is provenance for the biconditional; what this cell
 /// walks is the 600 census modules plus whatever the filesystem says lacks a
 /// companion. A library module with `is_module` false that DID carry companions
-/// is the one case outside that scope, and the sweep found none.
+/// is the one case outside that scope; it is now covered by
+/// `every_olean_in_the_library_agrees_with_its_companion_status`, which reads
+/// the flag on all 2,433 rather than only where the answer is known.
 #[test]
 fn the_is_module_flag_predicts_which_oleans_have_companions() {
     let lib = lib_or_skip!();
@@ -13657,5 +13659,93 @@ fn the_axioms_extension_biconditional_holds_over_every_init_module() {
     assert_eq!(
         widest, 2_204,
         "the largest block counts Prelude's exported declarations"
+    );
+}
+
+/// The `is_module` biconditional, read on every olean in the library rather than
+/// on the two that already fail.
+///
+/// `the_is_module_flag_predicts_which_oleans_have_companions` reads the flag for
+/// the companion-less modules and for the 600 census modules, and closes with:
+/// "A library module with `is_module` false that DID carry companions is the one
+/// case outside that scope, and the sweep found none." That case is outside the
+/// scope BY CONSTRUCTION — the cell only ever opens files it already knows the
+/// answer for. Between the 600 it checks and the 2 it derives, 1,831 library
+/// oleans are never opened, and a false flag on any of them would be invisible.
+///
+/// Read on all 2,433: the flag is true 2,431 times and false twice, and the
+/// false set equals the companion-less set exactly. Both directions now come
+/// from the same walk rather than one direction being sampled and the other
+/// argued.
+///
+/// This costs less than the caution around it suggested. The whole exported
+/// library is 0.33 GiB on disk — measured from `st_blocks`, not from apparent
+/// size — so opening every olean once is cheaper than several of the
+/// three-part `Init` passes this file already runs.
+///
+/// WHAT THE OLDER CELL STILL DOES BETTER: it discovers the two names from the
+/// filesystem instead of writing them into an assertion, so a third non-module
+/// olean would be picked up rather than failing an equality against two
+/// hardcoded strings. This cell keeps that — the expected set is derived from
+/// the companion walk, and the names appear nowhere in it.
+///
+/// Conservation first: both partitions must independently account for all 2,433
+/// oleans before they are compared, so a walk that silently dropped a file
+/// cannot make the two sides agree by shrinking together.
+#[test]
+fn every_olean_in_the_library_agrees_with_its_companion_status() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let module_name = |path: &String| -> String {
+        path.strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".")
+    };
+    let without: BTreeSet<String> = all
+        .exported
+        .difference(&all.private)
+        .map(module_name)
+        .collect();
+
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    let mut unflagged: BTreeSet<String> = BTreeSet::new();
+    for path in &all.exported {
+        let module = module_name(path);
+        if module_view(&lib, &module, Level::Exported).is_module {
+            flagged.insert(module);
+        } else {
+            unflagged.insert(module);
+        }
+    }
+
+    // Conservation first: each partition accounts for the whole census on its
+    // own, so the comparison below cannot be satisfied by two walks that both
+    // lost the same file.
+    assert_eq!(
+        flagged.len() + unflagged.len(),
+        all.exported.len(),
+        "the flag must classify every exported olean"
+    );
+    assert_eq!(
+        without.len() + all.private.len(),
+        all.exported.len(),
+        "and the filesystem must classify every exported olean"
+    );
+
+    // The biconditional, both directions from one walk.
+    assert_eq!(
+        unflagged, without,
+        "an olean is flagged a non-module exactly when it has no companion parts"
+    );
+
+    assert_eq!(
+        (all.exported.len(), flagged.len(), unflagged.len()),
+        (2_433, 2_431, 2),
+        "the library census and the two sides of the flag"
+    );
+    assert!(
+        !unflagged.is_empty() && !flagged.is_empty(),
+        "the flag must take both values, or a constant decode would satisfy the equality"
     );
 }
