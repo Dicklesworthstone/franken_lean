@@ -42,11 +42,13 @@ import json
 import os
 import pathlib
 import re
+import signal
 import builtins
 import contextlib
 import subprocess
 import sys
 import tempfile
+import threading
 from collections import defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2193,11 +2195,67 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
     return "\n".join(body) + "\n", line_map, emitted, attrs, provided
 
 
+# What a case may use and must not leave changed. One row per thing, so adding
+# another is a line here and a line in the restorer.
+STATE_FIELDS = (
+    ("cwd", "the working directory"),
+    ("umask", "the umask"),
+    ("env", "the environment"),
+    ("path", "sys.path"),
+    ("streams", "sys.stdout / sys.stderr"),
+    ("signals", "the signal handlers"),
+    ("threads", "the live thread count"),
+)
+WATCHED_SIGNALS = tuple(
+    getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP")
+    if hasattr(signal, name))
+
+
 def process_state():
-    """The process-global state a case must not leave changed behind it."""
+    """The process-global state a case must not leave changed behind it.
+
+    `streams` is here because a self-test that cannot be silenced is worth more
+    than one that catches an extra syscall: `sys.stderr = io.StringIO()` opens no
+    file, so no guard sees it, and it went straight through and STAYED swapped --
+    measured. Every verdict this command produces, the SELF-TEST OK line and the
+    REFUSE alike, is printed to sys.stderr, so a case that replaces it makes the
+    checker report into a buffer nobody reads.
+
+    `path`, `signals` and `threads` are the same family: sys.path decides what
+    everything after imports, a handler installed here outlives the block, and a
+    thread started here is still running when the verdict is printed.
+    """
     umask = os.umask(0o022)
     os.umask(umask)
-    return (os.getcwd(), umask, dict(os.environ))
+    return {
+        "cwd": os.getcwd(),
+        "umask": umask,
+        "env": dict(os.environ),
+        "path": list(sys.path),
+        "streams": (sys.stdout, sys.stderr),
+        "signals": {sig: signal.getsignal(sig) for sig in WATCHED_SIGNALS},
+        "threads": threading.active_count(),
+    }
+
+
+def restore_process_state(before):
+    """Put back everything in STATE_FIELDS that can be put back.
+
+    A function rather than a block inside the sandbox so it can be exercised on
+    its own. It could not be, before: every state case tested the pure drift
+    comparison, so a mutant that deleted the stream restoration passed the whole
+    self-test -- the detector still SAW the drift and reported it, and nobody
+    checked that the putting-back happened. A thread cannot be un-started, which
+    is why the count is reported and never restored.
+    """
+    os.chdir(before["cwd"])
+    os.umask(before["umask"])
+    os.environ.clear()
+    os.environ.update(before["env"])
+    sys.path[:] = before["path"]
+    sys.stdout, sys.stderr = before["streams"]
+    for sig, handler in before["signals"].items():
+        signal.signal(sig, handler)
 
 
 def process_state_drift(before, after):
@@ -2215,17 +2273,24 @@ def process_state_drift(before, after):
     Returns a list of descriptions, empty when the process came back as it went in.
     """
     drift = []
-    if before[0] != after[0]:
-        drift.append(f"the working directory was left at {after[0]} "
-                     f"instead of {before[0]}")
-    if before[1] != after[1]:
-        drift.append(f"the umask was left at {oct(after[1])} instead of "
-                     f"{oct(before[1])}")
-    changed = sorted(
-        set(before[2]) ^ set(after[2])
-        | {k for k in set(before[2]) & set(after[2]) if before[2][k] != after[2][k]})
-    if changed:
-        drift.append(f"the environment was left changed: {changed[:6]}")
+    for key, label in STATE_FIELDS:
+        if before[key] == after[key]:
+            continue
+        if key == "env":
+            changed = sorted(
+                set(before[key]) ^ set(after[key])
+                | {k for k in set(before[key]) & set(after[key])
+                   if before[key][k] != after[key][k]})
+            drift.append(f"{label} was left changed: {changed[:6]}")
+        elif key == "umask":
+            drift.append(f"{label} was left at {oct(after[key])} instead of "
+                         f"{oct(before[key])}")
+        elif key == "streams":
+            drift.append(f"{label} were replaced, so every verdict this command "
+                         "prints would go somewhere nobody is reading")
+        else:
+            drift.append(f"{label} was left changed: {after[key]!r} instead of "
+                         f"{before[key]!r}"[:160])
     return drift
 
 
@@ -2410,10 +2475,11 @@ def self_test_sandbox(work):
         # exception is in flight would replace a real failure with this one.
         drift = process_state_drift(before, process_state())
         if drift:
-            os.chdir(before[0])
-            os.umask(before[1])
-            os.environ.clear()
-            os.environ.update(before[2])
+            # Put back everything that can be put back. A thread that was started
+            # cannot be un-started, which is why the count is reported and not
+            # restored -- the drift message is the only thing that can be honest
+            # about it.
+            restore_process_state(before)
             raise SelfTestViolation(
                 "the self-test left the process changed behind it: "
                 + "; ".join(drift)
@@ -2580,21 +2646,59 @@ def self_test():
     # The drift detector is exercised directly rather than by nesting a sandbox
     # inside this one, which would double-apply every patch and restore them to
     # the guarded versions.
-    _st = (("/a", 0o022, {"X": "1"}), ("/a", 0o022, {"X": "1"}))
-    case("state/no-drift-when-unchanged",
-         "; ".join(process_state_drift(*_st)) or None, False)
-    case("state/cwd-left-changed",
-         "; ".join(process_state_drift(_st[0], ("/b", 0o022, {"X": "1"}))) or None,
-         True)
-    case("state/umask-left-changed",
-         "; ".join(process_state_drift(_st[0], ("/a", 0o077, {"X": "1"}))) or None,
-         True)
-    case("state/env-left-changed",
-         "; ".join(process_state_drift(_st[0], ("/a", 0o022, {"X": "2"}))) or None,
-         True)
-    case("state/env-key-added",
-         "; ".join(process_state_drift(_st[0], ("/a", 0o022, {"X": "1", "Y": "1"})))
-         or None, True)
+    _base = {"cwd": "/a", "umask": 0o022, "env": {"X": "1"}, "path": ["/p"],
+             "streams": ("out", "err"), "signals": {2: "h"}, "threads": 1}
+
+    def _drifted(**changes):
+        return "; ".join(
+            process_state_drift(_base, {**_base, **changes})) or None
+
+    case("state/no-drift-when-unchanged", _drifted(), False)
+    case("state/cwd-left-changed", _drifted(cwd="/b"), True)
+    case("state/umask-left-changed", _drifted(umask=0o077), True)
+    case("state/env-left-changed", _drifted(env={"X": "2"}), True)
+    case("state/env-key-added", _drifted(env={"X": "1", "Y": "1"}), True)
+    case("state/sys-path-left-changed", _drifted(path=["/p", "/q"]), True)
+    case("state/verdict-stream-replaced",
+         _drifted(streams=("out", "swallowed")), True)
+    case("state/signal-handler-left-installed",
+         _drifted(signals={2: "ignored"}), True)
+    case("state/thread-left-running", _drifted(threads=2), True)
+    # EVERY FIELD IN THE TABLE MUST BE ONE THIS DETECTOR ACTUALLY LOOKS AT. A row
+    # added to STATE_FIELDS and never compared would read as covered and watch
+    # nothing; the markers are type-correct per field so the formatter can render
+    # each one rather than failing on the first.
+    _markers = {"cwd": "/zz", "umask": 0o077, "env": {"ZZ": "1"},
+                "path": ["/zz"], "streams": ("zz", "zz"), "signals": {2: "zz"},
+                "threads": 99}
+    _unwatched = [k for k, _ in STATE_FIELDS if not _drifted(**{k: _markers[k]})]
+    case("state/every-field-detected",
+         f"never compared: {_unwatched}" if _unwatched else None, False)
+    # THE RESTORER ITSELF, exercised for real: change the process, put it back,
+    # and there must be nothing left to report. Without this a mutant that
+    # deleted a restoration line passed, because the detector still saw the drift
+    # and only the putting-back was missing.
+    # EVERY RESTORABLE FIELD IS PERTURBED, not a convenient two. The first
+    # version of this case moved the cwd and sys.path only, and a mutant that
+    # deleted the stream restoration survived it -- the case cannot see a line it
+    # never makes work. Note what the stream perturbation costs if the restore is
+    # broken: the failure message goes into the StringIO and is never seen, which
+    # is precisely the hazard being guarded, visible here as an exit code with no
+    # explanation.
+    _snapshot = process_state()
+    os.chdir(work)
+    sys.path.insert(0, os.path.join(work, "not-real"))
+    os.environ["FLN_L8F_SELFTEST_PERTURB"] = "1"
+    os.umask(0o077)
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    for _sig in WATCHED_SIGNALS:
+        signal.signal(_sig, signal.SIG_IGN)
+    restore_process_state(_snapshot)
+    case("state/restore-puts-it-back",
+         "; ".join(process_state_drift(_snapshot, process_state())) or None, False)
+    case("state/every-field-has-a-marker",
+         f"no marker: {[k for k, _ in STATE_FIELDS if k not in _markers]}"
+         if any(k not in _markers for k, _ in STATE_FIELDS) else None, False)
     case("sandbox/blocks-mkfifo",
          blocked(lambda: os.mkfifo(outside + ".fifo")), True)
     case("sandbox/blocks-kill",
