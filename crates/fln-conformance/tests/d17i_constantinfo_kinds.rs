@@ -4332,3 +4332,116 @@ fn recursor_binder_names_follow_the_generated_shape() {
          inductive, got {fallbacks}"
     );
 }
+
+/// Constructors whose parameter binder NAMES differ from their inductive's.
+///
+/// Both are the `refl` constructor of a K-carrying equality, and in both the
+/// INDUCTIVE side carries a macro-hygienic binder name while the constructor
+/// side carries the plain one.
+const HYGIENIC_PARAMETER_MISMATCHES: &[(&str, &str)] = &[("Eq.refl", "Eq"), ("HEq.refl", "HEq")];
+
+/// Parameter binder NAMES across a block, which is a different question from
+/// parameter binder TYPES.
+///
+/// `d1e0a3c4` compared the leading parameter DOMAINS of a constructor against
+/// its inductive's and found them identical. Domains are what admission needs to
+/// agree on; names are what byte-exact recursor comparison needs, since a
+/// regenerated recursor takes its parameter binders from the inductive. The two
+/// questions have different answers here, which is the reason to ask the second
+/// one separately.
+///
+/// Measured over `Init/Prelude` at private level: of the 107 constructors whose
+/// inductive takes parameters, 105 share its binder names exactly. The two that
+/// do not are `Eq.refl` and `HEq.refl`, where the inductive's second parameter
+/// is `a._@._internal._hyg.0` — a MACRO-HYGIENIC name — while the constructor's
+/// is plain `a`.
+///
+/// The exceptions are characterised rather than merely listed: each is required
+/// to differ ONLY by the inductive side carrying a hygiene marker. A different
+/// kind of disagreement in the same place would fail, which a bare name list
+/// would not catch.
+///
+/// Worth noting where they land. `Eq` and `HEq` are two of the three types whose
+/// recursors carry K, so hygiene in binder names shows up precisely on the types
+/// this bead's elimination work keeps returning to — and a regeneration that
+/// normalised those names away would differ from the artifact byte-for-byte
+/// while being semantically identical.
+#[test]
+fn constructors_share_their_inductives_parameter_binder_names_except_under_hygiene() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    let binder_names = |type_: &Expr, count: usize| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = type_;
+        while out.len() < count {
+            let ExprNode::ForallE {
+                binder_name, body, ..
+            } = current.node()
+            else {
+                break;
+            };
+            out.push(binder_name.to_display_string());
+            current = body;
+        }
+        out
+    };
+
+    let mut agreeing = 0usize;
+    let mut differing: Vec<(String, String)> = Vec::new();
+    for info in &infos {
+        let ConstantInfo::Ctor(ctor) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        let induct_name = ctor.induct.to_display_string();
+        let induct = inductives
+            .get(&induct_name)
+            .expect("constructor's inductive decodes");
+        if induct.num_params == 0 {
+            continue;
+        }
+        let count = induct.num_params as usize;
+        let theirs = binder_names(&induct.base.type_, count);
+        let mine = binder_names(&ctor.base.type_, count);
+        if mine == theirs {
+            agreeing += 1;
+            continue;
+        }
+        // Characterise the disagreement: the inductive side must be the plain
+        // name carrying a hygiene marker, and nothing else may differ.
+        for (theirs, mine) in theirs.iter().zip(&mine) {
+            if theirs == mine {
+                continue;
+            }
+            assert!(
+                theirs.starts_with(&format!("{mine}._@.")) && theirs.contains("_hyg"),
+                "{name}: parameter binder `{mine}` differs from its inductive's `{theirs}` by \
+                 something other than macro hygiene"
+            );
+        }
+        differing.push((name, induct_name));
+    }
+
+    assert!(
+        agreeing >= 100,
+        "the parameter-name comparison must be exercised, got {agreeing} agreements"
+    );
+    differing.sort();
+    let expected: Vec<(String, String)> = HYGIENIC_PARAMETER_MISMATCHES
+        .iter()
+        .map(|(ctor, induct)| ((*ctor).to_string(), (*induct).to_string()))
+        .collect();
+    assert_eq!(
+        differing, expected,
+        "the constructors whose parameter binder names differ from their inductive's; a new one \
+         needs looking at rather than absorbing, since byte-exact recursor comparison reads \
+         these names"
+    );
+}
