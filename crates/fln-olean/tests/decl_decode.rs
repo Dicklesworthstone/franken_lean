@@ -894,6 +894,26 @@ fn the_cons_cell_scalar_area_is_empty_and_that_is_what_fixes_its_size() {
 /// Only then are the width and the size asserted, and they are asserted on the
 /// cells that count bound.
 ///
+/// THE FIRST VERSION OF THIS CELL WAS ITSELF THE DEFECT IT LOOKS FOR, and w113
+/// caught it on `Init/Prelude.olean`. It treated `(tag, other, cs_sz) ==
+/// (0, 3, 32)` as identifying a `ConstantVal` and asserted that every hop of
+/// such an object's slot-1 chain was a cons cell. That header shape is
+/// `ConstantVal`'s and ALSO other three-field structures'; on Prelude one of
+/// them holds an array there, and the walk asserted `(246, 0) == (1, 2)`. The
+/// C3 fixtures are too small to contain a collision, so the filter looked
+/// injective for exactly as long as nobody ran it at scale - a projection keyed
+/// as an identity without checking injectivity, which is the same defect this
+/// file's other cells were written to catch.
+///
+/// The repair is not a looser assertion. A candidate must now also NAME a
+/// declaration this module declares, and a candidate whose slot 1 is not a cons
+/// chain is DROPPED rather than asserted against - a mismatch there is evidence
+/// the object is something else, not evidence the corpus is malformed. The
+/// binding then requires some candidate to carry a chain of exactly the decoded
+/// length, and measures that chain. That is stronger than the version w113
+/// killed, which accepted whatever chain the last same-named candidate happened
+/// to leave behind.
+///
 /// The anti-vacuity guard is the total. Every assertion here is an equality
 /// that a corpus of universe-monomorphic declarations satisfies as `0 == 0`,
 /// so the cell would pass over an empty population and report a binding it
@@ -939,13 +959,21 @@ fn the_measured_cons_cells_are_the_ones_the_decoder_walked() {
                 .flatten()
         };
 
-        // Every `ConstantVal` on the wire, by the name in its slot 0, with the
-        // length of the `levelParams` chain in its slot 1.
-        let mut on_the_wire: std::collections::BTreeMap<String, usize> =
+        // The names this module actually declares. A candidate that does not
+        // name one of them is not a declaration's `ConstantVal`, whatever its
+        // header says.
+        let census: BTreeSet<String> = infos.iter().map(|i| i.name().to_display_string()).collect();
+
+        // Candidate `ConstantVal`s by name, each with the cons chain its slot 1
+        // carries. A candidate whose slot 1 is NOT a cons chain is dropped
+        // rather than asserted against: the header shape is not a proof of
+        // identity, so a mismatch there is evidence the object is something
+        // else, not evidence the corpus is malformed.
+        let mut candidates: std::collections::BTreeMap<String, Vec<Vec<Obj>>> =
             std::collections::BTreeMap::new();
         for object in &objects {
-            // (0, 3, 32): three pointer fields and no scalar area, the shape
-            // measured over 215,111 objects and enforced by `decode_constant_val`.
+            // Necessary but NOT sufficient: three pointer fields and no scalar
+            // area is `ConstantVal`'s shape and also other structures'.
             if (object.tag, object.other, object.cs_sz) != (0, 3, 32) {
                 continue;
             }
@@ -954,44 +982,62 @@ fn the_measured_cons_cells_are_the_ones_the_decoder_walked() {
             else {
                 continue;
             };
+            let name = name.to_display_string();
+            if !census.contains(&name) {
+                continue;
+            }
 
             let mut cursor = word_at(bytes, object.off + 16);
-            let mut cells = 0usize;
-            while cursor & 1 == 0 {
-                let Some(cell) = deref(cursor) else {
-                    break;
+            let mut chain: Vec<Obj> = Vec::new();
+            let is_cons_chain = loop {
+                if cursor & 1 == 1 {
+                    break cursor >> 1 == 0; // boxed `List.nil` ends it
+                }
+                let Some(off) = deref(cursor) else {
+                    break false;
                 };
-                let Some(cell) = at.get(&cell) else {
-                    break;
+                let Some(cell) = at.get(&off) else {
+                    break false;
                 };
-                assert_eq!(
-                    (cell.tag, cell.other),
-                    (1, 2),
-                    "{module}: a `levelParams` chain must be cons cells"
-                );
-                widths.insert(i64::from(cell.cs_sz) - (8 + 8 * i64::from(cell.other)));
-                sizes.insert(cell.cs_sz);
-                cells += 1;
+                if (cell.tag, cell.other) != (1, 2) {
+                    break false;
+                }
+                if chain.len() == 4096 {
+                    break false; // the post-order law forbids cycles; do not rely on it
+                }
+                chain.push(*cell);
                 cursor = word_at(bytes, cell.off + 16);
+            };
+            if is_cons_chain {
+                candidates.entry(name).or_default().push(chain);
             }
-            on_the_wire.insert(name.to_display_string(), cells);
         }
 
-        // The binding, per declaration.
+        // The binding, per declaration: some `ConstantVal` on the wire must
+        // carry a cons chain of exactly the length the decoder returned, and
+        // the cells measured are that chain's.
         for info in &infos {
             let name = info.name().to_display_string();
             let decoded = info.constant_val().level_params.len();
-            let chained = on_the_wire.get(&name).copied().unwrap_or_else(|| {
-                panic!("{module}: {name} decoded, but no ConstantVal on the wire carries its name")
-            });
-            assert_eq!(
-                chained, decoded,
-                "{module}: {name}: the decoder returned {decoded} universe \
-                 parameters from a chain of {chained} cells. Unequal means the \
-                 cells measured by the cells above are not the cells \
-                 `list_ptrs` walks, and the recorded width describes the wrong \
-                 population"
-            );
+            let chains = candidates.get(&name).map(Vec::as_slice).unwrap_or(&[]);
+            let matching = chains
+                .iter()
+                .find(|chain| chain.len() == decoded)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{module}: {name}: the decoder returned {decoded} universe \
+                         parameters, and no ConstantVal on the wire carries a cons \
+                         chain of that length. Candidate lengths: {:?}. Unequal \
+                         means the cells measured by the cells above are not the \
+                         cells `list_ptrs` walks, and the recorded width describes \
+                         the wrong population",
+                        chains.iter().map(Vec::len).collect::<Vec<_>>()
+                    )
+                });
+            for cell in matching {
+                widths.insert(i64::from(cell.cs_sz) - (8 + 8 * i64::from(cell.other)));
+                sizes.insert(cell.cs_sz);
+            }
             bound += decoded;
             declarations += 1;
         }
