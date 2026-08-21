@@ -110,10 +110,13 @@ fn json_name_set(object: &str) -> BTreeSet<String> {
 
 fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expected_names: &[&str]) {
     let residuals = json_object_field(json, field);
-    assert_eq!(json_usize_field(residuals, "observed"), observed, "{json}");
+    let actual_observed = json_usize_field(residuals, "observed");
+    let actual_names = json_name_set(residuals);
+    assert_eq!(actual_observed, observed, "{json}");
+    assert_eq!(actual_observed, actual_names.len(), "{field}: {json}");
     assert_eq!(json_usize_field(residuals, "omitted"), 0, "{json}");
     assert_eq!(
-        json_name_set(residuals),
+        actual_names,
         expected_names
             .iter()
             .map(|name| (*name).to_owned())
