@@ -11721,6 +11721,209 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The walk conserves edges, and has exactly one entry point.
+///
+/// `be041416` counted the walk's OUT side - every slot, classified boxed,
+/// resolving or dangling - and stopped there. The other side of that relation
+/// was never counted: what each object receives. This pins both and the
+/// partition between them.
+///
+/// THE CONSERVATION IS THE WEAKEST PART AND IS LABELLED AS SUCH. Out-edges and
+/// in-edges are the same sum reached two ways - once as a running total over
+/// parents' slots, once as a per-object tally summed at the end - so equality
+/// is close to a tautology. It is not quite one: it would catch a tally that
+/// lost or doubled entries, which is exactly the bug an offset-keyed map
+/// invites. It is asserted for that and nothing more.
+///
+/// THE SHARP PART IS THE IN-DEGREE ZERO CLASS. Exactly ONE object in each
+/// module receives no reference at all, and it is the `ModuleData` root. Two
+/// real things follow. Nothing points back at the root, so the graph has a
+/// single entry and no cycle through it - a self-referential module structure
+/// would break this. And nothing else is unreferenced, so the walk reaches no
+/// object it did not arrive at through a pointer; a walk that also scanned for
+/// plausible headers would show orphans here.
+///
+/// THE PARTITION, asserted as a sum rather than as four independent counts:
+/// every object has in-degree 0, 1, 2, or 3-and-above, and those four add to
+/// the module's object count.
+///
+///   Prelude    1 + 75,052 + 6,283 + 7,544  =  88,880
+///
+/// SO THE GRAPH IS MOSTLY A TREE. 84% of Prelude's objects are pointed at
+/// exactly once and 15.6% are shared; the most-referenced object has 3,327
+/// incoming edges. The fixtures share less - `Init.olean` 3.8% - so the sharing
+/// rate is not a constant of the format and is pinned per module rather than
+/// pooled.
+///
+/// This relation is independent of the 13-and-0 pair in
+/// `the_array_holders_own_context_rescues_two_fifths`: that one counts elements
+/// of arrays lacking a constructor arrival, this one counts references received
+/// by every object, and either can move without the other.
+///
+/// POPULATION SCOPE: all four modules, each asserted by name; the counts are
+/// per module, not pooled into a total that could hide a zero.
+#[test]
+fn the_walk_conserves_edges_and_has_one_entry_point() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut conserved: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut partition: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+    let mut entry_is_root: Vec<(String, bool)> = Vec::new();
+    let mut hubs: Vec<(String, usize)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        // Out side: a running total. In side: a per-object tally.
+        let mut out_edges = 0usize;
+        let mut received: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            let words: Vec<u64> = if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                (0..usize::from(object.other))
+                    .map(|slot| word_at(bytes, object.off + 8 + 8 * slot))
+                    .collect()
+            } else if object.tag == abi::TAG_ARRAY {
+                (0..word_at(bytes, object.off + 8))
+                    .map(|i| word_at(bytes, object.off + 24 + 8 * i as usize))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for word in words {
+                if let Some(child) = resolve(word) {
+                    out_edges += 1;
+                    *received.entry(child).or_default() += 1;
+                }
+            }
+        }
+        let in_edges: usize = received.values().sum();
+        conserved.push((module.clone(), objects.len(), out_edges, in_edges));
+
+        // The in-degree partition.
+        let mut zero = Vec::new();
+        let (mut one, mut two, mut many) = (0usize, 0usize, 0usize);
+        for object in &objects {
+            match received.get(&object.off).copied().unwrap_or(0) {
+                0 => zero.push(object.off),
+                1 => one += 1,
+                2 => two += 1,
+                _ => many += 1,
+            }
+        }
+        partition.push((module.clone(), zero.len(), one, two, many));
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        entry_is_root.push((module.clone(), zero == vec![root]));
+        hubs.push((
+            module.clone(),
+            received.values().copied().max().unwrap_or(0),
+        ));
+    }
+
+    let keep4 = |all: Vec<(&str, usize, usize, usize)>| -> Vec<(String, usize, usize, usize)> {
+        all.into_iter()
+            .filter(|(m, _, _, _)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c)| (m.to_owned(), a, b, c))
+            .collect()
+    };
+
+    // The weak half, asserted for what it is.
+    assert_eq!(
+        conserved,
+        keep4(vec![
+            ("Init.olean", 158, 205, 205),
+            ("Init.BinderNameHint.olean", 267, 431, 431),
+            ("Init.SizeOfLemmas.olean", 795, 1332, 1332),
+            ("Init/Prelude.olean", 88880, 215995, 215995),
+        ]),
+        "objects, out-edges and in-edges. The two edge counts are the same sum \
+         reached two ways - a running total over parents' slots against a \
+         per-object tally summed at the end - so their equality is close to a \
+         tautology. It would still catch a tally that lost or doubled entries, \
+         which is what an offset-keyed map invites, and it is asserted for that \
+         and nothing more"
+    );
+
+    // The sharp half.
+    assert_eq!(
+        partition
+            .iter()
+            .map(|(m, z, o, t, n)| (m.as_str(), *z, *o, *t, *n))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 1, 151, 3, 3),
+            ("Init.BinderNameHint.olean", 1, 218, 16, 32),
+            ("Init.SizeOfLemmas.olean", 1, 658, 46, 90),
+            ("Init/Prelude.olean", 1, 75052, 6283, 7544),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "objects by in-degree: zero, one, two, and three-or-more"
+    );
+    for ((module, objects, ..), (_, zero, one, two, many)) in conserved.iter().zip(&partition) {
+        assert_eq!(
+            zero + one + two + many,
+            *objects,
+            "{module}: the four classes must account for every object, or the \
+             partition is not one"
+        );
+    }
+    assert!(
+        entry_is_root.iter().all(|(_, yes)| *yes),
+        "the ONLY object receiving no reference is the `ModuleData` root, in \
+         every module: nothing points back at the root, so there is a single \
+         entry and no cycle through it, and nothing else is unreferenced, so \
+         the walk reached no object it did not arrive at through a pointer"
+    );
+
+    // How much of the graph is shared, which is not a constant.
+    assert_eq!(
+        hubs.iter()
+            .map(|(m, n)| (m.as_str(), *n))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 42),
+            ("Init.BinderNameHint.olean", 15),
+            ("Init.SizeOfLemmas.olean", 33),
+            ("Init/Prelude.olean", 3327),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "the largest in-degree in each module. 84% of Prelude's objects are \
+         pointed at exactly once, so the graph is mostly a tree with 15.6% \
+         sharing - but `Init.olean` shares only 3.8%, so the rate is not a \
+         constant of the format and these are pinned per module rather than \
+         pooled"
+    );
+}
+
 /// The array holder's own context rescues two fifths of the blind spot.
 ///
 /// `94ea5264` found 10,262 objects with no constructor arrival - reached only
