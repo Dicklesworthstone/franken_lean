@@ -2660,12 +2660,16 @@ fn and_constructor_type(and_name: &WireName, constructor: &WireName) -> Option<W
     builder.finish(root)
 }
 
-fn and_motive_type(builder: &mut StructuralTermBuilder, and_name: &WireName) -> ExprId {
+fn and_motive_type(
+    builder: &mut StructuralTermBuilder,
+    and_name: &WireName,
+    motive_universe: &WireName,
+) -> ExprId {
     let left = builder.bvar(1);
     let right = builder.bvar(0);
     let subject = and_application(builder, and_name, left, right);
-    let proposition = builder.sort_zero();
-    builder.forall("t", BinderStyle::Default, subject, proposition)
+    let motive_sort = builder.sort_parameter(motive_universe);
+    builder.forall("t", BinderStyle::Default, subject, motive_sort)
 }
 
 fn and_minor_type(
@@ -2691,10 +2695,14 @@ fn and_minor_type(
     builder.forall("left", BinderStyle::Default, left_field, result)
 }
 
-fn and_recursor_type(and_name: &WireName, intro: &WireName) -> Option<WireExpr> {
+fn and_recursor_type(
+    and_name: &WireName,
+    intro: &WireName,
+    motive_universe: &WireName,
+) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
     let proposition = builder.sort_zero();
-    let motive_type = and_motive_type(&mut builder, and_name);
+    let motive_type = and_motive_type(&mut builder, and_name, motive_universe);
     let minor = and_minor_type(&mut builder, and_name, intro);
     let left = builder.bvar(4);
     let right = builder.bvar(3);
@@ -2710,10 +2718,14 @@ fn and_recursor_type(and_name: &WireName, intro: &WireName) -> Option<WireExpr> 
     builder.finish(root)
 }
 
-fn and_rule_rhs(and_name: &WireName, intro: &WireName) -> Option<WireExpr> {
+fn and_rule_rhs(
+    and_name: &WireName,
+    intro: &WireName,
+    motive_universe: &WireName,
+) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
     let proposition = builder.sort_zero();
-    let motive_type = and_motive_type(&mut builder, and_name);
+    let motive_type = and_motive_type(&mut builder, and_name, motive_universe);
     let minor = and_minor_type(&mut builder, and_name, intro);
     let mut result = builder.bvar(2);
     let left = builder.bvar(1);
@@ -4204,15 +4216,17 @@ fn admit_init_and(
     let recursor_name = checker_child(name, "rec");
     let Some(recursor) = declarations.iter().find(|entry| entry.name() == &recursor_name) else { return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing { name: recursor_name }); };
     let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else { return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name }); };
-    if recursor.declaration().safety() != ConstantSafety::Safe || !recursor.declaration().level_parameters().is_empty() || recursor_metadata.mutual() != std::slice::from_ref(name) || recursor_metadata.num_parameters() != 2 || recursor_metadata.num_indices() != 0 || recursor_metadata.num_motives() != 1 || recursor_metadata.num_minors() != 1 || recursor_metadata.rules().len() != 1 || recursor_metadata.k() || environment.find(&recursor_name).is_some() {
+    let levels = recursor.declaration().level_parameters();
+    let Some(motive_universe) = levels.first() else { return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name }); };
+    if recursor.declaration().safety() != ConstantSafety::Safe || levels.len() != 1 || recursor_metadata.mutual() != std::slice::from_ref(name) || recursor_metadata.num_parameters() != 2 || recursor_metadata.num_indices() != 0 || recursor_metadata.num_motives() != 1 || recursor_metadata.num_minors() != 1 || recursor_metadata.rules().len() != 1 || recursor_metadata.k() || environment.find(&recursor_name).is_some() {
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name });
     }
-    let Some(expected_type) = and_recursor_type(name, &intro) else { return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow); };
+    let Some(expected_type) = and_recursor_type(name, &intro, motive_universe) else { return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow); };
     match compare_inductive_expression(recursor.declaration().type_(), &expected_type, comparison, cancelled) {
         Ok(true) => {}, Ok(false) => return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name }), Err(verdict) => return verdict,
     }
     let Some(rule) = recursor_metadata.rules().first() else { return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name }); };
-    let Some(expected_rhs) = and_rule_rhs(name, &intro) else { return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow); };
+    let Some(expected_rhs) = and_rule_rhs(name, &intro, motive_universe) else { return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow); };
     if rule.constructor() != &intro || rule.num_fields() != 2 { return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name }); }
     match compare_inductive_expression(rule.rhs(), &expected_rhs, comparison, cancelled) {
         Ok(true) => {}, Ok(false) => return InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: recursor_name }), Err(verdict) => return verdict,

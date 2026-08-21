@@ -1591,6 +1591,8 @@ fn init_and_entries() -> Vec<ConstantEntry> {
     let and = checker_name("And");
     let intro = checker_qualified(&["And", "intro"]);
     let rec = checker_qualified(&["And", "rec"]);
+    let u_name = checker_name("u");
+    let u = Level::param(primary_name("u"));
     let prop = || Expr::sort(Level::zero());
     let and_expr = |a: Expr, b: Expr| {
         Expr::app(Expr::app(Expr::const_(primary_name("And"), Vec::new()), a), b)
@@ -1608,7 +1610,7 @@ fn init_and_entries() -> Vec<ConstantEntry> {
         )
     };
     let bv = |index| Expr::bvar(index).expect("packs");
-    let motive = || primary_pi("t", BinderInfo::Default, and_expr(bv(1), bv(0)), prop());
+    let motive = || primary_pi("t", BinderInfo::Default, and_expr(bv(1), bv(0)), Expr::sort(u.clone()));
     let minor = || primary_pi(
         "left", BinderInfo::Default, bv(2),
         primary_pi(
@@ -1652,7 +1654,7 @@ fn init_and_entries() -> Vec<ConstantEntry> {
             ))), ConstantSafety::Safe, ConstructorDeclaration::new(and.clone(), 0, 2, 2),
         )),
         ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            Vec::new(), decoded(&rec_type), ConstantSafety::Safe,
+            vec![u_name], decoded(&rec_type), ConstantSafety::Safe,
             RecursorDeclaration::new(vec![and], 2, 0, 1, 1, vec![RecursorRule::new(intro, 2, decoded(&rhs))], false),
         )),
     ]
