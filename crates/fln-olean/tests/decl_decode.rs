@@ -610,3 +610,128 @@ fn a_planted_name_link_is_consumed_as_a_cons_cell_before_anything_refuses() {
         other => panic!("expected a List cons shape refusal, got {other}"),
     }
 }
+
+/// The SAME collision in the other direction is already closed, and by exactly
+/// the rule `list_ptrs` is missing.
+///
+/// Its sibling above plants a `Name.str` link where a list belongs and shows
+/// the list walker consuming it. This cell plants a real `List.cons` cell where
+/// a NAME belongs. `decode_name` applies the identical shape test first -
+/// `tag == 1 || tag == 2` and `other == 2` - and a cons cell passes it, so the
+/// two are indistinguishable at that layer in both directions. What catches it
+/// is the next line: `decode_name` also requires `cs_sz == 32`, and refuses.
+///
+/// So the repair for `list_ptrs` is not a new idea that needs designing. It is
+/// the rule its neighbour in the same file already applies, ten functions away,
+/// against a corpus measurement of 5,842,155 objects. The pair of witnesses is
+/// what turns that from a claim into a demonstrated asymmetry: one direction
+/// reads the size and refuses at the planted object, the other does not and
+/// walks into it.
+///
+/// THE ANTI-VACUITY GUARD IS THE REFUSAL'S IDENTITY. If the planted cell were
+/// caught by the `Name ctor` shape rule instead, this cell would pass while
+/// proving the opposite of what it says - that the shapes are distinguishable
+/// without the size. It therefore asserts the message is the SIZE rule's, and
+/// separately that the planted cell really does carry the colliding tag and
+/// arity and a size other than 32.
+#[test]
+fn a_planted_cons_cell_is_refused_by_the_name_size_rule_the_list_walker_lacks() {
+    let mut bytes = fixture("Init.SizeOfLemmas.olean");
+    let view = OleanView::parse(&bytes).expect("parse");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("the unmodified fixture decodes");
+
+    // The census this module is pinned to, two cells above. The plant's target
+    // is taken FROM it rather than guessed: whichever declaration the chosen
+    // `ConstantVal` belongs to must be one this module actually declares.
+    assert_eq!(infos.len(), 16, "the pinned SizeOfLemmas constant census");
+    let census: BTreeSet<String> = infos
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+
+    let (objects, base) = objects_of(&bytes);
+    let at: std::collections::BTreeMap<usize, Obj> = objects.iter().map(|o| (o.off, *o)).collect();
+
+    // A real cons cell, by the same size-independent discriminator the
+    // measurement cell uses: its tail is another cell of the same shape, or
+    // boxed `List.nil`.
+    let cell = objects
+        .iter()
+        .find(|object| {
+            if (object.tag, object.other) != (1, 2) {
+                return false;
+            }
+            let tail = word_at(&bytes, object.off + 16);
+            if tail & 1 == 1 {
+                return tail >> 1 == 0;
+            }
+            usize::try_from(tail.wrapping_sub(base))
+                .ok()
+                .and_then(|off| at.get(&off))
+                .is_some_and(|t| (t.tag, t.other) == (1, 2))
+        })
+        .copied()
+        .expect("the fixture carries cons cells");
+
+    // Without these the refusal below could be the shape rule firing, and the
+    // cell would read as proof that the size is not needed.
+    assert_eq!(
+        (cell.tag, cell.other),
+        (1, 2),
+        "the planted object must collide with a name link on tag and arity, or \
+         `decode_name`'s shape rule catches it and the size rule is never \
+         reached"
+    );
+    assert_ne!(
+        cell.cs_sz, 32,
+        "and it must differ in size, or there is nothing for the size rule to \
+         refuse"
+    );
+
+    // A `ConstantVal` - three pointer fields, no scalars - whose slot 0 is the
+    // declaration's name. Confirm the declaration is one the census names.
+    let (constant_val, declaration) = objects
+        .iter()
+        .find_map(|object| {
+            if (object.tag, object.other) != (0, 3) {
+                return None;
+            }
+            let name = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(word_at(&bytes, object.off + 8))
+                .ok()?
+                .to_display_string();
+            census.contains(&name).then_some((*object, name))
+        })
+        .expect("a ConstantVal naming a declaration this module declares");
+
+    let planted = base + u64::try_from(cell.off).expect("in-range");
+    bytes[constant_val.off + 8..constant_val.off + 16].copy_from_slice(&planted.to_le_bytes());
+
+    let view = OleanView::parse(&bytes).expect("the plant changes no header");
+    let error = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect_err("a cons cell where a name belongs must not decode");
+
+    match error {
+        DeclError::Shape { offset, what } => {
+            assert_eq!(
+                what, "Name object size disagrees with its two-pointer-plus-hash layout",
+                "{declaration}: the refusal must come from the SIZE rule. The \
+                 `Name ctor` shape rule ran first and let this object through, \
+                 which is the whole point - a cons cell and a name link are the \
+                 same tag and arity"
+            );
+            assert_eq!(
+                offset,
+                u64::try_from(cell.off).expect("in-range"),
+                "{declaration}: and it names the planted cell itself, refusing \
+                 AT the colliding object rather than one hop later - which is \
+                 exactly what the sibling witness shows `list_ptrs` failing to \
+                 do"
+            );
+        }
+        other => panic!("expected a Name size refusal, got {other}"),
+    }
+}
