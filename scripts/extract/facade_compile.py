@@ -2982,6 +2982,27 @@ def main():
             "REFUSE: facade manifest kernel-special population must exceed "
             f"structural-refusal count ({json.dumps(kernel_special_structural_refusal_inequality_join, sort_keys=True)})"
         )
+    substrate_roundtrip_inequality_join = {
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+        "summary_type_roundtrip_checked": manifest_summary.get(
+            "type_roundtrip_checked"
+        ),
+    }
+    if (not isinstance(substrate_roundtrip_inequality_join[
+            "summary_substrate_emitted"], int)
+            or isinstance(substrate_roundtrip_inequality_join[
+                "summary_substrate_emitted"], bool)
+            or not isinstance(substrate_roundtrip_inequality_join[
+                "summary_type_roundtrip_checked"], int)
+            or isinstance(substrate_roundtrip_inequality_join[
+                "summary_type_roundtrip_checked"], bool)
+            or substrate_roundtrip_inequality_join["summary_substrate_emitted"]
+            <= substrate_roundtrip_inequality_join[
+                "summary_type_roundtrip_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest substrate-emission count must exceed type "
+            f"roundtrip count ({json.dumps(substrate_roundtrip_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5045,6 +5066,9 @@ def main():
         ),
         "manifest_kernel_special_structural_refusal_inequality_join": (
             kernel_special_structural_refusal_inequality_join
+        ),
+        "manifest_substrate_roundtrip_inequality_join": (
+            substrate_roundtrip_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
