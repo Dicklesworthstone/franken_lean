@@ -258,6 +258,10 @@ const SUM_LEX_INR_INL_MATCH_1_1: &str =
     "_private.Init.Data.Sum.Basic.0.Sum.lex_inr_inl.match_1_1";
 /// The pin's private sum companion stores this definition in Basic.
 const SUM_LEX_INR_INL_MATCH_1_1_MODULE: &str = "Init/Data/Sum/Basic";
+/// The private theorem defining the strict order on `Fin`.
+const FIN_MLT: &str = "_private.Init.Data.Fin.Basic.0.Fin.mlt";
+/// The pin's private finite-index companion stores this theorem in Basic.
+const FIN_MLT_MODULE: &str = "Init/Data/Fin/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1803,6 +1807,33 @@ fn sum_lex_inr_inl_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {SUM_LEX_INR_INL_MATCH_1_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn fin_mlt_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("fin_mlt_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, FIN_MLT_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&FIN_MLT.to_owned()),
+        "the private companion of {FIN_MLT_MODULE} must retain {FIN_MLT}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == FIN_MLT)
+        .unwrap_or_else(|| panic!("private decoder lost {FIN_MLT}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {FIN_MLT} as {} instead of Thm",
         recovered.kind_name()
     );
 }
