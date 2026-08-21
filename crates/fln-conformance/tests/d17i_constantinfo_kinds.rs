@@ -5313,3 +5313,154 @@ fn no_stored_level_is_in_a_form_its_smart_constructor_would_have_collapsed() {
         "exactly five level shapes occur at the pin, and `MVar` is not one of them"
     );
 }
+
+/// `constNames` and `extraConstNames` read as NAMES, per module and level:
+/// `(module, extra exported, extra private, overlap private)`.
+const EXTRA_CONST_NAME_ROWS: &[(&str, usize, usize, usize)] = &[
+    ("Init.Prelude", 424, 713, 0),
+    ("Init.Meta.Defs", 192, 697, 1),
+    ("Init.Data.List.Basic", 337, 443, 17),
+    ("Init.Data.Array.Lemmas", 41, 106, 17),
+];
+
+/// Both header name arrays, at one level.
+fn header_name_arrays(view: &OleanView<'_>) -> (Vec<String>, Vec<String>) {
+    let declared = view
+        .module_data(WalkBudget::default())
+        .expect("module data")
+        .const_names;
+    let extra = view
+        .extra_const_names(WalkBudget::default())
+        .expect("extra const names")
+        .iter()
+        .map(Name::to_display_string)
+        .collect();
+    (declared, extra)
+}
+
+/// Read `constNames` and `extraConstNames` as name arrays rather than counts.
+fn header_names(lib: &Path, module: &str, level: Level) -> (Vec<String>, Vec<String>) {
+    let base = lib.join(format!("{}.olean", module.replace('.', "/")));
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    match level {
+        Level::Exported => {
+            header_name_arrays(&OleanView::parse(&exported).expect("parse exported"))
+        }
+        Level::Private => {
+            let server = read(base.with_extension("olean.server"));
+            let private = read(base.with_extension("olean.private"));
+            header_name_arrays(
+                &OleanView::parse_with_dependencies(&private, &[&exported, &server])
+                    .expect("parse private"),
+            )
+        }
+    }
+}
+
+/// `extraConstNames` overlaps `constNames`, and the overlap is exactly the
+/// `.splitter` names — which the header cell above cannot see, because it
+/// compares the two arrays only by LENGTH.
+///
+/// That cell asserts `extraConstNames != constants` and reads the result as
+/// "a DIFFERENT population". Two unequal cardinalities are compatible with
+/// total overlap, so what is established there is much weaker than what it
+/// says. The names were never decoded, though the decoder has offered
+/// `extra_const_names` all along.
+///
+/// The upstream doc-comment calls these "auxiliary declarations that are NOT in
+/// the mapping `constants`", and taking that literally would have produced a
+/// disjointness assertion that is FALSE at the pin. Measured:
+///
+///   exported level: disjoint, all four modules, and no `.splitter` occurs
+///   private level:  the intersection is exactly the `.splitter` subset of
+///                   `extraConstNames`, in both directions — every overlapping
+///                   name ends in `.splitter`, and every `.splitter` in the
+///                   extra array is also declared
+///
+/// So the documented property is about the environment's mapping, not about the
+/// module header, and the distinction only becomes visible once the arrays are
+/// compared as sets. Corroboration beyond what this cell walks: over all 600
+/// `Init` modules at private level there are 29,050 extra names, 514 of them
+/// overlapping across 141 modules, and every single one is a `.splitter`. That
+/// sweep is provenance for the shape law, not something asserted here — this
+/// cell checks the four modules it names.
+///
+/// One more array law falls out and is worth having: `extraConstNames` carries
+/// no duplicate of its own, at either level, in any module walked.
+#[test]
+fn extra_const_names_overlap_declared_names_exactly_at_the_splitters() {
+    let lib = lib_or_skip!();
+
+    let mut overlapping_total = 0usize;
+    let mut splitters_total = 0usize;
+    for (module, expect_exported, expect_private, expect_overlap) in EXTRA_CONST_NAME_ROWS {
+        for level in [Level::Exported, Level::Private] {
+            let (declared, extra) = header_names(&lib, module, level);
+            let label = match level {
+                Level::Exported => "exported",
+                Level::Private => "private",
+            };
+            let declared_set: BTreeSet<&String> = declared.iter().collect();
+            let extra_set: BTreeSet<&String> = extra.iter().collect();
+            assert_eq!(
+                extra_set.len(),
+                extra.len(),
+                "{module} [{label}]: extraConstNames must not repeat a name"
+            );
+            assert_eq!(
+                extra.len(),
+                match level {
+                    Level::Exported => *expect_exported,
+                    Level::Private => *expect_private,
+                },
+                "{module} [{label}]: extraConstNames population"
+            );
+
+            let overlap: BTreeSet<&&String> = extra_set.intersection(&declared_set).collect();
+            let splitters: BTreeSet<&&String> = extra_set
+                .iter()
+                .filter(|name| name.ends_with(".splitter"))
+                .collect();
+            // The law, in both directions: overlapping IS being a splitter.
+            assert_eq!(
+                overlap, splitters,
+                "{module} [{label}]: the overlap between the two header arrays is exactly the \
+                 splitters"
+            );
+            match level {
+                Level::Exported => assert!(
+                    overlap.is_empty(),
+                    "{module}: the exported header carries no splitter, so its arrays are \
+                     disjoint; got {overlap:?}"
+                ),
+                Level::Private => {
+                    assert_eq!(
+                        overlap.len(),
+                        *expect_overlap,
+                        "{module}: private overlap count"
+                    );
+                    overlapping_total += overlap.len();
+                    splitters_total += splitters.len();
+                }
+            }
+        }
+    }
+
+    // Anti-vacuity, and it needs both sides. A module set with no overlap at all
+    // would satisfy the biconditional trivially, and so would one where every
+    // extra name were a splitter.
+    assert_eq!(
+        (overlapping_total, splitters_total),
+        (35, 35),
+        "the overlapping population must be real"
+    );
+    let (_, prelude_extra) = header_names(&lib, "Init.Prelude", Level::Private);
+    assert!(
+        prelude_extra
+            .iter()
+            .all(|name| !name.ends_with(".splitter")),
+        "Init.Prelude carries extra names and none is a splitter, so the empty overlap there is \
+         a consequence of the law rather than an absence of data"
+    );
+}
