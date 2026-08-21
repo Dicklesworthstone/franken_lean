@@ -396,6 +396,11 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         private_companion_observed,
         "{json}",
     );
+    assert_eq!(
+        private_companion_observed == 0,
+        private_companion_name_count == 0,
+        "{json}",
+    );
     let decoded_private_auxiliary_names = json_array_field(
         json,
         "decodedPrivateAuxiliaryNames",
