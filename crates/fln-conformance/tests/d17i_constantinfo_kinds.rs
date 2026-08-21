@@ -4704,3 +4704,123 @@ fn the_private_part_reserialises_rather_than_extends_the_exported_array() {
         );
     }
 }
+
+/// Inductives with no generated `recOn`.
+const WITHOUT_REC_ON: &[&str] = &["Lean.Name._impl", "Nat.le.below"];
+/// Non-Prop inductives with no generated `noConfusion`.
+const NON_PROP_WITHOUT_NO_CONFUSION: &[&str] = &["Lean.Name._impl", "PUnit"];
+
+/// The generated ELIMINATOR family, which is auxiliary declarations of exactly
+/// the kind this bead is about — and no cell had looked at it.
+///
+/// Every cell so far reads declarations Lean stores for an inductive block:
+/// the type, its constructors, its recursor. Lean also GENERATES a family of
+/// ordinary definitions around each inductive — `casesOn`, `recOn`,
+/// `noConfusion`, `below`, `brecOn` — and whether they are present is a function
+/// of fields this file already reads. Four relations, all exact over
+/// `Init/Prelude` at private level:
+///
+///   `casesOn` exists for ALL 127 inductives, without exception
+///   `recOn` exists for all but two, named above
+///   `noConfusion` exists for 115, and NONE of those 115 is a Prop — so being a
+///     Prop implies having no `noConfusion`. The converse fails: two non-Props
+///     lack it too, and they are named
+///   `below` and `brecOn` exist for exactly the RECURSIVE inductives that are
+///     not themselves a generated `.below` type — 6 of the 7, the exception
+///     being `Nat.le.below`
+///
+/// The `noConfusion` rule is stated as a ONE-WAY implication because that is
+/// what the artifact supports. An `iff` would be false, and writing one would
+/// have been the easy mistake: 10 of the 12 absences are Props, which reads as a
+/// clean biconditional until the other two are looked at.
+///
+/// The `below` rule IS an iff, and it is worth having as one: it ties a
+/// generated declaration's existence to `is_rec`, a stored flag, so a decode
+/// that lost `is_rec` would be caught by the presence of declarations it no
+/// longer predicts.
+#[test]
+fn the_generated_eliminator_family_follows_from_fields_already_read() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let names: BTreeSet<String> = infos
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    assert!(
+        inductives.len() > 100,
+        "the inductive census must be reached, got {}",
+        inductives.len()
+    );
+
+    let mut missing_rec_on: Vec<&String> = Vec::new();
+    let mut no_confusion_props = 0usize;
+    let mut non_prop_without: Vec<&String> = Vec::new();
+    let mut with_below: Vec<&String> = Vec::new();
+    let mut recursive = 0usize;
+    for (name, induct) in &inductives {
+        let has = |suffix: &str| names.contains(&format!("{name}.{suffix}"));
+
+        assert!(
+            has("casesOn"),
+            "{name}: every inductive gets a generated casesOn"
+        );
+        if !has("recOn") {
+            missing_rec_on.push(name);
+        }
+
+        let prop = inductive_result_is_prop(induct);
+        if has("noConfusion") {
+            assert!(
+                has("noConfusionType"),
+                "{name}: noConfusion and noConfusionType are generated together"
+            );
+            if prop {
+                no_confusion_props += 1;
+            }
+        } else if !prop {
+            non_prop_without.push(name);
+        }
+
+        if induct.is_rec {
+            recursive += 1;
+        }
+        // `below` exists exactly for recursive inductives that are not
+        // themselves a generated `.below` type.
+        let expected_below = induct.is_rec && !name.ends_with(".below");
+        assert_eq!(
+            has("below"),
+            expected_below,
+            "{name}: `below` is generated for recursive inductives and not for the `.below` \
+             types that generation itself produces"
+        );
+        assert_eq!(
+            has("brecOn"),
+            expected_below,
+            "{name}: `brecOn` accompanies `below`"
+        );
+        if has("below") {
+            with_below.push(name);
+        }
+    }
+
+    assert_eq!(
+        no_confusion_props, 0,
+        "a Prop inductive must not carry a generated noConfusion"
+    );
+    assert_eq!(missing_rec_on, WITHOUT_REC_ON);
+    assert_eq!(non_prop_without, NON_PROP_WITHOUT_NO_CONFUSION);
+    // Non-vacuity for the `below` iff: both sides of it must be populated.
+    assert!(
+        recursive >= 5 && with_below.len() >= 5 && with_below.len() < inductives.len(),
+        "the recursive population must be real ({recursive} recursive, {} with below of {})",
+        with_below.len(),
+        inductives.len()
+    );
+}
