@@ -3664,6 +3664,9 @@ def main():
     class_projection_field_set_inequality_join = {"summary_class_provided_projections": manifest_summary.get("class_provided_projections"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
     if (not isinstance(class_projection_field_set_inequality_join["summary_class_provided_projections"], int) or isinstance(class_projection_field_set_inequality_join["summary_class_provided_projections"], bool) or not isinstance(class_projection_field_set_inequality_join["summary_field_sets_checked"], int) or isinstance(class_projection_field_set_inequality_join["summary_field_sets_checked"], bool) or class_projection_field_set_inequality_join["summary_class_provided_projections"] <= class_projection_field_set_inequality_join["summary_field_sets_checked"]):
         raise SystemExit("REFUSE: facade manifest class-projection count must exceed field-set count " + json.dumps(class_projection_field_set_inequality_join, sort_keys=True))
+    class_projection_private_field_inequality_join = {"summary_class_provided_projections": manifest_summary.get("class_provided_projections"), "summary_private_fields_exposed": manifest_summary.get("private_fields_exposed")}
+    if (not isinstance(class_projection_private_field_inequality_join["summary_class_provided_projections"], int) or isinstance(class_projection_private_field_inequality_join["summary_class_provided_projections"], bool) or not isinstance(class_projection_private_field_inequality_join["summary_private_fields_exposed"], int) or isinstance(class_projection_private_field_inequality_join["summary_private_fields_exposed"], bool) or class_projection_private_field_inequality_join["summary_class_provided_projections"] <= class_projection_private_field_inequality_join["summary_private_fields_exposed"]):
+        raise SystemExit("REFUSE: facade manifest class-projection count must exceed private-field count " + json.dumps(class_projection_private_field_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5829,6 +5832,9 @@ def main():
         ),
         "manifest_class_projection_field_set_inequality_join": (
             class_projection_field_set_inequality_join
+        ),
+        "manifest_class_projection_private_field_inequality_join": (
+            class_projection_private_field_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
