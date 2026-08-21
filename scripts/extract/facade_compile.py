@@ -99,6 +99,9 @@ the toolchain would report a perfect facade:
   * A MANIFEST-TOTALITY JOIN requires the facade generator to report zero
     uncensused closure/emitted rows and no Reference import. The compile rig may
     not turn a manifest's known classification gap into availability evidence.
+  * A MANIFEST-OUTCOME TOTAL JOIN makes the manifest summary's demanded outcome
+    counts equal the declaration rows it summarizes. A stale aggregate cannot
+    conceal an omitted emitted, Init, or quarantined demanded row.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -650,6 +653,30 @@ def join_type_dependency_targets(dispositions, manifest_rows):
     }
 
 
+def join_manifest_demanded_outcomes(manifest_rows, summary):
+    """Make the manifest's demanded summary count the exact declaration rows."""
+    actual_counts = Counter(
+        row.get("demanded_outcome")
+        for row in manifest_rows
+        if row.get("demanded_outcome") is not None
+    )
+    unknown = sorted(set(actual_counts).difference(DEMANDED_OUTCOMES))
+    actual = {outcome: actual_counts[outcome] for outcome in sorted(DEMANDED_OUTCOMES)}
+    declared = summary.get("demanded_outcomes")
+    if (unknown
+            or declared != actual
+            or summary.get("demanded") != sum(actual.values())
+            or summary.get("demanded_emitted") != actual["emitted"]
+            or summary.get("demanded_init_substrate") != actual["init-substrate"]):
+        raise SystemExit(
+            "REFUSE: facade manifest demanded-outcome join disagrees with its "
+            f"declaration rows (actual={json.dumps(actual, sort_keys=True)}, "
+            f"declared={json.dumps(declared, sort_keys=True) if isinstance(declared, dict) else declared!r}, "
+            f"unknown={unknown!r})"
+        )
+    return actual
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -797,6 +824,9 @@ def main():
             "REFUSE: facade manifest totality join failed "
             f"({json.dumps(totality, sort_keys=True)})"
         )
+    manifest_outcome_join = join_manifest_demanded_outcomes(
+        manifest_rows, manifest_summary
+    )
 
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
@@ -929,6 +959,7 @@ def main():
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_totality_join": totality,
+        "manifest_demanded_outcome_join": manifest_outcome_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
