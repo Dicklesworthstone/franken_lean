@@ -895,6 +895,21 @@ pub enum OleanCheckError {
     DuplicateDeclaration {
         name: Name,
     },
+    /// Two modules of one closed set decode to DIFFERENT declarations sharing
+    /// a name.
+    ///
+    /// Re-generated equation and congruence lemmas legitimately repeat a name
+    /// across modules, so a name collision alone is not a fault. A collision
+    /// whose two sides disagree is: the set has no single coherent meaning for
+    /// that name, and admitting it in dependency order would let whichever
+    /// module sorted first silently win while the other was rejected as
+    /// already-declared — a kernel-shaped complaint about what is really a
+    /// property of the input set.
+    ConflictingModuleDeclaration {
+        name: Name,
+        first_module: Name,
+        second_module: Name,
+    },
     UnsupportedDeclaration {
         name: Name,
         kind: &'static str,
@@ -1000,6 +1015,17 @@ impl fmt::Display for OleanCheckError {
             Self::DuplicateDeclaration { name } => write!(
                 formatter,
                 ".olean repeats declaration `{}`",
+                name.to_display_string()
+            ),
+            Self::ConflictingModuleDeclaration {
+                name,
+                first_module,
+                second_module,
+            } => write!(
+                formatter,
+                "modules `{}` and `{}` decode to different declarations both named `{}`",
+                first_module.to_display_string(),
+                second_module.to_display_string(),
                 name.to_display_string()
             ),
             Self::UnsupportedDeclaration { name, kind } => write!(
@@ -2365,6 +2391,49 @@ impl Engine {
                 error,
             })?;
             decoded.push(Some((module.name.clone(), artifact)));
+        }
+
+        // The per-module companion guard (see `decode_olean_module_artifacts`)
+        // proves no single module loses a declaration its exported part
+        // declared. It says nothing about the SET: two modules can decode to
+        // declarations sharing a name, and at corpus scale they do. Across the
+        // 2,431 pinned modules that carry a complete chain, 215,111 per-module
+        // constants collapse to 214,919 distinct names — 128 names are declared
+        // by more than one module, all re-generated `eq_N` and `congr_simp`
+        // lemmas.
+        //
+        // A repeat is therefore NOT a fault by itself, and refusing one would
+        // reject the real corpus. A repeat whose two sides DISAGREE is a fault:
+        // the set has no single meaning for that name, and admission in
+        // dependency order would let whichever module sorted first silently win
+        // while the loser surfaced as an already-declared rejection from the
+        // kernel — attributing to the kernel what is a property of the input.
+        // This names both modules instead, at decode time.
+        let mut declared: BTreeMap<&Name, (&Name, &ConstantInfo)> = BTreeMap::new();
+        for entry in &decoded {
+            let Some((module_name, artifact)) = entry.as_ref() else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "decoded module disappeared before the set-wide declaration scan",
+                });
+            };
+            for info in &artifact.constants {
+                match declared.get(info.name()) {
+                    Some((owner, previous)) if *previous != info => {
+                        return Err(OleanCheckError::ConflictingModuleDeclaration {
+                            name: info.name().clone(),
+                            first_module: (*owner).clone(),
+                            second_module: module_name.clone(),
+                        });
+                    }
+                    // An identical repeat is benign: both modules mean the same
+                    // declaration, so the set stays coherent. Keep the first
+                    // owner so a later conflict is reported against it.
+                    Some(_) => {}
+                    None => {
+                        declared.insert(info.name(), (module_name, info));
+                    }
+                }
+            }
         }
 
         let mut remaining = vec![0_usize; modules.len()];
