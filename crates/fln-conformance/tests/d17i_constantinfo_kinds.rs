@@ -9628,19 +9628,32 @@ fn only_props_carry_indices_and_only_four_inductives_carry_any() {
         indexed_non_props.is_empty(),
         "a non-Prop inductive must carry no index: {indexed_non_props:?}"
     );
+    // Sorted, because the declaration walk is in the constant array's order and
+    // the pinned tables are lexicographic. Comparing a walk-ordered vector
+    // against a lexicographic constant makes the assertion depend on decode
+    // order, which is not a pin law and is not what these rows are about.
+    let indexed_by_name: BTreeMap<&str, u32> = indexed
+        .iter()
+        .map(|(name, width)| (name.as_str(), *width))
+        .collect();
     assert_eq!(
-        indexed
-            .iter()
-            .map(|(name, width)| (name.as_str(), *width))
-            .collect::<Vec<(&str, u32)>>(),
+        indexed_by_name.len(),
+        indexed.len(),
+        "an inductive must not be counted twice"
+    );
+    assert_eq!(
+        indexed_by_name.into_iter().collect::<Vec<(&str, u32)>>(),
         INDEXED_INDUCTIVES.to_vec(),
         "the indexed inductives and their widths"
     );
+    let unindexed_by_name: BTreeSet<&str> = unindexed_props.iter().map(String::as_str).collect();
     assert_eq!(
-        unindexed_props
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<&str>>(),
+        unindexed_by_name.len(),
+        unindexed_props.len(),
+        "a Prop must not be counted twice"
+    );
+    assert_eq!(
+        unindexed_by_name.into_iter().collect::<Vec<&str>>(),
         UNINDEXED_PROPS.to_vec(),
         "the Props that carry no index, so the implication is one-way"
     );
