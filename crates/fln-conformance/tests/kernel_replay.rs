@@ -9402,9 +9402,21 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
         Ok(rows) => rows,
         Err(reason) => panic!("{}: {reason}", path.display()),
     };
+    // THE SUCCESS ROW NEEDS ITS LIMITS MORE THAN THE FAILURE ROW DOES. The
+    // `none_retained` case above carefully says it evidences nothing; this one
+    // said only `validated`, and it is the row somebody would quote. What it
+    // establishes is narrow: every retained row for this pin is internally
+    // consistent and filed under the right epoch and corpus. A row's
+    // self-consistency says NOTHING about the run that produced it -- a
+    // hand-written row satisfying every law validates exactly as well as an
+    // observed one, which is the whole reason the producer digests its own
+    // source into the row rather than trusting the file.
     println!(
         "{{\"schema\":\"fln-t6r7-mathlib-receipt-retention/1\",\"status\":\"validated\",\
-         \"pin\":{},\"corpus_commit\":{},\"rows\":{}}}",
+         \"pin\":{},\"corpus_commit\":{},\"rows\":{},\
+         \"claims\":\"every retained row is self-consistent and bound to this pin and corpus. \
+         NOT that the lane ran, that any corpus was walked, or that any Mathlib declaration was \
+         checked -- a row's internal consistency is independent of whether it was observed.\"}}",
         json_string(&pin),
         json_string(&corpus),
         rows,
