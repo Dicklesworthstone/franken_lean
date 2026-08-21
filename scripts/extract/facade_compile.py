@@ -1542,6 +1542,16 @@ def main():
             "REFUSE: facade manifest Init-provided pin diverges "
             f"({json.dumps(init_provided_pin_join, sort_keys=True)})"
         )
+    pin_presence_pin_join = {
+        "summary_pin_presence_checked": manifest_summary.get("pin_presence_checked"),
+        "pinned_pin_presence_checked": 1543,
+    }
+    if (pin_presence_pin_join["summary_pin_presence_checked"]
+            != pin_presence_pin_join["pinned_pin_presence_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest pin-presence pin diverges "
+            f"({json.dumps(pin_presence_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2609,6 +2619,7 @@ def main():
         "manifest_transparent_values_pin_join": transparent_values_pin_join,
         "manifest_init_substrate_pin_join": init_substrate_pin_join,
         "manifest_init_provided_pin_join": init_provided_pin_join,
+        "manifest_pin_presence_pin_join": pin_presence_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
