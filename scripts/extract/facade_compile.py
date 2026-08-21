@@ -252,6 +252,11 @@ the toolchain would report a perfect facade:
     structure declarations. An un-demanded projection cannot cite a phantom or
     self-referential owner.
 
+  * A MANIFEST-TYPE-DEPENDENCY-TOTALITY JOIN requires every typed declaration
+    in the full manifest to carry a well-formed, duplicate-free dependency list
+    and every Init-substrate row to carry none. Closure-only rows cannot evade
+    the provenance shape checks applied to demanded rows.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1423,6 +1428,43 @@ def main():
             f"({json.dumps(manifest_provider_join, sort_keys=True)}, "
             f"unresolved={unresolved_providers[:8]!r}, self={self_providers[:8]!r})"
         )
+    malformed_type_dependencies = []
+    duplicate_type_dependencies = []
+    type_dependency_edges = 0
+    typed_dependency_rows = 0
+    for row in manifest_rows:
+        dependencies = row.get("type_deps")
+        if row.get("role") == "init-substrate":
+            if dependencies not in (None, []):
+                malformed_type_dependencies.append(row["name"])
+            continue
+        if (not isinstance(dependencies, list)
+                or not all(isinstance(dependency, str) and dependency
+                           for dependency in dependencies)):
+            malformed_type_dependencies.append(row["name"])
+            continue
+        type_dependency_edges += len(dependencies)
+        if dependencies:
+            typed_dependency_rows += 1
+        if len(dependencies) != len(set(dependencies)):
+            duplicate_type_dependencies.append(row["name"])
+    manifest_type_dependency_join = {
+        "typed_rows": manifest_signature_join["non_init_rows"],
+        "typed_dependency_rows": typed_dependency_rows,
+        "type_dependency_edges": type_dependency_edges,
+        "init_rows": manifest_signature_join["init_rows"],
+        "malformed_rows": len(malformed_type_dependencies),
+        "duplicate_dependency_rows": len(duplicate_type_dependencies),
+    }
+    if (manifest_type_dependency_join["typed_rows"] == 0
+            or manifest_type_dependency_join["malformed_rows"] != 0
+            or manifest_type_dependency_join["duplicate_dependency_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest type-dependency-totality join failed "
+            f"({json.dumps(manifest_type_dependency_join, sort_keys=True)}, "
+            f"malformed={malformed_type_dependencies[:8]!r}, "
+            f"duplicates={duplicate_type_dependencies[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1852,6 +1894,7 @@ def main():
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
         "manifest_global_provider_join": manifest_provider_join,
+        "manifest_type_dependency_totality_join": manifest_type_dependency_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
