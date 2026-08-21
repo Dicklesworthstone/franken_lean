@@ -264,3 +264,81 @@ fn kinds_are_discriminated_and_the_exported_name_set_is_never_lost() {
     assert_eq!(exported.len(), 5, "pin's exported ToArrayImpl census");
     assert_eq!(private.len(), 6, "pin's private ToArrayImpl census");
 }
+
+/// Every declaration that is still `Axiom` after the private part is read, for
+/// the two modules that hold all of them at the pin.
+///
+/// d17i measured that roughly 7,007 of 15,881 compared declarations — about 44
+/// in 100 — were compared as axioms whose bodies our decoder had not supplied,
+/// and warned that "we agreed with leanchecker" meant agreement on a postulated
+/// type rather than a checked body for that fraction. This is the assertion
+/// that keeps the answer honest once the companion chain restores them.
+///
+/// The residual set is pinned by NAME rather than by count. A count would be
+/// satisfied by any fifteen survivors, and the whole question here is WHICH
+/// declarations the kernel is still taking on trust: `propext`,
+/// `Classical.choice`, `Quot.sound` and `sorryAx` are Lean's genuine axioms,
+/// and the rest are compiler primitives (`lc*`, `isScalarObj`, `Quot.lcInv`,
+/// `Lean.trustCompiler`, `Lean.ofReduceBool`, `Lean.ofReduceNat`). Every one is
+/// declared `axiom` in the vendored pin source, so a postulate is the correct
+/// reading for all of them. A sixteenth name appearing here is a real
+/// definition whose body went missing again, and that is a finding, not noise.
+const RESIDUAL_AXIOMS: &[(&str, &[&str])] = &[
+    (
+        "Init/Prelude",
+        &[
+            "Classical.choice",
+            "Quot.lcInv",
+            "isScalarObj",
+            "lcAny",
+            "lcCast",
+            "lcErased",
+            "lcProof",
+            "lcUnreachable",
+            "lcVoid",
+            "sorryAx",
+        ],
+    ),
+    (
+        "Init/Core",
+        &[
+            "Lean.ofReduceBool",
+            "Lean.ofReduceNat",
+            "Lean.trustCompiler",
+            "Quot.sound",
+            "propext",
+        ],
+    ),
+];
+
+#[test]
+fn the_only_declarations_still_postulated_are_the_pins_real_axioms() {
+    let lib = lib_or_skip!();
+    for (module, expected) in RESIDUAL_AXIOMS {
+        let (exported, private) = exported_and_private(&lib, module);
+        let residual: Vec<&str> = exported
+            .iter()
+            .filter(|(name, kind)| {
+                **kind == "Axiom" && private.get(*name).copied() == Some("Axiom")
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            residual, *expected,
+            "{module}: the set of declarations the kernel still takes on trust has moved. \
+             A NEW name here is a definition whose body stopped being supplied — d17i's \
+             stripped-axiom defect returning — and a MISSING name means one of the pin's \
+             own axioms stopped being decoded."
+        );
+        // Anti-vacuity: the exported part must carry far more axioms than
+        // survive, or this test would pass against a decoder that had never
+        // stripped anything and would prove nothing about the repair.
+        let exported_axioms = exported.values().filter(|kind| **kind == "Axiom").count();
+        assert!(
+            exported_axioms > expected.len() * 10,
+            "{module}: expected the exported part to postulate far more than the {} that \
+             survive, got {exported_axioms}",
+            expected.len()
+        );
+    }
+}
