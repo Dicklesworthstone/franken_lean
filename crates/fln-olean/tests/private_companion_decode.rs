@@ -29,9 +29,13 @@
 
 use std::path::PathBuf;
 
-use fln_env::constants::ConstantInfo;
-use fln_olean::decl::DeclDecoder;
+use fln_core::expr::Expr;
+use fln_core::level::Level;
+use fln_core::name::Name;
+use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
+use fln_olean::decl::{DeclDecoder, DeclError, decode_chain_constants};
 use fln_olean::region::{OleanView, WalkBudget};
+use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
 
 /// The pinned Reference stdlib. `FLN_REFERENCE_LIB` overrides; the
 /// elan-installed pin is the default. No checked-in fixture carries the
@@ -433,13 +437,14 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 4] = [
+    let families: [(&str, fn(&str) -> bool); 5] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
+        ("eq_def", family::eq_def),
         (".loop", family::loop_),
     ];
-    let mut representatives: [Option<(String, String)>; 4] = [None, None, None, None];
+    let mut representatives: [Option<(String, String)>; 5] = [None, None, None, None, None];
 
     for relative in init_chain_modules(&lib) {
         let chain = chain_bytes(&lib, &relative);
@@ -497,10 +502,11 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 4] = [
+    let families: [(&str, fn(&str) -> bool); 5] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
+        ("eq_def", family::eq_def),
         (".loop", family::loop_),
     ];
 
@@ -553,6 +559,119 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
             "{family} {name}: private companion recovery weakened the declaration to an axiom"
         );
     }
+}
+
+#[test]
+fn verified_chain_decode_returns_the_private_superset_on_the_real_pin() {
+    let lib = lib_or_skip!("verified_chain_decode_returns_the_private_superset_on_the_real_pin");
+    let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+        .expect("server part parses against the exported region");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against the exported and server regions");
+
+    let constants = decode_chain_constants(&exported_view, &private_view, WalkBudget::default())
+        .expect("the pin's chain is a superset, so the containment proof must succeed");
+
+    let names: Vec<String> = constants
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+    assert_eq!(constants.len(), 6, "the private array is returned, not the exported one");
+    assert!(
+        names.contains(&TIMY_WITNESS.to_owned()),
+        "the verified decode must still carry {TIMY_WITNESS}; got {names:?}"
+    );
+}
+
+/// One axiom module carrying exactly `names`, encoded as a standalone region.
+///
+/// The containment proof compares two decoded constant arrays, so two
+/// independently encoded regions exercise it exactly. Building a genuinely
+/// non-superset three-part chain is not possible from the pin — the Reference
+/// never emits one, which is precisely why the assumption went unguarded.
+fn module_with(names: &[&str]) -> Vec<u8> {
+    let constants: Vec<ConstantInfo> = names
+        .iter()
+        .map(|name| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components(name.split('.')),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                is_unsafe: false,
+            })
+        })
+        .collect();
+    encode_module(
+        ModuleWriteInput {
+            is_module: false,
+            imports: &[],
+            constants: &constants,
+            extra_const_names: &[],
+        },
+        OleanWriteHeader {
+            version: 2,
+            flags: 1,
+            lean_version: "4.32.0",
+            githash: "0123456789abcdef0123456789abcdef01234567",
+            base_addr: 0x20_000,
+        },
+        WriteBudget::default(),
+    )
+    .expect("module encodes")
+    .bytes
+}
+
+#[test]
+fn verified_chain_decode_refuses_a_private_part_that_drops_an_exported_declaration() {
+    // The mutant this guard exists to kill: a private array that is NOT a
+    // superset. Returning it would hand the kernel fewer declarations than the
+    // module declares — franken_lean-timy's failure mode reached by a different
+    // cause — and every downstream reference to `Demo.dropped` would surface as
+    // an UnknownConstant with no indication that decode was responsible.
+    let exported = module_with(&["Demo.kept", "Demo.dropped"]);
+    let private = module_with(&["Demo.kept", "Demo.aux"]);
+
+    let exported_view = OleanView::parse(&exported).expect("exported fixture parses");
+    let private_view = OleanView::parse(&private).expect("private fixture parses");
+
+    let error = decode_chain_constants(&exported_view, &private_view, WalkBudget::default())
+        .expect_err("a private part missing an exported declaration must be refused");
+    match &error {
+        DeclError::PrivatePartIncomplete { missing } => {
+            assert_eq!(
+                missing.to_display_string(),
+                "Demo.dropped",
+                "the refusal must name the declaration that would have been lost"
+            );
+        }
+        other => panic!("expected PrivatePartIncomplete, got {other:?}"),
+    }
+    assert!(
+        format!("{error}").contains("Demo.dropped"),
+        "the rendered error must name the lost declaration: {error}"
+    );
+}
+
+#[test]
+fn verified_chain_decode_accepts_a_strict_superset() {
+    // The positive control for the mutant test above: the same machinery must
+    // NOT refuse a well-formed chain, or the guard would be a wall rather than
+    // a check and the test above would pass for the wrong reason.
+    let exported = module_with(&["Demo.kept", "Demo.other"]);
+    let private = module_with(&["Demo.kept", "Demo.other", "Demo.aux"]);
+
+    let exported_view = OleanView::parse(&exported).expect("exported fixture parses");
+    let private_view = OleanView::parse(&private).expect("private fixture parses");
+
+    let constants = decode_chain_constants(&exported_view, &private_view, WalkBudget::default())
+        .expect("a strict superset must be accepted");
+    assert_eq!(constants.len(), 3, "the private array is what is returned");
 }
 
 #[test]
