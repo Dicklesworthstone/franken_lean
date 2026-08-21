@@ -4520,7 +4520,15 @@ fn mathlib_corpus_root() -> PathBuf {
 /// Mathlib commit, a symlinked checkout, or a source-only checkout would make a
 /// seemingly successful sweep evidence about the wrong world.
 fn preflight_mathlib_corpus() -> Result<PathBuf, String> {
-    let corpus = mathlib_corpus_root();
+    preflight_mathlib_corpus_at(&mathlib_corpus_root())
+}
+
+/// The same gate over an explicitly named root, so a test can hand it something
+/// other than this host's corpus. Without this seam the classifier below could
+/// only ever be exercised against whatever happens to be on the machine, and on
+/// a machine with no corpus that means one arm of three.
+fn preflight_mathlib_corpus_at(root: &Path) -> Result<PathBuf, String> {
+    let corpus = root.to_path_buf();
     let metadata = fs::symlink_metadata(&corpus)
         .map_err(|error| format!("corpus root {} is unavailable: {error}", corpus.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -4568,6 +4576,232 @@ fn preflight_mathlib_corpus() -> Result<PathBuf, String> {
         ));
     }
     Ok(library)
+}
+
+/// How the whole-Mathlib corpus input presents itself on THIS host, as a typed
+/// value rather than as a boolean.
+///
+/// The distinction that matters is between ABSENT and MISPROVISIONED, and
+/// collapsing them is the reason this enum exists. A corpus that is not there is
+/// a missing host input: nothing in the repository can fix it, and a red for it
+/// is a red nobody can clear. A corpus that IS there and is the wrong thing -- a
+/// symlink, another Mathlib revision, a source-only checkout with no built
+/// oleans -- is a misprovisioned input, and skipping THAT would let someone
+/// provision the wrong corpus and read the resulting green as coverage.
+enum MathlibCorpusInput {
+    Absent { root: PathBuf, detail: String },
+    Present { root: PathBuf, library: PathBuf },
+    Misprovisioned { root: PathBuf, reason: String },
+}
+
+fn classify_mathlib_corpus_input() -> MathlibCorpusInput {
+    classify_mathlib_corpus_input_at(mathlib_corpus_root())
+}
+
+fn classify_mathlib_corpus_input_at(root: PathBuf) -> MathlibCorpusInput {
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MathlibCorpusInput::Absent {
+            detail: format!("{} does not exist: {error}", root.display()),
+            root,
+        },
+        Err(error) => MathlibCorpusInput::Misprovisioned {
+            reason: format!("cannot inspect {}: {error}", root.display()),
+            root,
+        },
+        // Present on disk: now it must prove it is the PINNED corpus. Every
+        // rejection `preflight_mathlib_corpus` can return is a misprovisioning,
+        // because the path existing is what separates the two arms.
+        Ok(_) => match preflight_mathlib_corpus_at(&root) {
+            Ok(library) => MathlibCorpusInput::Present { root, library },
+            Err(reason) => MathlibCorpusInput::Misprovisioned { root, reason },
+        },
+    }
+}
+
+/// The classifier tells ABSENT from MISPROVISIONED, proved on every run.
+///
+/// **The trap this is here for.** On a host with no corpus the walk above takes
+/// its `Absent` arm and asserts nothing whatever about a corpus -- correctly, and
+/// that is exactly what makes it decorative. If `classify_mathlib_corpus_input`
+/// were broken tomorrow to return `Absent` unconditionally, the walk would keep
+/// passing on a machine where the corpus was present and wrong, and the skip row
+/// would say "not on this host" about a corpus sitting right there. So the two
+/// arms are exercised here against roots chosen so their classification cannot
+/// depend on this machine's provisioning.
+///
+/// **Neither control writes to the filesystem.** They are a path that cannot
+/// exist and a directory that certainly does -- this crate's own source tree,
+/// which is a real, non-symlinked directory inside a readable git checkout whose
+/// `HEAD` is FrankenLean's, never `SUITE.lock`'s corpus commit. That makes it a
+/// genuine misprovisioned corpus for classification purposes without anyone
+/// having to fabricate one.
+#[test]
+fn the_corpus_classifier_distinguishes_an_absent_root_from_a_wrong_one() {
+    let missing = PathBuf::from("/data/tmp/fln-t6r7-a-root-that-does-not-exist");
+    assert!(
+        !missing.exists(),
+        "the absent-root control must name a path that really is absent"
+    );
+    match classify_mathlib_corpus_input_at(missing.clone()) {
+        MathlibCorpusInput::Absent { root, detail } => {
+            assert_eq!(root, missing);
+            assert!(
+                detail.contains(&*missing.to_string_lossy()),
+                "an absent classification must name the path it looked for: {detail}"
+            );
+        }
+        MathlibCorpusInput::Present { .. } => {
+            panic!("a nonexistent path was classified as a provisioned corpus")
+        }
+        MathlibCorpusInput::Misprovisioned { reason, .. } => panic!(
+            "a nonexistent path must be ABSENT, not misprovisioned: a missing host input and a \
+             wrong one need different responses, and merging them is what this test exists to \
+             prevent. Got: {reason}"
+        ),
+    }
+
+    // A real directory that is emphatically not the pinned Mathlib corpus.
+    let present_but_wrong = fln_conformance::checked_manifest_dir!();
+    assert!(
+        present_but_wrong.is_dir(),
+        "the wrong-root control must name a directory that really exists"
+    );
+    match classify_mathlib_corpus_input_at(present_but_wrong.clone()) {
+        MathlibCorpusInput::Misprovisioned { root, reason } => {
+            assert_eq!(root, present_but_wrong);
+            assert!(
+                !reason.trim().is_empty(),
+                "a misprovisioned classification must say what is wrong"
+            );
+        }
+        MathlibCorpusInput::Absent { .. } => panic!(
+            "a directory that exists was classified as ABSENT. This is the failure the walk \
+             cannot see for itself: it would skip, report a missing host input, and be wrong \
+             about a corpus that was right there"
+        ),
+        MathlibCorpusInput::Present { .. } => panic!(
+            "this crate's source tree was accepted as the pinned Mathlib corpus; the gate is \
+             not checking the corpus commit at all"
+        ),
+    }
+}
+
+/// The present-olean inventory walk over the whole-Mathlib corpus -- reachable
+/// by default, which is the whole point of it (bead `franken_lean-t6r7`).
+///
+/// **Why another one when two already exist.** `whole_mathlib_corpus_resurrection_preflight`
+/// and `_sweep` both cover this ground and both are `#[ignore]`d, so an ordinary
+/// `cargo test` says NOTHING about whether the corpus input is present, absent
+/// or wrong. The state of that input is the single fact this bead has been
+/// blocked on since 2026-08-04, and until now it was discoverable only by
+/// someone remembering to run an ignored test by name. This one runs in the
+/// batch and reports the input's state in a typed row every time.
+///
+/// **THE EXACT MISSING HOST INPUT**, so the skip below names something
+/// actionable rather than "not available":
+///
+///   path:    `/data/tmp/mathlib4-corpus` (override with `FLN_MATHLIB_CORPUS`)
+///   shape:   a real directory, NOT a symlink, holding a git checkout whose
+///            `HEAD` is `SUITE.lock`'s `corpus commit=` field, with built
+///            oleans under `.lake/build/lib/lean/Mathlib`
+///   size:    at least `WHOLE_MATHLIB_SEED_FLOOR` modules; a truncated corpus is
+///            not a smaller green walk
+///
+/// **What this walk is, and what it is NOT.** It enumerates the built olean set
+/// and derives canonical module names from it. It DOES NOT DECODE ANYTHING, does
+/// not build an import closure, does not reach the kernel and does not involve
+/// the oracle. The decode walk is the `#[ignore]`d `_sweep` (826 s when it last
+/// ran) and the differential is hours-class; making either reachable by default
+/// would put that cost on every commit. Inventory is the part that is cheap
+/// enough to be free, and it is the part that answers "is the input there".
+#[test]
+fn the_whole_mathlib_inventory_walks_the_corpus_or_names_what_is_missing() {
+    match classify_mathlib_corpus_input() {
+        MathlibCorpusInput::Absent { root, detail } => {
+            // ANTI-VACUITY ON THE DISCLOSURE ITSELF. A skip is only honest if it
+            // says what is missing; an empty reason would be a green that
+            // reports nothing, which is the shape this test exists to avoid.
+            assert!(
+                !detail.trim().is_empty() && detail.contains(&*root.to_string_lossy()),
+                "the skip must name the path it could not find, but the detail was {detail:?}"
+            );
+            println!(
+                "{{\"schema\":\"fln-t6r7-mathlib-inventory/1\",\"status\":\"skipped_absent_host_input\",\
+                 \"required_path\":{},\"override_env\":\"FLN_MATHLIB_CORPUS\",\
+                 \"required_corpus_commit\":{},\"required_library_subpath\":\".lake/build/lib/lean/Mathlib\",\
+                 \"required_min_modules\":{},\"detail\":{},\
+                 \"claims\":\"NOTHING. The corpus is not on this host, so no module was enumerated, \
+                 nothing was decoded, and no kernel or oracle verdict exists. This row records a \
+                 missing input, never a clean walk.\"}}",
+                json_string(&root.display().to_string()),
+                json_string(&suite_lock_corpus_commit()),
+                WHOLE_MATHLIB_SEED_FLOOR,
+                json_string(&detail),
+            );
+        }
+        MathlibCorpusInput::Misprovisioned { root, reason } => {
+            // NOT a skip. The input is present and is the wrong thing, and a
+            // green here would certify the wrong corpus.
+            panic!(
+                "the whole-Mathlib corpus root {} exists but is not the pinned corpus: {reason}. \
+                 This is a misprovisioned input, not a missing one, so it fails rather than \
+                 skipping -- a walk over another Mathlib revision would be evidence about \
+                 another world.",
+                root.display()
+            );
+        }
+        MathlibCorpusInput::Present { root, library } => {
+            let mut paths = Vec::new();
+            collect_present_oleans(&library, &mut paths)
+                .expect("enumerate the built whole-Mathlib olean set");
+            paths.sort();
+            let modules = module_names_below(&library, Some("Mathlib"))
+                .expect("derive canonical module names for the built Mathlib corpus");
+
+            assert!(
+                modules.len() as u64 >= WHOLE_MATHLIB_SEED_FLOOR,
+                "the whole-Mathlib inventory found only {} module(s) under {}; a truncated \
+                 corpus is not a smaller green walk",
+                modules.len(),
+                library.display()
+            );
+            assert!(
+                modules.iter().all(|name| name.starts_with("Mathlib.")),
+                "every module below the Mathlib olean root must be namespace-qualified before \
+                 its imports can be resolved"
+            );
+            // THE PROJECTION MUST BE INJECTIVE. `path -> module name` is a
+            // projection, and a projection keyed as an identity without anyone
+            // checking injectivity is a defect this repository has already
+            // found seven times. Two oleans collapsing to one name would make
+            // the inventory silently under-count and the shortfall would look
+            // exactly like a smaller corpus.
+            let distinct = modules.iter().collect::<BTreeSet<_>>();
+            assert_eq!(
+                distinct.len(),
+                paths.len(),
+                "{} olean(s) projected to {} distinct module name(s); the name is being used as \
+                 an identity and it is not injective over this corpus",
+                paths.len(),
+                distinct.len()
+            );
+
+            println!(
+                "{{\"schema\":\"fln-t6r7-mathlib-inventory/1\",\"status\":\"walked\",\
+                 \"root\":{},\"library\":{},\"corpus_commit\":{},\"oleans\":{},\"modules\":{},\
+                 \"decoded\":0,\
+                 \"claims\":\"INVENTORY ONLY. The built olean set was enumerated and projected to \
+                 canonical module names. Nothing was decoded, no import closure was built, no \
+                 declaration reached the kernel and the oracle was not consulted. This is not a \
+                 differential, not G1 and not PG-1.\"}}",
+                json_string(&root.display().to_string()),
+                json_string(&library.display().to_string()),
+                json_string(&suite_lock_corpus_commit()),
+                paths.len(),
+                modules.len(),
+            );
+        }
+    }
 }
 
 /// The cheap first gate for `franken_lean-t6r7`: establish that a full
