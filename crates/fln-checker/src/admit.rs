@@ -2409,7 +2409,7 @@ fn sum_constructor_type(
     let left = builder.bvar(2);
     let right = builder.bvar(1);
     let result = sum_application(&mut builder, sum, left_universe, right_universe, left, right);
-    let field = builder.bvar(if left_constructor { 2 } else { 1 });
+    let field = builder.bvar(if left_constructor { 1 } else { 0 });
     let result = builder.forall("val", BinderStyle::Default, field, result);
     let result = builder.forall("β", BinderStyle::Default, right_type, result);
     let root = builder.forall("α", BinderStyle::Default, left_type, result);
@@ -2448,7 +2448,7 @@ fn sum_minor_type(
     let constructor = builder.apply(constructor, field);
     let motive = builder.bvar(1 + prior_minors);
     let result = builder.apply(motive, constructor);
-    let field_type = builder.bvar(if left_constructor { 3 + prior_minors } else { 2 + prior_minors });
+    let field_type = builder.bvar(if left_constructor { 2 + prior_minors } else { 1 + prior_minors });
     let _ = sum;
     builder.forall("val", BinderStyle::Default, field_type, result)
 }
