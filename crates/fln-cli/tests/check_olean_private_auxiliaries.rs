@@ -774,6 +774,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateLeanNameResiduals",
+        3,
+        &[
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "listToArrayAuxMatchResiduals",
         1,
         &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"],
@@ -1059,6 +1069,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &["_private.Init.Prelude.0.Lean.Name.hash._proof_1", "_private.Init.Prelude.0.Lean.Name.hash._proof_2"],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private Lean.Name.beq.match_N residuals", "decoded _private Lean.Name.beq.match_N residual names", 1, &["_private.Init.Prelude.0.Lean.Name.beq.match_1"]);
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Lean.Name residuals",
+        "decoded _private Lean.Name residual names",
+        3,
+        &[
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
     assert_human_named_residuals(&human.stdout, "decoded _private List.toArrayAux.match_N residuals", "decoded _private List.toArrayAux.match_N residual names", 1, &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"]);
     assert_human_named_residuals(
         &human.stdout, "core-observables Lean.Syntax match_N residuals", "core-observables Lean.Syntax match_N residual names", 2,
