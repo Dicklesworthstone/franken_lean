@@ -2680,6 +2680,28 @@ def main():
             "REFUSE: facade manifest class-projection count must exceed Init "
             f"substrate-check count ({json.dumps(class_projection_init_substrate_checked_inequality_join, sort_keys=True)})"
         )
+    class_projection_init_provision_inequality_join = {
+        "summary_class_provided_projections": manifest_summary.get(
+            "class_provided_projections"
+        ),
+        "summary_init_provided": manifest_summary.get("init_provided"),
+    }
+    if (not isinstance(class_projection_init_provision_inequality_join[
+            "summary_class_provided_projections"], int)
+            or isinstance(class_projection_init_provision_inequality_join[
+                "summary_class_provided_projections"], bool)
+            or not isinstance(class_projection_init_provision_inequality_join[
+                "summary_init_provided"], int)
+            or isinstance(class_projection_init_provision_inequality_join[
+                "summary_init_provided"], bool)
+            or class_projection_init_provision_inequality_join[
+                "summary_class_provided_projections"]
+            <= class_projection_init_provision_inequality_join[
+                "summary_init_provided"]):
+        raise SystemExit(
+            "REFUSE: facade manifest class-projection count must exceed Init "
+            f"provision count ({json.dumps(class_projection_init_provision_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4704,6 +4726,9 @@ def main():
         ),
         "manifest_class_projection_init_substrate_checked_inequality_join": (
             class_projection_init_substrate_checked_inequality_join
+        ),
+        "manifest_class_projection_init_provision_inequality_join": (
+            class_projection_init_provision_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
