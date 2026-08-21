@@ -395,6 +395,16 @@ mod family {
                 .any(|component| *component == "loop")
     }
 
+    /// `.loop._proof_1` — proof helper emitted inside a generated loop.
+    pub fn loop_proof_1(name: &str) -> bool {
+        let parts = components(name);
+        parts.len() >= 3
+            && parts.last() == Some(&"_proof_1")
+            && parts[..parts.len() - 1]
+                .iter()
+                .any(|component| *component == "loop")
+    }
+
     /// `._unary` — compiler-generated unary recursor helper.
     pub fn unary(name: &str) -> bool {
         last_component_suffix(name, "_unary").is_some_and(str::is_empty)
@@ -801,6 +811,64 @@ fn private_f_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
     assert!(
         !matches!(recovered, ConstantInfo::Axiom(_)),
         "_f {name}: companion recovery weakened the declaration to an axiom"
+    );
+}
+
+#[test]
+fn loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib = lib_or_skip!(
+        "loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind"
+    );
+
+    // `.loop._proof_1` combines the recursion and proof-helper shapes; testing
+    // it separately prevents either broad predicate from masking a missing
+    // nested private declaration.
+    let (relative, name) = init_chain_modules(&lib)
+        .into_iter()
+        .find_map(|relative| {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::loop_proof_1(name))
+                .map(|name| (relative, name.clone()))
+        })
+        .expect("the pinned Init private companions contain a private-only .loop._proof_1 witness");
+    let chain = chain_bytes(&lib, &relative);
+
+    let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
+        panic!(".loop._proof_1 {name}: parse exported {relative}: {error}")
+    });
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| {
+            panic!(".loop._proof_1 {name}: decode exported {relative}: {error}")
+        });
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != name),
+        ".loop._proof_1 {name}: exported decoder unexpectedly has the private auxiliary"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap_or_else(|error| {
+                panic!(".loop._proof_1 {name}: parse private {relative}: {error}")
+            });
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| {
+            panic!(".loop._proof_1 {name}: decode private {relative}: {error}")
+        })
+        .into_iter()
+        .find(|info| info.name().to_display_string() == name)
+        .unwrap_or_else(|| {
+            panic!(".loop._proof_1 {name}: private decoder lost it in {relative}")
+        });
+    assert!(
+        !matches!(recovered, ConstantInfo::Axiom(_)),
+        ".loop._proof_1 {name}: companion recovery weakened the declaration to an axiom"
     );
 }
 
