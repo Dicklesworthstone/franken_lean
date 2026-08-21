@@ -225,6 +225,10 @@ the toolchain would report a perfect facade:
     declaration rows carrying a reason. The structural surface cannot hide a
     failed emission behind an aggregate count without row-level provenance.
 
+  * A MANIFEST-SCHEMA-ROW JOIN requires every consumed declaration and
+    Init-substrate row to carry the pinned manifest schema. A trusted summary
+    cannot make mixed-epoch data rows appear compatible by itself.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1232,6 +1236,7 @@ def main():
     sigs = {}
     manifest_rows = []
     manifest_init_substrate = []
+    manifest_contract_rows = []
     manifest_summary = None
     with open(args.module_manifest, encoding="utf-8") as fh:
         for line in fh:
@@ -1244,6 +1249,7 @@ def main():
                 )
                 manifest_summary = row
                 continue
+            manifest_contract_rows.append(row)
             if row.get("kind") == "init-substrate":
                 manifest_init_substrate.append(row)
                 continue
@@ -1265,6 +1271,21 @@ def main():
             f"(schema={None if manifest_summary is None else manifest_summary.get('schema')!r}, "
             f"pin={None if manifest_summary is None else manifest_summary.get('pin')!r}, "
             f"compiler={tag!r})"
+        )
+    manifest_schema_join = {
+        "consumed_rows": len(manifest_contract_rows),
+        "matching_schema_rows": sum(
+            row.get("schema") == manifest_summary["schema"]
+            for row in manifest_contract_rows
+        ),
+        "schema": manifest_summary["schema"],
+    }
+    if (manifest_schema_join["consumed_rows"] == 0
+            or manifest_schema_join["matching_schema_rows"]
+            != manifest_schema_join["consumed_rows"]):
+        raise SystemExit(
+            "REFUSE: facade manifest schema-row join disagrees with the pinned "
+            f"summary ({json.dumps(manifest_schema_join, sort_keys=True)})"
         )
     totality = {
         "uncensused_closure": manifest_summary.get("uncensused_closure"),
@@ -1663,6 +1684,7 @@ def main():
         "curated_module_join": module_join,
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
+        "manifest_schema_row_join": manifest_schema_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
         "manifest_emitted_row_join": emitted_row_join,
