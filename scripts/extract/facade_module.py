@@ -42,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2188,6 +2189,121 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
     return "\n".join(body) + "\n", line_map, emitted, attrs, provided
 
 
+def self_test():
+    """Run every publication guard against synthetic states, and refuse on a miss.
+
+    These seven guards only ever execute inside a full regeneration -- ten minutes
+    of pin invocations -- and nothing else in this repository mentions them, so in
+    practice they have never been run at all except by hand. Each was verified when
+    it landed by compiling the function out of the file in a scratch script and
+    feeding it decoys; none of that verification is in the tree, so a guard that
+    regressed tomorrow would be caught by nothing.
+
+    Every case below is one that was used to justify the guard beside it, kept in
+    the form that made it convincing: a state that must pass, and the specific
+    state that must refuse. `scripts/br_comment.py self-test` sets the convention
+    for this repository and this follows it.
+
+    Writes only into a fresh temp directory, never touches the artifacts, and
+    never invokes the Reference.
+    """
+    work = tempfile.mkdtemp(prefix="fln-l8f-selftest-")
+    failures, checked = [], []
+
+    def case(name, got_error, want_refusal):
+        checked.append(name)
+        refused = bool(got_error)
+        if refused != want_refusal:
+            failures.append(
+                f"{name}: expected {'a refusal' if want_refusal else 'a pass'}, "
+                f"got {'a refusal' if refused else 'a pass'}"
+                + (f" ({got_error})" if got_error else ""))
+
+    def at(tag, payload, *siblings):
+        path = os.path.join(work, tag)
+        mode, kw = ("wb", {}) if isinstance(payload, bytes) else ("w", {"encoding": "utf-8"})
+        with open(path, mode, **kw) as fh:
+            fh.write(payload)
+        for suffix in siblings:
+            with open(path + suffix, "w", encoding="utf-8") as fh:
+                fh.write("stale\n")
+        return path
+
+    text = "axiom Fln.SelfTest : Type\n" * 40
+    OUT, MAN = os.path.join(work, "f.lean"), os.path.join(work, "f.ndjson")
+
+    # published_bytes_error: the artifact on disk is the text this run built
+    case("bytes/identical", published_bytes_error(at("f.lean", text), text), False)
+    case("bytes/appended", published_bytes_error(at("app.lean", text + "x"), text), True)
+    case("bytes/missing",
+         published_bytes_error(os.path.join(work, "gone.lean"), text), True)
+    # the case that used to be a traceback rather than a verdict
+    case("bytes/not-utf8",
+         published_bytes_error(at("bad.lean", b"\xff\xfe not utf-8"), text), True)
+
+    # leftover_scratch_error: no scratch survives beside a published artifact
+    case("scratch/clean", leftover_scratch_error(at("c.lean", text)), False)
+    case("scratch/candidate-survived",
+         leftover_scratch_error(at("s.lean", text, CANDIDATE_SUFFIX)), True)
+    case("scratch/unrelated-sibling",
+         leftover_scratch_error(at("u.lean", text, ".notes.md")), False)
+
+    # scratch_coverage_error: what the run writes is what the leak check looks for
+    pub = {OUT: (text, "the facade", SCRATCH_SUFFIXES),
+           MAN: ("{}", "the manifest", MANIFEST_SCRATCH_SUFFIXES)}
+    created = {(OUT, OUT + CANDIDATE_SUFFIX), (MAN, MAN + MANIFEST_TMP_SUFFIX)}
+    case("coverage/covered", scratch_coverage_error(created, pub), False)
+    case("coverage/suffix-dropped",
+         scratch_coverage_error(created, {**pub, OUT: (text, "the facade",
+                                                       (VERIFY_SUFFIX,))}), True)
+
+    # publication_registry_error: every declared artifact went through the checks
+    case("registry/both", publication_registry_error(pub, (OUT, MAN)), False)
+    case("registry/never-registered",
+         publication_registry_error({OUT: pub[OUT]}, (OUT, MAN)), True)
+    case("registry/third-declared",
+         publication_registry_error(pub, (OUT, MAN, os.path.join(work, "third"))), True)
+    case("registry/undeclared-publish",
+         publication_registry_error({**pub, "stray": pub[OUT]}, (OUT, MAN)), True)
+
+    # artifact_divergence_note: a run that changed disk and did not finish says so
+    case("divergence/complete",
+         artifact_divergence_note(pub, [OUT], (OUT, MAN)), False)
+    case("divergence/half-written",
+         artifact_divergence_note({OUT: pub[OUT]}, [OUT], (OUT, MAN)), True)
+    case("divergence/nothing-replaced",
+         artifact_divergence_note({}, [], (OUT, MAN)), False)
+
+    # pin_acceptance_error: the published text is one the Reference accepted
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    case("acceptance/accepted", pin_acceptance_error(text, {digest}), False)
+    case("acceptance/never-recorded", pin_acceptance_error(text, set()), True)
+    case("acceptance/unvalidated", pin_acceptance_error(text, {"0" * 64}), True)
+
+    # work_scratch_report: the probes wrote where this run put them
+    case("work/populated", work_scratch_report(work)[0], False)
+    case("work/absent", work_scratch_report(os.path.join(work, "nope"))[0], True)
+    empty = os.path.join(work, "empty")
+    os.makedirs(empty, exist_ok=True)
+    case("work/empty", work_scratch_report(empty)[0], True)
+
+    # kept_candidate reports what is there rather than promising what is not
+    case("kept/present", None if "bytes" in kept_candidate(at("k.lean", text)) else "x",
+         False)
+    case("kept/absent",
+         None if "does not exist" in kept_candidate(os.path.join(work, "no")) else "x",
+         False)
+
+    if failures:
+        raise SystemExit("REFUSE: SELF-TEST FAILED — "
+                         + "; ".join(failures[:6])
+                         + f" (scratch kept at {work})")
+    print(f"facade-module: SELF-TEST OK — {len(checked)} cases across 7 guards: "
+          + " ".join(checked), file=sys.stderr)
+    print(f"facade-module: self-test scratch kept at {work}; nothing was deleted "
+          "and no artifact was read or written", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     for _dest, _help in OUTPUT_ARGS:
@@ -3759,6 +3875,11 @@ def _report_divergence():
 
 if __name__ == "__main__":
     try:
+        # Dispatched before argparse, because --out and --manifest are required and
+        # the self-test neither reads nor writes an artifact.
+        if "--self-test" in sys.argv[1:]:
+            self_test()
+            raise SystemExit(0)
         main()
     except SystemExit as exc:
         # A refusal must stay a refusal: this reports and re-raises, and the
