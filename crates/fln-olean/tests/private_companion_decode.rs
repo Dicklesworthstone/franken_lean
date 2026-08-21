@@ -206,6 +206,11 @@ const ARRAY_PMAP_IMPL_MATCH_1: &str =
     "_private.Init.Data.Array.Attach.0.Array.pmapImpl.match_1";
 /// The pin's private array stores this match helper in the attach module.
 const ARRAY_PMAP_IMPL_MATCH_1_MODULE: &str = "Init/Data/Array/Attach";
+/// The generated simp theorem for `Array.pmap_congr_left`.
+const ARRAY_PMAP_CONGR_LEFT_SIMP_1_1: &str =
+    "_private.Init.Data.Array.Attach.0.Array.pmap_congr_left._simp_1_1";
+/// The pin's private array stores this simp theorem in the attach module.
+const ARRAY_PMAP_CONGR_LEFT_SIMP_1_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1074,6 +1079,36 @@ fn array_pmap_impl_match_definition_is_decoded_from_its_private_storage_module()
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_PMAP_IMPL_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_pmap_congr_left_simp_theorem_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_pmap_congr_left_simp_theorem_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_PMAP_CONGR_LEFT_SIMP_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_PMAP_CONGR_LEFT_SIMP_1_1.to_owned()),
+        "the private companion of {ARRAY_PMAP_CONGR_LEFT_SIMP_1_1_MODULE} must retain \
+         {ARRAY_PMAP_CONGR_LEFT_SIMP_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_PMAP_CONGR_LEFT_SIMP_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_PMAP_CONGR_LEFT_SIMP_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_PMAP_CONGR_LEFT_SIMP_1_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
