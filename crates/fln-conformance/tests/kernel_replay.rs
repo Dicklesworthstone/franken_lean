@@ -4774,7 +4774,14 @@ impl CorpusMatrixReceipt {
 
         // PROVENANCE. These two fields are what bind the row to a corpus revision and to the
         // source that produced it. Empty strings are not weak provenance, they are none.
-        // TRIMMED, LIKE `bead` AND `target` TWO RULES DOWN. This was
+        // TRIMMED. AND THE REST OF THIS SENTENCE USED TO READ "LIKE `bead`
+        // AND `target` TWO RULES DOWN", WHICH NAMED RULES THAT ARE NOT HERE.
+        // It is a verbatim copy of the sibling receipt's comment, where those
+        // two rules do exist. In THIS validator `bead`, `target`, `profile`
+        // and `available_parallelism` appeared nowhere but `to_row` -- a
+        // comment asserting its neighbours, in a validator that had none. The
+        // rules named below now exist; the comment is no longer evidence for
+        // them. This was
         // `is_empty()`, so a hash of spaces named no corpus revision and passed
         // anyway -- the exact thing the message below says it refuses. A
         // retained row is editable by hand, which is why this file already
@@ -4853,6 +4860,45 @@ impl CorpusMatrixReceipt {
                  hex digest. A label records nothing a later reader could resolve to a source",
                 self.lane_source_digest_at_run
             ));
+        }
+        // THE HOST HALF OF THE BINDING, WHICH NOTHING HELD. This file's own
+        // account of the receipt is that it binds each run to the pin, the
+        // corpus revision AND THE HOST, and the waiver's cost figure is quoted
+        // in AGENTS.md as a 64-way host. `target`, `profile` and
+        // `available_parallelism` carried that half and were read by nothing
+        // outside serialization: a row could name no platform, no profile, and
+        // report zero cores while standing as the evidence.
+        //
+        // Zero is not a small number here, it is the producer's failure value --
+        // `available_parallelism().map(...).unwrap_or(0)`. A host that cannot
+        // report its parallelism cannot file a host-bound observation, and the
+        // lane should refuse rather than retain a row whose host half is absent.
+        if self.bead.trim().is_empty() {
+            return Err(
+                "row carries an empty bead, so it is filed against no work item".to_string(),
+            );
+        }
+        if self.target.trim().is_empty() {
+            return Err(
+                "row carries an empty target, so it names no platform. The observation is \
+                 bounded_model on a host, and a host it does not name cannot bound it"
+                    .to_string(),
+            );
+        }
+        if self.profile.trim().is_empty() {
+            return Err(
+                "row carries an empty profile. The 32-minute cost this waiver is granted on \
+                 was measured under a named build profile, and an unnamed one prices nothing"
+                    .to_string(),
+            );
+        }
+        if self.available_parallelism == 0 {
+            return Err(
+                "row records available_parallelism: 0, which is the producer's failure value \
+                 rather than a host with no cores. A run whose host capability is unknown \
+                 cannot support a claim quoted as having been measured on a 64-way host"
+                    .to_string(),
+            );
         }
 
         // CONTENT.
@@ -18542,6 +18588,38 @@ fn a_receipt_that_compared_nothing_is_refused() {
                 ..real.clone()
             },
             "empty corpus_fixture_hash",
+        ),
+        (
+            "filed against no work item",
+            CorpusMatrixReceipt {
+                bead: "  ".to_string(),
+                ..real.clone()
+            },
+            "empty bead",
+        ),
+        (
+            "an observation of no platform",
+            CorpusMatrixReceipt {
+                target: String::new(),
+                ..real.clone()
+            },
+            "names no platform",
+        ),
+        (
+            "an observation under no build profile",
+            CorpusMatrixReceipt {
+                profile: String::new(),
+                ..real.clone()
+            },
+            "empty profile",
+        ),
+        (
+            "a host that could not report its parallelism",
+            CorpusMatrixReceipt {
+                available_parallelism: 0,
+                ..real.clone()
+            },
+            "producer's failure value",
         ),
         (
             "a width that took no time",
