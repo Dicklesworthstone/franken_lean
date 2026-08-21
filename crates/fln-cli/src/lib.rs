@@ -2732,6 +2732,19 @@ fn is_private_cli_private_report_match_residual(display: &str) -> bool {
         })
 }
 
+fn is_private_cli_private_report_equation_residual(display: &str) -> bool {
+    display.starts_with("_private.CliPrivateReport.")
+        && display.split('.').any(|component| {
+            component == "eq_def"
+                || component.strip_prefix("match_").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                || component.strip_prefix("eq_").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+}
+
 fn is_private_eq_def_residual(display: &str) -> bool {
     display.starts_with("_private.") && display.split('.').any(|component| component == "eq_def")
 }
@@ -3082,6 +3095,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_cli_private_report_match_residual,
     );
+    let mut private_cli_private_report_equation_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_cli_private_report_equation_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_cli_private_report_equation_residual,
+    );
     let mut private_eq_def_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3324,6 +3345,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_match_residuals)
     };
+    let private_cli_private_report_equation_observed =
+        private_cli_private_report_equation_residuals.observed;
+    let private_cli_private_report_equation_omitted =
+        private_cli_private_report_equation_residuals.omitted();
+    let private_cli_private_report_equation_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_equation_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_equation_residuals)
+    };
     let private_eq_def_observed = private_eq_def_residuals.observed;
     let private_eq_def_omitted = private_eq_def_residuals.omitted();
     let private_eq_def_names = if json {
@@ -3561,6 +3591,7 @@ fn render_check_olean_success(
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportEquationResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3617,6 +3648,9 @@ fn render_check_olean_success(
             private_cli_private_report_match_observed,
             private_cli_private_report_match_names,
             private_cli_private_report_match_omitted,
+            private_cli_private_report_equation_observed,
+            private_cli_private_report_equation_names,
+            private_cli_private_report_equation_omitted,
             private_eq_def_observed,
             private_eq_def_names,
             private_eq_def_omitted,
@@ -3739,6 +3773,9 @@ fn render_check_olean_success(
                 "decoded _private CliPrivateReport.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport.match_N residual names: {}\n",
                 "decoded _private CliPrivateReport.match_N residual names omitted: {}\n",
+                "decoded _private CliPrivateReport equation residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport equation residual names: {}\n",
+                "decoded _private CliPrivateReport equation residual names omitted: {}\n",
                 "decoded _private eq_def residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private eq_def residual names: {}\n",
                 "decoded _private eq_def residual names omitted: {}\n",
@@ -3858,6 +3895,9 @@ fn render_check_olean_success(
             private_cli_private_report_match_observed,
             private_cli_private_report_match_names,
             private_cli_private_report_match_omitted,
+            private_cli_private_report_equation_observed,
+            private_cli_private_report_equation_names,
+            private_cli_private_report_equation_omitted,
             private_eq_def_observed,
             private_eq_def_names,
             private_eq_def_omitted,
@@ -4324,6 +4364,16 @@ fn render_check_olean_set_success(
             is_private_cli_private_report_match_residual,
         );
     }
+    let mut private_cli_private_report_equation_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_cli_private_report_equation_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_cli_private_report_equation_residual,
+        );
+    }
     let mut private_eq_def_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4631,6 +4681,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_match_residuals)
     };
+    let private_cli_private_report_equation_observed =
+        private_cli_private_report_equation_residuals.observed;
+    let private_cli_private_report_equation_omitted =
+        private_cli_private_report_equation_residuals.omitted();
+    let private_cli_private_report_equation_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_equation_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_equation_residuals)
+    };
     let private_eq_def_observed = private_eq_def_residuals.observed;
     let private_eq_def_omitted = private_eq_def_residuals.omitted();
     let private_eq_def_names = if json {
@@ -4874,6 +4933,7 @@ fn render_check_olean_set_success(
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportEquationResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4929,9 +4989,12 @@ fn render_check_olean_set_success(
             private_match_n_observed,
             private_match_n_names,
             private_match_n_omitted,
-            private_cli_private_report_match_observed,
-            private_cli_private_report_match_names,
-            private_cli_private_report_match_omitted,
+           private_cli_private_report_match_observed,
+           private_cli_private_report_match_names,
+           private_cli_private_report_match_omitted,
+            private_cli_private_report_equation_observed,
+            private_cli_private_report_equation_names,
+            private_cli_private_report_equation_omitted,
             private_eq_def_observed,
             private_eq_def_names,
             private_eq_def_omitted,
@@ -5056,6 +5119,9 @@ fn render_check_olean_set_success(
                 "decoded _private CliPrivateReport.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport.match_N residual names: {}\n",
                 "decoded _private CliPrivateReport.match_N residual names omitted: {}\n",
+                "decoded _private CliPrivateReport equation residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport equation residual names: {}\n",
+                "decoded _private CliPrivateReport equation residual names omitted: {}\n",
                 "decoded _private eq_def residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private eq_def residual names: {}\n",
                 "decoded _private eq_def residual names omitted: {}\n",
@@ -5177,6 +5243,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_match_observed,
             private_cli_private_report_match_names,
             private_cli_private_report_match_omitted,
+            private_cli_private_report_equation_observed,
+            private_cli_private_report_equation_names,
+            private_cli_private_report_equation_omitted,
             private_eq_def_observed,
             private_eq_def_names,
             private_eq_def_omitted,

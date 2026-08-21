@@ -630,6 +630,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportEquationResiduals",
+        4,
+        &[
+            "_private.CliPrivateReport.0.eq_1",
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.match_1",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateEqDefResiduals",
         2,
         &[
@@ -931,6 +942,18 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "decoded _private CliPrivateReport.match_N residual names",
         1,
         &["_private.CliPrivateReport.0.match_1"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport equation residuals",
+        "decoded _private CliPrivateReport equation residual names",
+        4,
+        &[
+            "_private.CliPrivateReport.0.eq_1",
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.match_1",
+        ],
     );
     assert_human_named_residuals(
         &human.stdout, "decoded _private eq_def residuals", "decoded _private eq_def residual names", 2,
