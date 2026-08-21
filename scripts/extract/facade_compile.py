@@ -3670,6 +3670,9 @@ def main():
     class_projection_quarantine_inequality_join = {"summary_class_provided_projections": manifest_summary.get("class_provided_projections"), "summary_quarantined": manifest_summary.get("quarantined")}
     if (not isinstance(class_projection_quarantine_inequality_join["summary_class_provided_projections"], int) or isinstance(class_projection_quarantine_inequality_join["summary_class_provided_projections"], bool) or not isinstance(class_projection_quarantine_inequality_join["summary_quarantined"], int) or isinstance(class_projection_quarantine_inequality_join["summary_quarantined"], bool) or class_projection_quarantine_inequality_join["summary_class_provided_projections"] <= class_projection_quarantine_inequality_join["summary_quarantined"]):
         raise SystemExit("REFUSE: facade manifest class-projection count must exceed quarantine count " + json.dumps(class_projection_quarantine_inequality_join, sort_keys=True))
+    projection_quarantine_inequality_join = {"summary_projection_types_checked": manifest_summary.get("projection_types_checked"), "summary_quarantined": manifest_summary.get("quarantined")}
+    if (not isinstance(projection_quarantine_inequality_join["summary_projection_types_checked"], int) or isinstance(projection_quarantine_inequality_join["summary_projection_types_checked"], bool) or not isinstance(projection_quarantine_inequality_join["summary_quarantined"], int) or isinstance(projection_quarantine_inequality_join["summary_quarantined"], bool) or projection_quarantine_inequality_join["summary_projection_types_checked"] <= projection_quarantine_inequality_join["summary_quarantined"]):
+        raise SystemExit("REFUSE: facade manifest projection-type count must exceed quarantine count " + json.dumps(projection_quarantine_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5841,6 +5844,9 @@ def main():
         ),
         "manifest_class_projection_quarantine_inequality_join": (
             class_projection_quarantine_inequality_join
+        ),
+        "manifest_projection_quarantine_inequality_join": (
+            projection_quarantine_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
