@@ -2343,6 +2343,19 @@ fn kr600_803_init_nat_fixture_pins_recursor_levels_motives_minors_and_rules() {
 }
 
 #[test]
+fn kr600_803_init_nat_fixture_pins_constructor_indices_parameters_and_fields() {
+    let entries = nat_entries();
+    for (entry, expected_index, expected_fields) in [(&entries[1], 0, 0), (&entries[2], 1, 1)] {
+        let metadata = entry.declaration().constructor_metadata().expect("fixture constructor metadata");
+        assert_eq!(metadata.inductive(), &checker_name("Nat"));
+        assert_eq!(metadata.index(), expected_index);
+        assert_eq!(metadata.num_parameters(), 0);
+        assert_eq!(metadata.num_fields(), expected_fields);
+        assert!(entry.declaration().level_parameters().is_empty());
+    }
+}
+
+#[test]
 fn kr600_803_init_option_universes_parameters_and_rules_are_reconstructed() {
     let entries = init_option_entries();
     let verdict = admit_inductive(
