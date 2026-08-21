@@ -191,6 +191,11 @@ the toolchain would report a perfect facade:
     declaration and binds the manifest's distinct-emission count to that set.
     Duplicate rows may not impersonate distinct coverage.
 
+  * A MANIFEST-TRANSPARENCY JOIN binds the generator's measured transparent
+    declaration count to the declaration rows marked `transparent-abbrev`.
+    A summary cannot claim a transparent compatibility surface that its own
+    manifest does not enumerate.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1289,6 +1294,23 @@ def main():
             f"({json.dumps(emitted_name_join, sort_keys=True)}, "
             f"rows={emitted_row_join['emitted_declaration_rows']})"
         )
+    transparency_join = {
+        "transparent_rows": sum(
+            row.get("form") == "transparent-abbrev" for row in manifest_rows
+        ),
+        "summary_transparent_declarations": manifest_summary.get(
+            "transparent_declarations"
+        ),
+    }
+    if (not isinstance(transparency_join["summary_transparent_declarations"], int)
+            or isinstance(transparency_join["summary_transparent_declarations"], bool)
+            or transparency_join["summary_transparent_declarations"] < 0
+            or transparency_join["transparent_rows"]
+            != transparency_join["summary_transparent_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest transparency join disagrees with its "
+            f"declaration rows ({json.dumps(transparency_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1463,6 +1485,7 @@ def main():
         "manifest_emission_verification_join": emission_verification,
         "manifest_emitted_row_join": emitted_row_join,
         "manifest_emitted_name_join": emitted_name_join,
+        "manifest_transparency_join": transparency_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
