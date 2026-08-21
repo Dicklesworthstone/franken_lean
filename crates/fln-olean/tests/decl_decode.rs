@@ -2444,3 +2444,158 @@ fn the_boxed_tail_third_shape_objects_hold_no_pointers() {
         "the boxed HEAD values, which nothing had read before"
     );
 }
+
+/// The heads of the other 82, closing the gap `a7a7a9e0` named.
+///
+/// That cell found that six waves had described the 99 entirely through their
+/// TAILS and had never read a HEAD, and it read the heads of the 17. This reads
+/// the heads of the remaining 82 - the 71 whose tail is a `tag 0` constructor
+/// and the 11 that are `Expr.const` - and the answer is a clean split:
+///
+///   the 71   every head a POINTER, all at one shape: `tag 0` arity 5
+///   the 11   every head BOXED, values 0 through 5
+///   the 17   every head BOXED, values 4 through 14   (`a7a7a9e0`)
+///
+/// EACH GROUP IS INTERNALLY UNIFORM AND NO GROUP IS MIXED, and that is the
+/// third independent measurement against the misread hypothesis. The 71 gave
+/// 142 tail-side fields, all pointers. The 17 gave 34 fields, all scalars. Now
+/// the head side splits the same way and along the same group boundaries: 71
+/// pointers with not one scalar among them, 11 scalars with not one pointer.
+/// A walker drifting off real object boundaries produces mixtures, and it
+/// certainly does not produce mixtures that align with a partition derived from
+/// a different field.
+///
+/// The 71 heads all point at a SINGLE shape, one per parent. Combined with
+/// `84951450` - where 71 of the tails' 142 fields pointed at one `tag 0` arity
+/// 4 shape, again one per tail - this is a regular record laid out the same way
+/// 71 times. That is a data structure, not debris.
+///
+/// Classified by CONSTRUCTOR TAG AND ARITY ONLY. No size is asserted anywhere
+/// in this cell: sizes appear in the file already where they were the thing
+/// being measured, and reaching for one here would be reintroducing the
+/// discriminator `daaaabe2` disproved through the back door.
+#[test]
+fn the_pointer_tailed_third_shape_heads_are_uniform_within_each_group() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut third_tails = 0usize;
+    let mut tag_zero = (0usize, 0usize); // (population, pointer heads)
+    let mut tag_four = (0usize, 0usize);
+    let mut tag_zero_heads: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut tag_four_heads: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let tail = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            if (second & 1 == 1 && second >> 1 == 0)
+                || tail.is_some_and(|t| (t.tag, t.other) == (1, 2))
+            {
+                continue;
+            }
+            third_tails += 1;
+            let Some(tail) = tail else { continue }; // the 17, done at a7a7a9e0
+
+            let head = word_at(bytes, object.off + 8);
+            let head_object = (head & 1 == 0)
+                .then(|| usize::try_from(head.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+
+            match (tail.tag, tail.other) {
+                (0, 2) => {
+                    tag_zero.0 += 1;
+                    if head & 1 == 0 {
+                        tag_zero.1 += 1;
+                        *tag_zero_heads
+                            .entry(match head_object {
+                                Some(h) => format!("tag {} arity {}", h.tag, h.other),
+                                None => "unresolvable".to_owned(),
+                            })
+                            .or_default() += 1;
+                    }
+                }
+                (4, 2) => {
+                    tag_four.0 += 1;
+                    if head & 1 == 0 {
+                        tag_four.1 += 1;
+                    } else {
+                        *tag_four_heads.entry(head >> 1).or_default() += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(third_tails, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Kept two-way, and the arithmetic that ties the three groups together.
+    assert_eq!(third_tails, 99, "the same 99 the remainder cell pins");
+    assert_eq!(
+        (tag_zero.0, tag_four.0),
+        (71, 11),
+        "the two pointer-tailed groups; the remaining 17 are `a7a7a9e0`'s"
+    );
+    assert_eq!(
+        tag_zero.0 + tag_four.0 + 17,
+        third_tails,
+        "the three groups must account for the whole population"
+    );
+
+    // The 71: every head a pointer, all at one constructor shape.
+    assert_eq!(
+        tag_zero.1, 71,
+        "every one of the 71 has a POINTER head - not one scalar among them"
+    );
+    assert_eq!(
+        tag_zero_heads.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 5".to_owned(), 71)],
+        "and they all point at a single constructor shape, one per parent - a \
+         regular record laid out the same way 71 times, not debris"
+    );
+
+    // The 11: every head boxed.
+    assert_eq!(
+        tag_four.1, 0,
+        "not one of the 11 has a pointer head; `Expr.const`'s parents carry \
+         scalars here"
+    );
+    assert_eq!(
+        tag_four_heads.into_iter().collect::<Vec<_>>(),
+        vec![(0, 2), (1, 2), (2, 2), (3, 2), (4, 2), (5, 1)],
+        "the boxed head values. A boxed ZERO is unremarkable in a head - it is \
+         only in a TAIL that it would mean `List.nil`"
+    );
+}
