@@ -1259,11 +1259,19 @@ impl ChainConstants {
 /// [`OleanView::is_chained_to`] is what identifies the pair, and the header
 /// comparison is kept as the cheaper toolchain check in front of it.
 fn is_companion_of(companion: &OleanView<'_>, exported: &OleanView<'_>) -> bool {
-    companion.header.version == exported.header.version
+    let same_toolchain = companion.header.version == exported.header.version
         && companion.header.flags == exported.header.flags
         && companion.header.lean_version == exported.header.lean_version
-        && companion.header.githash == exported.header.githash
-        && companion.is_chained_to(exported)
+        && companion.header.githash == exported.header.githash;
+
+    // The structural test only means something for a view that was parsed
+    // against dependency regions. A SELF-CONTAINED view — every pointer
+    // resolving inside its own region, as a freshly encoded module's does — is
+    // chained to nothing by construction, and demanding otherwise would refuse
+    // a legitimately composed pair for having been built without companions
+    // rather than for being the wrong module. The superset and strength laws
+    // still judge such a pair on its contents.
+    same_toolchain && (!companion.has_dependency_regions() || companion.is_chained_to(exported))
 }
 
 /// Ceilings for composing one module-system chain.
@@ -2012,6 +2020,48 @@ mod tests {
             strengthened > 0,
             "Init.BinderPredicates must carry exported axioms that the private part \
              gives a body, or this test witnesses nothing about the direction"
+        );
+    }
+
+    /// The structural companion test is gated on the view HAVING dependency
+    /// regions, and this pins that boundary.
+    ///
+    /// Requiring `is_chained_to` unconditionally refused a self-contained pair
+    /// for having been built without companions rather than for being the wrong
+    /// module — a real regression, caught only when the suite was executed. The
+    /// two halves are asserted here so the gate cannot quietly go away again.
+    #[test]
+    fn a_self_contained_view_has_no_dependency_regions_but_a_chained_one_does() {
+        let standalone = axiom_module(false);
+        let view = OleanView::parse(&standalone).expect("standalone parses");
+        assert!(
+            !view.has_dependency_regions(),
+            "a freshly encoded module resolves every pointer inside itself"
+        );
+        // Self-contained pairs are therefore judged on contents alone.
+        assert!(is_companion_of(&view, &view));
+
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the chained half of \
+                 a_self_contained_view_has_no_dependency_regions_but_a_chained_one_does: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |suffix: &str| {
+            std::fs::read(lib.join(format!("Init/Data/List/ToArrayImpl.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read ToArrayImpl{suffix}: {error}"))
+        };
+        let exported = read("");
+        let server = read(".server");
+        let private = read(".private");
+        let private_view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+            .expect("private parses against its chain");
+        assert!(
+            private_view.has_dependency_regions(),
+            "a real companion is parsed against earlier regions, so the structural \
+             test applies to it"
         );
     }
 

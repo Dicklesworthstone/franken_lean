@@ -414,6 +414,15 @@ impl<'a> OleanView<'a> {
         })
     }
 
+    /// Was this view parsed against any dependency regions at all?
+    ///
+    /// A view with none is self-contained: every pointer it holds resolves
+    /// inside its own region, so it cannot be a companion referring to an
+    /// earlier part, and [`Self::is_chained_to`] has nothing to answer from.
+    pub fn has_dependency_regions(&self) -> bool {
+        !self.dependencies.is_empty()
+    }
+
     /// Is `other`'s region one of the dependency regions this view was parsed
     /// against?
     ///
