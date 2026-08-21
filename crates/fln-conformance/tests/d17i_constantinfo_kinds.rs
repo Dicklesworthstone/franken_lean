@@ -7282,6 +7282,9 @@ fn the_import_closure_that_respects_import_all_is_still_total() {
     );
 }
 
+/// The one aggregator edge that is not a plain re-export: a meta import.
+const AGGREGATOR_META_EDGE: &str = "Init.Try";
+
 /// The library-root module the census leaves out, and the two facts that make
 /// leaving it out safe.
 ///
@@ -7300,10 +7303,18 @@ fn the_import_closure_that_respects_import_all_is_still_total() {
 ///     "zero edges leave the set" actually depends on — that cell passes
 ///     because nobody imports the aggregator, and it never said so
 ///
-/// And it is a pure re-export aggregator: 43 import edges, every one of them
-/// `import_all` false and `is_exported` true — no `import all`, no `meta`, no
-/// declarations of its own. 42 of the 43 are distinct; `Init.Try` appears
-/// twice, which is this module's instance of a repeated import row.
+/// It is a re-export aggregator with one exception: 43 import edges, every one
+/// of them `import_all` false and `is_exported` true — no `import all` anywhere
+/// and no declarations of its own — but ONE edge carries `is_meta`, and it is
+/// `Init.Try`. The remainder is named rather than folded into "plain
+/// re-export", because a predicate widened to accept meta edges would accept
+/// them anywhere.
+///
+/// That exception explains the other oddity instead of sitting beside it: 43
+/// edges carry only 42 distinct names, and the repeated one is `Init.Try` —
+/// imported once plainly and once as meta. The duplicate row and the meta flag
+/// are the same fact, and the cell asserts the link rather than the two counts
+/// separately.
 ///
 /// Those 43 edges transitively reach ALL 600 census modules. So the census is
 /// exactly what `Init` pulls in, and a module added under `Init/` that the
@@ -7329,8 +7340,20 @@ fn the_census_omits_the_aggregator_and_the_aggregator_reaches_the_census() {
         aggregator
             .imports
             .iter()
-            .all(|import| !import.import_all && import.is_exported && !import.is_meta),
-        "every aggregator edge is a plain re-export"
+            .all(|import| !import.import_all && import.is_exported),
+        "no aggregator edge carries import_all, and every one is re-exported"
+    );
+    let meta: Vec<String> = aggregator
+        .imports
+        .iter()
+        .filter(|import| import.is_meta)
+        .map(|import| import.module.to_display_string())
+        .collect();
+    assert_eq!(
+        meta,
+        vec![AGGREGATOR_META_EDGE],
+        "exactly one aggregator edge is a meta import, and it is named rather than absorbed \
+         into `plain re-export`"
     );
     let distinct: BTreeSet<String> = aggregator
         .imports
@@ -7341,6 +7364,16 @@ fn the_census_omits_the_aggregator_and_the_aggregator_reaches_the_census() {
         distinct.len(),
         42,
         "one edge is repeated, which is this module's instance of a duplicated import row"
+    );
+    // The repeat and the meta edge are the SAME module: `Init.Try` is imported
+    // once plainly and once as meta, which is what makes 43 edges carry 42
+    // names.
+    assert!(
+        aggregator.imports.iter().any(|import| {
+            import.module.to_display_string() == AGGREGATOR_META_EDGE && !import.is_meta
+        }),
+        "the meta edge's module must also appear as a plain edge, or the repeated row and the \
+         meta row are unrelated facts"
     );
 
     // One pass over the census: the adjacency, and whether anything imports the
