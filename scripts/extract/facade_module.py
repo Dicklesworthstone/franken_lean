@@ -2323,6 +2323,38 @@ def main():
             "in the facade — a facade that quarantines its way to a green is not a "
             "facade, and this artifact will not land")
 
+    # WHAT WAS WRITTEN, taken from the emitter's own line map rather than
+    # re-derived from the sets that fed it. The re-derivation had already drifted
+    # twice: an `inductive` block still reported form=axiom, and
+    # `Lean.Expr.brecOn` -- a row the emitter SKIPS because the kernel generates
+    # it -- reported form=transparent-abbrev because it was still a member of the
+    # transparent candidate set. A manifest that names the wrong mechanism is a
+    # worse artifact than one that names none.
+    # `attr` lines are NOT a declaration form -- they are `attribute [instance]`
+    # lines attached to a row written elsewhere, and for a class projection the
+    # row they attach to is one the KERNEL wrote. Reading them as a form would
+    # both invent a form for those rows and false-positive the guard below.
+    WRITTEN_FORMS = {"inductive": "inductive",
+                     "transparent": "transparent-abbrev", "axiom": "axiom",
+                     "struct": None}
+    written_form = {}
+    for _kind, _nm in line_map.values():
+        if _kind == "attr":
+            continue
+        if _kind not in WRITTEN_FORMS:
+            raise SystemExit(
+                f"REFUSE: the emitter wrote a line of kind {_kind!r} that this "
+                "manifest has no form for, so `form` would silently omit a "
+                "mechanism the artifact actually uses")
+        written_form[_nm] = WRITTEN_FORMS[_kind] or (
+            "class" if (structs.get(_nm) or {}).get("is_class") else "structure")
+    _both = sorted(set(written_form) & set(provided))
+    if _both:
+        raise SystemExit(
+            f"REFUSE: {len(_both)} rows were both WRITTEN by this emitter and "
+            f"claimed as kernel-generated: {_both[:6]} — one of the two records is "
+            "false, and every consumer reading `form` would be told the wrong "
+            "mechanism serves the row")
     for _ind, _iv in pin_inductives.items():
         for _c in _iv.get("ctors", ()):
             ctor_owner[_c] = _ind
@@ -2397,6 +2429,18 @@ def main():
         "quarantined": len(quarantine),
         "inductive_declarations": len(inductive_decls),
         "inductive_rows": sorted(inductive_decls),
+        "form_source": "the emitter's line map -- what the artifact actually "
+            "contains -- not a re-derivation from the candidate sets",
+        "form_counts": {k: sum(1 for v in written_form.values() if v == k)
+                        for k in sorted(set(written_form.values()))},
+        "candidate_vs_written_note": "transparent_declarations, "
+            "structural_declarations and inductive_declarations count the rows "
+            "SELECTED for each form. They are not what the file contains: a row "
+            "the kernel generates from some other row's block is skipped by the "
+            "emitter however it was selected, so 747 transparent candidates are "
+            "55 written transparent abbrevs and the rest arrive as projections of "
+            "a structure or constructors of an inductive. form_counts is the "
+            "written side and is derived from the emitter's line map.",
         "inductive_refused": len(inductive_refused),
         "inductive_refused_reasons": {k: inductive_refused[k]
                                       for k in sorted(inductive_refused)},
@@ -2586,14 +2630,11 @@ def main():
             "instance": d["instance"],
             "instance_registered": bool(d["instance"]) and name not in dropped_attrs,
             "instance_drop_reason": attr_reason.get(name),
-            "form": ("transparent-abbrev" if name in transparent
-                     else "inductive" if name in inductive_decls
-                     else "class" if name in structural and structs[name]["is_class"]
-                     else "structure" if name in structural
-                     else ("kernel-generated" if name in provided
-                           and pin_kind.get(name) in ("ctor", "rec", "quot")
-                           else "class-projection") if name in provided
-                     else "axiom"),
+            "form": written_form.get(name) or (
+                ("kernel-generated"
+                 if pin_kind.get(name) in ("ctor", "rec", "quot")
+                 else "class-projection") if name in provided
+                else "quarantined" if name in quarantine else None),
             "provided_by": provided.get(name),
             "structural_refused_reason": structural_refused.get(name),
             "transparent_refused_reason": transparent_refused.get(name),
