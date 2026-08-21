@@ -40,7 +40,7 @@ use fln_env::constants::{
     ReducibilityHints,
 };
 use fln_olean::decl::DeclDecoder;
-use fln_olean::region::{OleanView, WalkBudget};
+use fln_olean::region::{ModuleDataView, OleanView, WalkBudget};
 
 /// Pin discovery: `FLN_REFERENCE_LIB` when set, otherwise the elan-installed
 /// toolchain. Absent pin is a loud skip rather than a silent pass — a remote
@@ -2897,5 +2897,104 @@ fn binder_info_name(info: BinderInfo) -> &'static str {
         BinderInfo::Implicit => "Implicit",
         BinderInfo::StrictImplicit => "StrictImplicit",
         BinderInfo::InstImplicit => "InstImplicit",
+    }
+}
+
+/// Read one module's `ModuleData` header at the requested level.
+fn module_view(lib: &Path, module: &str, level: Level) -> ModuleDataView {
+    let base = lib.join(format!("{}.olean", module.replace('.', "/")));
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    match level {
+        Level::Exported => OleanView::parse(&exported)
+            .expect("parse exported part")
+            .module_data(WalkBudget::default())
+            .expect("exported module data"),
+        Level::Private => {
+            let server = read(base.with_extension("olean.server"));
+            let private = read(base.with_extension("olean.private"));
+            OleanView::parse_with_dependencies(&private, &[&exported, &server])
+                .expect("parse private part")
+                .module_data(WalkBudget::default())
+                .expect("private module data")
+        }
+    }
+}
+
+/// `is_module` and the `Import` flags — module-level stored fields, outside both
+/// the `ConstantInfo` and `Expr` inventories, and the missing WHY under the
+/// cross-module cell.
+///
+/// `a435ccb4` showed that `Init.Meta.Defs` references
+/// `_private.Init.Prelude.0.Lean.Name.beq.match_1` and that the reference
+/// resolves only when `Init.Prelude` is read at private level. It never showed
+/// what LICENSES that. An ordinary `import` gives you the exported part; `import
+/// all` gives you the private one. The artifact says which, in a stored flag
+/// nothing here reads.
+///
+/// Measured: `Init.Meta.Defs` has 7 imports and exactly ONE carries
+/// `import_all` — `Init.Prelude`, the module that owns the auxiliary. So the
+/// cross-module resolution that bead observed is not an accident of how the
+/// replay happens to build its environment; the artifact declares the import
+/// that permits it.
+///
+/// Two more facts fall out of the same header. `is_module` is true at BOTH
+/// levels for both modules, which is the premise of the entire companion-chain
+/// repair — a non-module olean has no `.private` part to read. And
+/// `Init.Prelude` declares ZERO imports, which is the premise the import-free
+/// closure cell rests on and had until now simply assumed.
+///
+/// Non-vacuity: all three import flags occur in this one header — one
+/// `import_all`, two `is_exported`, one `is_meta` — so a decode returning a
+/// uniform value for any of them fails here.
+#[test]
+fn the_import_that_licenses_the_cross_module_private_reference_is_declared() {
+    let lib = lib_or_skip!();
+
+    for level in [Level::Exported, Level::Private] {
+        // The companion-chain premise: without this, there is no private part.
+        assert!(
+            module_view(&lib, "Init.Prelude", level).is_module,
+            "Init.Prelude must be a module-system olean"
+        );
+        let defs = module_view(&lib, "Init.Meta.Defs", level);
+        assert!(
+            defs.is_module,
+            "Init.Meta.Defs must be a module-system olean"
+        );
+
+        // The premise the import-free closure cell rests on.
+        assert!(
+            module_view(&lib, "Init.Prelude", level).imports.is_empty(),
+            "Init.Prelude must import nothing; the closure cell's whole argument is that every \
+             constant it references has to be declared by it"
+        );
+
+        assert!(
+            defs.imports.len() >= 7,
+            "Init.Meta.Defs is supposed to carry at least the 7 imports measured at the pin, \
+             got {}",
+            defs.imports.len()
+        );
+        let import_all: Vec<String> = defs
+            .imports
+            .iter()
+            .filter(|import| import.import_all)
+            .map(|import| import.module.to_display_string())
+            .collect();
+        assert_eq!(
+            import_all,
+            vec!["Init.Prelude".to_string()],
+            "exactly one import may be `import all`, and it must be the module that owns the \
+             private auxiliary the cross-module cell resolves"
+        );
+
+        // All three flags must be exercised, or a uniform decode passes above.
+        assert!(
+            defs.imports.iter().filter(|i| i.is_exported).count() >= 2
+                && defs.imports.iter().any(|i| i.is_meta)
+                && defs.imports.iter().any(|i| !i.is_exported && !i.is_meta),
+            "the pin's import header exercises every flag; a uniform decode would not"
+        );
     }
 }
