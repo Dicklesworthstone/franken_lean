@@ -2753,11 +2753,41 @@ def self_test():
     case("sandbox/allows-artifact-read",
          blocked(lambda: builtins.open(__file__, "r").close()), False)
 
+    # A PLANTED FAILURE, BECAUSE THE HARNESS HAS NEVER BEEN CHECKED EITHER. Every
+    # case above routes its verdict through `case`, and `case` had nothing
+    # watching it: gutting its comparison makes all 65 cases pass and the command
+    # exit 0 with a green line. Measured, before this existed -- that mutant
+    # survived, and so did one that dropped the raise below. Six waves of guards
+    # rest on this function.
+    #
+    # So a case that MUST fail is run through the same path, and if it does not
+    # land in `failures` the harness cannot tell a pass from a refusal and nothing
+    # it just reported means anything. The plant is then removed, so it does not
+    # contaminate the real verdict.
+    planted_before = len(failures)
+    case("harness/planted-must-fail", None, True)
+    if len(failures) != planted_before + 1:
+        raise SystemExit(
+            "REFUSE: the self-test harness did not record a deliberately failing "
+            f"case ({len(checked)} cases were 'checked'). It cannot tell a pass "
+            "from a refusal, so every verdict above is decoration")
+    failures.pop()
+    checked.pop()
+
     if failures:
         raise SystemExit("REFUSE: SELF-TEST FAILED — "
                          + "; ".join(failures[:6])
                          + f" (scratch kept at {work})")
     sandbox.__exit__(None, None, None)
+    # Second, independent consumer of the same list. The condition above is one
+    # edit away from being removed, and removing it is the mutant that turns this
+    # whole command green -- a single line cannot be its own witness. This is not
+    # a second definition of the failure set; it is a second thing that acts on it.
+    if failures:
+        print("REFUSE: SELF-TEST FAILED (reached the success path with "
+              f"{len(failures)} failures recorded): {failures[:4]}", file=sys.stderr)
+        raise SystemExit(1)
+
     print(f"facade-module: SELF-TEST OK — {len(checked)} cases across 7 guards "
           f"and its own sandbox: "
           + " ".join(checked), file=sys.stderr)
