@@ -2532,6 +2532,17 @@ fn kr600_803_init_nat_fixture_pins_recursor_levels_motives_minors_and_rules() {
 }
 
 #[test]
+fn kr600_803_init_nat_fixture_pins_recursor_mutual_family_and_k() {
+    let entries = nat_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.mutual(), &[checker_name("Nat")]);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_init_nat_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = nat_entries();
     for (entry, expected_index, expected_fields) in [(&entries[1], 0, 0), (&entries[2], 1, 1)] {
