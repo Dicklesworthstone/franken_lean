@@ -1914,3 +1914,192 @@ fn the_third_shape_has_a_locatable_witness_per_module() {
          LOWEST such address - a witness a reader can open"
     );
 }
+
+/// The 71 `tag 0 arity 2` tails are WELL-FORMED CONSTRUCTOR OBJECTS.
+///
+/// SAY WHAT THIS DOES AND DOES NOT ADD, because the obvious reading is a
+/// tautology. That these tails are "not cons" follows from the selection
+/// itself: the third shape is defined as a `(1, 2, 24)` object whose tail is
+/// neither boxed nil nor a `(1, 2)` object, so a `tag 0` tail is excluded from
+/// being `List.cons` by the filter that found it, not by anything measured
+/// here. Asserting the tag inequality proves nothing that selecting on it did
+/// not already assume.
+///
+/// What is NOT given by the selection is that these tails are real objects at
+/// all. The competing explanation for the whole third shape has always been
+/// that the walker is wrong - landing mid-object, resolving a pointer into the
+/// middle of a payload, or reading a field that is not a pointer. Under that
+/// explanation the "tails" would be arbitrary words, and their headers would
+/// look arbitrary: mixed sizes, tags outside the constructor range, fields that
+/// do not resolve. This cell measures exactly those things.
+///
+/// All 71 carry tag 0 with two pointer fields and a stored size of 24 - which
+/// is `8 + 8 * 2` with NO scalar area, derived here from the object's own arity
+/// before the literal is written, the ordering `ac97cb3a` settled. All 71 are
+/// reachable from `entries`. And all 142 of their fields resolve to objects
+/// that the walk actually visited: not one is a boxed scalar, not one is
+/// unresolvable. A misread would not produce 142 valid pointers.
+///
+/// The grandchild histogram is pinned for the same reason the tail histogram
+/// was: it is the characterisation, and a green run must carry it somewhere a
+/// reader can see. Seventy-one of the 142 point at a single `tag 0 arity 4`
+/// shape - one per tail - which says these are records of a regular type rather
+/// than debris, without naming the type. Naming it needs the extension's own
+/// schema and is not guessed here.
+#[test]
+fn the_tag_zero_third_shape_tails_are_well_formed_constructors() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut third_tails = 0usize;
+    let mut tail_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut tag_zero = 0usize;
+    let mut tag_zero_in_entries = 0usize;
+    let mut tag_zero_sizes: BTreeSet<u16> = BTreeSet::new();
+    let mut tag_zero_widths: BTreeSet<i64> = BTreeSet::new();
+    let mut fields = 0usize;
+    let mut unresolved_fields = 0usize;
+    let mut grandchildren: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root in range");
+        let entries = reachable_from(bytes, base, word_at(bytes, root + 40));
+
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| {
+                    at.get(&off)
+                        .map(|o| (*o, second.wrapping_sub(base) as usize))
+                });
+            if (second & 1 == 1 && second >> 1 == 0)
+                || target.is_some_and(|(t, _)| (t.tag, t.other) == (1, 2))
+            {
+                continue;
+            }
+            third_tails += 1;
+            let Some((tail, tail_off)) = target else {
+                tail_shapes
+                    .entry("boxed or unresolvable".to_owned())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                continue;
+            };
+            *tail_shapes
+                .entry(format!("tag {} arity {}", tail.tag, tail.other))
+                .or_default() += 1;
+            if (tail.tag, tail.other) != (0, 2) {
+                continue;
+            }
+
+            tag_zero += 1;
+            if entries.contains(&tail_off) {
+                tag_zero_in_entries += 1;
+            }
+            // A constructor object, not an array, string, thunk or reference.
+            assert!(
+                tail.tag <= abi::TAG_MAX_CTOR_TAG,
+                "a tail outside the constructor tag range is not a constructor \
+                 object at all: tag {}",
+                tail.tag
+            );
+            tag_zero_sizes.insert(tail.cs_sz);
+            tag_zero_widths.insert(i64::from(tail.cs_sz) - (8 + 8 * i64::from(tail.other)));
+
+            for slot in 0..usize::from(tail.other) {
+                fields += 1;
+                let word = word_at(bytes, tail_off + 8 + 8 * slot);
+                match (word & 1 == 0)
+                    .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                    .flatten()
+                    .and_then(|off| at.get(&off))
+                {
+                    Some(child) => {
+                        *grandchildren
+                            .entry(format!("tag {} arity {}", child.tag, child.other))
+                            .or_default() += 1;
+                    }
+                    None => unresolved_fields += 1,
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(third_tails, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Kept: the remainder, two-way, and the tail histogram this refines.
+    assert_eq!(third_tails, 99, "the same 99 the remainder cell pins");
+    assert_eq!(
+        tail_shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("boxed or unresolvable".to_owned(), 17),
+            ("tag 0 arity 2".to_owned(), 71),
+            ("tag 4 arity 2".to_owned(), 11),
+        ],
+        "the tail histogram `2ea2447b` pins, grouped by shape"
+    );
+    assert_eq!(tag_zero, 71, "the population this cell characterises");
+
+    // Well-formedness: the derivation before the literal.
+    assert_eq!(
+        tag_zero_widths.iter().copied().collect::<Vec<_>>(),
+        vec![0_i64],
+        "every one stores two pointers and NOTHING after them"
+    );
+    assert_eq!(
+        tag_zero_sizes.iter().copied().collect::<Vec<_>>(),
+        vec![24_u16],
+        "which is the size that follows: 8 + 8 * 2"
+    );
+    assert_eq!(
+        tag_zero_in_entries, 71,
+        "all of them reached through `entries`, like their parents"
+    );
+
+    // The claim that actually rules out a misread.
+    assert_eq!(
+        (fields, unresolved_fields),
+        (142, 0),
+        "every field of every one resolves to an object the walk visited. A \
+         walker landing mid-object would not produce 142 valid pointers"
+    );
+    assert_eq!(
+        grandchildren.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 24),
+            ("tag 0 arity 4".to_owned(), 71),
+            ("tag 1 arity 2".to_owned(), 2),
+            ("tag 5 arity 1".to_owned(), 45),
+        ],
+        "what those fields point at; the 71 at a single `tag 0 arity 4` shape - \
+         one per tail - are records of a regular type, not debris"
+    );
+}
