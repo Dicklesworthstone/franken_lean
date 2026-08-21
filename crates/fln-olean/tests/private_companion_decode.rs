@@ -199,6 +199,12 @@ const STRING_POS_RAW_GET_MATCH_1_EQ_1: &str =
     "_private.Init.Data.String.Basic.0.String.Pos.Raw.get?.match_1.eq_1";
 /// The pin's private string companion stores this theorem in the Basic module.
 const STRING_POS_RAW_GET_MATCH_1_EQ_1_MODULE: &str = "Init/Data/String/Basic";
+/// The private match implementation for the UTF-8 singleton append theorem.
+const BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1: &str =
+    "_private.Init.Data.String.Basic.0.ByteArray.isValidUTF8_utf8Encode_singleton_append_iff.match_1_1";
+/// The pin's private string companion stores this definition in the Basic module.
+const BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1_MODULE: &str =
+    "Init/Data/String/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1358,6 +1364,45 @@ fn string_pos_raw_get_match_equation_is_decoded_from_its_private_storage_module(
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {STRING_POS_RAW_GET_MATCH_1_EQ_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn byte_array_utf8_singleton_append_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "byte_array_utf8_singleton_append_match_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(
+        &lib,
+        BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1_MODULE,
+    );
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1.to_owned()),
+        "the private companion of {BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1_MODULE} \
+         must retain {BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| {
+            info.name().to_display_string() == BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "private decoder lost {BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1}"
+            )
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
