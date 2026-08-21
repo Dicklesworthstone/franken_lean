@@ -1389,3 +1389,135 @@ fn structural_name_references_resolve_at_both_levels_unlike_expression_reference
         );
     }
 }
+
+/// Every constant reference paired with the NUMBER OF LEVEL ARGUMENTS it is
+/// applied to. Same bounded walk as `referenced_constants`, same cap discipline.
+fn referenced_constants_with_arity(root: &Expr) -> BTreeSet<(String, usize)> {
+    const CAP: usize = 1_000_000;
+    let mut out = BTreeSet::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<&Expr> = vec![root];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.allocation_identity()) {
+            continue;
+        }
+        assert!(seen.len() < CAP, "arity walk exceeded {CAP} distinct nodes");
+        match current.node() {
+            ExprNode::Const { name, levels } => {
+                out.insert((name.to_display_string(), levels.len()));
+            }
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    out
+}
+
+/// The OTHER half of KR-105, which every closure cell above leaves unmeasured.
+///
+/// `RejectClass::UnknownConstant` covers two failures, and its own doc says so:
+/// "unknown constant, OR level-arity mismatch". Everything pinned above answers
+/// the first — is the name resolvable — and nothing answers the second. The two
+/// are not interchangeable: a name that resolves perfectly but is applied to the
+/// wrong number of universe arguments lands in the same reject class, and the
+/// pin's `is_delta` refuses to unfold on exactly that condition
+/// (`length(const_levels(f)) == info->get_num_lparams()`).
+///
+/// Measured over `Init/Prelude` at private level: 1,543 distinct constant
+/// references, ZERO applied at an arity other than their declaration's
+/// level-parameter count.
+///
+/// A second fact falls out and is asserted because it is stronger than the
+/// first: the number of distinct `(name, arity)` pairs EQUALS the number of
+/// distinct names, so every referenced constant is used at exactly one arity
+/// throughout the module. A name appearing at two arities would mean at least
+/// one site is wrong even if each site individually matched something.
+#[test]
+fn every_constant_reference_matches_its_declarations_level_arity() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    let declared_arity: BTreeMap<String, usize> = infos
+        .iter()
+        .map(|info| {
+            (
+                info.name().to_display_string(),
+                info.constant_val().level_params.len(),
+            )
+        })
+        .collect();
+
+    let mut uses: BTreeSet<(String, usize)> = BTreeSet::new();
+    for info in &infos {
+        for expr in declaration_expressions(info) {
+            uses.append(&mut referenced_constants_with_arity(expr));
+        }
+    }
+
+    // Anti-vacuity. If every use site were monomorphic the comparison would be
+    // 0 == 0 everywhere and would catch nothing; the pin's Prelude is heavily
+    // level-polymorphic, up to seven universe arguments at a single site.
+    let polymorphic = uses.iter().filter(|(_, arity)| *arity > 0).count();
+    assert!(
+        polymorphic > 900,
+        "expected a level-polymorphic corpus, got {polymorphic} polymorphic use sites of {}",
+        uses.len()
+    );
+
+    let mismatched: Vec<String> = uses
+        .iter()
+        .filter_map(|(name, arity)| {
+            declared_arity
+                .get(name)
+                .filter(|declared| *declared != arity)
+                .map(|declared| format!("{name}: used with {arity}, declared {declared}"))
+        })
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "a resolvable name at the wrong universe arity is an UnknownConstant row just as much \
+         as a missing one, and the pin refuses to delta-unfold on exactly this condition: \
+         {mismatched:?}"
+    );
+
+    let distinct_names: BTreeSet<&String> = uses.iter().map(|(name, _)| name).collect();
+    assert_eq!(
+        uses.len(),
+        distinct_names.len(),
+        "some constant is referenced at two different arities in one module; at least one of \
+         those sites is wrong even though each resolves"
+    );
+}
