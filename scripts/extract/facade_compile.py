@@ -269,6 +269,10 @@ the toolchain would report a perfect facade:
     bounded-model evidence class. A generated coverage artifact cannot silently
     promote its own evidence level before this rig publishes it.
 
+  * A MANIFEST-WITHDRAWAL JOIN binds the summary's emission-withdrawal count to
+    declaration rows marked withdrawn. A withdrawn declaration cannot remain
+    hidden behind an otherwise successful emission aggregate.
+
   * A MANIFEST-FORM-TOTALITY JOIN requires every non-Init declaration row to
     use a recognized generator form, and every Init-substrate declaration to
     remain intentionally formless. A form classification cannot disappear
@@ -1427,6 +1431,21 @@ def main():
             "REFUSE: facade manifest claim-class join disagrees with this rig "
             f"({json.dumps(manifest_claim_class_join, sort_keys=True)})"
         )
+    manifest_withdrawal_join = {
+        "withdrawn_rows": sum(
+            row.get("emission_withdrawn") is True for row in manifest_rows
+        ),
+        "summary_withdrawn": manifest_summary.get("emission_withdrawn"),
+    }
+    if (not isinstance(manifest_withdrawal_join["summary_withdrawn"], int)
+            or isinstance(manifest_withdrawal_join["summary_withdrawn"], bool)
+            or manifest_withdrawal_join["summary_withdrawn"] < 0
+            or manifest_withdrawal_join["withdrawn_rows"]
+            != manifest_withdrawal_join["summary_withdrawn"]):
+        raise SystemExit(
+            "REFUSE: facade manifest withdrawal join disagrees with its rows "
+            f"({json.dumps(manifest_withdrawal_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2485,6 +2504,7 @@ def main():
         "manifest_schema_row_join": manifest_schema_join,
         "manifest_row_kind_join": manifest_row_kind_join,
         "manifest_claim_class_join": manifest_claim_class_join,
+        "manifest_withdrawal_join": manifest_withdrawal_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
