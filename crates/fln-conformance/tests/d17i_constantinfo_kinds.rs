@@ -11711,3 +11711,72 @@ fn the_kind_censuses_of_the_two_parts_balance() {
         );
     }
 }
+
+/// The walked field census equals the sum of the stored `num_fields`.
+///
+/// Two cells count constructor fields and neither knows about the other. The
+/// positivity and recursive-occurrence cells arrive at 229 by WALKING binders —
+/// stepping past `num_params` and taking the next `num_fields` of them. The
+/// arity cell reads the stored `num_fields` scalar per constructor. Nothing
+/// adds the scalars up and compares.
+///
+/// They agree: 157 constructors, stored fields summing to 229, and 229 binders
+/// walked. The per-constructor arity is already pinned elsewhere and is not
+/// restated here; what is new is that the two POPULATIONS are the same one.
+/// A stored `num_fields` too large by one on some constructor and too small by
+/// one on another leaves every existing pin satisfied — the arity cell compares
+/// each against its own telescope, so it would catch that, but nothing compares
+/// the totals, and a walk that skipped a constructor entirely would not be seen
+/// by either.
+///
+/// The distribution is what stops the equality being read at one width: 16
+/// constructors carry no field at all, 91 carry one, and the tail runs to six.
+/// The 16 matter most — a walk that mishandled the empty case would still sum
+/// correctly over the other 141.
+#[test]
+fn the_walked_field_census_equals_the_stored_field_counts() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut constructors = 0usize;
+    let mut stored = 0usize;
+    let mut walked = 0usize;
+    let mut spread: BTreeMap<u32, usize> = BTreeMap::new();
+    for info in &infos {
+        let ConstantInfo::Ctor(ctor) = info else {
+            continue;
+        };
+        constructors += 1;
+        stored += ctor.num_fields as usize;
+        *spread.entry(ctor.num_fields).or_default() += 1;
+
+        let mut binders = 0usize;
+        let mut current = &info.constant_val().type_;
+        while let ExprNode::ForallE { body, .. } = current.node() {
+            binders += 1;
+            current = body;
+        }
+        walked += binders.saturating_sub(ctor.num_params as usize);
+    }
+
+    // Conservation first: the two independently computed populations are one.
+    assert_eq!(
+        stored, walked,
+        "the stored field counts must sum to the number of field binders walked"
+    );
+    assert_eq!(
+        (constructors, stored),
+        (157, 229),
+        "the constructor and field censuses this row is stated against"
+    );
+    assert_eq!(
+        spread.values().sum::<usize>(),
+        constructors,
+        "the distribution must account for every constructor"
+    );
+    assert_eq!(
+        spread.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+        vec![(0, 16), (1, 91), (2, 27), (3, 12), (4, 8), (5, 2), (6, 1)],
+        "the field-count distribution, including the constructors carrying none"
+    );
+}
