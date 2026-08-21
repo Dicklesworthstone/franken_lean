@@ -272,6 +272,11 @@ the toolchain would report a perfect facade:
     occur in its signature, while Init-substrate rows carry none. Closure-only
     signatures cannot introduce unbound universe binders.
 
+  * A MANIFEST-TRANSPARENCY-FALLBACK JOIN requires every transparent-form
+    refusal to be either an emitted axiom fallback or a withheld transparent
+    abbreviation, with a reason in both cases. A failed transparent emission
+    cannot masquerade as a successful transparent row.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1587,6 +1592,58 @@ def main():
             f"duplicates={duplicate_level_parameter_rows[:8]!r}, "
             f"unbound={unbound_level_parameter_rows[:8]!r})"
         )
+    transparent_fallback_rows = [
+        row for row in manifest_rows
+        if isinstance(row.get("transparent_refused_reason"), str)
+        and row["transparent_refused_reason"].strip()
+    ]
+    emitted_axiom_fallbacks = [
+        row for row in transparent_fallback_rows
+        if row.get("form") == "axiom" and row.get("emitted") is True
+    ]
+    withheld_transparents = [
+        row for row in transparent_fallback_rows
+        if row.get("form") == "transparent-abbrev" and row.get("emitted") is False
+    ]
+    malformed_transparent_fallbacks = sorted(
+        row["name"] for row in transparent_fallback_rows
+        if row not in emitted_axiom_fallbacks and row not in withheld_transparents
+    )
+    unexplained_withheld_transparents = sorted(
+        row["name"] for row in manifest_rows
+        if row.get("form") == "transparent-abbrev"
+        and row.get("emitted") is False
+        and row not in withheld_transparents
+    )
+    refused_emitted_transparents = sorted(
+        row["name"] for row in manifest_rows
+        if row.get("form") == "transparent-abbrev"
+        and row.get("emitted") is True
+        and isinstance(row.get("transparent_refused_reason"), str)
+        and row["transparent_refused_reason"].strip()
+    )
+    manifest_transparency_fallback_join = {
+        "refusal_rows": len(transparent_fallback_rows),
+        "emitted_axiom_fallbacks": len(emitted_axiom_fallbacks),
+        "withheld_transparents": len(withheld_transparents),
+        "malformed_fallback_rows": len(malformed_transparent_fallbacks),
+        "unexplained_withheld_transparents": len(unexplained_withheld_transparents),
+        "refused_emitted_transparents": len(refused_emitted_transparents),
+    }
+    if (manifest_transparency_fallback_join["refusal_rows"] == 0
+            or manifest_transparency_fallback_join["emitted_axiom_fallbacks"]
+            + manifest_transparency_fallback_join["withheld_transparents"]
+            != manifest_transparency_fallback_join["refusal_rows"]
+            or manifest_transparency_fallback_join["malformed_fallback_rows"] != 0
+            or manifest_transparency_fallback_join["unexplained_withheld_transparents"] != 0
+            or manifest_transparency_fallback_join["refused_emitted_transparents"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest transparency-fallback join failed "
+            f"({json.dumps(manifest_transparency_fallback_join, sort_keys=True)}, "
+            f"malformed={malformed_transparent_fallbacks[:8]!r}, "
+            f"unexplained={unexplained_withheld_transparents[:8]!r}, "
+            f"refused_emitted={refused_emitted_transparents[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -2020,6 +2077,7 @@ def main():
         "manifest_effect_totality_join": manifest_effect_join,
         "manifest_safety_totality_join": manifest_safety_join,
         "manifest_level_parameter_totality_join": manifest_level_parameter_join,
+        "manifest_transparency_fallback_join": manifest_transparency_fallback_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
