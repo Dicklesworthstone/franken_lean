@@ -1136,6 +1136,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
+                lines[0].trim() == r##""bytes: {}\n","##
+                    && lines[1].trim() == r##""format version: {}\n","##
+            })
+            .count(),
+        1,
+        "the human olean audit renderer keeps byte count beside format version",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
                 lines[0].trim()
                     == r##""\"decodedPrivateAuxiliaries\":{},","##
                     && lines[1].trim()
