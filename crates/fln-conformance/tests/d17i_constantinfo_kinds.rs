@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::Name;
-use fln_env::constants::ConstantInfo;
+use fln_env::constants::{ConstantInfo, InductiveVal, RecursorVal};
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
@@ -1519,5 +1519,129 @@ fn every_constant_reference_matches_its_declarations_level_arity() {
         distinct_names.len(),
         "some constant is referenced at two different arities in one module; at least one of \
          those sites is wrong even though each resolves"
+    );
+}
+
+/// The two recursors whose rules are NOT their block's constructors, named.
+///
+/// `Lean.Syntax` is a nested inductive (`num_nested = 2`), and a nested block
+/// generates auxiliary recursors over the NESTING CONTAINERS: `rec_1`'s rules
+/// are `Array`'s constructors and `rec_2`'s are `List`'s. That is correct, and
+/// it is the reason the equality below cannot simply be asserted for all 129.
+///
+/// They are pinned by NAME rather than excluded as a class. "Skip recursors
+/// whose block is nested" would be satisfied by any future nested block whose
+/// rules were genuinely wrong, and this file has already been bitten twice by
+/// scans that quietly dropped part of their input.
+const NESTED_AUXILIARY_RECURSORS: &[&str] = &["Lean.Syntax.rec_1", "Lean.Syntax.rec_2"];
+
+/// Decoded block relations agree with each other, which is the surface directly
+/// upstream of the `BlockMismatch` family.
+///
+/// The structural-closure cell asks whether a block's names RESOLVE. It does not
+/// ask whether they agree: a constructor could name an inductive whose `ctors`
+/// list omits it, or a recursor could carry rules for constructors that are not
+/// its block's, and every name involved would still resolve. Block admission
+/// regenerates a recursor and compares it against the decoded one, so a decode
+/// that got these relations wrong surfaces as exactly the class this bead's 228
+/// rows carried.
+///
+/// Measured over `Init/Prelude` at private level: 127 inductives, 157
+/// constructors, 129 recursors; zero round-trip violations; and every recursor's
+/// rule set equal to its block's constructors except the two nested auxiliaries
+/// above.
+#[test]
+fn decoded_block_relations_agree_with_each_other() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    let mut inductives: BTreeMap<String, (&InductiveVal, BTreeSet<String>)> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, String> = BTreeMap::new();
+    let mut recursors: Vec<(String, &RecursorVal)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => {
+                let ctors = v.ctors.iter().map(Name::to_display_string).collect();
+                inductives.insert(name, (v, ctors));
+            }
+            ConstantInfo::Ctor(v) => {
+                constructors.insert(name, v.induct.to_display_string());
+            }
+            ConstantInfo::Rec(v) => recursors.push((name, v)),
+            _ => {}
+        }
+    }
+    assert!(
+        inductives.len() > 100 && constructors.len() > 120 && recursors.len() > 100,
+        "expected the pin's block census ({} inductives, {} constructors, {} recursors)",
+        inductives.len(),
+        constructors.len(),
+        recursors.len()
+    );
+
+    // Round trip, both directions. Either alone is satisfiable by a decode that
+    // dropped entries from the other side.
+    for (ctor, induct) in &constructors {
+        let Some((_, ctors)) = inductives.get(induct) else {
+            panic!("{ctor} names `{induct}` as its inductive, which is not one");
+        };
+        assert!(
+            ctors.contains(ctor),
+            "{ctor} claims `{induct}`, whose ctors list omits it"
+        );
+    }
+    for (induct, (_, ctors)) in &inductives {
+        for ctor in ctors {
+            assert_eq!(
+                constructors.get(ctor),
+                Some(induct),
+                "`{induct}` lists {ctor} as a constructor, which does not point back"
+            );
+        }
+    }
+
+    // Recursor rules against the block's constructors, with every recursor
+    // accounted for and the exceptions named rather than skipped by shape.
+    let mut exceptions: Vec<String> = Vec::new();
+    for (name, rec) in &recursors {
+        let mut block_ctors: BTreeSet<String> = BTreeSet::new();
+        for type_name in &rec.all {
+            let key = type_name.to_display_string();
+            let Some((_, ctors)) = inductives.get(&key) else {
+                panic!("{name} names `{key}` in its block, which is not a decoded inductive");
+            };
+            block_ctors.extend(ctors.iter().cloned());
+        }
+        let rule_ctors: BTreeSet<String> = rec
+            .rules
+            .iter()
+            .map(|rule| rule.ctor.to_display_string())
+            .collect();
+        if rule_ctors != block_ctors {
+            exceptions.push(name.clone());
+            // An exception must be a NESTED block, or it is simply wrong.
+            assert!(
+                rec.all.iter().any(|t| inductives
+                    .get(&t.to_display_string())
+                    .is_some_and(|(v, _)| v.num_nested > 0)),
+                "{name}'s rules are not its block's constructors and its block is not nested"
+            );
+        }
+    }
+    assert_eq!(
+        exceptions, NESTED_AUXILIARY_RECURSORS,
+        "the set of recursors whose rules differ from their block's constructors must be \
+         exactly the named nested auxiliaries; a new member is a decode defect wearing their \
+         clothes"
     );
 }
