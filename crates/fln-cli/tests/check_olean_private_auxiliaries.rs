@@ -148,11 +148,15 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
 
     let json = &report.stdout;
     assert!(!json_bool_field(json, "g1Satisfied"), "{json}");
+    assert!(json_bool_field(json, "companionPartsLoaded"), "{json}");
+    let private_companion_residuals = json_object_field(json, "privateCompanionResiduals");
+    assert_eq!(
+        json_usize_field(private_companion_residuals, "omitted"),
+        0,
+        "{json}",
+    );
     assert!(
-        json_usize_field(
-            json_object_field(json, "privateCompanionResiduals"),
-            "observed",
-        ) > 0,
+        json_usize_field(private_companion_residuals, "observed") > 0,
         "{json}",
     );
 }
@@ -684,7 +688,6 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         OsString::from("--json"),
         exported.clone().into_os_string(),
     ]);
-    assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
     assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":29"));
     let private_companion_names = &[
         "_private.CliPrivateReport.0._f",
