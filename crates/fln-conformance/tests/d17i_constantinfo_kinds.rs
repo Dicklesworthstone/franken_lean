@@ -10649,3 +10649,155 @@ fn a_projection_takes_its_structure_at_the_parameter_boundary() {
          {boundaries:?}"
     );
 }
+
+/// The binders after `self` are the FIELD TYPE's own telescope, name for name.
+///
+/// The cell above pins where the structure argument sits and records that 75 of
+/// the 142 projections carry further binders after it, without saying what
+/// those binders are. They are not extra structure the generator adds: they are
+/// the field's own type showing through.
+///
+/// A projection's type is the parameters, then `self`, then the field's type
+/// verbatim. So for a field whose type is itself a function the function's
+/// binders continue the projection's telescope, which is why `BEq.beq` reaches
+/// four and why a length rule was the wrong shape.
+///
+/// Measured over all 145 fields of every single-constructor inductive: for each
+/// of the 142 that project, the binders after `self` equal the leading binders
+/// of the corresponding CONSTRUCTOR FIELD'S TYPE — same count, same names, same
+/// order, no exception. The three that do not project are the ones named
+/// earlier.
+///
+/// This reads the constructor's field TYPES, which nothing here had done. The
+/// binder-name cells read names; the arity cells read counts; the field types
+/// themselves were only ever walked past.
+///
+/// It is not vacuous for most of the population: 75 of the 142 have a non-empty
+/// tail, the tails run from one binder to five, and the names in them vary —
+/// unlike `self`, which is a single generated name for every projection. A
+/// comparison that only counted, or that compared against one constant name,
+/// would be satisfied by a generator that renamed the field type's binders.
+#[test]
+fn the_binders_after_self_are_the_field_types_own() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let declared = kinds(&infos);
+    let mut types: BTreeMap<String, &Expr> = BTreeMap::new();
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<(String, &Expr)>)> =
+        BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        types.insert(name.clone(), &info.constant_val().type_);
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders: Vec<(String, &Expr)> = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                } = current.node()
+                {
+                    binders.push((binder_name.to_display_string(), binder_type));
+                    current = body;
+                }
+                drop(constructors.insert(name, (v, binders)));
+            }
+            _ => {}
+        }
+    }
+
+    let binder_names = |root: &Expr| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = root;
+        while let ExprNode::ForallE {
+            binder_name, body, ..
+        } = current.node()
+        {
+            out.push(binder_name.to_display_string());
+            current = body;
+        }
+        out
+    };
+
+    let mut agreeing = 0usize;
+    let mut absent = 0usize;
+    let mut fields = 0usize;
+    let mut departures: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    let mut tails: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut tail_names: BTreeSet<String> = BTreeSet::new();
+    for (name, induct) in &inductives {
+        if induct.ctors.len() != 1 {
+            continue;
+        }
+        let ctor_name = induct.ctors[0].to_display_string();
+        let Some((ctor, binders)) = constructors.get(&ctor_name) else {
+            continue;
+        };
+        let start = ctor.num_params as usize;
+        for (field, field_type) in &binders[start..start + ctor.num_fields as usize] {
+            fields += 1;
+            let plain = format!("{name}.{field}");
+            let suffix = format!(".{plain}");
+            let Some(declaration) = declared
+                .keys()
+                .find(|candidate| **candidate == plain || candidate.ends_with(&suffix))
+            else {
+                absent += 1;
+                continue;
+            };
+
+            let projection = binder_names(types[declaration]);
+            let tail: Vec<String> = projection.iter().skip(start + 1).cloned().collect();
+            let expected = binder_names(field_type);
+            if tail == expected {
+                agreeing += 1;
+                *tails.entry(tail.len()).or_default() += 1;
+                tail_names.extend(tail);
+            } else {
+                departures.push((declaration.clone(), tail, expected));
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        agreeing + absent + departures.len(),
+        fields,
+        "every field must agree, be absent, or be a departure"
+    );
+    assert!(
+        departures.is_empty(),
+        "the binders after `self` must be the field type's own, name for name: {:?}",
+        &departures[..departures.len().min(4)]
+    );
+    assert_eq!(
+        (fields, agreeing, absent),
+        (145, 142, 3),
+        "the field population and how many carry the field type's telescope"
+    );
+
+    // Not vacuous: most of the population has a tail, of varying length and
+    // varying names.
+    assert_eq!(
+        tails.values().sum::<usize>(),
+        agreeing,
+        "the tail-length table must account for every agreeing projection"
+    );
+    let empty = tails.get(&0).copied().unwrap_or_default();
+    assert_eq!(
+        (empty, agreeing - empty),
+        (67, 75),
+        "75 of the 142 carry a non-empty tail, so the comparison is not mostly against nothing"
+    );
+    assert!(
+        tails.len() >= 5 && tail_names.len() >= 10,
+        "the tails must vary in length and in name, or a renaming generator would pass: \
+         {tails:?}, {} distinct names",
+        tail_names.len()
+    );
+}
