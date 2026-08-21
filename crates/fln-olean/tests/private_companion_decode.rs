@@ -346,6 +346,11 @@ const ARRAY_IS_EQV_AUX_PROOF_1: &str =
     "_private.Init.Data.Array.Basic.0.Array.isEqvAux._proof_1";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_IS_EQV_AUX_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
+/// The second generated proof theorem for `Array.isEqvAux`.
+const ARRAY_IS_EQV_AUX_PROOF_2: &str =
+    "_private.Init.Data.Array.Basic.0.Array.isEqvAux._proof_2";
+/// The pin's private array stores this theorem in the basic module.
+const ARRAY_IS_EQV_AUX_PROOF_2_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.isEqv`.
 const ARRAY_IS_EQV_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.isEqv._proof_1";
 /// The pin's private array stores this theorem in the basic module.
@@ -2077,6 +2082,36 @@ fn array_is_eqv_aux_proof_theorem_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {ARRAY_IS_EQV_AUX_PROOF_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_is_eqv_aux_second_proof_theorem_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_is_eqv_aux_second_proof_theorem_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_IS_EQV_AUX_PROOF_2_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_IS_EQV_AUX_PROOF_2.to_owned()),
+        "the private companion of {ARRAY_IS_EQV_AUX_PROOF_2_MODULE} must retain \
+         {ARRAY_IS_EQV_AUX_PROOF_2}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_IS_EQV_AUX_PROOF_2)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_IS_EQV_AUX_PROOF_2}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_IS_EQV_AUX_PROOF_2} as {} instead of Thm",
         recovered.kind_name()
     );
 }
