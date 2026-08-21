@@ -1111,3 +1111,154 @@ fn the_import_free_root_module_is_reference_closed_at_private_level() {
          {private_unresolved:?}"
     );
 }
+
+/// Which level a module chain is read at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Exported,
+    Private,
+}
+
+/// Decode one module at the requested level, returning its declarations and
+/// the modules it imports.
+fn decode_at(lib: &Path, module: &str, level: Level) -> (Vec<ConstantInfo>, Vec<String>) {
+    let base = lib.join(format!("{}.olean", module.replace('.', "/")));
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let exported_view = OleanView::parse(&exported).expect("parse exported part");
+    let imports = exported_view
+        .module_data(WalkBudget::default())
+        .expect("module data")
+        .imports
+        .iter()
+        .map(|import| import.module.to_display_string())
+        .collect();
+    let infos = match level {
+        Level::Exported => DeclDecoder::new(&exported_view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("decode exported part"),
+        Level::Private => {
+            let server = read(base.with_extension("olean.server"));
+            let private = read(base.with_extension("olean.private"));
+            let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+                .expect("parse private part");
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_module_constants()
+                .expect("decode private part")
+        }
+    };
+    (infos, imports)
+}
+
+/// Every name declared by `module` and, transitively, by everything it imports.
+///
+/// A module whose file is absent would silently shrink the closure and make the
+/// deficit below look larger than it is, so misses are counted and the caller
+/// asserts there were none rather than trusting the walk to have been complete.
+fn closure_declared(lib: &Path, module: &str, level: Level) -> (BTreeSet<String>, usize) {
+    let mut declared = BTreeSet::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut missing = 0usize;
+    let mut queue = vec![module.to_string()];
+    while let Some(current) = queue.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let base = lib.join(format!("{}.olean", current.replace('.', "/")));
+        if !base.is_file() {
+            missing += 1;
+            continue;
+        }
+        let (infos, imports) = decode_at(lib, &current, level);
+        declared.extend(infos.iter().map(|info| info.name().to_display_string()));
+        queue.extend(imports);
+    }
+    (declared, missing)
+}
+
+/// The cross-module half of the UnknownConstant question.
+///
+/// `f564f92e` closed it for `Init/Prelude`, which imports nothing — so that
+/// result says nothing about a reference that has to cross an import edge, and
+/// crossing one is exactly what this bead observed: `Init.Meta.Defs`
+/// referencing `_private.Init.Prelude.0.Lean.Name.beq.match_1` while Prelude
+/// had already been processed.
+///
+/// Measured over `Init.Meta.Defs` and its 7 direct imports, transitively:
+///
+///   exported   8,483 declared in closure, 267 referenced, THREE unresolved
+///   private    9,217 declared in closure, 898 referenced, ZERO unresolved
+///
+/// The three are the whole point, and they are not all the same shape:
+///
+///   `_private.Init.Prelude.0.Lean.Name.beq.match_1`            owned ELSEWHERE
+///   `_private.Init.Meta.Defs.0.Lean.Name.beq.match_1.eq_4`     owned HERE
+///   `_private.Init.Meta.Defs.0.Lean.Name.beq.match_1.splitter` owned HERE
+///
+/// So one module exhibits both failure modes at once: a foreign private
+/// auxiliary its import could not supply at exported level, and two of its OWN
+/// private auxiliaries absent from its own exported part. Reading the whole
+/// closure at private level resolves all three, which is what makes the earlier
+/// per-name pins add up to a property rather than a list.
+const CROSS_MODULE_DEFICIT: &[&str] = &[
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.match_1.eq_4",
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.match_1.splitter",
+    "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+];
+
+#[test]
+fn a_module_with_imports_is_reference_closed_only_at_private_level() {
+    let lib = lib_or_skip!();
+    const MODULE: &str = "Init.Meta.Defs";
+
+    let mut referenced_counts = Vec::new();
+    let mut deficits = Vec::new();
+    for level in [Level::Exported, Level::Private] {
+        let (infos, imports) = decode_at(&lib, MODULE, level);
+        assert!(
+            imports.len() >= 7,
+            "{MODULE} is supposed to import at least the 7 measured at the pin, got {}",
+            imports.len()
+        );
+        let (available, missing) = closure_declared(&lib, MODULE, level);
+        assert_eq!(
+            missing, 0,
+            "an absent module would shrink the closure and inflate the deficit"
+        );
+        let mut referenced = BTreeSet::new();
+        for info in &infos {
+            for expr in declaration_expressions(info) {
+                referenced.append(&mut referenced_constants(expr));
+            }
+        }
+        referenced_counts.push(referenced.len());
+        deficits.push(
+            referenced
+                .difference(&available)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            available.len() > 8_000,
+            "the import closure must actually be walked, got {} names",
+            available.len()
+        );
+    }
+
+    // Anti-vacuity: an empty reference scan satisfies "zero unresolved".
+    assert!(
+        referenced_counts[0] > 200 && referenced_counts[1] > referenced_counts[0],
+        "reference scan must reach the declarations at both levels: {referenced_counts:?}"
+    );
+    assert_eq!(
+        deficits[0], CROSS_MODULE_DEFICIT,
+        "the exported deficit is what makes the private closure below a repair rather than a \
+         tautology; it must be exactly these three"
+    );
+    assert!(
+        deficits[1].is_empty(),
+        "reading the whole closure at private level must resolve every reference, including \
+         the one this bead observed crossing an import edge: {:?}",
+        deficits[1]
+    );
+}
