@@ -4538,6 +4538,7 @@ impl CorpusMatrixReceipt {
             let end = rest
                 .find(']')
                 .ok_or_else(|| format!("unterminated array field `{key}`"))?;
+            assert_array_terminator(key, rest, end)?;
             Ok(&rest[..end])
         }
         let numbers = |key: &str| -> Result<Vec<u64>, String> {
@@ -11428,6 +11429,7 @@ impl WholeMathlibReceipt {
             let end = rest
                 .find(']')
                 .ok_or_else(|| format!("unterminated array field `{key}`"))?;
+            assert_array_terminator(key, rest, end)?;
             Ok(rest[..end]
                 .split(',')
                 .filter(|item| !item.is_empty())
@@ -12701,6 +12703,39 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
+    // AN ARRAY ELEMENT CARRYING THE ARRAY'S TERMINATOR. `strings` stops at the
+    // first `]`, and JSON allows that character inside an element. Measured
+    // before this commit: a census listing two families, with the bracket inside
+    // the first, was read as ONE family carrying the whole total -- so the triage
+    // sums still balanced, every conservation rule still passed, and the second
+    // family was simply gone from the row. Totals are what the guard compares;
+    // membership is what it loses.
+    assert!(
+        row.contains("\"no_answer_families\":[]"),
+        "the sample's census must be empty for this surgery to build a two-element array: {row}"
+    );
+    let hidden = row.replace(
+        "\"no_answer_families\":[]",
+        "\"no_answer_families\":[\"inconclusive:Steps=1]hidden\",\"inconclusive:Depth=2\"]",
+    );
+    assert!(
+        hidden.contains("inconclusive:Steps") && hidden.contains("inconclusive:Depth"),
+        "the forged row must LIST both families, or nothing is being hidden: {hidden}"
+    );
+    let hidden_reason = match WholeMathlibReceipt::from_row(&hidden) {
+        Err(reason) => reason,
+        Ok(read) => panic!(
+            "a row listing 2 no-answer families was read as {}; the reader stopped at a bracket \
+             inside an element and dropped the rest",
+            read.no_answer_families.len()
+        ),
+    };
+    assert!(
+        hidden_reason.contains("no_answer_families") && hidden_reason.contains("dropped"),
+        "the refusal must name the array and say entries were lost, not blame a count: \
+         {hidden_reason}"
+    );
+
     // A STRING FIELD CARRYING AN ESCAPE. The serializer writes a quote as a
     // backslash-quote pair, and this reader stops at the first plain quote it
     // meets -- which for an escaped value is the escape's own. Measured with
@@ -13545,6 +13580,30 @@ fn assert_no_escape(key: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The bracket this reader stops at must be the array's own.
+///
+/// `strings` takes the FIRST `]` after the array opens. JSON allows that
+/// character inside an element, so one planted there ends the array early and
+/// every entry after it disappears. Measured: a census listing two families,
+/// with the terminator inside the first, is read as ONE family carrying the
+/// whole total -- so the triage sums still balance, every conservation rule
+/// still passes, and a divergence family is simply gone from the row.
+///
+/// In a well-formed row both arrays are followed by `,` (they sit before
+/// `wall_ms`), so the character after the real terminator is punctuation. If it
+/// is anything else, the bracket belonged to an element and the array was cut
+/// short.
+fn assert_array_terminator(key: &str, rest: &str, end: usize) -> Result<(), String> {
+    match rest[end..].chars().nth(1) {
+        Some(',') | Some('}') | None => Ok(()),
+        Some(other) => Err(format!(
+            "array field `{key}` is followed by `{other}` where the row's punctuation belongs, so \
+             the bracket this reader stopped at came from inside an element and every entry after \
+             it was dropped"
+        )),
+    }
 }
 
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
