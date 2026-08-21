@@ -3167,6 +3167,80 @@ mod tests {
         .bytes
     }
 
+    /// A scalar-boxed `List` that is not `nil` is refused.
+    ///
+    /// This is the scalar half of the list decode and the pair to
+    /// `a_list_cell_that_is_not_cons_is_refused`: `nil` is fieldless so Lean
+    /// boxes it, `cons` is a heap cell, and each half has exactly one rule.
+    /// Completing the pair is the same reason the scalar and heap
+    /// `ReducibilityHints` rules were taken together at 14e130f7 and 02c0cfbc.
+    ///
+    /// Unlike the cons cell this one needs an EMPTY list, so `axiom_module`
+    /// serves: its `ConstantVal.levelParams` is nil.
+    ///
+    /// Nothing shadows it. The plant writes a slot inside the ConstantVal, so
+    /// that object's header — and therefore its arity and size rules — is
+    /// untouched, which the cell re-asserts after planting.
+    #[test]
+    fn a_scalar_boxed_list_that_is_not_nil_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+
+        // ConstantVal slot 1 is levelParams, and this fixture declares none.
+        let slot = base_off as usize + 16;
+        let stored = view.read_u64(base_off + 16).expect("levelParams slot");
+        assert_eq!(
+            stored & 1,
+            1,
+            "an empty list is scalar-boxed, not a pointer"
+        );
+        assert_eq!(stored >> 1, 0, "and the box holds nil");
+
+        // Box a value that is not nil. The list decoder has exactly one thing
+        // to say about a scalar: it must be nil.
+        let planted: u64 = (1 << 1) | 1;
+        bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(base_off).expect("owner header"),
+            (0, 3, 32),
+            "the ConstantVal is untouched, so its arity and size rules cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a scalar list that is not nil must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "scalar List not nil",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `List` cell whose constructor is not `cons` is refused.
     ///
     /// Nothing shadows it: the list decoder has no size bind at all, so none of
