@@ -11721,6 +11721,197 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Arrays carry no slack either - and `1e3e85df` did not depend on which field.
+///
+/// `8cc7474c` found every string's `m_capacity` equal to its `m_size`. Arrays
+/// store the same pair - a length at `+8` and a capacity at `+16` - and this
+/// asks the same question of them: every array in all four modules has the two
+/// equal, 2,434 of 2,434 in Prelude. A compacted region carries no slack in
+/// either container.
+///
+/// WHICH RETIRES A DOUBT ABOUT THE PREVIOUS CELL. `1e3e85df` computed each
+/// array's extent from its CAPACITY and each string's from its CAPACITY, and
+/// never checked whether reading the other field would have changed anything.
+/// Recomputing its whole tiling with the array LENGTH instead, and again with
+/// the string `m_size` instead, gives the identical 88,879 exact pairs of
+/// 88,879. The choice was not load-bearing, and that is now measured rather
+/// than hoped.
+///
+/// This is the check `7a0a90fa` and `ed5d41d5` both wanted and did not get: I
+/// used one field and described a result as though the other would do. Twice
+/// that went unnoticed because the two fields happened to agree. Here they
+/// agree again - but the agreement is asserted, so a future corpus where they
+/// diverge fails this cell instead of silently changing `1e3e85df`'s meaning.
+///
+/// THE ELEMENT SLOTS PARTITION: 22,245 slots across Prelude's arrays are 523
+/// boxed scalars and 21,722 pointers, and the two sum to the total. Every array
+/// element is one or the other; there is no third case, which is what makes
+/// `be041416`'s zero-dangling result meaningful for arrays as well as for
+/// constructor slots.
+///
+/// POPULATION SCOPE: all four modules, each asserted by name; every count is
+/// per module.
+#[test]
+fn arrays_carry_no_slack_and_the_field_choice_did_not_matter() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut tilings: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, _) = objects_of(bytes);
+
+        let mut arrays = 0usize;
+        let mut tight = 0usize;
+        let mut slack = 0usize;
+        let mut slots = 0usize;
+        let mut boxed = 0usize;
+        let mut pointers = 0usize;
+        for object in &objects {
+            if object.tag != abi::TAG_ARRAY {
+                continue;
+            }
+            arrays += 1;
+            let length = word_at(bytes, object.off + 8);
+            let capacity = word_at(bytes, object.off + 16);
+            if length == capacity {
+                tight += 1;
+            } else {
+                slack += 1;
+            }
+            for i in 0..length {
+                slots += 1;
+                if word_at(bytes, object.off + 24 + 8 * i as usize) & 1 == 1 {
+                    boxed += 1;
+                } else {
+                    pointers += 1;
+                }
+            }
+        }
+        rows.push((module.clone(), arrays, tight, slack, slots, boxed, pointers));
+
+        // `1e3e85df`'s tiling, recomputed with each field in turn.
+        let mut sorted: Vec<Obj> = objects.clone();
+        sorted.sort_by_key(|object| object.off);
+        // `array_field` and `string_field` are byte offsets into the object:
+        // 16 is the capacity both carry, 8 is the array length and the string
+        // byte size.
+        let exact = |array_field: usize, string_field: usize| -> usize {
+            let extents: Vec<usize> = sorted
+                .iter()
+                .map(|object| {
+                    if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                        usize::from(object.cs_sz)
+                    } else if object.tag == abi::TAG_ARRAY {
+                        24 + 8 * usize::try_from(word_at(bytes, object.off + array_field))
+                            .expect("array count")
+                    } else if object.tag == abi::TAG_STRING {
+                        32 + usize::try_from(word_at(bytes, object.off + string_field))
+                            .expect("string count")
+                    } else {
+                        usize::from(object.cs_sz)
+                    }
+                })
+                .collect();
+            sorted
+                .windows(2)
+                .enumerate()
+                .filter(|(index, pair)| {
+                    let end = pair[0].off + extents[*index];
+                    end + (end.wrapping_neg() % 8) == pair[1].off
+                })
+                .count()
+        };
+        tilings.push((
+            module.clone(),
+            sorted.len() - 1,
+            exact(16, 16),
+            exact(8, 16),
+            exact(16, 8),
+        ));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize, usize, usize, usize)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c, d, e, f)| (m.to_owned(), a, b, c, d, e, f))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep(vec![
+            ("Init.olean", 5, 5, 0, 49, 2, 47),
+            ("Init.BinderNameHint.olean", 24, 24, 0, 80, 8, 72),
+            ("Init.SizeOfLemmas.olean", 26, 26, 0, 153, 26, 127),
+            ("Init/Prelude.olean", 2434, 2434, 0, 22245, 523, 21722),
+        ]),
+        "per module: arrays, those whose stored LENGTH equals their stored \
+         CAPACITY, those with slack, then element slots split into boxed \
+         scalars and pointers. No array anywhere carries slack, which is what \
+         `8cc7474c` found for strings"
+    );
+    for (module, arrays, tight, slack, slots, boxed, pointers) in &rows {
+        assert_eq!(
+            tight + slack,
+            *arrays,
+            "{module}: every array is one or the other"
+        );
+        assert_eq!(
+            boxed + pointers,
+            *slots,
+            "{module}: every element slot is a boxed scalar or a pointer and \
+             there is no third case"
+        );
+    }
+
+    assert_eq!(
+        tilings
+            .iter()
+            .map(|(m, p, a, b, c)| (m.as_str(), *p, *a, *b, *c))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 157, 157, 157, 157),
+            ("Init.BinderNameHint.olean", 266, 266, 266, 266),
+            ("Init.SizeOfLemmas.olean", 794, 794, 794, 794),
+            ("Init/Prelude.olean", 88879, 88879, 88879, 88879),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "consecutive pairs, then `1e3e85df`'s exact-adjacency count recomputed \
+         three ways: both extents from CAPACITY as that cell did, the array \
+         extent from LENGTH instead, and the string extent from `m_size` \
+         instead. All three agree, so that cell's choice of field was not \
+         load-bearing - measured here rather than assumed, because `7a0a90fa` \
+         and `ed5d41d5` were both exactly this mistake going unnoticed while \
+         the two fields happened to agree"
+    );
+    for (module, pairs, a, b, c) in &tilings {
+        assert_eq!(
+            (a, b, c),
+            (pairs, pairs, pairs),
+            "{module}: every reading must tile completely"
+        );
+    }
+}
+
 /// The objects tile the file - stored sizes predict every next offset.
 ///
 /// Every object stores its own extent: a constructor in `cs_sz`, an array as 24
