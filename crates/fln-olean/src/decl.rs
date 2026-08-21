@@ -2638,6 +2638,125 @@ mod tests {
         .bytes
     }
 
+    /// One definition whose hint is `Regular`, so the region contains a hints
+    /// OBJECT rather than a scalar box.
+    ///
+    /// `definition_module` uses `Abbrev`, which is fieldless and therefore
+    /// scalar-boxed — the same trap `Level::zero` set twice in this file. A
+    /// cell built on it would never reach the heap constructor rule.
+    fn regular_hints_definition_module() -> Vec<u8> {
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "regular"]),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::zero()),
+                    },
+                    value: Expr::sort(Level::zero()),
+                    hints: ReducibilityHints::Regular(5),
+                    safety: DefinitionSafety::Safe,
+                    all: Vec::new(),
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A heap `ReducibilityHints` whose constructor is not `regular` is
+    /// refused.
+    ///
+    /// This completes the hint trio: the heap padding is bound and mutated
+    /// (201976e7), the scalar values are mutated (14e130f7), and this is the
+    /// heap constructor rule — the last of the three without a mutant.
+    ///
+    /// Nothing shadows it. The hints object is not a ConstantInfo payload, so
+    /// the payload size and padding rules do not look at it; within
+    /// `decode_hints` the constructor check runs BEFORE the padding check, so
+    /// a wrong tag reaches it first. The DefinitionVal header is untouched by
+    /// the plant and re-asserted afterwards.
+    #[test]
+    fn a_heap_reducibility_hint_with_the_wrong_constructor_is_refused() {
+        let mut bytes = regular_hints_definition_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified regular-hint fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("DefinitionVal pointer"))
+            .expect("DefinitionVal object");
+
+        // Slot 2 is the hint, and this time it must be a POINTER.
+        let stored = view.read_u64(val_off + 8 + 8 * 2).expect("hints slot");
+        assert_eq!(
+            stored & 1,
+            0,
+            "a regular hint is a heap object, not a scalar box"
+        );
+        let hints_off = view.deref(stored).expect("hints object");
+        let (tag, other, cs_sz) = view.obj_header(hints_off).expect("hints header");
+        assert_eq!(tag, 2, "the regular constructor");
+        assert_eq!(other, 0, "which carries no pointer fields");
+        assert_eq!(cs_sz, 16, "8 header plus the UInt32 in its padded word");
+        assert_eq!(
+            view.read_u64(hints_off + 8).expect("hint word"),
+            5,
+            "the fixture's height, with the padding half clear"
+        );
+
+        // Claim a constructor the type does not have, leaving the size alone.
+        let header = view.read_u64(hints_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (3_u64 << 56);
+        bytes[hints_off as usize..hints_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(hints_off).expect("header after plant"),
+            (3, 0, 16),
+            "only the tag moved"
+        );
+        assert_eq!(
+            view.obj_header(val_off).expect("owner header"),
+            (1, 4, 48),
+            "and the owning DefinitionVal is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a hints object with the wrong constructor must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ReducibilityHints ctor",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A scalar `ReducibilityHints` outside `{0, 1}` is refused rather than
     /// read as opaque or abbrev.
     ///
