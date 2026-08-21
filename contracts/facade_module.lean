@@ -1418,6 +1418,8 @@ axiom Lean.Meta.SimpTheorems.toUnfoldThms : _root_.Lean.Meta.SimpTheorems → _r
 @[reducible] noncomputable def Lean.Meta.SimpTheoremsArray : Type := _root_.Array _root_.Lean.Meta.SimpTheorems
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.SynthInstanceCache : Type
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext._sizeOf_inst : _root_.SizeOf _root_.Lean.MetavarContext
 -- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
 axiom Lean.MetavarContext.dAssignment : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.DelayedMetavarAssignment _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
 -- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext pp=explicit
@@ -2212,6 +2214,7 @@ attribute [instance] Lean.Elab.instInhabitedInfoTree
 attribute [instance] Lean.Expr.instBEq
 attribute [instance] Lean.Expr.instHashable
 attribute [instance] Lean.Linter.instInhabitedDeprecationEntry
+attribute [instance] Lean.MVarId._sizeOf_inst
 attribute [instance] Lean.MessageData.instAppend
 attribute [instance] Lean.Meta.DiscrTree.instBEqKey
 attribute [instance] Lean.Meta.DiscrTree.instHashableKey
@@ -2220,6 +2223,7 @@ attribute [instance] Lean.Meta.instHashableOrigin
 attribute [instance] Lean.NameMap.instEmptyCollection
 attribute [instance] Lean.NameMap.instForInProdNameOfMonad
 attribute [instance] Lean.NameMap.instInhabited
+attribute [instance] Lean.Option._sizeOf_inst
 attribute [instance] Lean.SubExpr.Pos.instOrd
 attribute [instance] Lean.Syntax.instInhabitedRange
 attribute [instance] Lean.instBEqAttributeKind
@@ -2268,6 +2272,8 @@ attribute [instance] Lean.MonadLog.toMonadFileMap
 attribute [instance] Lean.instInhabitedMetavarDecl
 attribute [instance] Lean.instMonadLCtxOfMonadLift
 attribute [instance] Std.TreeMap.instEmptyCollection
+attribute [instance] Lean.MetavarContext._sizeOf_inst
+attribute [instance] Lean.Elab.TacticInfo._sizeOf_inst
 attribute [instance] Lean.instMonadMCtxOfMonadLift
 attribute [instance] Lean.Core.instAddMessageContextCoreM
 attribute [instance] Lean.Core.instMonadCoreM
@@ -2285,6 +2291,7 @@ attribute [instance] Lean.Elab.Command.instMonadOptionsCommandElabM
 attribute [instance] Lean.Elab.Command.instMonadQuotationCommandElabM
 attribute [instance] Lean.Elab.Command.instMonadRefCommandElabM
 attribute [instance] Lean.Elab.Command.instMonadResolveNameCommandElabM
+attribute [instance] Lean.Elab.ContextInfo._sizeOf_inst
 attribute [instance] Lean.instMonadExceptOfExceptionCoreM
 attribute [instance] Lean.instMonadLiftImportMAttrM
 attribute [instance] Lean.Meta.instAddMessageContextMetaM
@@ -2296,20 +2303,17 @@ attribute [instance] Lean.Meta.instMonadMetaM
 attribute [instance] Lean.Elab.Term.instMonadMacroAdapterTermElabM
 attribute [instance] Lean.Elab.Term.instMonadTermElabM
 attribute [instance] Lean.Elab.Tactic.instMonadTacticM
+attribute [instance] Lean.Elab.ContextInfo._sizeOf_inst
 attribute [instance] Lean.Elab.MonadMacroAdapter.toMonadQuotation
+attribute [instance] Lean.Elab.TacticInfo._sizeOf_inst
+attribute [instance] Lean.MVarId._sizeOf_inst
 attribute [instance] Lean.MonadError.toAddErrorMessageContext
 attribute [instance] Lean.MonadError.toMonadExceptOf
 attribute [instance] Lean.MonadError.toMonadRef
 attribute [instance] Lean.MonadLog.toMonadFileMap
--- QUARANTINED Lean.Elab.ContextInfo._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.Elab.TacticInfo._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.ImportM.Context.casesOn: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.ImportM.Context.rec: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.MVarId._sizeOf_inst: provided by the implicitly imported Init substrate
+attribute [instance] Lean.Option._sizeOf_inst
 -- QUARANTINED Lean.Meta.MetaM.run: pin rejects the printed type -- lean.unknownIdentifier: Unknown identifier `_root_.Lean.PersistentHashMap.mk`
 -- QUARANTINED Lean.Meta.simpGoal: pin rejects the printed type -- lean.unknownIdentifier: Unknown identifier `_root_.Lean.PersistentHashMap.mk`
--- QUARANTINED Lean.MetavarContext._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.Option._sizeOf_inst: provided by the implicitly imported Init substrate
 -- QUARANTINED Lean.PrettyPrinter.delab: pin rejects the printed type -- -: Application type mismatch: The argument
 -- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst: pin rejects the printed type -- -: unexpected token '.'; expected ':'
 -- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.aconstsImpl: pin rejects the printed type -- -: unexpected token '.'; expected ':'

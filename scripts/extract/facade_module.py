@@ -372,6 +372,16 @@ def probe(lean, env, work, names):
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
+# A `structure` block generates these alongside the fields. Emitting an axiom for
+# one is a redeclaration; omitting it when the owner is NOT structural loses the
+# row. The list is a claim about the pin's elaborator, and it is CHECKED both ways
+# by the compile rig: a name wrongly assumed generated shows up as unresolved, and
+# one wrongly emitted shows up as "already been declared".
+STRUCTURE_COMPANIONS = (
+    "mk", "rec", "recOn", "casesOn", "brecOn", "below", "ndrec", "noConfusion",
+    "noConfusionType", "_sizeOf_inst", "_sizeOf_1", "toCtorIdx", "ctorIdx",
+    "injEq", "sizeOf_spec",
+)
 TOKEN = re.compile(r"(?<![\w.\u00ab\u00bb])([A-Za-z_][\w'!?]*(?:\.[A-Za-z_][\w'!?]*)*)(?![\w.])")
 
 
@@ -594,6 +604,8 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
         for i, b in sorted(binders.get(c, {}).items()):
             if i >= st["num_params"]:
                 provided[f"{c}.{b['user']}"] = c
+        for suffix in STRUCTURE_COMPANIONS:
+            provided[f"{c}.{suffix}"] = c
     for name in ordered:
         if name in quarantine or name in provided:
             continue
@@ -1025,6 +1037,16 @@ def main():
         },
         "init_provided": len(init_provided),
         "transparent_declarations": len(transparent),
+        "transparency_note": "these are the pin's REDUCIBLE definitions — "
+            "abbreviations. The facade emits them with their values because "
+            "declaring them opaquely invents distinctions the Reference does not "
+            "have (Lean.LMVarId vs Lean.LevelMVarId, Lean.PHashMap vs "
+            "Lean.PersistentHashMap), and every row needing the unfolding then "
+            "fails. They are oracle-extracted from the pinned environment like "
+            "every other row here, they carry form=transparent-abbrev so they are "
+            "enumerable, and they are DEFINITIONS the facade now contains rather "
+            "than declarations it stands behind — read the coverage number with "
+            "that in view",
         "reducible_candidates": len(reducible),
         "value_residue": len(value_residue),
         "structural_declarations": len(structural),
