@@ -347,7 +347,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     assert_eq!(
         include_str!("../src/lib.rs")
-            .match_indices(r#"\"g1Satisfied\":false"#)
+            .match_indices(r#"\"g1Satisfied\":false}}\n"#)
             .count(),
         2,
         "both check-olean JSON render paths keep G1 unsatisfied",
