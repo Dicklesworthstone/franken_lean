@@ -90,6 +90,9 @@ the toolchain would report a perfect facade:
   * A CENSUS-COMPLETENESS SUMMARY JOIN requires the exact-demand artifact to
     report an empty `census_missing` set. A demand denominator with known absent
     census rows is not eligible for facade coverage evidence.
+  * A REFERENCE-PIN JOIN requires the exact-demand artifact's extraction pin to
+    equal the Reference compiler pin running this rig. Matching names from a
+    different upstream epoch are not compatible evidence.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -162,7 +165,7 @@ def load_partition():
     return part
 
 
-def load_demand(path, part):
+def load_demand(path, part, expected_pin):
     """Curated module -> the toolchain-api constants it actually uses, from the
     elaborated exact-demand artifact (never a lexical scan: `open Lean Meta Elab`
     makes ~95% of real usage unqualified, measured on this same slice)."""
@@ -170,6 +173,7 @@ def load_demand(path, part):
     modules = None
     declared_toolchain_api_demand = None
     census_missing = None
+    demand_pin = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -185,6 +189,7 @@ def load_demand(path, part):
                 modules = row.get("curated_modules", [])
                 declared_toolchain_api_demand = row.get("toolchain_api_demanded")
                 census_missing = row.get("census_missing")
+                demand_pin = row.get("pin")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -223,6 +228,11 @@ def load_demand(path, part):
         raise SystemExit(
             "REFUSE: exact-demand census-completeness join found missing census "
             f"rows ({detail})"
+        )
+    if demand_pin != expected_pin:
+        raise SystemExit(
+            "REFUSE: exact-demand Reference-pin join disagrees with this rig "
+            f"(demand={demand_pin!r}, compiler={expected_pin!r})"
         )
     if uncensused:
         raise SystemExit(
@@ -265,6 +275,7 @@ def load_demand(path, part):
         "toolchain_use_edges": sum(len(names) for names in by_module.values()),
         "toolchain_distinct_symbols": rebuilt_distinct,
         "census_missing": 0,
+        "reference_pin": expected_pin,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
@@ -729,7 +740,7 @@ def main():
 
     lean, tag, corpus_commit = pinned_lean()
     part = load_partition()
-    modules, by_module, module_join, partition_join = load_demand(args.demand, part)
+    modules, by_module, module_join, partition_join = load_demand(args.demand, part, tag)
     work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-compile-{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in ("LEAN_PATH", "LEAN_SYSROOT")}
