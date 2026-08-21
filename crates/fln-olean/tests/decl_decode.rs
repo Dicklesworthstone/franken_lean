@@ -1068,44 +1068,39 @@ fn the_measured_cons_cells_are_the_ones_the_decoder_walked() {
     );
 }
 
-/// The size discriminator is COMPLETE over the `(1, 2)` population, which is
-/// the precondition the `list_ptrs` repair needs and which nothing had checked.
+/// A THIRD SHAPE SHARES THE CONS CELL'S HEADER, and it bounds the repair.
 ///
-/// Everything measured so far is about SUFFICIENCY: a cons cell is 24, a name
-/// link is 32, so a size rule can tell those two apart. That is the wrong half
-/// to stop at. Adding `cs_sz != 24` to `list_ptrs` makes it REFUSE, and a
-/// refusal rule is only safe if nothing legitimate carries a size the rule
-/// rejects, and only useful if nothing illegitimate carries a size it accepts.
-/// Neither direction follows from measuring the two shapes we already knew
-/// about.
+/// This cell asserted the opposite until w115 measured it. The claim was that
+/// `cs_sz` identifies the two shapes at `(tag, other) == (1, 2)`, so a size
+/// rule in `list_ptrs` would be safe. Over 7,591 such objects, 99 are 24 bytes
+/// with a tail that is neither a cons cell nor boxed nil - the first at
+/// `Init/Prelude.olean` offset `0x32e7d0`.
 ///
-/// AND THE EARLIER MEASUREMENT COULD NOT HAVE SEEN IT. `c48c0813`'s classifier
-/// ends in `_ => {}`: a `(1, 2)` object whose second field is neither a string,
-/// nor boxed nil, nor another `(1, 2)` object is silently dropped. So its
-/// populations are a FILTERED SUBSET and its "every cons cell is 24" is a claim
-/// about what it chose to look at, not about the corpus - a scan that skips
-/// what it cannot classify has quietly redefined its own denominator. That cell
-/// is not wrong about what it measured; it just never bounded the remainder,
-/// and the remainder is where a refusal rule gets hurt.
+/// SO THE ONE-LINE FIX I RECOMMENDED FOR FIVE COMMITS IS WRONG. A refusal keyed
+/// on `cs_sz != 24` would accept those 99 as cons cells; a rule that instead
+/// demanded 24 would reject nothing extra, but the size still does not say
+/// "this is a list", which is what `list_ptrs` needs to know. Size separates a
+/// name link from a cons cell - that much held, and the two planted witnesses
+/// still stand - but separating two shapes is not identifying one.
 ///
-/// This cell partitions the SAME population exhaustively and asserts the two
-/// directions the repair rests on:
+/// NOTE WHICH ASSERTION SURVIVED, because it locates the defect. The partition
+/// by size is still exhaustive: every `(1, 2)` object is 24 or 32, and no third
+/// SIZE exists. The third shape hides INSIDE 24. A cell that had only counted
+/// sizes would still be green and still be wrong, which is why this one looks
+/// at what the tail points at.
 ///
-///   - every `(1, 2)` object of size 24 really is cons-shaped, so the rule
-///     `list_ptrs` would gain accepts nothing it should reject;
-///   - every `(1, 2)` object of size 32 really is a name link, so the rule
-///     rejects nothing it should accept;
-///   - and no third size occurs at `(1, 2)` at all.
+/// WHAT THE 99 ARE IS NOT KNOWN, and this cell does not pretend otherwise. It
+/// splits the 24-byte population into cons-shaped and this third tail, pins the
+/// remainder at its measured count so the blocker cannot quietly disappear, and
+/// carries a characterisation of the tails into the failure message for
+/// whoever reads it next. Identifying them is the next piece of work, not a
+/// guess to be recorded here.
 ///
-/// A FAILURE HERE IS A FINDING THAT BLOCKS THE REPAIR, not a broken test. If a
-/// third size shows up, or a 24-byte `(1, 2)` object turns out not to be a cons
-/// cell, then `cs_sz` does not identify these shapes and the one-line fix I
-/// have been recommending for four commits is wrong. That is precisely what
-/// `(0, 3, 32)` did to the previous cell at w113: one header triple, two
-/// different structures. The same thing happening at `(1, 2)` is not a remote
-/// possibility, it is the thing that has already happened once in this file.
+/// The pinned count is asserted only where `Init/Prelude.olean` was actually
+/// loaded, because that is the corpus it was measured over; the C3 fixtures
+/// alone do not contain it.
 #[test]
-fn no_third_shape_shares_the_cons_cell_header_and_the_sizes_identify_the_two() {
+fn a_third_shape_shares_the_cons_cell_header_and_bounds_the_size_rule() {
     let mut modules: Vec<(String, Vec<u8>)> = [
         "Init.olean",
         "Init.BinderNameHint.olean",
@@ -1114,18 +1109,23 @@ fn no_third_shape_shares_the_cons_cell_header_and_the_sizes_identify_the_two() {
     .into_iter()
     .map(|module| (module.to_owned(), fixture(module)))
     .collect();
+    let mut prelude_loaded = false;
     if let Some(lib) = reference_lib() {
         let prelude = lib.join("Init/Prelude.olean");
         if let Ok(bytes) = std::fs::read(&prelude) {
             modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
         }
     }
 
     let mut population = 0usize;
     let mut cons_shaped = 0usize;
+    let mut third_tail = 0usize;
     let mut name_shaped = 0usize;
+    let mut name_misfits = 0usize;
     let mut unexpected_sizes: BTreeSet<u16> = BTreeSet::new();
-    let mut misfits: Vec<String> = Vec::new();
+    let mut tail_kinds: BTreeSet<String> = BTreeSet::new();
+    let mut first_third: Option<String> = None;
 
     for (module, bytes) in &modules {
         let (objects, base) = objects_of(bytes);
@@ -1149,48 +1149,34 @@ fn no_third_shape_shares_the_cons_cell_header_and_the_sizes_identify_the_two() {
             let looks_like_name = target.is_some_and(|t| t.tag == abi::TAG_STRING);
 
             match object.cs_sz {
+                24 if looks_like_cons => cons_shaped += 1,
                 24 => {
-                    cons_shaped += 1;
-                    if !looks_like_cons {
-                        misfits.push(format!(
-                            "{module}: 24-byte (1,2) object at {:#x} whose tail is not a \
-                             cell and not nil",
-                            object.off
-                        ));
-                    }
+                    third_tail += 1;
+                    // What the tail actually is, so the remainder is described
+                    // rather than merely counted.
+                    tail_kinds.insert(match target {
+                        Some(t) => format!("object tag {} arity {}", t.tag, t.other),
+                        None if second & 1 == 1 => {
+                            format!("boxed scalar {}", second >> 1)
+                        }
+                        None => "unresolvable pointer".to_owned(),
+                    });
+                    first_third.get_or_insert_with(|| format!("{module} {:#x}", object.off));
                 }
-                32 => {
-                    name_shaped += 1;
-                    if !looks_like_name {
-                        misfits.push(format!(
-                            "{module}: 32-byte (1,2) object at {:#x} whose second field \
-                             is not a string",
-                            object.off
-                        ));
-                    }
-                }
+                32 if looks_like_name => name_shaped += 1,
+                32 => name_misfits += 1,
                 other => {
                     unexpected_sizes.insert(other);
-                    misfits.push(format!(
-                        "{module}: (1,2) object at {:#x} of size {other}",
-                        object.off
-                    ));
                 }
             }
         }
     }
 
-    // Anti-vacuity: an exhaustive partition of nothing partitions nothing, and
-    // the whole point of this cell is the size of the denominator.
+    // Anti-vacuity, unchanged: an exhaustive partition of nothing partitions
+    // nothing, and both sizes must actually occur.
     assert!(
         population >= 100,
         "too few (1,2) objects to bound the population: {population}"
-    );
-    assert_eq!(
-        cons_shaped + name_shaped,
-        population,
-        "the partition must be exhaustive; {} objects fell outside both sizes",
-        population - cons_shaped - name_shaped
     );
     assert!(
         cons_shaped > 0 && name_shaped > 0,
@@ -1198,20 +1184,36 @@ fn no_third_shape_shares_the_cons_cell_header_and_the_sizes_identify_the_two() {
          24, {name_shaped} at 32"
     );
 
-    // The two directions the repair rests on, and the absence of a third shape.
-    assert!(
-        misfits.is_empty(),
-        "`cs_sz` does not identify these shapes, which BLOCKS the `list_ptrs` \
-         size rule rather than merely failing this test - a refusal keyed on a \
-         size that does not identify the shape rejects real objects. \
-         {} counterexamples over {population} objects, first few: {:?}",
-        misfits.len(),
-        &misfits[..misfits.len().min(5)]
+    // The partition is still exhaustive by ARITHMETIC, and it still holds:
+    // there is no third SIZE. That is what makes the third shape interesting.
+    assert_eq!(
+        cons_shaped + third_tail + name_shaped + name_misfits,
+        population,
+        "the partition must account for every object"
     );
     assert!(
         unexpected_sizes.is_empty(),
-        "a third shape shares the cons cell's tag and arity: {unexpected_sizes:?}"
+        "a third SIZE appeared at (1,2), which is a different finding from the \
+         third shape below: {unexpected_sizes:?}"
     );
+
+    // The remainder, pinned rather than asserted away. A change in either
+    // direction is a finding: shrinking to zero would mean the blocker is gone
+    // and the size rule is back on the table.
+    if prelude_loaded {
+        assert_eq!(
+            third_tail, 99,
+            "the 24-byte objects at (1,2) whose tail is neither a cell nor nil, \
+             measured at w115 over {population} objects. This is the remainder \
+             that BLOCKS a `list_ptrs` size rule: 24 does not identify a cons \
+             cell. Tail kinds: {tail_kinds:?}. First: {first_third:?}"
+        );
+        assert_eq!(
+            name_misfits, 0,
+            "no 32-byte (1,2) object should fail to be a name link; that \
+             direction was clean at w115"
+        );
+    }
 }
 
 /// The bound population covers more than ONE of `list_ptrs`'s callers.
