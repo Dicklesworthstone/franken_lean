@@ -8716,3 +8716,143 @@ fn derived_equality_instances_split_into_generated_and_delegating() {
         }
     }
 }
+
+/// `(module, private-only total, Defn, Thm, Opaque, privacy-scoped, match_N,
+/// _proof_N, eq_N)`.
+const PRIVATE_ONLY_SHAPE: &[(&str, usize, usize, usize, usize, usize, usize, usize, usize)] = &[
+    ("Init.Prelude", 110, 103, 5, 2, 82, 25, 3, 0),
+    ("Init.Meta.Defs", 151, 123, 10, 18, 95, 50, 2, 4),
+];
+
+/// What the private part ADDS is always a body, and never a type or a
+/// postulate.
+///
+/// The retyping cell covers declarations present in BOTH parts and shows the
+/// private read never changes a type. That says nothing about the declarations
+/// the private part introduces — 110 of them in `Init/Prelude`, 151 in
+/// `Init.Meta.Defs` — which are precisely what this bead exists to recover and
+/// whose SHAPE nothing here had characterised.
+///
+/// Two decompositions, each summing to its population:
+///
+///   by kind: every private-only declaration is value-carrying — `Defn`, `Thm`
+///     or `Opaque`. Not one is an `Axiom`, and not one is an `Induct`, `Ctor`
+///     or `Rec`. The private part supplies bodies; it never introduces a new
+///     type, a new constructor, a new recursor or a new postulate
+///   by name: every one is either privacy-scoped (`_private.…`) or an indexed
+///     auxiliary (`match_N`, `_proof_N`, `eq_N`). ZERO fall outside those, so
+///     the private part never adds an ordinary, publicly-nameable declaration
+///
+/// The kind law is the one that matters. Reading the private part can only ever
+/// give a declaration a body it did not have, or add an auxiliary that has one.
+/// It cannot enlarge the type universe and it cannot enlarge the trusted base —
+/// which is the same guarantee the postulate cell establishes globally, arrived
+/// at from the other direction and per module.
+///
+/// Anti-vacuity is specific: the exported part of each module DOES declare
+/// axioms, inductives, constructors and recursors, so their absence from the
+/// added set is a property of what gets added rather than of what the module
+/// contains. That is asserted, not assumed.
+#[test]
+fn the_private_part_adds_only_bodies_and_never_a_type_or_a_postulate() {
+    let lib = lib_or_skip!();
+
+    for (module, total, defn, thm, opaque, scoped, matches, proofs, equations) in PRIVATE_ONLY_SHAPE
+    {
+        let (exported, _) = decode_at(&lib, module, Level::Exported);
+        let (private, _) = decode_at(&lib, module, Level::Private);
+        let known: BTreeSet<String> = exported
+            .iter()
+            .map(|info| info.name().to_display_string())
+            .collect();
+
+        let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut by_shape: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut added = 0usize;
+        let mut ordinary: Vec<String> = Vec::new();
+        for info in &private {
+            let name = info.name().to_display_string();
+            if known.contains(&name) {
+                continue;
+            }
+            added += 1;
+            *by_kind.entry(kind_of(info)).or_default() += 1;
+
+            let indexed = |prefix: &str| {
+                name.rsplit_once('.')
+                    .and_then(|(_, tail)| tail.strip_prefix(prefix))
+                    .is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                    })
+            };
+            let shape = if indexed("match_") {
+                "match_N"
+            } else if indexed("_proof_") {
+                "_proof_N"
+            } else if indexed("eq_") {
+                "eq_N"
+            } else if name.starts_with("_private.") {
+                "scoped"
+            } else {
+                ordinary.push(name.clone());
+                "ordinary"
+            };
+            *by_shape.entry(shape).or_default() += 1;
+        }
+
+        assert!(
+            ordinary.is_empty(),
+            "{module}: the private part must not add an ordinary declaration: {:?}",
+            &ordinary[..ordinary.len().min(8)]
+        );
+        let count = |table: &BTreeMap<&'static str, usize>, key: &str| {
+            table.get(key).copied().unwrap_or_default()
+        };
+        assert_eq!(
+            (
+                added,
+                count(&by_kind, "Defn"),
+                count(&by_kind, "Thm"),
+                count(&by_kind, "Opaque")
+            ),
+            (*total, *defn, *thm, *opaque),
+            "{module}: the added population by kind"
+        );
+        assert_eq!(
+            by_kind.values().sum::<usize>(),
+            added,
+            "{module}: the kind table must account for every added declaration, so no other \
+             kind may appear"
+        );
+        assert_eq!(
+            (
+                count(&by_shape, "scoped"),
+                count(&by_shape, "match_N"),
+                count(&by_shape, "_proof_N"),
+                count(&by_shape, "eq_N")
+            ),
+            (*scoped, *matches, *proofs, *equations),
+            "{module}: the added population by name shape"
+        );
+        assert_eq!(
+            by_shape.values().sum::<usize>(),
+            added,
+            "{module}: and the shape table must account for every one too"
+        );
+
+        // Anti-vacuity: the module DOES contain the kinds that never get added.
+        let exported_kinds: BTreeSet<&'static str> = exported.iter().map(kind_of).collect();
+        for absent in ["Axiom", "Induct", "Ctor", "Rec"] {
+            assert!(
+                exported_kinds.contains(absent),
+                "{module}: the exported part must contain a {absent}, or its absence from the \
+                 added set says nothing"
+            );
+            assert_eq!(
+                count(&by_kind, absent),
+                0,
+                "{module}: the private part must not add a {absent}"
+            );
+        }
+    }
+}
