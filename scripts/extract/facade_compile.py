@@ -3024,6 +3024,27 @@ def main():
             "REFUSE: facade manifest substrate-emission count must exceed "
             f"projection-type count ({json.dumps(substrate_projection_inequality_join, sort_keys=True)})"
         )
+    substrate_transparent_inequality_join = {
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+        "summary_transparent_declarations": manifest_summary.get(
+            "transparent_declarations"
+        ),
+    }
+    if (not isinstance(substrate_transparent_inequality_join[
+            "summary_substrate_emitted"], int)
+            or isinstance(substrate_transparent_inequality_join[
+                "summary_substrate_emitted"], bool)
+            or not isinstance(substrate_transparent_inequality_join[
+                "summary_transparent_declarations"], int)
+            or isinstance(substrate_transparent_inequality_join[
+                "summary_transparent_declarations"], bool)
+            or substrate_transparent_inequality_join["summary_substrate_emitted"]
+            <= substrate_transparent_inequality_join[
+                "summary_transparent_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest substrate-emission count must exceed "
+            f"transparent-declaration count ({json.dumps(substrate_transparent_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5093,6 +5114,9 @@ def main():
         ),
         "manifest_substrate_projection_inequality_join": (
             substrate_projection_inequality_join
+        ),
+        "manifest_substrate_transparent_inequality_join": (
+            substrate_transparent_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
