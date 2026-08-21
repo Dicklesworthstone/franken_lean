@@ -184,6 +184,30 @@ fn assert_json_residual_group_union_equals(json: &str, expected_field: &str, fie
     assert_eq!(covered, expected, "{json}");
 }
 
+fn assert_canonical_residual_group_keys_match_human_prefixes(json: &str, human: &str) {
+    let json_keys = [
+        "privateCliPrivateReportResiduals",
+        "privateInitDataResiduals",
+        "privateInitPreludeResiduals",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    for key in &json_keys {
+        let _ = json_object_field(json, key);
+    }
+
+    let human_keys = human
+        .lines()
+        .filter_map(|line| line.strip_prefix("decoded _private "))
+        .filter_map(|line| line.split_once(" residuals:").map(|(prefix, _)| prefix))
+        .filter(|prefix| matches!(*prefix, "CliPrivateReport" | "Init.Data" | "Init.Prelude"))
+        .map(|prefix| format!("private{}Residuals", prefix.replace('.', "")))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(human_keys, json_keys, "{json}\n{human}");
+}
+
 fn human_line_suffix<'a>(stdout: &'a str, prefix: &str) -> &'a str {
     stdout
         .lines()
@@ -1323,6 +1347,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             .stdout
             .contains("decoded _private auxiliaries: 29 (reporting only; not a G1 claim)")
     );
+    assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
         &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
         &[
