@@ -125,6 +125,12 @@ const HEAD_INFO_LOOP_UNSAFE_REC: &str =
 /// Its private-only dependency, which must be recovered from the companion.
 const HEAD_INFO_LOOP_MATCH_1: &str =
     "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1";
+/// The two tail-recursive merge-sort implementation helpers in the pinned
+/// `Init.Data.List.Sort.Impl` companion delta.
+const MERGE_SORT_TR_UNSAFE_RECS: [&str; 2] = [
+    "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR₂.run._unsafe_rec",
+    "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR₂.run'._unsafe_rec",
+];
 
 /// A recovered private declaration must retain a concrete declaration kind.
 /// Keep this exhaustive so a future placeholder kind cannot silently satisfy
@@ -319,6 +325,50 @@ fn prelude_exported_mangled_unsafe_rec_still_requires_its_private_match_companio
 }
 
 #[test]
+fn merge_sort_tr_unsafe_rec_companions_retain_concrete_kinds() {
+    let lib = lib_or_skip!("merge_sort_tr_unsafe_rec_companions_retain_concrete_kinds");
+    let chain = chain_bytes(&lib, "Init/Data/List/Sort/Impl");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let private_constants = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode");
+
+    for name in MERGE_SORT_TR_UNSAFE_RECS {
+        assert!(
+            !exported_names.contains(&name.to_owned()),
+            "the exported part must omit the private mergeSortTR helper {name}"
+        );
+        assert!(
+            private_names.contains(&name.to_owned()),
+            "the private companion must restore the mergeSortTR helper {name}"
+        );
+        assert!(
+            exported_constants
+                .iter()
+                .all(|info| info.name().to_display_string() != name),
+            "exported decoder unexpectedly recovered {name}"
+        );
+        let recovered = private_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("private decoder lost {name}"));
+        assert!(
+            is_concrete_recovery(recovered),
+            "private companion decoded {name} only as {} instead of a concrete declaration",
+            recovered.kind_name()
+        );
+    }
+}
+
+#[test]
 fn private_part_is_a_superset_across_the_modules_the_bead_names() {
     let lib = lib_or_skip!("private_part_is_a_superset_across_the_modules_the_bead_names");
 
@@ -442,7 +492,12 @@ mod family {
         last_component_suffix(name, "eq_").is_some_and(digits)
     }
 
-    /// `._eq_1`, … — equation-compiler internal equation lemmas.
+    /// `._eq_1`, … — a shape the pinned Reference does not emit.
+    ///
+    /// Kept, and exercised by
+    /// `the_underscore_eq_n_shape_is_absent_from_the_pin`, so the family's
+    /// absence is an asserted fact rather than a silent gap in the tables
+    /// above. See that test for the measurement.
     pub fn private_eq_n(name: &str) -> bool {
         last_component_suffix(name, "_eq_").is_some_and(digits)
     }
@@ -628,11 +683,10 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 15] = [
+    let families: [(&str, fn(&str) -> bool); 14] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
-        ("_eq_N", family::private_eq_n),
         ("eq_def", family::eq_def),
         (".loop.eq_def", family::loop_eq_def),
         (".loop.match_1", family::loop_match_1),
@@ -645,8 +699,8 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
         ("_f", family::private_f),
         ("Array.shrink.loop._f", family::array_shrink_loop_f),
     ];
-    let mut representatives: [Option<(String, String)>; 15] = [
-        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+    let mut representatives: [Option<(String, String)>; 14] = [
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
     ];
 
     for relative in init_chain_modules(&lib) {
@@ -713,11 +767,10 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 15] = [
+    let families: [(&str, fn(&str) -> bool); 14] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
-        ("_eq_N", family::private_eq_n),
         ("eq_def", family::eq_def),
         (".loop.eq_def", family::loop_eq_def),
         (".loop.match_1", family::loop_match_1),
@@ -1095,8 +1148,7 @@ fn loop_match_1_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 
 #[test]
 fn loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
-    let lib =
-        lib_or_skip!("loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind");
+    let lib = lib_or_skip!("loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind");
 
     // A `.loop.eq_def` is neither a broad loop helper nor an ordinary eq_def:
     // it is the equation-compiler declaration attached to the generated loop.
@@ -1114,14 +1166,11 @@ fn loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
         .expect("the pinned Init private companions contain a private-only .loop.eq_def witness");
     let chain = chain_bytes(&lib, &relative);
 
-    let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
-        panic!(".loop.eq_def {name}: parse exported {relative}: {error}")
-    });
+    let exported_view = OleanView::parse(&chain.exported)
+        .unwrap_or_else(|error| panic!(".loop.eq_def {name}: parse exported {relative}: {error}"));
     let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
         .decode_module_constants()
-        .unwrap_or_else(|error| {
-            panic!(".loop.eq_def {name}: decode exported {relative}: {error}")
-        });
+        .unwrap_or_else(|error| panic!(".loop.eq_def {name}: decode exported {relative}: {error}"));
     assert!(
         exported_constants
             .iter()
@@ -1136,9 +1185,7 @@ fn loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
             });
     let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
         .decode_module_constants()
-        .unwrap_or_else(|error| {
-            panic!(".loop.eq_def {name}: decode private {relative}: {error}")
-        })
+        .unwrap_or_else(|error| panic!(".loop.eq_def {name}: decode private {relative}: {error}"))
         .into_iter()
         .find(|info| info.name().to_display_string() == name)
         .unwrap_or_else(|| panic!(".loop.eq_def {name}: private decoder lost it in {relative}"));
@@ -1538,6 +1585,74 @@ fn the_parts_door_agrees_with_the_view_door_and_classifies_the_prelude_witnesses
             "{witness} must not appear in private_only()"
         );
     }
+}
+
+/// `._eq_<digits>` is not a declaration shape the pinned Reference emits.
+///
+/// The family tables above deliberately do NOT list it. That omission is a
+/// measurement, not an oversight, and this test is what makes it one: across
+/// every Init module with a complete companion chain, no declaration in
+/// `constants` and no name in `extraConstNames` has a final component of the
+/// form `_eq_<digits>`. Corpus-wide over all 2,431 chained modules the count is
+/// also zero.
+///
+/// A family row for a shape the pin never emits cannot be satisfied by any
+/// decoder: the per-family harnesses select a private-only representative and
+/// panic when none exists, so such a row fails for a reason that has nothing to
+/// do with decode. Asserting the absence keeps the fact in the suite while
+/// letting the tables describe only families that exist.
+#[test]
+fn the_underscore_eq_n_shape_is_absent_from_the_pin() {
+    let lib = lib_or_skip!("the_underscore_eq_n_shape_is_absent_from_the_pin");
+
+    // The near neighbour that DOES exist, asserted first so this test cannot
+    // pass because the predicate or the corpus walk silently matched nothing.
+    let mut eq_n_seen = 0_usize;
+    let mut underscore_eq_n = Vec::new();
+
+    for relative in init_chain_modules(&lib) {
+        let chain = chain_bytes(&lib, &relative);
+        let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+        let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+            .expect("server part parses against the exported region");
+        let private_view =
+            OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+                .expect("private part parses against the exported and server regions");
+
+        let module = private_view
+            .module_data(WalkBudget::default())
+            .expect("private ModuleData decodes");
+        let extra = private_view
+            .extra_const_names(WalkBudget::default())
+            .expect("extraConstNames decode");
+
+        for name in module.const_names.iter() {
+            if family::eq_n(name) {
+                eq_n_seen += 1;
+            }
+            if family::private_eq_n(name) {
+                underscore_eq_n.push(format!("{relative}: {name} (constants)"));
+            }
+        }
+        for name in &extra {
+            let rendered = name.to_display_string();
+            if family::private_eq_n(&rendered) {
+                underscore_eq_n.push(format!("{relative}: {rendered} (extraConstNames)"));
+            }
+        }
+        let _ = &exported_view;
+    }
+
+    assert_eq!(
+        eq_n_seen, 3_449,
+        "the `.eq_<digits>` family is the live neighbour; if this moved, the \
+         negative below is measuring a different corpus than it claims"
+    );
+    assert!(
+        underscore_eq_n.is_empty(),
+        "`._eq_<digits>` now exists at the pin, so the family tables above are \
+         missing a real family: {underscore_eq_n:?}"
+    );
 }
 
 #[test]
