@@ -10388,3 +10388,266 @@ fn the_ten_triples_are_not_the_same_kind() {
          needs no byte of that decoding"
     );
 }
+
+/// The ten's field-1 arrays - and below them, objects of the 111's kind again.
+///
+/// `cae89f06` left these unread and said so as unmeasured. Measured:
+///
+///   10 references to 6 distinct arrays; four of the six are used twice
+///   none of the 6 is among the 51 slot-2, 42 slot-3 or 5 inner-record arrays
+///   lengths 1 four times and 2 twice - NOT uniform
+///   8 elements, all the three-field shape, 8 distinct, none boxed
+///   none of the 8 is among the ten or the 111
+///
+/// THE LENGTHS ARE NOT UNIFORM, which weakens "parallel" one step further.
+/// `7e1ab465` found every array at the level above to be length 2 and called
+/// the arrangement parallel; `cae89f06` had to qualify that once already when
+/// the contents turned out to be a different kind. Here even the container
+/// shape stops matching.
+///
+/// AND YET THE OBJECTS BELOW ARE THE 111'S KIND AGAIN:
+///
+///                 the 111    the ten    these 8
+///   size          40         32         40
+///   field 0       tag 2/2    tag 1/2    tag 2/2
+///   field 1       a name     an ARRAY   a name
+///
+/// So the descent alternates: objects of the 111's kind, then a wrapper into
+/// objects of a different kind, then objects of the 111's kind again - disjoint
+/// from the 111 at every step.
+///
+/// THE COMPARISON HAS DEMONSTRATED DISCRIMINATING POWER, which is the check
+/// `f2da5b0e` added and the reason this claim is worth making. Agreeing with a
+/// rate-one group proves nothing if disagreement was impossible - but the ten
+/// disagree on all three of these properties, so they are a worked
+/// counterexample showing the properties CAN differ. Matching them is therefore
+/// a fact and not a tautology.
+///
+/// The eight are still disjoint from the 111, and by `7e1ab465`'s arithmetic
+/// that disjointness carries little on its own: the 111 are about two per cent
+/// of the corpus's objects of this shape. It is the profile match that carries,
+/// not the membership miss.
+#[test]
+fn the_ten_field_one_arrays() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut arrays: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut refcounts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut overlaps: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut lengths: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut below: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut below_profile: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut below_sizes: BTreeSet<u16> = BTreeSet::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        // The three known array populations and the 111.
+        let mut slot2: BTreeSet<usize> = BTreeSet::new();
+        let mut known111: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                slot2.insert(array);
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        known111.insert(element);
+                    }
+                }
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        let mut slot3: BTreeSet<usize> = BTreeSet::new();
+        for &node in &all {
+            if let Some(record) = resolve(word_at(bytes, node + 8))
+                && let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3))
+            {
+                for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                    if shape(carrier) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        slot3.insert(array);
+                    }
+                }
+            }
+        }
+
+        // The ten, and the arrays they hold at field 1.
+        let mut inner_arrays: BTreeSet<usize> = BTreeSet::new();
+        let mut ten: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            if let Some(tail) = resolve(word_at(bytes, node + 16))
+                && shape(tail) == Some((4, 1))
+                && let Some(inner) = resolve(word_at(bytes, tail + 8))
+                && let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3))
+            {
+                inner_arrays.insert(array);
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        ten.insert(element);
+                    }
+                }
+            }
+        }
+
+        let mut counts: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for &triple in &ten {
+            if let Some(array) = resolve(word_at(bytes, triple + 8 + 8)) {
+                references += 1;
+                arrays.insert((index, array));
+                *counts.entry(array).or_default() += 1;
+            }
+        }
+        for (&array, &count) in &counts {
+            *refcounts.entry(count).or_default() += 1;
+            if slot2.contains(&array) {
+                *overlaps.entry("slot 2".to_owned()).or_default() += 1;
+            }
+            if slot3.contains(&array) {
+                *overlaps.entry("slot 3".to_owned()).or_default() += 1;
+            }
+            if inner_arrays.contains(&array) {
+                *overlaps.entry("inner record".to_owned()).or_default() += 1;
+            }
+            let length = word_at(bytes, array + 8);
+            *lengths.entry(length).or_default() += 1;
+            for i in 0..length {
+                let element =
+                    resolve(word_at(bytes, array + 24 + 8 * i as usize)).expect("an element");
+                below.insert((index, element));
+                if ten.contains(&element) {
+                    *overlaps.entry("the ten".to_owned()).or_default() += 1;
+                }
+                if known111.contains(&element) {
+                    *overlaps.entry("the 111".to_owned()).or_default() += 1;
+                }
+                below_sizes.insert(at.get(&element).expect("resolved").cs_sz);
+                for slot in 0..3usize {
+                    let field = resolve(word_at(bytes, element + 8 + 8 * slot))
+                        .expect("a field is a pointer");
+                    *below_profile
+                        .entry(format!("field {slot}/{}", described(field)))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(
+        (references, arrays.len()),
+        (10, 6),
+        "ten references to six arrays"
+    );
+    assert_eq!(
+        refcounts.into_iter().collect::<Vec<_>>(),
+        vec![(1, 2), (2, 4)],
+        "four of the six are used twice - heavier sharing than any array level \
+         above"
+    );
+    assert!(
+        overlaps.is_empty(),
+        "none of the six arrays is among the three known array populations, and \
+         none of the eight elements is among the ten or the 111: {overlaps:?}"
+    );
+    assert_eq!(
+        lengths.into_iter().collect::<Vec<_>>(),
+        vec![(1, 4), (2, 2)],
+        "lengths are NOT uniform. `7e1ab465` found every array one level up to \
+         be length 2 and called the arrangement parallel; here even the \
+         container shape stops matching"
+    );
+
+    // Below them: the 111's kind again.
+    assert_eq!(below.len(), 8, "eight distinct objects below");
+    assert_eq!(
+        below_sizes.iter().copied().collect::<Vec<_>>(),
+        vec![40],
+        "forty bytes - the 111's size, not the ten's 32"
+    );
+    assert_eq!(
+        below_profile.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("field 0/tag 2 arity 2".to_owned(), 8),
+            ("field 1/tag 2 arity 2".to_owned(), 8),
+            ("field 2/tag 1 arity 1".to_owned(), 4),
+            ("field 2/tag 4 arity 2".to_owned(), 4),
+        ],
+        "a numbered link at field 0 and a name at field 1 - the 111's profile, \
+         where the ten had a string link and an ARRAY. The descent alternates: \
+         the 111's kind, a wrapper into a different kind, then the 111's kind \
+         again. And the ten are a worked counterexample proving these three \
+         properties CAN differ, so matching them is a fact and not a tautology"
+    );
+}
