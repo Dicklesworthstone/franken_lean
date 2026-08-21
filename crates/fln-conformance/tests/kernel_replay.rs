@@ -4523,6 +4523,7 @@ impl CorpusMatrixReceipt {
             let end = rest
                 .find(|c: char| !c.is_ascii_digit())
                 .unwrap_or(rest.len());
+            assert_number_terminator(key, rest, end)?;
             rest[..end]
                 .parse()
                 .map_err(|_| format!("field `{key}` is not a u64"))
@@ -11414,6 +11415,7 @@ impl WholeMathlibReceipt {
             let end = rest
                 .find(|c: char| !c.is_ascii_digit())
                 .unwrap_or(rest.len());
+            assert_number_terminator(key, rest, end)?;
             rest[..end]
                 .parse()
                 .map_err(|_| format!("field `{key}` is not a u64"))
@@ -12709,6 +12711,41 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
+    // AN EXPONENT APPENDED TO A NUMBER. `number` reads digits and stops at the
+    // first character that is not one. Appending `e9` therefore leaves THIS
+    // reader's answer identical -- the same value, so every count, floor and sum
+    // rule passes exactly as before -- while the file now states a number a
+    // billion times larger to anything that parses JSON. Measured before this
+    // commit, alongside `700044.5` read as `700044` and `700044abc` read as
+    // `700044` from a malformed row.
+    assert!(
+        sample.wall_ms > 0,
+        "the sample's wall_ms must be non-zero, or the truncated read would be refused for being \
+         zero and this cell would prove nothing about the terminator"
+    );
+    let exponent = row.replace(
+        &format!("\"wall_ms\":{}", sample.wall_ms),
+        &format!("\"wall_ms\":{}e9", sample.wall_ms),
+    );
+    assert_ne!(
+        exponent, row,
+        "the surgery must have changed the row, or the sample's wall_ms is not written where it \
+         was looked for"
+    );
+    let exponent_reason = match WholeMathlibReceipt::from_row(&exponent) {
+        Err(reason) => reason,
+        Ok(read) => panic!(
+            "a row stating {}e9 milliseconds was read as {}; this reader's answer is unchanged by \
+             the exponent, which is exactly why no other rule can notice it",
+            sample.wall_ms, read.wall_ms
+        ),
+    };
+    assert!(
+        exponent_reason.contains("wall_ms") && exponent_reason.contains("punctuation"),
+        "the refusal must name the field and say the number did not end where the row's \
+         punctuation does: {exponent_reason}"
+    );
+
     // A COMMA INSIDE ONE ELEMENT. The extractor splits the array on commas
     // before it looks at quotes, so one element containing a comma is read as
     // two. Measured before this commit: a census listing ONE family named
@@ -13660,6 +13697,27 @@ fn assert_whole_quoted_element(key: &str, item: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// A number must end where the row's punctuation begins.
+///
+/// `number` reads digits and stops at the first character that is not one,
+/// keeping whatever it has. Measured against what a JSON reader sees: `700044.5`
+/// is read as `700044`, `700044abc` is read as `700044` from a malformed row,
+/// and `7e5` is read as `7` where JSON says `700000`. The last is the shape that
+/// matters -- an exponent appended to a value leaves this reader's answer
+/// UNCHANGED while multiplying the file's by a billion, so every count rule
+/// passes exactly as before and the row means something else entirely to
+/// anything that parses it properly.
+fn assert_number_terminator(key: &str, rest: &str, end: usize) -> Result<(), String> {
+    match rest[end..].chars().next() {
+        Some(',') | Some('}') | None => Ok(()),
+        Some(other) => Err(format!(
+            "numeric field `{key}` is followed by `{other}` where the row's punctuation belongs. \
+             This reader stops at the first non-digit and keeps what it has, so the value it read \
+             is not the value the row states"
+        )),
+    }
 }
 
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
