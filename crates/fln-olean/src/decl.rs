@@ -2638,6 +2638,88 @@ mod tests {
         .bytes
     }
 
+    /// A scalar `ReducibilityHints` outside `{0, 1}` is refused rather than
+    /// read as opaque or abbrev.
+    ///
+    /// This is the fieldless half of the hint decode: `opaque` and `abbrev`
+    /// carry nothing, so Lean scalar-boxes them, and only `regular` is a heap
+    /// object. The heap half already has its padding bound (201976e7); this is
+    /// the scalar half's only rule and it had no mutant.
+    ///
+    /// Nothing shadows it. The hint is SLOT 2 of the DefinitionVal, so the
+    /// plant writes a pointer-sized word inside the object's slot area: the
+    /// header is untouched, so the arity and size rules cannot fire, and the
+    /// scalar padding after the safety byte is untouched too. Both are
+    /// re-asserted after the plant.
+    #[test]
+    fn a_scalar_reducibility_hint_outside_its_two_values_is_refused() {
+        let mut bytes = definition_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified definition fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("DefinitionVal pointer"))
+            .expect("DefinitionVal object");
+        assert_eq!(
+            view.obj_header(val_off).expect("header"),
+            (1, 4, 48),
+            "base, value, hints, all, then the safety byte"
+        );
+
+        // Slot 2 is `hints`. The fixture is Abbrev, which Lean scalar-boxes as
+        // (1 << 1) | 1 == 3.
+        let hints_slot = val_off as usize + 8 + 8 * 2;
+        let stored = view.read_u64(val_off + 8 + 8 * 2).expect("hints slot");
+        assert_eq!(
+            stored & 1,
+            1,
+            "a fieldless hint is scalar-boxed, not a pointer"
+        );
+        assert_eq!(stored >> 1, 1, "and the fixture's hint is Abbrev");
+
+        // Box a third value the constructor does not have.
+        let planted: u64 = (2 << 1) | 1;
+        bytes[hints_slot..hints_slot + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(val_off).expect("header after plant"),
+            (1, 4, 48),
+            "the header is untouched, so the arity and size rules cannot fire"
+        );
+        let safety = val_off as usize + 8 + 8 * 4;
+        assert!(
+            bytes[safety + 1..val_off as usize + 48]
+                .iter()
+                .all(|b| *b == 0),
+            "and the padding is untouched, so the padding rule cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a scalar hint outside {0, 1} must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ReducibilityHints scalar",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `safety` byte outside `0..=2` is refused rather than read as one of
     /// the three definition kinds.
     ///
