@@ -471,3 +471,77 @@ fn the_named_std_prefix_carries_no_postulates_and_restores_a_row_this_bead_names
          DefinitionTypeMismatch families; the private part must restore its body"
     );
 }
+
+/// The four definitions d17i found in BOTH restrictive families, closed.
+///
+/// The exhaustive pass of 2026-07-25 separated the 13 DefinitionTypeMismatch
+/// rows from the 24 UnknownConstant rows and found that four definitions
+/// appeared in both: when an un-decoded auxiliary sat in a declaration's own
+/// type or body the kernel reported `UnknownConstant`, and when it sat only on
+/// the unfolding path `def_eq` needed, the same root cause surfaced as
+/// `DefinitionTypeMismatch`. `Lean.Name.beq` showed both at once — `eq_4` and
+/// `eq_def` failed one way while `eq_1`, `eq_2` and `eq_3` failed the other.
+///
+/// That four-definition set is the last named population on this bead without a
+/// pin. Earlier increments covered three of them incidentally; none stated the
+/// set. All four take the same transition, which is the point: one root cause,
+/// one repair, no survivors.
+///
+/// `Std.Iterators.Types.Attach.Monadic.modifyStep` is the reason this is a
+/// table of (declaration, module) pairs rather than a name list. Despite its
+/// `Std.` prefix it lives under `Init/Data/Iterators/…` at this pin, so
+/// searching the `Std/` subtree for it reports it absent — a false negative
+/// that a name-only list would have made permanent.
+const CROSS_FAMILY_DEFINITIONS: &[(&str, &str)] = &[
+    ("Lean.Name.beq", "Init/Prelude"),
+    ("List.toArrayAux", "Init/Data/List/ToArrayImpl"),
+    (
+        "Std.DHashMap.Internal.AssocList.contains",
+        "Std/Data/DHashMap/Internal/AssocList/Basic",
+    ),
+    (
+        "Std.Iterators.Types.Attach.Monadic.modifyStep",
+        "Init/Data/Iterators/Combinators/Monadic/Attach",
+    ),
+];
+
+/// The two auxiliaries d17i names for `modifyStep`, spelled in full. The bead
+/// records them as the constants whose absence blocked the unfolding.
+const MODIFY_STEP_PROOFS: &[&str] = &[
+    "_private.Init.Data.Iterators.Combinators.Monadic.Attach.0.Std.Iterators.Types.Attach.Monadic.modifyStep._proof_1",
+    "_private.Init.Data.Iterators.Combinators.Monadic.Attach.0.Std.Iterators.Types.Attach.Monadic.modifyStep._proof_3",
+];
+
+#[test]
+fn every_definition_that_appeared_in_both_restrictive_families_is_restored() {
+    let lib = lib_or_skip!();
+    for (declaration, module) in CROSS_FAMILY_DEFINITIONS {
+        let (exported, private) = exported_and_private(&lib, module);
+        assert_eq!(
+            exported.get(*declaration).copied(),
+            Some("Axiom"),
+            "{declaration}: the exported reading this bead recorded must still be reproducible, \
+             or the private reading below is not evidence of a repair"
+        );
+        assert_eq!(
+            private.get(*declaration).copied(),
+            Some("Defn"),
+            "{declaration}: one of the four cross-family definitions lost its body again"
+        );
+    }
+
+    let (exported, private) =
+        exported_and_private(&lib, "Init/Data/Iterators/Combinators/Monadic/Attach");
+    for proof in MODIFY_STEP_PROOFS {
+        assert_eq!(
+            exported.get(*proof).copied(),
+            None,
+            "{proof}: absence from the exported part is why modifyStep could not be unfolded"
+        );
+        assert_eq!(
+            private.get(*proof).copied(),
+            Some("Thm"),
+            "{proof}: the private part must supply the auxiliary the unfolding needed"
+        );
+    }
+}
