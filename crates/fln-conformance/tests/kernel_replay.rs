@@ -17909,6 +17909,33 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
                 .map_or("nothing", |receipt| receipt.corpus_fixture_hash.as_str())
         );
     }
+    // AND TWO ROWS MAY NOT CLAIM THE SAME OBSERVATION INSTANT.
+    if let Some((index, instant)) =
+        first_repeated_observation_instant(receipts.iter().map(|receipt| receipt.observed_unix_s))
+    {
+        panic!(
+            "{}:{}: this row records observed_unix_s {instant}, which an earlier row already              records. The lane takes about 32 minutes, so two genuine runs cannot share an              instant: this is one observation retained twice, and the marker counts it as two              -- the count is the whole of what makes it evidence.
+             
+             Both honest actions: drop the duplicated line, or, if these really are distinct              runs, give each the instant it actually finished at.",
+            path.display(),
+            index + 1
+        );
+    }
+    assert_eq!(first_repeated_observation_instant([]), None);
+    assert_eq!(first_repeated_observation_instant([7]), None);
+    assert_eq!(first_repeated_observation_instant([1, 2, 3]), None);
+    assert_eq!(
+        first_repeated_observation_instant([5, 5]),
+        Some((1, 5)),
+        "an immediately duplicated instant must be found"
+    );
+    assert_eq!(
+        first_repeated_observation_instant([1, 2, 1]),
+        Some((2, 1)),
+        "and so must one that repeats a row further back, which a rule comparing only \
+         NEIGHBOURING rows would walk past"
+    );
+
     // AND THE RULE MUST BE ABLE TO SAY BOTH THINGS. Planted because the file
     // holds one row: a rule over a one-element set agrees with every mutant.
     assert_eq!(first_foreign_corpus_revision([]), None);
@@ -18027,6 +18054,35 @@ fn first_foreign_corpus_revision<'a>(
     let mut rows = hashes.into_iter().enumerate();
     let (_, first) = rows.next()?;
     rows.find(|(_, hash)| *hash != first)
+}
+
+/// The first retained row claiming an instant an earlier row already claimed.
+///
+/// The second cross-row property, and the one the marker is most exposed to. A
+/// duplicated line -- appended twice, or carried twice by a merge -- is one run
+/// recorded two times, and the count cannot tell that from two runs: the marker
+/// reads "observations recorded: 2, latest observed <the same date>", which is
+/// how a single 32-minute observation becomes two.
+///
+/// The instant is the right key. Two genuine runs of a lane that takes half an
+/// hour cannot finish in the same second, so a repeat is a duplicate or a
+/// fabrication, and either way the count overstates the evidence. Comparing
+/// whole rows would miss the more likely accident, where a hand edit changes one
+/// timing field while the run behind it stays the same.
+///
+/// Order-independent by construction, because `latest_observation` already
+/// treats row order as the lane's append order and nothing else.
+fn first_repeated_observation_instant(
+    instants: impl IntoIterator<Item = u64>,
+) -> Option<(usize, u64)> {
+    let mut seen: Vec<u64> = Vec::new();
+    for (index, instant) in instants.into_iter().enumerate() {
+        if seen.contains(&instant) {
+            return Some((index, instant));
+        }
+        seen.push(instant);
+    }
+    None
 }
 
 /// The most recent observation instant across the retained rows.
