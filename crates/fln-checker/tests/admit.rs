@@ -7123,17 +7123,21 @@ fn kr600_803_init_option_some_refuses_a_forged_constructor_index() {
             ConstructorDeclaration::new(checker_name("Option"), 0, 1, 1),
         ),
     );
-    assert!(matches!(
-        admit_inductive(
-            &ConstantEnvironment::empty(),
-            &entries,
-            AdmissionBudget::unlimited(),
-            EnvironmentBudget::unlimited(),
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
         ),
-        fln_checker::admit::InductiveVerdict::Rejected(
-            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
-        )
-    ));
+        "forged Option.some constructor-index verdict: {verdict:?}"
+    );
 }
 
 #[test]
