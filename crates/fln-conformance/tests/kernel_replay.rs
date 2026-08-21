@@ -1394,8 +1394,33 @@ const CORPUS_CENSUS_WIDTH: usize = 8;
 /// names, while every `{1, 8, 32}` line in the documents stayed green. The relationship is
 /// therefore CHECKED, at compile time, and the widths are the literal ones being claimed.
 const CORPUS_MATRIX_WIDTHS: [usize; 3] = [1, 8, 32];
+/// Whether the matrix runs a given width, asked of the array rather than of one index.
+///
+/// THE ASSERTION BELOW USED TO READ `CORPUS_MATRIX_WIDTHS[1]`, which is a POSITION where
+/// the rule three lines up is a MEMBERSHIP: "`CORPUS_CENSUS_WIDTH` must be one of these".
+/// The two agree only for the array as it stands. Add a width -- `[1, 4, 8, 32]` is the
+/// obvious next shape, since PG-5 names three and nothing forbids measuring more -- and
+/// index 1 is 4 while 8 is still very much one of the widths: a correct state reddening a
+/// compile-time assertion, which is the worst kind because it cannot be investigated at
+/// run time.
+///
+/// A `while` loop over `len()` rather than three hand-written comparisons, so the rule
+/// keeps holding when the array changes length. ORDER IS STILL PINNED, elsewhere and
+/// deliberately: the retained receipt records its widths as an array and the validator
+/// compares it elementwise, so reordering this one still reddens there. This relaxes the
+/// shape of a compile-time check, not the contract.
+const fn matrix_runs_width(width: usize) -> bool {
+    let mut index = 0;
+    while index < CORPUS_MATRIX_WIDTHS.len() {
+        if CORPUS_MATRIX_WIDTHS[index] == width {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
 const _: () = assert!(
-    CORPUS_MATRIX_WIDTHS[1] == CORPUS_CENSUS_WIDTH,
+    matrix_runs_width(CORPUS_CENSUS_WIDTH),
     "the corpus census must be scored at one of the matrix's widths, or its run is a \
      configuration the matrix never compared"
 );
