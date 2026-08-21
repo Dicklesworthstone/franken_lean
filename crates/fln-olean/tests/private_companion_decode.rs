@@ -129,13 +129,28 @@ const HEAD_INFO_LOOP_MATCH_1: &str =
 const TAIL_POS_LOOP_UNSAFE_REC: &str =
     "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec";
 /// Its companion-only equation-compiler dependency.
-const TAIL_POS_LOOP_MATCH_1: &str =
-    "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1";
+const TAIL_POS_LOOP_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1";
 /// The two tail-recursive merge-sort implementation helpers in the pinned
 /// `Init.Data.List.Sort.Impl` companion delta.
-const MERGE_SORT_TR_UNSAFE_RECS: [&str; 2] = [
+/// `mergeSortTR₂` helpers that are `_private.`-mangled AND declared by the
+/// EXPORTED part of `Init.Data.List.Sort.Impl`.
+///
+/// Note the subscript. `mergeSortTR₂.run` is exported; `mergeSortTR.run`
+/// without it is companion-only (see [`MERGE_SORT_TR_COMPANION_ONLY_UNSAFE_RECS`]).
+/// Two declarations one character apart sit on opposite sides of the export
+/// boundary, which is why the `_private.` prefix cannot be used to tell them
+/// apart and why both directions are asserted below.
+const MERGE_SORT_TR_EXPORTED_UNSAFE_RECS: [&str; 2] = [
     "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR₂.run._unsafe_rec",
     "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR₂.run'._unsafe_rec",
+];
+
+/// `_unsafe_rec` helpers of the same module that the exported part genuinely
+/// omits — the population the companion chain has to restore.
+const MERGE_SORT_TR_COMPANION_ONLY_UNSAFE_RECS: [&str; 3] = [
+    "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+    "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+    "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
 ];
 
 /// A recovered private declaration must retain a concrete declaration kind.
@@ -408,10 +423,14 @@ fn merge_sort_tr_unsafe_rec_companions_retain_concrete_kinds() {
         .decode_module_constants()
         .expect("private constants decode");
 
-    for name in MERGE_SORT_TR_UNSAFE_RECS {
+    // Direction 1: the companion-only helpers. These are what the chain must
+    // restore, and they must arrive with a real declaration kind rather than as
+    // a same-named axiom, which would let the kernel accept a type whose body
+    // was never recovered.
+    for name in MERGE_SORT_TR_COMPANION_ONLY_UNSAFE_RECS {
         assert!(
             !exported_names.contains(&name.to_owned()),
-            "the exported part must omit the private mergeSortTR helper {name}"
+            "the exported part must omit the companion-only mergeSortTR helper {name}"
         );
         assert!(
             private_names.contains(&name.to_owned()),
@@ -431,6 +450,39 @@ fn merge_sort_tr_unsafe_rec_companions_retain_concrete_kinds() {
             is_concrete_recovery(recovered),
             "private companion decoded {name} only as {} instead of a concrete declaration",
             recovered.kind_name()
+        );
+    }
+
+    // Direction 2: the `mergeSortTR₂` pair, which is `_private.`-mangled and
+    // EXPORTED. Asserting these are exported is what stops direction 1 from
+    // being restated as "every `_private.` name is companion-only" — the
+    // premise that failed this regression, and that
+    // `decl::EXPORTED_UNSAFE_REC_COLLISIONS` pins in src.
+    for name in MERGE_SORT_TR_EXPORTED_UNSAFE_RECS {
+        assert!(
+            exported_names.contains(&name.to_owned()),
+            "{name} is declared by the exported part at the pin; treating it as \
+             companion-only is the prefix misclassification"
+        );
+        let exported_decoded = exported_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("exported decoder lost {name}"));
+        assert!(
+            is_concrete_recovery(exported_decoded),
+            "exported decoder produced {name} as {} instead of a concrete declaration",
+            exported_decoded.kind_name()
+        );
+        // The private part is a superset, so it carries these too, and must not
+        // downgrade them on the way through.
+        let private_decoded = private_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("private decoder lost {name}"));
+        assert!(
+            is_concrete_recovery(private_decoded),
+            "private part produced {name} as {} instead of a concrete declaration",
+            private_decoded.kind_name()
         );
     }
 }
