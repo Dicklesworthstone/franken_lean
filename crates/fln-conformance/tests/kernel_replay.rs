@@ -6391,6 +6391,13 @@ fn two_spellings_of_one_path_are_one_fixture_entry() {
 /// other half exactly as it was, and the half it left is the one whose OS error
 /// happens to be more plausible-looking.
 ///
+/// **A third pair exists for a rule this test's own name invites.** Both pairs
+/// above differ in depth by exactly one, so `outer_depth + 1 == inner_depth` --
+/// "another entry's PARENT directory", read literally -- refuses both and passes
+/// every assertion here. `Nested` beside `Nested/Deep/Leaf.olean` is the same
+/// conflict two levels down, and the depth gap is asserted so the cell cannot
+/// quietly become a fourth copy of the first.
+///
 /// **The green control is the one a string-prefix implementation fails.**
 /// `Nested` is a prefix of `NestedOther.olean` as TEXT and not as a path: the
 /// components are `Nested` and `NestedOther.olean`, which are simply different
@@ -6435,6 +6442,16 @@ fn an_entry_that_is_also_another_entrys_directory_is_refused_in_either_order() {
         "t6r7-selftest-parent-dir-first-v1",
         &["Nested/Leaf.olean", "Nested"],
     );
+    // AN ANCESTOR THAT IS NOT THE DIRECT PARENT. Both pairs above differ in
+    // depth by exactly one, so a rule written `outer_depth + 1 == inner_depth`
+    // -- the reading this test's own name invites, "another entry's PARENT
+    // directory" -- refuses both and survives everything below. The conflict is
+    // the same: one path cannot be a file and an ancestor of another entry, at
+    // any distance.
+    let grandparent = refuse(
+        "t6r7-selftest-parent-deep-v1",
+        &["Nested", "Nested/Deep/Leaf.olean"],
+    );
 
     // BOTH ENTRIES, IN BOTH ORDERS. Naming only one is what the filesystem
     // already did.
@@ -6455,9 +6472,25 @@ fn an_entry_that_is_also_another_entrys_directory_is_refused_in_either_order() {
          this guard exists to remove"
     );
 
+    // THE DEPTH GAP IS TWO, SAID IN CODE. If this entry were ever shortened to a
+    // direct child, the cell would go on passing while testing the same thing as
+    // the two above.
+    assert_eq!(
+        Path::new("Nested/Deep/Leaf.olean").components().count()
+            - Path::new("Nested").components().count(),
+        2,
+        "the deep entry must sit more than one level below the file it collides with, or it does \
+         not distinguish a direct-parent rule from an ancestor rule"
+    );
+    assert!(
+        grandparent.contains("`Nested`") && grandparent.contains("`Nested/Deep/Leaf.olean`"),
+        "the grandparent refusal must name both entries: {grandparent}"
+    );
+
     for name in [
         "t6r7-selftest-parent-file-first-v1",
         "t6r7-selftest-parent-dir-first-v1",
+        "t6r7-selftest-parent-deep-v1",
     ] {
         assert!(
             !Path::new(env!("CARGO_TARGET_TMPDIR")).join(name).exists(),
