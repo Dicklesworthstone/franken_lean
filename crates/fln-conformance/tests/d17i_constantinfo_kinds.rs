@@ -11394,3 +11394,110 @@ fn a_block_owns_one_recursor_plus_its_nesting() {
         "and that block's extra recursors are exactly its nesting"
     );
 }
+
+/// A block's `ctors` list has exactly as many entries as there are constructor
+/// declarations naming it, and no entry twice.
+///
+/// The block-relations cell does the round trip in both directions: every
+/// constructor's `induct` names a block that lists it, and every listed name
+/// points back. That is membership, and membership cannot see MULTIPLICITY. A
+/// `ctors` list carrying the same constructor twice satisfies both loops — each
+/// listed name still points back, and each declaration is still contained — and
+/// its length is wrong.
+///
+/// Nor can a global total see the other failure. A constructor declaration
+/// whose `induct` named the wrong block moves a count from one block to
+/// another and leaves the corpus total at 157, so the sum is satisfied by an
+/// artifact where two blocks are both wrong.
+///
+/// Measured over `Init/Prelude`:
+///
+///   157 constructor declarations, and the per-block `ctors` lengths sum to
+///     157
+///   for every one of the 127 blocks, `ctors.len()` equals the number of
+///     declarations naming it — no departures
+///   no `ctors` list contains a duplicate
+///
+/// The distribution is pinned because it is what stops the equation being read
+/// at one width: 3 blocks list no constructor at all, 107 list one, 12 list
+/// two, 3 list three, and one each list four and thirteen. The empty blocks
+/// matter — `ctors.len()` of zero against zero declarations is the case a
+/// count-by-lookup would get wrong by finding nothing and reporting success.
+#[test]
+fn a_blocks_constructor_list_matches_the_declarations_that_name_it() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut listed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut naming: BTreeMap<String, usize> = BTreeMap::new();
+    let mut declarations = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => {
+                listed.insert(name, v.ctors.iter().map(Name::to_display_string).collect());
+            }
+            ConstantInfo::Ctor(v) => {
+                declarations += 1;
+                *naming.entry(v.induct.to_display_string()).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Precondition: nothing names a block that is not here, or the counts below
+    // would balance by losing a member.
+    let stray: Vec<&String> = naming
+        .keys()
+        .filter(|block| !listed.contains_key(*block))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "every constructor must name a decoded inductive: {stray:?}"
+    );
+
+    // Conservation first.
+    assert_eq!(
+        listed.values().map(Vec::len).sum::<usize>(),
+        declarations,
+        "the per-block lists must account for every constructor declaration"
+    );
+
+    let mut mismatched: Vec<(&String, usize, usize)> = Vec::new();
+    let mut duplicated: Vec<&String> = Vec::new();
+    for (block, entries) in &listed {
+        let declared = naming.get(block).copied().unwrap_or_default();
+        if entries.len() != declared {
+            mismatched.push((block, entries.len(), declared));
+        }
+        let distinct: BTreeSet<&String> = entries.iter().collect();
+        if distinct.len() != entries.len() {
+            duplicated.push(block);
+        }
+    }
+    assert!(
+        mismatched.is_empty(),
+        "a block lists exactly the constructors that name it (block, listed, naming): \
+         {mismatched:?}"
+    );
+    assert!(
+        duplicated.is_empty(),
+        "no ctors list may repeat an entry, which membership alone cannot see: {duplicated:?}"
+    );
+
+    let spread: BTreeMap<usize, usize> =
+        listed.values().fold(BTreeMap::new(), |mut table, entries| {
+            *table.entry(entries.len()).or_default() += 1;
+            table
+        });
+    assert_eq!(
+        spread.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+        vec![(0, 3), (1, 107), (2, 12), (3, 3), (4, 1), (13, 1)],
+        "the constructor-count distribution, including the blocks that list none"
+    );
+    assert_eq!(
+        spread.values().sum::<usize>(),
+        listed.len(),
+        "and the distribution must account for every block"
+    );
+}
