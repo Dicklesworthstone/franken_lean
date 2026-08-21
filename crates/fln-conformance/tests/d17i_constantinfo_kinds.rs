@@ -14208,3 +14208,151 @@ fn the_private_part_grows_thirteen_blocks_and_the_axioms_block_is_not_one() {
          exported declaration census"
     );
 }
+
+/// The five extension blocks that appear for the first time at PRIVATE level,
+/// corpus-wide.
+const PRIVATE_FIRST_EXTENSIONS: &[&str] = &[
+    "Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt",
+    "Lean.regularInitAttr",
+    "_private.Lean.Compiler.LCNF.Specialize.0.Lean.Compiler.LCNF.Specialize.specCacheExt",
+    "_private.Lean.Compiler.MetaAttr.0.Lean.declMetaExt",
+    "_private.Lean.ExtraModUses.0.Lean.extraModUses",
+];
+
+/// Block names are unique within a module, blocks are never empty, and the
+/// corpus vocabulary splits 96 + 6 + 5.
+///
+/// The uniqueness and non-empty checks live in the `AXIOM_WITNESS_ROWS` loop:
+/// five modules, two levels. Uniqueness is a premise of MY OWN two previous
+/// cells — both build a `BTreeMap` keyed by block name, and a repeated name
+/// would collapse into the map silently, taking one of the two entry counts
+/// with it. Widening a premise I am relying on is worth more than widening one
+/// I merely quote.
+///
+/// Over 600 modules at all three levels — 33,549 `(module, level, block)`
+/// triples — no module repeats a block name at any level, and no block is
+/// empty; the smallest holds one entry.
+///
+/// The same walk gives the corpus vocabulary as a three-way partition:
+///
+///   96  names occur at exported level
+///    6  occur first at server level — and they are exactly the
+///       `SERVER_DOCUMENTATION_EXTENSIONS` the vocabulary cell pins from a
+///       per-module measurement, reached here by a corpus union instead
+///    5  occur first at private level, all compiler caches or metadata
+///
+/// The partition is well posed only because the per-module nesting is already
+/// pinned: exported ⊆ server ⊆ private per module makes "first appears at" a
+/// property of a name rather than of the module it was seen in. That is why
+/// this cell does not re-assert the nesting — it is a premise here, not a
+/// result.
+///
+/// THE FIVE ARE NOT THE TWO. The extension cell describes the private
+/// contribution as "the compiler-cache extensions" and counts two of them; that
+/// is `Init/Prelude`, one module. Corpus-wide there are five, and only
+/// `extraModUses` and `functionSummariesExt` are among Prelude's. The
+/// characterisation was right and the count was local.
+///
+/// Anti-vacuity: 33,549 triples over 107 names means a block name recurs across
+/// modules constantly, so uniqueness WITHIN a module is a real constraint and
+/// not an artefact of names being scarce.
+///
+/// Conservation first: the three classes must reproduce the vocabulary before
+/// any class is named.
+#[test]
+fn block_names_are_unique_per_module_and_the_vocabulary_splits_three_ways() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut triples = 0usize;
+    let mut smallest = u64::MAX;
+    let mut exported_vocab: BTreeSet<String> = BTreeSet::new();
+    let mut server_vocab: BTreeSet<String> = BTreeSet::new();
+    let mut private_vocab: BTreeSet<String> = BTreeSet::new();
+    for module in &modules {
+        for (view, vocab) in [
+            (
+                module_view(&lib, module, Level::Exported),
+                &mut exported_vocab,
+            ),
+            (server_module_view(&lib, module), &mut server_vocab),
+            (
+                module_view(&lib, module, Level::Private),
+                &mut private_vocab,
+            ),
+        ] {
+            let names: BTreeSet<&String> = view.extensions.iter().map(|b| &b.name).collect();
+            assert_eq!(
+                names.len(),
+                view.extensions.len(),
+                "{module}: a block name must not repeat — every name-keyed map in this file \
+                 would lose an entry silently"
+            );
+            for block in &view.extensions {
+                assert!(
+                    block.entries > 0,
+                    "{module}: block {} is stored with no entries",
+                    block.name
+                );
+                smallest = smallest.min(block.entries);
+                triples += 1;
+            }
+            vocab.extend(view.extensions.iter().map(|b| b.name.clone()));
+        }
+    }
+
+    let server_first: BTreeSet<&String> = server_vocab.difference(&exported_vocab).collect();
+    let private_first: BTreeSet<&String> = private_vocab.difference(&server_vocab).collect();
+
+    // Conservation first: the three classes reproduce the vocabulary.
+    let vocabulary: BTreeSet<&String> = exported_vocab
+        .union(&server_vocab)
+        .chain(private_vocab.iter())
+        .collect();
+    assert_eq!(
+        exported_vocab.len() + server_first.len() + private_first.len(),
+        vocabulary.len(),
+        "the three classes must exhaust the corpus vocabulary"
+    );
+    assert_eq!(
+        (
+            vocabulary.len(),
+            exported_vocab.len(),
+            server_first.len(),
+            private_first.len()
+        ),
+        (107, 96, 6, 5),
+        "the vocabulary and its three-way split"
+    );
+
+    assert_eq!(
+        (triples, smallest),
+        (33_549, 1),
+        "the population walked, and the smallest stored block"
+    );
+
+    // The server half, cross-checked against a table measured per module.
+    assert_eq!(
+        server_first
+            .into_iter()
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        SERVER_DOCUMENTATION_EXTENSIONS
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect::<BTreeSet<String>>(),
+        "the corpus union must reproduce the per-module vocabulary table"
+    );
+    assert_eq!(
+        private_first
+            .into_iter()
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        PRIVATE_FIRST_EXTENSIONS
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect::<BTreeSet<String>>(),
+        "the blocks no exported or server part ever carries"
+    );
+}
