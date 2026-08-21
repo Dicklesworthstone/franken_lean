@@ -7829,3 +7829,134 @@ fn transitive_visibility_is_gated_by_is_exported_and_resolution_survives() {
         permissive.len()
     );
 }
+
+/// Every distinct set of flag rows a repeated import name carries, with how
+/// many groups carry it: `((import_all, is_exported, is_meta)…, groups)`.
+const REPEATED_IMPORT_SHAPES: &[(&[(bool, bool, bool)], usize)] = &[
+    (&[(false, false, false), (false, true, false)], 3),
+    (
+        &[
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+        ],
+        2,
+    ),
+    (&[(false, false, true), (false, true, false)], 1),
+    (&[(false, true, false)], 2),
+    (&[(false, true, false), (false, true, true)], 5),
+    (&[(false, true, false), (true, false, false)], 115),
+];
+
+/// What a repeated import row actually CARRIES, and why deduplicating by module
+/// name loses a private-part license.
+///
+/// The import-row cell counts repeated names and finds 102 modules carrying
+/// one. A count says a duplicate exists; it does not say what the two rows
+/// differ in, and the difference is the whole of what a dedup would destroy.
+///
+/// Measured over all 600 census modules — 128 groups of a module importing the
+/// same module more than once, 126 of size two and 2 of size three, spanning
+/// exactly SIX distinct row-sets that sum to 128:
+///
+///   115  `import X` re-exported, plus `import all X` NOT re-exported
+///     5  plain, plus the same module as `meta`
+///     3  differing only in `is_exported`
+///     2  three rows: plain, non-re-exported, and `import all`
+///     2  genuinely identical rows, which collapse to one row-set
+///     1  plain, plus a non-re-exported `meta`
+///
+/// So 117 of the 128 groups carry rows that differ in `import_all`. A decoder
+/// that deduplicates imports by module name — the natural thing to write, and
+/// the thing `decode_at` already does by returning bare names — drops a
+/// private-part license in 117 groups unless it takes the UNION of the flags.
+/// `import all` is what licenses reading a private part, so that is this bead's
+/// own mechanism being silently discarded by a plausible optimisation.
+///
+/// The decomposition is asserted as a decomposition: the six counts are summed
+/// and compared against the group total. Two reworks on this bead came from a
+/// partial view read as a complete one, and a table that does not add up to its
+/// own total is the shape both had.
+///
+/// One thing this cell deliberately does NOT claim. `Init.Meta.Defs`'s meta
+/// edge is closure-redundant — removing it changes nothing, 8,628 names over 44
+/// modules either way — but only because `Init.MetaTypes` is ALSO imported by a
+/// plain edge, so the module is reached regardless. That is a degenerate case,
+/// and "meta imports contribute nothing to the closure" does not follow from
+/// it. The artifact here cannot settle that question.
+#[test]
+fn a_repeated_import_row_differs_in_flags_that_a_name_keyed_dedup_would_lose() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut shapes: BTreeMap<Vec<(bool, bool, bool)>, usize> = BTreeMap::new();
+    let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut groups = 0usize;
+    let mut import_all_differs = 0usize;
+    for module in &modules {
+        let mut by_name: BTreeMap<String, Vec<(bool, bool, bool)>> = BTreeMap::new();
+        for import in module_view(&lib, module, Level::Exported).imports {
+            by_name
+                .entry(import.module.to_display_string())
+                .or_default()
+                .push((import.import_all, import.is_exported, import.is_meta));
+        }
+        for rows in by_name.values() {
+            if rows.len() < 2 {
+                continue;
+            }
+            groups += 1;
+            *sizes.entry(rows.len()).or_default() += 1;
+            let distinct: BTreeSet<(bool, bool, bool)> = rows.iter().copied().collect();
+            if distinct
+                .iter()
+                .map(|row| row.0)
+                .collect::<BTreeSet<bool>>()
+                .len()
+                > 1
+            {
+                import_all_differs += 1;
+            }
+            *shapes
+                .entry(distinct.into_iter().collect::<Vec<_>>())
+                .or_default() += 1;
+        }
+    }
+
+    assert_eq!(
+        (groups, sizes.len()),
+        (128, 2),
+        "the repeated-import population and how many group sizes occur"
+    );
+    assert_eq!(
+        sizes.into_iter().collect::<Vec<(usize, usize)>>(),
+        vec![(2, 126), (3, 2)],
+        "126 groups of two rows and two of three"
+    );
+
+    let expected: BTreeMap<Vec<(bool, bool, bool)>, usize> = REPEATED_IMPORT_SHAPES
+        .iter()
+        .map(|(rows, count)| (rows.to_vec(), *count))
+        .collect();
+    assert_eq!(
+        shapes, expected,
+        "every distinct flag-row set a repeated import carries, and how many groups carry it"
+    );
+    // The table must BE a decomposition, not a sample of one.
+    assert_eq!(
+        expected.values().sum::<usize>(),
+        groups,
+        "the row-set table must account for every group"
+    );
+
+    assert_eq!(
+        import_all_differs, 117,
+        "117 groups differ in import_all, so a dedup keyed on the module name drops a \
+         private-part license unless it takes the union of the flags"
+    );
+    assert!(
+        import_all_differs < groups,
+        "and not every group differs in it, or the flag would carry no information here"
+    );
+}
