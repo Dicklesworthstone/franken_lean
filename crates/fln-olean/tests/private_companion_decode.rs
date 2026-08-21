@@ -1070,6 +1070,61 @@ fn loop_match_1_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 }
 
 #[test]
+fn loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib =
+        lib_or_skip!("loop_eq_def_auxiliary_requires_the_companion_and_keeps_its_real_kind");
+
+    // A `.loop.eq_def` is neither a broad loop helper nor an ordinary eq_def:
+    // it is the equation-compiler declaration attached to the generated loop.
+    // Keep its RED/green recovery proof independently named.
+    let (relative, name) = init_chain_modules(&lib)
+        .into_iter()
+        .find_map(|relative| {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::loop_eq_def(name))
+                .map(|name| (relative, name.clone()))
+        })
+        .expect("the pinned Init private companions contain a private-only .loop.eq_def witness");
+    let chain = chain_bytes(&lib, &relative);
+
+    let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
+        panic!(".loop.eq_def {name}: parse exported {relative}: {error}")
+    });
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| {
+            panic!(".loop.eq_def {name}: decode exported {relative}: {error}")
+        });
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != name),
+        ".loop.eq_def {name}: exported decoder unexpectedly has the private auxiliary"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap_or_else(|error| {
+                panic!(".loop.eq_def {name}: parse private {relative}: {error}")
+            });
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| {
+            panic!(".loop.eq_def {name}: decode private {relative}: {error}")
+        })
+        .into_iter()
+        .find(|info| info.name().to_display_string() == name)
+        .unwrap_or_else(|| panic!(".loop.eq_def {name}: private decoder lost it in {relative}"));
+    assert!(
+        !matches!(recovered, ConstantInfo::Axiom(_)),
+        ".loop.eq_def {name}: companion recovery weakened the declaration to an axiom"
+    );
+}
+
+#[test]
 fn verified_chain_decode_returns_the_private_superset_on_the_real_pin() {
     let lib = lib_or_skip!("verified_chain_decode_returns_the_private_superset_on_the_real_pin");
     let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
