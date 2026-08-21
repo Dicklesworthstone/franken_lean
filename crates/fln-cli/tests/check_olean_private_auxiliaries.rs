@@ -165,6 +165,22 @@ fn assert_json_named_residual_groups_are_non_empty(json: &str, fields: &[&str]) 
     }
 }
 
+fn assert_json_residual_group_union_equals(json: &str, expected_field: &str, fields: &[&str]) {
+    let expected = json_name_set(json_object_field(json, expected_field));
+    let mut covered = BTreeSet::new();
+
+    for field in fields {
+        let names = json_name_set(json_object_field(json, field));
+        assert!(
+            names.is_subset(&expected),
+            "{field} includes a name outside {expected_field}: {json}",
+        );
+        covered.extend(names);
+    }
+
+    assert_eq!(covered, expected, "{json}");
+}
+
 fn human_line_suffix<'a>(stdout: &'a str, prefix: &str) -> &'a str {
     stdout
         .lines()
@@ -690,6 +706,18 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "privateInsertIdxLoopUnaryResiduals",
             "privateUnaryResiduals",
             "coreObservablesLoopUnsafeRecResiduals",
+        ],
+    );
+    assert_json_residual_group_union_equals(
+        &json.stdout,
+        "privateInitPreludeResiduals",
+        &[
+            "privateInitPreludeProofNResiduals",
+            "leanNameBeqMatchResiduals",
+            "privateInitPreludeUnsafeRecResiduals",
+            "coreObservablesSyntaxMatchResiduals",
+            "privateLoopMatchNResiduals",
+            "privateInsertIdxLoopUnaryResiduals",
         ],
     );
     assert_json_named_residuals(
