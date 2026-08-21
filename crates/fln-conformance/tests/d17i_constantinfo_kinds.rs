@@ -15245,3 +15245,149 @@ fn the_wholesale_drop_law_holds_library_wide_and_adds_no_new_absentee() {
         "and they account for the whole difference between the two excesses"
     );
 }
+
+/// The `.splitter` law over the whole library — and the two header arrays grow
+/// at completely different rates.
+///
+/// `the_splitter_overlap_law_holds_over_every_init_module` establishes the
+/// biconditional on the 600-module census: the overlap between
+/// `extraConstNames` and `constNames` is exactly the `.splitter` subset, and the
+/// exported level never overlaps at all. `Init` is one library of four, and the
+/// auxiliary-name conventions of `Std`, `Lean` and `Lake` are not `Init`'s.
+///
+/// The law survives. Across all 2,431 chains: 890 overlapping names in 215
+/// modules, every one a `.splitter`, no `.splitter` in an extra array left
+/// undeclared, and zero overlap at exported level anywhere.
+///
+/// The overlap by namespace is `Init` 514, `Std` 366, `Lean` 5, `Lake` 5. The
+/// 514 is the figure the census cell pins, reproduced here as a margin of a
+/// wider walk — but the other 376 mean the census sees well under two thirds of
+/// the population, and `Std` alone nearly matches `Init`.
+///
+/// THE TWO ARRAYS GROW NOTHING ALIKE, which the census cannot show because it
+/// measures one library. Between exported and private level:
+///
+///   constNames        158,583 → 215,111    about 1.36×
+///   extraConstNames    70,948 → 343,799    about 4.85×
+///
+/// So the private part is overwhelmingly a store of code-generator names rather
+/// than of declarations: it adds 56,528 declared names and 272,851 auxiliary
+/// ones. That is the quantitative shape of the part this whole bead is about,
+/// and both totals here are recomputed rather than quoted, so this cell agrees
+/// with the two name-census cells by measurement.
+///
+/// Anti-vacuity: four namespaces contribute overlap, so the biconditional is not
+/// an `Init` artefact; and the exported-level zero is a claim about 2,431
+/// modules rather than about a level that happens to be empty — its arrays hold
+/// 70,948 names.
+///
+/// Conservation first: each module's extra array must split into overlapping and
+/// non-overlapping parts counted independently, and the namespace classes must
+/// reproduce the overlap total, before the law is stated.
+#[test]
+fn the_splitter_law_and_the_two_array_growth_rates_hold_library_wide() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut extra_exported = 0usize;
+    let mut extra_private = 0usize;
+    let mut declared_exported = 0usize;
+    let mut declared_private = 0usize;
+    let mut overlap = 0usize;
+    let mut overlap_modules = 0usize;
+    let mut exported_overlap = 0usize;
+    let mut by_namespace: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &all.exported {
+        if !all.private.contains(path) {
+            continue;
+        }
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let namespace = module.split('.').next().expect("a module name").to_owned();
+
+        for level in [Level::Exported, Level::Private] {
+            let (declared_names, extra) = header_names(&lib, &module, level);
+            let declared: BTreeSet<&String> = declared_names.iter().collect();
+            let extra_set: BTreeSet<&String> = extra.iter().collect();
+            let shared: BTreeSet<&&String> = extra_set.intersection(&declared).collect();
+
+            // Conservation first, per module: both parts counted independently.
+            let untouched = extra.iter().filter(|n| !declared.contains(n)).count();
+            assert_eq!(
+                shared.len() + untouched,
+                extra.len(),
+                "{module}: the declared and undeclared extra names must exhaust the array"
+            );
+
+            match level {
+                Level::Exported => {
+                    extra_exported += extra.len();
+                    declared_exported += declared_names.len();
+                    exported_overlap += shared.len();
+                }
+                Level::Private => {
+                    let splitters: BTreeSet<&&String> = extra_set
+                        .iter()
+                        .filter(|name| name.ends_with(".splitter"))
+                        .collect();
+                    assert_eq!(
+                        shared, splitters,
+                        "{module}: the overlap must be exactly the `.splitter` subset"
+                    );
+                    if !shared.is_empty() {
+                        overlap_modules += 1;
+                        *by_namespace.entry(namespace.clone()).or_default() += shared.len();
+                    }
+                    overlap += shared.len();
+                    extra_private += extra.len();
+                    declared_private += declared_names.len();
+                }
+            }
+        }
+    }
+
+    // Conservation: the namespace classes reproduce the overlap.
+    assert_eq!(
+        by_namespace.values().sum::<usize>(),
+        overlap,
+        "every overlapping name must fall under exactly one namespace"
+    );
+
+    assert_eq!(
+        (overlap, overlap_modules, exported_overlap),
+        (890, 215, 0),
+        "the library overlap population, and the exported level's total absence of it"
+    );
+    assert_eq!(
+        by_namespace,
+        BTreeMap::from([
+            ("Init".to_owned(), 514),
+            ("Lake".to_owned(), 5),
+            ("Lean".to_owned(), 5),
+            ("Std".to_owned(), 366),
+        ]),
+        "Init's 514 is the census figure; the other 376 are outside its reach"
+    );
+
+    // The growth contrast, both arrays recomputed here.
+    assert_eq!(
+        (
+            declared_exported,
+            declared_private,
+            extra_exported,
+            extra_private
+        ),
+        (158_583, 215_111, 70_948, 343_799),
+        "the private part adds 56,528 declared names and 272,851 auxiliary ones"
+    );
+    // Cross-multiplied, not divided: integer division truncates both ratios to
+    // 4 and 1 here, so the comparison would survive a change that moved either
+    // rate a long way. This is the `b0049ce2` truncation defect in ratio form.
+    assert!(
+        extra_private * declared_exported > declared_private * extra_exported,
+        "the auxiliary array must grow faster than the declaration array, or the private \
+         part is not the code-generator store this bead takes it for"
+    );
+}
