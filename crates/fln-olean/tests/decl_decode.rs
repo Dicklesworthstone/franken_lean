@@ -9003,3 +9003,231 @@ fn the_other_histograms_checked_for_inversion() {
          distinguish having checked from a check that always says yes"
     );
 }
+
+/// The slot-3 slots on both bases - and the mixed field inverts.
+///
+/// `6a4dba87` pinned these per-slot histograms over DISTINCT carriers and never
+/// per use, which is the single-basis gap `0c7fd8af` found in field 1 - here in
+/// the opposite direction, since that cell pinned uses and this one pinned
+/// objects. Four of the slots take more than one value, so four can be checked:
+///
+///   seed / tag 3 / slot 1     use  tag 1 x5, boxed 0 x4
+///                             obj  boxed 0 x4, tag 1 x2      INVERTS
+///   seed / tag 2 / slot 1     use  30, 2, 2   obj 29, 2, 2   does not
+///   interior / tag 2 / slot 1 use  5, 3, 1, 1, 1
+///                             obj  5, 2, 1, 1, 1             does not
+///   interior / tag 3 / slot 1 use  5, 4        obj 5, 4       does not
+///
+/// THE ONE THAT INVERTS IS THE MIXED FIELD. `6a4dba87` singled that slot out as
+/// the first field in this file that is not uniformly a pointer or uniformly a
+/// scalar, and pinned it as boxed four times against a pointer twice. Per use
+/// it is the other way round: a pointer five times against boxed four. So the
+/// majority answer to "what does this field usually hold" depends entirely on
+/// which basis is asked, and the cell that introduced the field as remarkable
+/// reported only one of them.
+///
+/// Every row reconciles with `6a4dba87`'s own reference-and-object totals - 9
+/// and 6 for the seed `tag 3`, 34 and 33 for the seed `tag 2`, 11 and 10 for
+/// the interior `tag 2`, 9 and 9 for the interior `tag 3` - so the two bases
+/// are tied to a landed pin rather than standing alone.
+///
+/// THREE OF THE FOUR DO NOT INVERT, which is what makes the check worth
+/// running. An audit where everything inverted would not distinguish having
+/// looked from a test that always fires, the guard `0c7fd8af` added and this
+/// cell inherits.
+///
+/// The interior `tag 3` slot is identical on both bases because nothing there
+/// is shared - nine references to nine objects - so it is the control that
+/// shows the two bases can coincide.
+#[test]
+fn the_slot_three_slots_on_both_bases() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut per_use: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut per_object: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut carriers: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for (name, population) in [("seed", true), ("interior", false)] {
+            let mut references: Vec<usize> = Vec::new();
+            for &node in &all {
+                if seeds.contains(&node) != population {
+                    continue;
+                }
+                if let Some(record) = resolve(word_at(bytes, node + 8))
+                    && let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3))
+                {
+                    references.push(carrier);
+                }
+            }
+            let distinct: BTreeSet<usize> = references.iter().copied().collect();
+
+            let tally = |carrier: usize, into: &mut std::collections::BTreeMap<String, usize>| {
+                let object = at.get(&carrier).expect("a walked object");
+                for slot in 0..usize::from(object.other) {
+                    let word = word_at(bytes, carrier + 8 + 8 * slot);
+                    let value = match resolve(word) {
+                        Some(child) => {
+                            let child = at.get(&child).expect("resolved above");
+                            format!("tag {} arity {}", child.tag, child.other)
+                        }
+                        None => format!("boxed {}", word >> 1),
+                    };
+                    *into
+                        .entry(format!(
+                            "{name}/tag {} arity {}/slot {slot}/{value}",
+                            object.tag, object.other
+                        ))
+                        .or_default() += 1;
+                }
+                let key = format!("{name}/tag {} arity {}", object.tag, object.other);
+                key
+            };
+
+            for &carrier in &references {
+                let key = tally(carrier, &mut per_use);
+                carriers.entry(key).or_default().0 += 1;
+            }
+            for &carrier in &distinct {
+                let key = tally(carrier, &mut per_object);
+                carriers.entry(key).or_default().1 += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            per_use.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // The two bases tied to `6a4dba87`'s own reference-and-object totals.
+    assert_eq!(
+        carriers.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior/tag 2 arity 3".to_owned(), (11, 10)),
+            ("interior/tag 3 arity 3".to_owned(), (9, 9)),
+            ("interior/tag 4 arity 2".to_owned(), (26, 24)),
+            ("seed/tag 2 arity 3".to_owned(), (34, 33)),
+            ("seed/tag 3 arity 3".to_owned(), (9, 6)),
+            ("seed/tag 4 arity 2".to_owned(), (11, 11)),
+        ],
+        "references and objects per shape - `6a4dba87`'s pin, so every row \
+         below is tied to a landed total rather than standing alone"
+    );
+
+    // The mixed field, on both bases.
+    let use_of = |key: &str| per_use.get(key).copied().unwrap_or_default();
+    let object_of = |key: &str| per_object.get(key).copied().unwrap_or_default();
+
+    assert_eq!(
+        (
+            use_of("seed/tag 3 arity 3/slot 1/tag 1 arity 2"),
+            use_of("seed/tag 3 arity 3/slot 1/boxed 0"),
+        ),
+        (5, 4),
+        "per USE the mixed field is a pointer five times against boxed four"
+    );
+    assert_eq!(
+        (
+            object_of("seed/tag 3 arity 3/slot 1/boxed 0"),
+            object_of("seed/tag 3 arity 3/slot 1/tag 1 arity 2"),
+        ),
+        (4, 2),
+        "per OBJECT it is boxed four times against a pointer twice - the \
+         majority flips, and `6a4dba87` introduced this slot as the file's \
+         first non-uniform field while reporting only this basis"
+    );
+
+    // The three that do not invert, which is what makes the check meaningful.
+    assert_eq!(
+        (
+            use_of("seed/tag 2 arity 3/slot 1/boxed 0"),
+            object_of("seed/tag 2 arity 3/slot 1/boxed 0"),
+        ),
+        (30, 29),
+        "the seed `tag 2` slot leads on both bases"
+    );
+    assert_eq!(
+        (
+            use_of("interior/tag 2 arity 3/slot 1/boxed 0"),
+            object_of("interior/tag 2 arity 3/slot 1/boxed 0"),
+        ),
+        (5, 5),
+        "and the interior `tag 2` slot likewise"
+    );
+    assert_eq!(
+        (
+            use_of("interior/tag 3 arity 3/slot 1/boxed 0"),
+            object_of("interior/tag 3 arity 3/slot 1/boxed 0"),
+        ),
+        (5, 5),
+        "the interior `tag 3` slot is identical on both bases because nothing \
+         there is shared - nine references to nine objects - so it is the \
+         control showing the two bases CAN coincide"
+    );
+}
