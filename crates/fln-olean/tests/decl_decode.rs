@@ -11721,6 +11721,195 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Tag against tail width - the 16-byte tail lives in three tags of twelve.
+///
+/// `4e59dc69` ended with a rule for myself: when a population is selected by a
+/// header predicate and described by a type noun, print the tag breakdown
+/// first. This cell is that breakdown for `b4194cb0`'s three tail widths, as a
+/// full contingency table rather than a total.
+///
+/// Prelude, constructor objects, tag against scalar-tail width:
+///
+///   tag        0        8       16      row
+///     0    11594     7356        0    18950
+///     1     5213     4850        0    10063
+///     2      254     1888        0     2142
+///     3      487       71        0      558
+///     4      326     2246        0     2572
+///     5      162    26179        0    26341
+///     6      223        0    10832    11055
+///     7      129       38    12831    12998
+///     8        0        0        8        8
+///     9       12       53        0       65
+///    10        7       83        0       90
+///    11        0      150        0      150
+///   col    18407    42914    23671    84992
+///
+/// THE MARGINALS ARE A DOUBLE COUNT and are labelled as one: summing the rows
+/// and summing the columns is the same table added up two ways. Asserted to
+/// catch a tally that lost or doubled entries, nothing more.
+///
+/// THE CONTENT IS THE TABLE'S SHAPE. THE 16-BYTE TAIL IS CONFINED TO THREE TAGS
+/// OF TWELVE - 6, 7 and 8 - and two of those three use it for almost all their
+/// objects. It is not a width the format sprinkles about; it belongs to a
+/// specific family, which is why `b4194cb0` found exactly one shape with tails
+/// `{8, 16}`.
+///
+/// TAG 6 HAS A HOLE IN THE MIDDLE. It uses widths 0 and 16 and NEVER 8 - the
+/// only tag in any module that skips a width it brackets. Everything else is
+/// either a contiguous pair or a single value, and tag 7 alone spans all three.
+///
+/// AND THE FIXTURES DISAGREE ABOUT ALL OF IT: three tags in `Init.olean`
+/// against twelve in Prelude, no 16-byte tail at all in `Init.olean`, no tag
+/// spanning three widths outside Prelude and no gap outside it either. Every
+/// count here is per module for that reason.
+///
+/// POPULATION SCOPE: all four modules, constructor objects only; the full table
+/// is pinned for `Init/Prelude.olean` and the derived shape facts for each
+/// module by name.
+#[test]
+fn tag_against_tail_width() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    const WIDTHS: [usize; 3] = [0, 8, 16];
+    let mut shapes: Vec<(String, usize, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut prelude_table: Vec<(u8, usize, usize, usize)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, _) = objects_of(bytes);
+
+        let mut table: std::collections::BTreeMap<u8, [usize; 3]> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            if object.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            let tail = usize::from(object.cs_sz) - (8 + 8 * usize::from(object.other));
+            let column = WIDTHS
+                .iter()
+                .position(|width| *width == tail)
+                .expect("b4194cb0 pins the widths at 0, 8 and 16");
+            table.entry(object.tag).or_insert([0; 3])[column] += 1;
+        }
+
+        // Two independent sums of the one table.
+        let by_rows: usize = table.values().map(|row| row.iter().sum::<usize>()).sum();
+        let by_columns: usize = (0..3)
+            .map(|column| table.values().map(|row| row[column]).sum::<usize>())
+            .sum();
+
+        let uses_sixteen = table.values().filter(|row| row[2] > 0).count();
+        let spans_three = table
+            .values()
+            .filter(|row| row.iter().all(|count| *count > 0))
+            .count();
+        let spans_one = table
+            .values()
+            .filter(|row| row.iter().filter(|count| **count > 0).count() == 1)
+            .count();
+        // A tag that uses the outer widths and skips the middle one.
+        let gapped = table
+            .values()
+            .filter(|row| row[0] > 0 && row[2] > 0 && row[1] == 0)
+            .count();
+
+        assert_eq!(
+            by_rows, by_columns,
+            "{module}: the row and column marginals are the same table added \
+             up two ways, so this catches a lost or doubled tally and nothing \
+             more"
+        );
+        shapes.push((
+            module.clone(),
+            table.len(),
+            by_rows,
+            uses_sixteen,
+            spans_three,
+            spans_one,
+            gapped,
+        ));
+        if module == "Init/Prelude.olean" {
+            prelude_table = table
+                .iter()
+                .map(|(tag, row)| (*tag, row[0], row[1], row[2]))
+                .collect();
+        }
+    }
+
+    assert_eq!(
+        shapes
+            .iter()
+            .map(|(m, a, b, c, d, e, f)| (m.as_str(), *a, *b, *c, *d, *e, *f))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 3, 102, 0, 0, 2, 0),
+            ("Init.BinderNameHint.olean", 8, 200, 2, 0, 3, 0),
+            ("Init.SizeOfLemmas.olean", 9, 691, 2, 0, 5, 0),
+            ("Init/Prelude.olean", 12, 84992, 3, 1, 2, 1),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "per module: distinct constructor tags, the grand total, then tags \
+         using the 16-byte tail, tags spanning ALL THREE widths, tags using \
+         exactly one, and tags that use the outer two widths while skipping the \
+         middle. The fixtures disagree with Prelude about every one of these - \
+         three tags against twelve, no 16-byte tail at all in `Init.olean` - \
+         which is why none of it is pooled"
+    );
+
+    if !prelude_loaded {
+        return;
+    }
+    assert_eq!(
+        prelude_table,
+        vec![
+            (0, 11594, 7356, 0),
+            (1, 5213, 4850, 0),
+            (2, 254, 1888, 0),
+            (3, 487, 71, 0),
+            (4, 326, 2246, 0),
+            (5, 162, 26179, 0),
+            (6, 223, 0, 10832),
+            (7, 129, 38, 12831),
+            (8, 0, 0, 8),
+            (9, 12, 53, 0),
+            (10, 7, 83, 0),
+            (11, 0, 150, 0),
+        ],
+        "the whole table for Prelude: tag, then how many of its objects carry a \
+         0, 8 and 16-byte scalar tail. THE 16-BYTE TAIL IS CONFINED TO TAGS 6, \
+         7 AND 8 - three of twelve - and tag 6 uses widths 0 and 16 while never \
+         using 8, the only tag anywhere that skips a width it brackets. Tag 7 \
+         alone spans all three"
+    );
+    assert_eq!(
+        prelude_table
+            .iter()
+            .filter(|(_, _, _, sixteen)| *sixteen > 0)
+            .map(|(tag, ..)| *tag)
+            .collect::<Vec<_>>(),
+        vec![6, 7, 8],
+        "named rather than counted, so a different three tags would fail here"
+    );
+}
+
 /// The 8-byte tail is not a name hash - it belongs to seven tags.
 ///
 /// `b4194cb0` counted the scalar tails and found three widths. The 8-byte one
