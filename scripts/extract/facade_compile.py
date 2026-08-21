@@ -238,6 +238,11 @@ the toolchain would report a perfect facade:
     nonempty and unique before the signature map is built. A duplicate cannot
     overwrite another manifest row merely because neither is emitted.
 
+  * A MANIFEST-SIGNATURE-TOTALITY JOIN requires every non-Init declaration to
+    carry a usable Reference signature, while Init-substrate rows remain
+    intentionally signature-free. A partial signature map cannot degrade rows
+    into name-only evidence.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1318,6 +1323,33 @@ def main():
             f"({json.dumps(manifest_name_join, sort_keys=True)}, "
             f"duplicates={duplicate_manifest_names[:8]!r})"
         )
+    manifest_signature_join = {
+        "non_init_rows": sum(
+            row.get("role") != "init-substrate" for row in manifest_rows
+        ),
+        "usable_non_init_signatures": sum(
+            bool(row.get("role") != "init-substrate"
+                 and isinstance(row.get("signature"), str)
+                 and row["signature"].strip())
+            for row in manifest_rows
+        ),
+        "init_rows": sum(
+            row.get("role") == "init-substrate" for row in manifest_rows
+        ),
+        "signature_free_init_rows": sum(
+            row.get("role") == "init-substrate" and not row.get("signature")
+            for row in manifest_rows
+        ),
+    }
+    if (manifest_signature_join["non_init_rows"] == 0
+            or manifest_signature_join["usable_non_init_signatures"]
+            != manifest_signature_join["non_init_rows"]
+            or manifest_signature_join["signature_free_init_rows"]
+            != manifest_signature_join["init_rows"]):
+        raise SystemExit(
+            "REFUSE: facade manifest signature-totality join failed "
+            f"({json.dumps(manifest_signature_join, sort_keys=True)})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1744,6 +1776,7 @@ def main():
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_schema_row_join": manifest_schema_join,
         "manifest_declaration_name_join": manifest_name_join,
+        "manifest_signature_totality_join": manifest_signature_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
