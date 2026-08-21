@@ -46,8 +46,9 @@ const SOURCE_RUN_SCHEMA: &str = "fln.source-run/9";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const OLEAN_DIFF_MAX_RENDERED_CHANGES: usize = 256;
-const OLEAN_DIFF_MAX_RENDERED_NAME_CHARS: usize = 256;
+const OLEAN_MAX_RENDERED_NAME_CHARS: usize = 256;
 const OLEAN_DIFF_MAX_RENDERED_KINDS_PER_SIDE: usize = 16;
+const CHECK_OLEAN_MAX_RENDERED_PRIVATE_LOOP_AUXILIARIES: usize = 32;
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -1883,12 +1884,12 @@ impl OleanDiffSummary {
     }
 }
 
-fn bounded_olean_diff_name(name: &fln::Name) -> (String, bool) {
+fn bounded_olean_name(name: &fln::Name) -> (String, bool) {
     let full = name.to_display_string();
     let mut characters = full.chars();
     let mut rendered = characters
         .by_ref()
-        .take(OLEAN_DIFF_MAX_RENDERED_NAME_CHARS)
+        .take(OLEAN_MAX_RENDERED_NAME_CHARS)
         .collect::<String>();
     let truncated = characters.next().is_some();
     if truncated {
@@ -1979,7 +1980,7 @@ fn record_olean_diff_entry(
         rendered_constant_kinds(left, left_order, "left diff kind list")?;
     let (right_kinds, right_kinds_omitted) =
         rendered_constant_kinds(right, right_order, "right diff kind list")?;
-    let (name, name_truncated) = bounded_olean_diff_name(name);
+    let (name, name_truncated) = bounded_olean_name(name);
     summary.changes.push(OleanDiffEntry {
         name,
         name_truncated,
@@ -2611,6 +2612,86 @@ fn decoded_private_auxiliaries(constants: &[fln::ConstantInfo]) -> usize {
         .count()
 }
 
+/// A bounded, deterministic presentation of decoded private loop auxiliaries.
+/// `observed` counts every matching declaration while `names` keeps the
+/// lexicographically earliest names for a stable, bounded report.
+struct DecodedPrivateLoopAuxiliaries {
+    observed: usize,
+    names: Vec<fln::Name>,
+}
+
+impl DecodedPrivateLoopAuxiliaries {
+    fn observe(&mut self, constants: &[fln::ConstantInfo]) {
+        for constant in constants {
+            let name = constant.name();
+            let display = name.to_display_string();
+            if !display.starts_with("_private.")
+                || !display.split('.').any(|component| component == "loop")
+            {
+                continue;
+            }
+            self.observed = self.observed.saturating_add(1);
+            if self.names.len() < CHECK_OLEAN_MAX_RENDERED_PRIVATE_LOOP_AUXILIARIES {
+                self.names.push(name.clone());
+                continue;
+            }
+            let mut greatest = 0;
+            for index in 1..self.names.len() {
+                if self.names[index] > self.names[greatest] {
+                    greatest = index;
+                }
+            }
+            if name < &self.names[greatest] {
+                self.names[greatest] = name.clone();
+            }
+        }
+    }
+
+    fn omitted(&self) -> usize {
+        self.observed.saturating_sub(self.names.len())
+    }
+
+    fn sorted_names(&mut self) -> &[fln::Name] {
+        self.names.sort();
+        &self.names
+    }
+}
+
+fn render_private_loop_auxiliary_names_json(
+    auxiliaries: &mut DecodedPrivateLoopAuxiliaries,
+) -> String {
+    format!(
+        "[{}]",
+        auxiliaries
+            .sorted_names()
+            .iter()
+            .map(|name| {
+                let (name, truncated) = bounded_olean_name(name);
+                format!(
+                    "{{\"name\":{},\"nameTruncated\":{truncated}}}",
+                    json_string(&name),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_private_loop_auxiliary_names_human(
+    auxiliaries: &mut DecodedPrivateLoopAuxiliaries,
+) -> String {
+    let names = auxiliaries
+        .sorted_names()
+        .iter()
+        .map(|name| bounded_olean_name(name).0)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
 fn render_check_olean_success(
     bytes: usize,
     checked: &fln::CheckedOlean,
@@ -2619,6 +2700,18 @@ fn render_check_olean_success(
     let constants = checked.declarations.len();
     let extensions = checked.decoded.module.extensions.len();
     let private_auxiliaries = decoded_private_auxiliaries(&checked.decoded.constants);
+    let mut private_loop_auxiliaries = DecodedPrivateLoopAuxiliaries {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_loop_auxiliaries.observe(&checked.decoded.constants);
+    let private_loop_observed = private_loop_auxiliaries.observed;
+    let private_loop_omitted = private_loop_auxiliaries.omitted();
+    let private_loop_names = if json {
+        render_private_loop_auxiliary_names_json(&mut private_loop_auxiliaries)
+    } else {
+        render_private_loop_auxiliary_names_human(&mut private_loop_auxiliaries)
+    };
     let stdout = if json {
         format!(
             concat!(
@@ -2626,6 +2719,7 @@ fn render_check_olean_success(
                 "\"scope\":\"decoded-declarations\",\"artifactBytes\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
+                "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -2636,6 +2730,9 @@ fn render_check_olean_success(
             bytes,
             constants,
             private_auxiliaries,
+            private_loop_observed,
+            private_loop_names,
+            private_loop_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
@@ -2650,6 +2747,9 @@ fn render_check_olean_success(
                 "artifact bytes: {}\n",
                 "declarations checked: {}\n",
                 "decoded _private auxiliaries: {} (reporting only; not a G1 claim)\n",
+                "decoded _private.loop auxiliaries: {} (reporting only; not a G1 claim)\n",
+                "decoded _private.loop auxiliary names: {}\n",
+                "decoded _private.loop auxiliary names omitted: {}\n",
                 "dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -2661,6 +2761,9 @@ fn render_check_olean_success(
             bytes,
             constants,
             private_auxiliaries,
+            private_loop_observed,
+            private_loop_names,
+            private_loop_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
@@ -2992,6 +3095,20 @@ fn render_check_olean_set_success(
         .iter()
         .map(|module| decoded_private_auxiliaries(&module.decoded.constants))
         .sum();
+    let mut private_loop_auxiliaries = DecodedPrivateLoopAuxiliaries {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_loop_auxiliaries.observe(&module.decoded.constants);
+    }
+    let private_loop_observed = private_loop_auxiliaries.observed;
+    let private_loop_omitted = private_loop_auxiliaries.omitted();
+    let private_loop_names = if json {
+        render_private_loop_auxiliary_names_json(&mut private_loop_auxiliaries)
+    } else {
+        render_private_loop_auxiliary_names_human(&mut private_loop_auxiliaries)
+    };
     let companion_modules = checked
         .modules
         .iter()
@@ -3005,6 +3122,7 @@ fn render_check_olean_set_success(
                 "\"modulesChecked\":{},\"importsResolved\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
+                "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
@@ -3017,6 +3135,9 @@ fn render_check_olean_set_success(
             imports,
             declarations,
             private_auxiliaries,
+            private_loop_observed,
+            private_loop_names,
+            private_loop_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
@@ -3033,6 +3154,9 @@ fn render_check_olean_set_success(
                 "imports resolved: {}\n",
                 "declarations checked: {}\n",
                 "decoded _private auxiliaries: {} (reporting only; not a G1 claim)\n",
+                "decoded _private.loop auxiliaries: {} (reporting only; not a G1 claim)\n",
+                "decoded _private.loop auxiliary names: {}\n",
+                "decoded _private.loop auxiliary names omitted: {}\n",
                 "module and declaration dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -3046,6 +3170,9 @@ fn render_check_olean_set_success(
             imports,
             declarations,
             private_auxiliaries,
+            private_loop_observed,
+            private_loop_names,
+            private_loop_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,

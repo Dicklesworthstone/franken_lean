@@ -50,7 +50,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "_private",
         "CliPrivateReport",
         "0",
-        "witnessAux",
+        "loop",
     ]);
     let proposition_type = fln::Expr::sort(fln::Level::zero());
     let proposition_expr = fln::Expr::const_(proposition.clone(), Vec::new());
@@ -97,6 +97,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
     assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":1"));
+    assert!(json.stdout.contains(
+        "\"decodedPrivateLoopAuxiliaries\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
     assert!(json.stdout.contains("\"g1Satisfied\":false"));
 
     let human = fln_cli::run([OsString::from("check-olean"), exported.into_os_string()]);
@@ -107,5 +110,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             .stdout
             .contains("decoded _private auxiliaries: 1 (reporting only; not a G1 claim)")
     );
+    assert!(human.stdout.contains(
+        "decoded _private.loop auxiliaries: 1 (reporting only; not a G1 claim)"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private.loop auxiliary names: _private.CliPrivateReport.0.loop"));
+    assert!(human
+        .stdout
+        .contains("decoded _private.loop auxiliary names omitted: 0"));
     assert!(human.stdout.contains("G1 satisfied: no"));
 }
