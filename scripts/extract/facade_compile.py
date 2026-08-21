@@ -3718,6 +3718,9 @@ def main():
     transparent_declarations_init_provided_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(transparent_declarations_init_provided_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_declarations_init_provided_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_declarations_init_provided_inequality_join["summary_init_provided"], int) or isinstance(transparent_declarations_init_provided_inequality_join["summary_init_provided"], bool) or transparent_declarations_init_provided_inequality_join["summary_transparent_declarations"] <= transparent_declarations_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed Init-provided count " + json.dumps(transparent_declarations_init_provided_inequality_join, sort_keys=True))
+    transparent_declarations_demanded_emitted_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_demanded_emitted": manifest_summary.get("demanded_emitted")}
+    if (not isinstance(transparent_declarations_demanded_emitted_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_declarations_demanded_emitted_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_declarations_demanded_emitted_inequality_join["summary_demanded_emitted"], int) or isinstance(transparent_declarations_demanded_emitted_inequality_join["summary_demanded_emitted"], bool) or transparent_declarations_demanded_emitted_inequality_join["summary_transparent_declarations"] <= transparent_declarations_demanded_emitted_inequality_join["summary_demanded_emitted"]):
+        raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed emitted-demand count " + json.dumps(transparent_declarations_demanded_emitted_inequality_join, sort_keys=True))
     declaration_init_substrate_inequality_join = {"summary_declarations_emitted": manifest_summary.get("declarations_emitted"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], int) or isinstance(declaration_init_substrate_inequality_join["summary_declarations_emitted"], bool) or not isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(declaration_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or declaration_init_substrate_inequality_join["summary_declarations_emitted"] <= declaration_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest declaration count must exceed Init-substrate count " + json.dumps(declaration_init_substrate_inequality_join, sort_keys=True))
@@ -5952,6 +5955,9 @@ def main():
         ),
         "manifest_transparent_declarations_init_provided_inequality_join": (
             transparent_declarations_init_provided_inequality_join
+        ),
+        "manifest_transparent_declarations_demanded_emitted_inequality_join": (
+            transparent_declarations_demanded_emitted_inequality_join
         ),
         "manifest_declaration_init_substrate_inequality_join": (
             declaration_init_substrate_inequality_join
