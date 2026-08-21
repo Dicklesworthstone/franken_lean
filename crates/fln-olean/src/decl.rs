@@ -1103,6 +1103,30 @@ pub fn decode_chain_constants(
 /// a `_private.` prefix, eight of them with a `.loop.` component (all in
 /// `Init.Data.AC`). Any consumer deciding provenance by prefix therefore
 /// classifies those 2,336 wrongly.
+///
+/// EVERY AUXILIARY FAMILY IS SPLIT ACROSS BOTH ORIGINS. Measured over Init at
+/// the pin, by declarations carrying each component:
+///
+/// | family        | `Exported` | `PrivateOnly` | exported yet `_private.`-prefixed |
+/// |---------------|-----------:|--------------:|----------------------------------:|
+/// | `_sunfold`    |        324 |            65 |                                 0 |
+/// | `_unsafe_rec` |        390 |           131 |                                 8 |
+/// | `_unary`      |        116 |           431 |                                13 |
+/// | `_f`          |        533 |            94 |                                 0 |
+///
+/// Two consequences worth stating, because both have already cost a batch
+/// verify. First, no family is wholly private, so "this is an auxiliary,
+/// therefore it came from the companion" is false for all four — 324 of the
+/// `_sunfold` declarations are exported. Second, `_sunfold` and `_f` currently
+/// show zero prefix misclassifications, so a prefix test over them passes
+/// TODAY by accident; the families are split 324/65 and 533/94 by origin, so
+/// that accident is one pin bump from ending. `_unsafe_rec` and `_unary` are
+/// already wrong by 8 and 13 declarations, for example
+/// `_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.saveLine._unsafe_rec`
+/// and `_private.Init.Data.Array.Sort.Lemmas.0.Subarray.mergeSort._unary.eq_def`,
+/// both exported.
+///
+/// Ask [`ChainConstants::origin_of`]; do not read the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstantOrigin {
     /// Declared by the exported `.olean` part, and so also by the private one.
@@ -1127,11 +1151,35 @@ impl ChainConstants {
     /// The declarations recovered only from the private companion, in
     /// `constants` order.
     pub fn private_only(&self) -> impl Iterator<Item = &ConstantInfo> {
+        self.with_origin(ConstantOrigin::PrivateOnly)
+    }
+
+    /// The declarations the exported part also declared, in `constants` order.
+    pub fn exported(&self) -> impl Iterator<Item = &ConstantInfo> {
+        self.with_origin(ConstantOrigin::Exported)
+    }
+
+    fn with_origin(&self, wanted: ConstantOrigin) -> impl Iterator<Item = &ConstantInfo> {
         self.constants
             .iter()
             .zip(&self.origins)
-            .filter(|(_, origin)| **origin == ConstantOrigin::PrivateOnly)
+            .filter(move |(_, origin)| **origin == wanted)
             .map(|(info, _)| info)
+    }
+
+    /// The origin of one declaration by name, or `None` if this chain does not
+    /// declare it.
+    ///
+    /// This is the question a caller checking a specific auxiliary actually
+    /// has, and the one the `_private.` prefix gets wrong; see
+    /// [`ConstantOrigin`] for how often. Without it a caller must zip
+    /// `constants` against `origins` by hand, which is the plumbing that has
+    /// made guessing from the name look like the easier option.
+    pub fn origin_of(&self, name: &Name) -> Option<ConstantOrigin> {
+        self.constants
+            .iter()
+            .position(|info| info.name() == name)
+            .and_then(|index| self.origins.get(index).copied())
     }
 }
 
