@@ -1114,6 +1114,18 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .windows(2)
             .filter(|lines| {
                 lines[0].trim()
+                    == r##""\"class\":{},\"detail\":{},\"detailTruncated\":{},","##
+                    && lines[1].trim() == r##""\"execution\":{}}}\n""##
+            })
+            .count(),
+        1,
+        "the FLBC error renderer keeps error detail beside execution usage",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
                     == r##""\"decodedPrivateAuxiliaries\":{},","##
                     && lines[1].trim()
                         == r##""\"decodedPrivateAuxiliaryNames\":{},","##
