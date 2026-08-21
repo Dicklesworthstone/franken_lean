@@ -2725,6 +2725,11 @@ fn is_private_sunfold_or_f_residual(display: &str) -> bool {
             .any(|component| matches!(component, "_sunfold" | "_f"))
 }
 
+fn is_private_sunfold_residual(display: &str) -> bool {
+    display.starts_with("_private.")
+        && display.split('.').any(|component| component == "_sunfold")
+}
+
 fn is_private_loop_proof_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -2930,6 +2935,12 @@ fn render_check_olean_success(
     };
     private_sunfold_f_residuals
         .observe_matching(&checked.decoded.constants, is_private_sunfold_or_f_residual);
+    let mut private_sunfold_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_sunfold_residuals
+        .observe_matching(&checked.decoded.constants, is_private_sunfold_residual);
     let mut private_loop_proof_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3048,6 +3059,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_sunfold_f_residuals)
     };
+    let private_sunfold_observed = private_sunfold_residuals.observed;
+    let private_sunfold_omitted = private_sunfold_residuals.omitted();
+    let private_sunfold_names = if json {
+        render_named_residuals_json(&mut private_sunfold_residuals)
+    } else {
+        render_named_residuals_human(&mut private_sunfold_residuals)
+    };
     let private_loop_proof_observed = private_loop_proof_residuals.observed;
     let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
     let private_loop_proof_names = if json {
@@ -3140,6 +3158,7 @@ fn render_check_olean_success(
                 "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateSunfoldFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3179,6 +3198,9 @@ fn render_check_olean_success(
             private_sunfold_f_observed,
             private_sunfold_f_names,
             private_sunfold_f_omitted,
+            private_sunfold_observed,
+            private_sunfold_names,
+            private_sunfold_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
@@ -3244,6 +3266,9 @@ fn render_check_olean_success(
                 "decoded _private _sunfold/_f residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _sunfold/_f residual names: {}\n",
                 "decoded _private _sunfold/_f residual names omitted: {}\n",
+                "decoded _private _sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private _sunfold residual names: {}\n",
+                "decoded _private _sunfold residual names omitted: {}\n",
                 "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop._proof_* residual names: {}\n",
                 "decoded _private .loop._proof_* residual names omitted: {}\n",
@@ -3306,6 +3331,9 @@ fn render_check_olean_success(
             private_sunfold_f_observed,
             private_sunfold_f_names,
             private_sunfold_f_omitted,
+            private_sunfold_observed,
+            private_sunfold_names,
+            private_sunfold_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
@@ -3720,6 +3748,14 @@ fn render_check_olean_set_success(
         private_sunfold_f_residuals
             .observe_matching(&module.decoded.constants, is_private_sunfold_or_f_residual);
     }
+    let mut private_sunfold_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_sunfold_residuals
+            .observe_matching(&module.decoded.constants, is_private_sunfold_residual);
+    }
     let mut private_loop_proof_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3860,6 +3896,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_sunfold_f_residuals)
     };
+    let private_sunfold_observed = private_sunfold_residuals.observed;
+    let private_sunfold_omitted = private_sunfold_residuals.omitted();
+    let private_sunfold_names = if json {
+        render_named_residuals_json(&mut private_sunfold_residuals)
+    } else {
+        render_named_residuals_human(&mut private_sunfold_residuals)
+    };
     let private_loop_proof_observed = private_loop_proof_residuals.observed;
     let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
     let private_loop_proof_names = if json {
@@ -3958,6 +4001,7 @@ fn render_check_olean_set_success(
                 "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateSunfoldFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3999,6 +4043,9 @@ fn render_check_olean_set_success(
             private_sunfold_f_observed,
             private_sunfold_f_names,
             private_sunfold_f_omitted,
+            private_sunfold_observed,
+            private_sunfold_names,
+            private_sunfold_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
@@ -4066,6 +4113,9 @@ fn render_check_olean_set_success(
                 "decoded _private _sunfold/_f residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _sunfold/_f residual names: {}\n",
                 "decoded _private _sunfold/_f residual names omitted: {}\n",
+                "decoded _private _sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private _sunfold residual names: {}\n",
+                "decoded _private _sunfold residual names omitted: {}\n",
                 "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop._proof_* residual names: {}\n",
                 "decoded _private .loop._proof_* residual names omitted: {}\n",
@@ -4130,6 +4180,9 @@ fn render_check_olean_set_success(
             private_sunfold_f_observed,
             private_sunfold_f_names,
             private_sunfold_f_omitted,
+            private_sunfold_observed,
+            private_sunfold_names,
+            private_sunfold_omitted,
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
