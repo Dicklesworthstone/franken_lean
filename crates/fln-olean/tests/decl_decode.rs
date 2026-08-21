@@ -11938,6 +11938,11 @@ fn the_walk_conserves_edges_and_has_one_entry_point() {
 /// through grandparent contexts with no mixing at all - while `(0, 2)` gets
 /// back only 162 of 5,238.
 ///
+/// A grandparent context is pure or mixed as a fact about EVERY object it
+/// reaches, so the context counts below are taken over each shape's whole
+/// array-reached population rather than over its blind subset. Two of them were
+/// pinned from the subset in the first version and w236 caught it.
+///
 /// ONE LEVEL IS THE COMPLETE DEPTH HERE, NOT AN ARBITRARY STOP, and that is
 /// asserted rather than assumed: no BLIND object sits in an array that itself
 /// lacks a constructor arrival. There is no third level to go to, so this
@@ -12170,18 +12175,26 @@ fn the_array_holders_own_context_rescues_two_fifths() {
     assert_eq!(
         table,
         vec![
-            (0, 1, 489, 3, 0, 489, 0),
+            (0, 1, 489, 4, 0, 489, 0),
             (0, 2, 5238, 6, 1, 162, 5076),
             (0, 3, 2933, 5, 1, 1859, 1074),
             (1, 1, 1589, 4, 0, 1589, 0),
-            (1, 2, 13, 1, 1, 0, 13),
+            (1, 2, 13, 6, 1, 0, 13),
             (2, 2, 0, 0, 0, 0, 0),
         ],
-        "per shape: objects with no constructor arrival, the grandparent \
-         contexts they reach, how many of those are mixed, and the split into \
-         RESCUED and still indeterminate. `(0, 1)` and `(1, 1)` are rescued \
-         entirely - no mixed grandparent context at all - while `(0, 2)` \
-         recovers 162 of 5,238"
+        "per shape: objects with no constructor arrival, THE GRANDPARENT \
+         CONTEXTS THAT REACH THIS SHAPE THROUGH ANY ARRAY, how many of those \
+         are mixed, and the split of the blind objects into RESCUED and still \
+         indeterminate. `(0, 1)` and `(1, 1)` are rescued entirely - no mixed \
+         grandparent context at all - while `(0, 2)` recovers 162 of 5,238. \
+         \
+         The context column counts the shape's WHOLE array-reached population \
+         and not the blind subset, which is the right denominator: a context is \
+         pure or not as a fact about every object it reaches, so a rule keyed \
+         on it must be judged against all of them. The first version pinned 3 \
+         and 1 for `(0, 1)` and `(1, 2)`, computed from the blind subset alone, \
+         and w236 caught it - the same narrow-script-against-broad-code split \
+         that produced the `13` in the assertion above"
     );
     assert_eq!(
         (
