@@ -3389,3 +3389,77 @@ fn inductives_result_in_sorts_and_k_follows_from_prop_ness() {
          between it and K; if it ever measures as a Prop, the K population must grow with it"
     );
 }
+
+/// Count the leading `fun` binders of a term.
+fn lambda_length(value: &Expr) -> usize {
+    let mut current = value;
+    let mut length = 0usize;
+    while let ExprNode::Lam { body, .. } = current.node() {
+        length += 1;
+        current = body;
+    }
+    length
+}
+
+/// The iota right-hand side's own shape.
+///
+/// `db2ea8b0` checked which constructor each rule names and how many fields it
+/// binds. Both are properties of the rule's HEADER. The `rhs` — the term the
+/// recursor reduces TO — is walked by the closure cells and has never had a
+/// relation asserted about it, even though it is the thing iota actually
+/// produces: `reduce_recursor` substitutes into this term, so a wrong shape is a
+/// wrong reduction rather than a decode failure.
+///
+/// The relation: a rule's `rhs` abstracts the recursor's parameters, motives and
+/// minor premises, then the constructor's own fields, so its lambda telescope is
+/// exactly `num_params + num_motives + num_minors + rule.nfields`.
+///
+/// Measured over `Init/Prelude` at private level: 160 rules, every one an exact
+/// match — the deviation histogram is a single bucket at zero.
+///
+/// It is a genuinely discriminating length because it is not a constant: the
+/// expected values span 2 to 18 across 17 distinct lengths, drawn from four
+/// independently stored numbers. A decode that misread ANY of the four, or that
+/// truncated a lambda spine, moves a length and fails here. That is the reason
+/// to check the telescope rather than merely that the `rhs` is a lambda at all.
+#[test]
+fn every_iota_right_hand_side_abstracts_exactly_its_recursors_telescope() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut rules = 0usize;
+    let mut lengths: BTreeSet<usize> = BTreeSet::new();
+    for info in &infos {
+        let ConstantInfo::Rec(rec) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        for rule in &rec.rules {
+            let expected =
+                (rec.num_params + rec.num_motives + rec.num_minors + rule.nfields) as usize;
+            assert_eq!(
+                lambda_length(&rule.rhs),
+                expected,
+                "{name}'s rule for {}: the iota right-hand side must abstract the recursor's \
+                 parameters, motives and minors, then the constructor's fields",
+                rule.ctor.to_display_string()
+            );
+            lengths.insert(expected);
+            rules += 1;
+        }
+    }
+
+    // Non-vacuity: a constant expected length would make this satisfiable by a
+    // decoder that got one number right and reused it everywhere.
+    assert!(
+        rules >= 150 && lengths.len() >= 10,
+        "the expected telescope must vary across the pin's rules ({rules} rules, {} distinct \
+         lengths)",
+        lengths.len()
+    );
+    assert!(
+        *lengths.iter().next_back().expect("nonempty") >= 12,
+        "the pin reaches long iota telescopes; a decode truncating a lambda spine would show up \
+         at the top of this range first"
+    );
+}
