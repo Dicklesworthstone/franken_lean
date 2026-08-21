@@ -2951,6 +2951,22 @@ fn kr600_803_init_or_fixture_pins_constructor_indices_parameters_and_fields() {
 }
 
 #[test]
+fn kr600_803_init_or_fixture_pins_iota_rule_constructors_and_fields() {
+    let entries = init_or_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for (rule, constructor) in [
+        (&metadata.rules()[0], entries[1].name()),
+        (&metadata.rules()[1], entries[2].name()),
+    ] {
+        assert_eq!(rule.constructor(), constructor);
+        assert_eq!(rule.num_fields(), 1);
+    }
+}
+
+#[test]
 fn kr600_803_direct_recursion_reconstructs_iota_and_defers_indirect_fields() {
     let mut forged_rule = nat_entries();
     let recursor = forged_rule[3].declaration();
