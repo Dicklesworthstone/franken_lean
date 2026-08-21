@@ -389,9 +389,25 @@ forall exists sorry admit run_cmd
 """.split())
 
 
+# Lean identifiers are NOT ASCII: `α`, `β`, `σ` and subscripted names are ordinary
+# binder names throughout `Lean.*`. Testing writability with an ASCII pattern
+# refused `Lean.ToMessageData` and `Lean.Option` over a binder named `α` -- a
+# perfectly writable name -- and cost their projections. The test is therefore
+# NEGATIVE: a component is writable unless it carries something that cannot appear
+# in a Lean identifier.
+UNWRITABLE_CHARS = frozenset(
+    " \t\n\r.«»✝()[]{}⟨⟩,:;`\"@|=<>#$%^&*+-/\\~")
+
+
+def writable_component(part):
+    return (bool(part) and not part[0].isdigit()
+            and not (set(part) & UNWRITABLE_CHARS)
+            and part not in LEAN_KEYWORDS)
+
+
 def safe_ident(part):
     """One name component, written so the pin reads it as a NAME."""
-    if IDENT.match(part) and part not in LEAN_KEYWORDS:
+    if writable_component(part):
         return part
     return "«" + part + "»"
 # A `structure` block generates these alongside the fields. Emitting an axiom for
@@ -555,20 +571,32 @@ HEADER = [
 
 
 def writable_binder(name):
-    return bool(IDENT.match(name)) and name not in LEAN_KEYWORDS
+    return writable_component(name)
 
 
 def binder_text(b, deps):
-    """Render one constructor binder. An INACCESSIBLE name (`inst✝`) cannot be
-    written back as source, and a field type that mentions one cannot either — the
-    caller refuses structural emission for that structure rather than emitting a
-    line the pin will reject."""
+    """Render one constructor binder so the pin reads it as a binder.
+
+    A name that cannot be written back as source (inaccessible `inst✝`,
+    hygienic `inst._@.…._hyg.4`) is dropped where the binder does not need one and
+    escaped where it does; a field TYPE that mentions such a name cannot be
+    repaired here at all, and the caller refuses structural emission for that
+    structure instead."""
     name, ty, kind = b["user"], root_anchor(b["type"], deps), b["kind"]
+    # An instance binder's NAME is never referenced, so an unwritable one is
+    # DROPPED rather than escaped: `[T]` is the same binder. Testing only for the
+    # inaccessible marker missed the hygienic form -- `inst._@.Lean.Data.
+    # PersistentHashMap.3696607590._hygCtx._hyg.4` carries neither a dagger nor a
+    # writable name, and emitting `[that : BEq α]` is a PARSE error that takes the
+    # rest of the file with it (every later declaration then reports as an unknown
+    # identifier, which is how one bad binder cost three demanded rows).
     if kind == "inst":
-        return f"[{ty}]" if "✝" in name else f"[{name} : {ty}]"
+        return f"[{name} : {ty}]" if writable_binder(name) else f"[{ty}]"
     open_, close = {"default": ("(", ")"), "implicit": ("{", "}"),
                     "strict": ("\u2983", "\u2984")}[kind]
-    return f"{open_}{name} : {ty}{close}"
+    # Defensive: a caller that has not renamed an unwritable binder still emits a
+    # NAME here rather than a term the parser will choke on.
+    return f"{open_}{safe_ident(name)} : {ty}{close}"
 
 
 def structural_block(name, d, st, bs, deps, pks):
@@ -581,14 +609,19 @@ def structural_block(name, d, st, bs, deps, pks):
     binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
     params, fields = [], []
     for i, b in sorted(bs.items()):
-        # An unwritable non-instance binder is unreferenced (structural_refusal
-        # checked that) and gets a fresh, writable name.
+        # The KIND is resolved first. A structure parameter takes its binder kind
+        # from the structure's own type, not from the constructor, and the rename
+        # below must see the kind it will actually be rendered with: an instance
+        # parameter carrying a hygienic name renders as `[ty]` and needs no name,
+        # while the same binder rendered explicitly needs a writable one. Renaming
+        # before the override left `(inst._@.Lean.Data.PersistentHashMap.…._hyg.4 :
+        # BEq α)` in the output, whose `:` is a parse error that takes every later
+        # declaration in the file down with it.
+        if i < st["num_params"]:
+            b = dict(b, kind=pks.get(i, "default"))
         if b["kind"] != "inst" and not writable_binder(b["user"]):
             b = dict(b, user=f"flnp{i}")
-        if i < st["num_params"]:
-            params.append(dict(b, kind=pks.get(i, "default")))
-        else:
-            fields.append(b)
+        (params if i < st["num_params"] else fields).append(b)
     if not fields:
         return None
     head = f"{keyword} {d['decl_name']}{binder}" + (
