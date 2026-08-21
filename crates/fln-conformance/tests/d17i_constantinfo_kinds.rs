@@ -29,9 +29,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use fln_core::expr::{Expr, ExprNode};
 use fln_env::constants::ConstantInfo;
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
@@ -850,4 +851,155 @@ fn both_reject_classes_for_one_definition_reduce_to_two_absences_in_another_modu
          UnknownConstant half (eq_4, eq_def)"
     );
     assert_eq!(private.get(auxiliary).copied(), Some("Defn"));
+}
+
+/// Every constant `root` references, collected without expanding shared DAGs.
+///
+/// `allocation_identity` is the in-process node identity provided for exactly
+/// this: a bounded walk that visits a shared subterm once. It is not a semantic
+/// hash and nothing derived from it is retained.
+///
+/// The cap PANICS rather than returning what it has. A truncated walk that
+/// returned early would answer "this constant is not referenced" for a
+/// declaration whose reference simply sat past the cap — and the assertions
+/// below turn exactly that answer into a classification. A loud failure asking
+/// for a bigger cap is recoverable; a quiet false negative is not.
+fn referenced_constants(root: &Expr) -> BTreeSet<String> {
+    const CAP: usize = 1_000_000;
+    let mut out = BTreeSet::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<&Expr> = vec![root];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.allocation_identity()) {
+            continue;
+        }
+        assert!(
+            seen.len() < CAP,
+            "reference walk exceeded {CAP} distinct nodes; raise the cap rather than \
+             trusting a truncated answer"
+        );
+        match current.node() {
+            ExprNode::Const { name, .. } => {
+                out.insert(name.to_display_string());
+            }
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    out
+}
+
+/// Which of `Lean.Name.beq`'s equation lemmas actually REFERENCE the auxiliary
+/// that was missing, read from the declarations rather than from a reject log.
+///
+/// Columns are (lemma, aux-in-type, aux-in-value). Every one of the five also
+/// references `Lean.Name.beq` itself, in both type and value, which is why the
+/// stripped body alone would have failed all five.
+const BEQ_LEMMA_REFERENCES: &[(&str, bool, bool)] = &[
+    ("eq_1", false, false),
+    ("eq_2", false, false),
+    ("eq_3", false, false),
+    ("eq_4", false, true),
+    ("eq_def", true, true),
+];
+
+/// The reject-class discriminator, derived from the bytes.
+///
+/// The previous increment pinned WHICH constants were absent. It did not
+/// establish why the same definition produced two different reject classes —
+/// that was still inherited from the 2026-07-25 reject log, and my comment on
+/// it said the two `UnknownConstant` rows "name the auxiliary in their own
+/// statements". That is wrong for `eq_4`, and this measurement is what shows
+/// it: `eq_4` references the auxiliary in its VALUE only, not its type. Only
+/// `eq_def` carries it in the statement.
+///
+/// The rule the data actually supports is that a declaration is reported
+/// `UnknownConstant` when the absent constant appears anywhere among its own
+/// references — type OR value — and falls through to a defeq failure when it
+/// does not. Under that rule the split is exactly reproduced: `eq_4` and
+/// `eq_def` reference the auxiliary and were the two `UnknownConstant` rows;
+/// `eq_1`, `eq_2` and `eq_3` reference it nowhere and were the three
+/// `DefinitionTypeMismatch` rows, failing instead on the postulated
+/// `Lean.Name.beq` that all five need to unfold.
+#[test]
+fn the_reject_class_split_is_predicted_by_each_lemmas_own_references() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Meta/Defs.olean");
+    let read =
+        |path: PathBuf| std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part against its earlier regions");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    let auxiliary = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
+    for (lemma, in_type, in_value) in BEQ_LEMMA_REFERENCES {
+        let name = format!("_private.Init.Meta.Defs.0.Lean.Name.beq.{lemma}");
+        let Some(ConstantInfo::Thm(thm)) = infos
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+        else {
+            panic!("{name} must decode as a theorem from the private part");
+        };
+        let type_refs = referenced_constants(&thm.base.type_);
+        let value_refs = referenced_constants(&thm.value);
+        assert_eq!(
+            type_refs.contains(auxiliary),
+            *in_type,
+            "{lemma}: auxiliary in the STATEMENT — this is the column that separates eq_def \
+             from eq_4, and getting it wrong is what made the earlier account imprecise"
+        );
+        assert_eq!(
+            value_refs.contains(auxiliary),
+            *in_value,
+            "{lemma}: auxiliary in the PROOF"
+        );
+        // The common half: every lemma needs `Lean.Name.beq` to unfold, which
+        // is why a stripped body alone would have failed all five and cannot by
+        // itself explain why only three carried the defeq class.
+        assert!(
+            type_refs.contains("Lean.Name.beq") && value_refs.contains("Lean.Name.beq"),
+            "{lemma}: must reference the definition whose body was stripped"
+        );
+    }
+
+    // Anti-vacuity: the walker must actually find things. A collector that
+    // returned an empty set would satisfy every `false` above.
+    let sample = infos
+        .iter()
+        .find(|info| info.name().to_display_string().ends_with("beq.eq_def"))
+        .expect("eq_def decodes");
+    assert!(
+        referenced_constants(&sample.constant_val().type_).len() > 3,
+        "the reference walker must return a non-trivial set, or every negative \
+         assertion above is vacuous"
+    );
 }
