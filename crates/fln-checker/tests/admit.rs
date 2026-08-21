@@ -2534,6 +2534,38 @@ fn kr600_803_color_fixture_pins_recursor_mutual_family_and_k() {
 }
 
 #[test]
+fn kr600_803_color_fixture_pins_constructor_indices_parameters_and_fields() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    for (entry, expected_index) in [(&entries[1], 0), (&entries[2], 1)] {
+        let metadata = entry
+            .declaration()
+            .constructor_metadata()
+            .expect("fixture constructor metadata");
+        assert_eq!(metadata.inductive(), &checker_name("Color"));
+        assert_eq!(metadata.index(), expected_index);
+        assert_eq!(metadata.num_parameters(), 0);
+        assert_eq!(metadata.num_fields(), 0);
+        assert!(entry.declaration().level_parameters().is_empty());
+    }
+}
+
+#[test]
+fn kr600_803_color_fixture_pins_iota_rule_constructors_and_fields() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for (rule, constructor) in [
+        (&metadata.rules()[0], entries[1].name()),
+        (&metadata.rules()[1], entries[2].name()),
+    ] {
+        assert_eq!(rule.constructor(), constructor);
+        assert_eq!(rule.num_fields(), 0);
+    }
+}
+
+#[test]
 fn kr600_803_dependent_nonrecursive_fields_are_reconstructed_independently() {
     let entries = dependent_field_inductive_entries();
     let verdict = admit_inductive(
