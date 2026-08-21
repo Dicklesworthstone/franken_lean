@@ -1582,6 +1582,44 @@ VERIFY2_SUFFIX = ".verify2.lean"
 SCRATCH_SUFFIXES = (CANDIDATE_SUFFIX, VERIFY_SUFFIX, VERIFY2_SUFFIX)
 
 
+def published_bytes_error(out, text):
+    """The file that ships is byte-for-byte the text this run validated.
+
+    `os.replace(candidate, args.out)` is NOT the only success-path write of the
+    output, which is the assumption worth retiring: the best-of selection writes
+    args.out again from the winning round's text, and that second write is the one
+    that publishes. Both are safe -- the attempt loop's for-else raises rather than
+    falling through, so the best-of update is reachable only via the break that
+    follows a clean pin run, and every candidate text was pin-validated -- but the
+    mental model "the candidate becomes the artifact" is wrong, and a guard built
+    on it would be guarding the write whose result gets overwritten.
+
+    What actually has to hold is that the bytes on disk are the bytes this run
+    reasoned about. Every statement downstream -- the manifest, the refusal
+    verdicts, the axiom-line pin, form_counts -- describes `text`. If the file
+    differs, all of them are true of something other than the published artifact.
+    In a checkout several panes write to, that is not a hypothetical: this session
+    has already had its own extractor reverted mid-edit and its artifacts
+    committed by another pane.
+
+    Returns an error string, or None.
+    """
+    try:
+        with open(out, encoding="utf-8") as fh:
+            on_disk = fh.read()
+    except OSError as exc:
+        return (f"the artifact this run reported on is not readable at {out}: "
+                f"{exc.__class__.__name__}. Every number in the manifest "
+                "describes a file that is not there")
+    if on_disk != text:
+        return (f"{out} holds {len(on_disk)} bytes but this run validated and "
+                f"reported on {len(text)}. The manifest, the refusal verdicts and "
+                "the axiom-line pin all describe the text this run built, so if "
+                "the published file is a different one they are true of nothing "
+                "that shipped")
+    return None
+
+
 def leftover_scratch_error(out):
     """A finished run must leave none of its scratch files beside the artifact.
 
@@ -3376,6 +3414,9 @@ def main():
           f"/{len(private_owners)}mods "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
+    _pub = published_bytes_error(args.out, text)
+    if _pub:
+        raise SystemExit("REFUSE: " + _pub)
     _leak = leftover_scratch_error(args.out)
     if _leak:
         raise SystemExit("REFUSE: " + _leak)
