@@ -6311,9 +6311,36 @@ fn the_inventory_is_sorted_not_merely_stable_within_one_process() {
         "the olean paths came back unsorted, so the inventory's order is whatever this \
          filesystem happened to return: {oleans:?}"
     );
+    // THE NAME ORDER IS A COINCIDENCE OF THIS FIXTURE, NOT A PROPERTY OF THE
+    // WALK, and asserting it without saying so states something false about the
+    // code. `Path` orders COMPONENT BY COMPONENT, so a component that ends sorts
+    // before any longer one sharing its bytes: the directory `Algebra` precedes
+    // the file `Algebra.olean`, and the child module is enumerated before its
+    // parent. The joined name runs past that boundary into a `.` and the next
+    // component, so by name the parent comes first. That shape -- a file
+    // `X.olean` beside a directory `X/` -- is what a Lean library has wherever a
+    // module has submodules, and it is pinned by
+    // `a_parent_module_makes_path_order_disagree_with_module_name_order`.
+    //
+    // No entry here is a parent module, so the two orders coincide, and that
+    // premise is asserted rather than assumed: adding `Nested.olean` to the list
+    // above would redden the assertion below for a reason that has nothing to do
+    // with sorting, and its message would send the reader after the wrong bug.
+    assert!(
+        !CREATED.iter().any(|entry| {
+            entry.strip_suffix(".olean").is_some_and(|stem| {
+                let directory = format!("{stem}/");
+                CREATED.iter().any(|other| other.starts_with(&directory))
+            })
+        }),
+        "a fixture entry is a parent module -- a file with a directory of the same name beside it \
+         -- so path order and module-name order need not agree here and the sortedness check \
+         below is no longer the right assertion: {CREATED:?}"
+    );
     assert!(
         modules.windows(2).all(|pair| pair[0] <= pair[1]),
-        "the module names came back unsorted: {modules:?}"
+        "the module names came back unsorted on a fixture holding no parent module, where path \
+         order and name order coincide: {modules:?}"
     );
 
     // The first file CREATED must not be the first REPORTED -- the single
@@ -6325,6 +6352,131 @@ fn the_inventory_is_sorted_not_merely_stable_within_one_process() {
          created first; the walk is reporting creation order",
         oleans[0]
     );
+}
+
+/// The inventory is ordered by PATH, and a PARENT MODULE makes that differ from
+/// module-name order.
+///
+/// **`Path` orders component by component, not byte by byte.** A component that
+/// ends sorts before any longer component sharing its bytes, so the directory
+/// `Algebra` precedes the file `Algebra.olean` and the CHILD module is
+/// enumerated before its PARENT. The projection then joins components with `.`,
+/// and the joined name runs straight past that boundary into the next
+/// component's bytes -- so by name `Algebra` precedes `Algebra.Group`. Same
+/// tree, opposite orders.
+///
+/// **This is the ordinary shape of a Lean library, not a contrived tree.**
+/// Wherever a module has submodules it is a file `X.olean` sitting beside a
+/// directory `X/`, which is exactly the pair above. Neither existing inventory
+/// fixture contains one -- the sorted fixture's `Nested/` has no `Nested.olean`,
+/// and the parallel fixture's `Mid.dotted/` has no `Mid.dotted.olean` -- which
+/// is why nothing in this file has ever observed the disagreement.
+///
+/// **Which order the walk emits is not a detail.** `modules[i]` has to be the
+/// projection of `oleans[i]`, because the struct hands a caller two vectors side
+/// by side and
+/// `the_inventory_vectors_are_parallel_and_the_extension_match_is_exact` pins
+/// that they may be zipped. Path order is what preserves that correspondence, so
+/// sorting the NAMES -- the obvious-looking tidy-up -- is the change that would
+/// break it. This is the other half of that pin: the price of the
+/// correspondence is a module list that is not sorted by name, and a reader who
+/// assumes otherwise, with an adjacent dedup, a binary search or a merge against
+/// a sorted list, gets a wrong answer on the ordinary library layout rather than
+/// on some edge case.
+///
+/// **The tree is accepted, and every count taken from it is right.** The two
+/// names are distinct, so the injectivity rule inside the walk passes; nothing
+/// is refused and nothing is counted twice. Only the order is surprising, which
+/// is what makes it survivable and therefore worth pinning.
+///
+/// **This is why the sortedness claim next door had to be split rather than
+/// deleted.** `the_inventory_is_sorted_not_merely_stable_within_one_process`
+/// asserts the names come back sorted and passes -- truthfully of its fixture,
+/// which holds no parent module, and falsely of the walk. That test now states
+/// the premise it rests on; this one holds the general case.
+#[test]
+fn a_parent_module_makes_path_order_disagree_with_module_name_order() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-parent-module-v1",
+        &["Algebra.olean", "Algebra/Group.olean", "Order.olean"],
+    );
+
+    // ANTI-VACUITY, ON THE FIXTURE'S SHAPE. The entire disagreement rests on one
+    // name being both a file and a directory. If the writer ever created only
+    // one of the two -- or created `Algebra` as a directory alone -- everything
+    // below would still run and would be a statement about a pair that is not
+    // there.
+    assert!(
+        library.join("Algebra.olean").is_file(),
+        "the parent module file is missing from the fixture, so nothing here is about a parent \
+         module"
+    );
+    assert!(
+        library.join("Algebra").is_dir(),
+        "the submodule directory is missing from the fixture, so `Algebra.olean` has no child and \
+         the orders cannot disagree"
+    );
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("a library with a parent module must walk: {reason}"));
+    assert_eq!(
+        oleans.len(),
+        3,
+        "the fixture's three files must all be collected before their order means anything: \
+         {oleans:?}"
+    );
+
+    let index_of = |name: &str| {
+        modules
+            .iter()
+            .position(|module| module == name)
+            .unwrap_or_else(|| panic!("`{name}` is not in the inventory: {modules:?}"))
+    };
+    let parent = index_of("Fixture.Algebra");
+    let child = index_of("Fixture.Algebra.Group");
+
+    // THE PATHS ARE SORTED. Without this the rest is a statement about whatever
+    // order the filesystem happened to return, not about the projection.
+    assert!(
+        oleans.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the paths came back unsorted, so this test cannot say what path order projects to: \
+         {oleans:?}"
+    );
+
+    // AND THE CHILD IS REPORTED FIRST, while its name sorts second. Asserted on
+    // the one pair that differs rather than as a blanket `windows(2)`, because
+    // the other entry is in agreement and would dilute the claim.
+    assert!(
+        child < parent,
+        "`Algebra/Group.olean` must be enumerated before `Algebra.olean` -- the component \
+         `Algebra` ends where `Algebra.olean` continues -- or the disagreement this test is \
+         about is not present: {oleans:?}"
+    );
+    assert!(
+        modules[child] > modules[parent],
+        "the earlier entry `{}` and the later entry `{}` were expected to come back in DESCENDING \
+         name order, which is what makes the module list unsorted. If they now ascend, the walk \
+         has started ordering by NAME, and the parallel correspondence between `oleans` and \
+         `modules` is what to check next",
+        modules[child],
+        modules[parent]
+    );
+
+    // THE CORRESPONDENCE STILL HOLDS ON THIS TREE, which is why the unsorted
+    // names are the right answer rather than a bug. Each name is recomputed from
+    // its own path by the independent specification, not by the projection under
+    // test, so a projection replaced by a stub fails here instead of agreeing
+    // with itself.
+    for (path, name) in oleans.iter().zip(&modules) {
+        assert_eq!(
+            name,
+            &expected_module_name(&library, path, "Fixture"),
+            "`{}` is paired with `{name}`, which is not what its own path means. The two vectors \
+             are built by two separate walks and only their lengths are checked, so a change to \
+             either one's order silently attributes every module to the wrong file",
+            path.display()
+        );
+    }
 }
 
 /// What a module name MEANS, written out independently of how it is computed.
