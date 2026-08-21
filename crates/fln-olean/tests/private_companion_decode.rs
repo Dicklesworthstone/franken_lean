@@ -242,6 +242,8 @@ const ARRAY_MAP_M_GO_UNSAFE_REC: &str = "_private.Init.Data.Array.BasicAux.0.Arr
 const ARRAY_MAP_M_GO_UNSAFE_REC_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_MAP_M_GO_EQ_DEF: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go.eq_def";
 const ARRAY_MAP_M_GO_EQ_DEF_MODULE: &str = "Init/Data/Array/BasicAux";
+const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6: &str = "_private.Init.Data.Array.BasicAux.0.List.of_toArrayAux_eq_toArrayAux.match_1_6";
+const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6_MODULE: &str = "Init/Data/Array/BasicAux";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -2013,6 +2015,9 @@ fn array_map_m_go_unsafe_rec_is_decoded_from_its_private_storage_module() { let 
 
 #[test]
 fn array_map_m_go_eq_def_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_eq_def_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+
+#[test]
+fn list_of_to_array_aux_match_six_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_of_to_array_aux_match_six_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
