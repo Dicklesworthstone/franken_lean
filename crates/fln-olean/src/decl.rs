@@ -2403,6 +2403,71 @@ mod tests {
         );
     }
 
+    /// A non-canonical `BinderInfo` byte is refused rather than silently
+    /// treated as one of the four kinds.
+    ///
+    /// Nothing shadows this: the byte lives inside the scalar area at
+    /// `off + 8 + 8*other + 8`, so planting it changes no header field and
+    /// neither the arity rule nor the size law can fire first. Verified by
+    /// reading the object's header back unchanged after the plant.
+    #[test]
+    fn a_non_canonical_binder_info_byte_is_refused() {
+        let mut bytes = forall_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified forall fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let pi_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("forallE expression");
+        let (tag, other, cs_sz) = view.obj_header(pi_off).expect("forallE header");
+        assert_eq!((tag, other, cs_sz), (7, 3, 48));
+
+        // The binder byte sits one word past the Data word.
+        let binder = pi_off as usize + 8 + 8 * 3 + 8;
+        assert_eq!(
+            bytes[binder], 0,
+            "the fixture's binder is Default, so the plant is a change"
+        );
+        bytes[binder] = 4;
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(pi_off).expect("header after plant"),
+            (7, 3, 48),
+            "the header is untouched, so only the BinderInfo rule can object"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a BinderInfo byte outside 0..=3 must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "BinderInfo byte",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// An Expr claiming an arity its constructor does not have is refused.
     ///
     /// NO CO-PLANTING IS NEEDED HERE, and that is worth stating because the
@@ -2612,13 +2677,15 @@ mod tests {
             .deref(view.read_u64(base_off + 24).expect("type pointer"))
             .expect("forallE expression");
 
-        // forallE: three slots, then Data, then the binder byte -> 40 bytes.
+        // forallE: three slots, then Data, then the binder byte. 8 + 24 + 8 + 1
+        // is 41, padded to 48 — measured on 9,547 forallE objects in
+        // Init.Prelude, every one (tag 7, other 3, cs_sz 48).
         let (tag, other, cs_sz) = view.obj_header(pi_off).expect("forallE header");
         assert_eq!(tag, 7, "forallE");
         assert_eq!(other, 3, "binder name, binder type, body");
         assert_eq!(
-            cs_sz, 40,
-            "8 header + 24 slots + 8 Data + 1 binder byte, padded"
+            cs_sz, 48,
+            "8 header + 24 slots + 8 Data + 1 binder byte, padded to 48"
         );
         assert_eq!(
             DeclDecoder::expr_scalar_bytes(tag),
@@ -2631,10 +2698,10 @@ mod tests {
             "and that sort carries none"
         );
 
-        // Plant a size one word short: enough to hold the slots and Data, but
-        // not the binder byte the decoder then reads.
+        // Plant a size one word short — 40 is exactly the slots and Data with
+        // no room for the binder byte the decoder then reads.
         let header = view.read_u64(pi_off).expect("header word");
-        let planted = (header & !0x0000_ffff_0000_0000) | (32_u64 << 32);
+        let planted = (header & !0x0000_ffff_0000_0000) | (40_u64 << 32);
         bytes[pi_off as usize..pi_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
 
         let view = OleanView::parse(&bytes).expect("planted header");
