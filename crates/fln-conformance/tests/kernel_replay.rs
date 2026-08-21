@@ -4839,14 +4839,59 @@ fn walk_olean_inventory(
     // both project to `A.B`, so two real files can collapse to one name, the
     // inventory silently under-counts, and the shortfall looks exactly like a
     // smaller corpus.
-    let distinct = modules.iter().collect::<BTreeSet<_>>();
-    if distinct.len() != oleans.len() {
+    //
+    // THE REFUSAL NAMES THE COLLISION, AND IT USED TO ONLY COUNT IT. The message
+    // was two numbers -- so many oleans, so many distinct names -- which on the
+    // corpus this walk exists for reads as "5000 olean(s) projected to 4999
+    // distinct module name(s)" and gives whoever has to fix it a subtraction and
+    // no lead. The one place this guard can fire for real is the one place a
+    // by-hand search through the population is hopeless.
+    //
+    // The grouping is legitimate because `modules[i]` IS the projection of
+    // `oleans[i]`: two separate walks, related by nothing but construction, and
+    // pinned by
+    // `the_inventory_vectors_are_parallel_and_the_extension_match_is_exact`. If
+    // that correspondence ever breaks, this message starts blaming the wrong
+    // files, which is why it is pinned there rather than assumed here.
+    let mut by_name: BTreeMap<&str, Vec<&Path>> = BTreeMap::new();
+    for (name, path) in modules.iter().zip(&oleans) {
+        by_name
+            .entry(name.as_str())
+            .or_default()
+            .push(path.as_path());
+    }
+    let collisions = by_name
+        .iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .collect::<Vec<_>>();
+    if !collisions.is_empty() {
+        // BOUNDED, AND THE BOUND IS DISCLOSED. A message carrying every
+        // collision on a corpus-scale tree is unreadable, but a cap that says
+        // nothing about what it dropped reads as a complete list -- the failure
+        // mode where a scan that skips what it cannot handle silently redefines
+        // its own denominator. Whatever is not shown is counted out loud.
+        const SHOWN: usize = 3;
+        let mut detail = String::new();
+        for (name, paths) in collisions.iter().take(SHOWN) {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!("`{name}` <- {paths:?}"));
+        }
+        if collisions.len() > SHOWN {
+            detail.push_str(&format!(
+                "; and {} more colliding name(s) not listed",
+                collisions.len() - SHOWN
+            ));
+        }
         return Err(format!(
             "{} olean(s) below {} projected to {} distinct module name(s); the module name is \
-             being used as an identity and it is not injective over this tree",
+             being used as an identity and it is not injective over this tree. {} name(s) \
+             collide: {detail}",
             oleans.len(),
             library.display(),
-            distinct.len()
+            by_name.len(),
+            collisions.len()
         ));
     }
     Ok(OleanInventory { oleans, modules })
@@ -5124,6 +5169,89 @@ fn the_inventory_walk_refuses_a_non_injective_projection() {
         reason.contains("not injective"),
         "the refusal must name the non-injectivity rather than some incidental mismatch: \
          {reason}"
+    );
+
+    // AND IT MUST NAME THE COLLISION. Counting it is what the message used to
+    // do, and two numbers are exactly as useful on a two-file fixture as they
+    // are useless on the corpus -- which is the only tree where this guard fires
+    // without someone having built the collision on purpose.
+    assert!(
+        reason.contains("Fixture.A.B"),
+        "the refusal must name the module name the two files collided ON, or the reader has to \
+         re-run the projection to find out which one it was: {reason}"
+    );
+    // BOTH paths, asserted separately. A message naming only the first file
+    // satisfies half of this and leaves the whole search behind -- the half that
+    // costs, since the point of the pair is that they are different files.
+    assert!(
+        reason.contains("A/B.olean"),
+        "the refusal must name the nested file: {reason}"
+    );
+    assert!(
+        reason.contains("A.B.olean"),
+        "the refusal must name the dotted file: {reason}"
+    );
+}
+
+/// Many collisions are summarised, and the message says how many it dropped.
+///
+/// **A cap that says nothing about what it hid reads as a complete list.** The
+/// refusal shows the first few colliding names and stops; if it stopped
+/// silently, an operator reading three collisions off a corpus-scale tree would
+/// fix three and re-run, and the walk would refuse again for a reason the
+/// message had already declined to mention. So the remainder is counted out
+/// loud, and this test is what makes that sentence true rather than intended.
+///
+/// **Four collisions against a cap of three**, which is the smallest fixture
+/// that can tell "shows everything" from "shows some and admits it". The dropped
+/// name is asserted ABSENT as well as counted -- without that, a message that
+/// listed all four while also claiming one was omitted would pass.
+#[test]
+fn many_collisions_are_summarised_without_hiding_how_many() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-many-collisions-v1",
+        &[
+            "A/Y.olean",
+            "A.Y.olean",
+            "B/Y.olean",
+            "B.Y.olean",
+            "C/Y.olean",
+            "C.Y.olean",
+            "D/Y.olean",
+            "D.Y.olean",
+        ],
+    );
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(accepted) => panic!(
+            "eight files projecting to four names were accepted as {:?}",
+            accepted.modules
+        ),
+    };
+
+    assert!(
+        reason.contains("4 name(s) collide"),
+        "the refusal must count ALL the collisions, not the ones it chose to print: {reason}"
+    );
+    for shown in ["Fixture.A.Y", "Fixture.B.Y", "Fixture.C.Y"] {
+        assert!(
+            reason.contains(shown),
+            "`{shown}` is within the cap and must be listed: {reason}"
+        );
+    }
+    assert!(
+        reason.contains("1 more colliding name(s) not listed"),
+        "the message must say what it dropped; a cap nobody is told about is indistinguishable \
+         from a complete list: {reason}"
+    );
+    // THE DROPPED ONE IS REALLY DROPPED. `D.Y.olean` covers the paths and
+    // `Fixture.D.Y` the name, so neither half of the fourth group can be
+    // present while the message claims it was omitted.
+    assert!(
+        !reason.contains("Fixture.D.Y") && !reason.contains("D.Y.olean"),
+        "the fourth collision is claimed to be omitted and appears anyway, so the count and the \
+         list disagree about the same message: {reason}"
     );
 }
 
