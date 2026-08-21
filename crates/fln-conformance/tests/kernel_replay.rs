@@ -17892,6 +17892,39 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
         }
     }
 
+    // AND THE COUNT ONLY MEANS WHAT THE MARKER SAYS IF THE ROWS DESCRIBE ONE CORPUS.
+    if let Some((index, foreign)) = first_foreign_corpus_revision(
+        receipts
+            .iter()
+            .map(|receipt| receipt.corpus_fixture_hash.as_str()),
+    ) {
+        panic!(
+            "{}:{}: this row observed corpus {foreign}, while the first row observed {}. Every              check on this file is per row, so both rows are individually valid and the marker              still counts them together as though they were repeated observations of ONE              corpus revision -- which is the reading that makes a count evidence at all. Two              corpora observed once each is not one corpus observed twice.
+             
+             Both honest actions: keep the receipts for a corpus revision in their own file,              or re-derive the claim the documents make so it says what the rows actually              show. Neither is editing this assertion.",
+            path.display(),
+            index + 1,
+            receipts
+                .first()
+                .map_or("nothing", |receipt| receipt.corpus_fixture_hash.as_str())
+        );
+    }
+    // AND THE RULE MUST BE ABLE TO SAY BOTH THINGS. Planted because the file
+    // holds one row: a rule over a one-element set agrees with every mutant.
+    assert_eq!(first_foreign_corpus_revision([]), None);
+    assert_eq!(first_foreign_corpus_revision(["a"]), None);
+    assert_eq!(first_foreign_corpus_revision(["a", "a", "a"]), None);
+    assert_eq!(
+        first_foreign_corpus_revision(["a", "b"]),
+        Some((1, "b")),
+        "a second corpus revision must be found, and named by row"
+    );
+    assert_eq!(
+        first_foreign_corpus_revision(["a", "a", "c"]),
+        Some((2, "c")),
+        "and it must be found after any number of agreeing rows, not only at the second"
+    );
+
     // The claim must be re-derived when the evidence GROWS, not only when it decays. One
     // row is one observation; several are repeated observations over one corpus revision,
     // which is a different (still not invariant) class. Understating is a defect too.
@@ -17968,6 +18001,32 @@ fn corpus_matrix_marker(receipts: &[CorpusMatrixReceipt]) -> String {
         receipts.len(),
         utc_date_from_unix_seconds(latest_observation(receipts))
     )
+}
+
+/// The first retained row describing a different corpus than the first one does.
+///
+/// A CROSS-ROW PROPERTY CANNOT BE EXPRESSED BY A PER-ROW VALIDATOR, and every
+/// check on this file was per row: pin, widths, digest counts, unmatrixed
+/// modules. Each row can be perfectly valid while the SET means something other
+/// than what the marker says about it. The marker aggregates the rows into one
+/// count, and this file's own comment gives that count its meaning -- "several
+/// are repeated observations over one corpus revision, which is a different
+/// (still not invariant) class". Repeated observations of ONE corpus is a
+/// stronger reading than one observation each of two corpora, and the arithmetic
+/// is identical: both are "observations recorded: 2".
+///
+/// Vacuous today at one retained row, which is exactly when a cross-row rule is
+/// easiest to leave out and hardest to notice missing, so it is planted below
+/// rather than demonstrated on the file.
+///
+/// Takes hashes rather than receipts so the plants are inputs instead of
+/// fixtures: constructing a receipt to test this would test the constructor.
+fn first_foreign_corpus_revision<'a>(
+    hashes: impl IntoIterator<Item = &'a str>,
+) -> Option<(usize, &'a str)> {
+    let mut rows = hashes.into_iter().enumerate();
+    let (_, first) = rows.next()?;
+    rows.find(|(_, hash)| *hash != first)
 }
 
 /// The most recent observation instant across the retained rows.
