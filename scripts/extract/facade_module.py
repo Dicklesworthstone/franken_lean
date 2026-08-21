@@ -176,7 +176,7 @@ def demanded_symbols():
 
 PROBE = r'''import Lean
 open Lean in
-#eval show CoreM Unit from do
+#eval! show CoreM Unit from do
   let txt <- IO.FS.readFile "@NAMES@"
   let names := ((txt.splitOn "\n").filter (fun s => s != "")).map String.toName
   let env <- getEnv
@@ -204,6 +204,13 @@ open Lean in
         o4.setBool `pp.fieldNotation false
       let fmtm <- Meta.MetaM.run' (withOptions maxOpts (Meta.ppExpr info.type))
       let inst <- Meta.isInstance n
+      let redStatus <- getReducibilityStatus n
+      let red := match redStatus with
+        | ReducibilityStatus.reducible => "reducible"
+        | ReducibilityStatus.implicitReducible => "implicitReducible"
+        | ReducibilityStatus.semireducible => "semireducible"
+        | ReducibilityStatus.irreducible => "irreducible"
+      IO.println s!"RED\t{n}\t{red}"
       let lvls := ",".intercalate (info.levelParams.map toString)
       let deps := ",".intercalate ((info.type.getUsedConstants.map toString).toList)
       IO.println s!"TYPE\t{n}\t{lvls}\t{inst}\t{fmt}"
@@ -250,7 +257,7 @@ open Lean in
 
 VALUE_PROBE = r'''import Lean
 open Lean in
-#eval show CoreM Unit from do
+#eval! show CoreM Unit from do
   let txt <- IO.FS.readFile "@NAMES@"
   let names := ((txt.splitOn "\n").filter (fun s => s != "")).map String.toName
   let env <- getEnv
@@ -346,6 +353,7 @@ def probe(lean, env, work, names):
         raise SystemExit(f"REFUSE: the pinned binary refused the probe:\n"
                          f"{(proc.stdout + proc.stderr)[:1200]}")
     types, typesx, typesm, levels, insts, deps, missing = {}, {}, {}, {}, {}, {}, []
+    reducibility = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     current = None
     for line in proc.stdout.splitlines():
@@ -361,6 +369,10 @@ def probe(lean, env, work, names):
             _, name, ty = line.split("\t", 2)
             typesm[name] = ty
             current = (typesm, name)
+        elif line.startswith("RED\t"):
+            _, name, status = line.split("\t", 2)
+            reducibility[name] = status.strip()
+            current = None
         elif line.startswith("DEPS\t"):
             _, name, dep_csv = line.split("\t", 2)
             deps[name] = [d for d in dep_csv.split(",") if d]
@@ -390,7 +402,7 @@ def probe(lean, env, work, names):
             d[name] = d[name] + " " + line.strip()
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
-            {k: v for k, v in pbinders.items()})
+            {k: v for k, v in pbinders.items()}, reducibility)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -447,7 +459,7 @@ structure FlnProbeStruct (A : Type) where
 class FlnProbeClass (A : Type) where
   meth : A
 open Lean in
-#eval show CoreM Unit from do
+#eval! show CoreM Unit from do
   let env <- getEnv
   for (n, _) in env.constants.map₂.toList do
     let s := toString n
@@ -605,6 +617,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     non-prelude Lean file, so those constants are the shared substrate."""
     types, typesx, typesm, levels, insts, deps = {}, {}, {}, {}, {}, {}
     structs, binders, pbinders = {}, {}, {}
+    pin_reducibility = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -622,10 +635,12 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"REFUSE: type closure did not converge in {max_rounds} rounds "
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
-        t, tx, tm, lv, ins, dp, ms, st, bd, pb = probe(lean, env, work, frontier)
+        (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
+         rd) = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
+        pin_reducibility.update(rd)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -656,7 +671,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 nxt.add(dep)
         frontier = nxt
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
-            rounds, structs, binders, absent_projections, pbinders)
+            rounds, structs, binders, absent_projections, pbinders,
+            pin_reducibility)
 
 
 def order(names, deps):
@@ -975,8 +991,8 @@ def main():
         raise SystemExit("REFUSE: every demanded symbol is Init-provided — there "
                          "would be no facade left to emit")
     (types, typesx, typesm, levels, insts, deps, missing, init_provided,
-     rounds, structs, binders, absent_projections,
-     pbinders) = close_over_types(lean, env, work, facade_demand, census)
+     rounds, structs, binders, absent_projections, pbinders,
+     pin_reducibility) = close_over_types(lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -992,9 +1008,31 @@ def main():
     # too. Computing the reducible set once misses exactly the second layer —
     # measured on Lean.Meta.simpGoal, which failed on PHashMap after LMVarId was
     # already fixed.
+    # THE PIN DECIDES, THE CENSUS IS CROSS-CHECKED. Transparency is the facade's
+    # biggest fidelity lever — 682 declarations carry the pin's VALUES because
+    # declaring an abbreviation opaquely invents a distinction the Reference does
+    # not have — and until now the set was chosen from the census's `attrs`
+    # column: a committed artifact, extracted at some earlier moment, which can
+    # drift from the pin under this run. `getReducibilityStatus` answers directly.
+    reducibility_disagreements = {"census_only": [], "pin_only": []}
+
     def is_reducible(n):
+        pin = pin_reducibility.get(n)
+        if pin is not None:
+            return pin == "reducible"
         return ("ReducibilityStatus.reducible"
                 in ((census.get(n) or {}).get("attrs") or ""))
+
+    for n in sorted(types):
+        pin = pin_reducibility.get(n)
+        if pin is None:
+            continue
+        census_says = ("ReducibilityStatus.reducible"
+                       in ((census.get(n) or {}).get("attrs") or ""))
+        if census_says and pin != "reducible":
+            reducibility_disagreements["census_only"].append(n)
+        elif pin == "reducible" and not census_says:
+            reducibility_disagreements["pin_only"].append(n)
 
     values, valuesx, vdeps, reducible = {}, {}, {}, set()
     value_residue = set()
@@ -1022,11 +1060,12 @@ def main():
         if not extra:
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
-         pb2) = close_over_types(lean, env, work, extra, census)
+         pb2, rd2) = close_over_types(lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
         structs.update(st2); binders.update(bd2); pbinders.update(pb2)
+        pin_reducibility.update(rd2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1560,6 +1599,12 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "reducibility_source": "the pin (getReducibilityStatus), with the census "
+            "attrs column kept only as a fallback for constants the probe did not "
+            "reach",
+        "reducibility_probed": len(pin_reducibility),
+        "reducibility_census_only": reducibility_disagreements["census_only"],
+        "reducibility_pin_only": reducibility_disagreements["pin_only"],
         "init_substrate_checked": init_checked,
         "init_substrate_falsified": [n for n, _ in init_failed],
         "init_substrate_note": "every constant the emitter treats as Init substrate "
@@ -1662,6 +1707,9 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"red_probed={len(pin_reducibility)} "
+          f"red_drift={len(reducibility_disagreements['census_only'])}"
+          f"/{len(reducibility_disagreements['pin_only'])} "
           f"init_checked={init_checked} "
           f"bare_refused={len(MEASURED_UNWRITABLE)} "
           f"private_rows={sum(private_owners.values())}"
