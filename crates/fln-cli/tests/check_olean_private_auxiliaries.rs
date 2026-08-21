@@ -155,6 +155,11 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         0,
         "{json}",
     );
+    assert_eq!(
+        json_usize_field(private_companion_residuals, "missing"),
+        0,
+        "{json}",
+    );
     let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
     let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
     assert_eq!(

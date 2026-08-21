@@ -3664,6 +3664,7 @@ fn render_check_olean_success(
     };
     let private_companion_observed = private_companion_residuals.observed;
     let private_companion_omitted = private_companion_residuals.omitted();
+    let private_companion_missing = private_auxiliaries.saturating_sub(private_companion_observed);
     let private_companion_names = if json {
         render_named_residuals_json(&mut private_companion_residuals)
     } else {
@@ -4137,7 +4138,7 @@ fn render_check_olean_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
-                "\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},",
                 "\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4216,6 +4217,7 @@ fn render_check_olean_success(
             private_companion_observed,
             private_companion_names,
             private_companion_omitted,
+            private_companion_missing,
             private_cli_private_report_loop_observed,
             private_cli_private_report_loop_names,
             private_cli_private_report_loop_omitted,
@@ -5723,6 +5725,7 @@ fn render_check_olean_set_success(
     };
     let private_companion_observed = private_companion_residuals.observed;
     let private_companion_omitted = private_companion_residuals.omitted();
+    let private_companion_missing = private_auxiliaries.saturating_sub(private_companion_observed);
     let private_companion_names = if json {
         render_named_residuals_json(&mut private_companion_residuals)
     } else {
@@ -6202,7 +6205,7 @@ fn render_check_olean_set_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
-                "\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},",
                 "\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -6283,6 +6286,7 @@ fn render_check_olean_set_success(
             private_companion_observed,
             private_companion_names,
             private_companion_omitted,
+            private_companion_missing,
             private_cli_private_report_loop_observed,
             private_cli_private_report_loop_names,
             private_cli_private_report_loop_omitted,
