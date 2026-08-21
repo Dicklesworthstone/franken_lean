@@ -158,6 +158,10 @@ the toolchain would report a perfect facade:
     pin-measured verified-emission count to equal its emitted-declaration count.
     A generated façade cannot overstate verification of its own rows.
 
+  * A MANIFEST-GENERATOR-RESIDUE JOIN requires zero cycle/value residue and a
+    terminal generator attempt with zero errors. The facade cannot advertise a
+    clean emitted surface while its recorded generation remains unresolved.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1103,6 +1107,27 @@ def main():
             "REFUSE: facade manifest emission-verification join failed "
             f"({json.dumps(emission_verification, sort_keys=True)})"
         )
+    generator_attempts = manifest_summary.get("attempts")
+    terminal_attempt = (
+        generator_attempts[-1]
+        if isinstance(generator_attempts, list) and generator_attempts else None
+    )
+    generator_residue = {
+        "cycle_residue": manifest_summary.get("cycle_residue"),
+        "value_residue": manifest_summary.get("value_residue"),
+        "terminal_errors": (
+            terminal_attempt.get("errors") if isinstance(terminal_attempt, dict) else None
+        ),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in generator_residue.values())
+            or generator_residue["cycle_residue"] != 0
+            or generator_residue["value_residue"] != 0
+            or generator_residue["terminal_errors"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest generator-residue join failed "
+            f"({json.dumps(generator_residue, sort_keys=True)})"
+        )
     manifest_outcome_join = join_manifest_demanded_outcomes(
         manifest_rows, manifest_summary
     )
@@ -1252,6 +1277,7 @@ def main():
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
+        "manifest_generator_residue_join": generator_residue,
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
