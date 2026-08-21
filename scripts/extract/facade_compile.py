@@ -3700,6 +3700,9 @@ def main():
     emission_init_substrate_inequality_join = {"summary_emission_verified": manifest_summary.get("emission_verified"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(emission_init_substrate_inequality_join["summary_emission_verified"], int) or isinstance(emission_init_substrate_inequality_join["summary_emission_verified"], bool) or not isinstance(emission_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(emission_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or emission_init_substrate_inequality_join["summary_emission_verified"] <= emission_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest emission-verification count must exceed Init-substrate count " + json.dumps(emission_init_substrate_inequality_join, sort_keys=True))
+    substrate_init_substrate_inequality_join = {"summary_substrate_emitted": manifest_summary.get("substrate_emitted"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
+    if (not isinstance(substrate_init_substrate_inequality_join["summary_substrate_emitted"], int) or isinstance(substrate_init_substrate_inequality_join["summary_substrate_emitted"], bool) or not isinstance(substrate_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(substrate_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or substrate_init_substrate_inequality_join["summary_substrate_emitted"] <= substrate_init_substrate_inequality_join["summary_init_substrate_checked"]):
+        raise SystemExit("REFUSE: facade manifest substrate-emission count must exceed Init-substrate count " + json.dumps(substrate_init_substrate_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5901,6 +5904,9 @@ def main():
         ),
         "manifest_emission_init_substrate_inequality_join": (
             emission_init_substrate_inequality_join
+        ),
+        "manifest_substrate_init_substrate_inequality_join": (
+            substrate_init_substrate_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
