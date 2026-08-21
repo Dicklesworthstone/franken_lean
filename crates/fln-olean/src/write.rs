@@ -1806,6 +1806,166 @@ mod tests {
         );
     }
 
+    /// A constructor's type telescope keeps its ARITY and its binder ORDER.
+    ///
+    /// Every constant in these fixtures has had `Sort u` for a type, so the
+    /// telescope depth was ZERO and nothing about it could be wrong. That is
+    /// the vacuity the previous waves cleared in list fields, in the one place
+    /// it survives as a nested structure rather than a chain: a `forallE` whose
+    /// body is another `forallE` is a cons chain in all but name, and a depth
+    /// of nothing has neither an arity nor an order.
+    ///
+    /// A constructor's type is where its `numParams` and `numFields` are
+    /// REDUNDANTLY encoded - the telescope binds one for each - so the arity is
+    /// the one field of a `ConstructorVal` that a decoder could get wrong and
+    /// have contradicted by another field it already read. This cell does not
+    /// assert that relation, because these fixtures are structural and do not
+    /// maintain it; it pins the arity and the binder order, which is what can
+    /// be checked without inventing a semantic contract the writer never had.
+    ///
+    /// THE ARITY IS CHOSEN TO BE PAIRWISE DISTINCT from `cidx`, `numParams` and
+    /// `numFields`. All four are small naturals read out of the same
+    /// declaration, and a depth of 5 against a `numParams` of 5 would let a
+    /// miscount be confirmed by the wrong field. The guard below fails if a
+    /// later edit collides them.
+    #[test]
+    fn the_constructor_type_telescope_keeps_its_arity_and_binder_order() {
+        let sort = Expr::sort(Level::param(name("u")));
+        let binders = ["a", "b", "c", "d"];
+        let (cidx, num_params, num_fields) = (3_u32, 5_u32, 9_u32);
+
+        // The guard: the telescope depth must not collide with any index it
+        // could be confused for, and the binders must be distinguishable or a
+        // reordering would decode identically.
+        let distinct: std::collections::BTreeSet<u32> = [
+            cidx,
+            num_params,
+            num_fields,
+            u32::try_from(binders.len()).expect("small"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "the telescope arity must stay distinct from cidx, numParams and \
+             numFields, or a miscount could be confirmed by the wrong field"
+        );
+        assert_eq!(
+            binders.len(),
+            binders
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "the binder names must stay distinct, or a reordered telescope \
+             would decode identically"
+        );
+
+        // `forall a b c d : Sort u, Sort u` - built innermost-out.
+        let type_ = binders.iter().rev().fold(sort.clone(), |body, binder| {
+            Expr::forall_e(name(binder), sort.clone(), body, BinderInfo::Default)
+        });
+
+        // One constant, so the constants array's element 0 is unambiguous.
+        let constants = vec![ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: name("Demo.ind.mk"),
+                level_params: vec![name("u")],
+                type_: type_.clone(),
+            },
+            induct: name("Demo.ind"),
+            cidx,
+            num_params,
+            num_fields,
+            is_unsafe: false,
+        })];
+
+        let encoded = encode_module(
+            ModuleWriteInput {
+                is_module: true,
+                imports: &[],
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            header(),
+            WriteBudget::default(),
+        )
+        .expect("encode module");
+
+        let view = OleanView::parse(&encoded.bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        assert_eq!(
+            view.obj_header(info_off).expect("ConstantInfo header").0,
+            6,
+            "ConstantInfo.ctorInfo"
+        );
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("ConstructorVal pointer"))
+            .expect("ConstructorVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("base pointer"))
+            .expect("ConstantVal object");
+
+        // Walk the telescope on the wire: slot 2 of the base is the type, slot
+        // 0 of a `forallE` is its binder name and slot 2 is its body.
+        let mut cursor = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("type expression");
+        let mut on_the_wire = Vec::new();
+        while view.obj_header(cursor).expect("Expr header").0 == 7 {
+            let (tag, other, _) = view.obj_header(cursor).expect("forallE header");
+            assert_eq!((tag, other), (7, 3), "binderName, binderType and body");
+            on_the_wire.push(
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(view.read_u64(cursor + 8).expect("binder name"))
+                    .expect("binder name")
+                    .to_display_string(),
+            );
+            cursor = view
+                .deref(view.read_u64(cursor + 24).expect("body pointer"))
+                .expect("body expression");
+        }
+        assert_eq!(
+            view.obj_header(cursor).expect("result header").0,
+            3,
+            "the telescope ends in the RESULT type, and the loop above stopped \
+             because it ran out of binders rather than because it ran out of \
+             expression"
+        );
+        assert_eq!(
+            on_the_wire, binders,
+            "every binder, in the order it was written; a binder is referred to \
+             by its de Bruijn DEPTH, so a reordering rebinds every occurrence \
+             beneath it"
+        );
+
+        // And the decoder agrees with the bytes rather than with the encoder.
+        let mut decoder = DeclDecoder::new(&view, WalkBudget::default());
+        let decoded = decoder.decode_module_constants().expect("constants");
+        let ConstantInfo::Ctor(constructor) = &decoded[0] else {
+            panic!("the fixture declares one constructor")
+        };
+        let mut node = constructor.base.type_.node();
+        let mut as_decoded = Vec::new();
+        while let fln_core::expr::ExprNode::ForallE {
+            binder_name, body, ..
+        } = node
+        {
+            as_decoded.push(binder_name.to_display_string());
+            node = body.node();
+        }
+        assert_eq!(
+            as_decoded, on_the_wire,
+            "the decoded telescope must have the depth and order the bytes do"
+        );
+    }
+
     #[test]
     fn empty_complete_module_is_a_valid_nonmodule_image() {
         let encoded = encode_module(
