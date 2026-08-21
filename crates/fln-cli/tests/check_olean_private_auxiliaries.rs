@@ -784,6 +784,22 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateInitPreludeResiduals",
+        9,
+        &[
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "listToArrayAuxMatchResiduals",
         1,
         &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"],
@@ -1128,6 +1144,23 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Prelude.0.Lean.Name.beq.match_1",
             "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
             "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Init.Prelude residuals",
+        "decoded _private Init.Prelude residual names",
+        9,
+        &[
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
         ],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private List.toArrayAux.match_N residuals", "decoded _private List.toArrayAux.match_N residual names", 1, &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"]);

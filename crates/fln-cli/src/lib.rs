@@ -2864,6 +2864,10 @@ fn is_private_lean_name_residual(display: &str) -> bool {
     display.starts_with("_private.Init.Prelude.0.Lean.Name.")
 }
 
+fn is_private_init_prelude_residual(display: &str) -> bool {
+    display.starts_with("_private.Init.Prelude.")
+}
+
 fn is_list_to_array_aux_match_residual(display: &str) -> bool {
     display
         .strip_prefix(LIST_TO_ARRAY_AUX_MATCH_RESIDUAL_PREFIX)
@@ -3236,6 +3240,12 @@ fn render_check_olean_success(
     };
     private_lean_name_residuals
         .observe_matching(&checked.decoded.constants, is_private_lean_name_residual);
+    let mut private_init_prelude_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_init_prelude_residuals
+        .observe_matching(&checked.decoded.constants, is_private_init_prelude_residual);
     let mut list_to_array_aux_match_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3541,6 +3551,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_lean_name_residuals)
     };
+    let private_init_prelude_observed = private_init_prelude_residuals.observed;
+    let private_init_prelude_omitted = private_init_prelude_residuals.omitted();
+    let private_init_prelude_names = if json {
+        render_named_residuals_json(&mut private_init_prelude_residuals)
+    } else {
+        render_named_residuals_human(&mut private_init_prelude_residuals)
+    };
     let list_to_array_aux_match_observed = list_to_array_aux_match_residuals.observed;
     let list_to_array_aux_match_omitted = list_to_array_aux_match_residuals.omitted();
     let list_to_array_aux_match_names = if json {
@@ -3736,6 +3753,7 @@ fn render_check_olean_success(
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanNameResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateInitPreludeResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitDataListResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitDataResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3832,6 +3850,9 @@ fn render_check_olean_success(
             private_lean_name_observed,
             private_lean_name_names,
             private_lean_name_omitted,
+            private_init_prelude_observed,
+            private_init_prelude_names,
+            private_init_prelude_omitted,
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
@@ -3978,6 +3999,9 @@ fn render_check_olean_success(
                 "decoded _private Lean.Name residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Lean.Name residual names: {}\n",
                 "decoded _private Lean.Name residual names omitted: {}\n",
+                "decoded _private Init.Prelude residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private Init.Prelude residual names: {}\n",
+                "decoded _private Init.Prelude residual names omitted: {}\n",
                 "decoded _private List.toArrayAux.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private List.toArrayAux.match_N residual names: {}\n",
                 "decoded _private List.toArrayAux.match_N residual names omitted: {}\n",
@@ -4121,6 +4145,9 @@ fn render_check_olean_success(
             private_lean_name_observed,
             private_lean_name_names,
             private_lean_name_omitted,
+            private_init_prelude_observed,
+            private_init_prelude_names,
+            private_init_prelude_omitted,
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
@@ -4705,6 +4732,14 @@ fn render_check_olean_set_success(
         private_lean_name_residuals
             .observe_matching(&module.decoded.constants, is_private_lean_name_residual);
     }
+    let mut private_init_prelude_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_init_prelude_residuals
+            .observe_matching(&module.decoded.constants, is_private_init_prelude_residual);
+    }
     let mut list_to_array_aux_match_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -5058,6 +5093,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_lean_name_residuals)
     };
+    let private_init_prelude_observed = private_init_prelude_residuals.observed;
+    let private_init_prelude_omitted = private_init_prelude_residuals.omitted();
+    let private_init_prelude_names = if json {
+        render_named_residuals_json(&mut private_init_prelude_residuals)
+    } else {
+        render_named_residuals_human(&mut private_init_prelude_residuals)
+    };
     let list_to_array_aux_match_observed = list_to_array_aux_match_residuals.observed;
     let list_to_array_aux_match_omitted = list_to_array_aux_match_residuals.omitted();
     let list_to_array_aux_match_names = if json {
@@ -5259,6 +5301,7 @@ fn render_check_olean_set_success(
                 "\"leanNameHashProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanNameResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateInitPreludeResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitDataListResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitDataResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -5357,6 +5400,9 @@ fn render_check_olean_set_success(
             private_lean_name_observed,
             private_lean_name_names,
             private_lean_name_omitted,
+            private_init_prelude_observed,
+            private_init_prelude_names,
+            private_init_prelude_omitted,
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
@@ -5505,6 +5551,9 @@ fn render_check_olean_set_success(
                 "decoded _private Lean.Name residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Lean.Name residual names: {}\n",
                 "decoded _private Lean.Name residual names omitted: {}\n",
+                "decoded _private Init.Prelude residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private Init.Prelude residual names: {}\n",
+                "decoded _private Init.Prelude residual names omitted: {}\n",
                 "decoded _private List.toArrayAux.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private List.toArrayAux.match_N residual names: {}\n",
                 "decoded _private List.toArrayAux.match_N residual names omitted: {}\n",
@@ -5650,6 +5699,9 @@ fn render_check_olean_set_success(
             private_lean_name_observed,
             private_lean_name_names,
             private_lean_name_omitted,
+            private_init_prelude_observed,
+            private_init_prelude_names,
+            private_init_prelude_omitted,
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
