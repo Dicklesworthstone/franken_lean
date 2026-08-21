@@ -701,9 +701,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stdout.contains(
         "\"privateUnaryResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"privateMergeSortTRUnsafeRecResiduals\":{\"observed\":2,"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateMergeSortTRUnsafeRecResiduals",
+        1,
+        &["_private.CliPrivateReport.0.mergeSortTR._unsafe_rec"],
+    );
     assert!(json.stdout.contains(
         "\"privateRunUnsafeRecResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
@@ -979,7 +982,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         .stdout
         .contains("decoded _private _unary residual names omitted: 0"));
     assert!(human.stdout.contains(
-        "decoded _private mergeSortTR._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
+        "decoded _private mergeSortTR._unsafe_rec residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
     assert!(human
         .stdout
