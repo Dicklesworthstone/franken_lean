@@ -126,6 +126,22 @@ const HEAD_INFO_LOOP_UNSAFE_REC: &str =
 const HEAD_INFO_LOOP_MATCH_1: &str =
     "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1";
 
+/// A recovered private declaration must retain a concrete declaration kind.
+/// Keep this exhaustive so a future placeholder kind cannot silently satisfy
+/// the companion-recovery tests.
+fn is_concrete_recovery(info: &ConstantInfo) -> bool {
+    matches!(
+        info,
+        ConstantInfo::Defn(_)
+            | ConstantInfo::Thm(_)
+            | ConstantInfo::Opaque(_)
+            | ConstantInfo::Quot(_)
+            | ConstantInfo::Induct(_)
+            | ConstantInfo::Ctor(_)
+            | ConstantInfo::Rec(_)
+    )
+}
+
 #[test]
 fn timy_witness_module_recovers_its_private_match_auxiliary() {
     let lib = lib_or_skip!("timy_witness_module_recovers_its_private_match_auxiliary");
@@ -668,11 +684,18 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
             .decode_module_constants()
             .unwrap_or_else(|error| panic!("{family} {name}: decode private {relative}: {error}"));
 
+        let recovered = constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{family} {name} in {relative} remained only a constName instead of decoding to ConstantInfo"
+                )
+            });
         assert!(
-            constants
-                .iter()
-                .any(|info| info.name().to_display_string() == name),
-            "{family} {name} in {relative} remained only a constName instead of decoding to ConstantInfo"
+            is_concrete_recovery(recovered),
+            "{family} {name} in {relative} decoded only as {} instead of a concrete declaration",
+            recovered.kind_name()
         );
     }
 }
@@ -753,8 +776,9 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
                 panic!("{family} {name}: private decoder lost the representative in {relative}")
             });
         assert!(
-            !matches!(recovered, ConstantInfo::Axiom(_)),
-            "{family} {name}: private companion recovery weakened the declaration to an axiom"
+            is_concrete_recovery(recovered),
+            "{family} {name}: private companion recovery decoded only as {} instead of a concrete declaration",
+            recovered.kind_name()
         );
     }
 }
