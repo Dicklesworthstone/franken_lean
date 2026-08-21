@@ -895,8 +895,21 @@ def main():
                 # understate coverage by exactly the size of the prelude.
                 if "already been declared" in blame_msg.get(name, ""):
                     if name not in quarantine:
-                        quarantine[name] = "provided by the implicitly imported Init substrate"
-                        decl[name]["role"] = "init-substrate"
+                        # WHICH already-declared? Init's, or the facade's own? A
+                        # structural block generates companions (`_sizeOf_inst`),
+                        # so the same message means two different things, and
+                        # calling the second one "Init" writes a false row: Init
+                        # does not have it, and once that structure demotes to an
+                        # axiom the name is gone.
+                        mod = decl[name]["module"]
+                        from_init = mod == "Init" or mod.startswith("Init.")
+                        quarantine[name] = (
+                            "provided by the implicitly imported Init substrate"
+                            if from_init else
+                            "already declared inside the facade — a structural "
+                            "block generated it")
+                        if from_init:
+                            decl[name]["role"] = "init-substrate"
                         progressed = True
                     continue
                 if name not in explicit_for and decl[name]["typex"]:
@@ -931,7 +944,12 @@ def main():
         round_covered = sum(
             1 for n in set(emitted) | {p for p in provided if p in decl}
             if decl[n]["role"] == "demanded")
-        key = (round_covered, len(emitted))
+        # Then FEWER quarantined rows, then more declarations. Re-promoting every
+        # stronger form each round lets a different set of failures win the blame,
+        # so two rounds can cover the same demanded count with different residues;
+        # the smaller residue is the better artifact and this makes the choice
+        # independent of the order the rounds happened to run in.
+        key = (round_covered, -len(quarantine), len(emitted))
         if best is None or key > best[0]:
             best = (key, text, line_map, list(emitted), attr_count,
                     provided, dict(quarantine), set(explicit_for), set(maxexp_for),
@@ -946,6 +964,43 @@ def main():
     # A projection the structural block generates IS in the facade; counting only
     # the lines this emitter wrote would understate coverage by every field.
     emitted = emitted + [p for p in sorted(provided) if p in decl]
+    uncensused = sorted(
+        name for name, row in decl.items() if row["role"] == "uncensused-closure"
+    )
+    if uncensused:
+        raise SystemExit(
+            "REFUSE: the standalone facade would emit closure declarations absent "
+            "from the pinned builtin census: "
+            f"{uncensused[:8]}{' …' if len(uncensused) > 8 else ''} — classify "
+            "the source environment first; generated facade output may not invent "
+            "an unclassified symbol"
+        )
+
+    # Every demanded symbol must have exactly one honest disposition.  The facade
+    # is allowed to quarantine a pin-rejected type, but it is not allowed to make
+    # that row disappear from the denominator; likewise, Init-provided rows are
+    # shared substrate rather than omitted facade demand.  Keep this check beside
+    # emission so a later renderer cannot widen the generated module while leaving
+    # the manifest's totality claim behind.
+    emitted_set = set(emitted)
+    demanded_outcomes = {}
+    for name in sorted(demand):
+        if name in init_demanded:
+            demanded_outcomes[name] = "init-substrate"
+        elif name in emitted_set:
+            demanded_outcomes[name] = "emitted"
+        elif name in quarantine:
+            demanded_outcomes[name] = "quarantined"
+        else:
+            raise SystemExit(
+                f"REFUSE: demanded facade symbol {name} has no emitted, "
+                "Init-substrate, or quarantined disposition"
+            )
+    if len(demanded_outcomes) != len(demand):
+        raise SystemExit(
+            "REFUSE: facade demand totality lost a symbol while assigning "
+            "dispositions"
+        )
     covered = [n for n in emitted if decl[n]["role"] == "demanded"]
     if len(covered) < 0.5 * len(facade_demand):
         raise SystemExit(
@@ -962,7 +1017,12 @@ def main():
         "facade_demand": len(facade_demand),
         "closure_rounds": rounds, "declarations_emitted": len(emitted),
         "substrate_emitted": sum(1 for n in emitted if decl[n]["role"] == "substrate"),
-        "uncensused_emitted": sum(1 for n in emitted if decl[n]["role"] == "uncensused-closure"),
+        "uncensused_emitted": len(uncensused),
+        "uncensused_closure": len(uncensused),
+        "demanded_outcomes": {
+            outcome: sum(1 for value in demanded_outcomes.values() if value == outcome)
+            for outcome in ("emitted", "init-substrate", "quarantined")
+        },
         "init_provided": len(init_provided),
         "transparent_declarations": len(transparent),
         "reducible_candidates": len(reducible),
@@ -1009,6 +1069,7 @@ def main():
             "transparent_refused_reason": transparent_refused.get(name),
             "emitted": name not in quarantine,
             "quarantine_reason": quarantine.get(name),
+            "demanded_outcome": demanded_outcomes.get(name),
             "printer": ("pp.maxexplicit" if name in maxexp_for
                         else "pp.explicit" if name in explicit_for else "pp.fullNames"),
             "signature": (d["typem"] if name in maxexp_for
@@ -1021,6 +1082,7 @@ def main():
                      "bucket": demand[name]["bucket"],
                      "module": (dotted(census[name]["module"])
                                 if name in census and census[name].get("module") else "-"),
+                     "demanded_outcome": demanded_outcomes[name],
                      "quarantine_reason": "demanded, and defined under Init: the "
                      "shared prelude already provides it, so the facade must not "
                      "redeclare it"})

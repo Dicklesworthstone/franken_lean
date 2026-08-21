@@ -24,8 +24,6 @@ set_option maxRecDepth 8000
 
 -- role=substrate bucket=- effect=pure module=Lean.Data.AssocList
 axiom Lean.AssocList.{u, v} : Type u → Type v → Type (max u v)
--- role=demanded bucket=R-NONE effect=pure module=Lean.Attributes
-axiom Lean.AttrM : Type → Type
 -- role=substrate bucket=- effect=pure module=Lean.Attributes
 axiom Lean.AttributeApplicationTime : Type
 -- role=substrate bucket=- effect=pure module=Lean.Attributes
@@ -42,16 +40,10 @@ structure Lean.CompactedRegion where
   baseAddr : _root_.USize
   bufferOffset : _root_.USize
   root : _root_.NonScalar
--- role=substrate bucket=- effect=pure module=Lean.Environment
-axiom Lean.ConstMap : Type
 -- role=substrate bucket=- effect=pure module=Lean.Declaration
 axiom Lean.ConstantInfo : Type
 -- role=substrate bucket=- effect=pure module=Lean.Environment
 axiom Lean.ConstantKind : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.CoreM
-axiom Lean.Core.CoreM : Type → Type
--- role=substrate bucket=- effect=pure module=Lean.CoreM
-axiom Lean.Core.InstantiateLevelCache : Type
 -- role=substrate bucket=- effect=pure module=Lean.Data.KVMap
 axiom Lean.DataValue : Type
 -- role=substrate bucket=- structural=structure module=Lean.CoreM
@@ -63,10 +55,6 @@ structure Lean.DeclNameGenerator where
 axiom Lean.Declaration : Type
 -- role=substrate bucket=- effect=pure module=Lean.Declaration
 axiom Lean.DefinitionSafety : Type
--- role=substrate bucket=- effect=pure module=Lean.Elab.Command
-axiom Lean.Elab.Command.CommandElab : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Command
-axiom Lean.Elab.Command.CommandElabM : Type → Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Command
 axiom Lean.Elab.Command.Linter.name._autoParam : _root_.Lean.Syntax
 -- role=substrate bucket=- structural=structure module=Lean.Elab.InfoTree.Types
@@ -85,8 +73,6 @@ structure Lean.Elab.ElabInfo where
 axiom Lean.Elab.Info : Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.InfoTree : Type
--- role=substrate bucket=- effect=pure module=Lean.Elab.Util
-axiom Lean.Elab.MacroStack : Type
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Util
 structure Lean.Elab.MacroStackElem where
   before : _root_.Lean.Syntax
@@ -100,6 +86,10 @@ class Lean.Elab.MonadMacroAdapter (m : Type → Type) where
 axiom Lean.Elab.PartialContextInfo : Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.PreDefinition.TerminationHint
 axiom Lean.Elab.PartialFixpointType : Type
+-- role=substrate bucket=- structural=structure module=Lean.Elab.Tactic.Basic
+structure Lean.Elab.Tactic.Context where
+  elaborator : _root_.Lean.Name
+  recover : _root_.Bool
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Tactic.Simp
 axiom Lean.Elab.Tactic.ElabSimpArgResult : Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Tactic.RCases
@@ -108,10 +98,6 @@ axiom Lean.Elab.Tactic.RCases.RCasesPatt : Type
 axiom Lean.Elab.Tactic.Simp.DischargeWrapper : Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Tactic.Simp
 axiom Lean.Elab.Tactic.SimpKind : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.Tactic : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.TacticM : Type → Type
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Calc
 structure Lean.Elab.Term.CalcStepView where
   ref : _root_.Lean.Syntax
@@ -125,10 +111,6 @@ axiom Lean.Elab.Term.MVarErrorKind : Type
 axiom Lean.Elab.Term.PostponeBehavior : Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Term.SyntheticMVarKind : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.TermElab : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.TermElabM : Type → Type
 -- role=substrate bucket=- structural=structure module=Lean.Elab.PreDefinition.TerminationHint
 structure Lean.Elab.TerminationBy where
   ref : _root_.Lean.Syntax
@@ -165,10 +147,6 @@ structure Lean.Import where
   importAll : _root_.Bool
   isExported : _root_.Bool
   isMeta : _root_.Bool
--- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
-axiom Lean.ImportM : Type → Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Level
-axiom Lean.LMVarId : Type
 -- role=substrate bucket=- effect=pure module=Lean.Language.Basic
 axiom Lean.Language.Snapshot.desc._autoParam : _root_.Lean.Syntax
 -- role=substrate bucket=- effect=pure module=Lean.Language.Basic
@@ -197,8 +175,6 @@ axiom Lean.Linter.LinterSets : Type
 axiom Lean.Literal : Type
 -- role=substrate bucket=- effect=pure module=Lean.LocalContext
 axiom Lean.LocalDecl : Type
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.LocalInstances : Type
 -- role=substrate bucket=- structural=structure module=Lean.Data.Lsp.BasicAux
 structure Lean.Lsp.Position where
   line : _root_.Nat
@@ -206,73 +182,45 @@ structure Lean.Lsp.Position where
 -- role=substrate bucket=- structural=structure module=Lean.Data.Lsp.Basic
 structure Lean.Lsp.SnippetString where
   value : _root_.String
--- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
-axiom Lean.MData : Type
 -- role=substrate bucket=- structural=structure module=Lean.Expr
 structure Lean.MVarId where
   name : _root_.Lean.Name
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.MVarIdMap : Type → Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Message
-axiom Lean.Message : Type
 -- role=substrate bucket=- effect=pure module=Lean.Message
 axiom Lean.MessageData : Type
+-- role=substrate bucket=- effect=pure module=Lean.Message
+axiom Lean.MessageSeverity : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.CoeAttr
 axiom Lean.Meta.CoeFnType : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.CongrTheorems
 axiom Lean.Meta.CongrArgKind : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.DefEqCache : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types
 axiom Lean.Meta.DiscrTree.Key : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types
 axiom Lean.Meta.DiscrTree.Trie : Type → Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.FunInfoCache : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Eqns
 axiom Lean.Meta.GetEqnsFn : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Hint
 axiom Lean.Meta.Hint.DiffGranularity : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.InferTypeCache : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.MetaM : Type → Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
 axiom Lean.Meta.Origin : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.ProjReductionKind : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.DSimproc : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.Rewrite
-axiom Lean.Meta.Simp.Discharge : Type
+axiom Lean.Meta.Simp.MethodsRef : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.SimpM : Type → Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.Simproc : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.SimprocTree : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Simproc
-axiom Lean.Meta.Simp.SimprocsArray : Type
+axiom Lean.Meta.Simp.Step : Type
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.SimpCongrTheorems
 structure Lean.Meta.SimpCongrTheorem where
   theoremName : _root_.Lean.Name
   funName : _root_.Lean.Name
   hypothesesPos : _root_.Array _root_.Nat
   priority : _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
-axiom Lean.Meta.SimpTheoremKey : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
-axiom Lean.Meta.SimpTheoremTree : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
-axiom Lean.Meta.SimpTheoremsArray : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.SynthInstanceCache : Type
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.TryThis
 axiom Lean.Meta.Tactic.TryThis.SuggestionStyle : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.TryThis
 axiom Lean.Meta.Tactic.TryThis.SuggestionText : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.WhnfCache : Type
 -- role=substrate bucket=- effect=pure module=Lean.MetavarContext
 axiom Lean.MetavarKind : Type
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
@@ -307,26 +255,14 @@ axiom Lean.Option.register._auto_1 : _root_.Lean.Syntax
 structure Lean.OptionDeprecation where
   since : _root_.String
   text? : _root_.Option _root_.String
--- role=substrate bucket=- effect=pure module=Lean.Data.PersistentArray
-axiom Lean.PArray.{u} : Type u → Type u
--- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap
-axiom Lean.PHashMap.{u, v} : (α : Type u) → Type v → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
--- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashSet
-axiom Lean.PHashSet.{u} : (α : Type u) → [_root_.BEq α] → [_root_.Hashable α] → Type u
 -- role=substrate bucket=- effect=pure module=Lean.Parser.Types
 axiom Lean.Parser.FirstTokens : Type
 -- role=substrate bucket=- effect=pure module=Lean.Parser.Types
 axiom Lean.Parser.ParserFn : Type
--- role=substrate bucket=- effect=pure module=Lean.Parser.Types
-axiom Lean.Parser.SyntaxNodeKindSet : Type
--- role=substrate bucket=- effect=pure module=Lean.Parser.Types
-axiom Lean.Parser.Token : Type
--- role=substrate bucket=- effect=pure module=Lean.Parser.Types
-axiom Lean.Parser.TrailingParser : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentArray
-axiom Lean.PersistentArray.branching : _root_.USize
--- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentArray
-axiom Lean.PersistentArray.initShift : _root_.USize
+-- role=substrate bucket=- transparent module=Lean.Parser.Types
+@[reducible] noncomputable def Lean.Parser.Token : Type := _root_.String
+-- role=demanded bucket=R-NONE transparent module=Lean.Data.PersistentArray
+@[reducible] noncomputable def Lean.PersistentArray.initShift : _root_.USize := 5
 -- role=substrate bucket=- effect=pure module=Lean.Data.PersistentArray
 axiom Lean.PersistentArrayNode.{u} : Type u → Type u
 -- role=substrate bucket=- effect=pure module=Lean.Environment
@@ -343,10 +279,10 @@ axiom Lean.PersistentHashMap.Node.{u, v} : Type u → Type v → Type (max u v)
 structure Lean.Position where
   line : _root_.Nat
   column : _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.PrettyPrinter.Delaborator.SubExpr
-axiom Lean.PrettyPrinter.Delaborator.OptionsPerPos : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.PrettyPrinter.Parenthesizer
-axiom Lean.PrettyPrinter.Parenthesizer : Type
+-- role=substrate bucket=- structural=structure module=Lean.PrettyPrinter.Parenthesizer
+structure Lean.PrettyPrinter.Parenthesizer.Context where
+  cat : _root_.Lean.Name
+  forceParens : _root_.Bool
 -- role=substrate bucket=- structural=structure module=Lean.ProjFns
 structure Lean.ProjectionFunctionInfo where
   ctorName : _root_.Lean.Name
@@ -357,12 +293,14 @@ structure Lean.ProjectionFunctionInfo where
 axiom Lean.QuotKind : Type
 -- role=substrate bucket=- effect=pure module=Lean.Declaration
 axiom Lean.ReducibilityHints : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
-axiom Lean.ReplayFn : Type → Type
+-- role=demanded bucket=R-NONE transparent module=Lean.Environment
+@[reducible] noncomputable def Lean.ReplayFn : Type → Type := fun σ => σ → σ → _root_.List _root_.Lean.Name → σ → σ
 -- role=demanded bucket=R-NONE effect=pure module=Lean.ReservedNameAction
 axiom Lean.ReservedNameAction : Type
 -- role=substrate bucket=- effect=pure module=Lean.ScopedEnvExtension
-axiom Lean.SimpleScopedEnvExtension : Type → Type → Type
+axiom Lean.ScopedEnvExtension.Descr.name._autoParam : _root_.Lean.Syntax
+-- role=substrate bucket=- effect=pure module=Lean.ScopedEnvExtension
+axiom Lean.ScopedEnvExtension.Entry : Type → Type
 -- role=substrate bucket=- structural=structure module=Lean.Structure
 structure Lean.StructureParentInfo where
   structName : _root_.Lean.Name
@@ -374,6 +312,11 @@ axiom Lean.SubExpr.Pos : Type
 structure Lean.Syntax.Range where
   start : _root_.String.Pos.Raw
   stop : _root_.String.Pos.Raw
+-- role=substrate bucket=- structural=structure module=Lean.Syntax
+structure Lean.Syntax.Traverser where
+  cur : _root_.Lean.Syntax
+  parents : _root_.Array _root_.Lean.Syntax
+  idxs : _root_.Array _root_.Nat
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Syntax
 axiom Lean.Syntax.getAtomVal : _root_.Lean.Syntax → _root_.String
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Syntax
@@ -404,6 +347,16 @@ structure Lean.AttributeImplCore where
   name : _root_.Lean.Name
   descr : _root_.String
   applicationTime : _root_.Lean.AttributeApplicationTime
+-- role=substrate bucket=- structural=structure module=Lean.Message
+structure Lean.BaseMessage.{u} (α : Type u) where
+  fileName : _root_.String
+  pos : _root_.Lean.Position
+  endPos : _root_.Option _root_.Lean.Position
+  keepFullRange : _root_.Bool
+  severity : _root_.Lean.MessageSeverity
+  isSilent : _root_.Bool
+  caption : _root_.String
+  data : α
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.BinderInfo.ctorIdx : _root_.Lean.BinderInfo → _root_.Nat
 -- role=substrate bucket=- effect=pure module=Lean.Expr
@@ -421,22 +374,6 @@ structure Lean.ConstantVal where
   name : _root_.Lean.Name
   levelParams : _root_.List _root_.Lean.Name
   type : _root_.Lean.Expr
--- role=substrate bucket=- structural=structure module=Lean.CoreM
-structure Lean.Core.Cache where
-  instLevelType : _root_.Lean.Core.InstantiateLevelCache
-  instLevelValue : _root_.Lean.Core.InstantiateLevelCache
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.checkSystem : _root_.String → _root_.Lean.Core.CoreM _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.instMonadCoreM : _root_.Monad _root_.Lean.Core.CoreM
--- role=demanded bucket=R-EFFECT effect=io module=Lean.CoreM
-axiom Lean.Core.instMonadLiftIOCoreM : _root_.MonadLift _root_.IO _root_.Lean.Core.CoreM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.instMonadQuotationCoreM : _root_.Lean.MonadQuotation _root_.Lean.Core.CoreM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.instMonadRefCoreM : _root_.Lean.MonadRef _root_.Lean.Core.CoreM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.mkFreshUserName : _root_.Lean.Name → _root_.Lean.Core.CoreM _root_.Lean.Name
 -- role=substrate bucket=- structural=structure module=Lean.Data.DeclarationRange
 structure Lean.DeclarationRange where
   pos : _root_.Lean.Position
@@ -459,26 +396,6 @@ structure Lean.Elab.Attribute where
   kind : _root_.Lean.AttributeKind
   name : _root_.Lean.Name
   stx : _root_.Lean.Syntax
--- role=substrate bucket=- structural=structure module=Lean.Elab.AutoBound
-structure Lean.Elab.AutoBoundImplicitContext where
-  autoImplicitEnabled : _root_.Bool
-  boundVariables : _root_.Lean.PArray _root_.Lean.Expr
--- role=substrate bucket=- structural=structure module=Lean.Elab.Command
-structure Lean.Elab.Command.Linter where
-  run : _root_.Lean.Syntax → _root_.Lean.Elab.Command.CommandElabM _root_.Unit
-  name : _root_.autoParam _root_.Lean.Name _root_.Lean.Elab.Command.Linter.name._autoParam
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadCommandElabM : _root_.Monad _root_.Lean.Elab.Command.CommandElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadExceptOfExceptionCommandElabM : _root_.MonadExceptOf _root_.Lean.Exception _root_.Lean.Elab.Command.CommandElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadQuotationCommandElabM : _root_.Lean.MonadQuotation _root_.Lean.Elab.Command.CommandElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadRefCommandElabM : _root_.Lean.MonadRef _root_.Lean.Elab.Command.CommandElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.liftCoreM : {α : Type} → _root_.Lean.Core.CoreM α → _root_.Lean.Elab.Command.CommandElabM α
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.liftTermElabM : {α : Type} → _root_.Lean.Elab.Term.TermElabM α → _root_.Lean.Elab.Command.CommandElabM α
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.Info.ctorIdx : _root_.Lean.Elab.Info → _root_.Nat
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Server.InfoUtils
@@ -489,44 +406,18 @@ axiom Lean.Elab.InfoTree.context : _root_.Lean.Elab.PartialContextInfo → _root
 axiom Lean.Elab.InfoTree.ctorIdx : _root_.Lean.Elab.InfoTree → _root_.Nat
 -- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.InfoTree.hole : _root_.Lean.MVarId → _root_.Lean.Elab.InfoTree
+-- role=substrate bucket=- transparent module=Lean.Elab.Util
+@[reducible] noncomputable def Lean.Elab.MacroStack : Type := _root_.List _root_.Lean.Elab.MacroStackElem
 -- role=substrate bucket=- structural=structure module=Lean.Elab.PreDefinition.TerminationHint
 structure Lean.Elab.PartialFixpoint where
   ref : _root_.Lean.Syntax
   term? : _root_.Option _root_.Lean.Syntax.Term
   fixpointType : _root_.Lean.Elab.PartialFixpointType
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.RCases
-axiom Lean.Elab.Tactic.RCases.rcases : _root_.Array (_root_.Option _root_.Lean.Syntax.Ident × _root_.Lean.Syntax) → _root_.Lean.Elab.Tactic.RCases.RCasesPatt → _root_.Lean.MVarId → _root_.Lean.Elab.Term.TermElabM (_root_.List _root_.Lean.MVarId)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.RCases
-axiom Lean.Elab.Tactic.RCases.rintro : _root_.Lean.TSyntaxArray `rintroPat → _root_.Option _root_.Lean.Syntax.Term → _root_.Lean.MVarId → _root_.Lean.Elab.Term.TermElabM (_root_.List _root_.Lean.MVarId)
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Tactic.Simp
 axiom Lean.Elab.Tactic.SimpKind.simp : _root_.Lean.Elab.Tactic.SimpKind
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
 structure Lean.Elab.Tactic.State where
   goals : _root_.List _root_.Lean.MVarId
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.ElabTerm
-axiom Lean.Elab.Tactic.elabTerm : _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.Lean.Elab.Tactic.TacticM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.ElabTerm
-axiom Lean.Elab.Tactic.elabTermEnsuringType : _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.Lean.Elab.Tactic.TacticM _root_.Lean.Expr
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Tactic.BuiltinTactic
-axiom Lean.Elab.Tactic.evalAllGoals : _root_.Lean.Elab.Tactic.Tactic
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.evalTactic : _root_.Lean.Syntax → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.getGoals : _root_.Lean.Elab.Tactic.TacticM (_root_.List _root_.Lean.MVarId)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.getMainGoal : _root_.Lean.Elab.Tactic.TacticM _root_.Lean.MVarId
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.instMonadTacticM : _root_.Monad _root_.Lean.Elab.Tactic.TacticM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.pruneSolvedGoals : _root_.Lean.Elab.Tactic.TacticM _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.replaceMainGoal : _root_.List _root_.Lean.MVarId → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.run : _root_.Lean.MVarId → _root_.Lean.Elab.Tactic.TacticM _root_.Unit → _root_.Lean.Elab.Term.TermElabM (_root_.List _root_.Lean.MVarId)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.setGoals : _root_.List _root_.Lean.MVarId → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
-axiom Lean.Elab.Tactic.withMainContext : {α : Type} → _root_.Lean.Elab.Tactic.TacticM α → _root_.Lean.Elab.Tactic.TacticM α
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
 structure Lean.Elab.Term.MVarErrorInfo where
   mvarId : _root_.Lean.MVarId
@@ -538,16 +429,6 @@ axiom Lean.Elab.Term.PostponeBehavior.no : _root_.Lean.Elab.Term.PostponeBehavio
 structure Lean.Elab.Term.SyntheticMVarDecl where
   stx : _root_.Lean.Syntax
   kind : _root_.Lean.Elab.Term.SyntheticMVarKind
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.SyntheticMVars
-axiom Lean.Elab.Term.elabTermAndSynthesize : _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.elabType : _root_.Lean.Syntax → _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.instMonadMacroAdapterTermElabM : _root_.Lean.Elab.MonadMacroAdapter _root_.Lean.Elab.Term.TermElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM
-axiom Lean.Elab.Term.instMonadTermElabM : _root_.Monad _root_.Lean.Elab.Term.TermElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Calc
-axiom Lean.Elab.Term.mkCalcStepViews : _root_.Lean.TSyntax `Lean.calcSteps → _root_.Lean.Elab.Term.TermElabM (_root_.Array _root_.Lean.Elab.Term.CalcStepView)
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.instInhabitedInfoTree : _root_.Inhabited _root_.Lean.Elab.InfoTree
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Exception
@@ -633,8 +514,6 @@ axiom Lean.Expr.letE : _root_.Lean.Name → _root_.Lean.Expr → _root_.Lean.Exp
 -- role=demanded bucket=R-EXTERN effect=pure module=Lean.Expr
 axiom Lean.Expr.lit : _root_.Lean.Literal → _root_.Lean.Expr
 -- role=demanded bucket=R-EXTERN effect=pure module=Lean.Expr
-axiom Lean.Expr.mdata : _root_.Lean.MData → _root_.Lean.Expr → _root_.Lean.Expr
--- role=demanded bucket=R-EXTERN effect=pure module=Lean.Expr
 axiom Lean.Expr.mvar : _root_.Lean.MVarId → _root_.Lean.Expr
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.Expr.mvarId! : _root_.Lean.Expr → _root_.Lean.MVarId
@@ -648,20 +527,22 @@ axiom Lean.Expr.proj : _root_.Lean.Name → _root_.Nat → _root_.Lean.Expr → 
 axiom Lean.Expr.rawNatLit? : _root_.Lean.Expr → _root_.Option _root_.Nat
 -- role=demanded bucket=R-EXTERN effect=pure module=Lean.Expr
 axiom Lean.Expr.sort : _root_.Lean.Level → _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.FVarId.getUserName : _root_.Lean.FVarId → _root_.Lean.Meta.MetaM _root_.Lean.Name
+-- role=substrate bucket=- structural=structure module=Lean.Expr
+structure Lean.ExprStructEq where
+  val : _root_.Lean.Expr
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.Position
 axiom Lean.FileMap.ofPosition : _root_.Lean.FileMap → _root_.Lean.Position → _root_.String.Pos.Raw
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.Position
 axiom Lean.FileMap.toPosition : _root_.Lean.FileMap → _root_.String.Pos.Raw → _root_.Lean.Position
+-- role=substrate bucket=- structural=structure module=Lean.Data.KVMap
+structure Lean.KVMap where
+  entries : _root_.List (_root_.Lean.Name × _root_.Lean.DataValue)
 -- role=substrate bucket=- structural=class module=Lean.Data.KVMap
 class Lean.KVMap.Value (α : Type) where
   toDataValue : α → _root_.Lean.DataValue
   ofDataValue? : _root_.Lean.DataValue → _root_.Option α
--- role=substrate bucket=- structural=structure module=Lean.Environment
-structure Lean.Kernel.Diagnostics where
-  unfoldCounter : _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
-  enabled : _root_.Bool
+-- role=demanded bucket=R-NONE transparent module=Lean.Level
+@[reducible] noncomputable def Lean.LMVarId : Type := _root_.Lean.LevelMVarId
 -- role=substrate bucket=- structural=structure module=Lean.Language.Basic
 structure Lean.Language.SnapshotTask (α : Type) where
   stx? : _root_.Option _root_.Lean.Syntax
@@ -684,18 +565,6 @@ structure Lean.LocalInstance where
   fvar : _root_.Lean.Expr
 -- role=substrate bucket=- effect=pure module=Lean.Data.Lsp.BasicAux
 axiom Lean.Lsp.Range : Type
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Replace
-axiom Lean.MVarId.changeLocalDecl : _root_.Lean.MVarId → _root_.Lean.FVarId → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM _root_.Lean.MVarId
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Congr
-axiom Lean.MVarId.congrCore : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM (_root_.List _root_.Lean.MVarId)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Congr
-axiom Lean.MVarId.congrN : _root_.Lean.MVarId → _root_.optParam _root_.Nat 1000000 → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM (_root_.List _root_.Lean.MVarId)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Util
-axiom Lean.MVarId.getType : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Intro
-axiom Lean.MVarId.intros : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM (_root_.Array _root_.Lean.FVarId × _root_.Lean.MVarId)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Rfl
-axiom Lean.MVarId.liftReflToEq : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM _root_.Lean.MVarId
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Message
 axiom Lean.MessageData.andList : _root_.List _root_.Lean.MessageData → _root_.Lean.MessageData
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Message
@@ -719,14 +588,6 @@ structure Lean.Meta.AbstractMVarsResult where
   paramNames : _root_.Array _root_.Lean.Name
   mvars : _root_.Array _root_.Lean.Expr
   expr : _root_.Lean.Expr
--- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
-structure Lean.Meta.Cache where
-  inferType : _root_.Lean.Meta.InferTypeCache
-  funInfo : _root_.Lean.Meta.FunInfoCache
-  synthInstance : _root_.Lean.Meta.SynthInstanceCache
-  whnf : _root_.Lean.Meta.WhnfCache
-  defEqTrans : _root_.Lean.Meta.DefEqCache
-  defEqPerm : _root_.Lean.Meta.DefEqCache
 -- role=substrate bucket=- structural=structure module=Lean.Meta.CoeAttr
 structure Lean.Meta.CoeFnInfo where
   numArgs : _root_.Nat
@@ -801,38 +662,15 @@ structure Lean.Meta.RewriteResult where
   eNew : _root_.Lean.Expr
   eqProof : _root_.Lean.Expr
   mvarIds : _root_.List _root_.Lean.MVarId
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.DStep : Type := _root_.Lean.TransformStep
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
-structure Lean.Meta.Simp.Methods where
-  pre : _root_.Lean.Meta.Simp.Simproc
-  post : _root_.Lean.Meta.Simp.Simproc
-  dpre : _root_.Lean.Meta.Simp.DSimproc
-  dpost : _root_.Lean.Meta.Simp.DSimproc
-  discharge? : _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM (_root_.Option _root_.Lean.Expr)
-  wellBehavedDischarge : _root_.Bool
--- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
-structure Lean.Meta.Simp.Simprocs where
-  pre : _root_.Lean.Meta.Simp.SimprocTree
-  post : _root_.Lean.Meta.Simp.SimprocTree
-  simprocNames : _root_.Lean.PHashSet _root_.Lean.Name
-  erased : _root_.Lean.PHashSet _root_.Lean.Name
--- role=demanded bucket=R-EXTERN effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.dsimp : _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM _root_.Lean.Expr
--- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.SimpTheorems
-structure Lean.Meta.SimpTheorem where
-  keys : _root_.Array _root_.Lean.Meta.SimpTheoremKey
-  levelParams : _root_.Array _root_.Lean.Name
-  proof : _root_.Lean.Expr
-  priority : _root_.Nat
-  post : _root_.Bool
-  perm : _root_.Bool
-  origin : _root_.Lean.Meta.Origin
-  rfl : _root_.Bool
-  backwardRfl : _root_.Bool
--- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
-structure Lean.Meta.SynthInstanceCacheKey where
-  localInsts : _root_.Lean.LocalInstances
-  type : _root_.Lean.Expr
-  synthPendingDepth : _root_.Nat
+structure Lean.Meta.Simp.Result where
+  expr : _root_.Lean.Expr
+  proof? : _root_.Option _root_.Lean.Expr
+  cache : _root_.Bool
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.SimpTheorems
+@[reducible] noncomputable def Lean.Meta.SimpTheoremKey : Type := _root_.Lean.Meta.DiscrTree.Key
 -- role=substrate bucket=- structural=structure module=Lean.Meta.TryThis
 structure Lean.Meta.Tactic.TryThis.Suggestion where
   suggestion : _root_.Lean.Meta.Tactic.TryThis.SuggestionText
@@ -841,52 +679,12 @@ structure Lean.Meta.Tactic.TryThis.Suggestion where
   style? : _root_.Option _root_.Lean.Meta.Tactic.TryThis.SuggestionStyle
   messageData? : _root_.Option _root_.Lean.MessageData
   toCodeActionTitle? : _root_.Option (_root_.String → _root_.String)
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.approxDefEq.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → n α → n α
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.forallTelescope.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.Expr → (_root_.Array _root_.Lean.Expr → _root_.Lean.Expr → n α) → _root_.optParam _root_.Bool _root_.Bool.false → n α
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.forallTelescopeReducing.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.Expr → (_root_.Array _root_.Lean.Expr → _root_.Lean.Expr → n α) → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.false → n α
--- role=demanded bucket=R-EXTERN effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.inferType : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.instAlternativeMetaM : _root_.Alternative _root_.Lean.Meta.MetaM
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
 axiom Lean.Meta.instBEqOrigin : _root_.BEq _root_.Lean.Meta.Origin
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
 axiom Lean.Meta.instHashableOrigin : _root_.Hashable _root_.Lean.Meta.Origin
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.instMonadMetaM : _root_.Monad _root_.Lean.Meta.MetaM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Instances
-axiom Lean.Meta.isInstance : _root_.Lean.Name → _root_.Lean.Core.CoreM _root_.Bool
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.InferType
-axiom Lean.Meta.isProof : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Bool
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.InferType
-axiom Lean.Meta.isProp : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Bool
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
-axiom Lean.Meta.mkAdd : _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
-axiom Lean.Meta.mkAppM : _root_.Lean.Name → _root_.Array _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
-axiom Lean.Meta.mkAppOptM : _root_.Lean.Name → _root_.Array (_root_.Option _root_.Lean.Expr) → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Closure
-axiom Lean.Meta.mkAuxTheorem : _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam (_root_.Option _root_.Lean.Name) _root_.Option.none → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.mkFreshLevelMVar : _root_.Lean.Meta.MetaM _root_.Lean.Level
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
-axiom Lean.Meta.mkMul : _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Sorry
-axiom Lean.Meta.mkSorry : _root_.Lean.Expr → _root_.Bool → _root_.Lean.Meta.MetaM _root_.Lean.Expr
 -- role=demanded bucket=R-EFFECT effect=io module=Lean.Meta.Eqns
 axiom Lean.Meta.registerGetEqnsFn : _root_.Lean.Meta.GetEqnsFn → _root_.IO _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.SynthInstance
-axiom Lean.Meta.synthInstance : _root_.Lean.Expr → _root_.optParam (_root_.Option _root_.Nat) _root_.Option.none → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EXTERN effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.whnf : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.withLocalDeclD.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.Name → _root_.Lean.Expr → (_root_.Lean.Expr → n α) → n α
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.withReducible.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → n α → n α
 -- role=substrate bucket=- effect=pure module=Lean.MetavarContext
 axiom Lean.MetavarKind.natural : _root_.Lean.MetavarKind
 -- role=substrate bucket=- structural=structure module=Lean.Environment
@@ -929,15 +727,6 @@ structure Lean.Option.Decl (α : Type) where
 structure Lean.Options where
   map : _root_.Lean.NameMap _root_.Lean.DataValue
   hasTrace : _root_.Bool
--- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Command
-axiom Lean.Parser.Command.in : _root_.Lean.Parser.TrailingParser
--- role=substrate bucket=- structural=structure module=Lean.Parser.Types
-structure Lean.Parser.ParserInfo where
-  collectTokens : _root_.List _root_.Lean.Parser.Token → _root_.List _root_.Lean.Parser.Token
-  collectKinds : _root_.Lean.Parser.SyntaxNodeKindSet → _root_.Lean.Parser.SyntaxNodeKindSet
-  firstTokens : _root_.Lean.Parser.FirstTokens
--- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Term
-axiom Lean.Parser.Term.app : _root_.Lean.Parser.TrailingParser
 -- role=substrate bucket=- structural=structure module=Lean.Data.PersistentArray
 structure Lean.PersistentArray.{u} (α : Type u) where
   root : _root_.Lean.PersistentArrayNode α
@@ -945,6 +734,10 @@ structure Lean.PersistentArray.{u} (α : Type u) where
   size : _root_.Nat
   shift : _root_.USize
   tailOff : _root_.Nat
+-- role=demanded bucket=R-NONE transparent module=Lean.Data.PersistentArray
+@[reducible] noncomputable def Lean.PersistentArray.branching : _root_.USize := _root_.USize.ofNat (2 ^ Lean.PersistentArray.initShift.toNat)
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentArray
+axiom Lean.PersistentArrayNode.leaf.{u} : {α : Type u} → _root_.Array α → _root_.Lean.PersistentArrayNode α
 -- role=substrate bucket=- effect=pure module=Lean.Data.PersistentArray
 axiom Lean.PersistentArrayNode.node.{u} : {α : Type u} → _root_.Array (_root_.Lean.PersistentArrayNode α) → _root_.Lean.PersistentArrayNode α
 -- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap
@@ -953,13 +746,25 @@ axiom Lean.PersistentHashMap.{u, v} : (α : Type u) → Type v → [_root_.BEq �
 axiom Lean.PersistentHashMap.Node.entries.{u, v} : {α : Type u} → {β : Type v} → _root_.Array (_root_.Lean.PersistentHashMap.Entry α β (_root_.Lean.PersistentHashMap.Node α β)) → _root_.Lean.PersistentHashMap.Node α β
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentHashMap
 axiom Lean.PersistentHashMap.mkEmptyEntriesArray.{u_1, u_2} : {α : Type u_1} → {β : Type u_2} → _root_.Array (_root_.Lean.PersistentHashMap.Entry α β (_root_.Lean.PersistentHashMap.Node α β))
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.PrettyPrinter
-axiom Lean.PrettyPrinter.ppTactic : _root_.Lean.TSyntax `tactic → _root_.Lean.Core.CoreM _root_.Std.Format
+-- role=substrate bucket=- structural=structure module=Lean.PrettyPrinter.Parenthesizer
+structure Lean.PrettyPrinter.Parenthesizer.State where
+  stxTrav : _root_.Lean.Syntax.Traverser
+  contPrec : _root_.Option _root_.Nat
+  contCat : _root_.Lean.Name
+  minPrec : _root_.Option _root_.Nat
+  trailPrec : _root_.Option _root_.Nat
+  trailCat : _root_.Lean.Name
+  visitedToken : _root_.Bool
 -- role=substrate bucket=- structural=structure module=Lean.Declaration
 structure Lean.RecursorRule where
   ctor : _root_.Lean.Name
   nfields : _root_.Nat
   rhs : _root_.Lean.Expr
+-- role=substrate bucket=- structural=structure module=Lean.ScopedEnvExtension
+structure Lean.ScopedEnvExtension.State (σ : Type) where
+  state : σ
+  activeScopes : _root_.Lean.NameSet
+  delimitsLocal : _root_.Bool
 -- role=substrate bucket=- structural=structure module=Lean.Structure
 structure Lean.StructureFieldInfo where
   fieldName : _root_.Lean.Name
@@ -1014,10 +819,6 @@ axiom Lean.instInhabitedDeclaration : _root_.Inhabited _root_.Lean.Declaration
 axiom Lean.instInhabitedFVarId : _root_.Inhabited _root_.Lean.FVarId
 -- role=demanded bucket=R-NONE effect=pure module=Lean.LocalContext
 axiom Lean.instInhabitedLocalDecl : _root_.Inhabited _root_.Lean.LocalDecl
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.instMonadExceptOfExceptionCoreM : _root_.MonadExceptOf _root_.Lean.Exception _root_.Lean.Core.CoreM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Attributes
-axiom Lean.instMonadLiftImportMAttrM : _root_.MonadLift _root_.Lean.ImportM _root_.Lean.AttrM
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.mkApp : _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Expr
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
@@ -1032,8 +833,6 @@ axiom Lean.mkNot : _root_.Lean.Expr → _root_.Lean.Expr
 axiom Lean.mkRawNatLit : _root_.Nat → _root_.Lean.Expr
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.mkSort : _root_.Lean.Level → _root_.Lean.Expr
--- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Basic
-axiom Lean.withSetOptionIn : _root_.Lean.Elab.Command.CommandElab → _root_.Lean.Elab.Command.CommandElab
 -- role=substrate bucket=- structural=structure module=Std.Data.DHashMap.RawDef
 structure Std.DHashMap.Raw.{u, v} (α : Type u) (β : α → Type v) where
   size : _root_.Nat
@@ -1046,11 +845,6 @@ structure Lean.AsyncConstantInfo where
   kind : _root_.Lean.ConstantKind
   sig : _root_.Task _root_.Lean.ConstantVal
   constInfo : _root_.Task _root_.Lean.ConstantInfo
--- role=substrate bucket=- structural=structure module=Lean.Attributes
-structure Lean.AttributeImpl where
-  toAttributeImplCore : _root_.Lean.AttributeImplCore
-  add : _root_.Lean.Name → _root_.Lean.Syntax → _root_.Lean.AttributeKind → _root_.Lean.AttrM _root_.Unit
-  erase : _root_.Lean.Name → _root_.Lean.AttrM _root_.Unit
 -- role=substrate bucket=- structural=structure module=Lean.Declaration
 structure Lean.AxiomVal where
   toConstantVal : _root_.Lean.ConstantVal
@@ -1065,8 +859,8 @@ structure Lean.ConstructorVal where
   numParams : _root_.Nat
   numFields : _root_.Nat
   isUnsafe : _root_.Bool
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.instAddMessageContextCoreM : _root_.Lean.AddMessageContext _root_.Lean.Core.CoreM
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.InstantiateLevelCache : Type
 -- role=substrate bucket=- structural=structure module=Lean.Data.DeclarationRange
 structure Lean.DeclarationRanges where
   range : _root_.Lean.DeclarationRange
@@ -1093,18 +887,10 @@ structure Lean.Elab.Command.Scope where
   isPublic : _root_.Bool
   isMeta : _root_.Bool
   attrs : _root_.List (_root_.Lean.TSyntax `Lean.Parser.Term.attrInstance)
--- role=demanded bucket=R-EFFECT effect=io module=Lean.Elab.Command
-axiom Lean.Elab.Command.addLinter : _root_.Lean.Elab.Command.Linter → _root_.IO _root_.Unit
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instAddMessageContextCommandElabM : _root_.Lean.AddMessageContext _root_.Lean.Elab.Command.CommandElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadResolveNameCommandElabM : _root_.Lean.MonadResolveName _root_.Lean.Elab.Command.CommandElabM
 -- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.InfoState : Type
 -- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.InfoTree.node : _root_.Lean.Elab.Info → _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree → _root_.Lean.Elab.InfoTree
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.SyntheticMVars
-axiom Lean.Elab.Term.withSynthesize.{u_1} : {m : Type → Type u_1} → {α : Type} → [_root_.MonadFunctorT _root_.Lean.Elab.Term.TermElabM m] → m α → _root_.optParam _root_.Lean.Elab.Term.PostponeBehavior _root_.Lean.Elab.Term.PostponeBehavior.no → m α
 -- role=substrate bucket=- structural=structure module=Lean.Elab.PreDefinition.TerminationHint
 structure Lean.Elab.TerminationHints where
   ref : _root_.Lean.Syntax
@@ -1115,6 +901,10 @@ structure Lean.Elab.TerminationHints where
   extraParams : _root_.Nat
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
 axiom Lean.Expr.getArg! : (e : _root_.Lean.Expr) → _root_.Nat → _root_.optParam _root_.Nat e.getAppNumArgs → _root_.Lean.Expr
+-- role=substrate bucket=- effect=pure module=Lean.Expr
+axiom Lean.ExprStructEq.instBEq : _root_.BEq _root_.Lean.ExprStructEq
+-- role=substrate bucket=- effect=pure module=Lean.Expr
+axiom Lean.ExprStructEq.instHashable : _root_.Hashable _root_.Lean.ExprStructEq
 -- role=substrate bucket=- structural=structure module=Lean.Declaration
 structure Lean.InductiveVal where
   toConstantVal : _root_.Lean.ConstantVal
@@ -1138,6 +928,8 @@ structure Lean.Linter.LinterOptions where
   linterSets : _root_.Lean.Linter.LinterSets
 -- role=substrate bucket=- effect=pure module=Lean.LocalContext
 axiom Lean.LocalContext : Type
+-- role=substrate bucket=- transparent module=Lean.MetavarContext
+@[reducible] noncomputable def Lean.LocalInstances : Type := _root_.Array _root_.Lean.LocalInstance
 -- role=substrate bucket=- effect=pure module=Lean.Data.Lsp.BasicAux
 axiom Lean.Lsp.Range.end : _root_.Lean.Lsp.Range → _root_.Lean.Lsp.Position
 -- role=substrate bucket=- effect=pure module=Lean.Data.Lsp.BasicAux
@@ -1150,13 +942,10 @@ structure Lean.Lsp.TextEdit where
   newText : _root_.String
   leanExtSnippet? : _root_.Option _root_.Lean.Lsp.SnippetString
   annotationId? : _root_.Option _root_.String
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Rewrite
-axiom Lean.MVarId.rewrite : _root_.Lean.MVarId → _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Lean.Meta.Rewrite.Config { } → _root_.Lean.Meta.MetaM _root_.Lean.Meta.RewriteResult
--- role=substrate bucket=- structural=structure module=Lean.Message
-structure Lean.MessageLog where
-  reported : _root_.Lean.PersistentArray _root_.Lean.Message
-  unreported : _root_.Lean.PersistentArray _root_.Lean.Message
-  loggedKinds : _root_.Lean.NameSet
+-- role=demanded bucket=R-NONE transparent module=Lean.Expr
+@[reducible] noncomputable def Lean.MData : Type := _root_.Lean.KVMap
+-- role=demanded bucket=R-NONE transparent module=Lean.Message
+@[reducible] noncomputable def Lean.Message : Type := _root_.Lean.BaseMessage _root_.Lean.MessageData
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Assert
 structure Lean.Meta.AssertAfterResult where
   fvarId : _root_.Lean.FVarId
@@ -1166,34 +955,28 @@ structure Lean.Meta.AssertAfterResult where
 structure Lean.Meta.ConfigWithKey where
   config : _root_.Lean.Meta.Config
   key : _root_.UInt64
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.Diagnostics : Type
 -- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types
 axiom Lean.Meta.DiscrTree : Type → Type
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
 structure Lean.Meta.FunInfo where
   paramInfo : _root_.Array _root_.Lean.Meta.ParamInfo
   resultDeps : _root_.Array _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.Diagnostics : Type
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
-axiom Lean.Meta.Simp.UsedSimps : Type
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Simproc
-axiom Lean.Meta.Simp.getSimprocs : _root_.Lean.Core.CoreM _root_.Lean.Meta.Simp.Simprocs
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Rewrite
-axiom Lean.Meta.Simp.mkDefaultMethods : _root_.Lean.Core.CoreM _root_.Lean.Meta.Simp.Methods
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.Rewrite
-axiom Lean.Meta.Simp.mkDefaultMethodsCore : _root_.Lean.Meta.Simp.SimprocsArray → _root_.Lean.Meta.Simp.Methods
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
-axiom Lean.Meta.SimpTheorems : Type
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.TryThis
-axiom Lean.Meta.Tactic.TryThis.addSuggestion : _root_.Lean.Syntax → _root_.Lean.Meta.Tactic.TryThis.Suggestion → _root_.optParam (_root_.Option _root_.Lean.Syntax) _root_.Option.none → _root_.optParam _root_.String "Try this:" → _root_.optParam (_root_.Option _root_.String) _root_.Option.none → _root_.optParam _root_.Lean.Meta.Hint.DiffGranularity _root_.Lean.Meta.Hint.DiffGranularity.none → _root_.optParam _root_.Lean.MessageData _root_.Lean.MessageData.nil → _root_.Lean.Core.CoreM _root_.Unit
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.CoeAttr
-axiom Lean.Meta.coeExt : _root_.Lean.SimpleScopedEnvExtension (_root_.Lean.Name × _root_.Lean.Meta.CoeFnInfo) (_root_.Lean.NameMap _root_.Lean.Meta.CoeFnInfo)
--- role=demanded bucket=R-UNSAFE effect=toolchain-monad module=Lean.Meta.Eval
-axiom Lean.Meta.evalExpr : (α : Type) → _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Lean.DefinitionSafety _root_.Lean.DefinitionSafety.safe → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM α
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.instAddMessageContextMetaM : _root_.Lean.AddMessageContext _root_.Lean.Meta.MetaM
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
+structure Lean.Meta.Simp.SimprocOLeanEntry where
+  declName : _root_.Lean.Name
+  post : _root_.Bool
+  keys : _root_.Array _root_.Lean.Meta.SimpTheoremKey
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.SimpTheorems
+structure Lean.Meta.SimpTheorem where
+  keys : _root_.Array _root_.Lean.Meta.SimpTheoremKey
+  levelParams : _root_.Array _root_.Lean.Name
+  proof : _root_.Lean.Expr
+  priority : _root_.Nat
+  post : _root_.Bool
+  perm : _root_.Bool
+  origin : _root_.Lean.Meta.Origin
+  rfl : _root_.Bool
+  backwardRfl : _root_.Bool
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.instBEqDefEqCacheKey : _root_.BEq _root_.Lean.Meta.DefEqCacheKey
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
@@ -1201,37 +984,16 @@ axiom Lean.Meta.instBEqExprConfigCacheKey : _root_.BEq _root_.Lean.Meta.ExprConf
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.instBEqInfoCacheKey : _root_.BEq _root_.Lean.Meta.InfoCacheKey
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.instBEqSynthInstanceCacheKey : _root_.BEq _root_.Lean.Meta.SynthInstanceCacheKey
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.instHashableDefEqCacheKey : _root_.Hashable _root_.Lean.Meta.DefEqCacheKey
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.instHashableExprConfigCacheKey : _root_.Hashable _root_.Lean.Meta.ExprConfigCacheKey
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.instHashableInfoCacheKey : _root_.Hashable _root_.Lean.Meta.InfoCacheKey
--- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.instHashableSynthInstanceCacheKey : _root_.Hashable _root_.Lean.Meta.SynthInstanceCacheKey
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.mkForallFVars : _root_.Array _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Lean.BinderInfo _root_.Lean.BinderInfo.implicit → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.mkFreshExprMVar : _root_.Option _root_.Lean.Expr → _root_.optParam _root_.Lean.MetavarKind _root_.Lean.MetavarKind.natural → _root_.optParam _root_.Lean.Name _root_.Lean.Name.anonymous → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.CongrTheorems
-axiom Lean.Meta.mkHCongrWithArity : _root_.Lean.Expr → _root_.Nat → _root_.Lean.Meta.MetaM _root_.Lean.Meta.CongrTheorem
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.mkLambdaFVars : _root_.Array _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Lean.BinderInfo _root_.Lean.BinderInfo.implicit → _root_.Lean.Meta.MetaM _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.CoeAttr
-axiom Lean.Meta.registerCoercion : _root_.Lean.Name → _root_.optParam (_root_.Option _root_.Lean.Meta.CoeFnInfo) _root_.Option.none → _root_.Lean.Meta.MetaM _root_.Unit
 -- role=substrate bucket=- structural=class module=Lean.Exception
 class Lean.MonadError (m : Type → Type) where
   toMonadExceptOf : _root_.MonadExceptOf _root_.Lean.Exception m
   toMonadRef : _root_.Lean.MonadRef m
   toAddErrorMessageContext : _root_.Lean.AddErrorMessageContext m
--- role=substrate bucket=- structural=class module=Lean.Log
-class Lean.MonadLog (m : Type → Type) where
-  toMonadFileMap : _root_.Lean.MonadFileMap m
-  getRef : m _root_.Lean.Syntax
-  getFileName : m _root_.String
-  hasErrors : m _root_.Bool
-  logMessage : _root_.Lean.Message → m _root_.Unit
 -- role=substrate bucket=- structural=class module=Lean.Data.Options
 class Lean.MonadOptions (m : Type → Type) where
   getOptions : m _root_.Lean.Options
@@ -1245,10 +1007,12 @@ structure Lean.OpaqueVal where
 axiom Lean.Option.register : {α : Type} → [_root_.Lean.KVMap.Value α] → _root_.Lean.Name → _root_.Lean.Option.Decl α → _root_.autoParam _root_.Lean.Name _root_.Lean.Option.register._auto_1 → _root_.IO (_root_.Lean.Option α)
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.Options
 axiom Lean.Options.instEmptyCollection : _root_.EmptyCollection _root_.Lean.Options
--- role=substrate bucket=- structural=structure module=Lean.Parser.Types
-structure Lean.Parser.Parser where
-  info : _root_.Lean.Parser.ParserInfo
-  fn : _root_.Lean.Parser.ParserFn
+-- role=substrate bucket=- transparent module=Lean.Data.PersistentArray
+@[reducible] noncomputable def Lean.PArray.{u} : Type u → Type u := fun α => _root_.Lean.PersistentArray α
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap
+axiom Lean.PHashMap.{u, v} : (α : Type u) → Type v → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
+-- role=substrate bucket=- effect=pure module=Lean.Parser.Types
+axiom Lean.Parser.SyntaxNodeKindSet : Type
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentArray
 axiom Lean.PersistentArray.findSomeM?.{u, v, w} : {α : Type u} → {m : Type v → Type w} → [_root_.Monad m] → {β : Type v} → _root_.Lean.PersistentArray α → (α → m (_root_.Option β)) → m (_root_.Option β)
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentArray
@@ -1261,10 +1025,12 @@ axiom Lean.PersistentHashMap.find?.{u_1, u_2} : {α : Type u_1} → {β : Type u
 axiom Lean.PersistentHashMap.findD.{u_1, u_2} : {α : Type u_1} → {β : Type u_2} → {x : _root_.BEq α} → {x_1 : _root_.Hashable α} → @_root_.Lean.PersistentHashMap α β x x_1 → α → β → β
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentHashMap pp=explicit
 axiom Lean.PersistentHashMap.isEmpty.{u_1, u_2} : {α : Type u_1} → {β : Type u_2} → {x : _root_.BEq α} → {x_1 : _root_.Hashable α} → @_root_.Lean.PersistentHashMap α β x x_1 → _root_.Bool
--- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap pp=explicit
-axiom Lean.PersistentHashMap.mk.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.PersistentHashMap.Node α β → @_root_.Lean.PersistentHashMap α β inst inst_1
--- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap pp=explicit
-axiom Lean.PersistentHashMap.root.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → @_root_.Lean.PersistentHashMap α β inst inst_1 → _root_.Lean.PersistentHashMap.Node α β
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap
+axiom Lean.PersistentHashMap.mk.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.PersistentHashMap.Node α β → _root_.Lean.PersistentHashMap α β
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashMap
+axiom Lean.PersistentHashMap.root.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.PersistentHashMap α β → _root_.Lean.PersistentHashMap.Node α β
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashSet
+axiom Lean.PersistentHashSet.{u} : (α : Type u) → [_root_.BEq α] → [_root_.Hashable α] → Type u
 -- role=substrate bucket=- structural=structure module=Lean.Declaration
 structure Lean.QuotVal where
   toConstantVal : _root_.Lean.ConstantVal
@@ -1335,10 +1101,14 @@ axiom Lean.ConstantInfo.quotInfo : _root_.Lean.QuotVal → _root_.Lean.ConstantI
 axiom Lean.ConstantInfo.recInfo : _root_.Lean.RecursorVal → _root_.Lean.ConstantInfo
 -- role=substrate bucket=- effect=pure module=Lean.Declaration
 axiom Lean.ConstantInfo.thmInfo : _root_.Lean.TheoremVal → _root_.Lean.ConstantInfo
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadLogCommandElabM : _root_.Lean.MonadLog _root_.Lean.Elab.Command.CommandElabM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadOptionsCommandElabM : _root_.Lean.MonadOptions _root_.Lean.Elab.Command.CommandElabM
+-- role=substrate bucket=- structural=structure module=Lean.CoreM
+structure Lean.Core.Cache where
+  instLevelType : _root_.Lean.Core.InstantiateLevelCache
+  instLevelValue : _root_.Lean.Core.InstantiateLevelCache
+-- role=substrate bucket=- structural=structure module=Lean.Elab.AutoBound
+structure Lean.Elab.AutoBoundImplicitContext where
+  autoImplicitEnabled : _root_.Bool
+  boundVariables : _root_.Lean.PArray _root_.Lean.Expr
 -- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types pp=explicit
 axiom Lean.Elab.InfoState.assignment : _root_.Lean.Elab.InfoState → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.Elab.InfoTree _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Types
@@ -1349,8 +1119,8 @@ axiom Lean.Elab.InfoState.lazyAssignment : _root_.Lean.Elab.InfoState → @_root
 axiom Lean.Elab.InfoState.mk : _root_.Bool → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.Elab.InfoTree _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId (_root_.Task _root_.Lean.Elab.InfoTree) _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId → _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree → _root_.Lean.Elab.InfoState
 -- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types
 axiom Lean.Elab.InfoState.trees : _root_.Lean.Elab.InfoState → _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Types
-axiom Lean.Elab.InfoTree.casesOn.{u} : {motive_1 : _root_.Lean.Elab.InfoTree → Sort u} → (t : _root_.Lean.Elab.InfoTree) → ((i : _root_.Lean.Elab.PartialContextInfo) → (t : _root_.Lean.Elab.InfoTree) → motive_1 (_root_.Lean.Elab.InfoTree.context i t)) → ((i : _root_.Lean.Elab.Info) → (children : _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree) → motive_1 (_root_.Lean.Elab.InfoTree.node i children)) → ((mvarId : _root_.Lean.MVarId) → motive_1 (_root_.Lean.Elab.InfoTree.hole mvarId)) → motive_1 t
+-- role=substrate bucket=- effect=pure module=Lean.Elab.InfoTree.Types
+axiom Lean.Elab.InfoTree.rec.{u} : {motive_1 : _root_.Lean.Elab.InfoTree → Sort u} → {motive_2 : _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree → Sort u} → {motive_3 : _root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree → Sort u} → {motive_4 : _root_.Array _root_.Lean.Elab.InfoTree → Sort u} → {motive_5 : _root_.Array (_root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree) → Sort u} → {motive_6 : _root_.List _root_.Lean.Elab.InfoTree → Sort u} → {motive_7 : _root_.List (_root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree) → Sort u} → ((i : _root_.Lean.Elab.PartialContextInfo) → (t : _root_.Lean.Elab.InfoTree) → motive_1 t → motive_1 (_root_.Lean.Elab.InfoTree.context i t)) → ((i : _root_.Lean.Elab.Info) → (children : _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree) → motive_2 children → motive_1 (_root_.Lean.Elab.InfoTree.node i children)) → ((mvarId : _root_.Lean.MVarId) → motive_1 (_root_.Lean.Elab.InfoTree.hole mvarId)) → ((root : _root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree) → (tail : _root_.Array _root_.Lean.Elab.InfoTree) → (size : _root_.Nat) → (shift : _root_.USize) → (tailOff : _root_.Nat) → motive_3 root → motive_4 tail → motive_2 { root := root, tail := tail, size := size, shift := shift, tailOff := tailOff }) → ((cs : _root_.Array (_root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree)) → motive_5 cs → motive_3 (_root_.Lean.PersistentArrayNode.node cs)) → ((vs : _root_.Array _root_.Lean.Elab.InfoTree) → motive_4 vs → motive_3 (_root_.Lean.PersistentArrayNode.leaf vs)) → ((toList : _root_.List _root_.Lean.Elab.InfoTree) → motive_6 toList → motive_4 { toList := toList }) → ((toList : _root_.List (_root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree)) → motive_7 toList → motive_5 { toList := toList }) → motive_6 [] → ((head : _root_.Lean.Elab.InfoTree) → (tail : _root_.List _root_.Lean.Elab.InfoTree) → motive_1 head → motive_6 tail → motive_6 (head :: tail)) → motive_7 [] → ((head : _root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree) → (tail : _root_.List (_root_.Lean.PersistentArrayNode _root_.Lean.Elab.InfoTree)) → motive_3 head → motive_7 tail → motive_7 (head :: tail)) → (t : _root_.Lean.Elab.InfoTree) → motive_1 t
 -- role=substrate bucket=- structural=class module=Lean.Elab.InfoTree.Types
 class Lean.Elab.MonadInfoTree (m : Type → Type) where
   getInfoState : m _root_.Lean.Elab.InfoState
@@ -1360,8 +1130,6 @@ structure Lean.Elab.PartialTermInfo where
   toElabInfo : _root_.Lean.Elab.ElabInfo
   lctx : _root_.Lean.LocalContext
   expectedType? : _root_.Option _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Simp
-axiom Lean.Elab.Tactic.mkSimpOnly : _root_.Lean.Syntax → _root_.Lean.Meta.Simp.UsedSimps → _root_.Lean.Meta.MetaM _root_.Lean.Syntax
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
 structure Lean.Elab.Term.LetRecToLift where
   ref : _root_.Lean.Syntax
@@ -1392,14 +1160,14 @@ structure Lean.Elab.TermInfo where
   expr : _root_.Lean.Expr
   isBinder : _root_.Bool
   isDisplayableTerm : _root_.Bool
--- role=substrate bucket=- structural=structure module=Lean.Language.Basic
-structure Lean.Language.Snapshot.Diagnostics where
-  msgLog : _root_.Lean.MessageLog
-  interactiveDiagsRef? : _root_.Option (_root_.IO.Ref (_root_.Option _root_.Dynamic))
+-- role=demanded bucket=R-EXTERN effect=pure module=Lean.Expr
+axiom Lean.Expr.mdata : _root_.Lean.MData → _root_.Lean.Expr → _root_.Lean.Expr
+-- role=substrate bucket=- structural=structure module=Lean.Environment
+structure Lean.Kernel.Diagnostics where
+  unfoldCounter : _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
+  enabled : _root_.Bool
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Init
 axiom Lean.Linter.getLinterValue : _root_.Lean.Option _root_.Bool → _root_.Lean.Linter.LinterOptions → _root_.Bool
--- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Init
-axiom Lean.Linter.logLint : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.Option _root_.Bool → _root_.Lean.Syntax → _root_.Lean.MessageData → m _root_.Unit
 -- role=substrate bucket=- effect=pure module=Lean.LocalContext
 axiom Lean.LocalContext.auxDeclToFullName : _root_.Lean.LocalContext → _root_.Lean.FVarIdMap _root_.Lean.Name
 -- role=substrate bucket=- effect=pure module=Lean.LocalContext
@@ -1416,16 +1184,120 @@ axiom Lean.LocalContext.getFVarIds : _root_.Lean.LocalContext → _root_.Array _
 axiom Lean.LocalContext.instForInLocalDeclOfMonad.{u_1, u_2} : {m : Type u_1 → Type u_2} → [_root_.Monad m] → _root_.ForIn m _root_.Lean.LocalContext _root_.Lean.LocalDecl
 -- role=substrate bucket=- effect=pure module=Lean.LocalContext pp=explicit
 axiom Lean.LocalContext.mk : @_root_.Lean.PersistentHashMap _root_.Lean.FVarId _root_.Lean.LocalDecl _root_.Lean.instBEqFVarId _root_.Lean.instHashableFVarId → _root_.Lean.PersistentArray (_root_.Option _root_.Lean.LocalDecl) → _root_.Lean.FVarIdMap _root_.Lean.Name → _root_.Lean.LocalContext
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Replace
-axiom Lean.MVarId.replaceLocalDecl : _root_.Lean.MVarId → _root_.Lean.FVarId → _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Meta.AssertAfterResult
--- role=demanded bucket=R-NONE effect=pure module=Lean.Message
-axiom Lean.MessageLog.hasErrors : _root_.Lean.MessageLog → _root_.Bool
+-- role=substrate bucket=- structural=structure module=Lean.Message
+structure Lean.MessageLog where
+  reported : _root_.Lean.PersistentArray _root_.Lean.Message
+  unreported : _root_.Lean.PersistentArray _root_.Lean.Message
+  loggedKinds : _root_.Lean.NameSet
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.DefEqCache : Type
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
 structure Lean.Meta.DefEqContext where
   lhs : _root_.Lean.Expr
   rhs : _root_.Lean.Expr
   lctx : _root_.Lean.LocalContext
   localInstances : _root_.Lean.LocalInstances
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.Diagnostics : Type
+-- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types pp=explicit
+axiom Lean.Meta.DiscrTree.mk : {α : Type} → @_root_.Lean.PersistentHashMap _root_.Lean.Meta.DiscrTree.Key (_root_.Lean.Meta.DiscrTree.Trie α) _root_.Lean.Meta.DiscrTree.instBEqKey _root_.Lean.Meta.DiscrTree.instHashableKey → _root_.Lean.Meta.DiscrTree α
+-- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types pp=explicit
+axiom Lean.Meta.DiscrTree.root : {α : Type} → _root_.Lean.Meta.DiscrTree α → @_root_.Lean.PersistentHashMap _root_.Lean.Meta.DiscrTree.Key (_root_.Lean.Meta.DiscrTree.Trie α) _root_.Lean.Meta.DiscrTree.instBEqKey _root_.Lean.Meta.DiscrTree.instHashableKey
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.FunInfoCache : Type
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.InferTypeCache : Type
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
+axiom Lean.Meta.Simp.Diagnostics : Type
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
+axiom Lean.Meta.Simp.UsedSimps : Type
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.SimpTheorems
+@[reducible] noncomputable def Lean.Meta.SimpTheoremTree : Type := _root_.Lean.Meta.DiscrTree _root_.Lean.Meta.SimpTheorem
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
+structure Lean.Meta.SynthInstanceCacheKey where
+  localInsts : _root_.Lean.LocalInstances
+  type : _root_.Lean.Expr
+  synthPendingDepth : _root_.Nat
+-- role=substrate bucket=- structural=structure module=Lean.Meta.TryThis
+structure Lean.Meta.Tactic.TryThis.TryThisInfo where
+  edit : _root_.Lean.Lsp.TextEdit
+  codeActionTitle : _root_.String
+  suggestion : _root_.Lean.Meta.Tactic.TryThis.Suggestion
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.WhnfCache : Type
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.instInhabitedConfigWithKey : _root_.Inhabited _root_.Lean.Meta.ConfigWithKey
+-- role=substrate bucket=- structural=structure module=Lean.MetavarContext
+structure Lean.MetavarDecl where
+  userName : _root_.Lean.Name
+  lctx : _root_.Lean.LocalContext
+  type : _root_.Lean.Expr
+  depth : _root_.Nat
+  localInstances : _root_.Lean.LocalInstances
+  kind : _root_.Lean.MetavarKind
+  numScopeArgs : _root_.Nat
+  index : _root_.Nat
+-- role=substrate bucket=- structural=class module=Lean.LocalContext
+class Lean.MonadLCtx (m : Type → Type) where
+  getLCtx : m _root_.Lean.LocalContext
+-- role=substrate bucket=- structural=class module=Lean.Log
+class Lean.MonadLog (m : Type → Type) where
+  toMonadFileMap : _root_.Lean.MonadFileMap m
+  getRef : m _root_.Lean.Syntax
+  getFileName : m _root_.String
+  hasErrors : m _root_.Bool
+  logMessage : _root_.Lean.Message → m _root_.Unit
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashSet
+axiom Lean.PHashSet.{u} : (α : Type u) → [_root_.BEq α] → [_root_.Hashable α] → Type u
+-- role=substrate bucket=- structural=structure module=Lean.Parser.Types
+structure Lean.Parser.ParserInfo where
+  collectTokens : _root_.List _root_.Lean.Parser.Token → _root_.List _root_.Lean.Parser.Token
+  collectKinds : _root_.Lean.Parser.SyntaxNodeKindSet → _root_.Lean.Parser.SyntaxNodeKindSet
+  firstTokens : _root_.Lean.Parser.FirstTokens
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentArray
+axiom Lean.PersistentArray.instGetElemNatLtSizeOfInhabited.{u} : {α : Type u} → [_root_.Inhabited α] → _root_.GetElem (_root_.Lean.PersistentArray α) _root_.Nat α fun as i => i < as.size
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashSet
+axiom Lean.PersistentHashSet.mk.{u} : {α : Type u} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.PersistentHashMap α _root_.Unit → _root_.Lean.PersistentHashSet α
+-- role=substrate bucket=- effect=pure module=Lean.Data.PersistentHashSet
+axiom Lean.PersistentHashSet.set.{u} : {α : Type u} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.PersistentHashSet α → _root_.Lean.PersistentHashMap α _root_.Unit
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Structure
+axiom Lean.instInhabitedStructureInfo : _root_.Inhabited _root_.Lean.StructureInfo
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Exception
+axiom Lean.throwError : {m : Type → Type} → {α : Type} → [_root_.Monad m] → [_root_.Lean.MonadError m] → _root_.Lean.MessageData → m α
+-- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic
+axiom Std.DHashMap.{u, v} : (α : Type u) → (α → Type v) → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Basic
+axiom Std.DTreeMap.inner.{u, v} : {α : Type u} → {β : α → Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} → _root_.Std.DTreeMap α β cmp → _root_.Std.DTreeMap.Internal.Impl α β
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Basic pp=explicit
+axiom Std.DTreeMap.mk.{u, v} : {α : Type u} → {β : α → Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} → (inner : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.WF α (@_root_.Ord.mk α cmp) β inner → _root_.Std.DTreeMap α β cmp
+-- role=substrate bucket=- structural=structure module=Std.Data.TreeMap.Basic
+structure Std.TreeMap.{u, v} (α : Type u) (β : Type v) (cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap._auto_1) where
+  inner : _root_.Std.DTreeMap α (fun x => β) cmp
+-- role=substrate bucket=- effect=pure module=Lean.Declaration
+axiom Lean.ConstantInfo.rec.{u} : {motive : _root_.Lean.ConstantInfo → Sort u} → ((val : _root_.Lean.AxiomVal) → motive (_root_.Lean.ConstantInfo.axiomInfo val)) → ((val : _root_.Lean.DefinitionVal) → motive (_root_.Lean.ConstantInfo.defnInfo val)) → ((val : _root_.Lean.TheoremVal) → motive (_root_.Lean.ConstantInfo.thmInfo val)) → ((val : _root_.Lean.OpaqueVal) → motive (_root_.Lean.ConstantInfo.opaqueInfo val)) → ((val : _root_.Lean.QuotVal) → motive (_root_.Lean.ConstantInfo.quotInfo val)) → ((val : _root_.Lean.InductiveVal) → motive (_root_.Lean.ConstantInfo.inductInfo val)) → ((val : _root_.Lean.ConstructorVal) → motive (_root_.Lean.ConstantInfo.ctorInfo val)) → ((val : _root_.Lean.RecursorVal) → motive (_root_.Lean.ConstantInfo.recInfo val)) → (t : _root_.Lean.ConstantInfo) → motive t
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Types
+axiom Lean.Elab.InfoTree.casesOn.{u} : {motive_1 : _root_.Lean.Elab.InfoTree → Sort u} → (t : _root_.Lean.Elab.InfoTree) → ((i : _root_.Lean.Elab.PartialContextInfo) → (t : _root_.Lean.Elab.InfoTree) → motive_1 (_root_.Lean.Elab.InfoTree.context i t)) → ((i : _root_.Lean.Elab.Info) → (children : _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree) → motive_1 (_root_.Lean.Elab.InfoTree.node i children)) → ((mvarId : _root_.Lean.MVarId) → motive_1 (_root_.Lean.Elab.InfoTree.hole mvarId)) → motive_1 t
+-- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
+structure Lean.Elab.Term.State where
+  levelNames : _root_.List _root_.Lean.Name
+  syntheticMVars : _root_.Lean.MVarIdMap _root_.Lean.Elab.Term.SyntheticMVarDecl
+  pendingMVars : _root_.List _root_.Lean.MVarId
+  mvarErrorInfos : _root_.List _root_.Lean.Elab.Term.MVarErrorInfo
+  levelMVarErrorInfos : _root_.List _root_.Lean.Elab.Term.LevelMVarErrorInfo
+  mvarArgNames : _root_.Lean.MVarIdMap _root_.Lean.Name
+  letRecsToLift : _root_.List _root_.Lean.Elab.Term.LetRecToLift
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Main
+axiom Lean.Elab.getInfoTrees : {m : Type → Type} → [_root_.Lean.Elab.MonadInfoTree m] → [_root_.Monad m] → m (_root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree)
+-- role=substrate bucket=- effect=pure module=Lean.Expr
+axiom Lean.Expr.rec.{u} : {motive : _root_.Lean.Expr → Sort u} → ((deBruijnIndex : _root_.Nat) → motive (_root_.Lean.Expr.bvar deBruijnIndex)) → ((fvarId : _root_.Lean.FVarId) → motive (_root_.Lean.Expr.fvar fvarId)) → ((mvarId : _root_.Lean.MVarId) → motive (_root_.Lean.Expr.mvar mvarId)) → ((u : _root_.Lean.Level) → motive (_root_.Lean.Expr.sort u)) → ((declName : _root_.Lean.Name) → (us : _root_.List _root_.Lean.Level) → motive (_root_.Lean.Expr.const declName us)) → ((fn arg : _root_.Lean.Expr) → motive fn → motive arg → motive (fn.app arg)) → ((binderName : _root_.Lean.Name) → (binderType body : _root_.Lean.Expr) → (binderInfo : _root_.Lean.BinderInfo) → motive binderType → motive body → motive (_root_.Lean.Expr.lam binderName binderType body binderInfo)) → ((binderName : _root_.Lean.Name) → (binderType body : _root_.Lean.Expr) → (binderInfo : _root_.Lean.BinderInfo) → motive binderType → motive body → motive (_root_.Lean.Expr.forallE binderName binderType body binderInfo)) → ((declName : _root_.Lean.Name) → (type value body : _root_.Lean.Expr) → (nondep : _root_.Bool) → motive type → motive value → motive body → motive (_root_.Lean.Expr.letE declName type value body nondep)) → ((a : _root_.Lean.Literal) → motive (_root_.Lean.Expr.lit a)) → ((data : _root_.Lean.MData) → (expr : _root_.Lean.Expr) → motive expr → motive (_root_.Lean.Expr.mdata data expr)) → ((typeName : _root_.Lean.Name) → (idx : _root_.Nat) → (struct : _root_.Lean.Expr) → motive struct → motive (_root_.Lean.Expr.proj typeName idx struct)) → (t : _root_.Lean.Expr) → motive t
+-- role=substrate bucket=- structural=structure module=Lean.Language.Basic
+structure Lean.Language.Snapshot.Diagnostics where
+  msgLog : _root_.Lean.MessageLog
+  interactiveDiagsRef? : _root_.Option (_root_.IO.Ref (_root_.Option _root_.Dynamic))
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Init
+axiom Lean.Linter.logLint : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.Option _root_.Bool → _root_.Lean.Syntax → _root_.Lean.MessageData → m _root_.Unit
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Message
+axiom Lean.MessageLog.hasErrors : _root_.Lean.MessageLog → _root_.Bool
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.Diagnostics.heuristicCounter : _root_.Lean.Meta.Diagnostics → _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
@@ -1438,16 +1310,16 @@ axiom Lean.Meta.Diagnostics.synthPendingFailures : _root_.Lean.Meta.Diagnostics 
 axiom Lean.Meta.Diagnostics.unfoldAxiomCounter : _root_.Lean.Meta.Diagnostics → _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.Diagnostics.unfoldCounter : _root_.Lean.Meta.Diagnostics → _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types pp=explicit
-axiom Lean.Meta.DiscrTree.mk : {α : Type} → @_root_.Lean.PersistentHashMap _root_.Lean.Meta.DiscrTree.Key (_root_.Lean.Meta.DiscrTree.Trie α) _root_.Lean.Meta.DiscrTree.instBEqKey _root_.Lean.Meta.DiscrTree.instHashableKey → _root_.Lean.Meta.DiscrTree α
--- role=substrate bucket=- effect=pure module=Lean.Meta.DiscrTree.Types pp=explicit
-axiom Lean.Meta.DiscrTree.root : {α : Type} → _root_.Lean.Meta.DiscrTree α → @_root_.Lean.PersistentHashMap _root_.Lean.Meta.DiscrTree.Key (_root_.Lean.Meta.DiscrTree.Trie α) _root_.Lean.Meta.DiscrTree.instBEqKey _root_.Lean.Meta.DiscrTree.instHashableKey
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Ext
 structure Lean.Meta.Ext.ExtTheorems where
   tree : _root_.Lean.Meta.DiscrTree _root_.Lean.Meta.Ext.ExtTheorem
   erased : _root_.Lean.PHashSet _root_.Lean.Name
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Rfl
-axiom Lean.Meta.Rfl.reflExt : _root_.Lean.SimpleScopedEnvExtension (_root_.Lean.Name × _root_.Array _root_.Lean.Meta.DiscrTree.Key) (_root_.Lean.Meta.DiscrTree _root_.Lean.Name)
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
+structure Lean.Meta.PostponedEntry where
+  ref : _root_.Lean.Syntax
+  lhs : _root_.Lean.Level
+  rhs : _root_.Lean.Level
+  ctx? : _root_.Option _root_.Lean.Meta.DefEqContext
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
 axiom Lean.Meta.Simp.Diagnostics.congrThmCounter : _root_.Lean.Meta.Simp.Diagnostics → _root_.Lean.PHashMap _root_.Lean.Name _root_.Nat
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types pp=explicit
@@ -1468,6 +1340,66 @@ axiom Lean.Meta.Simp.UsedSimps.map : _root_.Lean.Meta.Simp.UsedSimps → @_root_
 axiom Lean.Meta.Simp.UsedSimps.mk : @_root_.Lean.PHashMap _root_.Lean.Meta.Origin _root_.Nat _root_.Lean.Meta.instBEqOrigin _root_.Lean.Meta.instHashableOrigin → _root_.Nat → _root_.Lean.Meta.Simp.UsedSimps
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.Types
 axiom Lean.Meta.Simp.UsedSimps.size : _root_.Lean.Meta.Simp.UsedSimps → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
+axiom Lean.Meta.SimpTheorems : Type
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.TryThis
+axiom Lean.Meta.Tactic.TryThis.instTypeNameTryThisInfo : _root_.TypeName _root_.Lean.Meta.Tactic.TryThis.TryThisInfo
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.instBEqSynthInstanceCacheKey : _root_.BEq _root_.Lean.Meta.SynthInstanceCacheKey
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.instHashableSynthInstanceCacheKey : _root_.Hashable _root_.Lean.Meta.SynthInstanceCacheKey
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext : Type
+-- role=substrate bucket=- structural=structure module=Lean.Parser.Types
+structure Lean.Parser.Parser where
+  info : _root_.Lean.Parser.ParserInfo
+  fn : _root_.Lean.Parser.ParserFn
+-- role=substrate bucket=- effect=pure module=Lean.PrettyPrinter.Delaborator.SubExpr
+axiom Lean.PrettyPrinter.Delaborator.OptionsPerPos : Type
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
+axiom Lean.instInhabitedMetavarDecl : _root_.Inhabited _root_.Lean.MetavarDecl
+-- role=demanded bucket=R-NONE effect=pure module=Lean.LocalContext
+axiom Lean.instMonadLCtxOfMonadLift : {m n : Type → Type} → [_root_.MonadLift m n] → [_root_.Lean.MonadLCtx m] → _root_.Lean.MonadLCtx n
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Log
+axiom Lean.logInfoAt : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.Syntax → _root_.Lean.MessageData → m _root_.Unit
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Log
+axiom Lean.logWarning : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.MessageData → m _root_.Unit
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Log
+axiom Lean.logWarningAt : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.Syntax → _root_.Lean.MessageData → m _root_.Unit
+-- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic
+axiom Std.DHashMap.inner.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Std.DHashMap α β → _root_.Std.DHashMap.Raw α β
+-- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic
+axiom Std.DHashMap.mk.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → (inner : _root_.Std.DHashMap.Raw α β) → inner.WF → _root_.Std.DHashMap α β
+-- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Basic pp=explicit
+axiom Std.DTreeMap.wf.{u, v} : ∀ {α : Type u} {β : α → Type v} {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} (self : _root_.Std.DTreeMap α β cmp), @_root_.Std.DTreeMap.Internal.Impl.WF α (@_root_.Ord.mk α cmp) β (@_root_.Std.DTreeMap.inner α β cmp self)
+-- role=substrate bucket=- effect=pure module=Std.Data.HashMap.Basic
+axiom Std.HashMap.{u, v} : (α : Type u) → Type v → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
+-- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
+axiom Std.TreeMap.instEmptyCollection.{u, v} : {α : Type u} → {β : Type v} → {cmp : α → α → _root_.Ordering} → _root_.EmptyCollection (_root_.Std.TreeMap α β cmp)
+-- role=demanded bucket=R-NONE transparent module=Lean.Declaration
+@[reducible] noncomputable def Lean.ConstantInfo.casesOn.{u} : {motive : _root_.Lean.ConstantInfo → Sort u} → (t : _root_.Lean.ConstantInfo) → ((val : _root_.Lean.AxiomVal) → motive (_root_.Lean.ConstantInfo.axiomInfo val)) → ((val : _root_.Lean.DefinitionVal) → motive (_root_.Lean.ConstantInfo.defnInfo val)) → ((val : _root_.Lean.TheoremVal) → motive (_root_.Lean.ConstantInfo.thmInfo val)) → ((val : _root_.Lean.OpaqueVal) → motive (_root_.Lean.ConstantInfo.opaqueInfo val)) → ((val : _root_.Lean.QuotVal) → motive (_root_.Lean.ConstantInfo.quotInfo val)) → ((val : _root_.Lean.InductiveVal) → motive (_root_.Lean.ConstantInfo.inductInfo val)) → ((val : _root_.Lean.ConstructorVal) → motive (_root_.Lean.ConstantInfo.ctorInfo val)) → ((val : _root_.Lean.RecursorVal) → motive (_root_.Lean.ConstantInfo.recInfo val)) → motive t := fun {motive} t axiomInfo defnInfo thmInfo opaqueInfo quotInfo inductInfo ctorInfo recInfo => _root_.Lean.ConstantInfo.rec (fun val => axiomInfo val) (fun val => defnInfo val) (fun val => thmInfo val) (fun val => opaqueInfo val) (fun val => quotInfo val) (fun val => inductInfo val) (fun val => ctorInfo val) (fun val => recInfo val) t
+-- role=substrate bucket=- structural=structure module=Lean.Elab.InfoTree.Types
+structure Lean.Elab.TacticInfo where
+  toElabInfo : _root_.Lean.Elab.ElabInfo
+  mctxBefore : _root_.Lean.MetavarContext
+  goalsBefore : _root_.List _root_.Lean.MVarId
+  mctxAfter : _root_.Lean.MetavarContext
+  goalsAfter : _root_.List _root_.Lean.MVarId
+-- role=substrate bucket=- effect=pure module=Lean.Environment
+axiom Lean.EnvironmentHeader : Type
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Expr
+axiom Lean.Expr.below.{u} : {motive : _root_.Lean.Expr → Sort u} → _root_.Lean.Expr → Sort (max 1 u)
+-- role=substrate bucket=- effect=pure module=Lean.Expr
+axiom Lean.ExprMap : Type → Type
+-- role=substrate bucket=- effect=pure module=Lean.Expr
+axiom Lean.ExprStructMap : Type → Type
+-- role=substrate bucket=- structural=structure module=Lean.Language.Basic
+structure Lean.Language.Snapshot where
+  desc : _root_.autoParam _root_.String _root_.Lean.Language.Snapshot.desc._autoParam
+  diagnostics : _root_.Lean.Language.Snapshot.Diagnostics
+  infoTree? : _root_.Option _root_.Lean.Elab.InfoTree
+  traces : _root_.Lean.TraceState
+  isFatal : _root_.Bool
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems pp=explicit
 axiom Lean.Meta.SimpTheorems.erased : _root_.Lean.Meta.SimpTheorems → @_root_.Lean.PHashSet _root_.Lean.Meta.Origin _root_.Lean.Meta.instBEqOrigin _root_.Lean.Meta.instHashableOrigin
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems pp=explicit
@@ -1482,30 +1414,38 @@ axiom Lean.Meta.SimpTheorems.pre : _root_.Lean.Meta.SimpTheorems → _root_.Lean
 axiom Lean.Meta.SimpTheorems.toUnfold : _root_.Lean.Meta.SimpTheorems → _root_.Lean.PHashSet _root_.Lean.Name
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpTheorems
 axiom Lean.Meta.SimpTheorems.toUnfoldThms : _root_.Lean.Meta.SimpTheorems → _root_.Lean.PHashMap _root_.Lean.Name (_root_.Array _root_.Lean.Name)
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Symm
-axiom Lean.Meta.Symm.symmExt : _root_.Lean.SimpleScopedEnvExtension (_root_.Lean.Name × _root_.Array _root_.Lean.Meta.DiscrTree.Key) (_root_.Lean.Meta.DiscrTree _root_.Lean.Name)
--- role=substrate bucket=- structural=structure module=Lean.Meta.TryThis
-structure Lean.Meta.Tactic.TryThis.TryThisInfo where
-  edit : _root_.Lean.Lsp.TextEdit
-  codeActionTitle : _root_.String
-  suggestion : _root_.Lean.Meta.Tactic.TryThis.Suggestion
--- role=substrate bucket=- effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Attr
-axiom Lean.Meta.getSimpTheorems : _root_.Lean.Core.CoreM _root_.Lean.Meta.SimpTheorems
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.SimpTheorems
+@[reducible] noncomputable def Lean.Meta.SimpTheoremsArray : Type := _root_.Array _root_.Lean.Meta.SimpTheorems
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.instInhabitedConfigWithKey : _root_.Inhabited _root_.Lean.Meta.ConfigWithKey
--- role=substrate bucket=- structural=structure module=Lean.MetavarContext
-structure Lean.MetavarDecl where
-  userName : _root_.Lean.Name
-  lctx : _root_.Lean.LocalContext
-  type : _root_.Lean.Expr
-  depth : _root_.Nat
-  localInstances : _root_.Lean.LocalInstances
-  kind : _root_.Lean.MetavarKind
-  numScopeArgs : _root_.Nat
-  index : _root_.Nat
--- role=substrate bucket=- structural=class module=Lean.LocalContext
-class Lean.MonadLCtx (m : Type → Type) where
-  getLCtx : m _root_.Lean.LocalContext
+axiom Lean.Meta.SynthInstanceCache : Type
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
+axiom Lean.MetavarContext.dAssignment : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.DelayedMetavarAssignment _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext pp=explicit
+axiom Lean.MetavarContext.decls : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.MetavarDecl _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext.depth : _root_.Lean.MetavarContext → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
+axiom Lean.MetavarContext.eAssignment : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.Expr _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext.findDecl? : _root_.Lean.MetavarContext → _root_.Lean.MVarId → _root_.Option _root_.Lean.MetavarDecl
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
+axiom Lean.MetavarContext.lAssignment : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.LMVarId _root_.Lean.Level _root_.Lean.instBEqLevelMVarId _root_.Lean.instHashableLevelMVarId
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
+axiom Lean.MetavarContext.lDecls : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.LMVarId _root_.Lean.LevelMetavarDecl _root_.Lean.instBEqLevelMVarId _root_.Lean.instHashableLevelMVarId
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext.levelAssignDepth : _root_.Lean.MetavarContext → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext.lmvarCounter : _root_.Lean.MetavarContext → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
+axiom Lean.MetavarContext.mk : _root_.Nat → _root_.Nat → _root_.Nat → _root_.Nat → @_root_.Lean.PersistentHashMap _root_.Lean.LMVarId _root_.Lean.LevelMetavarDecl _root_.Lean.instBEqLevelMVarId _root_.Lean.instHashableLevelMVarId → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.MetavarDecl _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId → @_root_.Lean.PersistentHashMap _root_.Lean.Name _root_.Lean.MVarId _root_.Lean.Name.instBEq _root_.Lean.instHashableName → @_root_.Lean.PersistentHashMap _root_.Lean.LMVarId _root_.Lean.Level _root_.Lean.instBEqLevelMVarId _root_.Lean.instHashableLevelMVarId → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.Expr _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.DelayedMetavarAssignment _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId → _root_.Lean.MetavarContext
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext.mvarCounter : _root_.Lean.MetavarContext → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.MetavarContext
+axiom Lean.MetavarContext.userNames : _root_.Lean.MetavarContext → _root_.Lean.PersistentHashMap _root_.Lean.Name _root_.Lean.MVarId
+-- role=substrate bucket=- structural=class module=Lean.MetavarContext
+class Lean.MonadMCtx (m : Type → Type) where
+  getMCtx : m _root_.Lean.MetavarContext
+  modifyMCtx : (_root_.Lean.MetavarContext → _root_.Lean.MetavarContext) → m _root_.Unit
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Command
 axiom Lean.Parser.Command.declId : _root_.Lean.Parser.Parser
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Command
@@ -1560,137 +1500,22 @@ axiom Lean.Parser.Term.cdot : _root_.Lean.Parser.Parser
 axiom Lean.Parser.Term.dynamicQuot : _root_.Lean.Parser.Parser
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Term
 axiom Lean.Parser.Term.matchDiscr : _root_.Lean.Parser.Parser
--- role=demanded bucket=R-NONE effect=pure module=Lean.Data.PersistentArray
-axiom Lean.PersistentArray.instGetElemNatLtSizeOfInhabited.{u} : {α : Type u} → [_root_.Inhabited α] → _root_.GetElem (_root_.Lean.PersistentArray α) _root_.Nat α fun as i => i < as.size
--- role=demanded bucket=R-NONE effect=pure module=Lean.Structure
-axiom Lean.instInhabitedStructureInfo : _root_.Inhabited _root_.Lean.StructureInfo
--- role=demanded bucket=R-NONE effect=pure module=Lean.Log
-axiom Lean.logInfoAt : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.Syntax → _root_.Lean.MessageData → m _root_.Unit
--- role=demanded bucket=R-NONE effect=pure module=Lean.Log
-axiom Lean.logWarning : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.MessageData → m _root_.Unit
--- role=demanded bucket=R-NONE effect=pure module=Lean.Log
-axiom Lean.logWarningAt : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadLog m] → [_root_.Lean.AddMessageContext m] → [_root_.Lean.MonadOptions m] → _root_.Lean.Syntax → _root_.Lean.MessageData → m _root_.Unit
--- role=demanded bucket=R-EFFECT effect=io module=Lean.Attributes
-axiom Lean.registerBuiltinAttribute : _root_.Lean.AttributeImpl → _root_.IO _root_.Unit
--- role=demanded bucket=R-NONE effect=pure module=Lean.Exception
-axiom Lean.throwError : {m : Type → Type} → {α : Type} → [_root_.Monad m] → [_root_.Lean.MonadError m] → _root_.Lean.MessageData → m α
--- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic
-axiom Std.DHashMap.{u, v} : (α : Type u) → (α → Type v) → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Basic
-axiom Std.DTreeMap.inner.{u, v} : {α : Type u} → {β : α → Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} → _root_.Std.DTreeMap α β cmp → _root_.Std.DTreeMap.Internal.Impl α β
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Basic pp=explicit
-axiom Std.DTreeMap.mk.{u, v} : {α : Type u} → {β : α → Type v} → {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} → (inner : _root_.Std.DTreeMap.Internal.Impl α β) → @_root_.Std.DTreeMap.Internal.Impl.WF α (@_root_.Ord.mk α cmp) β inner → _root_.Std.DTreeMap α β cmp
--- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
-axiom Std.TreeMap.{u, v} : (α : Type u) → Type v → _root_.autoParam (α → α → _root_.Ordering) _root_.Std.TreeMap._auto_1 → Type (max u v)
--- role=demanded bucket=R-NONE effect=pure module=Lean.Declaration
-axiom Lean.ConstantInfo.casesOn.{u} : {motive : _root_.Lean.ConstantInfo → Sort u} → (t : _root_.Lean.ConstantInfo) → ((val : _root_.Lean.AxiomVal) → motive (_root_.Lean.ConstantInfo.axiomInfo val)) → ((val : _root_.Lean.DefinitionVal) → motive (_root_.Lean.ConstantInfo.defnInfo val)) → ((val : _root_.Lean.TheoremVal) → motive (_root_.Lean.ConstantInfo.thmInfo val)) → ((val : _root_.Lean.OpaqueVal) → motive (_root_.Lean.ConstantInfo.opaqueInfo val)) → ((val : _root_.Lean.QuotVal) → motive (_root_.Lean.ConstantInfo.quotInfo val)) → ((val : _root_.Lean.InductiveVal) → motive (_root_.Lean.ConstantInfo.inductInfo val)) → ((val : _root_.Lean.ConstructorVal) → motive (_root_.Lean.ConstantInfo.ctorInfo val)) → ((val : _root_.Lean.RecursorVal) → motive (_root_.Lean.ConstantInfo.recInfo val)) → motive t
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadInfoTreeCommandElabM : _root_.Lean.Elab.MonadInfoTree _root_.Lean.Elab.Command.CommandElabM
--- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
-structure Lean.Elab.Term.State where
-  levelNames : _root_.List _root_.Lean.Name
-  syntheticMVars : _root_.Lean.MVarIdMap _root_.Lean.Elab.Term.SyntheticMVarDecl
-  pendingMVars : _root_.List _root_.Lean.MVarId
-  mvarErrorInfos : _root_.List _root_.Lean.Elab.Term.MVarErrorInfo
-  levelMVarErrorInfos : _root_.List _root_.Lean.Elab.Term.LevelMVarErrorInfo
-  mvarArgNames : _root_.Lean.MVarIdMap _root_.Lean.Name
-  letRecsToLift : _root_.List _root_.Lean.Elab.Term.LetRecToLift
--- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Main
-axiom Lean.Elab.getInfoTrees : {m : Type → Type} → [_root_.Lean.Elab.MonadInfoTree m] → [_root_.Monad m] → m (_root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree)
--- role=substrate bucket=- structural=structure module=Lean.Language.Basic
-structure Lean.Language.Snapshot where
-  desc : _root_.autoParam _root_.String _root_.Lean.Language.Snapshot.desc._autoParam
-  diagnostics : _root_.Lean.Language.Snapshot.Diagnostics
-  infoTree? : _root_.Option _root_.Lean.Elab.InfoTree
-  traces : _root_.Lean.TraceState
-  isFatal : _root_.Bool
--- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
-structure Lean.Meta.Context where
-  keyedConfig : _root_.Lean.Meta.ConfigWithKey
-  trackZetaDelta : _root_.Bool
-  zetaDeltaSet : _root_.Lean.FVarIdSet
-  lctx : _root_.Lean.LocalContext
-  localInstances : _root_.Lean.LocalInstances
-  defEqCtx? : _root_.Option _root_.Lean.Meta.DefEqContext
-  synthPendingDepth : _root_.Nat
-  canUnfold? : _root_.Option (_root_.Lean.Meta.Config → _root_.Lean.ConstantInfo → _root_.Lean.Core.CoreM _root_.Bool)
-  univApprox : _root_.Bool
-  inTypeClassResolution : _root_.Bool
-  cacheInferType : _root_.Bool
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Ext
-axiom Lean.Meta.Ext.extExtension : _root_.Lean.SimpleScopedEnvExtension _root_.Lean.Meta.Ext.ExtTheorem _root_.Lean.Meta.Ext.ExtTheorems
--- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
-structure Lean.Meta.PostponedEntry where
-  ref : _root_.Lean.Syntax
-  lhs : _root_.Lean.Level
-  rhs : _root_.Lean.Level
-  ctx? : _root_.Option _root_.Lean.Meta.DefEqContext
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.TryThis
-axiom Lean.Meta.Tactic.TryThis.instTypeNameTryThisInfo : _root_.TypeName _root_.Lean.Meta.Tactic.TryThis.TryThisInfo
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.instMonadLCtxMetaM : _root_.Lean.MonadLCtx _root_.Lean.Meta.MetaM
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
-axiom Lean.instInhabitedMetavarDecl : _root_.Inhabited _root_.Lean.MetavarDecl
--- role=demanded bucket=R-NONE effect=pure module=Lean.LocalContext
-axiom Lean.instMonadLCtxOfMonadLift : {m n : Type → Type} → [_root_.MonadLift m n] → [_root_.Lean.MonadLCtx m] → _root_.Lean.MonadLCtx n
--- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic pp=explicit
-axiom Std.DHashMap.inner.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → @_root_.Std.DHashMap α β inst inst_1 → _root_.Std.DHashMap.Raw α β
--- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic pp=explicit
-axiom Std.DHashMap.mk.{u, v} : {α : Type u} → {β : α → Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → (inner : _root_.Std.DHashMap.Raw α β) → @_root_.Std.DHashMap.Raw.WF α β inst inst_1 inner → @_root_.Std.DHashMap α β inst inst_1
--- role=substrate bucket=- effect=pure module=Std.Data.DTreeMap.Basic pp=explicit
-axiom Std.DTreeMap.wf.{u, v} : ∀ {α : Type u} {β : α → Type v} {cmp : _root_.autoParam (α → α → _root_.Ordering) _root_.Std.DTreeMap._auto_1} (self : _root_.Std.DTreeMap α β cmp), @_root_.Std.DTreeMap.Internal.Impl.WF α (@_root_.Ord.mk α cmp) β (@_root_.Std.DTreeMap.inner α β cmp self)
--- role=substrate bucket=- effect=pure module=Std.Data.HashMap.Basic
-axiom Std.HashMap.{u, v} : (α : Type u) → Type v → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
--- role=substrate bucket=- effect=pure module=Std.Data.TreeMap.Basic
-axiom Std.TreeMap.instEmptyCollection.{u, v} : {α : Type u} → {β : Type v} → {cmp : α → α → _root_.Ordering} → _root_.EmptyCollection (_root_.Std.TreeMap α β cmp)
--- role=substrate bucket=- structural=structure module=Lean.Elab.InfoTree.Types
-structure Lean.Elab.TacticInfo where
-  toElabInfo : _root_.Lean.Elab.ElabInfo
-  mctxBefore : _root_.Lean.MetavarContext
-  goalsBefore : _root_.List _root_.Lean.MVarId
-  mctxAfter : _root_.Lean.MetavarContext
-  goalsAfter : _root_.List _root_.Lean.MVarId
--- role=substrate bucket=- effect=pure module=Lean.Environment
-axiom Lean.EnvironmentHeader : Type
--- role=substrate bucket=- effect=pure module=Lean.Language.Basic
-axiom Lean.Language.SnapshotTree : Type
--- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
-structure Lean.Meta.State where
-  mctx : _root_.Lean.MetavarContext
-  cache : _root_.Lean.Meta.Cache
-  zetaDeltaFVarIds : _root_.Lean.FVarIdSet
-  postponed : _root_.Lean.PersistentArray _root_.Lean.Meta.PostponedEntry
-  diag : _root_.Lean.Meta.Diagnostics
--- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
-axiom Lean.Meta.withMCtx.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.MetavarContext → n α → n α
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
-axiom Lean.MetavarContext.dAssignment : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.DelayedMetavarAssignment _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
--- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext pp=explicit
-axiom Lean.MetavarContext.decls : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.MetavarDecl _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext.depth : _root_.Lean.MetavarContext → _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext pp=explicit
-axiom Lean.MetavarContext.eAssignment : _root_.Lean.MetavarContext → @_root_.Lean.PersistentHashMap _root_.Lean.MVarId _root_.Lean.Expr _root_.Lean.instBEqMVarId _root_.Lean.instHashableMVarId
--- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext.findDecl? : _root_.Lean.MetavarContext → _root_.Lean.MVarId → _root_.Option _root_.Lean.MetavarDecl
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext.levelAssignDepth : _root_.Lean.MetavarContext → _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext.lmvarCounter : _root_.Lean.MetavarContext → _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext.mvarCounter : _root_.Lean.MetavarContext → _root_.Nat
--- role=substrate bucket=- effect=pure module=Lean.MetavarContext
-axiom Lean.MetavarContext.userNames : _root_.Lean.MetavarContext → _root_.Lean.PersistentHashMap _root_.Lean.Name _root_.Lean.MVarId
--- role=substrate bucket=- structural=class module=Lean.MetavarContext
-class Lean.MonadMCtx (m : Type → Type) where
-  getMCtx : m _root_.Lean.MetavarContext
-  modifyMCtx : (_root_.Lean.MetavarContext → _root_.Lean.MetavarContext) → m _root_.Unit
+-- role=substrate bucket=- transparent module=Lean.Parser.Types
+@[reducible] noncomputable def Lean.Parser.TrailingParser : Type := _root_.Lean.Parser.Parser
 -- role=substrate bucket=- effect=pure module=Lean.Data.SMap
 axiom Lean.SMap.{u, v} : (α : Type u) → Type v → [_root_.BEq α] → [_root_.Hashable α] → Type (max u v)
--- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic pp=explicit
-axiom Std.DHashMap.wf.{u, v} : ∀ {α : Type u} {β : α → Type v} [inst : _root_.BEq α] [inst_1 : _root_.Hashable α] (self : @_root_.Std.DHashMap α β inst inst_1), @_root_.Std.DHashMap.Raw.WF α β inst inst_1 (@_root_.Std.DHashMap.inner α β inst inst_1 self)
+-- role=substrate bucket=- effect=pure module=Std.Data.DHashMap.Basic
+axiom Std.DHashMap.wf.{u, v} : ∀ {α : Type u} {β : α → Type v} [inst : _root_.BEq α] [inst_1 : _root_.Hashable α] (self : _root_.Std.DHashMap α β), self.inner.WF
+-- role=substrate bucket=- effect=pure module=Std.Data.HashMap.Basic
+axiom Std.HashMap.inner.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Std.HashMap α β → _root_.Std.DHashMap α fun x => β
+-- role=substrate bucket=- effect=pure module=Std.Data.HashMap.Basic
+axiom Std.HashMap.mk.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → (_root_.Std.DHashMap α fun x => β) → _root_.Std.HashMap α β
+-- role=substrate bucket=- effect=pure module=Std.Data.HashSet.Basic
+axiom Std.HashSet.{u} : (α : Type u) → [_root_.BEq α] → [_root_.Hashable α] → Type u
+-- role=substrate bucket=- effect=pure module=Lean.Environment
+axiom Lean.ConstMap : Type
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context : Type
 -- role=substrate bucket=- effect=pure module=Lean.Environment
 axiom Lean.EnvironmentHeader.importAllModules : _root_.Lean.EnvironmentHeader → _root_.Array _root_.Lean.EffectiveImport
 -- role=substrate bucket=- effect=pure module=Lean.Environment
@@ -1707,6 +1532,84 @@ axiom Lean.EnvironmentHeader.modules : _root_.Lean.EnvironmentHeader → _root_.
 axiom Lean.EnvironmentHeader.regions : _root_.Lean.EnvironmentHeader → _root_.Array _root_.Lean.CompactedRegion
 -- role=substrate bucket=- effect=pure module=Lean.Environment
 axiom Lean.EnvironmentHeader.trustLevel : _root_.Lean.EnvironmentHeader → _root_.UInt32
+-- role=substrate bucket=- effect=pure module=Lean.Expr pp=explicit
+axiom Lean.Expr.brecOn.go.{u} : {motive : _root_.Lean.Expr → Sort u} → (t : _root_.Lean.Expr) → ((t : _root_.Lean.Expr) → @_root_.Lean.Expr.below motive t → motive t) → _root_.PProd (motive t) (@_root_.Lean.Expr.below motive t)
+-- role=substrate bucket=- effect=pure module=Lean.Language.Basic
+axiom Lean.Language.SnapshotTree : Type
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
+structure Lean.Meta.Cache where
+  inferType : _root_.Lean.Meta.InferTypeCache
+  funInfo : _root_.Lean.Meta.FunInfoCache
+  synthInstance : _root_.Lean.Meta.SynthInstanceCache
+  whnf : _root_.Lean.Meta.WhnfCache
+  defEqTrans : _root_.Lean.Meta.DefEqCache
+  defEqPerm : _root_.Lean.Meta.DefEqCache
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.CongrCache : Type := _root_.Lean.ExprMap (_root_.Option _root_.Lean.Meta.CongrTheorem)
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpCongrTheorems
+axiom Lean.Meta.SimpCongrTheorems : Type
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Command
+axiom Lean.Parser.Command.in : _root_.Lean.Parser.TrailingParser
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Parser.Term
+axiom Lean.Parser.Term.app : _root_.Lean.Parser.TrailingParser
+-- role=substrate bucket=- effect=pure module=Lean.Expr
+axiom Lean.SExprMap : Type → Type
+-- role=substrate bucket=- effect=pure module=Lean.Data.SMap
+axiom Lean.SMap.«map₁».{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.SMap α β → _root_.Std.HashMap α β
+-- role=substrate bucket=- effect=pure module=Lean.Data.SMap
+axiom Lean.SMap.«map₂».{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.SMap α β → _root_.Lean.PHashMap α β
+-- role=substrate bucket=- effect=pure module=Lean.Data.SMap
+axiom Lean.SMap.mk.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Bool → _root_.Std.HashMap α β → _root_.Lean.PHashMap α β → _root_.Lean.SMap α β
+-- role=substrate bucket=- effect=pure module=Lean.Data.SMap
+axiom Lean.SMap.«stage₁».{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Lean.SMap α β → _root_.Bool
+-- role=substrate bucket=- effect=pure module=Lean.ScopedEnvExtension
+axiom Lean.ScopedEnvExtension.ScopedEntries : Type → Type
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
+axiom Lean.instMonadMCtxOfMonadLift : (m n : Type → Type) → [_root_.MonadLift m n] → [_root_.Lean.MonadMCtx m] → _root_.Lean.MonadMCtx n
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
+axiom Lean.instantiateMVarDeclMVars : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadMCtx m] → _root_.Lean.MVarId → m _root_.Unit
+-- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
+axiom Lean.instantiateMVars : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadMCtx m] → _root_.Lean.Expr → m _root_.Lean.Expr
+-- role=substrate bucket=- effect=pure module=Std.Data.HashSet.Basic
+axiom Std.HashSet.inner.{u} : {α : Type u} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Std.HashSet α → _root_.Std.HashMap α _root_.Unit
+-- role=substrate bucket=- effect=pure module=Std.Data.HashSet.Basic
+axiom Std.HashSet.mk.{u} : {α : Type u} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Std.HashMap α _root_.Unit → _root_.Std.HashSet α
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.cancelTk? : _root_.Lean.Core.Context → _root_.Option _root_.IO.CancelToken
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.currMacroScope : _root_.Lean.Core.Context → _root_.Lean.MacroScope
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.currNamespace : _root_.Lean.Core.Context → _root_.Lean.Name
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.currRecDepth : _root_.Lean.Core.Context → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.diag : _root_.Lean.Core.Context → _root_.Bool
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.fileMap : _root_.Lean.Core.Context → _root_.Lean.FileMap
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.fileName : _root_.Lean.Core.Context → _root_.String
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.inheritedTraceOptions : _root_.Lean.Core.Context → _root_.Std.HashSet _root_.Lean.Name
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.initHeartbeats : _root_.Lean.Core.Context → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.maxHeartbeats : _root_.Lean.Core.Context → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.maxRecDepth : _root_.Lean.Core.Context → _root_.Nat
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.mk : _root_.String → _root_.Lean.FileMap → _root_.Lean.Options → _root_.Nat → _root_.Nat → _root_.Lean.Syntax → _root_.Lean.Name → _root_.List _root_.Lean.OpenDecl → _root_.Nat → _root_.Nat → _root_.Lean.Name → _root_.Lean.MacroScope → _root_.Bool → _root_.Option _root_.IO.CancelToken → _root_.Bool → _root_.Std.HashSet _root_.Lean.Name → _root_.Lean.Core.Context
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.openDecls : _root_.Lean.Core.Context → _root_.List _root_.Lean.OpenDecl
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.options : _root_.Lean.Core.Context → _root_.Lean.Options
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.quotContext : _root_.Lean.Core.Context → _root_.Lean.Name
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.ref : _root_.Lean.Core.Context → _root_.Lean.Syntax
+-- role=substrate bucket=- effect=pure module=Lean.CoreM
+axiom Lean.Core.Context.suppressElabErrors : _root_.Lean.Core.Context → _root_.Bool
+-- role=demanded bucket=R-NONE transparent module=Lean.Expr
+@[reducible] noncomputable def Lean.Expr.brecOn.{u} : {motive : _root_.Lean.Expr → Sort u} → (t : _root_.Lean.Expr) → ((t : _root_.Lean.Expr) → @_root_.Lean.Expr.below motive t → motive t) → motive t := fun {motive} t F_1 => (_root_.Lean.Expr.brecOn.go t F_1).1
 -- role=substrate bucket=- effect=pure module=Lean.Environment
 axiom Lean.Kernel.Environment : Type
 -- role=substrate bucket=- structural=structure module=Lean.Language.Basic
@@ -1719,24 +1622,43 @@ axiom Lean.Language.SnapshotTree.children : _root_.Lean.Language.SnapshotTree �
 axiom Lean.Language.SnapshotTree.element : _root_.Lean.Language.SnapshotTree → _root_.Lean.Language.Snapshot
 -- role=substrate bucket=- effect=pure module=Lean.Language.Basic
 axiom Lean.Language.SnapshotTree.mk : _root_.Lean.Language.Snapshot → _root_.Array (_root_.Lean.Language.SnapshotTask _root_.Lean.Language.SnapshotTree) → _root_.Lean.Language.SnapshotTree
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.Cache : Type := _root_.Lean.SExprMap _root_.Lean.Meta.Simp.Result
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
+structure Lean.Meta.Simp.Context where
+  config : _root_.Lean.Meta.Simp.Config
+  userConfig : _root_.Lean.Options
+  zetaDeltaSet : _root_.Lean.FVarIdSet
+  initUsedZetaDelta : _root_.Lean.FVarIdSet
+  metaConfig : _root_.Lean.Meta.ConfigWithKey
+  indexConfig : _root_.Lean.Meta.ConfigWithKey
+  maxDischargeDepth : _root_.UInt32
+  simpTheorems : _root_.Lean.Meta.SimpTheoremsArray
+  congrTheorems : _root_.Lean.Meta.SimpCongrTheorems
+  parent? : _root_.Option _root_.Lean.Expr
+  dischargeDepth : _root_.UInt32
+  lctxInitIndices : _root_.Nat
+  inDSimp : _root_.Bool
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpCongrTheorems
-axiom Lean.Meta.SimpCongrTheorems : Type
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.instMonadMCtxMetaM : _root_.Lean.MonadMCtx _root_.Lean.Meta.MetaM
--- role=substrate bucket=- effect=pure module=Lean.Data.SMap pp=explicit
-axiom Lean.SMap.«map₁».{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → @_root_.Lean.SMap α β inst inst_1 → @_root_.Std.HashMap α β inst inst_1
--- role=substrate bucket=- effect=pure module=Lean.Data.SMap pp=explicit
-axiom Lean.SMap.«map₂».{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → @_root_.Lean.SMap α β inst inst_1 → @_root_.Lean.PHashMap α β inst inst_1
--- role=substrate bucket=- effect=pure module=Lean.Data.SMap pp=explicit
-axiom Lean.SMap.mk.{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → _root_.Bool → @_root_.Std.HashMap α β inst inst_1 → @_root_.Lean.PHashMap α β inst inst_1 → @_root_.Lean.SMap α β inst inst_1
--- role=substrate bucket=- effect=pure module=Lean.Data.SMap pp=explicit
-axiom Lean.SMap.«stage₁».{u, v} : {α : Type u} → {β : Type v} → [inst : _root_.BEq α] → [inst_1 : _root_.Hashable α] → @_root_.Lean.SMap α β inst inst_1 → _root_.Bool
--- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
-axiom Lean.instMonadMCtxOfMonadLift : (m n : Type → Type) → [_root_.MonadLift m n] → [_root_.Lean.MonadMCtx m] → _root_.Lean.MonadMCtx n
--- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
-axiom Lean.instantiateMVarDeclMVars : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadMCtx m] → _root_.Lean.MVarId → m _root_.Unit
--- role=demanded bucket=R-NONE effect=pure module=Lean.MetavarContext
-axiom Lean.instantiateMVars : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadMCtx m] → _root_.Lean.Expr → m _root_.Lean.Expr
+axiom Lean.Meta.SimpCongrTheorems.lemmas : _root_.Lean.Meta.SimpCongrTheorems → _root_.Lean.SMap _root_.Lean.Name (_root_.List _root_.Lean.Meta.SimpCongrTheorem)
+-- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpCongrTheorems
+axiom Lean.Meta.SimpCongrTheorems.mk : _root_.Lean.SMap _root_.Lean.Name (_root_.List _root_.Lean.Meta.SimpCongrTheorem) → _root_.Lean.Meta.SimpCongrTheorems
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
+structure Lean.Meta.State where
+  mctx : _root_.Lean.MetavarContext
+  cache : _root_.Lean.Meta.Cache
+  zetaDeltaFVarIds : _root_.Lean.FVarIdSet
+  postponed : _root_.Lean.PersistentArray _root_.Lean.Meta.PostponedEntry
+  diag : _root_.Lean.Meta.Diagnostics
+-- role=substrate bucket=- effect=pure module=Lean.ScopedEnvExtension
+axiom Lean.ScopedEnvExtension.ScopedEntries.map : {β : Type} → _root_.Lean.ScopedEnvExtension.ScopedEntries β → _root_.Lean.SMap _root_.Lean.Name (_root_.Lean.PArray β)
+-- role=substrate bucket=- effect=pure module=Lean.ScopedEnvExtension
+axiom Lean.ScopedEnvExtension.ScopedEntries.mk : {β : Type} → _root_.Lean.SMap _root_.Lean.Name (_root_.Lean.PArray β) → _root_.Lean.ScopedEnvExtension.ScopedEntries β
+-- role=substrate bucket=- structural=structure module=Lean.ScopedEnvExtension
+structure Lean.ScopedEnvExtension.StateStack (α : Type) (β : Type) (σ : Type) where
+  stateStack : _root_.List (_root_.Lean.ScopedEnvExtension.State σ)
+  scopedEntries : _root_.Lean.ScopedEnvExtension.ScopedEntries β
+  newEntries : _root_.List (_root_.Lean.ScopedEnvExtension.Entry α)
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Command
 structure Lean.Elab.Command.Context where
   fileName : _root_.String
@@ -1763,24 +1685,13 @@ axiom Lean.Kernel.Environment.header : _root_.Lean.Kernel.Environment → _root_
 -- role=substrate bucket=- effect=pure module=Lean.Environment
 axiom Lean.Kernel.Environment.quotInit : _root_.Lean.Kernel.Environment → _root_.Bool
 -- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
-structure Lean.Meta.Simp.Context where
-  config : _root_.Lean.Meta.Simp.Config
-  userConfig : _root_.Lean.Options
-  zetaDeltaSet : _root_.Lean.FVarIdSet
-  initUsedZetaDelta : _root_.Lean.FVarIdSet
-  metaConfig : _root_.Lean.Meta.ConfigWithKey
-  indexConfig : _root_.Lean.Meta.ConfigWithKey
-  maxDischargeDepth : _root_.UInt32
-  simpTheorems : _root_.Lean.Meta.SimpTheoremsArray
-  congrTheorems : _root_.Lean.Meta.SimpCongrTheorems
-  parent? : _root_.Option _root_.Lean.Expr
-  dischargeDepth : _root_.UInt32
-  lctxInitIndices : _root_.Nat
-  inDSimp : _root_.Bool
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpCongrTheorems
-axiom Lean.Meta.SimpCongrTheorems.lemmas : _root_.Lean.Meta.SimpCongrTheorems → _root_.Lean.SMap _root_.Lean.Name (_root_.List _root_.Lean.Meta.SimpCongrTheorem)
--- role=substrate bucket=- effect=pure module=Lean.Meta.Tactic.Simp.SimpCongrTheorems
-axiom Lean.Meta.SimpCongrTheorems.mk : _root_.Lean.SMap _root_.Lean.Name (_root_.List _root_.Lean.Meta.SimpCongrTheorem) → _root_.Lean.Meta.SimpCongrTheorems
+structure Lean.Meta.Simp.State where
+  cache : _root_.Lean.Meta.Simp.Cache
+  congrCache : _root_.Lean.Meta.Simp.CongrCache
+  dsimpCache : _root_.Lean.ExprStructMap _root_.Lean.Expr
+  usedTheorems : _root_.Lean.Meta.Simp.UsedSimps
+  numSteps : _root_.Nat
+  diag : _root_.Lean.Meta.Simp.Diagnostics
 -- role=substrate bucket=- structural=structure module=Lean.CoreM
 structure Lean.Core.State where
   env : _root_.Lean.Environment
@@ -1815,12 +1726,6 @@ structure Lean.Elab.CommandContextInfo where
   currNamespace : _root_.Lean.Name
   openDecls : _root_.List _root_.Lean.OpenDecl
   ngen : _root_.Lean.NameGenerator
--- role=substrate bucket=- structural=structure module=Lean.Elab.Tactic.Simp
-structure Lean.Elab.Tactic.MkSimpContextResult where
-  ctx : _root_.Lean.Meta.Simp.Context
-  simprocs : _root_.Lean.Meta.Simp.SimprocsArray
-  dischargeWrapper : _root_.Lean.Elab.Tactic.Simp.DischargeWrapper
-  simpArgs : _root_.Array (_root_.Lean.Syntax × _root_.Lean.Elab.Tactic.ElabSimpArgResult)
 -- role=substrate bucket=- effect=task module=Lean.Environment
 axiom Lean.Environment.checked : _root_.Lean.Environment → _root_.Task _root_.Lean.Kernel.Environment
 -- role=demanded bucket=R-UNSAFE effect=pure module=Lean.Environment
@@ -1839,30 +1744,10 @@ axiom Lean.IR.getSorryDep : _root_.Lean.Environment → _root_.Lean.Name → _ro
 structure Lean.ImportM.Context where
   env : _root_.Lean.Environment
   opts : _root_.Lean.Options
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Attr
-axiom Lean.Meta.Simp.Context.mkDefault : _root_.Lean.Meta.MetaM _root_.Lean.Meta.Simp.Context
 -- role=substrate bucket=- structural=class module=Lean.Environment
 class Lean.MonadEnv (m : Type → Type) where
   getEnv : m _root_.Lean.Environment
   modifyEnv : (_root_.Lean.Environment → _root_.Lean.Environment) → m _root_.Unit
--- role=substrate bucket=- structural=structure module=Lean.Environment
-structure Lean.PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
-  toEnvExtension : _root_.Lean.EnvExtension (_root_.Lean.PersistentEnvExtensionState α σ)
-  name : _root_.Lean.Name
-  addImportedFn : _root_.Array (_root_.Array α) → _root_.Lean.ImportM σ
-  addEntryFn : σ → β → σ
-  exportEntriesFn : _root_.Lean.Environment → σ → _root_.Lean.OLeanEntries (_root_.Array α)
-  statsFn : σ → _root_.Std.Format
--- role=substrate bucket=- structural=structure module=Lean.Environment
-structure Lean.PersistentEnvExtensionDescrCore (α : Type) (β : Type) (σ : Type) where
-  name : _root_.autoParam _root_.Lean.Name _root_.Lean.PersistentEnvExtensionDescrCore.name._autoParam
-  mkInitial : _root_.IO σ
-  addImportedFn : _root_.Array (_root_.Array α) → _root_.Lean.ImportM σ
-  addEntryFn : σ → β → σ
-  exportEntriesFnEx : _root_.Lean.Environment → σ → _root_.Lean.OLeanEntries (_root_.Array α)
-  statsFn : σ → _root_.Std.Format
-  asyncMode : _root_.Lean.EnvExtension.AsyncMode
-  replay? : _root_.Option (_root_.Lean.ReplayFn σ)
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Structure
 axiom Lean.findField? : _root_.Lean.Environment → _root_.Lean.Name → _root_.Lean.Name → _root_.Option _root_.Lean.Name
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Structure
@@ -1881,39 +1766,25 @@ axiom Lean.isNoConfusion : _root_.Lean.Environment → _root_.Lean.Name → _roo
 axiom Lean.isStructure : _root_.Lean.Environment → _root_.Lean.Name → _root_.Bool
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Structure
 axiom Lean.isSubobjectField? : _root_.Lean.Environment → _root_.Lean.Name → _root_.Lean.Name → _root_.Option _root_.Lean.Name
+-- role=demanded bucket=R-NONE transparent module=Lean.CoreM
+@[reducible] noncomputable def Lean.Core.CoreM : Type → Type := _root_.ReaderT _root_.Lean.Core.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Core.State (_root_.EIO _root_.Lean.Exception))
 -- role=substrate bucket=- structural=structure module=Lean.CoreM
 structure Lean.Core.SavedState where
   toState : _root_.Lean.Core.State
   passedHeartbeats : _root_.Nat
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
-axiom Lean.Core.instMonadEnvCoreM : _root_.Lean.MonadEnv _root_.Lean.Core.CoreM
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
-axiom Lean.Elab.Command.instMonadEnvCommandElabM : _root_.Lean.MonadEnv _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-NONE transparent module=Lean.Elab.Command
+@[reducible] noncomputable def Lean.Elab.Command.CommandElabM : Type → Type := _root_.ReaderT _root_.Lean.Elab.Command.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Elab.Command.State (_root_.EIO _root_.Lean.Exception))
 -- role=substrate bucket=- structural=structure module=Lean.Elab.InfoTree.Types
 structure Lean.Elab.ContextInfo where
   toCommandContextInfo : _root_.Lean.Elab.CommandContextInfo
   parentDecl? : _root_.Option _root_.Lean.Name
   autoImplicits : _root_.Array _root_.Lean.Expr
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Simp
-axiom Lean.Elab.Tactic.mkSimpContext : _root_.Lean.Syntax → _root_.Bool → _root_.optParam _root_.Lean.Elab.Tactic.SimpKind _root_.Lean.Elab.Tactic.SimpKind.simp → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam (_root_.Lean.Core.CoreM _root_.Lean.Meta.SimpTheorems) _root_.Lean.Meta.getSimpTheorems → _root_.Lean.Elab.Tactic.TacticM _root_.Lean.Elab.Tactic.MkSimpContextResult
+-- role=demanded bucket=R-NONE transparent module=Lean.Environment
+@[reducible] noncomputable def Lean.ImportM : Type → Type := _root_.ReaderT _root_.Lean.ImportM.Context _root_.IO
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Init
 axiom Lean.Linter.getLinterOptions : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadOptions m] → [_root_.Lean.MonadEnv m] → m _root_.Lean.Linter.LinterOptions
--- role=substrate bucket=- structural=structure module=Lean.EnvExtension
-structure Lean.MapDeclarationExtension (α : Type) where
-  toPersistentEnvExtension : _root_.Lean.PersistentEnvExtension (_root_.Lean.Name × α) (_root_.Lean.Name × α) (_root_.Lean.NameMap α)
--- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
-axiom Lean.Meta.instMonadEnvMetaM : _root_.Lean.MonadEnv _root_.Lean.Meta.MetaM
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Match.MatcherInfo
 axiom Lean.Meta.isMatcher : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadEnv m] → _root_.Lean.Name → m _root_.Bool
--- role=substrate bucket=- structural=structure module=Lean.Attributes
-structure Lean.ParametricAttribute (α : Type) where
-  attr : _root_.Lean.AttributeImpl
-  ext : _root_.Lean.PersistentEnvExtension (_root_.Lean.Name × α) (_root_.Lean.Name × α) (_root_.List _root_.Lean.Name × _root_.Lean.NameMap α)
-  preserveOrder : _root_.Bool
--- role=substrate bucket=- structural=structure module=Lean.Environment
-structure Lean.PersistentEnvExtensionDescr (α : Type) (β : Type) (σ : Type) where
-  toPersistentEnvExtensionDescrCore : _root_.Lean.PersistentEnvExtensionDescrCore α β σ
-  exportEntriesFn : σ → _root_.Array α
 -- role=demanded bucket=R-NONE effect=pure module=Lean.MonadEnv
 axiom Lean.getConstInfo : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadEnv m] → [_root_.Lean.MonadError m] → _root_.Lean.Name → m _root_.Lean.ConstantInfo
 -- role=demanded bucket=R-NONE effect=pure module=Lean.ProjFns
@@ -1924,8 +1795,52 @@ axiom Lean.isRec : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.Mon
 axiom Lean.mkConstWithLevelParams : {m : Type → Type} → [_root_.Monad m] → [_root_.Lean.MonadEnv m] → [_root_.Lean.MonadError m] → _root_.Lean.Name → m _root_.Lean.Expr
 -- role=demanded bucket=R-NONE effect=pure module=Lean.MonadEnv
 axiom Lean.setEnv : {m : Type → Type} → [_root_.Lean.MonadEnv m] → _root_.Lean.Environment → m _root_.Unit
--- role=demanded bucket=R-EFFECT effect=io module=Lean.Elab.InfoTree.Main
-axiom Lean.Elab.ContextInfo.runMetaM : {α : Type} → _root_.Lean.Elab.ContextInfo → _root_.Lean.LocalContext → _root_.Lean.Meta.MetaM α → _root_.IO α
+-- role=demanded bucket=R-NONE transparent module=Lean.Attributes
+@[reducible] noncomputable def Lean.AttrM : Type → Type := _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.checkSystem : _root_.String → _root_.Lean.Core.CoreM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.instAddMessageContextCoreM : _root_.Lean.AddMessageContext _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.instMonadCoreM : _root_.Monad _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.instMonadEnvCoreM : _root_.Lean.MonadEnv _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=io module=Lean.CoreM
+axiom Lean.Core.instMonadLiftIOCoreM : _root_.MonadLift _root_.IO _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.instMonadQuotationCoreM : _root_.Lean.MonadQuotation _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.instMonadRefCoreM : _root_.Lean.MonadRef _root_.Lean.Core.CoreM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.Core.mkFreshUserName : _root_.Lean.Name → _root_.Lean.Core.CoreM _root_.Lean.Name
+-- role=substrate bucket=- transparent module=Lean.Elab.Command
+@[reducible] noncomputable def Lean.Elab.Command.CommandElab : Type := _root_.Lean.Syntax → _root_.Lean.Elab.Command.CommandElabM _root_.Unit
+-- role=substrate bucket=- structural=structure module=Lean.Elab.Command
+structure Lean.Elab.Command.Linter where
+  run : _root_.Lean.Syntax → _root_.Lean.Elab.Command.CommandElabM _root_.Unit
+  name : _root_.autoParam _root_.Lean.Name _root_.Lean.Elab.Command.Linter.name._autoParam
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instAddMessageContextCommandElabM : _root_.Lean.AddMessageContext _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadCommandElabM : _root_.Monad _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadEnvCommandElabM : _root_.Lean.MonadEnv _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadExceptOfExceptionCommandElabM : _root_.MonadExceptOf _root_.Lean.Exception _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadInfoTreeCommandElabM : _root_.Lean.Elab.MonadInfoTree _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadLogCommandElabM : _root_.Lean.MonadLog _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadOptionsCommandElabM : _root_.Lean.MonadOptions _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadQuotationCommandElabM : _root_.Lean.MonadQuotation _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadRefCommandElabM : _root_.Lean.MonadRef _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.instMonadResolveNameCommandElabM : _root_.Lean.MonadResolveName _root_.Lean.Elab.Command.CommandElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.liftCoreM : {α : Type} → _root_.Lean.Core.CoreM α → _root_.Lean.Elab.Command.CommandElabM α
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Main
 axiom Lean.Elab.Info.updateContext? : _root_.Option _root_.Lean.Elab.ContextInfo → _root_.Lean.Elab.Info → _root_.Option _root_.Lean.Elab.ContextInfo
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Server.InfoUtils
@@ -1934,47 +1849,252 @@ axiom Lean.Elab.InfoTree.collectNodesBottomUp : {α : Type} → (_root_.Lean.Ela
 axiom Lean.Elab.InfoTree.foldInfo.{u_1} : {α : Type u_1} → (_root_.Lean.Elab.ContextInfo → _root_.Lean.Elab.Info → α → α) → α → _root_.Lean.Elab.InfoTree → α
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Server.InfoUtils
 axiom Lean.Elab.InfoTree.foldInfoTree.{u_1} : {α : Type u_1} → α → (_root_.Lean.Elab.ContextInfo → _root_.Lean.Elab.InfoTree → α → α) → _root_.Lean.Elab.InfoTree → α
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Server.InfoUtils
+axiom Lean.Elab.InfoTree.visitM.{u_1} : {m : Type → Type u_1} → {α : Type} → [inst : _root_.Monad m] → (_root_.optParam (_root_.Lean.Elab.ContextInfo → _root_.Lean.Elab.Info → _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree → m _root_.Bool) fun x x_1 x_2 => _root_.Pure.pure _root_.Bool.true) → (_root_.Lean.Elab.ContextInfo → _root_.Lean.Elab.Info → _root_.Lean.PersistentArray _root_.Lean.Elab.InfoTree → _root_.List (_root_.Option α) → m α) → _root_.optParam (_root_.Option _root_.Lean.Elab.ContextInfo) _root_.Option.none → _root_.Lean.Elab.InfoTree → m (_root_.Option α)
 -- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.InfoTree.Main
 axiom Lean.Elab.PartialContextInfo.mergeIntoOuter? : _root_.Lean.Elab.PartialContextInfo → _root_.Option _root_.Lean.Elab.ContextInfo → _root_.Option _root_.Lean.Elab.ContextInfo
--- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Deprecated
-axiom Lean.Linter.deprecatedAttr : _root_.Lean.ParametricAttribute _root_.Lean.Linter.DeprecationEntry
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Basic
+structure Lean.Meta.Context where
+  keyedConfig : _root_.Lean.Meta.ConfigWithKey
+  trackZetaDelta : _root_.Bool
+  zetaDeltaSet : _root_.Lean.FVarIdSet
+  lctx : _root_.Lean.LocalContext
+  localInstances : _root_.Lean.LocalInstances
+  defEqCtx? : _root_.Option _root_.Lean.Meta.DefEqContext
+  synthPendingDepth : _root_.Nat
+  canUnfold? : _root_.Option (_root_.Lean.Meta.Config → _root_.Lean.ConstantInfo → _root_.Lean.Core.CoreM _root_.Bool)
+  univApprox : _root_.Bool
+  inTypeClassResolution : _root_.Bool
+  cacheInferType : _root_.Bool
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.SavedState : Type
--- role=demanded bucket=R-NONE effect=pure module=Lean.Attributes
-axiom Lean.ParametricAttribute.getParam? : {α : Type} → [_root_.Inhabited α] → _root_.Lean.ParametricAttribute α → _root_.Lean.Environment → _root_.Lean.Name → _root_.Option α
--- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
-axiom Lean.PersistentEnvExtension.addEntry : {α β σ : Type} → (ext : _root_.Lean.PersistentEnvExtension α β σ) → _root_.Lean.Environment → β → _root_.optParam _root_.Lean.EnvExtension.AsyncMode ext.toEnvExtension.asyncMode → _root_.optParam _root_.Lean.Name _root_.Lean.Name.anonymous → _root_.Lean.Environment
--- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
-axiom Lean.PersistentEnvExtension.getState : {α β σ : Type} → [_root_.Inhabited σ] → (ext : _root_.Lean.PersistentEnvExtension α β σ) → _root_.Lean.Environment → _root_.optParam _root_.Lean.EnvExtension.AsyncMode ext.toEnvExtension.asyncMode → _root_.optParam _root_.Lean.Name _root_.Lean.Name.anonymous → σ
--- role=demanded bucket=R-NONE effect=pure module=Lean.DeclarationRange
-axiom Lean.declRangeExt : _root_.Lean.MapDeclarationExtension _root_.Lean.DeclarationRanges
--- role=demanded bucket=R-EXTERN effect=io module=Lean.Environment
-axiom Lean.registerPersistentEnvExtension : {α β σ : Type} → [_root_.Inhabited σ] → _root_.Lean.PersistentEnvExtensionDescr α β σ → _root_.IO (_root_.Lean.PersistentEnvExtension α β σ)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.TryThis
+axiom Lean.Meta.Tactic.TryThis.addSuggestion : _root_.Lean.Syntax → _root_.Lean.Meta.Tactic.TryThis.Suggestion → _root_.optParam (_root_.Option _root_.Lean.Syntax) _root_.Option.none → _root_.optParam _root_.String "Try this:" → _root_.optParam (_root_.Option _root_.String) _root_.Option.none → _root_.optParam _root_.Lean.Meta.Hint.DiffGranularity _root_.Lean.Meta.Hint.DiffGranularity.none → _root_.optParam _root_.Lean.MessageData _root_.Lean.MessageData.nil → _root_.Lean.Core.CoreM _root_.Unit
+-- role=substrate bucket=- effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Attr
+axiom Lean.Meta.getSimpTheorems : _root_.Lean.Core.CoreM _root_.Lean.Meta.SimpTheorems
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Instances
+axiom Lean.Meta.isInstance : _root_.Lean.Name → _root_.Lean.Core.CoreM _root_.Bool
+-- role=substrate bucket=- structural=structure module=Lean.Environment
+structure Lean.PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
+  toEnvExtension : _root_.Lean.EnvExtension (_root_.Lean.PersistentEnvExtensionState α σ)
+  name : _root_.Lean.Name
+  addImportedFn : _root_.Array (_root_.Array α) → _root_.Lean.ImportM σ
+  addEntryFn : σ → β → σ
+  exportEntriesFn : _root_.Lean.Environment → σ → _root_.Lean.OLeanEntries (_root_.Array α)
+  statsFn : σ → _root_.Std.Format
+-- role=substrate bucket=- structural=structure module=Lean.Environment
+structure Lean.PersistentEnvExtensionDescrCore (α : Type) (β : Type) (σ : Type) where
+  name : _root_.autoParam _root_.Lean.Name _root_.Lean.PersistentEnvExtensionDescrCore.name._autoParam
+  mkInitial : _root_.IO σ
+  addImportedFn : _root_.Array (_root_.Array α) → _root_.Lean.ImportM σ
+  addEntryFn : σ → β → σ
+  exportEntriesFnEx : _root_.Lean.Environment → σ → _root_.Lean.OLeanEntries (_root_.Array α)
+  statsFn : σ → _root_.Std.Format
+  asyncMode : _root_.Lean.EnvExtension.AsyncMode
+  replay? : _root_.Option (_root_.Lean.ReplayFn σ)
+-- role=substrate bucket=- transparent module=Lean.PrettyPrinter.Parenthesizer
+@[reducible] noncomputable def Lean.PrettyPrinter.ParenthesizerM : Type → Type := _root_.ReaderT _root_.Lean.PrettyPrinter.Parenthesizer.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.PrettyPrinter.Parenthesizer.State _root_.Lean.Core.CoreM)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.PrettyPrinter
+axiom Lean.PrettyPrinter.ppTactic : _root_.Lean.TSyntax `tactic → _root_.Lean.Core.CoreM _root_.Std.Format
+-- role=substrate bucket=- structural=structure module=Lean.ScopedEnvExtension
+structure Lean.ScopedEnvExtension.Descr (α : Type) (β : Type) (σ : Type) where
+  name : _root_.autoParam _root_.Lean.Name _root_.Lean.ScopedEnvExtension.Descr.name._autoParam
+  mkInitial : _root_.IO σ
+  ofOLeanEntry : σ → α → _root_.Lean.ImportM β
+  toOLeanEntry : β → α
+  addEntry : σ → β → σ
+  finalizeImport : σ → σ
+  exportEntry? : _root_.Lean.Environment → α → _root_.Lean.OLeanEntries (_root_.Option α)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.CoreM
+axiom Lean.instMonadExceptOfExceptionCoreM : _root_.MonadExceptOf _root_.Lean.Exception _root_.Lean.Core.CoreM
+-- role=substrate bucket=- structural=structure module=Lean.Attributes
+structure Lean.AttributeImpl where
+  toAttributeImplCore : _root_.Lean.AttributeImplCore
+  add : _root_.Lean.Name → _root_.Lean.Syntax → _root_.Lean.AttributeKind → _root_.Lean.AttrM _root_.Unit
+  erase : _root_.Lean.Name → _root_.Lean.AttrM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=io module=Lean.Elab.Command
+axiom Lean.Elab.Command.addLinter : _root_.Lean.Elab.Command.Linter → _root_.IO _root_.Unit
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Term.SavedState : Type
+-- role=substrate bucket=- structural=structure module=Lean.EnvExtension
+structure Lean.MapDeclarationExtension (α : Type) where
+  toPersistentEnvExtension : _root_.Lean.PersistentEnvExtension (_root_.Lean.Name × α) (_root_.Lean.Name × α) (_root_.Lean.NameMap α)
+-- role=demanded bucket=R-NONE transparent module=Lean.Meta.Basic
+@[reducible] noncomputable def Lean.Meta.MetaM : Type → Type := _root_.ReaderT _root_.Lean.Meta.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Meta.State _root_.Lean.Core.CoreM)
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.SavedState.core : _root_.Lean.Meta.SavedState → _root_.Lean.Core.SavedState
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.SavedState.meta : _root_.Lean.Meta.SavedState → _root_.Lean.Meta.State
 -- role=substrate bucket=- effect=pure module=Lean.Meta.Basic
 axiom Lean.Meta.SavedState.mk : _root_.Lean.Core.SavedState → _root_.Lean.Meta.State → _root_.Lean.Meta.SavedState
+-- role=substrate bucket=- structural=structure module=Lean.Environment
+structure Lean.PersistentEnvExtensionDescr (α : Type) (β : Type) (σ : Type) where
+  toPersistentEnvExtensionDescrCore : _root_.Lean.PersistentEnvExtensionDescrCore α β σ
+  exportEntriesFn : σ → _root_.Array α
+-- role=demanded bucket=R-NONE transparent module=Lean.PrettyPrinter.Parenthesizer
+@[reducible] noncomputable def Lean.PrettyPrinter.Parenthesizer : Type := _root_.Lean.PrettyPrinter.ParenthesizerM _root_.Unit
+-- role=substrate bucket=- structural=structure module=Lean.ScopedEnvExtension
+structure Lean.ScopedEnvExtension (α : Type) (β : Type) (σ : Type) where
+  descr : _root_.Lean.ScopedEnvExtension.Descr α β σ
+  ext : _root_.Lean.PersistentEnvExtension (_root_.Lean.ScopedEnvExtension.Entry α) (_root_.Lean.ScopedEnvExtension.Entry β) (_root_.Lean.ScopedEnvExtension.StateStack α β σ)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Attributes
+axiom Lean.instMonadLiftImportMAttrM : _root_.MonadLift _root_.Lean.ImportM _root_.Lean.AttrM
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Basic
+axiom Lean.withSetOptionIn : _root_.Lean.Elab.Command.CommandElab → _root_.Lean.Elab.Command.CommandElab
+-- role=demanded bucket=R-EFFECT effect=io module=Lean.Elab.InfoTree.Main
+axiom Lean.Elab.ContextInfo.runMetaM : {α : Type} → _root_.Lean.Elab.ContextInfo → _root_.Lean.LocalContext → _root_.Lean.Meta.MetaM α → _root_.IO α
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
 structure Lean.Elab.Tactic.SavedState where
   term : _root_.Lean.Elab.Term.SavedState
   tactic : _root_.Lean.Elab.Tactic.State
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Simp
+axiom Lean.Elab.Tactic.mkSimpOnly : _root_.Lean.Syntax → _root_.Lean.Meta.Simp.UsedSimps → _root_.Lean.Meta.MetaM _root_.Lean.Syntax
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Term.SavedState.elab : _root_.Lean.Elab.Term.SavedState → _root_.Lean.Elab.Term.State
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Term.SavedState.meta : _root_.Lean.Elab.Term.SavedState → _root_.Lean.Meta.SavedState
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Term.SavedState.mk : _root_.Lean.Meta.SavedState → _root_.Lean.Elab.Term.State → _root_.Lean.Elab.Term.SavedState
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.FVarId.getUserName : _root_.Lean.FVarId → _root_.Lean.Meta.MetaM _root_.Lean.Name
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Replace
+axiom Lean.MVarId.changeLocalDecl : _root_.Lean.MVarId → _root_.Lean.FVarId → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM _root_.Lean.MVarId
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Congr
+axiom Lean.MVarId.congrCore : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM (_root_.List _root_.Lean.MVarId)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Congr
+axiom Lean.MVarId.congrN : _root_.Lean.MVarId → _root_.optParam _root_.Nat 1000000 → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM (_root_.List _root_.Lean.MVarId)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Util
+axiom Lean.MVarId.getType : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Intro
+axiom Lean.MVarId.intros : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM (_root_.Array _root_.Lean.FVarId × _root_.Lean.MVarId)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Rfl
+axiom Lean.MVarId.liftReflToEq : _root_.Lean.MVarId → _root_.Lean.Meta.MetaM _root_.Lean.MVarId
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Replace
+axiom Lean.MVarId.replaceLocalDecl : _root_.Lean.MVarId → _root_.Lean.FVarId → _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Meta.AssertAfterResult
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Rewrite
+axiom Lean.MVarId.rewrite : _root_.Lean.MVarId → _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Lean.Meta.Rewrite.Config { } → _root_.Lean.Meta.MetaM _root_.Lean.Meta.RewriteResult
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Attr
+axiom Lean.Meta.Simp.Context.mkDefault : _root_.Lean.Meta.MetaM _root_.Lean.Meta.Simp.Context
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.SimpM : Type → Type := _root_.ReaderT _root_.Lean.Meta.Simp.MethodsRef (_root_.ReaderT _root_.Lean.Meta.Simp.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Meta.Simp.State _root_.Lean.Meta.MetaM))
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.approxDefEq.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → n α → n α
+-- role=demanded bucket=R-UNSAFE effect=toolchain-monad module=Lean.Meta.Eval
+axiom Lean.Meta.evalExpr : (α : Type) → _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Lean.DefinitionSafety _root_.Lean.DefinitionSafety.safe → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM α
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.forallTelescope.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.Expr → (_root_.Array _root_.Lean.Expr → _root_.Lean.Expr → n α) → _root_.optParam _root_.Bool _root_.Bool.false → n α
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.forallTelescopeReducing.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.Expr → (_root_.Array _root_.Lean.Expr → _root_.Lean.Expr → n α) → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.false → n α
+-- role=demanded bucket=R-EXTERN effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.inferType : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.instAddMessageContextMetaM : _root_.Lean.AddMessageContext _root_.Lean.Meta.MetaM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.instAlternativeMetaM : _root_.Alternative _root_.Lean.Meta.MetaM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.instMonadEnvMetaM : _root_.Lean.MonadEnv _root_.Lean.Meta.MetaM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.instMonadLCtxMetaM : _root_.Lean.MonadLCtx _root_.Lean.Meta.MetaM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.instMonadMCtxMetaM : _root_.Lean.MonadMCtx _root_.Lean.Meta.MetaM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.instMonadMetaM : _root_.Monad _root_.Lean.Meta.MetaM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.InferType
+axiom Lean.Meta.isProof : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Bool
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.InferType
+axiom Lean.Meta.isProp : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Bool
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
+axiom Lean.Meta.mkAdd : _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
+axiom Lean.Meta.mkAppM : _root_.Lean.Name → _root_.Array _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
+axiom Lean.Meta.mkAppOptM : _root_.Lean.Name → _root_.Array (_root_.Option _root_.Lean.Expr) → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Closure
+axiom Lean.Meta.mkAuxTheorem : _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam (_root_.Option _root_.Lean.Name) _root_.Option.none → _root_.optParam _root_.Bool _root_.Bool.true → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.mkForallFVars : _root_.Array _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Lean.BinderInfo _root_.Lean.BinderInfo.implicit → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.mkFreshExprMVar : _root_.Option _root_.Lean.Expr → _root_.optParam _root_.Lean.MetavarKind _root_.Lean.MetavarKind.natural → _root_.optParam _root_.Lean.Name _root_.Lean.Name.anonymous → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.mkFreshLevelMVar : _root_.Lean.Meta.MetaM _root_.Lean.Level
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.CongrTheorems
+axiom Lean.Meta.mkHCongrWithArity : _root_.Lean.Expr → _root_.Nat → _root_.Lean.Meta.MetaM _root_.Lean.Meta.CongrTheorem
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.mkLambdaFVars : _root_.Array _root_.Lean.Expr → _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.true → _root_.optParam _root_.Lean.BinderInfo _root_.Lean.BinderInfo.implicit → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.AppBuilder
+axiom Lean.Meta.mkMul : _root_.Lean.Expr → _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Sorry
+axiom Lean.Meta.mkSorry : _root_.Lean.Expr → _root_.Bool → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.CoeAttr
+axiom Lean.Meta.registerCoercion : _root_.Lean.Name → _root_.optParam (_root_.Option _root_.Lean.Meta.CoeFnInfo) _root_.Option.none → _root_.Lean.Meta.MetaM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.SynthInstance
+axiom Lean.Meta.synthInstance : _root_.Lean.Expr → _root_.optParam (_root_.Option _root_.Nat) _root_.Option.none → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Transform
+axiom Lean.Meta.transform : {m : Type → Type} → [inst : _root_.Monad m] → [_root_.MonadLiftT _root_.Lean.Meta.MetaM m] → [_root_.MonadControlT _root_.Lean.Meta.MetaM m] → _root_.Lean.Expr → (_root_.optParam (_root_.Lean.Expr → m _root_.Lean.TransformStep) fun x => _root_.Pure.pure _root_.Lean.TransformStep.continue) → (_root_.optParam (_root_.Lean.Expr → m _root_.Lean.TransformStep) fun e => _root_.Pure.pure (_root_.Lean.TransformStep.done e)) → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam _root_.Bool _root_.Bool.false → m _root_.Lean.Expr
+-- role=demanded bucket=R-EXTERN effect=toolchain-monad module=Lean.Meta.Basic
+axiom Lean.Meta.whnf : _root_.Lean.Expr → _root_.Lean.Meta.MetaM _root_.Lean.Expr
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.withLocalDeclD.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.Name → _root_.Lean.Expr → (_root_.Lean.Expr → n α) → n α
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.withMCtx.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → _root_.Lean.MetavarContext → n α → n α
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Basic
+axiom Lean.Meta.withReducible.{u_1} : {n : Type → Type u_1} → [_root_.MonadControlT _root_.Lean.Meta.MetaM n] → [_root_.Monad n] → {α : Type} → n α → n α
+-- role=substrate bucket=- structural=structure module=Lean.Attributes
+structure Lean.ParametricAttribute (α : Type) where
+  attr : _root_.Lean.AttributeImpl
+  ext : _root_.Lean.PersistentEnvExtension (_root_.Lean.Name × α) (_root_.Lean.Name × α) (_root_.List _root_.Lean.Name × _root_.Lean.NameMap α)
+  preserveOrder : _root_.Bool
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
+axiom Lean.PersistentEnvExtension.addEntry : {α β σ : Type} → (ext : _root_.Lean.PersistentEnvExtension α β σ) → _root_.Lean.Environment → β → _root_.optParam _root_.Lean.EnvExtension.AsyncMode ext.toEnvExtension.asyncMode → _root_.optParam _root_.Lean.Name _root_.Lean.Name.anonymous → _root_.Lean.Environment
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Environment
+axiom Lean.PersistentEnvExtension.getState : {α β σ : Type} → [_root_.Inhabited σ] → (ext : _root_.Lean.PersistentEnvExtension α β σ) → _root_.Lean.Environment → _root_.optParam _root_.Lean.EnvExtension.AsyncMode ext.toEnvExtension.asyncMode → _root_.optParam _root_.Lean.Name _root_.Lean.Name.anonymous → σ
+-- role=substrate bucket=- transparent module=Lean.ScopedEnvExtension
+@[reducible] noncomputable def Lean.SimpleScopedEnvExtension : Type → Type → Type := fun α σ => _root_.Lean.ScopedEnvExtension α α σ
+-- role=demanded bucket=R-NONE effect=pure module=Lean.DeclarationRange
+axiom Lean.declRangeExt : _root_.Lean.MapDeclarationExtension _root_.Lean.DeclarationRanges
+-- role=demanded bucket=R-EFFECT effect=io module=Lean.Attributes
+axiom Lean.registerBuiltinAttribute : _root_.Lean.AttributeImpl → _root_.IO _root_.Unit
+-- role=demanded bucket=R-EXTERN effect=io module=Lean.Environment
+axiom Lean.registerPersistentEnvExtension : {α β σ : Type} → [_root_.Inhabited σ] → _root_.Lean.PersistentEnvExtensionDescr α β σ → _root_.IO (_root_.Lean.PersistentEnvExtension α β σ)
 -- role=substrate bucket=- structural=structure module=Lean.Elab.Term.TermElabM
 structure Lean.Elab.Tactic.TacticFinishedSnapshot where
   toSnapshot : _root_.Lean.Language.Snapshot
   state? : _root_.Option _root_.Lean.Elab.Tactic.SavedState
   moreSnaps : _root_.Array (_root_.Lean.Language.SnapshotTask _root_.Lean.Language.SnapshotTree)
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Linter.Deprecated
+axiom Lean.Linter.deprecatedAttr : _root_.Lean.ParametricAttribute _root_.Lean.Linter.DeprecationEntry
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Ext
+axiom Lean.Meta.Ext.extExtension : _root_.Lean.SimpleScopedEnvExtension _root_.Lean.Meta.Ext.ExtTheorem _root_.Lean.Meta.Ext.ExtTheorems
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Rfl
+axiom Lean.Meta.Rfl.reflExt : _root_.Lean.SimpleScopedEnvExtension (_root_.Lean.Name × _root_.Array _root_.Lean.Meta.DiscrTree.Key) (_root_.Lean.Meta.DiscrTree _root_.Lean.Name)
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.DSimproc : Type := _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM _root_.Lean.Meta.Simp.DStep
+-- role=demanded bucket=R-NONE transparent module=Lean.Meta.Tactic.Simp.Rewrite
+@[reducible] noncomputable def Lean.Meta.Simp.Discharge : Type := _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM (_root_.Option _root_.Lean.Expr)
+-- role=demanded bucket=R-NONE transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.Simproc : Type := _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM _root_.Lean.Meta.Simp.Step
+-- role=demanded bucket=R-EXTERN effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Types
+axiom Lean.Meta.Simp.dsimp : _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM _root_.Lean.Expr
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Symm
+axiom Lean.Meta.Symm.symmExt : _root_.Lean.SimpleScopedEnvExtension (_root_.Lean.Name × _root_.Array _root_.Lean.Meta.DiscrTree.Key) (_root_.Lean.Meta.DiscrTree _root_.Lean.Name)
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.CoeAttr
+axiom Lean.Meta.coeExt : _root_.Lean.SimpleScopedEnvExtension (_root_.Lean.Name × _root_.Lean.Meta.CoeFnInfo) (_root_.Lean.NameMap _root_.Lean.Meta.CoeFnInfo)
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Attributes
+axiom Lean.ParametricAttribute.getParam? : {α : Type} → [_root_.Inhabited α] → _root_.Lean.ParametricAttribute α → _root_.Lean.Environment → _root_.Lean.Name → _root_.Option α
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Tactic.TacticParsedSnapshot : Type
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
+structure Lean.Meta.Simp.Methods where
+  pre : _root_.Lean.Meta.Simp.Simproc
+  post : _root_.Lean.Meta.Simp.Simproc
+  dpre : _root_.Lean.Meta.Simp.DSimproc
+  dpost : _root_.Lean.Meta.Simp.DSimproc
+  discharge? : _root_.Lean.Expr → _root_.Lean.Meta.Simp.SimpM (_root_.Option _root_.Lean.Expr)
+  wellBehavedDischarge : _root_.Bool
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
+structure Lean.Meta.Simp.SimprocEntry where
+  toSimprocOLeanEntry : _root_.Lean.Meta.Simp.SimprocOLeanEntry
+  proc : _root_.Lean.Meta.Simp.Simproc ⊕ _root_.Lean.Meta.Simp.DSimproc
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
 axiom Lean.Elab.Tactic.TacticParsedSnapshot.finished : _root_.Lean.Elab.Tactic.TacticParsedSnapshot → _root_.Lean.Language.SnapshotTask _root_.Lean.Elab.Tactic.TacticFinishedSnapshot
 -- role=substrate bucket=- effect=pure module=Lean.Elab.Term.TermElabM
@@ -2008,18 +2128,86 @@ structure Lean.Elab.Term.Context where
   holesAsSyntheticOpaque : _root_.Bool
   checkDeprecated : _root_.Bool
   fixedTermElabs : _root_.Array _root_.Lean.Elab.Term.FixedTermElabRef
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Types
+@[reducible] noncomputable def Lean.Meta.Simp.SimprocTree : Type := _root_.Lean.Meta.DiscrTree _root_.Lean.Meta.Simp.SimprocEntry
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Rewrite
+axiom Lean.Meta.Simp.mkDefaultMethods : _root_.Lean.Core.CoreM _root_.Lean.Meta.Simp.Methods
+-- role=demanded bucket=R-NONE transparent module=Lean.Elab.Term.TermElabM
+@[reducible] noncomputable def Lean.Elab.Term.TermElabM : Type → Type := _root_.ReaderT _root_.Lean.Elab.Term.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Elab.Term.State _root_.Lean.Meta.MetaM)
+-- role=substrate bucket=- structural=structure module=Lean.Meta.Tactic.Simp.Types
+structure Lean.Meta.Simp.Simprocs where
+  pre : _root_.Lean.Meta.Simp.SimprocTree
+  post : _root_.Lean.Meta.Simp.SimprocTree
+  simprocNames : _root_.Lean.PHashSet _root_.Lean.Name
+  erased : _root_.Lean.PHashSet _root_.Lean.Name
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Command
+axiom Lean.Elab.Command.liftTermElabM : {α : Type} → _root_.Lean.Elab.Term.TermElabM α → _root_.Lean.Elab.Command.CommandElabM α
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.RCases
+axiom Lean.Elab.Tactic.RCases.rcases : _root_.Array (_root_.Option _root_.Lean.Syntax.Ident × _root_.Lean.Syntax) → _root_.Lean.Elab.Tactic.RCases.RCasesPatt → _root_.Lean.MVarId → _root_.Lean.Elab.Term.TermElabM (_root_.List _root_.Lean.MVarId)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.RCases
+axiom Lean.Elab.Tactic.RCases.rintro : _root_.Lean.TSyntaxArray `rintroPat → _root_.Option _root_.Lean.Syntax.Term → _root_.Lean.MVarId → _root_.Lean.Elab.Term.TermElabM (_root_.List _root_.Lean.MVarId)
+-- role=demanded bucket=R-NONE transparent module=Lean.Elab.Tactic.Basic
+@[reducible] noncomputable def Lean.Elab.Tactic.TacticM : Type → Type := _root_.ReaderT _root_.Lean.Elab.Tactic.Context (_root_.StateRefT' _root_.IO.RealWorld _root_.Lean.Elab.Tactic.State _root_.Lean.Elab.Term.TermElabM)
+-- role=demanded bucket=R-NONE transparent module=Lean.Elab.Term.TermElabM
+@[reducible] noncomputable def Lean.Elab.Term.TermElab : Type := _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM pp=explicit
+axiom Lean.Elab.Term.TermElabM.run' : {α : Type} → _root_.Lean.Elab.Term.TermElabM α → _root_.optParam _root_.Lean.Elab.Term.Context (_root_.Lean.Elab.Term.Context.mk (@_root_.Option.none _root_.Lean.Name) (@_root_.List.nil _root_.Lean.Elab.MacroStackElem) _root_.Bool.true _root_.Bool.true (@_root_.Option.none _root_.Lean.Elab.AutoBoundImplicitContext) (fun x => _root_.Bool.false) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.NameMap _root_.Lean.Name) (_root_.Lean.NameMap.instEmptyCollection _root_.Lean.Name)) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.NameMap _root_.Lean.Expr) (_root_.Lean.NameMap.instEmptyCollection _root_.Lean.Expr)) _root_.Bool.true _root_.Bool.true _root_.Bool.false _root_.Bool.false _root_.Bool.false _root_.Bool.false (@_root_.Option.none (_root_.Lean.Language.SnapshotBundle _root_.Lean.Elab.Tactic.TacticParsedSnapshot)) _root_.Bool.true _root_.Bool.false _root_.Bool.true (@_root_.List.toArray _root_.Lean.Elab.Term.FixedTermElabRef (@_root_.List.nil _root_.Lean.Elab.Term.FixedTermElabRef))) → _root_.optParam _root_.Lean.Elab.Term.State (_root_.Lean.Elab.Term.State.mk (@_root_.List.nil _root_.Lean.Name) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.MVarIdMap _root_.Lean.Elab.Term.SyntheticMVarDecl) (@_root_.Lean.instEmptyCollectionMVarIdMap _root_.Lean.Elab.Term.SyntheticMVarDecl)) (@_root_.EmptyCollection.emptyCollection (_root_.List _root_.Lean.MVarId) (@_root_.List.instEmptyCollection _root_.Lean.MVarId)) (@_root_.List.nil _root_.Lean.Elab.Term.MVarErrorInfo) (@_root_.List.nil _root_.Lean.Elab.Term.LevelMVarErrorInfo) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.MVarIdMap _root_.Lean.Name) (@_root_.Lean.instEmptyCollectionMVarIdMap _root_.Lean.Name)) (@_root_.List.nil _root_.Lean.Elab.Term.LetRecToLift)) → _root_.Lean.Meta.MetaM α
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.SyntheticMVars
+axiom Lean.Elab.Term.elabTermAndSynthesize : _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM
+axiom Lean.Elab.Term.elabType : _root_.Lean.Syntax → _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM
+axiom Lean.Elab.Term.instMonadMacroAdapterTermElabM : _root_.Lean.Elab.MonadMacroAdapter _root_.Lean.Elab.Term.TermElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Term.TermElabM
+axiom Lean.Elab.Term.instMonadTermElabM : _root_.Monad _root_.Lean.Elab.Term.TermElabM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Calc
+axiom Lean.Elab.Term.mkCalcStepViews : _root_.Lean.TSyntax `Lean.calcSteps → _root_.Lean.Elab.Term.TermElabM (_root_.Array _root_.Lean.Elab.Term.CalcStepView)
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.SyntheticMVars
+axiom Lean.Elab.Term.withSynthesize.{u_1} : {m : Type → Type u_1} → {α : Type} → [_root_.MonadFunctorT _root_.Lean.Elab.Term.TermElabM m] → m α → _root_.optParam _root_.Lean.Elab.Term.PostponeBehavior _root_.Lean.Elab.Term.PostponeBehavior.no → m α
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Meta pp=explicit
+axiom Lean.Elab.runTactic : _root_.Lean.MVarId → _root_.Lean.Syntax → _root_.optParam _root_.Lean.Elab.Term.Context (_root_.Lean.Elab.Term.Context.mk (@_root_.Option.none _root_.Lean.Name) (@_root_.List.nil _root_.Lean.Elab.MacroStackElem) _root_.Bool.true _root_.Bool.true (@_root_.Option.none _root_.Lean.Elab.AutoBoundImplicitContext) (fun x => _root_.Bool.false) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.NameMap _root_.Lean.Name) (_root_.Lean.NameMap.instEmptyCollection _root_.Lean.Name)) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.NameMap _root_.Lean.Expr) (_root_.Lean.NameMap.instEmptyCollection _root_.Lean.Expr)) _root_.Bool.true _root_.Bool.true _root_.Bool.false _root_.Bool.false _root_.Bool.false _root_.Bool.false (@_root_.Option.none (_root_.Lean.Language.SnapshotBundle _root_.Lean.Elab.Tactic.TacticParsedSnapshot)) _root_.Bool.true _root_.Bool.false _root_.Bool.true (@_root_.List.toArray _root_.Lean.Elab.Term.FixedTermElabRef (@_root_.List.nil _root_.Lean.Elab.Term.FixedTermElabRef))) → _root_.optParam _root_.Lean.Elab.Term.State (_root_.Lean.Elab.Term.State.mk (@_root_.List.nil _root_.Lean.Name) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.MVarIdMap _root_.Lean.Elab.Term.SyntheticMVarDecl) (@_root_.Lean.instEmptyCollectionMVarIdMap _root_.Lean.Elab.Term.SyntheticMVarDecl)) (@_root_.EmptyCollection.emptyCollection (_root_.List _root_.Lean.MVarId) (@_root_.List.instEmptyCollection _root_.Lean.MVarId)) (@_root_.List.nil _root_.Lean.Elab.Term.MVarErrorInfo) (@_root_.List.nil _root_.Lean.Elab.Term.LevelMVarErrorInfo) (@_root_.EmptyCollection.emptyCollection (_root_.Lean.MVarIdMap _root_.Lean.Name) (@_root_.Lean.instEmptyCollectionMVarIdMap _root_.Lean.Name)) (@_root_.List.nil _root_.Lean.Elab.Term.LetRecToLift)) → _root_.Lean.Meta.MetaM (_root_.Prod (_root_.List _root_.Lean.MVarId) _root_.Lean.Elab.Term.State)
+-- role=substrate bucket=- transparent module=Lean.Meta.Tactic.Simp.Simproc
+@[reducible] noncomputable def Lean.Meta.Simp.SimprocsArray : Type := _root_.Array _root_.Lean.Meta.Simp.Simprocs
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Meta.Tactic.Simp.Simproc
+axiom Lean.Meta.Simp.getSimprocs : _root_.Lean.Core.CoreM _root_.Lean.Meta.Simp.Simprocs
+-- role=substrate bucket=- structural=structure module=Lean.Elab.Tactic.Simp
+structure Lean.Elab.Tactic.MkSimpContextResult where
+  ctx : _root_.Lean.Meta.Simp.Context
+  simprocs : _root_.Lean.Meta.Simp.SimprocsArray
+  dischargeWrapper : _root_.Lean.Elab.Tactic.Simp.DischargeWrapper
+  simpArgs : _root_.Array (_root_.Lean.Syntax × _root_.Lean.Elab.Tactic.ElabSimpArgResult)
+-- role=demanded bucket=R-NONE transparent module=Lean.Elab.Tactic.Basic
+@[reducible] noncomputable def Lean.Elab.Tactic.Tactic : Type := _root_.Lean.Syntax → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.ElabTerm
+axiom Lean.Elab.Tactic.elabTerm : _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.Lean.Elab.Tactic.TacticM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.ElabTerm
+axiom Lean.Elab.Tactic.elabTermEnsuringType : _root_.Lean.Syntax → _root_.Option _root_.Lean.Expr → _root_.optParam _root_.Bool _root_.Bool.false → _root_.Lean.Elab.Tactic.TacticM _root_.Lean.Expr
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.evalTactic : _root_.Lean.Syntax → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.getGoals : _root_.Lean.Elab.Tactic.TacticM (_root_.List _root_.Lean.MVarId)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.getMainGoal : _root_.Lean.Elab.Tactic.TacticM _root_.Lean.MVarId
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.instMonadTacticM : _root_.Monad _root_.Lean.Elab.Tactic.TacticM
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.pruneSolvedGoals : _root_.Lean.Elab.Tactic.TacticM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.replaceMainGoal : _root_.List _root_.Lean.MVarId → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.run : _root_.Lean.MVarId → _root_.Lean.Elab.Tactic.TacticM _root_.Unit → _root_.Lean.Elab.Term.TermElabM (_root_.List _root_.Lean.MVarId)
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.setGoals : _root_.List _root_.Lean.MVarId → _root_.Lean.Elab.Tactic.TacticM _root_.Unit
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Basic
+axiom Lean.Elab.Tactic.withMainContext : {α : Type} → _root_.Lean.Elab.Tactic.TacticM α → _root_.Lean.Elab.Tactic.TacticM α
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Meta.Tactic.Simp.Rewrite
+axiom Lean.Meta.Simp.mkDefaultMethodsCore : _root_.Lean.Meta.Simp.SimprocsArray → _root_.Lean.Meta.Simp.Methods
+-- role=demanded bucket=R-NONE effect=pure module=Lean.Elab.Tactic.BuiltinTactic
+axiom Lean.Elab.Tactic.evalAllGoals : _root_.Lean.Elab.Tactic.Tactic
+-- role=demanded bucket=R-EFFECT effect=toolchain-monad module=Lean.Elab.Tactic.Simp
+axiom Lean.Elab.Tactic.mkSimpContext : _root_.Lean.Syntax → _root_.Bool → _root_.optParam _root_.Lean.Elab.Tactic.SimpKind _root_.Lean.Elab.Tactic.SimpKind.simp → _root_.optParam _root_.Bool _root_.Bool.false → _root_.optParam (_root_.Lean.Core.CoreM _root_.Lean.Meta.SimpTheorems) _root_.Lean.Meta.getSimpTheorems → _root_.Lean.Elab.Tactic.TacticM _root_.Lean.Elab.Tactic.MkSimpContextResult
 
-attribute [instance] Lean.Core.instMonadCoreM
-attribute [instance] Lean.Core.instMonadLiftIOCoreM
-attribute [instance] Lean.Core.instMonadQuotationCoreM
-attribute [instance] Lean.Core.instMonadRefCoreM
-attribute [instance] Lean.Elab.Command.instMonadCommandElabM
-attribute [instance] Lean.Elab.Command.instMonadExceptOfExceptionCommandElabM
-attribute [instance] Lean.Elab.Command.instMonadQuotationCommandElabM
-attribute [instance] Lean.Elab.Command.instMonadRefCommandElabM
-attribute [instance] Lean.Elab.Tactic.instMonadTacticM
-attribute [instance] Lean.Elab.Term.instMonadMacroAdapterTermElabM
-attribute [instance] Lean.Elab.Term.instMonadTermElabM
+attribute [instance] Lean.Elab.MonadMacroAdapter.toMonadQuotation
 attribute [instance] Lean.Elab.instInhabitedInfoTree
 attribute [instance] Lean.Expr.instBEq
 attribute [instance] Lean.Expr.instHashable
@@ -2027,10 +2215,8 @@ attribute [instance] Lean.Linter.instInhabitedDeprecationEntry
 attribute [instance] Lean.MessageData.instAppend
 attribute [instance] Lean.Meta.DiscrTree.instBEqKey
 attribute [instance] Lean.Meta.DiscrTree.instHashableKey
-attribute [instance] Lean.Meta.instAlternativeMetaM
 attribute [instance] Lean.Meta.instBEqOrigin
 attribute [instance] Lean.Meta.instHashableOrigin
-attribute [instance] Lean.Meta.instMonadMetaM
 attribute [instance] Lean.NameMap.instEmptyCollection
 attribute [instance] Lean.NameMap.instForInProdNameOfMonad
 attribute [instance] Lean.NameMap.instInhabited
@@ -2049,21 +2235,15 @@ attribute [instance] Lean.instHashableMVarId
 attribute [instance] Lean.instInhabitedDeclaration
 attribute [instance] Lean.instInhabitedFVarId
 attribute [instance] Lean.instInhabitedLocalDecl
-attribute [instance] Lean.instMonadExceptOfExceptionCoreM
-attribute [instance] Lean.instMonadLiftImportMAttrM
-attribute [instance] Lean.Core.instAddMessageContextCoreM
-attribute [instance] Lean.Elab.Command.instAddMessageContextCommandElabM
-attribute [instance] Lean.Elab.Command.instMonadResolveNameCommandElabM
+attribute [instance] Lean.ExprStructEq.instBEq
+attribute [instance] Lean.ExprStructEq.instHashable
 attribute [instance] Lean.KVMap.instValueBool
-attribute [instance] Lean.Meta.instAddMessageContextMetaM
 attribute [instance] Lean.Meta.instBEqDefEqCacheKey
 attribute [instance] Lean.Meta.instBEqExprConfigCacheKey
 attribute [instance] Lean.Meta.instBEqInfoCacheKey
-attribute [instance] Lean.Meta.instBEqSynthInstanceCacheKey
 attribute [instance] Lean.Meta.instHashableDefEqCacheKey
 attribute [instance] Lean.Meta.instHashableExprConfigCacheKey
 attribute [instance] Lean.Meta.instHashableInfoCacheKey
-attribute [instance] Lean.Meta.instHashableSynthInstanceCacheKey
 attribute [instance] Lean.Options.instEmptyCollection
 attribute [instance] Lean.PersistentArray.instForInOfMonad
 attribute [instance] Lean.instAddErrorMessageContextOfAddMessageContextOfMonad
@@ -2074,79 +2254,88 @@ attribute [instance] Lean.instToMessageDataName
 attribute [instance] Lean.instToMessageDataOfToFormat
 attribute [instance] Lean.instToMessageDataString
 attribute [instance] Lean.instToMessageDataTSyntax
-attribute [instance] Lean.Elab.Command.instMonadLogCommandElabM
-attribute [instance] Lean.Elab.Command.instMonadOptionsCommandElabM
 attribute [instance] Lean.LocalContext.instForInLocalDeclOfMonad
 attribute [instance] Lean.Meta.instInhabitedConfigWithKey
+attribute [instance] Lean.MonadError.toAddErrorMessageContext
+attribute [instance] Lean.MonadError.toMonadExceptOf
+attribute [instance] Lean.MonadError.toMonadRef
 attribute [instance] Lean.PersistentArray.instGetElemNatLtSizeOfInhabited
 attribute [instance] Lean.instInhabitedStructureInfo
-attribute [instance] Lean.Elab.Command.instMonadInfoTreeCommandElabM
 attribute [instance] Lean.Meta.Tactic.TryThis.instTypeNameTryThisInfo
-attribute [instance] Lean.Meta.instMonadLCtxMetaM
+attribute [instance] Lean.Meta.instBEqSynthInstanceCacheKey
+attribute [instance] Lean.Meta.instHashableSynthInstanceCacheKey
+attribute [instance] Lean.MonadLog.toMonadFileMap
 attribute [instance] Lean.instInhabitedMetavarDecl
 attribute [instance] Lean.instMonadLCtxOfMonadLift
 attribute [instance] Std.TreeMap.instEmptyCollection
-attribute [instance] Lean.Meta.instMonadMCtxMetaM
 attribute [instance] Lean.instMonadMCtxOfMonadLift
+attribute [instance] Lean.Core.instAddMessageContextCoreM
+attribute [instance] Lean.Core.instMonadCoreM
 attribute [instance] Lean.Core.instMonadEnvCoreM
+attribute [instance] Lean.Core.instMonadLiftIOCoreM
+attribute [instance] Lean.Core.instMonadQuotationCoreM
+attribute [instance] Lean.Core.instMonadRefCoreM
+attribute [instance] Lean.Elab.Command.instAddMessageContextCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadCommandElabM
 attribute [instance] Lean.Elab.Command.instMonadEnvCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadExceptOfExceptionCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadInfoTreeCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadLogCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadOptionsCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadQuotationCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadRefCommandElabM
+attribute [instance] Lean.Elab.Command.instMonadResolveNameCommandElabM
+attribute [instance] Lean.instMonadExceptOfExceptionCoreM
+attribute [instance] Lean.instMonadLiftImportMAttrM
+attribute [instance] Lean.Meta.instAddMessageContextMetaM
+attribute [instance] Lean.Meta.instAlternativeMetaM
 attribute [instance] Lean.Meta.instMonadEnvMetaM
+attribute [instance] Lean.Meta.instMonadLCtxMetaM
+attribute [instance] Lean.Meta.instMonadMCtxMetaM
+attribute [instance] Lean.Meta.instMonadMetaM
+attribute [instance] Lean.Elab.Term.instMonadMacroAdapterTermElabM
+attribute [instance] Lean.Elab.Term.instMonadTermElabM
+attribute [instance] Lean.Elab.Tactic.instMonadTacticM
+attribute [instance] Lean.Elab.MonadMacroAdapter.toMonadQuotation
+attribute [instance] Lean.MonadError.toAddErrorMessageContext
+attribute [instance] Lean.MonadError.toMonadExceptOf
+attribute [instance] Lean.MonadError.toMonadRef
+attribute [instance] Lean.MonadLog.toMonadFileMap
 -- QUARANTINED Lean.Elab.ContextInfo._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.Elab.InfoTree.visitM: pin rejects the printed type -- -
 -- QUARANTINED Lean.Elab.TacticInfo._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.Elab.Term.TermElabM.run': pin rejects the printed type -- -: overloaded, errors 
--- QUARANTINED Lean.Elab.runTactic: pin rejects the printed type -- -: overloaded, errors 
--- QUARANTINED Lean.Expr.below: pin rejects the printed type -- -
--- QUARANTINED Lean.Expr.brecOn: pin rejects the printed type -- lean.unknownIdentifier: Unknown constant `Lean.Expr.below`
 -- QUARANTINED Lean.ImportM.Context.casesOn: provided by the implicitly imported Init substrate
+-- QUARANTINED Lean.ImportM.Context.rec: provided by the implicitly imported Init substrate
 -- QUARANTINED Lean.MVarId._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.Meta.MetaM.run: pin rejects the printed type -- -: overloaded, errors 
--- QUARANTINED Lean.Meta.simpGoal: pin rejects the printed type -- -: overloaded, errors 
--- QUARANTINED Lean.Meta.transform: pin rejects the printed type -- -
+-- QUARANTINED Lean.Meta.MetaM.run: pin rejects the printed type -- lean.unknownIdentifier: Unknown identifier `_root_.Lean.PersistentHashMap.mk`
+-- QUARANTINED Lean.Meta.simpGoal: pin rejects the printed type -- lean.unknownIdentifier: Unknown identifier `_root_.Lean.PersistentHashMap.mk`
 -- QUARANTINED Lean.MetavarContext._sizeOf_inst: provided by the implicitly imported Init substrate
--- QUARANTINED Lean.MetavarContext.lAssignment: pin rejects the printed type -- -: Application type mismatch: The argument
--- QUARANTINED Lean.MetavarContext.lDecls: pin rejects the printed type -- -: Application type mismatch: The argument
--- QUARANTINED Lean.MetavarContext.mk: pin rejects the printed type -- -: Application type mismatch: The argument
 -- QUARANTINED Lean.Option._sizeOf_inst: provided by the implicitly imported Init substrate
 -- QUARANTINED Lean.PrettyPrinter.delab: pin rejects the printed type -- -: Application type mismatch: The argument
--- QUARANTINED Std.HashMap.inner: pin rejects the printed type -- -
--- QUARANTINED Std.HashMap.mk: pin rejects the printed type -- -
--- QUARANTINED Std.TreeMap.inner: pin rejects the printed type -- -
--- QUARANTINED Std.TreeMap.mk: pin rejects the printed type -- -
--- QUARANTINED _private.Lean.CompactedRegion.0.Lean.CompactedRegion.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Data.Options.0.Lean.Options.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.aconstsImpl: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.constInfo: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.exts?: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.isRealized: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.map: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.normalizedTrie: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.revList: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.size: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.declPrefix: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.mkRaw: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.realizingStack: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.EnvExtension.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.Environment.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.EnvironmentHeader.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.Kernel.Environment.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.env: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.opts: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.realizeMapRef: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.private: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.public: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Language.Basic.0.Lean.Language.Snapshot.Diagnostics.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.ConfigWithKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.DefEqCacheKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.ExprConfigCacheKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Basic.0.Lean.Meta.InfoCacheKey.mk: name has a component the facade cannot declare
--- QUARANTINED _private.Lean.Meta.Tactic.Simp.Types.0.Lean.Meta.Simp.Context.mk: name has a component the facade cannot declare
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.aconstsImpl: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.constInfo: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.exts?: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.isRealized: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConst.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.map: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.normalizedTrie: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.revList: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncConsts.size: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.declPrefix: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.mkRaw: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.AsyncContext.realizingStack: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.Environment.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.EnvironmentHeader.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.Kernel.Environment.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.env: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.opts: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.RealizationContext.realizeMapRef: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.mk: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.private: pin rejects the printed type -- -: unexpected token '.'; expected ':'
+-- QUARANTINED _private.Lean.Environment.0.Lean.VisibilityMap.public: pin rejects the printed type -- -: unexpected token '.'; expected ':'
