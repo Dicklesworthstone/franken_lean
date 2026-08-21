@@ -142,6 +142,10 @@ the toolchain would report a perfect facade:
     and uncovered counts to sum to its toolchain-api denominator. The coverage
     aggregate cannot silently drop a demanded row.
 
+  * A CONSTANT-UNIVERSE JOIN requires the exact-demand artifact's non-API
+    partition counts plus toolchain API demand to reconstruct the measured
+    distinct-constant universe at the pinned Reference epoch.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -229,6 +233,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
     demand_corpus_commit = None
     covered_by_stubs = None
     uncovered = None
+    demand_counts = None
+    distinct_used_constants = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -248,6 +254,8 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
                 demand_corpus_commit = row.get("corpus_commit")
                 covered_by_stubs = row.get("covered_by_stubs")
                 uncovered = row.get("uncovered")
+                demand_counts = row.get("counts")
+                distinct_used_constants = row.get("distinct_used_constants")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -308,6 +316,25 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
             f"uncovered={uncovered!r}, "
             f"demanded={declared_toolchain_api_demand!r})"
         )
+    expected_count_keys = {
+        "corpus-internal", "toolchain-library-code", "toolchain-user-facing-data",
+        "local",
+    }
+    if (not isinstance(demand_counts, dict)
+            or set(demand_counts) != expected_count_keys
+            or any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+                   for count in demand_counts.values())
+            or not isinstance(distinct_used_constants, int)
+            or isinstance(distinct_used_constants, bool)
+            or distinct_used_constants < 0
+            or sum(demand_counts.values()) + declared_toolchain_api_demand
+            != distinct_used_constants):
+        raise SystemExit(
+            "REFUSE: exact-demand constant-universe join disagrees with the "
+            f"Reference summary (counts={demand_counts!r}, "
+            f"toolchain_api={declared_toolchain_api_demand!r}, "
+            f"distinct_used_constants={distinct_used_constants!r})"
+        )
     if uncensused:
         raise SystemExit(
             "REFUSE: exact-demand census-partition join found uncensused symbols "
@@ -353,6 +380,7 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
         "corpus_commit": expected_corpus_commit,
         "covered_by_stubs": covered_by_stubs,
         "uncovered": uncovered,
+        "distinct_used_constants": distinct_used_constants,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
