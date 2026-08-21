@@ -4508,7 +4508,9 @@ impl CorpusMatrixReceipt {
             let end = rest
                 .find('"')
                 .ok_or_else(|| format!("unterminated string field `{key}`"))?;
-            Ok(rest[..end].to_string())
+            let value = &rest[..end];
+            assert_no_escape(key, value)?;
+            Ok(value.to_string())
         }
         fn number(row: &str, key: &str) -> Result<u64, String> {
             let needle = format!("\"{key}\":");
@@ -11396,7 +11398,9 @@ impl WholeMathlibReceipt {
             let end = rest
                 .find('"')
                 .ok_or_else(|| format!("unterminated string field `{key}`"))?;
-            Ok(rest[..end].to_string())
+            let value = &rest[..end];
+            assert_no_escape(key, value)?;
+            Ok(value.to_string())
         }
         fn number(row: &str, key: &str) -> Result<u64, String> {
             let needle = format!("\"{key}\":");
@@ -12697,6 +12701,34 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
+    // A STRING FIELD CARRYING AN ESCAPE. The serializer writes a quote as a
+    // backslash-quote pair, and this reader stops at the first plain quote it
+    // meets -- which for an escaped value is the escape's own. Measured with
+    // exact copies of both functions before this commit: a bead of `a"b` came
+    // back as `a` plus a trailing backslash, every other field still parsed, and
+    // the row VALIDATED, because a corrupted bead is still non-blank. The bead
+    // is what routes a retained observation to whoever owns it.
+    let quoted = WholeMathlibReceipt {
+        bead: "a\"b".to_string(),
+        ..sample_whole_mathlib_receipt()
+    };
+    let quoted_row = quoted.to_row();
+    assert!(
+        quoted_row.contains("\\\""),
+        "the serializer must escape the quote, or the reader never meets one: {quoted_row}"
+    );
+    let quoted_reason = match WholeMathlibReceipt::from_row(&quoted_row) {
+        Err(reason) => reason,
+        Ok(read) => panic!(
+            "a bead of {:?} was read back as {:?}; the reader stopped at the escaped quote",
+            quoted.bead, read.bead
+        ),
+    };
+    assert!(
+        quoted_reason.contains("bead") && quoted_reason.contains("escape"),
+        "the refusal must name the field and say the reader cannot decode it: {quoted_reason}"
+    );
+
     // A FIELD NAMED TWICE. This reader finds the FIRST match and a JSON reader
     // takes the last, so before this commit the row below passed every floor
     // here -- 700_000 decoded declarations -- while `jq` over the same file
@@ -13486,6 +13518,30 @@ fn assert_field_once(row: &str, key: &str, needle: &str) -> Result<(), String> {
         return Err(format!(
             "field `{key}` appears more than once. This reader takes the first value and a JSON \
              reader takes the last, so the row would mean different things to different readers"
+        ));
+    }
+    Ok(())
+}
+
+/// This reader returns raw text and does not decode escapes.
+///
+/// `json_string` writes a quote as a backslash-quote pair. The extractor stops
+/// at the first plain quote it finds, which for an escaped value is the escape's
+/// own quote -- so a bead of `a"b` is written escaped and read back as `a` plus
+/// a trailing backslash. Measured with exact copies of both functions: the value
+/// is corrupted, every other field still parses, and the row VALIDATES, because
+/// a corrupted bead is still non-blank. The bead is the routing field; a mangled
+/// one names no work item.
+///
+/// Refusing is the honest half of a reader that cannot decode. Nothing the
+/// producer legitimately writes carries a backslash -- pins, commits, hex
+/// digests, target triples, the class token -- so this refuses exactly the rows
+/// it cannot read correctly.
+fn assert_no_escape(key: &str, value: &str) -> Result<(), String> {
+    if value.contains('\\') {
+        return Err(format!(
+            "string field `{key}` carries a backslash escape, and this reader returns raw text \
+             without decoding escapes; the value it read is not the value that was written"
         ));
     }
     Ok(())
