@@ -7082,6 +7082,78 @@ fn only_an_absent_root_takes_the_skip_path() {
     );
 }
 
+/// The corpus gate's refusals, counted from the function rather than remembered.
+///
+/// **Seven refusals, one probed.** `preflight_mathlib_corpus_at` can reject an
+/// input seven ways. Exactly one -- the commit mismatch -- was ever asserted to
+/// fire; a second appeared covered but was only ever named in a NEGATIVE
+/// assertion, which says a message is absent and nothing about it being
+/// reachable. Counting them from the source rather than from what I remembered
+/// writing is what surfaced that, and it is the same correction the conservation
+/// laws needed last wave.
+///
+/// **Three are reachable here and are probed.** A path that is not there, a real
+/// file where a directory belongs, and a real directory whose revision is not
+/// the pinned one.
+///
+/// **Four are NOT, and saying which keeps the gap honest.** `cannot inspect
+/// corpus checkout` needs `git` to fail to spawn. `is not a readable git
+/// checkout` needs a directory outside any repository -- `CARGO_TARGET_TMPDIR`
+/// lives under `target/`, which is inside this one, so every fixture path
+/// resolves to FrankenLean's HEAD and takes the commit-mismatch branch instead.
+/// The last two, about the built Mathlib olean root, are reachable only AFTER
+/// the commit check passes, which requires the corpus this bead has never had --
+/// they are covered by the same tripwire as the other unexecuted paths.
+///
+/// **Expectations name what differs.** `must be a real directory` appears in two
+/// of the seven, so the cell for the root check asserts the tail unique to it.
+#[test]
+fn the_corpus_gate_refuses_three_reachable_shapes_distinctly() {
+    let manifest = fln_conformance::checked_manifest_dir!();
+
+    let cases = [
+        (
+            "a root that is not on this host",
+            PathBuf::from("/data/tmp/fln-t6r7-a-root-that-does-not-exist"),
+            "is unavailable",
+        ),
+        (
+            "a real FILE where a directory belongs",
+            manifest.join("Cargo.toml"),
+            "not a symlink or non-directory",
+        ),
+        (
+            "a real directory at the wrong revision",
+            manifest.clone(),
+            "corpus commit",
+        ),
+    ];
+
+    let mut reasons: Vec<String> = Vec::new();
+    for (name, root, expected) in cases {
+        let reason = preflight_mathlib_corpus_at(&root)
+            .map(|library| {
+                panic!("`{name}` was accepted as the pinned corpus, yielding {library:?}")
+            })
+            .unwrap_err();
+        assert!(
+            reason.contains(expected),
+            "`{name}` was refused, but not for `{expected}`: {reason}"
+        );
+        reasons.push(reason);
+    }
+
+    // THREE SHAPES, THREE DIFFERENT COMPLAINTS. If two collapsed to one message
+    // the gate would be refusing them for the same reason, and whoever had to
+    // repair a corpus would be told the wrong thing about it.
+    let distinct = reasons.iter().collect::<BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        reasons.len(),
+        "the gate gave the same complaint for different inputs: {reasons:?}"
+    );
+}
+
 /// A TRIPWIRE ON A DISCLOSURE, not a check of the product.
 ///
 /// **What is being disclosed.** Two code paths in this file have never executed
@@ -7212,8 +7284,11 @@ fn the_corpus_classifier_distinguishes_an_absent_root_from_a_wrong_one() {
                 "the refusal must be about this root's IDENTITY as a corpus, not something \
                  incidental: {reason}"
             );
+            // `must be a real directory` appears in TWO of preflight's messages --
+            // the corpus root's and the built-Mathlib root's -- so the tail
+            // unique to the root check is what this must name.
             assert!(
-                !reason.contains("must be a real directory"),
+                !reason.contains("not a symlink or non-directory"),
                 "a real directory was refused for not being one, so the gate misread its input \
                  and this control is not exercising the corpus-identity check: {reason}"
             );
