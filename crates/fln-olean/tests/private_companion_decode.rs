@@ -27,7 +27,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fln_core::expr::Expr;
 use fln_core::level::Level;
@@ -77,11 +77,11 @@ struct ChainBytes {
     private: Vec<u8>,
 }
 
-fn chain_bytes(lib: &PathBuf, relative: &str) -> ChainBytes {
+fn chain_bytes(lib: &Path, relative: &str) -> ChainBytes {
     let exported_path = lib.join(format!("{relative}.olean"));
     let server_path = lib.join(format!("{relative}.olean.server"));
     let private_path = lib.join(format!("{relative}.olean.private"));
-    let read = |path: &PathBuf| -> Vec<u8> {
+    let read = |path: &Path| -> Vec<u8> {
         std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
     };
     ChainBytes {
@@ -8206,9 +8206,7 @@ mod family {
         let parts = components(name);
         parts.len() >= 3
             && parts.last() == Some(&"eq_def")
-            && parts[..parts.len() - 1]
-                .iter()
-                .any(|component| *component == "loop")
+            && parts[..parts.len() - 1].contains(&"loop")
     }
 
     /// `.loop._proof_1` — proof helper emitted inside a generated loop.
@@ -8216,9 +8214,7 @@ mod family {
         let parts = components(name);
         parts.len() >= 3
             && parts.last() == Some(&"_proof_1")
-            && parts[..parts.len() - 1]
-                .iter()
-                .any(|component| *component == "loop")
+            && parts[..parts.len() - 1].contains(&"loop")
     }
 
     /// `.loop.match_1` — match helper emitted inside a generated loop.
@@ -8226,9 +8222,7 @@ mod family {
         let parts = components(name);
         parts.len() >= 3
             && parts.last() == Some(&"match_1")
-            && parts[..parts.len() - 1]
-                .iter()
-                .any(|component| *component == "loop")
+            && parts[..parts.len() - 1].contains(&"loop")
     }
 
     /// `._unary` — compiler-generated unary recursor helper.
@@ -8355,6 +8349,7 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
+    #[allow(clippy::type_complexity)]
     let families: [(&str, fn(&str) -> bool); 14] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
@@ -8439,6 +8434,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
+    #[allow(clippy::type_complexity)]
     let families: [(&str, fn(&str) -> bool); 14] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
