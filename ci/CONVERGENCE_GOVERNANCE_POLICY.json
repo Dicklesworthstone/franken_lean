@@ -1,6 +1,6 @@
 {
   "schema": "fln.convergence-governance-policy/1",
-  "policy_version": "2026-08-04.2",
+  "policy_version": "2026-08-22.1",
   "workstreams": ["W1", "W2", "W3"],
   "wip": {
     "max_active_workstreams": 3,
@@ -15,7 +15,7 @@
   "review": {
     "authority": "sequencer",
     "cadence_days": 7,
-    "next_review": "2026-08-11T00:00:00Z"
+    "next_review": "2026-08-29T00:00:00Z"
   },
   "gates": [
     {"id": "G0", "state": "failed", "root_beads": ["fln-l8f"]},
@@ -57,18 +57,9 @@
     {"id": "franken_lean-npl", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-gii.23", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-gii.26", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "fln-ehb5", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "fln-nhf5", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "fln-s8oo", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "fln-ubs-timeout-promoted-to-rejection-pekl", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "fln-y0f7", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "fln-yihl", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-closure-binding-exempt-rows-uninspected-3s8w", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-d3-root-attr-no-creation-affordance-sso4", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-evidence-fields-never-resolved-bs5o", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-h40t", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-m3fq", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-p6x1", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
-    {"id": "franken_lean-parity-ledger-l2-definition-split-kl4h", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"}
+    {"id": "fln-s8oo", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
+    {"id": "franken_lean-closure-binding-exempt-rows-uninspected-3s8w", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
+    {"id": "franken_lean-p6x1", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
+    {"id": "franken_lean-parity-ledger-l2-definition-split-kl4h", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"}
   ]
 }
