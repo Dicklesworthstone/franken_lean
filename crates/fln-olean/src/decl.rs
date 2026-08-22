@@ -726,7 +726,7 @@ impl<'a> DeclDecoder<'a> {
     /// other constructor stores nothing after `Data`.
     fn expr_scalar_bytes(tag: u8) -> u64 {
         match tag {
-            6 | 7 | 8 => 1,
+            6..=8 => 1,
             _ => 0,
         }
     }
@@ -2380,10 +2380,10 @@ mod tests {
 
         let mut regular = 0_usize;
         for info in &constants {
-            if let ConstantInfo::Defn(definition) = info {
-                if matches!(definition.hints, ReducibilityHints::Regular(_)) {
-                    regular += 1;
-                }
+            if let ConstantInfo::Defn(definition) = info
+                && matches!(definition.hints, ReducibilityHints::Regular(_))
+            {
+                regular += 1;
             }
             if info.name().to_display_string() == "Nat.div.go" {
                 let ConstantInfo::Defn(definition) = info else {
@@ -3532,7 +3532,7 @@ mod tests {
         );
 
         // Box a word in its place.
-        let planted: u64 = (0 << 1) | 1;
+        let planted: u64 = 0b01; // ctor 0 scalar-boxed: (tag << 1) | 1
         bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
 
         let view = OleanView::parse(&bytes).expect("planted region");
@@ -4334,8 +4334,9 @@ mod tests {
         );
         assert_eq!(
             view.obj_header(val_off).expect("owner header"),
-            (1, 4, 48),
-            "and the owning DefinitionVal is untouched"
+            (0, 4, 48),
+            "the DefinitionVal ctor is ctor 0 of the region; the Defn tag 1 \
+             lives on the ConstantInfo wrapper one level up"
         );
 
         let error = DeclDecoder::new(&view, WalkBudget::default())
@@ -4387,12 +4388,10 @@ mod tests {
             .expect("DefinitionVal object");
         assert_eq!(
             view.obj_header(val_off).expect("header"),
-            (1, 4, 48),
-            "base, value, hints, all, then the safety byte"
+            (0, 4, 48),
+            "the DefinitionVal ctor: base, value, hints, all, then the safety \
+             byte; the Defn tag lives on the ConstantInfo wrapper"
         );
-
-        // Slot 2 is `hints`. The fixture is Abbrev, which Lean scalar-boxes as
-        // (1 << 1) | 1 == 3.
         let hints_slot = val_off as usize + 8 + 8 * 2;
         let stored = view.read_u64(val_off + 8 + 8 * 2).expect("hints slot");
         assert_eq!(
@@ -4409,7 +4408,7 @@ mod tests {
         let view = OleanView::parse(&bytes).expect("planted region");
         assert_eq!(
             view.obj_header(val_off).expect("header after plant"),
-            (1, 4, 48),
+            (0, 4, 48),
             "the header is untouched, so the arity and size rules cannot fire"
         );
         let safety = val_off as usize + 8 + 8 * 4;
@@ -4464,10 +4463,11 @@ mod tests {
             .deref(view.read_u64(info_off + 8).expect("DefinitionVal pointer"))
             .expect("DefinitionVal object");
 
-        // DefinitionVal: base, value, hints, all — four slots — then the
-        // safety byte. 8 + 32 + 1 = 41, padded to 48.
+        // DefinitionVal ctor: base, value, hints, all — four slots — then
+        // the safety byte. 8 + 32 + 1 = 41, padded to 48. The ctor is 0; the
+        // Defn tag 1 belongs to the ConstantInfo wrapper above it.
         let (tag, other, cs_sz) = view.obj_header(val_off).expect("DefinitionVal header");
-        assert_eq!(tag, 1, "Defn");
+        assert_eq!(tag, 0, "the DefinitionVal ctor, not the ConstantInfo tag");
         assert_eq!(other, 4, "base, value, hints, all");
         assert_eq!(cs_sz, 48, "plus the safety byte, padded");
 
@@ -4488,7 +4488,7 @@ mod tests {
         let view = OleanView::parse(&bytes).expect("planted region");
         assert_eq!(
             view.obj_header(val_off).expect("header after plant"),
-            (1, 4, 48),
+            (0, 4, 48),
             "the header is untouched, so the arity and size rules cannot fire"
         );
         assert!(
@@ -5036,9 +5036,11 @@ mod tests {
         assert_eq!(cs_sz, 24, "plus the stored Data word");
 
         // Claim two slots AND the 32-byte size that arity implies, so the size
-        // law is satisfied and only the param/mvar arity rule can object.
+        // law is satisfied and only the param/mvar arity rule can object. The
+        // mask clears cs_sz (bits 32-47) AND other (bits 48-55) so the OR
+        // replaces the fixture's arity 1 instead of OR-ing over it.
         let header = view.read_u64(level_off).expect("header word");
-        let planted = (header & !0x0000_ffff_ffff_0000) | (2_u64 << 48) | (32_u64 << 32);
+        let planted = (header & !0x00ff_ffff_0000_0000) | (2_u64 << 48) | (32_u64 << 32);
         bytes[level_off as usize..level_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
 
         let view = OleanView::parse(&bytes).expect("planted region");
@@ -5371,7 +5373,7 @@ mod tests {
             "the fixture's type is a heap expression, so the plant is a change"
         );
 
-        let planted: u64 = (0 << 1) | 1;
+        let planted: u64 = 0b01; // ctor 0 scalar-boxed: (tag << 1) | 1
         bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
 
         let view = OleanView::parse(&bytes).expect("planted region");
@@ -5452,7 +5454,7 @@ mod tests {
         );
 
         // Box a scalar in its place.
-        let planted: u64 = (0 << 1) | 1;
+        let planted: u64 = 0b01; // ctor 0 scalar-boxed: (tag << 1) | 1
         bytes[slot..slot + 8].copy_from_slice(&planted.to_le_bytes());
 
         let view = OleanView::parse(&bytes).expect("planted region");

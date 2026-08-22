@@ -195,8 +195,7 @@ const LIST_MEM_TO_ARRAY_SIMP_1_1: &str =
 /// The census stores this theorem in Array/Basic's private companion.
 const LIST_MEM_TO_ARRAY_SIMP_1_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The second private equation theorem for `List.toArrayAux` in Array/Basic.
-const LIST_TO_ARRAY_AUX_BASIC_EQ_2: &str =
-    "_private.Init.Data.Array.Basic.0.List.toArrayAux.eq_2";
+const LIST_TO_ARRAY_AUX_BASIC_EQ_2: &str = "_private.Init.Data.Array.Basic.0.List.toArrayAux.eq_2";
 /// The census stores this theorem in Array/Basic's private companion.
 const LIST_TO_ARRAY_AUX_BASIC_EQ_2_MODULE: &str = "Init/Data/Array/Basic";
 /// The private defining equation theorem for `List.toArrayAux` in Array/Basic.
@@ -222,27 +221,37 @@ const LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER_MODULE: &str = "Init/Data/Array/B
 const ARRAY_MAP_M_GO_UNARY_PROOF_1: &str =
     "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_1";
 const ARRAY_MAP_M_GO_UNARY_PROOF_1_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_2: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_2";
+const ARRAY_MAP_M_GO_UNARY_PROOF_2: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_2";
 const ARRAY_MAP_M_GO_UNARY_PROOF_2_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_3: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_3";
+const ARRAY_MAP_M_GO_UNARY_PROOF_3: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_3";
 const ARRAY_MAP_M_GO_UNARY_PROOF_3_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_4: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_4";
+const ARRAY_MAP_M_GO_UNARY_PROOF_4: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_4";
 const ARRAY_MAP_M_GO_UNARY_PROOF_4_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_5: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_5";
+const ARRAY_MAP_M_GO_UNARY_PROOF_5: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_5";
 const ARRAY_MAP_M_GO_UNARY_PROOF_5_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_6: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_6";
+const ARRAY_MAP_M_GO_UNARY_PROOF_6: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_6";
 const ARRAY_MAP_M_GO_UNARY_PROOF_6_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_7: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_7";
+const ARRAY_MAP_M_GO_UNARY_PROOF_7: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_7";
 const ARRAY_MAP_M_GO_UNARY_PROOF_7_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_PROOF_8: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_8";
+const ARRAY_MAP_M_GO_UNARY_PROOF_8: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_8";
 const ARRAY_MAP_M_GO_UNARY_PROOF_8_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNARY_EQ_DEF: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary.eq_def";
+const ARRAY_MAP_M_GO_UNARY_EQ_DEF: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary.eq_def";
 const ARRAY_MAP_M_GO_UNARY_EQ_DEF_MODULE: &str = "Init/Data/Array/BasicAux";
-const ARRAY_MAP_M_GO_UNSAFE_REC: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unsafe_rec";
+const ARRAY_MAP_M_GO_UNSAFE_REC: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unsafe_rec";
 const ARRAY_MAP_M_GO_UNSAFE_REC_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_MAP_M_GO_EQ_DEF: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go.eq_def";
 const ARRAY_MAP_M_GO_EQ_DEF_MODULE: &str = "Init/Data/Array/BasicAux";
-const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6: &str = "_private.Init.Data.Array.BasicAux.0.List.of_toArrayAux_eq_toArrayAux.match_1_6";
+const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.of_toArrayAux_eq_toArrayAux.match_1_6";
 const LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_MAP_M_GO_PROOF_1: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._proof_1";
 const ARRAY_MAP_M_GO_PROOF_1_MODULE: &str = "Init/Data/Array/BasicAux";
@@ -252,43 +261,60 @@ const ARRAY_MAP_M_GO_UNARY: &str = "_private.Init.Data.Array.BasicAux.0.Array.ma
 const ARRAY_MAP_M_GO_UNARY_MODULE: &str = "Init/Data/Array/BasicAux";
 const MAP_MONO_M_IMP_GO: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp.go";
 const MAP_MONO_M_IMP_GO_MODULE: &str = "Init/Data/Array/BasicAux";
-const LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.eq_2";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.eq_2";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2_MODULE: &str = "Init/Data/Array/BasicAux";
-const LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.eq_def";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.eq_def";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF_MODULE: &str = "Init/Data/Array/BasicAux";
-const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.eq_1";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.eq_1";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Array/BasicAux";
-const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.eq_2";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.eq_2";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2_MODULE: &str = "Init/Data/Array/BasicAux";
-const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.splitter";
+const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER: &str =
+    "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.match_1.splitter";
 const LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER_MODULE: &str = "Init/Data/Array/BasicAux";
-const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX: &str = "_private.Init.Data.Array.BasicAux.0.PSigma.casesOn._arg_pusher";
+const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX: &str =
+    "_private.Init.Data.Array.BasicAux.0.PSigma.casesOn._arg_pusher";
 const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_ALL_DIFF_AUX_EQ_DEF: &str = "_private.Init.Data.Array.Basic.0.Array.allDiffAux.eq_def";
 const ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE: &str = "Init/Data/Array/Basic";
 const ARRAY_FIND_FIN_IDX_EQ_1: &str = "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.eq_1";
 const ARRAY_FIND_FIN_IDX_EQ_1_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF: &str = "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop.eq_def";
+const ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop.eq_def";
 const ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIND_FIN_IDX_LOOP_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop._proof_1";
+const ARRAY_FIND_FIN_IDX_LOOP_PROOF_1: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop._proof_1";
 const ARRAY_FIND_FIN_IDX_LOOP_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC: &str = "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop._unsafe_rec";
+const ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop._unsafe_rec";
 const ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIND_SOME_REV_M_FIND: &str = "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find";
+const ARRAY_FIND_SOME_REV_M_FIND: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find";
 const ARRAY_FIND_SOME_REV_M_FIND_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIND_SOME_REV_M_FIND_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find.match_1";
+const ARRAY_FIND_SOME_REV_M_FIND_MATCH_1: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find.match_1";
 const ARRAY_FIND_SOME_REV_M_FIND_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIRST_M_GO_UNSAFE_REC: &str = "_private.Init.Data.Array.Basic.0.Array.firstM.go._unsafe_rec";
+const ARRAY_FIRST_M_GO_UNSAFE_REC: &str =
+    "_private.Init.Data.Array.Basic.0.Array.firstM.go._unsafe_rec";
 const ARRAY_FIRST_M_GO_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_UNZIP_MATCH_2: &str = "_private.Init.Data.Array.Basic.0.Array.unzip.match_2";
-const ARRAY_UNZIP_MATCH_2_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC: &str = "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find._unsafe_rec";
+/// The private proof companion generated for `Array.firstM.go`.
+const ARRAY_FIRST_M_GO_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.firstM.go._proof_1";
+/// The pin's private array stores this proof in the basic module.
+const ARRAY_FIRST_M_GO_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
+const ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC: &str =
+    "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find._unsafe_rec";
 const ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
-const ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop.match_1";
+const ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1: &str =
+    "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop.match_1";
 const ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
 const INSERT_IDX_LOOP: &str = "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop";
 const INSERT_IDX_LOOP_MODULE: &str = "Init/Data/Array/Basic";
-const INSERT_IDX_LOOP_UNSAFE_REC: &str = "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop._unsafe_rec";
+const INSERT_IDX_LOOP_UNSAFE_REC: &str =
+    "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop._unsafe_rec";
 const INSERT_IDX_LOOP_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
@@ -310,11 +336,9 @@ const STRING_POS_RAW_GET_MATCH_1_EQ_1: &str =
 /// The pin's private string companion stores this theorem in the Basic module.
 const STRING_POS_RAW_GET_MATCH_1_EQ_1_MODULE: &str = "Init/Data/String/Basic";
 /// The private match implementation for the UTF-8 singleton append theorem.
-const BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1: &str =
-    "_private.Init.Data.String.Basic.0.ByteArray.isValidUTF8_utf8Encode_singleton_append_iff.match_1_1";
+const BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1: &str = "_private.Init.Data.String.Basic.0.ByteArray.isValidUTF8_utf8Encode_singleton_append_iff.match_1_1";
 /// The pin's private string companion stores this definition in the Basic module.
-const BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1_MODULE: &str =
-    "Init/Data/String/Basic";
+const BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1_MODULE: &str = "Init/Data/String/Basic";
 /// The private simp theorem characterizing a failed UTF-8 validation.
 const BYTE_ARRAY_VALIDATE_UTF8_EQ_FALSE_IFF_SIMP_1_1: &str =
     "_private.Init.Data.String.Basic.0.ByteArray.validateUTF8_eq_false_iff._simp_1_1";
@@ -342,8 +366,7 @@ const NAT_REPEAT_MATCH_1_EQ_1: &str = "_private.Init.Data.Nat.Basic.0.Nat.repeat
 /// The pin's private natural-number companion stores this theorem in Basic.
 const NAT_REPEAT_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Nat/Basic";
 /// The private match implementation for `Int.zero_ne_one`.
-const INT_ZERO_NE_ONE_MATCH_1_1: &str =
-    "_private.Init.Data.Int.Basic.0.Int.zero_ne_one.match_1_1";
+const INT_ZERO_NE_ONE_MATCH_1_1: &str = "_private.Init.Data.Int.Basic.0.Int.zero_ne_one.match_1_1";
 /// The pin's private integer companion stores this definition in Basic.
 const INT_ZERO_NE_ONE_MATCH_1_1_MODULE: &str = "Init/Data/Int/Basic";
 /// The private match implementation for `Int.not`.
@@ -355,8 +378,7 @@ const BOOL_EXISTS_BOOL_MATCH_1_1: &str = "_private.Init.Data.Bool.0.Bool.exists_
 /// The pin's private Boolean companion stores this definition in its module.
 const BOOL_EXISTS_BOOL_MATCH_1_1_MODULE: &str = "Init/Data/Bool";
 /// The private match implementation for `Option.map_id`.
-const OPTION_MAP_ID_MATCH_1_1: &str =
-    "_private.Init.Data.Option.Basic.0.Option.map_id.match_1_1";
+const OPTION_MAP_ID_MATCH_1_1: &str = "_private.Init.Data.Option.Basic.0.Option.map_id.match_1_1";
 /// The pin's private option companion stores this definition in Basic.
 const OPTION_MAP_ID_MATCH_1_1_MODULE: &str = "Init/Data/Option/Basic";
 /// The private simp theorem for `Prod.swap_inj`.
@@ -364,8 +386,7 @@ const PROD_SWAP_INJ_SIMP_1_1: &str = "_private.Init.Data.Prod.0.Prod.swap_inj._s
 /// The pin's private product companion stores this theorem in its module.
 const PROD_SWAP_INJ_SIMP_1_1_MODULE: &str = "Init/Data/Prod";
 /// The private match implementation for `Sum.lex_inr_inl`.
-const SUM_LEX_INR_INL_MATCH_1_1: &str =
-    "_private.Init.Data.Sum.Basic.0.Sum.lex_inr_inl.match_1_1";
+const SUM_LEX_INR_INL_MATCH_1_1: &str = "_private.Init.Data.Sum.Basic.0.Sum.lex_inr_inl.match_1_1";
 /// The pin's private sum companion stores this definition in Basic.
 const SUM_LEX_INR_INL_MATCH_1_1_MODULE: &str = "Init/Data/Sum/Basic";
 /// The private theorem defining the strict order on `Fin`.
@@ -574,13 +595,11 @@ const OPTION_JOIN_NE_NONE_SIMP_1_2: &str =
 /// The pin's private option companion stores this theorem in Lemmas.
 const OPTION_JOIN_NE_NONE_SIMP_1_2_MODULE: &str = "Init/Data/Option/Lemmas";
 /// The private first equation for `Option.le`.
-const OPTION_LE_MATCH_1_EQ_1: &str =
-    "_private.Init.Data.Option.Lemmas.0.Option.le.match_1.eq_1";
+const OPTION_LE_MATCH_1_EQ_1: &str = "_private.Init.Data.Option.Lemmas.0.Option.le.match_1.eq_1";
 /// The pin's private option companion stores this theorem in Lemmas.
 const OPTION_LE_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Option/Lemmas";
 /// The private second equation for `Option.le`.
-const OPTION_LE_MATCH_1_EQ_2: &str =
-    "_private.Init.Data.Option.Lemmas.0.Option.le.match_1.eq_2";
+const OPTION_LE_MATCH_1_EQ_2: &str = "_private.Init.Data.Option.Lemmas.0.Option.le.match_1.eq_2";
 /// The pin's private option companion stores this theorem in Lemmas.
 const OPTION_LE_MATCH_1_EQ_2_MODULE: &str = "Init/Data/Option/Lemmas";
 /// The private splitter for the `Option.le` match.
@@ -679,13 +698,11 @@ const OPTION_TO_LIST_JOIN_SIMP_1_1: &str =
 /// The census places the theorem in Option/List's private companion.
 const OPTION_TO_LIST_JOIN_SIMP_1_1_MODULE: &str = "Init/Data/Option/List";
 /// The private equation theorem for Option's inferred membership `forIn` instance.
-const OPTION_FOR_IN_INFER_MEMBERSHIP_MATCH_1_EQ_1: &str =
-    "_private.Init.Data.Option.Monadic.0.Option.instForIn'InferInstanceMembershipOfMonad.match_1.eq_1";
+const OPTION_FOR_IN_INFER_MEMBERSHIP_MATCH_1_EQ_1: &str = "_private.Init.Data.Option.Monadic.0.Option.instForIn'InferInstanceMembershipOfMonad.match_1.eq_1";
 /// The census stores the theorem in Option/Monadic's private companion.
 const OPTION_FOR_IN_INFER_MEMBERSHIP_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Option/Monadic";
 /// The second private equation theorem for Option's inferred membership `forIn` instance.
-const OPTION_FOR_IN_INFER_MEMBERSHIP_MATCH_1_EQ_2: &str =
-    "_private.Init.Data.Option.Monadic.0.Option.instForIn'InferInstanceMembershipOfMonad.match_1.eq_2";
+const OPTION_FOR_IN_INFER_MEMBERSHIP_MATCH_1_EQ_2: &str = "_private.Init.Data.Option.Monadic.0.Option.instForIn'InferInstanceMembershipOfMonad.match_1.eq_2";
 /// The census stores the theorem in Option/Monadic's private companion.
 const OPTION_FOR_IN_INFER_MEMBERSHIP_MATCH_1_EQ_2_MODULE: &str = "Init/Data/Option/Monadic";
 /// The private stored definition implementing `List.hasDecEq`.
@@ -773,12 +790,10 @@ const ARRAY_ZIP_WITH_M_AUX_UNARY_EQ_DEF_MODULE: &str = "Init/Data/Array/Basic";
 ///
 /// The pin census records this theorem under `Init.Data.Nat.Gcd`; its private
 /// companion owns the declaration rather than the exported interface.
-const NAT_GCD_UNARY_PROOF_1: &str =
-    "_private.Init.Data.Nat.Gcd.0.Nat.gcd._unary._proof_1";
+const NAT_GCD_UNARY_PROOF_1: &str = "_private.Init.Data.Nat.Gcd.0.Nat.gcd._unary._proof_1";
 /// A generated theorem whose privacy prefix names `Array.Basic`, while the
 /// pin's private array stores it in the module that generated the simp lemma.
-const ARRAY_OF_FN_GO_CONGR_SIMP: &str =
-    "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp";
+const ARRAY_OF_FN_GO_CONGR_SIMP: &str = "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp";
 /// The actual storage module from the pin's private constant array.
 const ARRAY_OF_FN_GO_CONGR_SIMP_MODULE: &str = "Init/Data/Array/Lemmas";
 /// The exact private simp theorem generated by `Array.foldl_attach`.
@@ -797,8 +812,7 @@ const ARRAY_MEM_ATTACH_MATCH_1_1: &str =
 /// The pin's private array stores this match helper in the attach module.
 const ARRAY_MEM_ATTACH_MATCH_1_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The generated match definition for `Array.pmapImpl`.
-const ARRAY_PMAP_IMPL_MATCH_1: &str =
-    "_private.Init.Data.Array.Attach.0.Array.pmapImpl.match_1";
+const ARRAY_PMAP_IMPL_MATCH_1: &str = "_private.Init.Data.Array.Attach.0.Array.pmapImpl.match_1";
 /// The pin's private array stores this match helper in the attach module.
 const ARRAY_PMAP_IMPL_MATCH_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The generated simp theorem for `Array.pmap_congr_left`.
@@ -812,8 +826,7 @@ const ARRAY_PMAP_EQ_SELF_SIMP_1_1: &str =
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_PMAP_EQ_SELF_SIMP_1_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The generated simp theorem for `Array.pmap_push`.
-const ARRAY_PMAP_PUSH_SIMP_1: &str =
-    "_private.Init.Data.Array.Attach.0.Array.pmap_push._simp_1";
+const ARRAY_PMAP_PUSH_SIMP_1: &str = "_private.Init.Data.Array.Attach.0.Array.pmap_push._simp_1";
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_PMAP_PUSH_SIMP_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The generated simp theorem for `Array.toList_attachWith`.
@@ -827,33 +840,27 @@ const ARRAY_MEM_UNATTACH_SIMP_1_2: &str =
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_MEM_UNATTACH_SIMP_1_2_MODULE: &str = "Init/Data/Array/Attach";
 /// The first generated simp theorem for `Array.mem_pmap`.
-const ARRAY_MEM_PMAP_SIMP_1_1: &str =
-    "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_1";
+const ARRAY_MEM_PMAP_SIMP_1_1: &str = "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_1";
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_MEM_PMAP_SIMP_1_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The second generated simp theorem for `Array.mem_pmap`.
-const ARRAY_MEM_PMAP_SIMP_1_2: &str =
-    "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_2";
+const ARRAY_MEM_PMAP_SIMP_1_2: &str = "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_2";
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_MEM_PMAP_SIMP_1_2_MODULE: &str = "Init/Data/Array/Attach";
 /// The third generated simp theorem for `Array.mem_pmap`.
-const ARRAY_MEM_PMAP_SIMP_1_3: &str =
-    "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_3";
+const ARRAY_MEM_PMAP_SIMP_1_3: &str = "_private.Init.Data.Array.Attach.0.Array.mem_pmap._simp_1_3";
 /// The pin's private array stores this simp theorem in the attach module.
 const ARRAY_MEM_PMAP_SIMP_1_3_MODULE: &str = "Init/Data/Array/Attach";
 /// The private implementation definition behind `Array.attachWith`.
-const ARRAY_ATTACH_WITH_IMPL: &str =
-    "_private.Init.Data.Array.Attach.0.Array.attachWithImpl";
+const ARRAY_ATTACH_WITH_IMPL: &str = "_private.Init.Data.Array.Attach.0.Array.attachWithImpl";
 /// The pin's private array stores this implementation in the attach module.
 const ARRAY_ATTACH_WITH_IMPL_MODULE: &str = "Init/Data/Array/Attach";
 /// The private equation theorem generated for `Array.unattach`.
-const ARRAY_UNATTACH_EQ_1: &str =
-    "_private.Init.Data.Array.Attach.0.Array.unattach.eq_1";
+const ARRAY_UNATTACH_EQ_1: &str = "_private.Init.Data.Array.Attach.0.Array.unattach.eq_1";
 /// The pin's private array stores this theorem in the attach module.
 const ARRAY_UNATTACH_EQ_1_MODULE: &str = "Init/Data/Array/Attach";
 /// The private implementation definition for `Array.allDiffAux`.
-const ARRAY_ALL_DIFF_AUX: &str =
-    "_private.Init.Data.Array.Basic.0.Array.allDiffAux";
+const ARRAY_ALL_DIFF_AUX: &str = "_private.Init.Data.Array.Basic.0.Array.allDiffAux";
 /// The pin's private array stores this implementation in the basic module.
 const ARRAY_ALL_DIFF_AUX_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.allDiffAux`.
@@ -867,28 +874,23 @@ const ARRAY_ALL_DIFF_AUX_UNSAFE_REC: &str =
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_ALL_DIFF_AUX_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
 /// The private monadic scan implementation behind `Array.anyMUnsafe`.
-const ARRAY_ANY_M_UNSAFE_ANY: &str =
-    "_private.Init.Data.Array.Basic.0.Array.anyMUnsafe.any";
+const ARRAY_ANY_M_UNSAFE_ANY: &str = "_private.Init.Data.Array.Basic.0.Array.anyMUnsafe.any";
 /// The pin's private array stores this implementation in the basic module.
 const ARRAY_ANY_M_UNSAFE_ANY_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.back`.
-const ARRAY_BACK_PROOF_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.back._proof_1";
+const ARRAY_BACK_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.back._proof_1";
 /// The pin's private array stores this proof in the basic module.
 const ARRAY_BACK_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.erase`.
-const ARRAY_ERASE_PROOF_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.erase._proof_1";
+const ARRAY_ERASE_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.erase._proof_1";
 /// The pin's private array stores this proof in the basic module.
 const ARRAY_ERASE_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.erase`.
-const ARRAY_ERASE_MATCH_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.erase.match_1";
+const ARRAY_ERASE_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.erase.match_1";
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_ERASE_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.eraseIdx`.
-const ARRAY_ERASE_IDX_PROOF_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.eraseIdx._proof_1";
+const ARRAY_ERASE_IDX_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.eraseIdx._proof_1";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_ERASE_IDX_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The unary generated proof theorem for `Array.eraseIdx`.
@@ -912,18 +914,15 @@ const ARRAY_ERASE_IDX_UNARY_PROOF_4: &str =
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_ERASE_IDX_UNARY_PROOF_4_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.eraseReps`.
-const ARRAY_ERASE_REPS_MATCH_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.eraseReps.match_1";
+const ARRAY_ERASE_REPS_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.eraseReps.match_1";
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_ERASE_REPS_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The private extensionality theorem generated for arrays.
-const ARRAY_EXT_AUX: &str =
-    "_private.Init.Data.Array.Basic.0.Array.ext.extAux";
+const ARRAY_EXT_AUX: &str = "_private.Init.Data.Array.Basic.0.Array.ext.extAux";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_EXT_AUX_MODULE: &str = "Init/Data/Array/Basic";
 /// The private search loop generated for `Array.findFinIdx?`.
-const ARRAY_FIND_FIN_IDX_LOOP: &str =
-    "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop";
+const ARRAY_FIND_FIN_IDX_LOOP: &str = "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.loop";
 /// The pin's private array stores this loop in the basic module.
 const ARRAY_FIND_FIN_IDX_LOOP_MODULE: &str = "Init/Data/Array/Basic";
 /// The private theorem relating `findIdx?` to `findFinIdx?`'s loop.
@@ -937,28 +936,23 @@ const ARRAY_FIND_SOME_REV_M_FIND_F: &str =
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_FIND_SOME_REV_M_FIND_F_MODULE: &str = "Init/Data/Array/Basic";
 /// The private recursion helper generated for `Array.firstM`.
-const ARRAY_FIRST_M_GO: &str =
-    "_private.Init.Data.Array.Basic.0.Array.firstM.go";
+const ARRAY_FIRST_M_GO: &str = "_private.Init.Data.Array.Basic.0.Array.firstM.go";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_FIRST_M_GO_MODULE: &str = "Init/Data/Array/Basic";
 /// The private monadic left-fold implementation helper.
-const ARRAY_FOLDL_M_UNSAFE_FOLD: &str =
-    "_private.Init.Data.Array.Basic.0.Array.foldlMUnsafe.fold";
+const ARRAY_FOLDL_M_UNSAFE_FOLD: &str = "_private.Init.Data.Array.Basic.0.Array.foldlMUnsafe.fold";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_FOLDL_M_UNSAFE_FOLD_MODULE: &str = "Init/Data/Array/Basic";
 /// The private monadic right-fold implementation helper.
-const ARRAY_FOLDR_M_UNSAFE_FOLD: &str =
-    "_private.Init.Data.Array.Basic.0.Array.foldrMUnsafe.fold";
+const ARRAY_FOLDR_M_UNSAFE_FOLD: &str = "_private.Init.Data.Array.Basic.0.Array.foldrMUnsafe.fold";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_FOLDR_M_UNSAFE_FOLD_MODULE: &str = "Init/Data/Array/Basic";
 /// The private iterator loop generated for `Array.forIn'Unsafe`.
-const ARRAY_FOR_IN_UNSAFE_LOOP: &str =
-    "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop";
+const ARRAY_FOR_IN_UNSAFE_LOOP: &str = "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop";
 /// The pin's private array stores this loop in the basic module.
 const ARRAY_FOR_IN_UNSAFE_LOOP_MODULE: &str = "Init/Data/Array/Basic";
 /// The private monadic map implementation helper.
-const ARRAY_MAP_M_UNSAFE_MAP: &str =
-    "_private.Init.Data.Array.Basic.0.Array.mapMUnsafe.map";
+const ARRAY_MAP_M_UNSAFE_MAP: &str = "_private.Init.Data.Array.Basic.0.Array.mapMUnsafe.map";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_MAP_M_UNSAFE_MAP_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.getEvenElems`.
@@ -967,23 +961,19 @@ const ARRAY_GET_EVEN_ELEMS_MATCH_1: &str =
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_GET_EVEN_ELEMS_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.idxOfAux`.
-const ARRAY_IDX_OF_AUX_PROOF_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.idxOfAux._proof_1";
+const ARRAY_IDX_OF_AUX_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.idxOfAux._proof_1";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_IDX_OF_AUX_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.isEqvAux`.
-const ARRAY_IS_EQV_AUX_MATCH_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.isEqvAux.match_1";
+const ARRAY_IS_EQV_AUX_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.isEqvAux.match_1";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_IS_EQV_AUX_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The first generated proof theorem for `Array.isEqvAux`.
-const ARRAY_IS_EQV_AUX_PROOF_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.isEqvAux._proof_1";
+const ARRAY_IS_EQV_AUX_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.isEqvAux._proof_1";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_IS_EQV_AUX_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The second generated proof theorem for `Array.isEqvAux`.
-const ARRAY_IS_EQV_AUX_PROOF_2: &str =
-    "_private.Init.Data.Array.Basic.0.Array.isEqvAux._proof_2";
+const ARRAY_IS_EQV_AUX_PROOF_2: &str = "_private.Init.Data.Array.Basic.0.Array.isEqvAux._proof_2";
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_IS_EQV_AUX_PROOF_2_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.isEqv`.
@@ -1016,8 +1006,7 @@ const ARRAY_IS_PREFIX_OF_AUX_EQ_DEF: &str =
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_IS_PREFIX_OF_AUX_EQ_DEF_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated recursion helper for `Array.allDiffAuxAux`.
-const ARRAY_ALL_DIFF_AUX_AUX_F: &str =
-    "_private.Init.Data.Array.Basic.0.Array.allDiffAuxAux._f";
+const ARRAY_ALL_DIFF_AUX_AUX_F: &str = "_private.Init.Data.Array.Basic.0.Array.allDiffAuxAux._f";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_ALL_DIFF_AUX_AUX_F_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated proof theorem for `Array.allDiffAuxAux`.
@@ -1071,34 +1060,6 @@ const ARRAY_TAKE_WHILE_GO_UNSAFE_REC: &str =
     "_private.Init.Data.Array.Basic.0.Array.takeWhile.go._unsafe_rec";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_TAKE_WHILE_GO_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
-/// The private recursion helper generated for `Array.filterM`.
-const ARRAY_FILTER_M_GO: &str = "_private.Init.Data.Array.Basic.0.Array.filterM.go";
-/// The pin's private array stores this helper in the basic module.
-const ARRAY_FILTER_M_GO_MODULE: &str = "Init/Data/Array/Basic";
-/// The private recursion helper generated for `Array.mapIdx`.
-const ARRAY_MAP_IDX_GO: &str = "_private.Init.Data.Array.Basic.0.Array.mapIdx.go";
-/// The pin's private array stores this helper in the basic module.
-const ARRAY_MAP_IDX_GO_MODULE: &str = "Init/Data/Array/Basic";
-/// The private recursion helper generated for `Array.foldlM`.
-const ARRAY_FOLDL_M_GO: &str = "_private.Init.Data.Array.Basic.0.Array.foldlM.go";
-/// The pin's private array stores this helper in the basic module.
-const ARRAY_FOLDL_M_GO_MODULE: &str = "Init/Data/Array/Basic";
-/// The private recursion helper generated for `Array.forIn`.
-const ARRAY_FOR_IN_GO: &str = "_private.Init.Data.Array.Basic.0.Array.forIn.go";
-/// The pin's private array stores this helper in the basic module.
-const ARRAY_FOR_IN_GO_MODULE: &str = "Init/Data/Array/Basic";
-/// The private recursion helper generated for `Array.mapM`.
-const ARRAY_MAP_M_GO_BASIC: &str = "_private.Init.Data.Array.Basic.0.Array.mapM.go";
-/// The pin's private array stores this helper in the basic module.
-const ARRAY_MAP_M_GO_BASIC_MODULE: &str = "Init/Data/Array/Basic";
-/// The private recursion helper generated for `Array.filterMap`.
-const ARRAY_FILTER_MAP_GO: &str = "_private.Init.Data.Array.Basic.0.Array.filterMap.go";
-/// The pin's private array stores this helper in the basic module.
-const ARRAY_FILTER_MAP_GO_MODULE: &str = "Init/Data/Array/Basic";
-/// The private proof generated for `Array.swap`.
-const ARRAY_SWAP_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.swap._proof_1";
-/// The pin's private array stores this proof in the basic module.
-const ARRAY_SWAP_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The private recursion helper generated for `Array.zipWithAll`.
 const ARRAY_ZIP_WITH_ALL_GO: &str = "_private.Init.Data.Array.Basic.0.Array.zipWithAll.go";
 /// The pin's private array stores this helper in the basic module.
@@ -1112,8 +1073,7 @@ const ARRAY_UNZIP_MATCH_3: &str = "_private.Init.Data.Array.Basic.0.Array.unzip.
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_UNZIP_MATCH_3_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.size_pop`.
-const ARRAY_SIZE_POP_MATCH_1_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.size_pop.match_1_1";
+const ARRAY_SIZE_POP_MATCH_1_1: &str = "_private.Init.Data.Array.Basic.0.Array.size_pop.match_1_1";
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_SIZE_POP_MATCH_1_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.shrink`.
@@ -1173,8 +1133,7 @@ const ARRAY_POP_WHILE_EQ_1: &str = "_private.Init.Data.Array.Basic.0.Array.popWh
 /// The pin's private array stores this theorem in the basic module.
 const ARRAY_POP_WHILE_EQ_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.mem_def`.
-const ARRAY_MEM_DEF_MATCH_1_1: &str =
-    "_private.Init.Data.Array.Basic.0.Array.mem_def.match_1_1";
+const ARRAY_MEM_DEF_MATCH_1_1: &str = "_private.Init.Data.Array.Basic.0.Array.mem_def.match_1_1";
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_MEM_DEF_MATCH_1_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The splitter definition generated for `Option.isSome.match_1`.
@@ -1637,8 +1596,7 @@ fn list_of_to_array_aux_helper_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn list_of_to_array_aux_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("list_of_to_array_aux_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("list_of_to_array_aux_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -1698,8 +1656,7 @@ fn list_size_to_array_aux_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn list_to_array_aux_equation_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("list_to_array_aux_equation_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("list_to_array_aux_equation_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_EQ_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -1812,8 +1769,7 @@ fn get_elem_second_match_equation_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn get_elem_match_splitter_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("get_elem_match_splitter_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("get_elem_match_splitter_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, GET_ELEM_MATCH_1_SPLITTER_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -1841,8 +1797,7 @@ fn get_elem_match_splitter_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn list_mem_to_array_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("list_mem_to_array_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("list_mem_to_array_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, LIST_MEM_TO_ARRAY_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -1930,8 +1885,7 @@ fn list_to_array_aux_defining_equation_is_decoded_from_its_private_storage_modul
 
 #[test]
 fn list_to_array_aux_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("list_to_array_aux_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("list_to_array_aux_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_MATCH_1_EQ_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -1997,15 +1951,22 @@ fn list_to_array_aux_match_splitter_is_decoded_from_its_private_storage_module()
         "the private companion of {LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER_MODULE} must retain \\
          {LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER}"
     );
-    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
-        .expect("private part parses against its companion address spaces");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
     let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
-        .decode_module_constants().expect("private constants decode").into_iter()
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
         .find(|info| info.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER)
-        .unwrap_or_else(|| panic!("private decoder lost {LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER}"));
-    assert!(matches!(recovered, ConstantInfo::Defn(_)),
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {LIST_TO_ARRAY_AUX_BASIC_MATCH_1_SPLITTER} as {} instead of Defn",
-        recovered.kind_name());
+        recovered.kind_name()
+    );
 }
 
 #[test]
@@ -2013,183 +1974,668 @@ fn array_map_m_go_unary_proof_is_decoded_from_its_private_storage_module() {
     let lib = lib_or_skip!("array_map_m_go_unary_proof_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
-    assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_1.to_owned()),
-        "the private companion of {ARRAY_MAP_M_GO_UNARY_PROOF_1_MODULE} must retain {ARRAY_MAP_M_GO_UNARY_PROOF_1}");
-    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
-        .expect("private part parses against its companion address spaces");
-    let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants()
-        .expect("private constants decode").into_iter()
+    assert!(
+        private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_1.to_owned()),
+        "the private companion of {ARRAY_MAP_M_GO_UNARY_PROOF_1_MODULE} must retain {ARRAY_MAP_M_GO_UNARY_PROOF_1}"
+    );
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
         .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_1)
         .unwrap_or_else(|| panic!("private decoder lost {ARRAY_MAP_M_GO_UNARY_PROOF_1}"));
-    assert!(matches!(recovered, ConstantInfo::Thm(_)),
-        "private companion decoded {ARRAY_MAP_M_GO_UNARY_PROOF_1} as {} instead of Thm", recovered.kind_name());
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_MAP_M_GO_UNARY_PROOF_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
 }
 
 #[test]
 fn array_map_m_go_unary_second_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_second_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_map_m_go_unary_second_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
     assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_2.to_owned()));
-    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap();
-    let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_2).unwrap();
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_2)
+        .unwrap();
     assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_third_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_third_proof_is_decoded_from_its_private_storage_module");
+    let lib =
+        lib_or_skip!("array_map_m_go_unary_third_proof_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_3_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
     assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_3.to_owned()));
-    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap();
-    let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_3).unwrap();
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_3)
+        .unwrap();
     assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_fourth_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_fourth_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_map_m_go_unary_fourth_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_4_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
     assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_4.to_owned()));
-    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap();
-    let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_4).unwrap();
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_4)
+        .unwrap();
     assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_fifth_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_fifth_proof_is_decoded_from_its_private_storage_module");
+    let lib =
+        lib_or_skip!("array_map_m_go_unary_fifth_proof_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_5_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
     assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_5.to_owned()));
-    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap();
-    let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_5).unwrap();
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_5)
+        .unwrap();
     assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_sixth_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_sixth_proof_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_6_MODULE); let (_, private_names) = exported_and_private_names(&chain); assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_6.to_owned())); let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_6).unwrap(); assert!(matches!(recovered, ConstantInfo::Thm(_)));
+    let lib =
+        lib_or_skip!("array_map_m_go_unary_sixth_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_6_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+    assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_6.to_owned()));
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_6)
+        .unwrap();
+    assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_seventh_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_seventh_proof_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_7_MODULE); let (_, private_names) = exported_and_private_names(&chain); assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_7.to_owned())); let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_7).unwrap(); assert!(matches!(recovered, ConstantInfo::Thm(_)));
+    let lib = lib_or_skip!(
+        "array_map_m_go_unary_seventh_proof_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_7_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+    assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_7.to_owned()));
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_7)
+        .unwrap();
+    assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_eighth_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_eighth_proof_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_8_MODULE); let (_, private_names) = exported_and_private_names(&chain); assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_8.to_owned())); let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_8).unwrap(); assert!(matches!(recovered, ConstantInfo::Thm(_)));
+    let lib = lib_or_skip!(
+        "array_map_m_go_unary_eighth_proof_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_8_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+    assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_8.to_owned()));
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_8)
+        .unwrap();
+    assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
 fn array_map_m_go_unary_eq_def_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_map_m_go_unary_eq_def_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_EQ_DEF_MODULE); let (_, private_names) = exported_and_private_names(&chain); assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_EQ_DEF.to_owned())); let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_EQ_DEF).unwrap(); assert!(matches!(recovered, ConstantInfo::Thm(_)));
+    let lib =
+        lib_or_skip!("array_map_m_go_unary_eq_def_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_EQ_DEF_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+    assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_EQ_DEF.to_owned()));
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_EQ_DEF)
+        .unwrap();
+    assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
 #[test]
-fn array_map_m_go_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_map_m_go_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_map_m_go_unsafe_rec_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNSAFE_REC_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_MAP_M_GO_UNSAFE_REC.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_UNSAFE_REC)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_map_m_go_eq_def_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_eq_def_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_map_m_go_eq_def_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_map_m_go_eq_def_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_EQ_DEF_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_MAP_M_GO_EQ_DEF.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_EQ_DEF)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn list_of_to_array_aux_match_six_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_of_to_array_aux_match_six_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn list_of_to_array_aux_match_six_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("list_of_to_array_aux_match_six_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == LIST_OF_TO_ARRAY_AUX_EQ_TO_ARRAY_AUX_MATCH_1_6)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_map_m_go_proof_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_proof_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_PROOF_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_PROOF_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_PROOF_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_map_m_go_proof_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_map_m_go_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_PROOF_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_MAP_M_GO_PROOF_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_PROOF_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_map_m_go_second_proof_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_second_proof_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_PROOF_2_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_PROOF_2.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_PROOF_2).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_map_m_go_second_proof_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_map_m_go_second_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_PROOF_2_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_MAP_M_GO_PROOF_2.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_PROOF_2)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_map_m_go_unary_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_unary_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_UNARY.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_UNARY).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_map_m_go_unary_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_map_m_go_unary_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_MAP_M_GO_UNARY.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_UNARY)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn map_mono_m_imp_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("map_mono_m_imp_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, MAP_MONO_M_IMP_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&MAP_MONO_M_IMP_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == MAP_MONO_M_IMP_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn map_mono_m_imp_go_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("map_mono_m_imp_go_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, MAP_MONO_M_IMP_GO_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&MAP_MONO_M_IMP_GO.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == MAP_MONO_M_IMP_GO)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn list_to_array_aux_basic_aux_second_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_second_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn list_to_array_aux_basic_aux_second_equation_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "list_to_array_aux_basic_aux_second_equation_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_2)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn list_to_array_aux_basic_aux_defining_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_defining_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn list_to_array_aux_basic_aux_defining_equation_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "list_to_array_aux_basic_aux_defining_equation_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_EQ_DEF)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn list_to_array_aux_basic_aux_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn list_to_array_aux_basic_aux_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "list_to_array_aux_basic_aux_match_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn list_to_array_aux_basic_aux_second_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_second_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn list_to_array_aux_basic_aux_second_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "list_to_array_aux_basic_aux_second_match_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_EQ_2)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "list_to_array_aux_basic_aux_match_splitter_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == LIST_TO_ARRAY_AUX_BASIC_AUX_MATCH_1_SPLITTER)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_ALL_DIFF_AUX_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_ALL_DIFF_AUX_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_ALL_DIFF_AUX_EQ_DEF.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_ALL_DIFF_AUX_EQ_DEF)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_find_fin_idx_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_fin_idx_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_EQ_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_FIN_IDX_EQ_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_EQ_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_find_fin_idx_equation_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_find_fin_idx_equation_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_EQ_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_FIN_IDX_EQ_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_EQ_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_find_fin_idx_loop_defining_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_fin_idx_loop_defining_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_find_fin_idx_loop_defining_equation_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_find_fin_idx_loop_defining_equation_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP_EQ_DEF)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_find_fin_idx_loop_proof_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_fin_idx_loop_proof_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_PROOF_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_FIN_IDX_LOOP_PROOF_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP_PROOF_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+fn array_find_fin_idx_loop_proof_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_find_fin_idx_loop_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_PROOF_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_FIN_IDX_LOOP_PROOF_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP_PROOF_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_find_fin_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_fin_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_find_fin_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_find_fin_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_LOOP_UNSAFE_REC)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_find_some_rev_m_find_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_some_rev_m_find_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_find_some_rev_m_find_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_find_some_rev_m_find_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_find_some_rev_m_find_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_some_rev_m_find_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_MATCH_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND_MATCH_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND_MATCH_1).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_find_some_rev_m_find_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_find_some_rev_m_find_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_MATCH_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND_MATCH_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND_MATCH_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_first_m_go_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_first_m_go_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIRST_M_GO_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIRST_M_GO_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIRST_M_GO_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_first_m_go_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_first_m_go_unsafe_rec_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIRST_M_GO_UNSAFE_REC_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIRST_M_GO_UNSAFE_REC.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIRST_M_GO_UNSAFE_REC)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_unzip_basic_second_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_unzip_basic_second_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_UNZIP_MATCH_2_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_UNZIP_MATCH_2.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_UNZIP_MATCH_2).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_first_m_go_proof_1_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_first_m_go_proof_1_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIRST_M_GO_PROOF_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIRST_M_GO_PROOF_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIRST_M_GO_PROOF_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Thm(_)));
+}
 
 #[test]
-fn array_take_while_go_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_take_while_go_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_TAKE_WHILE_GO_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_TAKE_WHILE_GO_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_TAKE_WHILE_GO_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_take_while_go_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_take_while_go_unsafe_rec_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_TAKE_WHILE_GO_UNSAFE_REC_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_TAKE_WHILE_GO_UNSAFE_REC.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_TAKE_WHILE_GO_UNSAFE_REC)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_filter_m_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_filter_m_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FILTER_M_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FILTER_M_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FILTER_M_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_map_idx_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_idx_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_IDX_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_IDX_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_IDX_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn array_for_in_unsafe_loop_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_for_in_unsafe_loop_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_foldl_m_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_foldl_m_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FOLDL_M_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FOLDL_M_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FOLDL_M_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn insert_idx_loop_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("insert_idx_loop_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, INSERT_IDX_LOOP_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&INSERT_IDX_LOOP.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == INSERT_IDX_LOOP)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
-fn array_for_in_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_for_in_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FOR_IN_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FOR_IN_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FOR_IN_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
-
-#[test]
-fn array_map_m_basic_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_basic_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_BASIC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_BASIC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_BASIC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
-
-#[test]
-fn array_filter_map_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_filter_map_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FILTER_MAP_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FILTER_MAP_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FILTER_MAP_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
-
-#[test]
-fn array_swap_proof_1_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_swap_proof_1_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_SWAP_PROOF_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_SWAP_PROOF_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_SWAP_PROOF_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
-
-#[test]
-fn array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
-
-#[test]
-fn array_for_in_unsafe_loop_match_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_for_in_unsafe_loop_match_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FOR_IN_UNSAFE_LOOP_MATCH_1).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
-
-#[test]
-fn insert_idx_loop_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("insert_idx_loop_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, INSERT_IDX_LOOP_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&INSERT_IDX_LOOP.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == INSERT_IDX_LOOP).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
-
-#[test]
-fn insert_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("insert_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, INSERT_IDX_LOOP_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&INSERT_IDX_LOOP_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == INSERT_IDX_LOOP_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+fn insert_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("insert_idx_loop_unsafe_rec_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, INSERT_IDX_LOOP_UNSAFE_REC_MODULE);
+    let (_, n) = exported_and_private_names(&chain);
+    assert!(n.contains(&INSERT_IDX_LOOP_UNSAFE_REC.to_owned()));
+    let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+        .unwrap();
+    let r = DeclDecoder::new(&v, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name().to_display_string() == INSERT_IDX_LOOP_UNSAFE_REC)
+        .unwrap();
+    assert!(matches!(r, ConstantInfo::Defn(_)));
+}
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
@@ -2240,9 +2686,7 @@ fn byte_array_utf8_decode_success_theorem_is_decoded_from_its_private_storage_mo
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == BYTE_ARRAY_IS_SOME_UTF8_DECODE_GO_IFF)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {BYTE_ARRAY_IS_SOME_UTF8_DECODE_GO_IFF}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {BYTE_ARRAY_IS_SOME_UTF8_DECODE_GO_IFF}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {BYTE_ARRAY_IS_SOME_UTF8_DECODE_GO_IFF} as {} instead of Thm",
@@ -2272,9 +2716,7 @@ fn byte_array_utf8_decode_match_equation_is_decoded_from_its_private_storage_mod
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == BYTE_ARRAY_UTF8_DECODE_GO_MATCH_1_EQ_1)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {BYTE_ARRAY_UTF8_DECODE_GO_MATCH_1_EQ_1}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {BYTE_ARRAY_UTF8_DECODE_GO_MATCH_1_EQ_1}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {BYTE_ARRAY_UTF8_DECODE_GO_MATCH_1_EQ_1} as {} instead of Thm",
@@ -2304,9 +2746,7 @@ fn string_pos_raw_get_match_equation_is_decoded_from_its_private_storage_module(
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == STRING_POS_RAW_GET_MATCH_1_EQ_1)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {STRING_POS_RAW_GET_MATCH_1_EQ_1}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {STRING_POS_RAW_GET_MATCH_1_EQ_1}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {STRING_POS_RAW_GET_MATCH_1_EQ_1} as {} instead of Thm",
@@ -2342,9 +2782,7 @@ fn byte_array_utf8_singleton_append_match_is_decoded_from_its_private_storage_mo
             info.name().to_display_string() == BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1
         })
         .unwrap_or_else(|| {
-            panic!(
-                "private decoder lost {BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1}"
-            )
+            panic!("private decoder lost {BYTE_ARRAY_IS_VALID_UTF8_SINGLETON_APPEND_MATCH_1_1}")
         });
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
@@ -2355,9 +2793,8 @@ fn byte_array_utf8_singleton_append_match_is_decoded_from_its_private_storage_mo
 
 #[test]
 fn byte_array_utf8_validation_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "byte_array_utf8_validation_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("byte_array_utf8_validation_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, BYTE_ARRAY_VALIDATE_UTF8_EQ_FALSE_IFF_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -2389,9 +2826,8 @@ fn byte_array_utf8_validation_simp_is_decoded_from_its_private_storage_module() 
 
 #[test]
 fn string_pos_raw_append_left_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "string_pos_raw_append_left_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("string_pos_raw_append_left_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, STRING_POS_RAW_IS_VALID_APPEND_LEFT_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -2729,8 +3165,7 @@ fn fin_mlt_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn char_is_valid_uint32_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("char_is_valid_uint32_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("char_is_valid_uint32_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, CHAR_IS_VALID_UINT32_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -2859,9 +3294,7 @@ fn byte_array_fast_append_simp_is_decoded_from_its_private_storage_module() {
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1} as {} instead of Thm",
@@ -2889,9 +3322,7 @@ fn dyadic_neg_add_cancel_simp_is_decoded_from_its_private_storage_module() {
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == DYADIC_NEG_ADD_CANCEL_SIMP_1_1)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {DYADIC_NEG_ADD_CANCEL_SIMP_1_1}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {DYADIC_NEG_ADD_CANCEL_SIMP_1_1}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {DYADIC_NEG_ADD_CANCEL_SIMP_1_1} as {} instead of Thm",
@@ -3128,8 +3559,9 @@ fn option_is_some_second_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_lemmas_is_some_match_splitter_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_lemmas_is_some_match_splitter_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "option_lemmas_is_some_match_splitter_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, OPTION_LEMMAS_IS_SOME_MATCH_1_SPLITTER_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3157,8 +3589,7 @@ fn option_lemmas_is_some_match_splitter_is_decoded_from_its_private_storage_modu
 
 #[test]
 fn option_join_eq_none_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_join_eq_none_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_join_eq_none_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_JOIN_EQ_NONE_IFF_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3186,8 +3617,7 @@ fn option_join_eq_none_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_join_eq_some_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_join_eq_some_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_join_eq_some_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_JOIN_EQ_SOME_IFF_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3215,9 +3645,8 @@ fn option_join_eq_some_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_join_eq_some_second_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_join_eq_some_second_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_join_eq_some_second_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_JOIN_EQ_SOME_IFF_SIMP_1_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3245,8 +3674,7 @@ fn option_join_eq_some_second_simp_is_decoded_from_its_private_storage_module() 
 
 #[test]
 fn option_join_filter_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_join_filter_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_join_filter_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_JOIN_FILTER_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3274,8 +3702,7 @@ fn option_join_filter_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_join_ne_none_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_join_ne_none_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_join_ne_none_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_JOIN_NE_NONE_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3303,8 +3730,7 @@ fn option_join_ne_none_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_mem_to_array_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_mem_to_array_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_mem_to_array_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_MEM_TO_ARRAY_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3332,8 +3758,7 @@ fn option_mem_to_array_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_to_array_join_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_to_array_join_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_to_array_join_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_TO_ARRAY_JOIN_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3390,9 +3815,8 @@ fn option_attach_eq_some_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_unattach_eq_some_match_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_unattach_eq_some_match_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_unattach_eq_some_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3410,9 +3834,7 @@ fn option_unattach_eq_some_match_is_decoded_from_its_private_storage_module() {
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1}"));
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1} as {} instead of Defn",
@@ -3422,8 +3844,7 @@ fn option_unattach_eq_some_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_attach_filter_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_attach_filter_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_attach_filter_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_ATTACH_FILTER_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3451,9 +3872,8 @@ fn option_attach_filter_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_attach_filter_second_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_attach_filter_second_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_attach_filter_second_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_ATTACH_FILTER_SIMP_1_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3481,8 +3901,7 @@ fn option_attach_filter_second_simp_is_decoded_from_its_private_storage_module()
 
 #[test]
 fn option_attach_pfilter_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_attach_pfilter_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_attach_pfilter_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_ATTACH_PFILTER_SIMP_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3539,9 +3958,8 @@ fn option_decidable_eq_first_match_is_decoded_from_its_private_storage_module() 
 
 #[test]
 fn option_decidable_eq_second_match_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_decidable_eq_second_match_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_decidable_eq_second_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_DECIDABLE_EQ_MATCH_1_EQ_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3588,9 +4006,7 @@ fn option_decidable_eq_match_splitter_is_decoded_from_its_private_storage_module
         .decode_module_constants()
         .expect("private constants decode")
         .into_iter()
-        .find(|info| {
-            info.name().to_display_string() == OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER
-        })
+        .find(|info| info.name().to_display_string() == OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER)
         .unwrap_or_else(|| {
             panic!("private decoder lost {OPTION_ATTACH_DECIDABLE_EQ_MATCH_1_SPLITTER}")
         });
@@ -3603,9 +4019,8 @@ fn option_decidable_eq_match_splitter_is_decoded_from_its_private_storage_module
 
 #[test]
 fn option_lawful_monad_attach_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_lawful_monad_attach_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_lawful_monad_attach_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_LAWFUL_MONAD_ATTACH_SIMP_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3663,8 +4078,7 @@ fn option_lawful_monad_attach_second_simp_is_decoded_from_its_private_storage_mo
 
 #[test]
 fn option_is_none_choice_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_is_none_choice_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_is_none_choice_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_IS_NONE_CHOICE_EQ_FALSE_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3694,8 +4108,7 @@ fn option_is_none_choice_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_is_none_merge_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_is_none_merge_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_is_none_merge_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_IS_NONE_MERGE_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -3742,9 +4155,7 @@ fn option_is_none_pfilter_simp_is_decoded_from_its_private_storage_module() {
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == OPTION_IS_NONE_PFILTER_IFF_SIMP_1_1)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_1}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_1}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_1} as {} instead of Thm",
@@ -3774,9 +4185,7 @@ fn option_is_none_pfilter_second_simp_is_decoded_from_its_private_storage_module
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == OPTION_IS_NONE_PFILTER_IFF_SIMP_1_2)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_2}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_2}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_2} as {} instead of Thm",
@@ -3806,9 +4215,7 @@ fn option_is_none_pfilter_third_simp_is_decoded_from_its_private_storage_module(
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == OPTION_IS_NONE_PFILTER_IFF_SIMP_1_3)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_3}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_3}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_IS_NONE_PFILTER_IFF_SIMP_1_3} as {} instead of Thm",
@@ -3818,8 +4225,7 @@ fn option_is_none_pfilter_third_simp_is_decoded_from_its_private_storage_module(
 
 #[test]
 fn option_is_some_merge_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_is_some_merge_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_is_some_merge_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_IS_SOME_MERGE_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4075,8 +4481,7 @@ fn option_pmap_second_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_pmap_match_splitter_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_pmap_match_splitter_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_pmap_match_splitter_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_PMAP_MATCH_1_SPLITTER_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4104,8 +4509,7 @@ fn option_pmap_match_splitter_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_pmap_eq_some_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_pmap_eq_some_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_pmap_eq_some_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_PMAP_EQ_SOME_IFF_SIMP_1_4_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4133,9 +4537,8 @@ fn option_pmap_eq_some_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_pmap_eq_some_second_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_pmap_eq_some_second_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_pmap_eq_some_second_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4163,8 +4566,7 @@ fn option_pmap_eq_some_second_simp_is_decoded_from_its_private_storage_module() 
 
 #[test]
 fn option_pfilter_first_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_pfilter_first_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_pfilter_first_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_PFILTER_MATCH_1_EQ_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4250,9 +4652,8 @@ fn option_pfilter_match_splitter_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_pfilter_eq_some_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_pfilter_eq_some_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_pfilter_eq_some_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_PFILTER_EQ_SOME_IFF_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4300,9 +4701,7 @@ fn option_pfilter_eq_some_second_simp_is_decoded_from_its_private_storage_module
         .expect("private constants decode")
         .into_iter()
         .find(|info| info.name().to_display_string() == OPTION_PFILTER_EQ_SOME_IFF_SIMP_1_2)
-        .unwrap_or_else(|| {
-            panic!("private decoder lost {OPTION_PFILTER_EQ_SOME_IFF_SIMP_1_2}")
-        });
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_PFILTER_EQ_SOME_IFF_SIMP_1_2}"));
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_PFILTER_EQ_SOME_IFF_SIMP_1_2} as {} instead of Thm",
@@ -4312,9 +4711,8 @@ fn option_pfilter_eq_some_second_simp_is_decoded_from_its_private_storage_module
 
 #[test]
 fn option_pmap_eq_some_third_simp_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_pmap_eq_some_third_simp_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_pmap_eq_some_third_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_PMAP_EQ_SOME_IFF_SIMP_1_6_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4342,8 +4740,7 @@ fn option_pmap_eq_some_third_simp_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_rel_some_some_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_rel_some_some_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_rel_some_some_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_REL_SOME_SOME_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4371,8 +4768,7 @@ fn option_rel_some_some_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_some_get_bang_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_some_get_bang_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_some_get_bang_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_SOME_GET_BANG_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4400,8 +4796,7 @@ fn option_some_get_bang_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_some_ne_none_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_some_ne_none_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_some_ne_none_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_SOME_NE_NONE_MATCH_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4429,8 +4824,7 @@ fn option_some_ne_none_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_mem_to_list_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_mem_to_list_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_mem_to_list_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_MEM_TO_LIST_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -4517,8 +4911,7 @@ fn option_to_list_filter_second_match_is_decoded_from_its_private_storage_module
 
 #[test]
 fn option_to_list_join_simp_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("option_to_list_join_simp_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("option_to_list_join_simp_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_TO_LIST_JOIN_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5022,8 +5415,9 @@ fn array_basic_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_k
 
 #[test]
 fn array_insert_idx_loop_unary_proof_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_insert_idx_loop_unary_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_insert_idx_loop_unary_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, INSERT_IDX_LOOP_UNARY_PROOF_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5051,7 +5445,8 @@ fn array_insert_idx_loop_unary_proof_is_decoded_from_its_private_storage_module(
 
 #[test]
 fn array_insert_idx_loop_proof_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_insert_idx_loop_proof_is_decoded_from_its_private_storage_module");
+    let lib =
+        lib_or_skip!("array_insert_idx_loop_proof_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, INSERT_IDX_LOOP_PROOF_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5079,8 +5474,9 @@ fn array_insert_idx_loop_proof_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_insert_idx_loop_second_proof_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_insert_idx_loop_second_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_insert_idx_loop_second_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, INSERT_IDX_LOOP_PROOF_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5108,8 +5504,9 @@ fn array_insert_idx_loop_second_proof_is_decoded_from_its_private_storage_module
 
 #[test]
 fn array_insert_idx_loop_third_proof_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_insert_idx_loop_third_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_insert_idx_loop_third_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, INSERT_IDX_LOOP_PROOF_3_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5206,8 +5603,9 @@ fn array_zip_with_m_aux_unary_proof_is_decoded_from_its_private_storage_module()
 
 #[test]
 fn array_zip_with_m_aux_unary_equation_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_zip_with_m_aux_unary_equation_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_zip_with_m_aux_unary_equation_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_ZIP_WITH_M_AUX_UNARY_EQ_DEF_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5277,9 +5675,8 @@ fn nat_gcd_unary_proof_requires_the_companion_and_remains_a_theorem() {
 
 #[test]
 fn array_of_fn_go_congr_simp_is_decoded_from_its_actual_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_of_fn_go_congr_simp_is_decoded_from_its_actual_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_of_fn_go_congr_simp_is_decoded_from_its_actual_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_OF_FN_GO_CONGR_SIMP_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5307,9 +5704,8 @@ fn array_of_fn_go_congr_simp_is_decoded_from_its_actual_private_storage_module()
 
 #[test]
 fn array_foldl_attach_simp_theorem_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_foldl_attach_simp_theorem_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_foldl_attach_simp_theorem_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_FOLDL_ATTACH_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5337,9 +5733,8 @@ fn array_foldl_attach_simp_theorem_is_decoded_from_its_private_storage_module() 
 
 #[test]
 fn array_foldr_attach_simp_theorem_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_foldr_attach_simp_theorem_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_foldr_attach_simp_theorem_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_FOLDR_ATTACH_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5397,9 +5792,8 @@ fn array_mem_attach_match_definition_is_decoded_from_its_private_storage_module(
 
 #[test]
 fn array_pmap_impl_match_definition_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_pmap_impl_match_definition_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_pmap_impl_match_definition_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_PMAP_IMPL_MATCH_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5457,9 +5851,8 @@ fn array_pmap_congr_left_simp_theorem_is_decoded_from_its_private_storage_module
 
 #[test]
 fn array_pmap_eq_self_simp_theorem_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_pmap_eq_self_simp_theorem_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_pmap_eq_self_simp_theorem_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_PMAP_EQ_SELF_SIMP_1_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5546,9 +5939,8 @@ fn array_to_list_attach_with_simp_theorem_is_decoded_from_its_private_storage_mo
 
 #[test]
 fn array_mem_unattach_simp_theorem_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_mem_unattach_simp_theorem_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_mem_unattach_simp_theorem_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MEM_UNATTACH_SIMP_1_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5887,7 +6279,8 @@ fn array_erase_proof_theorem_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_erase_match_definition_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!("array_erase_match_definition_is_decoded_from_its_private_storage_module");
+    let lib =
+        lib_or_skip!("array_erase_match_definition_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_ERASE_MATCH_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -5972,8 +6365,9 @@ fn array_erase_idx_unary_proof_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_erase_idx_unary_second_proof_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_erase_idx_unary_second_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_erase_idx_unary_second_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_ERASE_IDX_UNARY_PROOF_2_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6001,8 +6395,9 @@ fn array_erase_idx_unary_second_proof_is_decoded_from_its_private_storage_module
 
 #[test]
 fn array_erase_idx_unary_third_proof_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_erase_idx_unary_third_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_erase_idx_unary_third_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_ERASE_IDX_UNARY_PROOF_3_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6030,8 +6425,9 @@ fn array_erase_idx_unary_third_proof_is_decoded_from_its_private_storage_module(
 
 #[test]
 fn array_erase_idx_unary_fourth_proof_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_erase_idx_unary_fourth_proof_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_erase_idx_unary_fourth_proof_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_ERASE_IDX_UNARY_PROOF_4_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6059,8 +6455,9 @@ fn array_erase_idx_unary_fourth_proof_is_decoded_from_its_private_storage_module
 
 #[test]
 fn array_erase_reps_match_definition_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_erase_reps_match_definition_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!(
+        "array_erase_reps_match_definition_is_decoded_from_its_private_storage_module"
+    );
     let chain = chain_bytes(&lib, ARRAY_ERASE_REPS_MATCH_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6145,7 +6542,10 @@ fn array_find_fin_idx_loop_is_decoded_from_its_private_storage_module() {
 fn array_find_idx_loop_theorem_is_decoded_from_its_private_storage_module() {
     let lib =
         lib_or_skip!("array_find_idx_loop_theorem_is_decoded_from_its_private_storage_module");
-    let chain = chain_bytes(&lib, ARRAY_FIND_IDX_LOOP_EQ_MAP_FIND_FIN_IDX_LOOP_VAL_MODULE);
+    let chain = chain_bytes(
+        &lib,
+        ARRAY_FIND_IDX_LOOP_EQ_MAP_FIND_FIN_IDX_LOOP_VAL_MODULE,
+    );
     let (_, private_names) = exported_and_private_names(&chain);
 
     assert!(
@@ -6232,8 +6632,7 @@ fn array_first_m_go_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_foldl_m_unsafe_fold_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_foldl_m_unsafe_fold_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_foldl_m_unsafe_fold_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_FOLDL_M_UNSAFE_FOLD_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6261,8 +6660,7 @@ fn array_foldl_m_unsafe_fold_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_foldr_m_unsafe_fold_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_foldr_m_unsafe_fold_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_foldr_m_unsafe_fold_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_FOLDR_M_UNSAFE_FOLD_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6290,8 +6688,7 @@ fn array_foldr_m_unsafe_fold_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_for_in_unsafe_loop_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_for_in_unsafe_loop_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_for_in_unsafe_loop_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_FOR_IN_UNSAFE_LOOP_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6319,8 +6716,7 @@ fn array_for_in_unsafe_loop_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_map_m_unsafe_map_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_map_m_unsafe_map_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_map_m_unsafe_map_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MAP_M_UNSAFE_MAP_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6348,8 +6744,7 @@ fn array_map_m_unsafe_map_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_get_even_elems_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_get_even_elems_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_get_even_elems_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_GET_EVEN_ELEMS_MATCH_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6406,8 +6801,7 @@ fn array_idx_of_aux_proof_theorem_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_is_eqv_aux_match_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_is_eqv_aux_match_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_is_eqv_aux_match_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_IS_EQV_AUX_MATCH_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6641,9 +7035,8 @@ fn array_is_prefix_of_aux_fourth_proof_is_decoded_from_its_private_storage_modul
 
 #[test]
 fn array_is_prefix_of_aux_equation_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_is_prefix_of_aux_equation_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_is_prefix_of_aux_equation_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_IS_PREFIX_OF_AUX_EQ_DEF_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6729,9 +7122,8 @@ fn array_all_diff_aux_aux_proof_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_all_diff_aux_aux_sunfold_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_all_diff_aux_aux_sunfold_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_all_diff_aux_aux_sunfold_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_AUX_SUNFOLD_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6848,8 +7240,7 @@ fn array_all_diff_aux_aux_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_map_m_map_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_map_m_map_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_map_m_map_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MAP_M_MAP_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -6904,9 +7295,7 @@ fn array_map_m_map_unary_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_map_m_map_unsafe_rec_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_map_m_map_unsafe_rec_is_decoded_from_its_private_storage_module"
-    );
+    let lib = lib_or_skip!("array_map_m_map_unsafe_rec_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_MAP_M_MAP_UNSAFE_REC_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -7127,8 +7516,7 @@ fn array_shrink_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_shrink_loop_sunfold_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_shrink_loop_sunfold_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_shrink_loop_sunfold_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_SHRINK_LOOP_SUNFOLD_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -7156,9 +7544,8 @@ fn array_shrink_loop_sunfold_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_shrink_loop_unsafe_rec_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_shrink_loop_unsafe_rec_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_shrink_loop_unsafe_rec_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_SHRINK_LOOP_UNSAFE_REC_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -7270,8 +7657,7 @@ fn array_of_fn_go_sunfold_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_of_fn_go_unsafe_rec_is_decoded_from_its_private_storage_module() {
-    let lib =
-        lib_or_skip!("array_of_fn_go_unsafe_rec_is_decoded_from_its_private_storage_module");
+    let lib = lib_or_skip!("array_of_fn_go_unsafe_rec_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_OF_FN_GO_UNSAFE_REC_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -7445,9 +7831,8 @@ fn array_pop_while_third_proof_theorem_is_decoded_from_its_private_storage_modul
 
 #[test]
 fn array_pop_while_equation_theorem_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "array_pop_while_equation_theorem_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("array_pop_while_equation_theorem_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, ARRAY_POP_WHILE_EQ_1_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
@@ -7502,9 +7887,8 @@ fn array_mem_def_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn option_is_some_match_splitter_is_decoded_from_its_private_storage_module() {
-    let lib = lib_or_skip!(
-        "option_is_some_match_splitter_is_decoded_from_its_private_storage_module"
-    );
+    let lib =
+        lib_or_skip!("option_is_some_match_splitter_is_decoded_from_its_private_storage_module");
     let chain = chain_bytes(&lib, OPTION_IS_SOME_MATCH_1_SPLITTER_MODULE);
     let (_, private_names) = exported_and_private_names(&chain);
 
