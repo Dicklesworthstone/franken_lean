@@ -12831,8 +12831,12 @@ fn every_family_token_a_run_can_emit_belongs_to_the_closed_taxonomy() {
 /// Those are OBSERVATIONS FROM ANOTHER PANE's run, cited rather than re-measured
 /// -- this host has no corpus -- which is exactly why the numbers deserve to be
 /// written down where a change has to argue with them.
-    #[allow(clippy::type_complexity)]
-    fn the_whole_mathlib_floors_are_anchored_and_coherent() {
+// The three asserts below compare NAMED CONSTANTS, so clippy sees folded
+// truths; they stay runtime asserts because each message is the argument a
+// future change has to answer.
+#[allow(clippy::assertions_on_constants)]
+#[test]
+fn the_whole_mathlib_floors_are_anchored_and_coherent() {
     assert_eq!(
         (
             WHOLE_MATHLIB_SEED_FLOOR,

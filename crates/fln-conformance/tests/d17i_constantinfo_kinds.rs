@@ -11064,8 +11064,9 @@ fn a_recursive_occurrence_applies_the_constructors_own_parameters() {
                             head = f;
                         }
                         arguments.reverse();
-                        if let ExprNode::Const { name: target, .. } = head.node() {
-                            if target.to_display_string() == induct_name {
+                        if let ExprNode::Const { name: target, .. } = head.node()
+                            && target.to_display_string() == induct_name
+                        {
                                 occurrences += 1;
                                 *by_inductive.entry(induct_name.clone()).or_default() += 1;
                                 if params > 0 {
@@ -11214,10 +11215,10 @@ fn the_recursive_blocks_are_exactly_those_owning_a_self_referencing_recursor() {
                 if !seen.insert(current.allocation_identity()) {
                     continue;
                 }
-                if let ExprNode::Const { name: target, .. } = current.node() {
-                    if target.to_display_string() == **name {
-                        return true;
-                    }
+                if let ExprNode::Const { name: target, .. } = current.node()
+                    && target.to_display_string() == **name
+                {
+                    return true;
                 }
                 match current.node() {
                     ExprNode::App { f, a } => {
