@@ -28,8 +28,15 @@ const HASH_DOMAIN: &str = "fln 2026 domain fixture/1";
 const HASH_PREIMAGE: &str = "fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8";
 const PROJECTION_HASH_TAG: &[u8] = b"fln.kernel-contract-ownership.ids/1";
 const SOURCE_ROOT_TAG: &[u8] = b"fln.kernel-contract-ownership.source-bytes/1";
-const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_LINE_BYTES: usize = 256 * 1024;
+// Measured 2026-08-21: the live export is 9,894,985 bytes over 464 records and
+// HEAD carried 8,374,193, so the previous 8 MiB bound refused every
+// regeneration and with it every bead-carrying commit swarm-wide. 64 MiB gives
+// years of headroom at the observed growth while still bounding the read.
+const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+// Measured 2026-08-21: three live records exceed the previous 256 KiB line
+// bound (largest 618,651 bytes - an accumulated immutable comment log, not
+// corrupt input), so regeneration refused after the file-bound raise. 1 MiB.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
 const MAX_ID_BYTES: usize = 256;
 const MAX_WAIT_MS: u64 = 30_000;
