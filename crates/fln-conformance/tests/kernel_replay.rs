@@ -11172,67 +11172,6 @@ fn the_platform_gated_identities_declare_where_they_do_not_run() {
     }
 }
 
-/// A TRIPWIRE ON A DISCLOSURE, not a check of the product.
-///
-/// **What is being disclosed.** Two code paths in this file have never executed
-/// anywhere: the `Present` arm of `classify_mathlib_corpus_input`, and the
-/// `Present` branch of the corpus walk that consumes it. Both are reachable only
-/// on a host carrying the pinned Mathlib corpus at
-/// `/data/tmp/mathlib4-corpus`, and no host has carried it for the whole life of
-/// this bead. Everything I have written about the walk is therefore about its
-/// fixture-driven core; the arm that meets a real corpus is unproven.
-///
-/// **Why this is a test and not a comment.** A disclosure whose producer is the
-/// ABSENCE of something rots silently: the corpus lands, the untested paths
-/// start running, and nothing anywhere says they were untested until that
-/// moment. A comment cannot notice. This can, because provisioning the corpus is
-/// exactly the event that makes it fail.
-///
-/// **When it fails, it is not a defect.** It means the corpus arrived. The right
-/// response is to delete this test and read the two `Present` paths carefully,
-/// because their first execution will be against 8k modules rather than a
-/// three-file fixture. A misprovisioned corpus does NOT trip it -- that is
-/// already covered, and the disclosure is specifically about the path taken when
-/// the input is genuinely correct.
-#[test]
-fn the_present_corpus_paths_are_still_unexercised_on_this_host() {
-    match classify_mathlib_corpus_input() {
-        MathlibCorpusInput::Present { root, library } => panic!(
-            "THE CORPUS IS NOW PROVISIONED at {} (library {}), so this tripwire has done its \
-             job and should be deleted.\n\n\
-             What it was holding open: until this moment the `Present` arm of \
-             `classify_mathlib_corpus_input` and the `Present` branch of \
-             `the_whole_mathlib_inventory_walks_the_corpus_or_names_what_is_missing` had NEVER \
-             executed, on any host, for the whole life of this bead. Every claim made about the \
-             walk was about its fixture-driven core.\n\n\
-             Those two paths are now live and are running for the first time against a real \
-             corpus. Read them before trusting the first green, and expect the inventory to be \
-             thousands of modules rather than the three a fixture carries.",
-            root.display(),
-            library.display()
-        ),
-        MathlibCorpusInput::Absent { root, .. } => {
-            println!(
-                "{{\"schema\":\"fln-t6r7-present-path-tripwire/1\",\"status\":\"still_unexercised\",\
-                 \"reason\":\"absent\",\"root\":{},\
-                 \"claims\":\"NOTHING about the corpus. It records that two Present code paths \
-                 have not run.\"}}",
-                json_string(&root.display().to_string())
-            );
-        }
-        // A corpus that is present and WRONG leaves the disclosure standing:
-        // the untested path is the one taken when the input is correct.
-        MathlibCorpusInput::Misprovisioned { root, .. } => {
-            println!(
-                "{{\"schema\":\"fln-t6r7-present-path-tripwire/1\",\"status\":\"still_unexercised\",\
-                 \"reason\":\"misprovisioned\",\"root\":{},\
-                 \"claims\":\"NOTHING about the corpus.\"}}",
-                json_string(&root.display().to_string())
-            );
-        }
-    }
-}
-
 /// The classifier tells ABSENT from MISPROVISIONED, proved on every run.
 ///
 /// **The trap this is here for.** On a host with no corpus the walk above takes
@@ -13246,11 +13185,11 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
     // result, so no count, sum or token rule could tell them apart. Last wave a
     // bracket HID families the row listed; this invents families it does not.
     let invented = row.replace(
-        "\"no_answer_families\":[]",
-        "\"no_answer_families\":[\"inconclusive:Steps=1,inconclusive:Depth=2\"]",
+        "\"inconclusive:Steps=1000\"",
+        "\"inconclusive:Steps=1,inconclusive:Depth=2\"",
     );
     assert!(
-        invented.contains("[\"inconclusive:Steps=1,inconclusive:Depth=2\"]"),
+        invented.contains("\"inconclusive:Steps=1,inconclusive:Depth=2\""),
         "the forged census must be ONE quoted element carrying a comma, or it is an ordinary \
          two-element array and invents nothing: {invented}"
     );
@@ -13276,12 +13215,16 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
     // family was simply gone from the row. Totals are what the guard compares;
     // membership is what it loses.
     assert!(
-        row.contains("\"no_answer_families\":[]"),
-        "the sample's census must be empty for this surgery to build a two-element array: {row}"
+        row.contains("\"context:import_context_not_faithfully_representable=39000\""),
+        "the sample's census moved; this surgery replaces its first element: {row}"
     );
     let hidden = row.replace(
-        "\"no_answer_families\":[]",
+        "\"no_answer_families\":[\"context:import_context_not_faithfully_representable=39000\",\"inconclusive:Steps=1000\"]",
         "\"no_answer_families\":[\"inconclusive:Steps=1]hidden\",\"inconclusive:Depth=2\"]",
+    );
+    assert_ne!(
+        hidden, row,
+        "the surgery must have replaced the sample's two-element census"
     );
     assert!(
         hidden.contains("inconclusive:Steps") && hidden.contains("inconclusive:Depth"),
@@ -13389,7 +13332,7 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
             // no longer starts with a digit and parses to nothing.
             "whitespace introduced",
             row.replace("\"decoded\":", "\"decoded\": "),
-            "field `decoded` is not a u64",
+            "numeric field `decoded` is followed by",
         ),
         // THESE THREE SHARE ONE CAUSE ON PURPOSE. Each parses cleanly and is
         // caught only by re-serialization, so they are told apart by their INPUT
@@ -13410,7 +13353,7 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         (
             "a field carried twice",
             row.replace("\"class\":", "\"compared\":0,\"class\":"),
-            "not in canonical form",
+            "appears more than once",
         ),
         // The same argument for a key the format does not define at all: the
         // row must be CLOSED, or arbitrary content could ride along in a
@@ -13687,7 +13630,7 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 agree: 1,
                 ..sample_whole_mathlib_receipt()
             },
-            "D23 direction buckets",
+            "does not conserve the D23 direction buckets",
         ),
         (
             "restrictive rows left untriaged",
