@@ -4649,6 +4649,10 @@ fn admit_init_unit(
 }
 
 /// Reconstruct a named two-parameter Type coproduct and its eliminator.
+// Same shape as `admit_init_prod` and the site at :871: an admission
+// reconstruction carries the whole member preamble explicitly because the
+// trusted checker does not hide state in a context struct.
+#[allow(clippy::too_many_arguments)]
 fn admit_init_sum(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],

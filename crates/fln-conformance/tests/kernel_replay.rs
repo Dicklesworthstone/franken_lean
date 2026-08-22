@@ -7135,6 +7135,9 @@ fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
         Some(std::ffi::OsStr::new("/")),
         "`/` round-trips through its own component, so only the ORDINARY-name rule refuses it"
     );
+    // The absolute path DISCARDING the base is the escape behavior under
+    // test, not a mistake the lint is for.
+    #[allow(clippy::join_absolute_paths)]
     assert_eq!(
         tmp.join("/"),
         Path::new("/"),
@@ -9916,6 +9919,8 @@ fn a_fixture_entry_that_leaves_the_tree_is_refused_before_anything_is_written() 
     // two stops holding, the guard above is solving a problem that no longer
     // exists and the cells below are theatre.
     let base = Path::new("/fixtures/tree");
+    // Same as above: joining an absolute entry is the escape being measured.
+    #[allow(clippy::join_absolute_paths)]
     assert_eq!(
         base.join("/data/tmp/evil.olean"),
         Path::new("/data/tmp/evil.olean"),
@@ -12826,8 +12831,8 @@ fn every_family_token_a_run_can_emit_belongs_to_the_closed_taxonomy() {
 /// Those are OBSERVATIONS FROM ANOTHER PANE's run, cited rather than re-measured
 /// -- this host has no corpus -- which is exactly why the numbers deserve to be
 /// written down where a change has to argue with them.
-#[test]
-fn the_whole_mathlib_floors_are_anchored_and_coherent() {
+    #[allow(clippy::type_complexity)]
+    fn the_whole_mathlib_floors_are_anchored_and_coherent() {
     assert_eq!(
         (
             WHOLE_MATHLIB_SEED_FLOOR,
