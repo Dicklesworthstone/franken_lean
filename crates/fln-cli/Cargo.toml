@@ -11,3 +11,4 @@ default-run = "fln"
 [dependencies]
 fln = { path = "../fln" }
 fln-core = { path = "../fln-core" }
+fln-hash = { path = "../fln-hash" }

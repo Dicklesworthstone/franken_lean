@@ -364,10 +364,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     assert_eq!(
         include_str!("../src/lib.rs")
-            .match_indices(r#"\"g1Satisfied\":false}}\n"#)
+            .match_indices(r#"\"k2Checked\":false,\"g1Satisfied\":false}}\n"#)
             .count(),
-        2,
-        "both check-olean JSON render paths keep G1 unsatisfied",
+        1,
+        "the standalone check-olean JSON path keeps G1 unsatisfied",
+    );
+    assert_eq!(
+        include_str!("../src/lib.rs")
+            .match_indices(r#"\"k2Checked\":false,\"g1Satisfied\":false{}}}\n"#)
+            .count(),
+        1,
+        "the module-set check-olean JSON path keeps G1 unsatisfied, with the optional receipts field before the close",
     );
     assert_eq!(
         include_str!("../src/lib.rs")
@@ -437,11 +444,13 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"') && line.contains(r#"\"declarationsChecked\":"#)
+                line.starts_with('"')
+                    && line
+                        .contains(r#"\"declarationsChecked\":{},\"dependencyOrderDerived\":true,"#)
             })
             .count(),
         2,
-        "both check-olean JSON render paths emit declaration counts in concat-item strings",
+        "both check-olean JSON render paths emit declaration counts in concat-item strings (receipt rows carry their own schema and are excluded)",
     );
     assert_eq!(
         cli_source_lines
@@ -1023,23 +1032,13 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
                 .filter(|lines| {
                     lines[0].trim()
                         == r##""\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},","##
-                        && lines[1].trim() == r##""\"k2Checked\":false,","##
+                        && lines[1].trim()
+                            == r##""\"k2Checked\":false,\"g1Satisfied\":false{}}}\n""##
                 })
                 .count(),
         ],
         [1, 1],
-        "the check-olean JSON render paths keep companion loading beside their terminal K2/G1 status",
-    );
-    assert_eq!(
-        cli_source_lines
-            .windows(2)
-            .filter(|lines| {
-                lines[0].trim() == r##""\"k2Checked\":false,","##
-                    && lines[1].trim() == r##""\"g1Satisfied\":false}}\n""##
-            })
-            .count(),
-        1,
-        "the module-set check-olean JSON render path keeps K2 beside G1 at its split terminator",
+        "the check-olean JSON render paths keep companion loading beside their terminal K2/G1 status; the module-set path carries the optional receipts field before the close",
     );
     assert_eq!(
         [

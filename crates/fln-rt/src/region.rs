@@ -1240,8 +1240,19 @@ static NEW_FILE_STAGING_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 const NEW_FILE_STAGING_ATTEMPTS: usize = 1_024;
 
+/// The directory that hosts `path`, with one trap closed: `Path::parent()`
+/// answers `Some("")` for a bare filename, and opening "" is ENOENT — the
+/// empty fallback arm below never fired for exactly the relative-path shape
+/// callers actually use. Normalize the empty parent to ".".
+fn parent_or_dot(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    }
+}
+
 fn new_file_staging_path(path: &std::path::Path, sequence: u64) -> std::path::PathBuf {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = parent_or_dot(path);
     let thread: String = format!("{:?}", std::thread::current().id())
         .chars()
         .filter(char::is_ascii_digit)
@@ -1462,7 +1473,7 @@ pub fn write_file_atomic_new_controlled<E, C>(
 where
     C: FnMut(AtomicCreateStep) -> Result<(), E> + ?Sized,
 {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = parent_or_dot(path);
     let (tmp, mut file) = {
         let mut selected = None;
         for _ in 0..NEW_FILE_STAGING_ATTEMPTS {
@@ -1687,7 +1698,7 @@ pub fn write_file_atomic_controlled<E, C>(
 where
     C: FnMut(AtomicWriteStep) -> Result<(), E> + ?Sized,
 {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = parent_or_dot(path);
     let tmp = dir.join(staging_name(path));
     let mut target_replaced = false;
     atomic_write_checkpoint(control, AtomicWriteStep::CreateStaging, target_replaced)?;
@@ -1741,6 +1752,6 @@ where
 /// target absent". Call it from the thread that publishes, or it will name a
 /// different file.
 pub fn atomic_staging_path(path: &std::path::Path) -> std::path::PathBuf {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = parent_or_dot(path);
     dir.join(staging_name(path))
 }

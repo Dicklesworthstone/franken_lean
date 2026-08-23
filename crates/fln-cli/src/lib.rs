@@ -17,6 +17,7 @@ use fln_core::diag::{
 };
 use fln_core::mode::Mode;
 use fln_core::outcome::BoundedText;
+use fln_hash::domain::{Digest, Domain, DomainHasher, hash as domain_hash};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
@@ -80,13 +81,16 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln check-olean [--json] [--max-bytes BYTES] PATH\n",
+    "  fln check-olean [--json] [--receipts PATH] [--max-bytes BYTES] PATH\n",
     "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln ilean inspect [--json] [--max-bytes BYTES] PATH\n",
+    "  fln audit --tcb [--json] [--max-bytes BYTES] PATH\n",
+    "  fln why-trusts [--json] [--max-bytes BYTES] [--max-nodes N] NAME PATH\n",
+    "  fln identity [--json]\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
@@ -109,6 +113,24 @@ const USAGE: &str = concat!(
     "inductive/quotient/mutual shapes, interpret extensions, run\n",
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
+    "With --receipts, a successful closed-module-set run (a directory root)\n",
+    "also writes one hash-chained JSONL receipt set recording per-module\n",
+    "verdict accounting and the independent-checker agreement grounds. Rows\n",
+    "carry no clock values, so an identical set and byte content reproduce the\n",
+    "file byte-for-byte. Receipts attest THIS run; they are not proof\n",
+    "certificates and do not widen what the check itself establishes.\n",
+    "`audit --tcb` inventories the trust surface of one import-free .olean or a\n",
+    "closed directory set: every axiom declaration, plus unsafe and partial\n",
+    "definitions. It decodes only; it does not kernel-check or interpret\n",
+    "extensions, and it does not yet track plugins or façade classes.\n",
+    "`why-trusts NAME` reports the bounded trust closure of one decoded\n",
+    "constant: every axiom reachable by following constant references through\n",
+    "declaration types and definition/theorem/opaque bodies across the closed\n",
+    "set. Recursor reduction rules, instance selection, and rewrite provenance\n",
+    "are not traversed; this is not the Palimpsest causal graph.\n",
+    "`identity` prints the baked build facts: package version, product root,\n",
+    "modes, and the SUITE.lock reference/corpus/toolchain pins this binary was\n",
+    "compiled against. It is compile-time derived, never probed at runtime.\n",
     "\n",
     "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls. The exact scalar rows also accept pin-precedence ==, |||, ^^^, &&&, +, -, ++, *, /, %, <<<, >>>, and ^ infix syntax; == is bounded Nat/String equality, not general BEq or typeclass notation,\n",
     "from an import-free caller-ordered path batch, one entry path with a bounded\n",
@@ -227,6 +249,7 @@ enum MultiplexerCommand {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
+        receipts: Option<PathBuf>,
     },
     SourceRun {
         paths: Vec<PathBuf>,
@@ -261,6 +284,21 @@ enum MultiplexerCommand {
     IleanInspect {
         path: PathBuf,
         max_bytes: usize,
+        json: bool,
+    },
+    Identity {
+        json: bool,
+    },
+    AuditTcb {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
+    WhyTrusts {
+        name: String,
+        path: PathBuf,
+        max_bytes: usize,
+        max_nodes: usize,
         json: bool,
     },
 }
@@ -647,8 +685,43 @@ fn output_paths_alias(left: &Path, right: &Path) -> bool {
 }
 
 fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut receipts = None;
+    let mut filtered = Vec::new();
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            filtered.push(argument);
+            continue;
+        }
+        let selected = if options && argument == "--receipts" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--receipts requires a following output path".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--receipts="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(path) = selected {
+            if path.is_empty() {
+                return Err(UsageError("--receipts path must not be empty".to_owned()));
+            }
+            if receipts.replace(PathBuf::from(path)).is_some() {
+                return Err(UsageError(
+                    "--receipts may be supplied at most once".to_owned(),
+                ));
+            }
+            continue;
+        }
+        filtered.push(argument);
+    }
     let Some((paths, max_bytes, json)) =
-        parse_path_options(arguments, "check-olean", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+        parse_path_options(filtered, "check-olean", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
     else {
         return Ok(MultiplexerCommand::Help);
     };
@@ -661,7 +734,141 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
         path: path.clone(),
         max_bytes,
         json,
+        receipts,
     })
+}
+
+fn parse_audit_tcb(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut tcb = false;
+    let mut filtered = Vec::new();
+    let mut options = true;
+    for argument in arguments {
+        if options && argument == "--" {
+            options = false;
+            filtered.push(argument);
+            continue;
+        }
+        if options && argument == "--tcb" {
+            if tcb {
+                return Err(UsageError("--tcb may be supplied at most once".to_owned()));
+            }
+            tcb = true;
+            continue;
+        }
+        if options && argument.to_str() == Some("--help") {
+            return Err(UsageError("--help must be used alone".to_owned()));
+        }
+        filtered.push(argument);
+    }
+    if !tcb {
+        return Err(UsageError(
+            "audit requires --tcb; no other audit scope is implemented".to_owned(),
+        ));
+    }
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(filtered, "audit --tcb", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        // `audit --tcb --help` is answered by the multiplexer usage text.
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "audit accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::AuditTcb {
+        path: path.clone(),
+        max_bytes,
+        json,
+    })
+}
+
+fn parse_why_trusts(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    const DEFAULT_MAX_NODES: usize = 50_000;
+    const MAX_NODES_CEILING: usize = 10_000_000;
+    let mut max_nodes = DEFAULT_MAX_NODES;
+    let mut max_nodes_seen = false;
+    let mut filtered = Vec::new();
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            filtered.push(argument);
+            continue;
+        }
+        let value =
+            if options && argument == "--max-nodes" {
+                Some(arguments.next().ok_or_else(|| {
+                    UsageError("--max-nodes requires a following integer".to_owned())
+                })?)
+            } else if options {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--max-nodes="))
+                    .map(OsString::from)
+            } else {
+                None
+            };
+        if let Some(value) = value {
+            if max_nodes_seen {
+                return Err(UsageError(
+                    "--max-nodes may be supplied at most once".to_owned(),
+                ));
+            }
+            max_nodes_seen = true;
+            max_nodes = parse_byte_limit(&value).map_err(|_| {
+                UsageError("--max-nodes requires an ASCII integer within range".to_owned())
+            })?;
+            if max_nodes > MAX_NODES_CEILING {
+                return Err(UsageError(format!(
+                    "--max-nodes exceeds the {MAX_NODES_CEILING}-node ceiling"
+                )));
+            }
+            continue;
+        }
+        filtered.push(argument);
+    }
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(filtered, "why-trusts", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [name, path] = paths.as_slice() else {
+        return Err(UsageError(
+            "why-trusts accepts exactly one constant name and one input path".to_owned(),
+        ));
+    };
+    let Some(name) = name.to_str() else {
+        return Err(UsageError(
+            "why-trusts constant names are dotted ASCII identifiers".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::WhyTrusts {
+        name: name.to_owned(),
+        path: path.clone(),
+        max_bytes,
+        max_nodes,
+        json,
+    })
+}
+
+fn parse_identity(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut json = false;
+    for argument in arguments {
+        if argument == "--json" {
+            if json {
+                return Err(UsageError("--json may be supplied at most once".to_owned()));
+            }
+            json = true;
+            continue;
+        }
+        return Err(UsageError(format!(
+            "identity accepts only an optional --json, not {:?}",
+            argument.to_string_lossy()
+        )));
+    }
+    Ok(MultiplexerCommand::Identity { json })
 }
 
 fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
@@ -815,6 +1022,15 @@ fn parse_command(
     }
     if command == "check-olean" {
         return parse_check_olean(arguments.collect());
+    }
+    if command == "audit" {
+        return parse_audit_tcb(arguments.collect());
+    }
+    if command == "why-trusts" {
+        return parse_why_trusts(arguments.collect());
+    }
+    if command == "identity" {
+        return parse_identity(arguments.collect());
     }
     if command == "flbc" {
         let Some(subcommand) = arguments.next() else {
@@ -5162,7 +5378,16 @@ fn render_check_olean_set_success(
     bytes: usize,
     checked: &fln::CheckedOleanSet,
     json: bool,
+    receipts: Option<&WrittenReceiptSet>,
 ) -> MultiplexerOutput {
+    let receipts_json_fragment = match receipts {
+        Some(written) => format!(",\"receipts\":{}", written.summary_json()),
+        None => String::new(),
+    };
+    let receipts_human_line = match receipts {
+        Some(written) => written.human_line(),
+        None => String::new(),
+    };
     let declarations: usize = checked
         .modules
         .iter()
@@ -6343,8 +6568,7 @@ fn render_check_olean_set_success(
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
-                "\"k2Checked\":false,",
-                "\"g1Satisfied\":false}}\n"
+                "\"k2Checked\":false,\"g1Satisfied\":false{}}}\n"
             ),
             json_string(CHECK_OLEAN_SCHEMA),
             bytes,
@@ -6552,6 +6776,7 @@ fn render_check_olean_set_success(
             extensions,
             companion_modules > 0,
             companion_modules,
+            receipts_json_fragment,
         )
     } else {
         format!(
@@ -6761,7 +6986,7 @@ fn render_check_olean_set_success(
                 "extension blocks observed: {} (not interpreted)\n",
                 "complete module companion chains loaded: {}\n",
                 "K2 checked: no\n",
-                "G1 satisfied: no\n"
+                "G1 satisfied: no\n{}"
             ),
             bytes,
             checked.modules.len(),
@@ -6964,6 +7189,7 @@ fn render_check_olean_set_success(
             checked.result_logical_root,
             extensions,
             companion_modules,
+            receipts_human_line,
         )
     };
     MultiplexerOutput::success(stdout)
@@ -6973,6 +7199,7 @@ fn check_olean_module_bytes(
     modules: Vec<NamedOleanBytes>,
     max_bytes: usize,
     json: bool,
+    receipts_path: Option<PathBuf>,
 ) -> MultiplexerOutput {
     let total_bytes = modules.iter().fold(0_usize, |total, module| {
         [
@@ -7007,7 +7234,23 @@ fn check_olean_module_bytes(
                 ),
             ) {
                 Ok(fln::Outcome::Complete(checked)) => {
-                    render_check_olean_set_success(total_bytes, &checked, json)
+                    let written = match receipts_path {
+                        Some(path) => match write_receipt_set(&path, &modules, &checked) {
+                            Ok(written) => Some(written),
+                            Err(error) => {
+                                let (class, exit_code) = error.disposition();
+                                return check_olean_failure(
+                                    class,
+                                    &error.to_string(),
+                                    false,
+                                    json,
+                                    exit_code,
+                                );
+                            }
+                        },
+                        None => None,
+                    };
+                    render_check_olean_set_success(total_bytes, &checked, json, written.as_ref())
                 }
                 Ok(fln::Outcome::Inconclusive(reason)) => {
                     check_olean_failure("inconclusive", &format!("{reason:?}"), false, json, 3)
@@ -7044,7 +7287,12 @@ fn check_olean_module_bytes(
     }
 }
 
-fn check_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+fn check_olean(
+    path: &Path,
+    max_bytes: usize,
+    json: bool,
+    receipts: Option<&Path>,
+) -> MultiplexerOutput {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -7066,6 +7314,20 @@ fn check_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
             1,
         );
     }
+    if let Some(receipts) = receipts
+        && !metadata.is_dir()
+    {
+        return check_olean_failure(
+            "input",
+            &format!(
+                "--receipts {} requires a closed module-set root (a directory); a single import-free artifact writes no receipt set",
+                receipts.display()
+            ),
+            false,
+            json,
+            1,
+        );
+    }
     if metadata.is_dir() {
         let modules = match collect_olean_directory(path, max_bytes) {
             Ok(modules) => modules,
@@ -7080,7 +7342,7 @@ fn check_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
                 );
             }
         };
-        return check_olean_module_bytes(modules, max_bytes, json);
+        return check_olean_module_bytes(modules, max_bytes, json, receipts.map(Path::to_path_buf));
     }
     if !metadata.is_file() {
         return check_olean_failure(
@@ -7147,6 +7409,127 @@ fn check_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
     check_olean_part_bytes(bytes, server_bytes, private_bytes, max_bytes, json)
 }
 
+// ---- trust surfaces: identity, audit --tcb, why-trusts, run receipts -----
+
+const RECEIPT_SET_SCHEMA: &str = "fln.check-olean.run-receipt/1";
+const AUDIT_TCB_SCHEMA: &str = "fln.audit-tcb/1";
+const WHY_TRUSTS_SCHEMA: &str = "fln.why-trusts/1";
+const IDENTITY_SCHEMA: &str = "fln.identity/1";
+const WHY_TRUSTS_MAX_UNRESOLVED_SAMPLE: usize = 16;
+
+/// Baked, compile-time build facts for `fln identity`. Every value is derived
+/// by `build.rs` from SUITE.lock or this crate's own provenance comment; a
+/// missing source bakes as `unavailable` rather than being probed at runtime.
+fn render_identity(json: bool) -> MultiplexerOutput {
+    let reference_tag = env!("FLN_IDENTITY_REFERENCE_TAG");
+    let reference_commit = env!("FLN_IDENTITY_REFERENCE_COMMIT");
+    let corpus_tag = env!("FLN_IDENTITY_CORPUS_TAG");
+    let corpus_commit = env!("FLN_IDENTITY_CORPUS_COMMIT");
+    let rust_channel = env!("FLN_IDENTITY_RUST_CHANNEL");
+    let product_root = env!("FLN_IDENTITY_PRODUCT_ROOT");
+    if json {
+        MultiplexerOutput::success(format!(
+            concat!(
+                "{{\"schema\":{},\"version\":{},\"productRoot\":{},",
+                "\"modes\":[\"faithful\",\"sound\",\"frontier\"],",
+                "\"reference\":{{\"tag\":{},\"commit\":{}}},",
+                "\"corpus\":{{\"tag\":{},\"commit\":{}}},",
+                "\"rustChannel\":{}}}\n"
+            ),
+            json_string(IDENTITY_SCHEMA),
+            json_string(env!("CARGO_PKG_VERSION")),
+            json_string(product_root),
+            json_string(reference_tag),
+            json_string(reference_commit),
+            json_string(corpus_tag),
+            json_string(corpus_commit),
+            json_string(rust_channel),
+        ))
+    } else {
+        MultiplexerOutput::success(format!(
+            concat!(
+                "fln identity\n",
+                "schema: {}\n",
+                "version: {}\n",
+                "product root: {}\n",
+                "modes: faithful, sound, frontier\n",
+                "reference pin: {} ({})\n",
+                "corpus pin: {} ({})\n",
+                "rust channel: {}\n"
+            ),
+            IDENTITY_SCHEMA,
+            env!("CARGO_PKG_VERSION"),
+            product_root,
+            reference_tag,
+            reference_commit,
+            corpus_tag,
+            corpus_commit,
+            rust_channel,
+        ))
+    }
+}
+
+#[derive(Debug)]
+enum TrustSurfaceError {
+    Read(BoundedReadFailure),
+    Decode {
+        module: String,
+        error: fln::OleanDecodeError,
+    },
+    MissingImports {
+        module: String,
+        missing: Vec<String>,
+    },
+    DuplicateModule(String),
+    EmptySet,
+    ConstantNotFound(String),
+}
+
+impl TrustSurfaceError {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::Read(error) => error.class(),
+            Self::Decode { error, .. } if error.is_resource_exhaustion() => "resource",
+            Self::Decode { .. } | Self::MissingImports { .. } => "decode",
+            Self::DuplicateModule(_) | Self::EmptySet | Self::ConstantNotFound(_) => "input",
+        }
+    }
+    fn exit_code(&self) -> u8 {
+        match self.class() {
+            "resource" => 3,
+            _ => 1,
+        }
+    }
+}
+
+impl fmt::Display for TrustSurfaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(formatter),
+            Self::Decode { module, error } => {
+                write!(formatter, "module {module}: {error}")
+            }
+            Self::MissingImports { module, missing } => {
+                let list = missing.join(", ");
+                write!(
+                    formatter,
+                    "module {module}: imports outside the supplied set: {list}"
+                )
+            }
+            Self::DuplicateModule(module) => {
+                write!(formatter, "module {module} appears more than once")
+            }
+            Self::ConstantNotFound(name) => {
+                write!(
+                    formatter,
+                    "constant {name} is not present in the supplied set"
+                )
+            }
+            Self::EmptySet => formatter.write_str("the supplied set contains no .olean artifact"),
+        }
+    }
+}
+
 fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
     match ground {
         fln::CheckerAdmissionGround::AxiomPreamble => "axiom-preamble",
@@ -7160,6 +7543,665 @@ fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
         fln::CheckerAdmissionGround::UnsafeQuarantine => "unsafe-quarantine",
         fln::CheckerAdmissionGround::PartialQuarantine => "partial-quarantine",
     }
+}
+
+/// Decode a supplied `.olean` set (no kernel admission) and require that its
+/// import graph closes within the set, so trust queries answer over exactly
+/// the bytes the caller supplied.
+struct DecodedTrustModule {
+    name: fln::Name,
+    decoded: fln::DecodedOlean,
+}
+
+fn decode_trust_surface(
+    modules: Vec<NamedOleanBytes>,
+) -> Result<Vec<DecodedTrustModule>, TrustSurfaceError> {
+    if modules.is_empty() {
+        return Err(TrustSurfaceError::EmptySet);
+    }
+    let mut decoded_modules: Vec<DecodedTrustModule> = Vec::with_capacity(modules.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for module in &modules {
+        let name = module.name.to_display_string();
+        if !seen.insert(name.clone()) {
+            return Err(TrustSurfaceError::DuplicateModule(name));
+        }
+        let decoded = match (
+            module.server_bytes.as_deref(),
+            module.private_bytes.as_deref(),
+        ) {
+            (Some(server), Some(private)) => fln::decode_olean_module_artifacts(
+                &module.bytes,
+                server,
+                private,
+                fln::OleanDecodeLimits::new(usize::MAX),
+            ),
+            _ => fln::decode_olean_artifact(&module.bytes, fln::OleanDecodeLimits::new(usize::MAX)),
+        };
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return Err(TrustSurfaceError::Decode {
+                    module: name,
+                    error,
+                });
+            }
+        };
+        decoded_modules.push(DecodedTrustModule {
+            name: module.name.clone(),
+            decoded,
+        });
+    }
+    for module in &decoded_modules {
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        for import in &module.decoded.module.imports {
+            let imported = import.module.to_display_string();
+            if !seen.contains(&imported) {
+                missing.insert(imported);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(TrustSurfaceError::MissingImports {
+                module: module.name.to_display_string(),
+                missing: missing.into_iter().collect(),
+            });
+        }
+    }
+    Ok(decoded_modules)
+}
+
+/// Constant-reference closure over decoded types and definition/theorem/
+/// opaque bodies. Recursor reduction rules and instance selections are NOT
+/// traversed; the report states that scope explicitly.
+fn collect_const_refs(root: &fln::Expr, refs: &mut Vec<String>) {
+    let mut stack = vec![root];
+    while let Some(expr) = stack.pop() {
+        match expr.node() {
+            fln::ExprNode::Const { name, .. } => refs.push(name.to_display_string()),
+            fln::ExprNode::App { f, a } => {
+                stack.push(a);
+                stack.push(f);
+            }
+            fln::ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | fln::ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            fln::ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(body);
+                stack.push(value);
+                stack.push(type_);
+            }
+            fln::ExprNode::MData { expr, .. } | fln::ExprNode::Proj { expr, .. } => {
+                stack.push(expr);
+            }
+            _ => {}
+        }
+    }
+}
+
+const fn trust_value(info: &fln::ConstantInfo) -> Option<&fln::Expr> {
+    match info {
+        fln::ConstantInfo::Defn(value) => Some(&value.value),
+        fln::ConstantInfo::Thm(value) => Some(&value.value),
+        fln::ConstantInfo::Opaque(value) => Some(&value.value),
+        _ => None,
+    }
+}
+
+/// Load the `.olean` bytes behind a trust-surface root: a directory holding a
+/// closed import set, or one artifact whose companions are loaded when present.
+fn load_trust_modules(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<NamedOleanBytes>, BoundedReadFailure> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| BoundedReadFailure::Input {
+        subject: "trust-surface root",
+        detail: format!("cannot inspect {}: {error}", path.display()),
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(BoundedReadFailure::Input {
+            subject: "trust-surface root",
+            detail: format!("refusing symlink {} ", path.display()),
+        });
+    }
+    if metadata.is_dir() {
+        return collect_olean_directory(path, max_bytes);
+    }
+    if !metadata.is_file() {
+        return Err(BoundedReadFailure::Input {
+            subject: "trust-surface root",
+            detail: format!(
+                "{} is neither a regular file nor a directory",
+                path.display()
+            ),
+        });
+    }
+    let bytes = read_bounded(path, max_bytes, ".olean artifact")?;
+    let mut total = bytes.len();
+    let server_path = path.with_extension("olean.server");
+    let server_bytes =
+        match read_optional_olean_companion(&server_path, max_bytes.saturating_sub(total))? {
+            Some(server) => {
+                total = total.saturating_add(server.len());
+                Some(server)
+            }
+            None => None,
+        };
+    let private_path = path.with_extension("olean.private");
+    let private_bytes =
+        read_optional_olean_companion(&private_path, max_bytes.saturating_sub(total))?;
+    let stem = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| BoundedReadFailure::Input {
+            subject: "trust-surface root",
+            detail: format!("module name from {} is not UTF-8", path.display()),
+        })?;
+    let name = fln::Name::from_components(stem.split('.'));
+    Ok(vec![NamedOleanBytes {
+        name,
+        bytes,
+        server_bytes,
+        private_bytes,
+    }])
+}
+
+fn run_trust_surface_failure(error: &TrustSurfaceError, json: bool) -> MultiplexerOutput {
+    if !json {
+        return MultiplexerOutput::failure(format!("fln: {error}\n"), error.exit_code());
+    }
+    MultiplexerOutput::failure(
+        format!(
+            "{{\"schema\":{},\"class\":{},\"detail\":{}}}\n",
+            json_string("fln.error/1"),
+            json_string(error.class()),
+            json_string(&error.to_string()),
+        ),
+        error.exit_code(),
+    )
+}
+
+struct TrustAxiomRow {
+    name: String,
+    is_unsafe: bool,
+}
+
+fn inventory_module(decoded: &DecodedTrustModule) -> (usize, Vec<TrustAxiomRow>, usize, usize) {
+    let mut axioms = Vec::new();
+    let mut unsafe_definitions = 0_usize;
+    let mut partial_definitions = 0_usize;
+    for info in &decoded.decoded.constants {
+        match info {
+            fln::ConstantInfo::Axiom(axiom) => axioms.push(TrustAxiomRow {
+                name: axiom.base.name.to_display_string(),
+                is_unsafe: axiom.is_unsafe,
+            }),
+            fln::ConstantInfo::Defn(definition) => match definition.safety {
+                fln::DefinitionSafety::Unsafe => unsafe_definitions += 1,
+                fln::DefinitionSafety::Partial => partial_definitions += 1,
+                fln::DefinitionSafety::Safe => {}
+            },
+            _ => {}
+        }
+    }
+    axioms.sort_by(|left, right| left.name.cmp(&right.name));
+    (
+        decoded.decoded.constants.len(),
+        axioms,
+        unsafe_definitions,
+        partial_definitions,
+    )
+}
+
+fn audit_tcb(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let execution = || -> Result<MultiplexerOutput, TrustSurfaceError> {
+        let modules = load_trust_modules(path, max_bytes).map_err(TrustSurfaceError::Read)?;
+        let decoded = decode_trust_surface(modules)?;
+        let mut total_axioms = 0_usize;
+        let mut rows: Vec<(String, usize, Vec<TrustAxiomRow>, usize, usize)> =
+            Vec::with_capacity(decoded.len());
+        for module in &decoded {
+            let (constants, axioms, unsafe_definitions, partial_definitions) =
+                inventory_module(module);
+            total_axioms += axioms.len();
+            rows.push((
+                module.name.to_display_string(),
+                constants,
+                axioms,
+                unsafe_definitions,
+                partial_definitions,
+            ));
+        }
+        if json {
+            let mut stdout = format!(
+                "{{\"schema\":{},\"modules\":{},\"axioms\":{},\"rows\":[",
+                json_string(AUDIT_TCB_SCHEMA),
+                rows.len(),
+                total_axioms,
+            );
+            for (index, (name, constants, axioms, unsafe_definitions, partial_definitions)) in
+                rows.iter().enumerate()
+            {
+                if index > 0 {
+                    stdout.push(',');
+                }
+                stdout.push_str(&format!(
+                    "{{\"module\":{},\"constants\":{},\"unsafeDefinitions\":{},\"partialDefinitions\":{},\"axioms\":[",
+                    json_string(name),
+                    constants,
+                    unsafe_definitions,
+                    partial_definitions,
+                ));
+                for (position, axiom) in axioms.iter().enumerate() {
+                    if position > 0 {
+                        stdout.push(',');
+                    }
+                    stdout.push_str(&format!(
+                        "{{\"name\":{},\"unsafe\":{}}}",
+                        json_string(&axiom.name),
+                        axiom.is_unsafe,
+                    ));
+                }
+                stdout.push_str("]}");
+            }
+            stdout.push_str("]}\n");
+            return Ok(MultiplexerOutput::success(stdout));
+        }
+        let mut stdout = format!(
+            concat!(
+                "trust surface inventory: complete\n",
+                "modules decoded: {}\n",
+                "axiom declarations: {}\n",
+            ),
+            rows.len(),
+            total_axioms,
+        );
+        for (name, constants, axioms, unsafe_definitions, partial_definitions) in &rows {
+            stdout.push_str(&format!(
+                "{name}: {constants} constants, {} axioms, {unsafe_definitions} unsafe defs, {partial_definitions} partial defs\n",
+                axioms.len(),
+            ));
+            for axiom in axioms {
+                let marker = if axiom.is_unsafe { " (unsafe)" } else { "" };
+                stdout.push_str(&format!("  axiom {}{}\n", axiom.name, marker));
+            }
+        }
+        stdout.push_str(
+            "scope: decoded declarations only; plugins and façade classes are not yet tracked\n",
+        );
+        Ok(MultiplexerOutput::success(stdout))
+    };
+    match execution() {
+        Ok(output) => output,
+        Err(error) => run_trust_surface_failure(&error, json),
+    }
+}
+
+struct WhyTrustsReport {
+    target: String,
+    module: String,
+    kind: &'static str,
+    axioms: Vec<String>,
+    visited: usize,
+    unresolved_sample: Vec<String>,
+    unresolved_total: usize,
+    truncated: bool,
+}
+
+fn why_trusts(
+    target: &str,
+    path: &Path,
+    max_bytes: usize,
+    max_nodes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let execution = || -> Result<MultiplexerOutput, TrustSurfaceError> {
+        let modules = load_trust_modules(path, max_bytes).map_err(TrustSurfaceError::Read)?;
+        let decoded = decode_trust_surface(modules)?;
+        let wanted = fln::Name::from_components(target.split('.'));
+        let wanted_display = wanted.to_display_string();
+        let mut index: BTreeMap<String, (String, &fln::ConstantInfo)> = BTreeMap::new();
+        for module in &decoded {
+            let module_name = module.name.to_display_string();
+            for info in &module.decoded.constants {
+                index.insert(info.name().to_display_string(), (module_name.clone(), info));
+            }
+        }
+        let Some((target_module, _)) = index.get(&wanted_display) else {
+            return Err(TrustSurfaceError::ConstantNotFound(wanted_display.clone()));
+        };
+        let target_module = target_module.clone();
+
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        queue.push_back(wanted_display.clone());
+        let mut axioms: Vec<String> = Vec::new();
+        let mut unresolved_sample: Vec<String> = Vec::new();
+        let mut unresolved_total = 0_usize;
+        let mut truncated = false;
+        while let Some(name) = queue.pop_front() {
+            if visited.contains(&name) {
+                continue;
+            }
+            if visited.len() >= max_nodes {
+                truncated = true;
+                break;
+            }
+            visited.insert(name.clone());
+            let Some((_, info)) = index.get(&name) else {
+                unresolved_total += 1;
+                if unresolved_sample.len() < WHY_TRUSTS_MAX_UNRESOLVED_SAMPLE
+                    && !unresolved_sample.contains(&name)
+                {
+                    unresolved_sample.push(name);
+                }
+                continue;
+            };
+            if matches!(info, fln::ConstantInfo::Axiom(_)) {
+                axioms.push(name);
+                continue;
+            }
+            let mut refs = Vec::new();
+            collect_const_refs(&info.constant_val().type_, &mut refs);
+            if let Some(value) = trust_value(info) {
+                collect_const_refs(value, &mut refs);
+            }
+            for reference in refs {
+                if !visited.contains(&reference) {
+                    queue.push_back(reference);
+                }
+            }
+        }
+        axioms.sort();
+        axioms.dedup();
+        let kind = index
+            .get(&wanted_display)
+            .map(|(_, info)| info.kind_name())
+            .unwrap_or("unknown");
+        let report = WhyTrustsReport {
+            target: wanted_display,
+            module: target_module,
+            kind,
+            axioms,
+            visited: visited.len(),
+            unresolved_sample,
+            unresolved_total,
+            truncated,
+        };
+        Ok(render_why_trusts(&report, json))
+    };
+    match execution() {
+        Ok(output) => output,
+        Err(error) => run_trust_surface_failure(&error, json),
+    }
+}
+
+fn render_why_trusts(report: &WhyTrustsReport, json: bool) -> MultiplexerOutput {
+    if json {
+        return MultiplexerOutput::success(format!(
+            concat!(
+                "{{\"schema\":{},\"target\":{},\"module\":{},\"kind\":{},",
+                "\"axioms\":[{}],\"visited\":{},",
+                "\"unresolvedTotal\":{},\"unresolvedSample\":[{}],",
+                "\"truncated\":{}}}\n"
+            ),
+            json_string(WHY_TRUSTS_SCHEMA),
+            json_string(&report.target),
+            json_string(&report.module),
+            json_string(report.kind),
+            report
+                .axioms
+                .iter()
+                .map(|axiom| json_string(axiom))
+                .collect::<Vec<_>>()
+                .join(","),
+            report.visited,
+            report.unresolved_total,
+            report
+                .unresolved_sample
+                .iter()
+                .map(|name| json_string(name))
+                .collect::<Vec<_>>()
+                .join(","),
+            report.truncated,
+        ));
+    }
+    let mut stdout = format!(
+        concat!("why-trusts: {}\n", "module: {}\n", "kind: {}\n",),
+        report.target, report.module, report.kind,
+    );
+    if report.axioms.is_empty() {
+        stdout.push_str("axioms: none\n");
+    } else {
+        stdout.push_str(&format!("axioms: {}\n", report.axioms.join(", ")));
+    }
+    stdout.push_str(&format!(
+        "reachable constants: {}{}\n",
+        report.visited,
+        if report.truncated {
+            " (truncated by --max-nodes)"
+        } else {
+            ""
+        },
+    ));
+    stdout.push_str(&format!(
+        "unresolved references: {}\n",
+        report.unresolved_total
+    ));
+    stdout.push_str(
+        "scope: decoded types and definition/theorem/opaque bodies; recursor rules, instance selections, and rewrite provenance are not traversed\n",
+    );
+    MultiplexerOutput::success(stdout)
+}
+
+// ---- check-olean run receipts -------------------------------------------
+
+#[derive(Debug)]
+enum ReceiptWriteError {
+    Input { detail: String },
+    Resource { detail: String },
+}
+
+impl ReceiptWriteError {
+    const fn disposition(&self) -> (&'static str, u8) {
+        match self {
+            Self::Input { .. } => ("input", 1),
+            Self::Resource { .. } => ("resource", 3),
+        }
+    }
+}
+
+impl fmt::Display for ReceiptWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input { detail } | Self::Resource { detail } => formatter.write_str(detail),
+        }
+    }
+}
+
+/// Length-prefixed field, so canonical bytes never depend on separator choices.
+fn receipt_field(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    buffer.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buffer.extend_from_slice(bytes);
+}
+
+fn receipt_u64(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+struct WrittenReceiptSet {
+    path: PathBuf,
+    module_rows: usize,
+    declarations_checked: usize,
+    chain: Digest,
+}
+
+impl WrittenReceiptSet {
+    fn summary_json(&self) -> String {
+        format!(
+            "{{\"path\":{},\"moduleRows\":{},\"declarationsChecked\":{},\"chain\":{}}}",
+            json_string(&self.path.to_string_lossy()),
+            self.module_rows,
+            self.declarations_checked,
+            json_string(&self.chain.to_hex()),
+        )
+    }
+
+    fn human_line(&self) -> String {
+        format!(
+            "receipts: {} module rows, {} declarations checked, chained to {}, written to {}\n",
+            self.module_rows,
+            self.declarations_checked,
+            self.chain.to_hex(),
+            self.path.display(),
+        )
+    }
+}
+
+/// Write one hash-chained JSONL receipt set for a completed closed-set check.
+///
+/// Every row is `row = H(TransparencyLeaf, prev || canonical_fields)` under
+/// fln-hash's registered domains, with the first `prev` at zero. Rows carry NO
+/// clock values, so an identical module set and byte content reproduce the
+/// receipt file byte-for-byte; wall-clock timing belongs to the caller's
+/// telemetry, not to a verifiable chain. The set is published no-clobber via a
+/// sibling partial file and one rename.
+fn write_receipt_set(
+    path: &Path,
+    modules: &[NamedOleanBytes],
+    checked: &fln::CheckedOleanSet,
+) -> Result<WrittenReceiptSet, ReceiptWriteError> {
+    if path.exists() {
+        return Err(ReceiptWriteError::Input {
+            detail: format!(
+                "refusing to overwrite existing receipt set {}",
+                path.display()
+            ),
+        });
+    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    if !parent.is_dir() {
+        return Err(ReceiptWriteError::Input {
+            detail: format!(
+                "receipt parent directory {} does not exist",
+                parent.display()
+            ),
+        });
+    }
+
+    let mut jsonl = String::new();
+    let mut prev = [0u8; 32];
+    let mut declarations_checked = 0_usize;
+    for module in modules {
+        let Some(checked_module) = checked
+            .modules
+            .iter()
+            .find(|checked| checked.name == module.name)
+        else {
+            return Err(ReceiptWriteError::Input {
+                detail: format!(
+                    "module {} is missing from the checked set",
+                    module.name.to_display_string()
+                ),
+            });
+        };
+        let mut grounds: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for declaration in &checked_module.declarations {
+            *grounds
+                .entry(checker_ground_name(declaration.checker.ground))
+                .or_insert(0) += 1;
+        }
+        declarations_checked += checked_module.declarations.len();
+
+        let mut artifact_canon = Vec::new();
+        receipt_field(
+            &mut artifact_canon,
+            module.name.to_display_string().as_bytes(),
+        );
+        receipt_field(&mut artifact_canon, &module.bytes);
+        if let Some(server) = &module.server_bytes {
+            receipt_field(&mut artifact_canon, server);
+        }
+        if let Some(private) = &module.private_bytes {
+            receipt_field(&mut artifact_canon, private);
+        }
+        let artifact_root = domain_hash(Domain::ArtifactClosureComponent, &artifact_canon);
+
+        let mut canon = Vec::new();
+        receipt_u64(&mut canon, 1); // row kind: module
+        receipt_field(&mut canon, prev.as_slice());
+        receipt_field(&mut canon, module.name.to_display_string().as_bytes());
+        receipt_field(&mut canon, artifact_root.to_hex().as_bytes());
+        receipt_u64(&mut canon, checked_module.declarations.len() as u64);
+        for (ground, count) in &grounds {
+            receipt_field(&mut canon, ground.as_bytes());
+            receipt_u64(&mut canon, *count as u64);
+        }
+        let row_hash = DomainHasher::new(Domain::TransparencyLeaf)
+            .update(&canon)
+            .finalize();
+
+        let grounds_json = grounds
+            .iter()
+            .map(|(ground, count)| format!("{}:{}", json_string(ground), count))
+            .collect::<Vec<_>>()
+            .join(",");
+        jsonl.push_str(&format!(
+            "{{\"schema\":{schema},\"kind\":\"module\",\"prev\":\"{prev}\",\"module\":{module},\"artifactRoot\":\"{root}\",\"declarationsChecked\":{decls},\"agreementGrounds\":{{{grounds}}},\"rowHash\":\"{hash}\"}}\n",
+            schema = json_string(RECEIPT_SET_SCHEMA),
+            prev = Digest(prev).to_hex(),
+            module = json_string(&module.name.to_display_string()),
+            root = artifact_root.to_hex(),
+            decls = checked_module.declarations.len(),
+            grounds = grounds_json,
+            hash = row_hash.to_hex(),
+        ));
+        prev = row_hash.0;
+    }
+
+    let mut summary_canon = Vec::new();
+    receipt_u64(&mut summary_canon, 2); // row kind: summary
+    receipt_field(&mut summary_canon, prev.as_slice());
+    receipt_u64(&mut summary_canon, modules.len() as u64);
+    receipt_u64(&mut summary_canon, declarations_checked as u64);
+    let chain = DomainHasher::new(Domain::TransparencyLeaf)
+        .update(&summary_canon)
+        .finalize();
+    jsonl.push_str(&format!(
+        "{{\"schema\":{},\"kind\":\"summary\",\"prev\":\"{}\",\"moduleRows\":{},\"declarationsChecked\":{},\"chain\":\"{}\"}}\n",
+        json_string(RECEIPT_SET_SCHEMA),
+        Digest(prev).to_hex(),
+        modules.len(),
+        declarations_checked,
+        chain.to_hex(),
+    ));
+
+    let partial = path.with_extension("fln-receipts-partial");
+    std::fs::write(&partial, jsonl).map_err(|error| ReceiptWriteError::Resource {
+        detail: format!("could not write {}: {error}", partial.display()),
+    })?;
+    if let Err(error) = std::fs::rename(&partial, path) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(ReceiptWriteError::Resource {
+            detail: format!("could not publish {}: {error}", path.display()),
+        });
+    }
+    Ok(WrittenReceiptSet {
+        path: path.to_path_buf(),
+        module_rows: modules.len(),
+        declarations_checked,
+        chain,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -9514,7 +10556,21 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             path,
             max_bytes,
             json,
-        }) => check_olean(&path, max_bytes, json),
+            receipts,
+        }) => check_olean(&path, max_bytes, json, receipts.as_deref()),
+        Ok(MultiplexerCommand::Identity { json }) => render_identity(json),
+        Ok(MultiplexerCommand::AuditTcb {
+            path,
+            max_bytes,
+            json,
+        }) => audit_tcb(&path, max_bytes, json),
+        Ok(MultiplexerCommand::WhyTrusts {
+            name,
+            path,
+            max_bytes,
+            max_nodes,
+            json,
+        }) => why_trusts(&name, &path, max_bytes, max_nodes, json),
         Ok(MultiplexerCommand::SourceRun {
             paths,
             max_bytes,
@@ -10057,7 +11113,7 @@ pub fn project(
 mod tests {
     use super::{
         CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, ILEAN_INSPECT_SCHEMA, NamedOleanBytes,
-        OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA,
+        OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, RECEIPT_SET_SCHEMA,
         SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation, SourcePublication,
         SourceSidecarPublication, admission_error_disposition, check_olean_bytes,
         check_olean_module_bytes, derive_lean_installation_paths, diff_olean_bytes,
@@ -10713,6 +11769,7 @@ mod tests {
             ],
             total,
             true,
+            None,
         );
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
@@ -12188,5 +13245,254 @@ mod tests {
         assert_eq!(error.exit_code, 2);
         assert!(error.stdout.is_empty());
         assert!(error.stderr.contains("unknown olean subcommand"));
+    }
+
+    // ---- trust surfaces ----------------------------------------------------
+
+    fn unique_scratch_root(label: &str) -> PathBuf {
+        let unique = format!(
+            "fln-cli-trust-surface-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time is after the Unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(Into::into)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(unique);
+        std::fs::create_dir_all(&root).expect("create trust-surface scratch root");
+        root
+    }
+
+    /// One real checked environment, emitted through the product door, as an
+    /// import-free non-module snapshot: the same artifact class the bounded
+    /// check-olean and trust surfaces consume.
+    fn checked_snapshot_fixture(root: &std::path::Path) -> PathBuf {
+        let source = root.join("answer_source.lean");
+        std::fs::write(&source, "def answer : Nat := 40 + 2\n#eval answer\n")
+            .expect("write trust-surface source fixture");
+        let snapshot = root.join("answer_snapshot.olean");
+        let output = run([
+            OsString::from("run"),
+            OsString::from("--emit-olean-snapshot"),
+            snapshot.clone().into_os_string(),
+            source.clone().into_os_string(),
+        ]);
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(snapshot.is_file(), "the snapshot must be published");
+        snapshot
+    }
+
+    #[test]
+    fn identity_reports_baked_suite_lock_facts() {
+        let robot = run([OsString::from("identity"), OsString::from("--json")]);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(robot.stdout.contains("\"schema\":\"fln.identity/1\""));
+        assert!(
+            robot
+                .stdout
+                .contains("\"modes\":[\"faithful\",\"sound\",\"frontier\"]")
+        );
+
+        // The baked reference pin must equal the SUITE.lock row this tree
+        // carries — identity derives, it never transcribes.
+        let lock = std::fs::read_to_string(repository_path("SUITE.lock")).expect("read SUITE.lock");
+        let tag = lock
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix("reference ")?;
+                rest.split_ascii_whitespace()
+                    .find_map(|word| word.strip_prefix("tag="))
+            })
+            .expect("SUITE.lock carries a reference row");
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"reference\":{{\"tag\":\"{tag}\"")),
+            "identity must report the SUITE.lock reference tag {tag}"
+        );
+
+        let human = run([OsString::from("identity")]);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stdout.contains("fln identity"));
+        assert!(human.stdout.contains(&format!("reference pin: {tag}")));
+        assert!(human.stdout.contains("modes: faithful, sound, frontier"));
+    }
+
+    #[test]
+    fn audit_tcb_inventories_axioms_over_a_closed_set() {
+        let root = unique_scratch_root("audit");
+        let snapshot = checked_snapshot_fixture(&root);
+        let robot = run([
+            OsString::from("audit"),
+            OsString::from("--tcb"),
+            OsString::from("--json"),
+            snapshot.clone().into_os_string(),
+        ]);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stdout.contains("\"schema\":\"fln.audit-tcb/1\""));
+        assert!(robot.stdout.contains("\"modules\":1"));
+        assert!(
+            robot.stdout.contains("\"name\":\"Nat\""),
+            "the seed Nat axiom must appear in the inventory: {}",
+            robot.stdout
+        );
+        assert!(!robot.stdout.contains("\"unsafe\":true"));
+
+        let human = run([
+            OsString::from("audit"),
+            OsString::from("--tcb"),
+            snapshot.into_os_string(),
+        ]);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stdout.contains("trust surface inventory: complete"));
+        assert!(human.stdout.contains("axiom Nat"));
+        assert!(human.stdout.contains("scope: decoded declarations only"));
+
+        let missing_flag = run([
+            OsString::from("audit"),
+            root.join("x.olean").into_os_string(),
+        ]);
+        assert_eq!(missing_flag.exit_code, 2);
+        assert!(missing_flag.stderr.contains("audit requires --tcb"));
+    }
+
+    #[test]
+    fn why_trusts_traces_a_target_to_its_axioms() {
+        let root = unique_scratch_root("why-trusts");
+        let snapshot = checked_snapshot_fixture(&root);
+        let robot = run([
+            OsString::from("why-trusts"),
+            OsString::from("--json"),
+            OsString::from("answer"),
+            snapshot.clone().into_os_string(),
+        ]);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stdout.contains("\"schema\":\"fln.why-trusts/1\""));
+        assert!(robot.stdout.contains("\"target\":\"answer\""));
+        assert!(robot.stdout.contains("\"kind\":\"definition\""));
+        assert!(
+            robot.stdout.contains("\"axioms\":[\"Nat\",\"Nat.add\"]"),
+            "answer's trust closure must reach the seed Nat axioms: {}",
+            robot.stdout
+        );
+        assert!(robot.stdout.contains("\"truncated\":false"));
+
+        let human = run([
+            OsString::from("why-trusts"),
+            OsString::from("answer"),
+            snapshot.into_os_string(),
+        ]);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stdout.contains("why-trusts: answer"));
+        assert!(human.stdout.contains("axioms: Nat, Nat.add"));
+        assert!(human.stdout.contains(
+            "recursor rules, instance selections, and rewrite provenance are not traversed"
+        ));
+
+        let absent = run([
+            OsString::from("why-trusts"),
+            OsString::from("NoSuch.Constant"),
+            root.join("answer_snapshot.olean").into_os_string(),
+        ]);
+        assert_eq!(absent.exit_code, 1);
+        assert!(absent.stderr.contains("is not present in the supplied set"));
+    }
+
+    #[test]
+    fn check_olean_receipts_chain_and_refuse_overwrite() {
+        let base_name = fln::Name::from_components(["Fixture", "RcptBase"]);
+        let child_name = fln::Name::from_components(["Fixture", "RcptChild"]);
+        let base = empty_olean_fixture(&[]);
+        let child = empty_olean_fixture(&[fln::OleanModuleImport {
+            module: base_name.clone(),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        }]);
+        let total = base.len() + child.len();
+        let root = unique_scratch_root("receipts");
+        let receipts = root.join("run.receipts.jsonl");
+        let output = check_olean_module_bytes(
+            vec![
+                NamedOleanBytes {
+                    name: child_name,
+                    bytes: child,
+                    server_bytes: None,
+                    private_bytes: None,
+                },
+                NamedOleanBytes {
+                    name: base_name,
+                    bytes: base,
+                    server_bytes: None,
+                    private_bytes: None,
+                },
+            ],
+            total,
+            false,
+            Some(receipts.clone()),
+        );
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("receipts: 2 module rows"));
+        assert!(receipts.is_file(), "the receipt set must be published");
+
+        let text = std::fs::read_to_string(&receipts).expect("read the receipt set");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "two module rows plus one summary row");
+        assert!(lines[0].contains(
+            "\"prev\":\"0000000000000000000000000000000000000000000000000000000000000000\""
+        ));
+        let row_hash = |line: &str| {
+            line.split("\"rowHash\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("module rows carry rowHash")
+                .to_owned()
+        };
+        assert_eq!(
+            lines[1]
+                .split("\"prev\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next()),
+            Some(row_hash(lines[0]).as_str()),
+            "row two must chain to row one"
+        );
+        assert!(lines[2].contains("\"kind\":\"summary\""));
+        assert!(lines[2].contains(&format!("\"prev\":\"{}\"", row_hash(lines[1]))));
+        assert!(lines.iter().all(|line| line.contains(RECEIPT_SET_SCHEMA)));
+
+        let again = check_olean_module_bytes(
+            vec![
+                NamedOleanBytes {
+                    name: fln::Name::from_components(["Fixture", "RcptChild"]),
+                    bytes: empty_olean_fixture(&[fln::OleanModuleImport {
+                        module: fln::Name::from_components(["Fixture", "RcptBase"]),
+                        import_all: false,
+                        is_exported: false,
+                        is_meta: false,
+                    }]),
+                    server_bytes: None,
+                    private_bytes: None,
+                },
+                NamedOleanBytes {
+                    name: fln::Name::from_components(["Fixture", "RcptBase"]),
+                    bytes: empty_olean_fixture(&[]),
+                    server_bytes: None,
+                    private_bytes: None,
+                },
+            ],
+            total,
+            true,
+            Some(receipts),
+        );
+        assert_eq!(again.exit_code, 1);
+        assert!(
+            again
+                .stderr
+                .contains("refusing to overwrite existing receipt set")
+        );
     }
 }
