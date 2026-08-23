@@ -3571,7 +3571,7 @@ fn inductive_and_recursor_block_lists_agree() {
 /// d17i's `BlockMismatch` family was exactly this: the kernel regenerated a
 /// recursor whose level-parameter list was one SHORTER than the decoded one,
 /// reported as `generated [u,v,w]` against `decoded [u_1,u,v,w]`. The repair at
-/// `50f65ba4` restored the missing motive universe. Nothing has ever checked the
+/// `bbb464f1` restored the missing motive universe. Nothing has ever checked the
 /// decoded side of that comparison — what the artifact actually carries.
 ///
 /// Measured over `Init/Prelude` at private level:
