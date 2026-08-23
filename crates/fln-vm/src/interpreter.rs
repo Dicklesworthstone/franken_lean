@@ -542,6 +542,8 @@ enum IntrinsicImplementation {
     NatShiftLeft,
     NatShiftRight,
     NatXor,
+    NatDivExact,
+    NatModCore,
     NatDecEq,
     NatDecLe,
     NatDecLt,
@@ -634,6 +636,8 @@ impl IntrinsicImplementation {
             "extern:Nat.shiftLeft" => Self::NatShiftLeft,
             "extern:Nat.shiftRight" => Self::NatShiftRight,
             "extern:Nat.xor" => Self::NatXor,
+            "extern:Nat.divExact" => Self::NatDivExact,
+            "extern:Nat.modCore" => Self::NatModCore,
             "extern:Nat.decEq" => Self::NatDecEq,
             "extern:Nat.decLe" => Self::NatDecLe,
             "extern:Nat.decLt" => Self::NatDecLt,
@@ -3156,7 +3160,10 @@ fn invoke_intrinsic(
             )??;
             finish_nat_result(product, max_nat_magnitude_bytes)
         }
-        IntrinsicImplementation::NatDiv => {
+        // Nat.divExact shares Nat.div's runtime: the pin's definition is
+        // `x / y` with the divisibility proof erased before the call
+        // (Init/Data/Nat/Div/Basic.lean:110).
+        IntrinsicImplementation::NatDiv | IntrinsicImplementation::NatDivExact => {
             expect_arity(row, args, 2)?;
             let quotient = with_nat_views(
                 &args[0],
@@ -3224,7 +3231,10 @@ fn invoke_intrinsic(
             )??;
             finish_nat_result(result, max_nat_magnitude_bytes)
         }
-        IntrinsicImplementation::NatMod => {
+        // Nat.modCore x y = if 0 < y then x mod y else x (Init/Prelude.lean:2196):
+        // the zero divisor yields the dividend, which is exactly Nat.mod's
+        // runtime contract, so one handler serves both rows.
+        IntrinsicImplementation::NatMod | IntrinsicImplementation::NatModCore => {
             expect_arity(row, args, 2)?;
             let remainder = with_nat_views(
                 &args[0],
@@ -4106,6 +4116,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatDecEq
         | IntrinsicImplementation::NatDecLe
         | IntrinsicImplementation::NatDecLt
+        | IntrinsicImplementation::NatDivExact
+        | IntrinsicImplementation::NatModCore
         | IntrinsicImplementation::ByteArrayBeq
         | IntrinsicImplementation::ByteArrayCopySlice
         | IntrinsicImplementation::ByteArrayData
@@ -5165,5 +5177,39 @@ mod tests {
             owned_usize(invoke("extern:Nat.decEq", &[big.clone_ref(), big])),
             1
         );
+    }
+
+    #[test]
+    fn nat_div_exact_shares_div_runtime_including_zero_divisor() {
+        assert_eq!(
+            owned_usize(invoke("extern:Nat.divExact", &[n(100), n(4)])),
+            25
+        );
+        // The pin's div answers 0 for a zero divisor; divExact is `x / y`
+        // with only the proof erased, so the runtime contract is identical.
+        assert_eq!(owned_usize(invoke("extern:Nat.divExact", &[n(7), n(0)])), 0);
+    }
+
+    #[test]
+    fn nat_mod_core_matches_mod_with_zero_divisor_identity() {
+        assert_eq!(owned_usize(invoke("extern:Nat.modCore", &[n(17), n(5)])), 2);
+        // Init/Prelude.lean:2196 — the zero divisor yields the dividend.
+        assert_eq!(
+            owned_usize(invoke("extern:Nat.modCore", &[n(17), n(0)])),
+            17
+        );
+        assert_eq!(owned_usize(invoke("extern:Nat.modCore", &[n(0), n(3)])), 0);
+    }
+
+    #[test]
+    fn nat_arith_rows_resolve_and_stay_off_managerless_task_path() {
+        for row in ["extern:Nat.divExact", "extern:Nat.modCore"] {
+            assert_ne!(
+                IntrinsicImplementation::for_row(row),
+                IntrinsicImplementation::Unsupported,
+                "{row} must resolve"
+            );
+            assert!(!IntrinsicImplementation::for_row(row).is_managerless_task());
+        }
     }
 }
