@@ -31,7 +31,7 @@ const MANIFEST_HASH_TAG: &[u8] = b"fln.kernel-contract-ownership.manifest/1";
 const CANONICAL_ID_PREFIX: &[u8] = b"{\"id\":\"";
 
 pub const ABSOLUTE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-pub const ABSOLUTE_MAX_LINE_BYTES: u64 = 1024 * 1024;
+pub const ABSOLUTE_MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 pub const ABSOLUTE_MAX_RECORDS: u64 = 1_000_000;
 pub const ABSOLUTE_MAX_ID_BYTES: u64 = 4096;
 pub const ABSOLUTE_MAX_PARSE_DEPTH: u64 = 256;
