@@ -5707,10 +5707,11 @@ fn private_names_are_the_only_ones_carrying_a_num_component() {
                 "{module}: {display} carries a num component too large to store"
             );
             for component in &components {
-                if let Component::Str(text) = component {
-                    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
-                        numeric_strings.push(display.clone());
-                    }
+                if let Component::Str(text) = component
+                    && !text.is_empty()
+                    && text.chars().all(|c| c.is_ascii_digit())
+                {
+                    numeric_strings.push(display.clone());
                 }
             }
 
@@ -6536,17 +6537,17 @@ fn chain_census(lib: &Path, root: &Path) -> ChainCensus {
                 .expect("under lib")
                 .to_string_lossy()
                 .into_owned();
-            if let Some(base) = relative.strip_suffix(".server") {
-                if base.ends_with(".olean") {
-                    out.server.insert(base.to_owned());
-                    continue;
-                }
+            if let Some(base) = relative.strip_suffix(".server")
+                && base.ends_with(".olean")
+            {
+                out.server.insert(base.to_owned());
+                continue;
             }
-            if let Some(base) = relative.strip_suffix(".private") {
-                if base.ends_with(".olean") {
-                    out.private.insert(base.to_owned());
-                    continue;
-                }
+            if let Some(base) = relative.strip_suffix(".private")
+                && base.ends_with(".olean")
+            {
+                out.private.insert(base.to_owned());
+                continue;
             }
             if relative.ends_with(".olean") {
                 out.exported.insert(relative);
@@ -6960,10 +6961,10 @@ fn a_name_identifies_a_declaration_but_not_the_module_that_declares_it() {
                 let boundary = components
                     .iter()
                     .position(|part| part.chars().all(|c| c.is_ascii_digit()));
-                if let Some(index) = boundary {
-                    if components[..index].join(".") == *module {
-                        scope_is_declarer += 1;
-                    }
+                if let Some(index) = boundary
+                    && components[..index].join(".") == *module
+                {
+                    scope_is_declarer += 1;
                 }
             }
             declarers.entry(name).or_default().push(module.clone());
@@ -7837,10 +7838,11 @@ fn transitive_visibility_is_gated_by_is_exported_and_resolution_survives() {
         permissive.len()
     );
 }
+type RepeatedImportShape = (&'static [(bool, bool, bool)], usize);
 
 /// Every distinct set of flag rows a repeated import name carries, with how
 /// many groups carry it: `((import_all, is_exported, is_meta)…, groups)`.
-const REPEATED_IMPORT_SHAPES: &[(&[(bool, bool, bool)], usize)] = &[
+const REPEATED_IMPORT_SHAPES: &[RepeatedImportShape] = &[
     (&[(false, false, false), (false, true, false)], 3),
     (
         &[
@@ -8399,10 +8401,10 @@ fn proof_auxiliaries_are_numbered_contiguously_and_match_auxiliaries_are_not() {
             continue;
         };
         for (prefix, family) in [("match_", &mut matches), ("_proof_", &mut proofs)] {
-            if let Some(digits) = tail.strip_prefix(prefix) {
-                if let Ok(index) = digits.parse::<u32>() {
-                    family.entry(base.to_owned()).or_default().insert(index);
-                }
+            if let Some(digits) = tail.strip_prefix(prefix)
+                && let Ok(index) = digits.parse::<u32>()
+            {
+                family.entry(base.to_owned()).or_default().insert(index);
             }
         }
     }
@@ -8514,10 +8516,11 @@ fn an_instance_name_does_not_determine_its_type_but_its_stored_type_does() {
         if matches!(info, ConstantInfo::Induct(_)) {
             inductives.insert(name.clone());
         }
-        if let Some(suffix) = name.strip_prefix("instDecidableEq") {
-            if !suffix.is_empty() && !suffix.contains('.') {
-                instances.insert(name, &info.constant_val().type_);
-            }
+        if let Some(suffix) = name.strip_prefix("instDecidableEq")
+            && !suffix.is_empty()
+            && !suffix.contains('.')
+        {
+            instances.insert(name, &info.constant_val().type_);
         }
     }
     assert_eq!(
@@ -8643,12 +8646,12 @@ fn derived_equality_instances_split_into_generated_and_delegating() {
         if name.ends_with(".decEq") {
             generated.insert(name.clone());
         }
-        if let Some(suffix) = name.strip_prefix("instDecidableEq") {
-            if !suffix.is_empty() && !suffix.contains('.') {
-                if let ConstantInfo::Defn(v) = info {
-                    instances.insert(name, &v.value);
-                }
-            }
+        if let Some(suffix) = name.strip_prefix("instDecidableEq")
+            && !suffix.is_empty()
+            && !suffix.contains('.')
+            && let ConstantInfo::Defn(v) = info
+        {
+            instances.insert(name, &v.value);
         }
     }
     assert_eq!(
@@ -8725,9 +8728,21 @@ fn derived_equality_instances_split_into_generated_and_delegating() {
     }
 }
 
+type PrivateOnlyShapeRow = (
+    &'static str,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+);
+
 /// `(module, private-only total, Defn, Thm, Opaque, privacy-scoped, match_N,
 /// _proof_N, eq_N)`.
-const PRIVATE_ONLY_SHAPE: &[(&str, usize, usize, usize, usize, usize, usize, usize, usize)] = &[
+const PRIVATE_ONLY_SHAPE: &[PrivateOnlyShapeRow] = &[
     ("Init.Prelude", 110, 103, 5, 2, 82, 25, 3, 0),
     ("Init.Meta.Defs", 151, 123, 10, 18, 95, 50, 2, 4),
 ];
@@ -9684,17 +9699,17 @@ fn only_props_carry_indices_and_only_four_inductives_carry_any() {
     // actually consumed.
     let mut recursors = 0usize;
     for info in &infos {
-        if let ConstantInfo::Rec(rec) = info {
-            if rec.num_indices > 0 {
-                recursors += 1;
-                let head = rec.all.first().expect("a block head").to_display_string();
-                assert!(
-                    INDEXED_INDUCTIVES
-                        .iter()
-                        .any(|(name, width)| *name == head && *width == rec.num_indices),
-                    "{head}: a recursor's index count must match its inductive's"
-                );
-            }
+        if let ConstantInfo::Rec(rec) = info
+            && rec.num_indices > 0
+        {
+            recursors += 1;
+            let head = rec.all.first().expect("a block head").to_display_string();
+            assert!(
+                INDEXED_INDUCTIVES
+                    .iter()
+                    .any(|(name, width)| *name == head && *width == rec.num_indices),
+                "{head}: a recursor's index count must match its inductive's"
+            );
         }
     }
     assert_eq!(
@@ -9784,9 +9799,13 @@ fn a_constructor_result_passes_its_parameters_as_its_own_binders() {
             "{name}: the result must apply parameters and indices"
         );
 
-        for position in 0..induct.num_params as usize {
+        for (position, argument) in arguments
+            .iter()
+            .take(induct.num_params as usize)
+            .enumerate()
+        {
             let expected = depth - 1 - position;
-            match arguments[position].node() {
+            match argument.node() {
                 ExprNode::BVar { idx } if *idx as usize == expected => {}
                 ExprNode::BVar { idx } => departures.push((name.clone(), position, Some(*idx))),
                 _ => departures.push((name.clone(), position, None)),
@@ -10693,8 +10712,9 @@ fn the_binders_after_self_are_the_field_types_own() {
     let declared = kinds(&infos);
     let mut types: BTreeMap<String, &Expr> = BTreeMap::new();
     let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
-    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<(String, &Expr)>)> =
-        BTreeMap::new();
+    /// One constructor of the private Prelude part with its decoded field types.
+    type PrivateConstructorRow<'a> = (&'a ConstructorVal, Vec<(String, &'a Expr)>);
+    let mut constructors: BTreeMap<String, PrivateConstructorRow<'_>> = BTreeMap::new();
     for info in &infos {
         let name = info.name().to_display_string();
         types.insert(name.clone(), &info.constant_val().type_);
@@ -10883,12 +10903,12 @@ fn no_constructor_field_mentions_its_inductive_in_a_domain() {
             if !seen.insert((current.allocation_identity(), under)) {
                 continue;
             }
-            if let ExprNode::Const { name, .. } = current.node() {
-                if name.to_display_string() == target {
-                    mentions = true;
-                    if under {
-                        in_domain = true;
-                    }
+            if let ExprNode::Const { name, .. } = current.node()
+                && name.to_display_string() == target
+            {
+                mentions = true;
+                if under {
+                    in_domain = true;
                 }
             }
             match current.node() {
@@ -11067,18 +11087,17 @@ fn a_recursive_occurrence_applies_the_constructors_own_parameters() {
                         if let ExprNode::Const { name: target, .. } = head.node()
                             && target.to_display_string() == induct_name
                         {
-                                occurrences += 1;
-                                *by_inductive.entry(induct_name.clone()).or_default() += 1;
-                                if params > 0 {
-                                    exercising += 1;
-                                    widths.insert(induct.num_params);
-                                }
-                                for position in 0..params.min(arguments.len()) {
-                                    let expected = depth - 1 - position;
-                                    match arguments[position].node() {
-                                        ExprNode::BVar { idx } if *idx as usize == expected => {}
-                                        _ => departures.push((name.clone(), position)),
-                                    }
+                            occurrences += 1;
+                            *by_inductive.entry(induct_name.clone()).or_default() += 1;
+                            if params > 0 {
+                                exercising += 1;
+                                widths.insert(induct.num_params);
+                            }
+                            for (position, argument) in arguments.iter().take(params).enumerate() {
+                                let expected = depth - 1 - position;
+                                match argument.node() {
+                                    ExprNode::BVar { idx } if *idx as usize == expected => {}
+                                    _ => departures.push((name.clone(), position)),
                                 }
                             }
                         }

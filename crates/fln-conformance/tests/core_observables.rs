@@ -129,7 +129,9 @@ fn complete_olean_chain_restores_all_private_equation_compiler_auxiliary_familie
         );
     }
 
-    let families: [(&str, fn(&str) -> bool); 4] = [
+    /// One private-only auxiliary family and the name shape that belongs to it.
+    type AuxiliaryFamily = (&'static str, fn(&str) -> bool);
+    let families: [AuxiliaryFamily; 4] = [
         ("match_N", |name| numbered_private_auxiliary(name, "match_")),
         ("_proof_N", |name| {
             numbered_private_auxiliary(name, "_proof_")

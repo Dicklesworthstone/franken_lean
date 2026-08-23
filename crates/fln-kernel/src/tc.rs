@@ -85,11 +85,15 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // local-generation snapshots per cache, with no one row retaining more than
 // 256 or scanning more than 65,536 distinct structural expression subterms to
 // discover them. Structural scan deduplication retains at most four exact
-// candidates per attacker-controlled packed hash. Each cache may spend at most
-// 33,554,432 such visits on dependency discovery in total. A bounded packed-key
-// refusal set prevents an expression beyond those limits from repeatedly
-// consuming that allowance; a hash collision can therefore suppress reuse,
-// never manufacture a result.
+// candidates per attacker-controlled packed hash; a saturated bucket degrades
+// the remainder of that scan to exact allocation-identity dedup — which can
+// never alias two distinct subterms — instead of refusing, so an ordinary
+// large term keeps its cache rows (bead `franken_lean-shgs`: family-wide
+// refusal keys turned one full bucket into a permanent reuse blackout).
+// Each cache may spend at most 33,554,432 such visits on dependency discovery
+// in total. A bounded packed-key refusal set prevents a scan beyond those
+// limits from repeatedly consuming that allowance; it suppresses reuse,
+// never manufactures a result.
 // Dead-generation rows are reclaimed from a touched bucket before its collision
 // cap is applied. These are shallow cardinality bounds: retained Expr DAG weight,
 // allocator failure, cancellation, and Consumption-accounted cache bookkeeping
@@ -150,11 +154,68 @@ struct LocalDecl {
     value: Option<Expr>,
 }
 
+/// Seen-set for dependency-scan node deduplication.
+///
+/// Structural buckets give exact, sharing-independent dedup while they have
+/// room. When a packed-hash bucket saturates, the scan degrades to exact
+/// allocation-identity dedup for the remainder of the walk instead of
+/// refusing: an allocation identity can never alias two distinct subterms,
+/// so the no-aliasing property this function exists to preserve holds in the
+/// degraded mode too, while ordinary large terms keep their cache rows
+/// instead of poisoning a permanent refusal key (bead `franken_lean-shgs`).
+struct DependencyScanSeen {
+    structural: HashMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
+    allocations: HashMap<usize, ()>,
+    degraded: bool,
+}
+
+impl DependencyScanSeen {
+    fn new() -> Self {
+        Self {
+            structural: HashMap::new(),
+            allocations: HashMap::new(),
+            degraded: false,
+        }
+    }
+
+    /// `true` when an identical subterm was already recorded; `false` when the
+    /// subterm is new and the caller must charge one visit. The walk refuses —
+    /// `None` — only when a genuinely unbounded scan exhausts its allowance,
+    /// never because one hash bucket ran out of slots.
+    fn admit(&mut self, current: &Expr) -> Option<bool> {
+        if !self.degraded {
+            let bucket = self
+                .structural
+                .entry(current.data().0)
+                .or_insert_with(|| std::array::from_fn(|_| None));
+            if bucket
+                .iter()
+                .flatten()
+                .any(|candidate| candidate == current)
+            {
+                return Some(true);
+            }
+            match bucket.iter_mut().find(|candidate| candidate.is_none()) {
+                Some(vacant) => {
+                    *vacant = Some(current.clone());
+                    return Some(false);
+                }
+                None => self.degraded = true,
+            }
+        }
+        let was_present = self
+            .allocations
+            .insert(current.allocation_identity(), ())
+            .is_some();
+        Some(was_present)
+    }
+}
+
 fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
     seen_ids: &mut HashMap<FVarId, ()>,
-    seen_nodes: &mut HashMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
+    seen_nodes: &mut DependencyScanSeen,
     nodes_left: &mut usize,
 ) -> bool {
     if !expr.has_fvar() {
@@ -162,23 +223,12 @@ fn collect_fvar_ids(
     }
     let mut pending = vec![expr.clone()];
     while let Some(current) = pending.pop() {
-        let collision_bucket = seen_nodes
-            .entry(current.data().0)
-            .or_insert_with(|| std::array::from_fn(|_| None));
-        if collision_bucket
-            .iter()
-            .flatten()
-            .any(|candidate| candidate == &current)
-        {
-            continue;
-        }
-        let Some(vacant) = collision_bucket
-            .iter_mut()
-            .find(|candidate| candidate.is_none())
-        else {
+        let Some(is_known) = seen_nodes.admit(&current) else {
             return false;
         };
-        *vacant = Some(current.clone());
+        if is_known {
+            continue;
+        }
         let Some(remaining) = nodes_left.checked_sub(1) else {
             return false;
         };
@@ -236,7 +286,7 @@ fn local_dependencies(
 ) -> Option<Vec<LocalDependency>> {
     let mut ids = Vec::new();
     let mut seen_ids = HashMap::new();
-    let mut seen_nodes = HashMap::new();
+    let mut seen_nodes = DependencyScanSeen::new();
     for expression in expressions {
         if !collect_fvar_ids(
             expression,
@@ -9008,10 +9058,11 @@ mod tests {
     }
 
     #[test]
-    fn dependency_discovery_refuses_an_overfull_structural_hash_collision_bucket() {
+    fn dependency_discovery_degrades_to_exact_allocation_dedup_on_an_overfull_bucket() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
         let mut expression = Expr::sort(Level::zero());
+        let mut ids = Vec::new();
         let mut packed = None;
         for offset in 0..=TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
             let id = FVarId(Name::num_overflowing(
@@ -9027,20 +9078,41 @@ mod tests {
             } else {
                 packed = Some(local.data().0);
             }
-            tc.adopt_local(id, Expr::sort(Level::zero()));
+            tc.adopt_local(id.clone(), Expr::sort(Level::zero()));
+            ids.push(id);
             expression = Expr::app(expression, local);
         }
 
+        // One bucket holds four exact candidates, so the fifth colliding fvar
+        // saturates it. The scan must degrade to exact allocation-identity
+        // dedup — never alias the distinct subterms, never refuse — and still
+        // discover every dependency with one charge per distinct subterm
+        // (bead `franken_lean-shgs`: refusing here poisoned a family-wide
+        // refusal key and blacked out cache reuse for whole modules).
         let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
-        assert!(
-            local_dependencies(
-                &[&expression],
-                &tc.locals,
-                &tc.local_positions,
-                &mut nodes_left,
-            )
-            .is_none(),
-            "a fifth exact candidate must refuse cache reuse instead of aliasing a dependency"
+        let dependencies = local_dependencies(
+            &[&expression],
+            &tc.locals,
+            &tc.local_positions,
+            &mut nodes_left,
+        )
+        .expect("a saturated bucket degrades to exact dedup instead of refusing");
+        assert_eq!(
+            dependencies.len(),
+            ids.len(),
+            "no colliding fvar may be aliased away"
+        );
+        for id in &ids {
+            assert!(
+                dependencies.iter().any(|dependency| &dependency.id == id),
+                "every distinct colliding fvar must survive degradation"
+            );
+        }
+        let charged = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - nodes_left;
+        assert_eq!(
+            charged,
+            2 * TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES + 3,
+            "one charge per distinct structural subterm: five fvars, five apps, one sort"
         );
     }
 

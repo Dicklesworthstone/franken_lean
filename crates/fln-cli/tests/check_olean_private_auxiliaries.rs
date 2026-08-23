@@ -181,7 +181,10 @@ fn json_usize_field(object: &str, field: &str) -> usize {
         .bytes()
         .take_while(|byte| byte.is_ascii_digit())
         .count();
-    assert!(digits > 0, "JSON integer field starts with a number: {object}");
+    assert!(
+        digits > 0,
+        "JSON integer field starts with a number: {object}"
+    );
     assert!(
         matches!(value.as_bytes().get(digits), Some(b',') | Some(b'}')),
         "JSON integer field is terminated: {object}",
@@ -255,7 +258,10 @@ fn json_object_key_set(object: &str) -> BTreeSet<String> {
         }
     }
 
-    assert!(!in_string && key_start.is_none(), "JSON object keys are closed");
+    assert!(
+        !in_string && key_start.is_none(),
+        "JSON object keys are closed"
+    );
     keys
 }
 
@@ -287,7 +293,11 @@ fn json_non_empty_name_strings(array: &str) -> Vec<String> {
 
         let mut escaped = false;
         let mut value_end = None;
-        for (offset, byte) in array.as_bytes()[value_start + 1..].iter().copied().enumerate() {
+        for (offset, byte) in array.as_bytes()[value_start + 1..]
+            .iter()
+            .copied()
+            .enumerate()
+        {
             if escaped {
                 escaped = false;
             } else if byte == b'\\' {
@@ -461,8 +471,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"')
-                    && line.contains(r#"\"privateCliPrivateReportResiduals\":"#)
+                line.starts_with('"') && line.contains(r#"\"privateCliPrivateReportResiduals\":"#)
             })
             .count(),
         2,
@@ -552,8 +561,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"')
-                    && line.contains(r#"\"privateUnsafeRecSunfoldResiduals\":"#)
+                line.starts_with('"') && line.contains(r#"\"privateUnsafeRecSunfoldResiduals\":"#)
             })
             .count(),
         2,
@@ -587,8 +595,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"')
-                    && line.contains(r#"\"privateCliPrivateReportFResiduals\":"#)
+                line.starts_with('"') && line.contains(r#"\"privateCliPrivateReportFResiduals\":"#)
             })
             .count(),
         2,
@@ -644,8 +651,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"')
-                    && line.contains(r#"\"privateInitDataUnsafeRecResiduals\":"#)
+                line.starts_with('"') && line.contains(r#"\"privateInitDataUnsafeRecResiduals\":"#)
             })
             .count(),
         2,
@@ -736,8 +742,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"')
-                    && line.contains(r#"\"privateInitDataProofNResiduals\":"#)
+                line.starts_with('"') && line.contains(r#"\"privateInitDataProofNResiduals\":"#)
             })
             .count(),
         2,
@@ -748,8 +753,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .iter()
             .filter(|line| {
                 let line = line.trim();
-                line.starts_with('"')
-                    && line.contains(r#"\"privateInitPreludeProofNResiduals\":"#)
+                line.starts_with('"') && line.contains(r#"\"privateInitPreludeProofNResiduals\":"#)
             })
             .count(),
         2,
@@ -997,8 +1001,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
-                lines[0].trim()
-                    == r##""\"module\":{{\"isModulePart\":{},\"imports\":0,","##
+                lines[0].trim() == r##""\"module\":{{\"isModulePart\":{},\"imports\":0,","##
                     && lines[1].trim()
                         == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,","##
             })
@@ -1012,8 +1015,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
                 .windows(2)
                 .filter(|lines| {
                     lines[0].trim() == r##""\"companionPartsLoaded\":{}}},","##
-                        && lines[1].trim()
-                            == r##""\"k2Checked\":false,\"g1Satisfied\":false}}\n""##
+                        && lines[1].trim() == r##""\"k2Checked\":false,\"g1Satisfied\":false}}\n""##
                 })
                 .count(),
             cli_source_lines
@@ -1044,15 +1046,13 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             cli_source_lines
                 .iter()
                 .filter(|line| {
-                    line.trim()
-                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
+                    line.trim() == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
                 })
                 .count(),
             cli_source_lines
                 .windows(2)
                 .filter(|lines| {
-                    lines[0].trim()
-                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
+                    lines[0].trim() == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
                         && lines[1].trim()
                             == r##""\"checker\":{{\"admissions\":{},\"finalSchema\":{},","##
                 })
@@ -1065,8 +1065,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
-                lines[0].trim()
-                    == r##""\"checker\":{{\"admissions\":{},\"finalSchema\":{},","##
+                lines[0].trim() == r##""\"checker\":{{\"admissions\":{},\"finalSchema\":{},","##
                     && lines[1].trim() == r##""\"finalGround\":{}}},","##
             })
             .count(),
@@ -1089,8 +1088,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
-                lines[0].trim()
-                    == r##""\"finalExecution\":{{\"steps\":{},\"systemPolls\":{},","##
+                lines[0].trim() == r##""\"finalExecution\":{{\"steps\":{},\"systemPolls\":{},","##
                     && lines[1].trim() == r##""\"peakStackDepth\":{}}}}}\n""##
             })
             .count(),
@@ -1101,8 +1099,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
-                lines[0].trim()
-                    == r##""\"execution\":{{\"steps\":{},\"systemPolls\":{},","##
+                lines[0].trim() == r##""\"execution\":{{\"steps\":{},\"systemPolls\":{},","##
                     && lines[1].trim() == r##""\"peakStackDepth\":{}}}}}\n""##
             })
             .count(),
@@ -1113,8 +1110,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
-                lines[0].trim()
-                    == r##""\"class\":{},\"detail\":{},\"detailTruncated\":{},","##
+                lines[0].trim() == r##""\"class\":{},\"detail\":{},\"detailTruncated\":{},","##
                     && lines[1].trim() == r##""\"execution\":{}}}\n""##
             })
             .count(),
@@ -1169,10 +1165,8 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
-                lines[0].trim()
-                    == r##""\"decodedPrivateAuxiliaries\":{},","##
-                    && lines[1].trim()
-                        == r##""\"decodedPrivateAuxiliaryNames\":{},","##
+                lines[0].trim() == r##""\"decodedPrivateAuxiliaries\":{},","##
+                    && lines[1].trim() == r##""\"decodedPrivateAuxiliaryNames\":{},","##
             })
             .count(),
         2,
@@ -1209,8 +1203,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .filter(|lines| {
                 lines[0].trim()
                     == r##""\"declarationsChecked\":{},\"dependencyOrderDerived\":true,","##
-                    && lines[1].trim()
-                        == r##""\"decodedPrivateAuxiliaries\":{},","##
+                    && lines[1].trim() == r##""\"decodedPrivateAuxiliaries\":{},","##
             })
             .count(),
         2,
@@ -2120,8 +2113,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "{json}",
     );
     assert_eq!(
-        private_companion_name_count,
-        private_companion_observed,
+        private_companion_name_count, private_companion_observed,
         "{json}",
     );
     assert_eq!(
@@ -2129,33 +2121,24 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         private_companion_name_count == 0,
         "{json}",
     );
-    let decoded_private_auxiliary_names = json_array_field(
-        json,
-        "decodedPrivateAuxiliaryNames",
-    );
+    let decoded_private_auxiliary_names = json_array_field(json, "decodedPrivateAuxiliaryNames");
     let decoded_private_auxiliary_name_count = json_array_len(decoded_private_auxiliary_names);
     let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
     assert_eq!(
-        decoded_private_auxiliaries,
-        private_companion_name_count,
+        decoded_private_auxiliaries, private_companion_name_count,
         "{json}",
     );
     assert!(
         decoded_private_auxiliaries == 0 || companion_parts_loaded,
         "{json}",
     );
-    assert!(
-        decoded_private_auxiliaries > 0 && !g1_satisfied,
+    assert!(decoded_private_auxiliaries > 0 && !g1_satisfied, "{json}",);
+    assert_eq!(
+        decoded_private_auxiliary_name_count, private_companion_observed,
         "{json}",
     );
     assert_eq!(
-        decoded_private_auxiliary_name_count,
-        private_companion_observed,
-        "{json}",
-    );
-    assert_eq!(
-        decoded_private_auxiliary_name_count,
-        decoded_private_auxiliaries,
+        decoded_private_auxiliary_name_count, decoded_private_auxiliaries,
         "{json}",
     );
     let decoded_private_auxiliary_name_strings =
@@ -2213,10 +2196,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     let decoded_private_loop_observed =
         json_usize_field(decoded_private_loop_auxiliaries, "observed");
-    let decoded_private_loop_names = json_array_field(
-        decoded_private_loop_auxiliaries,
-        "names",
-    );
+    let decoded_private_loop_names = json_array_field(decoded_private_loop_auxiliaries, "names");
     let decoded_private_loop_name_count = json_array_len(decoded_private_loop_names);
     assert_eq!(
         decoded_private_loop_observed > 0,
@@ -2228,8 +2208,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         decoded_private_loop_name_count == 0,
         "{json}",
     );
-    let decoded_private_loop_name_strings =
-        json_non_empty_name_strings(decoded_private_loop_names);
+    let decoded_private_loop_name_strings = json_non_empty_name_strings(decoded_private_loop_names);
     assert!(
         decoded_private_loop_name_strings
             .iter()
@@ -2246,8 +2225,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "{json}",
     );
     assert_eq!(
-        decoded_private_loop_name_count,
-        decoded_private_loop_observed,
+        decoded_private_loop_name_count, decoded_private_loop_observed,
         "{json}",
     );
     assert!(
@@ -2420,12 +2398,8 @@ fn decoded_private_auxiliary_names_is_required() {
 fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part() {
     let proposition = fln::Name::from_components(["CliPrivateReport", "P"]);
     let public_witness = fln::Name::from_components(["CliPrivateReport", "witness"]);
-    let private_auxiliary = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "loop",
-    ]);
+    let private_auxiliary =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "loop"]);
     let core_observables_loop_residual = fln::Name::from_components([
         "_private",
         "Init",
@@ -2437,19 +2411,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "loop",
         "match_1",
     ]);
-    let private_eq_def_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "eq_def",
-    ]);
-    let private_loop_eq_def_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "loop",
-        "eq_def",
-    ]);
+    let private_eq_def_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "eq_def"]);
+    let private_loop_eq_def_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "loop", "eq_def"]);
     let private_insert_idx_loop_unary_residual = fln::Name::from_components([
         "_private",
         "Init",
@@ -2461,24 +2426,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "loop",
         "_unary",
     ]);
-    let private_eq_n_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "eq_1",
-    ]);
-    let private_match_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "match_1",
-    ]);
-    let private_unsafe_rec_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "_unsafe_rec",
-    ]);
+    let private_eq_n_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "eq_1"]);
+    let private_match_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "match_1"]);
+    let private_unsafe_rec_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "_unsafe_rec"]);
     let private_merge_sort_tr_unsafe_rec_residual = fln::Name::from_components([
         "_private",
         "CliPrivateReport",
@@ -2511,71 +2464,66 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "_unsafe_rec",
     ]);
     let merge_sort_tr_run_unsafe_rec_residual = fln::Name::from_components([
-        "_private", "Init", "Data", "List", "Sort", "Impl", "0", "List", "MergeSort",
-        "Internal", "mergeSortTR", "run", "_unsafe_rec",
+        "_private",
+        "Init",
+        "Data",
+        "List",
+        "Sort",
+        "Impl",
+        "0",
+        "List",
+        "MergeSort",
+        "Internal",
+        "mergeSortTR",
+        "run",
+        "_unsafe_rec",
     ]);
     let merge_tr_go_unsafe_rec_residual = fln::Name::from_components([
-        "_private", "Init", "Data", "List", "Sort", "Impl", "0", "List", "MergeSort",
-        "Internal", "mergeTR", "go", "_unsafe_rec",
+        "_private",
+        "Init",
+        "Data",
+        "List",
+        "Sort",
+        "Impl",
+        "0",
+        "List",
+        "MergeSort",
+        "Internal",
+        "mergeTR",
+        "go",
+        "_unsafe_rec",
     ]);
     let split_rev_at_go_unsafe_rec_residual = fln::Name::from_components([
-        "_private", "Init", "Data", "List", "Sort", "Impl", "0", "List", "MergeSort",
-        "Internal", "splitRevAt", "go", "_unsafe_rec",
-    ]);
-    let private_sunfold_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "_sunfold",
-    ]);
-    let private_f_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "_f",
-    ]);
-    let private_loop_proof_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "loop",
-        "_proof_1",
-    ]);
-    let private_standalone_proof_n_residual = fln::Name::from_components([
-        "_private",
-        "CliPrivateReport",
-        "0",
-        "_proof_2",
-    ]);
-    let lean_name_hash_proof_one_residual = fln::Name::from_components([
         "_private",
         "Init",
-        "Prelude",
+        "Data",
+        "List",
+        "Sort",
+        "Impl",
         "0",
-        "Lean",
-        "Name",
-        "hash",
-        "_proof_1",
+        "List",
+        "MergeSort",
+        "Internal",
+        "splitRevAt",
+        "go",
+        "_unsafe_rec",
+    ]);
+    let private_sunfold_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "_sunfold"]);
+    let private_f_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "_f"]);
+    let private_loop_proof_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "loop", "_proof_1"]);
+    let private_standalone_proof_n_residual =
+        fln::Name::from_components(["_private", "CliPrivateReport", "0", "_proof_2"]);
+    let lean_name_hash_proof_one_residual = fln::Name::from_components([
+        "_private", "Init", "Prelude", "0", "Lean", "Name", "hash", "_proof_1",
     ]);
     let lean_name_hash_proof_two_residual = fln::Name::from_components([
-        "_private",
-        "Init",
-        "Prelude",
-        "0",
-        "Lean",
-        "Name",
-        "hash",
-        "_proof_2",
+        "_private", "Init", "Prelude", "0", "Lean", "Name", "hash", "_proof_2",
     ]);
     let lean_name_beq_match_residual = fln::Name::from_components([
-        "_private",
-        "Init",
-        "Prelude",
-        "0",
-        "Lean",
-        "Name",
-        "beq",
-        "match_1",
+        "_private", "Init", "Prelude", "0", "Lean", "Name", "beq", "match_1",
     ]);
     let list_to_array_aux_match_residual = fln::Name::from_components([
         "_private",
@@ -2609,37 +2557,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "match_1",
     ]);
     let array_map_m_proof_one_residual = fln::Name::from_components([
-        "_private",
-        "Init",
-        "Data",
-        "Array",
-        "BasicAux",
-        "0",
-        "Array",
-        "mapM'",
-        "_proof_1",
+        "_private", "Init", "Data", "Array", "BasicAux", "0", "Array", "mapM'", "_proof_1",
     ]);
     let array_map_m_proof_two_residual = fln::Name::from_components([
-        "_private",
-        "Init",
-        "Data",
-        "Array",
-        "BasicAux",
-        "0",
-        "Array",
-        "mapM'",
-        "_proof_2",
+        "_private", "Init", "Data", "Array", "BasicAux", "0", "Array", "mapM'", "_proof_2",
     ]);
     let array_map_m_go_residual = fln::Name::from_components([
-        "_private",
-        "Init",
-        "Data",
-        "Array",
-        "BasicAux",
-        "0",
-        "Array",
-        "mapM'",
-        "go",
+        "_private", "Init", "Data", "Array", "BasicAux", "0", "Array", "mapM'", "go",
     ]);
     let core_observables_head_loop_unsafe_rec_residual = fln::Name::from_components([
         "_private",
@@ -3443,7 +3367,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &json.stdout,
         "privateRunUnsafeRecResiduals",
         1,
-        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec"],
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+        ],
     );
     assert_json_named_residuals(
         &json.stdout,
@@ -3502,15 +3428,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     let human = fln_cli::run([OsString::from("check-olean"), exported.into_os_string()]);
     assert_eq!(human.exit_code, 0, "{}", human.stderr);
     assert!(human.stderr.is_empty());
-    let human_decoded_private_auxiliaries = human_line_suffix(
-        &human.stdout,
-        "decoded _private auxiliaries: ",
-    )
-    .split_once(" (")
-    .map(|(count, _)| count)
-    .expect("human decoded-private summary has a reporting suffix")
-    .parse::<usize>()
-    .expect("human decoded-private count is a usize");
+    let human_decoded_private_auxiliaries =
+        human_line_suffix(&human.stdout, "decoded _private auxiliaries: ")
+            .split_once(" (")
+            .map(|(count, _)| count)
+            .expect("human decoded-private summary has a reporting suffix")
+            .parse::<usize>()
+            .expect("human decoded-private count is a usize");
     assert_eq!(
         human_decoded_private_auxiliaries,
         json_usize_field(&json.stdout, "decodedPrivateAuxiliaries"),
@@ -3518,15 +3442,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_decoded_private_loop_auxiliaries = human_line_suffix(
-        &human.stdout,
-        "decoded _private.loop auxiliaries: ",
-    )
-    .split_once(" (")
-    .map(|(count, _)| count)
-    .expect("human decoded-private loop summary has a reporting suffix")
-    .parse::<usize>()
-    .expect("human decoded-private loop count is a usize");
+    let human_decoded_private_loop_auxiliaries =
+        human_line_suffix(&human.stdout, "decoded _private.loop auxiliaries: ")
+            .split_once(" (")
+            .map(|(count, _)| count)
+            .expect("human decoded-private loop summary has a reporting suffix")
+            .parse::<usize>()
+            .expect("human decoded-private loop count is a usize");
     assert_eq!(
         human_decoded_private_loop_auxiliaries,
         json_usize_field(
@@ -3537,15 +3459,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_private_companion_residuals = human_line_suffix(
-        &human.stdout,
-        "decoded _private companion residuals: ",
-    )
-    .split_once(" (")
-    .map(|(count, _)| count)
-    .expect("human private-companion residual summary has a reporting suffix")
-    .parse::<usize>()
-    .expect("human private-companion residual count is a usize");
+    let human_private_companion_residuals =
+        human_line_suffix(&human.stdout, "decoded _private companion residuals: ")
+            .split_once(" (")
+            .map(|(count, _)| count)
+            .expect("human private-companion residual summary has a reporting suffix")
+            .parse::<usize>()
+            .expect("human private-companion residual count is a usize");
     assert_eq!(
         human_private_companion_residuals,
         json_usize_field(
@@ -3556,14 +3476,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_companion_parts_loaded = match human_line_suffix(
-        &human.stdout,
-        "companion artifact parts loaded: ",
-    ) {
-        "yes" => true,
-        "no" => false,
-        status => panic!("human companion-parts loaded status is a yes/no value: {status}"),
-    };
+    let human_companion_parts_loaded =
+        match human_line_suffix(&human.stdout, "companion artifact parts loaded: ") {
+            "yes" => true,
+            "no" => false,
+            status => panic!("human companion-parts loaded status is a yes/no value: {status}"),
+        };
     assert_eq!(
         human_companion_parts_loaded,
         json_bool_field(&json.stdout, "companionPartsLoaded"),
@@ -3583,13 +3501,11 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_dependency_order_derived = match human_line_suffix(
-        &human.stdout,
-        "dependency order: ",
-    ) {
-        "derived" => true,
-        status => panic!("human dependency-order status is derived: {status}"),
-    };
+    let human_dependency_order_derived =
+        match human_line_suffix(&human.stdout, "dependency order: ") {
+            "derived" => true,
+            status => panic!("human dependency-order status is derived: {status}"),
+        };
     assert_eq!(
         human_dependency_order_derived,
         json_bool_field(&json.stdout, "dependencyOrderDerived"),
@@ -3597,15 +3513,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_extension_blocks_observed = human_line_suffix(
-        &human.stdout,
-        "extension blocks observed: ",
-    )
-    .split_once(" (")
-    .map(|(count, _)| count)
-    .expect("human extension-block summary has an interpretation suffix")
-    .parse::<usize>()
-    .expect("human extension-block count is a usize");
+    let human_extension_blocks_observed =
+        human_line_suffix(&human.stdout, "extension blocks observed: ")
+            .split_once(" (")
+            .map(|(count, _)| count)
+            .expect("human extension-block summary has an interpretation suffix")
+            .parse::<usize>()
+            .expect("human extension-block count is a usize");
     assert_eq!(
         human_extension_blocks_observed,
         json_usize_field(&json.stdout, "extensionBlocksObserved"),
@@ -3613,19 +3527,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
-    let human_extensions_interpreted = match human_line_suffix(
-        &human.stdout,
-        "extension blocks observed: ",
-    )
-    .split_once(" (")
-    .map(|(_, status)| status.strip_suffix(')'))
-    .flatten()
-    .expect("human extension-block summary has an interpretation status")
-    {
-        "interpreted" => true,
-        "not interpreted" => false,
-        status => panic!("human extension interpretation status is known: {status}"),
-    };
+    let human_extensions_interpreted =
+        match human_line_suffix(&human.stdout, "extension blocks observed: ")
+            .split_once(" (")
+            .and_then(|(_, status)| status.strip_suffix(')'))
+            .expect("human extension-block summary has an interpretation status")
+        {
+            "interpreted" => true,
+            "not interpreted" => false,
+            status => panic!("human extension interpretation status is known: {status}"),
+        };
     assert_eq!(
         human_extensions_interpreted,
         json_bool_field(&json.stdout, "extensionsInterpreted"),
@@ -3666,11 +3577,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
-        &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
+        &human.stdout,
+        "decoded _private.loop auxiliaries",
+        "decoded _private.loop auxiliary names",
+        7,
         &[
-            "_private.CliPrivateReport.0.loop", "_private.CliPrivateReport.0.loop.eq_def",
-            "_private.CliPrivateReport.0.loop._proof_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.CliPrivateReport.0.loop",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
             "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
         ],
     );
@@ -3712,27 +3629,44 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "core-observables .loop residuals", "core-observables .loop residual names", 3,
+        &human.stdout,
+        "core-observables .loop residuals",
+        "core-observables .loop residual names",
+        3,
         &[
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private eq_def/match_N residuals", "decoded _private eq_def/match_N residual names", 8,
+        &human.stdout,
+        "decoded _private eq_def/match_N residuals",
+        "decoded _private eq_def/match_N residual names",
+        8,
         &[
-            "_private.CliPrivateReport.0.eq_def", "_private.CliPrivateReport.0.loop.eq_def", "_private.CliPrivateReport.0.match_1",
-            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1", "_private.Init.Prelude.0.Lean.Name.beq.match_1",
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.match_1",
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1",
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private match_N residuals", "decoded _private match_N residual names", 6,
+        &human.stdout,
+        "decoded _private match_N residuals",
+        "decoded _private match_N residual names",
+        6,
         &[
-            "_private.CliPrivateReport.0.match_1", "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1",
-            "_private.Init.Prelude.0.Lean.Name.beq.match_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+            "_private.CliPrivateReport.0.match_1",
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1",
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
         ],
     );
     assert_human_named_residuals(
@@ -3755,23 +3689,49 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private eq_def residuals", "decoded _private eq_def residual names", 2,
-        &["_private.CliPrivateReport.0.eq_def", "_private.CliPrivateReport.0.loop.eq_def"],
-    );
-    assert_human_named_residuals(&human.stdout, "decoded _private eq_N residuals", "decoded _private eq_N residual names", 1, &["_private.CliPrivateReport.0.eq_1"]);
-    assert_human_named_residuals(
-        &human.stdout, "decoded _private _unsafe_rec/_sunfold residuals", "decoded _private _unsafe_rec/_sunfold residual names", 10,
+        &human.stdout,
+        "decoded _private eq_def residuals",
+        "decoded _private eq_def residual names",
+        2,
         &[
-            "_private.CliPrivateReport.0._sunfold", "_private.CliPrivateReport.0._unsafe_rec", "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
-            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
-            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec", "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
-            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop.eq_def",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private eq_N residuals",
+        "decoded _private eq_N residual names",
+        1,
+        &["_private.CliPrivateReport.0.eq_1"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private _unsafe_rec/_sunfold residuals",
+        "decoded _private _unsafe_rec/_sunfold residual names",
+        10,
+        &[
+            "_private.CliPrivateReport.0._sunfold",
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private _sunfold/_f residuals", "decoded _private _sunfold/_f residual names", 2,
-        &["_private.CliPrivateReport.0._f", "_private.CliPrivateReport.0._sunfold"],
+        &human.stdout,
+        "decoded _private _sunfold/_f residuals",
+        "decoded _private _sunfold/_f residual names",
+        2,
+        &[
+            "_private.CliPrivateReport.0._f",
+            "_private.CliPrivateReport.0._sunfold",
+        ],
     );
     assert_human_named_residuals(
         &human.stdout,
@@ -3783,14 +3743,27 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.CliPrivateReport.0._sunfold",
         ],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private _sunfold residuals", "decoded _private _sunfold residual names", 1, &["_private.CliPrivateReport.0._sunfold"]);
     assert_human_named_residuals(
-        &human.stdout, "decoded _private _unsafe_rec residuals", "decoded _private _unsafe_rec residual names", 9,
+        &human.stdout,
+        "decoded _private _sunfold residuals",
+        "decoded _private _sunfold residual names",
+        1,
+        &["_private.CliPrivateReport.0._sunfold"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private _unsafe_rec residuals",
+        "decoded _private _unsafe_rec residual names",
+        9,
         &[
-            "_private.CliPrivateReport.0._unsafe_rec", "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
-            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
-            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec", "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
-            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ],
     );
@@ -3868,12 +3841,23 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         1,
         &["_private.CliPrivateReport.0._unsafe_rec"],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private .loop._proof_* residuals", "decoded _private .loop._proof_* residual names", 1, &["_private.CliPrivateReport.0.loop._proof_1"]);
     assert_human_named_residuals(
-        &human.stdout, "decoded standalone _private _proof_N residuals", "decoded standalone _private _proof_N residual names", 5,
+        &human.stdout,
+        "decoded _private .loop._proof_* residuals",
+        "decoded _private .loop._proof_* residual names",
+        1,
+        &["_private.CliPrivateReport.0.loop._proof_1"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded standalone _private _proof_N residuals",
+        "decoded standalone _private _proof_N residual names",
+        5,
         &[
-            "_private.CliPrivateReport.0._proof_2", "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
-            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2", "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.CliPrivateReport.0._proof_2",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
             "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
         ],
     );
@@ -3941,10 +3925,22 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &["_private.CliPrivateReport.0._proof_2"],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private Lean.Name.hash._proof_N residuals", "decoded _private Lean.Name.hash._proof_N residual names", 2,
-        &["_private.Init.Prelude.0.Lean.Name.hash._proof_1", "_private.Init.Prelude.0.Lean.Name.hash._proof_2"],
+        &human.stdout,
+        "decoded _private Lean.Name.hash._proof_N residuals",
+        "decoded _private Lean.Name.hash._proof_N residual names",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private Lean.Name.beq.match_N residuals", "decoded _private Lean.Name.beq.match_N residual names", 1, &["_private.Init.Prelude.0.Lean.Name.beq.match_1"]);
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Lean.Name.beq.match_N residuals",
+        "decoded _private Lean.Name.beq.match_N residual names",
+        1,
+        &["_private.Init.Prelude.0.Lean.Name.beq.match_1"],
+    );
     assert_human_named_residuals(
         &human.stdout,
         "decoded _private Lean.Name residuals",
@@ -3999,7 +3995,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
         ],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private List.toArrayAux.match_N residuals", "decoded _private List.toArrayAux.match_N residual names", 1, &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"]);
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private List.toArrayAux.match_N residuals",
+        "decoded _private List.toArrayAux.match_N residual names",
+        1,
+        &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"],
+    );
     assert_human_named_residuals(
         &human.stdout,
         "decoded _private Init.Data.List.ToArrayImpl residuals",
@@ -4037,8 +4039,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "core-observables Lean.Syntax match_N residuals", "core-observables Lean.Syntax match_N residual names", 2,
-        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"],
+        &human.stdout,
+        "core-observables Lean.Syntax match_N residuals",
+        "core-observables Lean.Syntax match_N residual names",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        ],
     );
     assert_human_named_residuals(
         &human.stdout,
@@ -4055,10 +4063,22 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private Array.mapM'._proof_N residuals", "decoded _private Array.mapM'._proof_N residual names", 2,
-        &["_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1", "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2"],
+        &human.stdout,
+        "decoded _private Array.mapM'._proof_N residuals",
+        "decoded _private Array.mapM'._proof_N residual names",
+        2,
+        &[
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+        ],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private Array.mapM'.go residuals", "decoded _private Array.mapM'.go residual names", 1, &["_private.Init.Data.Array.BasicAux.0.Array.mapM'.go"]);
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Array.mapM'.go residuals",
+        "decoded _private Array.mapM'.go residual names",
+        1,
+        &["_private.Init.Data.Array.BasicAux.0.Array.mapM'.go"],
+    );
     assert_human_named_residuals(
         &human.stdout,
         "decoded _private Array.mapM' residuals",
@@ -4071,21 +4091,31 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private .go residuals", "decoded _private .go residual names", 3,
+        &human.stdout,
+        "decoded _private .go residuals",
+        "decoded _private .go residual names",
+        3,
         &[
-            "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals", "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names", 2,
+        &human.stdout,
+        "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals",
+        "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names",
+        2,
         &[
             "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
             "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "decoded _private List.MergeSort companion-only _unsafe_rec residuals", "decoded _private List.MergeSort companion-only _unsafe_rec residual names", 3,
+        &human.stdout,
+        "decoded _private List.MergeSort companion-only _unsafe_rec residuals",
+        "decoded _private List.MergeSort companion-only _unsafe_rec residual names",
+        3,
         &[
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
@@ -4102,20 +4132,76 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
         ],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private .loop.match_1 residuals", "decoded _private .loop.match_1 residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"]);
-    assert_human_named_residuals(&human.stdout, "decoded _private .loop.match_N residuals", "decoded _private .loop.match_N residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"]);
     assert_human_named_residuals(
-        &human.stdout, "decoded _private .loop._unsafe_rec residuals", "decoded _private .loop._unsafe_rec residual names", 2,
-        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"],
+        &human.stdout,
+        "decoded _private .loop.match_1 residuals",
+        "decoded _private .loop.match_1 residual names",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"],
     );
-    assert_human_named_residuals(&human.stdout, "decoded _private .loop.eq_def residuals", "decoded _private .loop.eq_def residual names", 1, &["_private.CliPrivateReport.0.loop.eq_def"]);
-    assert_human_named_residuals(&human.stdout, "decoded _private insertIdx.loop._unary residuals", "decoded _private insertIdx.loop._unary residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"]);
-    assert_human_named_residuals(&human.stdout, "decoded _private _unary residuals", "decoded _private _unary residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"]);
-    assert_human_named_residuals(&human.stdout, "decoded _private mergeSortTR._unsafe_rec residuals", "decoded _private mergeSortTR._unsafe_rec residual names", 1, &["_private.CliPrivateReport.0.mergeSortTR._unsafe_rec"]);
-    assert_human_named_residuals(&human.stdout, "decoded _private .run._unsafe_rec residuals", "decoded _private .run._unsafe_rec residual names", 1, &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec"]);
     assert_human_named_residuals(
-        &human.stdout, "decoded _private .go._unsafe_rec residuals", "decoded _private .go._unsafe_rec residual names", 2,
-        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"],
+        &human.stdout,
+        "decoded _private .loop.match_N residuals",
+        "decoded _private .loop.match_N residual names",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private .loop._unsafe_rec residuals",
+        "decoded _private .loop._unsafe_rec residual names",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private .loop.eq_def residuals",
+        "decoded _private .loop.eq_def residual names",
+        1,
+        &["_private.CliPrivateReport.0.loop.eq_def"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private insertIdx.loop._unary residuals",
+        "decoded _private insertIdx.loop._unary residual names",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private _unary residuals",
+        "decoded _private _unary residual names",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private mergeSortTR._unsafe_rec residuals",
+        "decoded _private mergeSortTR._unsafe_rec residual names",
+        1,
+        &["_private.CliPrivateReport.0.mergeSortTR._unsafe_rec"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private .run._unsafe_rec residuals",
+        "decoded _private .run._unsafe_rec residual names",
+        1,
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private .go._unsafe_rec residuals",
+        "decoded _private .go._unsafe_rec residual names",
+        2,
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+        ],
     );
     assert_human_named_residuals(
         &human.stdout,
@@ -4157,12 +4243,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(
-        &human.stdout, "core-observables Lean.Syntax .loop._unsafe_rec residuals", "core-observables Lean.Syntax .loop._unsafe_rec residual names", 2,
-        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"],
+        &human.stdout,
+        "core-observables Lean.Syntax .loop._unsafe_rec residuals",
+        "core-observables Lean.Syntax .loop._unsafe_rec residual names",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
     );
     assert!(
-        human.stdout.contains("G1 satisfied: no")
-            && !json_bool_field(&json.stdout, "g1Satisfied"),
+        human.stdout.contains("G1 satisfied: no") && !json_bool_field(&json.stdout, "g1Satisfied"),
         "human: {}\njson: {}",
         human.stdout,
         json.stdout,

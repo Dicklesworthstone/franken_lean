@@ -7138,13 +7138,14 @@ fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
     // The absolute path DISCARDING the base is the escape behavior under
     // test, not a mistake the lint is for.
     #[allow(clippy::join_absolute_paths)]
-    assert_eq!(
-        tmp.join("/"),
-        Path::new("/"),
-        "an absolute name discards the temporary directory: the fixture tree would be the \
-         filesystem root, and the walk would enumerate it"
-    );
-
+    {
+        assert_eq!(
+            tmp.join("/"),
+            Path::new("/"),
+            "an absolute name discards the temporary directory: the fixture tree would be the \
+             filesystem root, and the walk would enumerate it"
+        );
+    }
     let rooted = refuse("/");
     assert!(
         rooted.contains("climb out") && !rooted.contains("names nothing at all"),
@@ -8627,7 +8628,10 @@ fn each_conservation_law_catches_its_own_violation() {
     // `compared + unscorable` says rows were scored without being decoded, and
     // buckets below `compared` says a compared row landed in no direction at
     // all.
-    let cases: [(&str, fn(&mut CorpusCounts), &str); 9] = [
+    /// One planted violation of a census conservation law and the complaint the
+    /// law's own assert must produce for it.
+    type ConservationCase = (&'static str, fn(&mut CorpusCounts), &'static str);
+    let cases: [ConservationCase; 9] = [
         (
             // The token loop runs BEFORE the sum checks, so this must keep the
             // family SUM correct: otherwise the restrictive-triage law would
@@ -9921,12 +9925,14 @@ fn a_fixture_entry_that_leaves_the_tree_is_refused_before_anything_is_written() 
     let base = Path::new("/fixtures/tree");
     // Same as above: joining an absolute entry is the escape being measured.
     #[allow(clippy::join_absolute_paths)]
-    assert_eq!(
-        base.join("/data/tmp/evil.olean"),
-        Path::new("/data/tmp/evil.olean"),
-        "an absolute entry must DISCARD the base -- that is what makes it an escape rather than a \
-         nested path"
-    );
+    {
+        assert_eq!(
+            base.join("/data/tmp/evil.olean"),
+            Path::new("/data/tmp/evil.olean"),
+            "an absolute entry must DISCARD the base -- that is what makes it an escape rather \
+             than a nested path"
+        );
+    }
     assert!(
         base.join("../sibling/F.olean").starts_with(base),
         "`starts_with` must still accept the escaping path; if it has learned to resolve `..`, \

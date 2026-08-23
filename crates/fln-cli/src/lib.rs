@@ -57,10 +57,8 @@ const CORE_OBSERVABLES_LOOP_UNSAFE_REC_RESIDUAL_PREFIXES: [&str; 2] = [
     "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
     "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
 ];
-const LEAN_NAME_HASH_PROOF_RESIDUAL_PREFIX: &str =
-    "_private.Init.Prelude.0.Lean.Name.hash._proof_";
-const LEAN_NAME_BEQ_MATCH_RESIDUAL_PREFIX: &str =
-    "_private.Init.Prelude.0.Lean.Name.beq.match_";
+const LEAN_NAME_HASH_PROOF_RESIDUAL_PREFIX: &str = "_private.Init.Prelude.0.Lean.Name.hash._proof_";
+const LEAN_NAME_BEQ_MATCH_RESIDUAL_PREFIX: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_";
 const LIST_TO_ARRAY_AUX_MATCH_RESIDUAL_PREFIX: &str =
     "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_";
 const CORE_OBSERVABLES_SYNTAX_MATCH_RESIDUAL_PREFIXES: [&str; 2] = [
@@ -2634,12 +2632,7 @@ fn check_olean_failure(
 fn decoded_private_auxiliaries(constants: &[fln::ConstantInfo]) -> usize {
     constants
         .iter()
-        .filter(|constant| {
-            constant
-                .name()
-                .to_display_string()
-                .starts_with("_private.")
-        })
+        .filter(|constant| constant.name().to_display_string().starts_with("_private."))
         .count()
 }
 
@@ -2719,29 +2712,27 @@ fn is_private_eq_def_or_match_residual(display: &str) -> bool {
     display.starts_with("_private.")
         && display.split('.').any(|component| {
             component == "eq_def"
-                || component
-                    .strip_prefix("match_")
-                    .is_some_and(|suffix| {
-                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                    })
+                || component.strip_prefix("match_").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
         })
 }
 
 fn is_private_match_n_residual(display: &str) -> bool {
     display.starts_with("_private.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("match_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("match_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
 fn is_private_cli_private_report_match_residual(display: &str) -> bool {
     display.starts_with("_private.CliPrivateReport.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("match_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("match_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
@@ -2765,9 +2756,9 @@ fn is_private_eq_def_residual(display: &str) -> bool {
 fn is_private_eq_n_residual(display: &str) -> bool {
     display.starts_with("_private.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("eq_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("eq_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
@@ -2808,8 +2799,7 @@ fn is_private_cli_private_report_implementation_aux_residual(display: &str) -> b
 }
 
 fn is_private_sunfold_residual(display: &str) -> bool {
-    display.starts_with("_private.")
-        && display.split('.').any(|component| component == "_sunfold")
+    display.starts_with("_private.") && display.split('.').any(|component| component == "_sunfold")
 }
 
 fn is_private_unsafe_rec_residual(display: &str) -> bool {
@@ -2890,27 +2880,27 @@ fn is_private_standalone_proof_n_residual(display: &str) -> bool {
 fn is_private_proof_n_residual(display: &str) -> bool {
     display.starts_with("_private.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("_proof_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("_proof_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
 fn is_private_init_proof_n_residual(display: &str) -> bool {
     display.starts_with("_private.Init.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("_proof_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("_proof_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
 fn is_private_init_data_proof_n_residual(display: &str) -> bool {
     display.starts_with("_private.Init.Data.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("_proof_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("_proof_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
@@ -2926,9 +2916,9 @@ fn is_private_init_prelude_proof_n_residual(display: &str) -> bool {
 fn is_private_cli_private_report_proof_residual(display: &str) -> bool {
     display.starts_with("_private.CliPrivateReport.")
         && display.split('.').any(|component| {
-            component
-                .strip_prefix("_proof_")
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            component.strip_prefix("_proof_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
 }
 
@@ -2939,13 +2929,17 @@ fn is_private_cli_private_report_standalone_proof_n_residual(display: &str) -> b
 fn is_lean_name_hash_proof_residual(display: &str) -> bool {
     display
         .strip_prefix(LEAN_NAME_HASH_PROOF_RESIDUAL_PREFIX)
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn is_lean_name_beq_match_residual(display: &str) -> bool {
     display
         .strip_prefix(LEAN_NAME_BEQ_MATCH_RESIDUAL_PREFIX)
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn is_private_lean_name_residual(display: &str) -> bool {
@@ -2963,7 +2957,9 @@ fn is_private_init_residual(display: &str) -> bool {
 fn is_list_to_array_aux_match_residual(display: &str) -> bool {
     display
         .strip_prefix(LIST_TO_ARRAY_AUX_MATCH_RESIDUAL_PREFIX)
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn is_private_init_data_list_to_array_residual(display: &str) -> bool {
@@ -2996,7 +2992,9 @@ fn is_private_lean_syntax_residual(display: &str) -> bool {
 fn is_array_map_m_proof_residual(display: &str) -> bool {
     display
         .strip_prefix(ARRAY_MAP_M_PROOF_RESIDUAL_PREFIX)
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn is_array_map_m_go_residual(display: &str) -> bool {
@@ -3046,8 +3044,9 @@ fn is_private_loop_match_n_residual(display: &str) -> bool {
     while let Some(component) = components.next() {
         if component == "loop"
             && components.next().is_some_and(|next| {
-                next.strip_prefix("match_")
-                    .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+                next.strip_prefix("match_").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
             })
         {
             return true;
@@ -3247,14 +3246,18 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    core_observables_loop_residuals
-        .observe_matching(&checked.decoded.constants, is_core_observables_loop_residual);
+    core_observables_loop_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_core_observables_loop_residual,
+    );
     let mut private_equation_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
     };
-    private_equation_residuals
-        .observe_matching(&checked.decoded.constants, is_private_eq_def_or_match_residual);
+    private_equation_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_eq_def_or_match_residual,
+    );
     let mut private_match_n_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3342,8 +3345,10 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    private_init_unsafe_rec_residuals
-        .observe_matching(&checked.decoded.constants, is_private_init_unsafe_rec_residual);
+    private_init_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_init_unsafe_rec_residual,
+    );
     let mut private_init_data_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3467,8 +3472,10 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    list_to_array_aux_match_residuals
-        .observe_matching(&checked.decoded.constants, is_list_to_array_aux_match_residual);
+    list_to_array_aux_match_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_list_to_array_aux_match_residual,
+    );
     let mut private_init_data_list_to_array_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3481,8 +3488,10 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    private_init_data_list_residuals
-        .observe_matching(&checked.decoded.constants, is_private_init_data_list_residual);
+    private_init_data_list_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_init_data_list_residual,
+    );
     let mut private_init_data_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3554,8 +3563,10 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    private_loop_match_one_residuals
-        .observe_matching(&checked.decoded.constants, is_private_loop_match_one_residual);
+    private_loop_match_one_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_loop_match_one_residual,
+    );
     let mut private_loop_match_n_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3566,8 +3577,10 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    private_loop_unsafe_rec_residuals
-        .observe_matching(&checked.decoded.constants, is_private_loop_unsafe_rec_residual);
+    private_loop_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_loop_unsafe_rec_residual,
+    );
     let mut private_loop_eq_def_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3599,14 +3612,18 @@ fn render_check_olean_success(
         observed: 0,
         names: Vec::new(),
     };
-    private_run_unsafe_rec_residuals
-        .observe_matching(&checked.decoded.constants, is_private_run_unsafe_rec_residual);
+    private_run_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_run_unsafe_rec_residual,
+    );
     let mut private_go_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
     };
-    private_go_unsafe_rec_residuals
-        .observe_matching(&checked.decoded.constants, is_private_go_unsafe_rec_residual);
+    private_go_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_go_unsafe_rec_residual,
+    );
     let mut private_merge_tr_go_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3673,8 +3690,10 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_companion_residuals)
     };
-    let private_cli_private_report_loop_observed = private_cli_private_report_loop_residuals.observed;
-    let private_cli_private_report_loop_omitted = private_cli_private_report_loop_residuals.omitted();
+    let private_cli_private_report_loop_observed =
+        private_cli_private_report_loop_residuals.observed;
+    let private_cli_private_report_loop_omitted =
+        private_cli_private_report_loop_residuals.omitted();
     let private_cli_private_report_loop_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_loop_residuals)
     } else {
@@ -3708,8 +3727,10 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_match_n_residuals)
     };
-    let private_cli_private_report_match_observed = private_cli_private_report_match_residuals.observed;
-    let private_cli_private_report_match_omitted = private_cli_private_report_match_residuals.omitted();
+    let private_cli_private_report_match_observed =
+        private_cli_private_report_match_residuals.observed;
+    let private_cli_private_report_match_omitted =
+        private_cli_private_report_match_residuals.omitted();
     let private_cli_private_report_match_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_match_residuals)
     } else {
@@ -3805,8 +3826,10 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_init_data_unsafe_rec_residuals)
     };
-    let private_init_prelude_unsafe_rec_observed = private_init_prelude_unsafe_rec_residuals.observed;
-    let private_init_prelude_unsafe_rec_omitted = private_init_prelude_unsafe_rec_residuals.omitted();
+    let private_init_prelude_unsafe_rec_observed =
+        private_init_prelude_unsafe_rec_residuals.observed;
+    let private_init_prelude_unsafe_rec_omitted =
+        private_init_prelude_unsafe_rec_residuals.omitted();
     let private_init_prelude_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_init_prelude_unsafe_rec_residuals)
     } else {
@@ -3828,7 +3851,9 @@ fn render_check_olean_success(
     let private_cli_private_report_standalone_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
     } else {
-        render_named_residuals_human(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
+        render_named_residuals_human(
+            &mut private_cli_private_report_standalone_unsafe_rec_residuals,
+        )
     };
     let private_loop_proof_observed = private_loop_proof_residuals.observed;
     let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
@@ -3872,8 +3897,10 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_init_prelude_proof_n_residuals)
     };
-    let private_cli_private_report_proof_observed = private_cli_private_report_proof_residuals.observed;
-    let private_cli_private_report_proof_omitted = private_cli_private_report_proof_residuals.omitted();
+    let private_cli_private_report_proof_observed =
+        private_cli_private_report_proof_residuals.observed;
+    let private_cli_private_report_proof_omitted =
+        private_cli_private_report_proof_residuals.omitted();
     let private_cli_private_report_proof_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_proof_residuals)
     } else {
@@ -3930,8 +3957,10 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut list_to_array_aux_match_residuals)
     };
-    let private_init_data_list_to_array_observed = private_init_data_list_to_array_residuals.observed;
-    let private_init_data_list_to_array_omitted = private_init_data_list_to_array_residuals.omitted();
+    let private_init_data_list_to_array_observed =
+        private_init_data_list_to_array_residuals.observed;
+    let private_init_data_list_to_array_omitted =
+        private_init_data_list_to_array_residuals.omitted();
     let private_init_data_list_to_array_names = if json {
         render_named_residuals_json(&mut private_init_data_list_to_array_residuals)
     } else {
@@ -4060,8 +4089,10 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_unary_residuals)
     };
-    let private_merge_sort_tr_unsafe_rec_observed = private_merge_sort_tr_unsafe_rec_residuals.observed;
-    let private_merge_sort_tr_unsafe_rec_omitted = private_merge_sort_tr_unsafe_rec_residuals.omitted();
+    let private_merge_sort_tr_unsafe_rec_observed =
+        private_merge_sort_tr_unsafe_rec_residuals.observed;
+    let private_merge_sort_tr_unsafe_rec_omitted =
+        private_merge_sort_tr_unsafe_rec_residuals.omitted();
     let private_merge_sort_tr_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_merge_sort_tr_unsafe_rec_residuals)
     } else {
@@ -4122,7 +4153,9 @@ fn render_check_olean_success(
     let private_find_leading_spaces_next_line_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_find_leading_spaces_next_line_unsafe_rec_residuals)
     } else {
-        render_named_residuals_human(&mut private_find_leading_spaces_next_line_unsafe_rec_residuals)
+        render_named_residuals_human(
+            &mut private_find_leading_spaces_next_line_unsafe_rec_residuals,
+        )
     };
     let core_observables_loop_unsafe_rec_observed =
         core_observables_loop_unsafe_rec_residuals.observed;
@@ -5199,8 +5232,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_equation_residuals
-            .observe_matching(&module.decoded.constants, is_private_eq_def_or_match_residual);
+        private_equation_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_eq_def_or_match_residual,
+        );
     }
     let mut private_match_n_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5315,8 +5350,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_init_unsafe_rec_residuals
-            .observe_matching(&module.decoded.constants, is_private_init_unsafe_rec_residual);
+        private_init_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_init_unsafe_rec_residual,
+        );
     }
     let mut private_init_data_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5477,8 +5514,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        list_to_array_aux_match_residuals
-            .observe_matching(&module.decoded.constants, is_list_to_array_aux_match_residual);
+        list_to_array_aux_match_residuals.observe_matching(
+            &module.decoded.constants,
+            is_list_to_array_aux_match_residual,
+        );
     }
     let mut private_init_data_list_to_array_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5495,8 +5534,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_init_data_list_residuals
-            .observe_matching(&module.decoded.constants, is_private_init_data_list_residual);
+        private_init_data_list_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_init_data_list_residual,
+        );
     }
     let mut private_init_data_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5553,8 +5594,7 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_go_residuals
-            .observe_matching(&module.decoded.constants, is_private_go_residual);
+        private_go_residuals.observe_matching(&module.decoded.constants, is_private_go_residual);
     }
     let mut string_extra_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5591,8 +5631,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_loop_match_one_residuals
-            .observe_matching(&module.decoded.constants, is_private_loop_match_one_residual);
+        private_loop_match_one_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_loop_match_one_residual,
+        );
     }
     let mut private_loop_match_n_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5607,8 +5649,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_loop_unsafe_rec_residuals
-            .observe_matching(&module.decoded.constants, is_private_loop_unsafe_rec_residual);
+        private_loop_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_loop_unsafe_rec_residual,
+        );
     }
     let mut private_loop_eq_def_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5651,8 +5695,10 @@ fn render_check_olean_set_success(
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_run_unsafe_rec_residuals
-            .observe_matching(&module.decoded.constants, is_private_run_unsafe_rec_residual);
+        private_run_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_run_unsafe_rec_residual,
+        );
     }
     let mut private_go_unsafe_rec_residuals = DecodedNamedResiduals {
         observed: 0,
@@ -5740,8 +5786,10 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_companion_residuals)
     };
-    let private_cli_private_report_loop_observed = private_cli_private_report_loop_residuals.observed;
-    let private_cli_private_report_loop_omitted = private_cli_private_report_loop_residuals.omitted();
+    let private_cli_private_report_loop_observed =
+        private_cli_private_report_loop_residuals.observed;
+    let private_cli_private_report_loop_omitted =
+        private_cli_private_report_loop_residuals.omitted();
     let private_cli_private_report_loop_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_loop_residuals)
     } else {
@@ -5775,8 +5823,10 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_match_n_residuals)
     };
-    let private_cli_private_report_match_observed = private_cli_private_report_match_residuals.observed;
-    let private_cli_private_report_match_omitted = private_cli_private_report_match_residuals.omitted();
+    let private_cli_private_report_match_observed =
+        private_cli_private_report_match_residuals.observed;
+    let private_cli_private_report_match_omitted =
+        private_cli_private_report_match_residuals.omitted();
     let private_cli_private_report_match_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_match_residuals)
     } else {
@@ -5872,8 +5922,10 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_init_data_unsafe_rec_residuals)
     };
-    let private_init_prelude_unsafe_rec_observed = private_init_prelude_unsafe_rec_residuals.observed;
-    let private_init_prelude_unsafe_rec_omitted = private_init_prelude_unsafe_rec_residuals.omitted();
+    let private_init_prelude_unsafe_rec_observed =
+        private_init_prelude_unsafe_rec_residuals.observed;
+    let private_init_prelude_unsafe_rec_omitted =
+        private_init_prelude_unsafe_rec_residuals.omitted();
     let private_init_prelude_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_init_prelude_unsafe_rec_residuals)
     } else {
@@ -5895,7 +5947,9 @@ fn render_check_olean_set_success(
     let private_cli_private_report_standalone_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
     } else {
-        render_named_residuals_human(&mut private_cli_private_report_standalone_unsafe_rec_residuals)
+        render_named_residuals_human(
+            &mut private_cli_private_report_standalone_unsafe_rec_residuals,
+        )
     };
     let private_loop_proof_observed = private_loop_proof_residuals.observed;
     let private_loop_proof_omitted = private_loop_proof_residuals.omitted();
@@ -5939,8 +5993,10 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_init_prelude_proof_n_residuals)
     };
-    let private_cli_private_report_proof_observed = private_cli_private_report_proof_residuals.observed;
-    let private_cli_private_report_proof_omitted = private_cli_private_report_proof_residuals.omitted();
+    let private_cli_private_report_proof_observed =
+        private_cli_private_report_proof_residuals.observed;
+    let private_cli_private_report_proof_omitted =
+        private_cli_private_report_proof_residuals.omitted();
     let private_cli_private_report_proof_names = if json {
         render_named_residuals_json(&mut private_cli_private_report_proof_residuals)
     } else {
@@ -5997,8 +6053,10 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut list_to_array_aux_match_residuals)
     };
-    let private_init_data_list_to_array_observed = private_init_data_list_to_array_residuals.observed;
-    let private_init_data_list_to_array_omitted = private_init_data_list_to_array_residuals.omitted();
+    let private_init_data_list_to_array_observed =
+        private_init_data_list_to_array_residuals.observed;
+    let private_init_data_list_to_array_omitted =
+        private_init_data_list_to_array_residuals.omitted();
     let private_init_data_list_to_array_names = if json {
         render_named_residuals_json(&mut private_init_data_list_to_array_residuals)
     } else {
@@ -6127,8 +6185,10 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_unary_residuals)
     };
-    let private_merge_sort_tr_unsafe_rec_observed = private_merge_sort_tr_unsafe_rec_residuals.observed;
-    let private_merge_sort_tr_unsafe_rec_omitted = private_merge_sort_tr_unsafe_rec_residuals.omitted();
+    let private_merge_sort_tr_unsafe_rec_observed =
+        private_merge_sort_tr_unsafe_rec_residuals.observed;
+    let private_merge_sort_tr_unsafe_rec_omitted =
+        private_merge_sort_tr_unsafe_rec_residuals.omitted();
     let private_merge_sort_tr_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_merge_sort_tr_unsafe_rec_residuals)
     } else {
@@ -6189,7 +6249,9 @@ fn render_check_olean_set_success(
     let private_find_leading_spaces_next_line_unsafe_rec_names = if json {
         render_named_residuals_json(&mut private_find_leading_spaces_next_line_unsafe_rec_residuals)
     } else {
-        render_named_residuals_human(&mut private_find_leading_spaces_next_line_unsafe_rec_residuals)
+        render_named_residuals_human(
+            &mut private_find_leading_spaces_next_line_unsafe_rec_residuals,
+        )
     };
     let core_observables_loop_unsafe_rec_observed =
         core_observables_loop_unsafe_rec_residuals.observed;
@@ -6314,9 +6376,9 @@ fn render_check_olean_set_success(
             private_match_n_observed,
             private_match_n_names,
             private_match_n_omitted,
-           private_cli_private_report_match_observed,
-           private_cli_private_report_match_names,
-           private_cli_private_report_match_omitted,
+            private_cli_private_report_match_observed,
+            private_cli_private_report_match_names,
+            private_cli_private_report_match_omitted,
             private_cli_private_report_equation_observed,
             private_cli_private_report_equation_names,
             private_cli_private_report_equation_omitted,
