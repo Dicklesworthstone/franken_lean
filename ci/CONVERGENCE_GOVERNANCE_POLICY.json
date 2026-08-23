@@ -1,7 +1,11 @@
 {
   "schema": "fln.convergence-governance-policy/1",
   "policy_version": "2026-08-22.1",
-  "workstreams": ["W1", "W2", "W3"],
+  "workstreams": [
+    "W1",
+    "W2",
+    "W3"
+  ],
   "wip": {
     "max_active_workstreams": 3,
     "verification_reservation": 16,
@@ -18,48 +22,273 @@
     "next_review": "2026-08-29T00:00:00Z"
   },
   "gates": [
-    {"id": "G0", "state": "failed", "root_beads": ["fln-l8f"]},
-    {"id": "G1", "state": "not_yet_runnable", "root_beads": ["franken_lean-bc7"]},
-    {"id": "G2", "state": "not_yet_runnable", "root_beads": ["fln-52h0"]},
-    {"id": "G3", "state": "not_yet_runnable", "root_beads": ["franken_lean-zis"]},
-    {"id": "G4", "state": "not_yet_runnable", "root_beads": ["franken_lean-cgt"]},
-    {"id": "G5", "state": "not_yet_runnable", "root_beads": ["franken_lean-sk0"]},
-    {"id": "G6", "state": "not_yet_runnable", "root_beads": ["fln-86m"]}
+    {
+      "id": "G0",
+      "state": "failed",
+      "root_beads": [
+        "fln-l8f"
+      ]
+    },
+    {
+      "id": "G1",
+      "state": "not_yet_runnable",
+      "root_beads": [
+        "franken_lean-bc7"
+      ]
+    },
+    {
+      "id": "G2",
+      "state": "not_yet_runnable",
+      "root_beads": [
+        "fln-52h0"
+      ]
+    },
+    {
+      "id": "G3",
+      "state": "not_yet_runnable",
+      "root_beads": [
+        "franken_lean-zis"
+      ]
+    },
+    {
+      "id": "G4",
+      "state": "not_yet_runnable",
+      "root_beads": [
+        "franken_lean-cgt"
+      ]
+    },
+    {
+      "id": "G5",
+      "state": "not_yet_runnable",
+      "root_beads": [
+        "franken_lean-sk0"
+      ]
+    },
+    {
+      "id": "G6",
+      "state": "not_yet_runnable",
+      "root_beads": [
+        "fln-86m"
+      ]
+    }
   ],
   "exceptions": [],
   "registry": [
-    {"id": "fln-l8f", "class": "prerequisite", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-private-index-worktree-sync-mbh9", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-xjjr", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-d3-safety-note-unenforced-cdbg", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-convergence-wip-governance-149", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-smk0", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-manifest-complete-row-preflight-gap-77xh", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-census-empty-referent-no-mock-krb0", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-cross-tree-baked-root-k60n", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-h25", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-path-classification-coverage-unbound-9teu", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-ubs-stage-no-complete-verdict-z5kt", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-build-gate-lane-governed-set-98np", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-ephemeral-manifest-artifact-povo", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-gate-lock-producer-optional-o2vz", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-odwj", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-ubs-path-sensitive-baseline-jfb8", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "franken_lean-workspace-graph-producer-edge-drift-8o3o", "class": "verification", "workstream": "W1", "gate": "G0"},
-    {"id": "fln-3gv", "class": "implementation", "workstream": "W2", "gate": "G1"},
-    {"id": "fln-8w8", "class": "implementation", "workstream": "W2", "gate": "G1"},
-    {"id": "fln-extension-merge-validation-proof-debt-dt5", "class": "implementation", "workstream": "W2", "gate": "G1"},
-    {"id": "franken_lean-83r", "class": "implementation", "workstream": "W2", "gate": "G1"},
-    {"id": "franken_lean-module-provenance-atomic-apply-as7", "class": "implementation", "workstream": "W2", "gate": "G1"},
-    {"id": "franken_lean-yzd", "class": "implementation", "workstream": "W2", "gate": "G1"},
-    {"id": "franken_lean-bc7", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "franken_lean-eikp", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "franken_lean-npl", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "franken_lean-gii.23", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "franken_lean-gii.26", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "fln-s8oo", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
-    {"id": "franken_lean-closure-binding-exempt-rows-uninspected-3s8w", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
-    {"id": "franken_lean-p6x1", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
-    {"id": "franken_lean-parity-ledger-l2-definition-split-kl4h", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"}
+    {
+      "id": "fln-l8f",
+      "class": "prerequisite",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-private-index-worktree-sync-mbh9",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-xjjr",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-d3-safety-note-unenforced-cdbg",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-convergence-wip-governance-149",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-smk0",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-manifest-complete-row-preflight-gap-77xh",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-census-empty-referent-no-mock-krb0",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-cross-tree-baked-root-k60n",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-h25",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-path-classification-coverage-unbound-9teu",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-ubs-stage-no-complete-verdict-z5kt",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-build-gate-lane-governed-set-98np",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-ephemeral-manifest-artifact-povo",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-gate-lock-producer-optional-o2vz",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-odwj",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-ubs-path-sensitive-baseline-jfb8",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "franken_lean-workspace-graph-producer-edge-drift-8o3o",
+      "class": "verification",
+      "workstream": "W1",
+      "gate": "G0"
+    },
+    {
+      "id": "fln-3gv",
+      "class": "implementation",
+      "workstream": "W2",
+      "gate": "G1"
+    },
+    {
+      "id": "fln-8w8",
+      "class": "implementation",
+      "workstream": "W2",
+      "gate": "G1"
+    },
+    {
+      "id": "fln-extension-merge-validation-proof-debt-dt5",
+      "class": "implementation",
+      "workstream": "W2",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-83r",
+      "class": "implementation",
+      "workstream": "W2",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-module-provenance-atomic-apply-as7",
+      "class": "implementation",
+      "workstream": "W2",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-yzd",
+      "class": "implementation",
+      "workstream": "W2",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-bc7",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-eikp",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-npl",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-gii.23",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-gii.26",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "fln-s8oo",
+      "class": "adoption",
+      "workstream": "adoption",
+      "expiry": "2026-08-29T00:00:00Z"
+    },
+    {
+      "id": "franken_lean-closure-binding-exempt-rows-uninspected-3s8w",
+      "class": "adoption",
+      "workstream": "adoption",
+      "expiry": "2026-08-29T00:00:00Z"
+    },
+    {
+      "id": "franken_lean-p6x1",
+      "class": "adoption",
+      "workstream": "adoption",
+      "expiry": "2026-08-29T00:00:00Z"
+    },
+    {
+      "id": "franken_lean-parity-ledger-l2-definition-split-kl4h",
+      "class": "adoption",
+      "workstream": "adoption",
+      "expiry": "2026-08-29T00:00:00Z"
+    },
+    {
+      "id": "franken_lean-shgs",
+      "class": "verification",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "fln-4hol",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    },
+    {
+      "id": "franken_lean-3lvw",
+      "class": "implementation",
+      "workstream": "W3",
+      "gate": "G1"
+    }
   ]
 }

@@ -186,6 +186,8 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-mandated-mutant-join-unwatched-uagk",
     "fln-7li",
     "fln-lld",
+    "fln-sv7x",
+    "franken_lean-l8bj",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -219,7 +221,19 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// code-level `.elan/toolchains` at the door test only). The direct door-test citation
 /// was REMOVED from the row in the same change (that one was the pin-gated test itself,
 /// correctly not declarable); these siblings run pinless and pass. Measured.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 8;
+///
+/// 8 -> 10 at franken_lean-shgs's repair landing (2026-08-23), and the root cause is
+/// THIS GUARD'S OWN SURFACE GRANULARITY meeting a late-measured close. l8bj's work
+/// added pin-gated tests under `crates/fln-olean`'s decl_decode surface and measured
+/// its closure BOTH ways — with the pin (510 passed) and pinless via
+/// HOME=/data/tmp/nohome (same 510, skips verified loud under --nocapture). That made
+/// the surface pin-reaching retroactively, sweeping in sv7x's month-old citation of
+/// `real_declarations_decode_to_shared_dags_not_expanded_trees` from the same target.
+/// Both rows' cited tests run pinless and pass. Re-measured fresh at this edit, one
+/// variable per cell: pinless 97 passed / 0.05s against with-pin 97 passed / 2.76s
+/// over the whole decl_decode target. The debt shrinks when CI installs the pin or
+/// the rows migrate off the surface.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 10;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
