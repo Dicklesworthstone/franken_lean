@@ -186,10 +186,21 @@ fn check_limit(
 }
 
 impl Default for OwnershipLimits {
+    /// Sized against the live `.beads/issues.jsonl` this loader exists to read
+    /// (9.97 MB across 469 records at the 2026-08-23 raise, largest single
+    /// record 612 KB — a dense bead carrying its full embedded comment
+    /// history; nine records exceed 100 KB). The previous 8 MiB/256 KiB pair
+    /// predated comment-dense records and refused the REAL tracker, which
+    /// turns every ownership read into a resource fault and reddens
+    /// `kernel_contract` for every pane. Headroom is ~3x on both axes.
+    /// The durable repair is a tracker-side compaction or comment
+    /// off-loading affordance so records stop growing monotonically;
+    /// until that exists these numbers are the honest accommodation, not a
+    /// license for unbounded growth.
     fn default() -> Self {
         Self {
-            max_file_bytes: 8 * 1024 * 1024,
-            max_line_bytes: 256 * 1024,
+            max_file_bytes: 32 * 1024 * 1024,
+            max_line_bytes: 2 * 1024 * 1024,
             max_records: 100_000,
             max_id_bytes: 256,
             max_parse_depth: 128,
