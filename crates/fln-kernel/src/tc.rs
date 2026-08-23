@@ -111,8 +111,15 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // exact-key and live-generation checks, a separate bounded scan allowance,
 // and deterministic ring replacement. They are unavailable to ordinary cache
 // insertions, so general saturation remains a miss.
-const TYPE_CHECKER_CACHE_MAX_ENTRIES: usize = 65_536;
-const TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES: usize = 4;
+/// Capacity, not semantics: franken_lean-3lvw measured the Aug-19/20 restructuring's
+/// corpus cost (subject_no_answer 5 -> 420 across 62a5ff9a..c2cf2754) as thrash —
+/// theorem-tower modules evicting hot entries mid-check — and recovered 429 of shgs's
+/// 539 with these two values alone (65,536 -> 1,048_576 entries, 4 -> 64 bucket
+/// slots; one full pinned differential, zero verdict changes, restrictive families
+/// none). The correctness properties the restructurings introduced are untouched:
+/// same code paths with room to keep hits. 16x is a first tuning, not a sweep.
+const TYPE_CHECKER_CACHE_MAX_ENTRIES: usize = 1_048_576;
+const TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES: usize = 64;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS: usize = 262_144;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY: usize = 256;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES: usize = 33_554_432;
