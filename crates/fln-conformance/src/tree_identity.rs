@@ -437,8 +437,14 @@ pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
          so a shared target cannot bake another checkout's capability module into the check \
          (franken_lean-79k)",
     ),
+    (
+        "crates/fln-cli/build.rs",
+        "the identity baker reads CARGO_MANIFEST_DIR with env::var at build-script run time \
+         to derive SUITE.lock pins into baked variables - never env!() - so a shared target \
+         cannot bake another checkout's pins: a wrong-root read names the wrong SUITE.lock, \
+         which rerun-if-changed plus the unavailable fallback refuse (trust surfaces)",
+    ),
 ];
-
 /// Reconcile the precise needle against a coarser, independent one, per file.
 ///
 /// Pure, so a broken needle, a new spelling, a stale declaration and an impossible pair are
