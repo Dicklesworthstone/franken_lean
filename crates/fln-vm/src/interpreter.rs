@@ -549,6 +549,17 @@ enum IntrinsicImplementation {
     StringDecLt,
     StringLength,
     StringUtf8ByteSize,
+    StringCapitalize,
+    StringContains,
+    StringDrop,
+    StringDropRight,
+    StringExtract,
+    StringInternalIsEmpty,
+    StringInternalIsPrefixOf,
+    StringNext,
+    StringPrev,
+    StringPush,
+    StringTrim,
     ArraySize,
     ArrayGetInternal,
     ArrayUGet,
@@ -616,6 +627,23 @@ impl IntrinsicImplementation {
             "extern:String.decidableLT" => Self::StringDecLt,
             "extern:String.length" => Self::StringLength,
             "extern:String.utf8ByteSize" => Self::StringUtf8ByteSize,
+            "extern:String.Internal.capitalize" => Self::StringCapitalize,
+            "extern:String.Internal.contains" => Self::StringContains,
+            "extern:String.Internal.drop" => Self::StringDrop,
+            "extern:String.Internal.dropRight" => Self::StringDropRight,
+            "extern:String.Internal.extract"
+            | "extern:String.extract"
+            | "extern:String.Pos.Raw.extract" => Self::StringExtract,
+            "extern:String.Internal.isEmpty" => Self::StringInternalIsEmpty,
+            "extern:String.Internal.isPrefixOf" => Self::StringInternalIsPrefixOf,
+            "extern:String.Internal.next" | "extern:String.next" | "extern:String.Pos.Raw.next" => {
+                Self::StringNext
+            }
+            "extern:String.Internal.prev" | "extern:String.prev" | "extern:String.Pos.Raw.prev" => {
+                Self::StringPrev
+            }
+            "extern:String.push" => Self::StringPush,
+            "extern:String.Internal.trim" => Self::StringTrim,
             "extern:Array.size" => Self::ArraySize,
             "extern:Array.getInternal" => Self::ArrayGetInternal,
             "extern:Array.uget" => Self::ArrayUGet,
@@ -3344,6 +3372,128 @@ fn invoke_intrinsic(
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(length)))
         }
+        // The pin implements these on validated UTF-8 and asserts (UB) on
+        // out-of-range scalars; here every such input is a typed range
+        // refusal — an FL-INV-07 non-answer, never undefined behavior.
+        IntrinsicImplementation::StringInternalIsEmpty => {
+            expect_arity(row, args, 1)?;
+            let empty = string_bytes(&args[0], "String.isEmpty", 0)?.is_empty();
+            // The census rule is owned-result: Bool crosses as a boxed
+            // constructor object, not a tagged scalar.
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(empty))))
+        }
+        IntrinsicImplementation::StringInternalIsPrefixOf => {
+            expect_arity(row, args, 2)?;
+            let prefix = string_value(&args[0], "String.isPrefixOf", 0)?;
+            let candidate = string_value(&args[1], "String.isPrefixOf", 1)?;
+            // UTF-8 is self-synchronizing, so a byte prefix is a character
+            // prefix; the pin's `startsWith` agrees byte-for-byte here.
+            let is_prefix = candidate.starts_with(prefix.as_str());
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(is_prefix))))
+        }
+        IntrinsicImplementation::StringContains => {
+            expect_arity(row, args, 2)?;
+            let haystack = string_value(&args[0], "String.contains", 0)?;
+            let scalar = scalar_code_point(&args[1], "String.contains", 1)?;
+            let needle = char::from_u32(scalar).ok_or(VmRefusal::NatOverflow {
+                operation: "String.contains",
+            })?;
+            let contains = haystack.contains(needle);
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(contains))))
+        }
+        IntrinsicImplementation::StringPush => {
+            expect_arity(row, args, 2)?;
+            let mut base = string_value(&args[0], "String.push", 0)?;
+            let scalar = scalar_code_point(&args[1], "String.push", 1)?;
+            let pushed = char::from_u32(scalar).ok_or(VmRefusal::NatOverflow {
+                operation: "String.push",
+            })?;
+            base.push(pushed);
+            Ok(IntrinsicResult::owned(Obj::mk_string(&base)))
+        }
+        IntrinsicImplementation::StringNext => {
+            expect_arity(row, args, 2)?;
+            let bytes = string_bytes(&args[0], "String.next", 0)?;
+            match nat_as_usize(&args[1], "String.next", 1)? {
+                None => Ok(IntrinsicResult::owned(args[1].clone_ref())),
+                Some(index) if index >= bytes.len() => {
+                    Ok(IntrinsicResult::owned(args[1].clone_ref()))
+                }
+                Some(index) => {
+                    let next = index + utf8_first_byte_width(bytes[index]);
+                    Ok(IntrinsicResult::owned(Obj::mk_nat(next)))
+                }
+            }
+        }
+        IntrinsicImplementation::StringPrev => {
+            expect_arity(row, args, 2)?;
+            let bytes = string_bytes(&args[0], "String.prev", 0)?;
+            match nat_as_usize(&args[1], "String.prev", 1)? {
+                // The pin subtracts one at arbitrary precision; positions
+                // beyond the machine word are outside this VM's Nat ceiling.
+                None => Err(VmRefusal::NatOverflow {
+                    operation: "String.prev",
+                }
+                .into()),
+                Some(0) => Ok(IntrinsicResult::owned(Obj::mk_nat(0))),
+                Some(index) if index > bytes.len() => {
+                    Ok(IntrinsicResult::owned(Obj::mk_nat(index - 1)))
+                }
+                Some(mut index) => {
+                    index -= 1;
+                    while !is_utf8_first_byte(bytes[index]) {
+                        index -= 1;
+                    }
+                    Ok(IntrinsicResult::owned(Obj::mk_nat(index)))
+                }
+            }
+        }
+        IntrinsicImplementation::StringExtract => {
+            expect_arity(row, args, 3)?;
+            let bytes = string_bytes(&args[0], "String.extract", 0)?;
+            let begin = nat_as_usize(&args[1], "String.extract", 1)?;
+            let end = nat_as_usize(&args[2], "String.extract", 2)?;
+            let extracted =
+                extract_utf8(&bytes, begin, end).ok_or(VmRefusal::InvalidStringObject)?;
+            Ok(IntrinsicResult::owned(Obj::mk_string(extracted.as_str())))
+        }
+        IntrinsicImplementation::StringDrop => {
+            expect_arity(row, args, 2)?;
+            let base = string_value(&args[0], "String.drop", 0)?;
+            let count = nat_as_usize(&args[1], "String.drop", 1)?.unwrap_or(usize::MAX);
+            let dropped: String = base.chars().skip(count).collect();
+            Ok(IntrinsicResult::owned(Obj::mk_string(&dropped)))
+        }
+        IntrinsicImplementation::StringDropRight => {
+            expect_arity(row, args, 2)?;
+            let base = string_value(&args[0], "String.dropRight", 0)?;
+            let count = nat_as_usize(&args[1], "String.dropRight", 1)?.unwrap_or(usize::MAX);
+            let keep = base.chars().count().saturating_sub(count);
+            let dropped: String = base.chars().take(keep).collect();
+            Ok(IntrinsicResult::owned(Obj::mk_string(&dropped)))
+        }
+        IntrinsicImplementation::StringTrim => {
+            expect_arity(row, args, 1)?;
+            // `Char.isWhitespace` is exactly these four scalars at the pin.
+            const WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+            let untrimmed = string_value(&args[0], "String.trim", 0)?;
+            let trimmed = untrimmed.trim_matches(WHITESPACE);
+            Ok(IntrinsicResult::owned(Obj::mk_string(trimmed)))
+        }
+        IntrinsicImplementation::StringCapitalize => {
+            expect_arity(row, args, 1)?;
+            let mut base = string_value(&args[0], "String.capitalize", 0)?;
+            // `Char.toUpper` at the pin maps only 'a'..='z'; everything else
+            // passes through unchanged.
+            let mut chars = base.chars();
+            if let Some(first @ 'a'..='z') = chars.next() {
+                let mut capitalized = String::with_capacity(base.len());
+                capitalized.push(first.to_ascii_uppercase());
+                capitalized.push_str(chars.as_str());
+                base = capitalized;
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_string(&base)))
+        }
         IntrinsicImplementation::ArraySize => {
             expect_arity(row, args, 1)?;
             let (size, _) = array_value(&args[0], "Array.size", 0)?;
@@ -3727,6 +3877,17 @@ fn managerless_task_application(
         | IntrinsicImplementation::StringDecLt
         | IntrinsicImplementation::StringLength
         | IntrinsicImplementation::StringUtf8ByteSize
+        | IntrinsicImplementation::StringCapitalize
+        | IntrinsicImplementation::StringContains
+        | IntrinsicImplementation::StringDrop
+        | IntrinsicImplementation::StringDropRight
+        | IntrinsicImplementation::StringExtract
+        | IntrinsicImplementation::StringInternalIsEmpty
+        | IntrinsicImplementation::StringInternalIsPrefixOf
+        | IntrinsicImplementation::StringNext
+        | IntrinsicImplementation::StringPrev
+        | IntrinsicImplementation::StringPush
+        | IntrinsicImplementation::StringTrim
         | IntrinsicImplementation::ArraySize
         | IntrinsicImplementation::ArrayGetInternal
         | IntrinsicImplementation::ArrayUGet
@@ -4027,6 +4188,69 @@ fn string_bytes(
     Ok(bytes)
 }
 
+/// The scalar argument of a string intrinsic, range-checked before any
+/// `char` conversion. The pin asserts on out-of-range scalars; this VM
+/// refuses with a typed range fault instead.
+fn scalar_code_point(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<u32, VmRefusal> {
+    let word = match nat_as_usize(value, operation, argument)? {
+        Some(word) => word,
+        None => return Err(VmRefusal::NatOverflow { operation }),
+    };
+    u32::try_from(word).map_err(|_| VmRefusal::NatOverflow { operation })
+}
+
+/// Width of the UTF-8 sequence led by `lead`, per the pin's
+/// `lean_string_utf8_next_fast_cold`: an invalid lead byte advances by one.
+fn utf8_first_byte_width(lead: u8) -> usize {
+    if lead & 0xe0 == 0xc0 {
+        2
+    } else if lead & 0xf0 == 0xe0 {
+        3
+    } else if lead & 0xf8 == 0xf0 {
+        4
+    } else {
+        1
+    }
+}
+
+/// The pin's `is_utf8_first_byte`: does a byte begin a UTF-8 sequence?
+const fn is_utf8_first_byte(byte: u8) -> bool {
+    byte & 0x80 == 0 || byte & 0xe0 == 0xc0 || byte & 0xf0 == 0xe0 || byte & 0xf8 == 0xf0
+}
+
+/// Exact port of the pin's `lean_string_utf8_extract`, including its two
+/// documented quirks: an empty result when `begin` is mid-character, and an
+/// end clamped to the string when `end` is mid-character. A non-scalar
+/// position leaves that side of the slice unbounded (the whole string).
+fn extract_utf8(bytes: &[u8], begin: Option<usize>, end: Option<usize>) -> Option<String> {
+    let (Some(begin), Some(end)) = (begin, end) else {
+        return std::str::from_utf8(bytes)
+            .ok()
+            .map(std::borrow::ToOwned::to_owned);
+    };
+    let size = bytes.len();
+    if begin >= end || begin >= size {
+        return Some(String::new());
+    }
+    if !is_utf8_first_byte(bytes[begin]) {
+        return Some(String::new());
+    }
+    let mut end = end;
+    if end > size {
+        end = size;
+    }
+    if end < size && !is_utf8_first_byte(bytes[end]) {
+        end = size;
+    }
+    std::str::from_utf8(&bytes[begin..end])
+        .ok()
+        .map(std::borrow::ToOwned::to_owned)
+}
+
 fn type_mismatch(
     operation: &'static str,
     argument: usize,
@@ -4113,5 +4337,283 @@ mod tests {
                 actual: ResultOwnership::Owned,
             }) if row == "extern:Array.ugetBorrowed"
         ));
+    }
+
+    const CEILING: u64 = 8 * 1024 * 1024;
+
+    fn invoke(row: &'static str, args: &[Obj]) -> Result<Obj, VmRefusal> {
+        let implementation = IntrinsicImplementation::for_row(row);
+        assert!(
+            implementation != IntrinsicImplementation::Unsupported,
+            "{row} must be registered"
+        );
+        let generated = EXTERN_ROWS
+            .iter()
+            .find(|candidate| candidate.id == row)
+            .expect("the row exists in the generated census");
+        let expected_ownership = match ExternOwnership::parse(generated.ownership)
+            .expect("the census ownership form parses")
+            .result_ownership()
+            .expect("the census result ownership is executable")
+        {
+            ContractResultOwnership::Owned => ResultOwnership::Owned,
+            ContractResultOwnership::Borrowed => ResultOwnership::Borrowed,
+            ContractResultOwnership::Scalar => ResultOwnership::Scalar,
+            ContractResultOwnership::RawObject => ResultOwnership::RawObject,
+        };
+        finish_intrinsic_result(
+            row,
+            expected_ownership,
+            invoke_intrinsic(implementation, row, args, CEILING).map_err(
+                |failure| match failure {
+                    IntrinsicFailure::Refused(refusal) => refusal,
+                    other => panic!(
+                        "unexpected intrinsic failure class: {name}",
+                        name = std::any::type_name_of_val(&other)
+                    ),
+                },
+            )?,
+        )
+    }
+
+    fn s(value: &str) -> Obj {
+        Obj::mk_string(value)
+    }
+
+    fn n(value: usize) -> Obj {
+        Obj::mk_nat(value)
+    }
+
+    fn owned_string(result: Result<Obj, VmRefusal>) -> String {
+        let object = result.expect("the intrinsic answers");
+        string_value(&object, "test projection", 0).expect("a string result")
+    }
+
+    fn owned_usize(result: Result<Obj, VmRefusal>) -> usize {
+        let object = result.expect("the intrinsic answers");
+        nat_as_usize(&object, "test projection", 0)
+            .expect("a well-typed Nat")
+            .expect("a machine-word Nat")
+    }
+
+    #[test]
+    fn string_navigation_walks_utf8_scalars_like_the_pin() {
+        // "héllo" — é is two bytes, so positions are 0, 1, 3, 4, 5, 6.
+        let text = s("héllo");
+        assert_eq!(
+            owned_usize(invoke("extern:String.next", &[text.clone_ref(), n(0)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:String.next", &[text.clone_ref(), n(1)])),
+            3
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:String.next", &[text.clone_ref(), n(6)])),
+            6
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:String.prev", &[text.clone_ref(), n(3)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:String.prev", &[text.clone_ref(), n(0)])),
+            0
+        );
+        // The pin returns i-1 without walking when i is past the end.
+        assert_eq!(
+            owned_usize(invoke("extern:String.prev", &[text, n(99)])),
+            98
+        );
+    }
+
+    #[test]
+    fn string_push_appends_one_utf8_scalar() {
+        let pushed = owned_string(invoke("extern:String.push", &[s("héllo"), n('!' as usize)]));
+        assert_eq!(pushed, "héllo!");
+        let snowman = owned_string(invoke("extern:String.push", &[s(""), n('☃' as usize)]));
+        assert_eq!(snowman, "☃");
+    }
+
+    #[test]
+    fn string_push_refuses_out_of_range_scalars_typed() {
+        for scalar in [0xD800usize, 0xDFFF, 0x11_0000] {
+            let result = invoke("extern:String.push", &[s("x"), n(scalar)]);
+            assert!(
+                matches!(
+                    result,
+                    Err(VmRefusal::NatOverflow {
+                        operation: "String.push"
+                    })
+                ),
+                "scalar {scalar:#x} must refuse as a range fault"
+            );
+        }
+    }
+
+    #[test]
+    fn string_extract_ports_the_pin_quirks() {
+        let text = s("héllo");
+        // A finite Nat far past the end clamps to empty; the pin's
+        // non-scalar whole-string branch is unreachable through well-typed
+        // machine-word Nats in this VM and stays defensive totality.
+        let big = Obj::mk_mpz(&[u64::from(u32::MAX) + 1], false);
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.extract",
+                &[text.clone_ref(), big, n(2)]
+            )),
+            ""
+        );
+        // Empty on begin >= end and on begin past the end.
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.extract",
+                &[text.clone_ref(), n(3), n(1)]
+            )),
+            ""
+        );
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.extract",
+                &[text.clone_ref(), n(9), n(10)]
+            )),
+            ""
+        );
+        // End clamps to the string; mid-character end means "to the end".
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.extract",
+                &[text.clone_ref(), n(1), n(99)]
+            )),
+            "éllo"
+        );
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.extract",
+                &[text.clone_ref(), n(1), n(2)]
+            )),
+            "éllo"
+        );
+        assert_eq!(
+            owned_string(invoke("extern:String.extract", &[text, n(1), n(3)])),
+            "é"
+        );
+    }
+
+    #[test]
+    fn string_drop_drop_right_trim_capitalize_match_the_pin() {
+        let text = s("héllo");
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.Internal.drop",
+                &[text.clone_ref(), n(2)]
+            )),
+            "llo"
+        );
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.Internal.drop",
+                &[text.clone_ref(), n(99)]
+            )),
+            ""
+        );
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.Internal.dropRight",
+                &[text.clone_ref(), n(2)]
+            )),
+            "hél"
+        );
+        assert_eq!(
+            owned_string(invoke(
+                "extern:String.Internal.trim",
+                &[s("  \t héllo \r\n")],
+            )),
+            "héllo"
+        );
+        assert_eq!(
+            owned_string(invoke("extern:String.Internal.capitalize", &[s("hello")])),
+            "Hello"
+        );
+        // Only 'a'..='z' capitalizes; multi-byte first scalars pass through.
+        assert_eq!(
+            owned_string(invoke("extern:String.Internal.capitalize", &[s("élan")])),
+            "élan"
+        );
+        assert_eq!(
+            owned_string(invoke("extern:String.Internal.capitalize", &[s("")])),
+            ""
+        );
+    }
+
+    #[test]
+    fn string_predicates_report_bool_scalars() {
+        assert_eq!(
+            owned_usize(invoke("extern:String.Internal.isEmpty", &[s("")])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:String.Internal.isEmpty", &[s("x")])),
+            0
+        );
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:String.Internal.isPrefixOf",
+                &[s("hél"), s("héllo")]
+            )),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:String.Internal.isPrefixOf",
+                &[s("helo"), s("héllo")]
+            )),
+            0
+        );
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:String.Internal.contains",
+                &[s("héllo"), n('ł' as usize)]
+            )),
+            0
+        );
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:String.Internal.contains",
+                &[s("héllo"), n('é' as usize)]
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn every_registered_row_resolves_and_every_string_row_has_an_owner() {
+        let rows = [
+            "extern:String.Internal.capitalize",
+            "extern:String.Internal.contains",
+            "extern:String.Internal.drop",
+            "extern:String.Internal.dropRight",
+            "extern:String.Internal.extract",
+            "extern:String.Internal.isEmpty",
+            "extern:String.Internal.isPrefixOf",
+            "extern:String.Internal.next",
+            "extern:String.Pos.Raw.extract",
+            "extern:String.Pos.Raw.next",
+            "extern:String.Pos.Raw.prev",
+            "extern:String.Internal.prev",
+            "extern:String.Internal.trim",
+            "extern:String.extract",
+            "extern:String.next",
+            "extern:String.prev",
+            "extern:String.push",
+        ];
+        for row in rows {
+            assert_ne!(
+                IntrinsicImplementation::for_row(row),
+                IntrinsicImplementation::Unsupported,
+                "{row} must resolve"
+            );
+        }
     }
 }

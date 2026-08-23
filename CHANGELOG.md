@@ -279,6 +279,48 @@ A small hygiene wave. The commit subject claims that root planning docs moved in
 
 ---
 
+## 10) Trust surfaces on the native CLI (2026-08-23)
+
+Four promised `fln` verbs became real, all answering from decoded pinned-format
+artifacts with no new engines: `why-trusts` (bounded axiom closure over a closed
+import set — types plus definition/theorem/opaque bodies; recursor rules,
+instance selections, and rewrite provenance explicitly out of scope), `audit
+--tcb` (per-module axiom inventory plus unsafe/partial definition counts),
+`identity` (compile-time-baked SUITE.lock pins via a ledgered `fln-cli`
+build.rs, never probed at runtime), and `check-olean --receipts` (hash-chained
+JSONL run receipts under fln-hash's `TransparencyLeaf` domain with
+`ArtifactClosureComponent` module roots; no clock values, so an identical set
+reproduces the file byte-for-byte; no-clobber publication). Receipts attest a
+run; they are not proof certificates.
+
+Root-cause fix en route: durable publication in `fln-rt/src/region.rs` opened
+the empty parent of bare relative filenames (`Path::parent()` answers
+`Some("")`, so the `"."` fallback never fired) and failed ENOENT after a
+successful link on `--emit-flbc` / `--emit-sidecar` /
+`--emit-olean-snapshot`; normalized across all four sites via
+`parent_or_dot`. Kernel covenant re-measured by the enforcing tool:
+9,777 / 12,000 LOC (81.4%).
+
+### Delivered capability
+
+- `fln why-trusts answer snap.olean` → `axioms: Nat, Nat.add` over a real
+  checked snapshot emitted by `fln run --emit-olean-snapshot`.
+- `fln audit --tcb` inventories 22 seed axioms over that snapshot in one pass.
+- `fln check-olean --receipts rc.jsonl <closed-set-dir>` writes a chained
+  receipt set whose row hash chain verifies line-by-line.
+
+### Closed workstreams
+
+ Advances the W3 Independent Judge CLI surface (`fln-fur`, `fln-dcv` scope);
+ no gate is claimed.
+
+### Representative commits
+
+- `ef78cef4` `feat(cli): trust surfaces — why-trusts, audit --tcb, identity,
+  check-olean --receipts`.
+
+---
+
 ## Notes for Agents
 
 - Start with the version timeline if you need chronology. There is no `v0.x` tag and no GitHub Release; HEAD is the only published artifact.

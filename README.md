@@ -210,6 +210,8 @@ fln serve-mcp                      # Envoy: snapshots, tactics, search, eval —
 fln identity --json                # implementation commit, epoch, profile, TCB hash
 ```
 
+> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity` are implemented and tested against real pinned artifacts — see the CHANGELOG for exact scope and refusals. The remaining verbs above (`goals`, `serve-mcp`, `cache`, `doctor --sql`, `replay`, `build explain`, `diff --level`) and the `lake`/`leanc` binaries are the 1.0 target this README describes, not shipped code.
+
 ## Installation
 
 **1. Install script — *not yet available*.** The planned script detects your platform, fetches the signed release binaries (`lean`, `leanc`, `lake`, `fln`), and installs an elan-compatible toolchain. It is deliberately not shown as a runnable command here: `scripts/install.sh` does not exist yet, and there are no release binaries for it to install. This section becomes a command again when distribution ships one (bead `franken_lean-readme-install-oneliner-wao6`).

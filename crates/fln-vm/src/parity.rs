@@ -227,6 +227,11 @@ pub const CORPUS: &[(&str, &str, &str)] = &[
         include_str!("../fixtures/g03/strings.lean.expected"),
     ),
     (
+        "strings_ops",
+        include_str!("../fixtures/g03/strings_ops.lean"),
+        include_str!("../fixtures/g03/strings_ops.lean.expected"),
+    ),
+    (
         "tasks",
         include_str!("../fixtures/g03/tasks.lean"),
         include_str!("../fixtures/g03/tasks.lean.expected"),
@@ -239,7 +244,7 @@ mod tests {
 
     #[test]
     fn every_committed_fixture_parses_with_pinned_censuses() {
-        assert_eq!(CORPUS.len(), 10, "corpus census");
+        assert_eq!(CORPUS.len(), 11, "corpus census");
         let mut refusals = 0;
         let mut nonzero_exit = 0;
         let mut dropped_total = 0;
