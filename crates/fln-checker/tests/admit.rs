@@ -1135,10 +1135,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                         Expr::lam(
                             primary_name("tail"),
                             list_expr(bv(4)),
-                            Expr::app(
-                                Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
-                                recursive_call,
-                            ),
+                            Expr::app(Expr::app(Expr::app(bv(2), bv(1)), bv(0)), recursive_call),
                             BinderInfo::Default,
                         ),
                         BinderInfo::Default,
@@ -1286,18 +1283,44 @@ fn init_false_entries() -> Vec<ConstantEntry> {
     let false_expr = || Expr::const_(primary_name("False"), Vec::new());
     let bv = |index| Expr::bvar(index).expect("packs");
     let motive = primary_pi("t", BinderInfo::Default, false_expr(), Expr::sort(u));
-    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive, primary_pi(
-        "t", BinderInfo::Default, false_expr(), Expr::app(bv(1), bv(0)),
-    ));
+    let rec_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive,
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            false_expr(),
+            Expr::app(bv(1), bv(0)),
+        ),
+    );
     vec![
-        ConstantEntry::new(false_name.clone(), ConstantDeclaration::inductive(
-            Vec::new(), decoded(&Expr::sort(Level::zero())), ConstantSafety::Safe,
-            InductiveDeclaration::new(0, 0, vec![false_name.clone()], Vec::new(), 0, false, false),
-        )),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            vec![u_name], decoded(&rec_type), ConstantSafety::Safe,
-            RecursorDeclaration::new(vec![false_name], 0, 0, 1, 0, Vec::new(), false),
-        )),
+        ConstantEntry::new(
+            false_name.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::zero())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![false_name.clone()],
+                    Vec::new(),
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(vec![false_name], 0, 0, 1, 0, Vec::new(), false),
+            ),
+        ),
     ]
 }
 
@@ -1595,13 +1618,19 @@ fn init_and_entries() -> Vec<ConstantEntry> {
     let u = Level::param(primary_name("u"));
     let prop = || Expr::sort(Level::zero());
     let and_expr = |a: Expr, b: Expr| {
-        Expr::app(Expr::app(Expr::const_(primary_name("And"), Vec::new()), a), b)
+        Expr::app(
+            Expr::app(Expr::const_(primary_name("And"), Vec::new()), a),
+            b,
+        )
     };
     let intro_expr = |a: Expr, b: Expr, left: Expr, right: Expr| {
         Expr::app(
             Expr::app(
                 Expr::app(
-                    Expr::app(Expr::const_(Name::from_components(["And", "intro"]), Vec::new()), a),
+                    Expr::app(
+                        Expr::const_(Name::from_components(["And", "intro"]), Vec::new()),
+                        a,
+                    ),
                     b,
                 ),
                 left,
@@ -1610,53 +1639,148 @@ fn init_and_entries() -> Vec<ConstantEntry> {
         )
     };
     let bv = |index| Expr::bvar(index).expect("packs");
-    let motive = || primary_pi("t", BinderInfo::Default, and_expr(bv(1), bv(0)), Expr::sort(u.clone()));
-    let minor = || primary_pi(
-        "left", BinderInfo::Default, bv(2),
+    let motive = || {
         primary_pi(
-            "right", BinderInfo::Default, bv(2),
-            Expr::app(bv(2), intro_expr(bv(4), bv(3), bv(1), bv(0))),
-        ),
-    );
-    let rec_type = primary_pi("a", BinderInfo::Implicit, prop(), primary_pi(
-        "b", BinderInfo::Implicit, prop(), primary_pi(
-            "motive", BinderInfo::Implicit, motive(), primary_pi(
-                "intro", BinderInfo::Default, minor(), primary_pi(
-                    "t", BinderInfo::Default, and_expr(bv(3), bv(2)), Expr::app(bv(2), bv(0)),
+            "t",
+            BinderInfo::Default,
+            and_expr(bv(1), bv(0)),
+            Expr::sort(u.clone()),
+        )
+    };
+    let minor = || {
+        primary_pi(
+            "left",
+            BinderInfo::Default,
+            bv(2),
+            primary_pi(
+                "right",
+                BinderInfo::Default,
+                bv(2),
+                Expr::app(bv(2), intro_expr(bv(4), bv(3), bv(1), bv(0))),
+            ),
+        )
+    };
+    let rec_type = primary_pi(
+        "a",
+        BinderInfo::Implicit,
+        prop(),
+        primary_pi(
+            "b",
+            BinderInfo::Implicit,
+            prop(),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive(),
+                primary_pi(
+                    "intro",
+                    BinderInfo::Default,
+                    minor(),
+                    primary_pi(
+                        "t",
+                        BinderInfo::Default,
+                        and_expr(bv(3), bv(2)),
+                        Expr::app(bv(2), bv(0)),
+                    ),
                 ),
             ),
         ),
-    ));
-    let rhs = Expr::lam(primary_name("a"), prop(), Expr::lam(
-        primary_name("b"), prop(), Expr::lam(
-            primary_name("motive"), motive(), Expr::lam(
-                primary_name("intro"), minor(), Expr::lam(
-                    primary_name("left"), bv(3), Expr::lam(
-                        primary_name("right"), bv(3),
-                        Expr::app(Expr::app(bv(2), bv(1)), bv(0)), BinderInfo::Default,
-                    ), BinderInfo::Default,
-                ), BinderInfo::Default,
-            ), BinderInfo::Default,
-        ), BinderInfo::Default,
-    ), BinderInfo::Default);
-    vec![
-        ConstantEntry::new(and.clone(), ConstantDeclaration::inductive(
-            Vec::new(), decoded(&primary_pi("a", BinderInfo::Default, prop(), primary_pi("b", BinderInfo::Default, prop(), prop()))), ConstantSafety::Safe,
-            InductiveDeclaration::new(2, 0, vec![and.clone()], vec![intro.clone()], 0, false, false),
-        )),
-        ConstantEntry::new(intro.clone(), ConstantDeclaration::constructor(
-            Vec::new(), decoded(&primary_pi("a", BinderInfo::Default, prop(), primary_pi(
-                "b", BinderInfo::Default, prop(), primary_pi(
-                    "left", BinderInfo::Default, bv(1), primary_pi(
-                        "right", BinderInfo::Default, bv(1), and_expr(bv(3), bv(2)),
+    );
+    let rhs = Expr::lam(
+        primary_name("a"),
+        prop(),
+        Expr::lam(
+            primary_name("b"),
+            prop(),
+            Expr::lam(
+                primary_name("motive"),
+                motive(),
+                Expr::lam(
+                    primary_name("intro"),
+                    minor(),
+                    Expr::lam(
+                        primary_name("left"),
+                        bv(3),
+                        Expr::lam(
+                            primary_name("right"),
+                            bv(3),
+                            Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
                     ),
+                    BinderInfo::Default,
                 ),
-            ))), ConstantSafety::Safe, ConstructorDeclaration::new(and.clone(), 0, 2, 2),
-        )),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            vec![u_name], decoded(&rec_type), ConstantSafety::Safe,
-            RecursorDeclaration::new(vec![and], 2, 0, 1, 1, vec![RecursorRule::new(intro, 2, decoded(&rhs))], false),
-        )),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            and.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&primary_pi(
+                    "a",
+                    BinderInfo::Default,
+                    prop(),
+                    primary_pi("b", BinderInfo::Default, prop(), prop()),
+                )),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    0,
+                    vec![and.clone()],
+                    vec![intro.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            intro.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&primary_pi(
+                    "a",
+                    BinderInfo::Default,
+                    prop(),
+                    primary_pi(
+                        "b",
+                        BinderInfo::Default,
+                        prop(),
+                        primary_pi(
+                            "left",
+                            BinderInfo::Default,
+                            bv(1),
+                            primary_pi("right", BinderInfo::Default, bv(1), and_expr(bv(3), bv(2))),
+                        ),
+                    ),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(and.clone(), 0, 2, 2),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![and],
+                    2,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(intro, 2, decoded(&rhs))],
+                    false,
+                ),
+            ),
+        ),
     ]
 }
 
@@ -1674,43 +1798,115 @@ fn init_bool_entries() -> Vec<ConstantEntry> {
     let motive = || primary_pi("t", BinderInfo::Default, bool_expr(), Expr::sort(u.clone()));
     let false_minor = || Expr::app(bv(0), false_expr());
     let true_minor = || Expr::app(bv(1), true_expr());
-    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
-        "false", BinderInfo::Default, false_minor(), primary_pi(
-            "true", BinderInfo::Default, true_minor(), primary_pi(
-                "t", BinderInfo::Default, bool_expr(), Expr::app(bv(3), bv(0)),
+    let rec_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive(),
+        primary_pi(
+            "false",
+            BinderInfo::Default,
+            false_minor(),
+            primary_pi(
+                "true",
+                BinderInfo::Default,
+                true_minor(),
+                primary_pi(
+                    "t",
+                    BinderInfo::Default,
+                    bool_expr(),
+                    Expr::app(bv(3), bv(0)),
+                ),
             ),
         ),
-    ));
-    let false_rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
-        primary_name("false"), false_minor(), Expr::lam(
-            primary_name("true"), true_minor(), bv(1), BinderInfo::Default,
-        ), BinderInfo::Default,
-    ), BinderInfo::Default);
-    let true_rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
-        primary_name("false"), false_minor(), Expr::lam(
-            primary_name("true"), true_minor(), bv(0), BinderInfo::Default,
-        ), BinderInfo::Default,
-    ), BinderInfo::Default);
+    );
+    let false_rhs = Expr::lam(
+        primary_name("motive"),
+        motive(),
+        Expr::lam(
+            primary_name("false"),
+            false_minor(),
+            Expr::lam(
+                primary_name("true"),
+                true_minor(),
+                bv(1),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let true_rhs = Expr::lam(
+        primary_name("motive"),
+        motive(),
+        Expr::lam(
+            primary_name("false"),
+            false_minor(),
+            Expr::lam(
+                primary_name("true"),
+                true_minor(),
+                bv(0),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
     vec![
-        ConstantEntry::new(bool_name.clone(), ConstantDeclaration::inductive(
-            Vec::new(), decoded(&Expr::sort(Level::one())), ConstantSafety::Safe,
-            InductiveDeclaration::new(0, 0, vec![bool_name.clone()], vec![false_name.clone(), true_name.clone()], 0, false, false),
-        )),
-        ConstantEntry::new(false_name.clone(), ConstantDeclaration::constructor(
-            Vec::new(), decoded(&bool_expr()), ConstantSafety::Safe,
-            ConstructorDeclaration::new(bool_name.clone(), 0, 0, 0),
-        )),
-        ConstantEntry::new(true_name.clone(), ConstantDeclaration::constructor(
-            Vec::new(), decoded(&bool_expr()), ConstantSafety::Safe,
-            ConstructorDeclaration::new(bool_name.clone(), 1, 0, 0),
-        )),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            vec![u_name], decoded(&rec_type), ConstantSafety::Safe,
-            RecursorDeclaration::new(vec![bool_name], 0, 0, 1, 2, vec![
-                RecursorRule::new(false_name, 0, decoded(&false_rhs)),
-                RecursorRule::new(true_name, 0, decoded(&true_rhs)),
-            ], false),
-        )),
+        ConstantEntry::new(
+            bool_name.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![bool_name.clone()],
+                    vec![false_name.clone(), true_name.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            false_name.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&bool_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(bool_name.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            true_name.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&bool_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(bool_name.clone(), 1, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![bool_name],
+                    0,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(false_name, 0, decoded(&false_rhs)),
+                        RecursorRule::new(true_name, 0, decoded(&true_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
     ]
 }
 
@@ -1725,29 +1921,81 @@ fn init_punit_entries() -> Vec<ConstantEntry> {
     let punit_expr = || Expr::const_(primary_name("PUnit"), vec![u.clone()]);
     let unit_expr = || Expr::const_(Name::from_components(["PUnit", "unit"]), vec![u.clone()]);
     let bv = |index| Expr::bvar(index).expect("packs");
-    let motive = || primary_pi("t", BinderInfo::Default, punit_expr(), Expr::sort(v.clone()));
+    let motive = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            punit_expr(),
+            Expr::sort(v.clone()),
+        )
+    };
     let minor = || Expr::app(bv(0), unit_expr());
-    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
-        "unit", BinderInfo::Default, minor(), primary_pi(
-            "t", BinderInfo::Default, punit_expr(), Expr::app(bv(2), bv(0)),
+    let rec_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive(),
+        primary_pi(
+            "unit",
+            BinderInfo::Default,
+            minor(),
+            primary_pi(
+                "t",
+                BinderInfo::Default,
+                punit_expr(),
+                Expr::app(bv(2), bv(0)),
+            ),
         ),
-    ));
-    let rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
-        primary_name("unit"), minor(), bv(0), BinderInfo::Default,
-    ), BinderInfo::Default);
+    );
+    let rhs = Expr::lam(
+        primary_name("motive"),
+        motive(),
+        Expr::lam(primary_name("unit"), minor(), bv(0), BinderInfo::Default),
+        BinderInfo::Default,
+    );
     vec![
-        ConstantEntry::new(punit.clone(), ConstantDeclaration::inductive(
-            vec![u_name.clone()], decoded(&Expr::sort(u.clone())), ConstantSafety::Safe,
-            InductiveDeclaration::new(0, 0, vec![punit.clone()], vec![unit.clone()], 0, false, false),
-        )),
-        ConstantEntry::new(unit.clone(), ConstantDeclaration::constructor(
-            vec![u_name.clone()], decoded(&punit_expr()), ConstantSafety::Safe,
-            ConstructorDeclaration::new(punit.clone(), 0, 0, 0),
-        )),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            vec![v_name, u_name], decoded(&rec_type), ConstantSafety::Safe,
-            RecursorDeclaration::new(vec![punit], 0, 0, 1, 1, vec![RecursorRule::new(unit, 0, decoded(&rhs))], false),
-        )),
+        ConstantEntry::new(
+            punit.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&Expr::sort(u.clone())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![punit.clone()],
+                    vec![unit.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            unit.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&punit_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(punit.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![punit],
+                    0,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(unit, 0, decoded(&rhs))],
+                    false,
+                ),
+            ),
+        ),
     ]
 }
 
@@ -1762,27 +2010,72 @@ fn init_unit_entries() -> Vec<ConstantEntry> {
     let bv = |index| Expr::bvar(index).expect("packs");
     let motive = || primary_pi("t", BinderInfo::Default, unit_expr(), Expr::sort(v.clone()));
     let minor = || Expr::app(bv(0), unit_ctor_expr());
-    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
-        "unit", BinderInfo::Default, minor(), primary_pi(
-            "t", BinderInfo::Default, unit_expr(), Expr::app(bv(2), bv(0)),
+    let rec_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive(),
+        primary_pi(
+            "unit",
+            BinderInfo::Default,
+            minor(),
+            primary_pi(
+                "t",
+                BinderInfo::Default,
+                unit_expr(),
+                Expr::app(bv(2), bv(0)),
+            ),
         ),
-    ));
-    let rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
-        primary_name("unit"), minor(), bv(0), BinderInfo::Default,
-    ), BinderInfo::Default);
+    );
+    let rhs = Expr::lam(
+        primary_name("motive"),
+        motive(),
+        Expr::lam(primary_name("unit"), minor(), bv(0), BinderInfo::Default),
+        BinderInfo::Default,
+    );
     vec![
-        ConstantEntry::new(unit.clone(), ConstantDeclaration::inductive(
-            Vec::new(), decoded(&Expr::sort(Level::one())), ConstantSafety::Safe,
-            InductiveDeclaration::new(0, 0, vec![unit.clone()], vec![unit_ctor.clone()], 0, false, false),
-        )),
-        ConstantEntry::new(unit_ctor.clone(), ConstantDeclaration::constructor(
-            Vec::new(), decoded(&unit_expr()), ConstantSafety::Safe,
-            ConstructorDeclaration::new(unit.clone(), 0, 0, 0),
-        )),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            vec![v_name], decoded(&rec_type), ConstantSafety::Safe,
-            RecursorDeclaration::new(vec![unit], 0, 0, 1, 1, vec![RecursorRule::new(unit_ctor, 0, decoded(&rhs))], false),
-        )),
+        ConstantEntry::new(
+            unit.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![unit.clone()],
+                    vec![unit_ctor.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            unit_ctor.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&unit_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(unit.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![unit],
+                    0,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(unit_ctor, 0, decoded(&rhs))],
+                    false,
+                ),
+            ),
+        ),
     ]
 }
 
@@ -1799,17 +2092,31 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
     let w = Level::param(primary_name("w"));
     let left_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
     let right_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
-    let sum_type = || Expr::sort(Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs")).expect("universe successor packs"));
+    let sum_type = || {
+        Expr::sort(
+            Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs"))
+                .expect("universe successor packs"),
+        )
+    };
     let sum_expr = |left: Expr, right: Expr| {
         Expr::app(
-            Expr::app(Expr::const_(primary_name("Sum"), vec![u.clone(), v.clone()]), left),
+            Expr::app(
+                Expr::const_(primary_name("Sum"), vec![u.clone(), v.clone()]),
+                left,
+            ),
             right,
         )
     };
     let inl_expr = |left: Expr, right: Expr, value: Expr| {
         Expr::app(
             Expr::app(
-                Expr::app(Expr::const_(Name::from_components(["Sum", "inl"]), vec![u.clone(), v.clone()]), left),
+                Expr::app(
+                    Expr::const_(
+                        Name::from_components(["Sum", "inl"]),
+                        vec![u.clone(), v.clone()],
+                    ),
+                    left,
+                ),
                 right,
             ),
             value,
@@ -1818,49 +2125,136 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
     let inr_expr = |left: Expr, right: Expr, value: Expr| {
         Expr::app(
             Expr::app(
-                Expr::app(Expr::const_(Name::from_components(["Sum", "inr"]), vec![u.clone(), v.clone()]), left),
+                Expr::app(
+                    Expr::const_(
+                        Name::from_components(["Sum", "inr"]),
+                        vec![u.clone(), v.clone()],
+                    ),
+                    left,
+                ),
                 right,
             ),
             value,
         )
     };
     let bv = |index| Expr::bvar(index).expect("packs");
-    let motive = || primary_pi("t", BinderInfo::Default, sum_expr(bv(1), bv(0)), Expr::sort(w.clone()));
-    let inl_minor = || primary_pi("value", BinderInfo::Default, bv(2), Expr::app(bv(1), inl_expr(bv(3), bv(2), bv(0))));
-    let inr_minor = || primary_pi("value", BinderInfo::Default, bv(2), Expr::app(bv(2), inr_expr(bv(4), bv(3), bv(0))));
-    let rec_type = primary_pi("α", BinderInfo::Implicit, left_type(), primary_pi(
-        "β", BinderInfo::Implicit, right_type(), primary_pi(
-            "motive", BinderInfo::Implicit, motive(), primary_pi(
-                "inl", BinderInfo::Default, inl_minor(), primary_pi(
-                    "inr", BinderInfo::Default, inr_minor(), primary_pi(
-                        "t", BinderInfo::Default, sum_expr(bv(4), bv(3)), Expr::app(bv(3), bv(0)),
+    let motive = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            sum_expr(bv(1), bv(0)),
+            Expr::sort(w.clone()),
+        )
+    };
+    let inl_minor = || {
+        primary_pi(
+            "value",
+            BinderInfo::Default,
+            bv(2),
+            Expr::app(bv(1), inl_expr(bv(3), bv(2), bv(0))),
+        )
+    };
+    let inr_minor = || {
+        primary_pi(
+            "value",
+            BinderInfo::Default,
+            bv(2),
+            Expr::app(bv(2), inr_expr(bv(4), bv(3), bv(0))),
+        )
+    };
+    let rec_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        left_type(),
+        primary_pi(
+            "β",
+            BinderInfo::Implicit,
+            right_type(),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive(),
+                primary_pi(
+                    "inl",
+                    BinderInfo::Default,
+                    inl_minor(),
+                    primary_pi(
+                        "inr",
+                        BinderInfo::Default,
+                        inr_minor(),
+                        primary_pi(
+                            "t",
+                            BinderInfo::Default,
+                            sum_expr(bv(4), bv(3)),
+                            Expr::app(bv(3), bv(0)),
+                        ),
                     ),
                 ),
             ),
         ),
-    ));
-    let inl_rhs = Expr::lam(primary_name("α"), left_type(), Expr::lam(
-        primary_name("β"), right_type(), Expr::lam(
-            primary_name("motive"), motive(), Expr::lam(
-                primary_name("inl"), inl_minor(), Expr::lam(
-                    primary_name("inr"), inr_minor(), Expr::lam(
-                        primary_name("value"), bv(4), Expr::app(bv(2), bv(0)), BinderInfo::Default,
-                    ), BinderInfo::Default,
-                ), BinderInfo::Default,
-            ), BinderInfo::Default,
-        ), BinderInfo::Default,
-    ), BinderInfo::Default);
-    let inr_rhs = Expr::lam(primary_name("α"), left_type(), Expr::lam(
-        primary_name("β"), right_type(), Expr::lam(
-            primary_name("motive"), motive(), Expr::lam(
-                primary_name("inl"), inl_minor(), Expr::lam(
-                    primary_name("inr"), inr_minor(), Expr::lam(
-                        primary_name("value"), bv(3), Expr::app(bv(1), bv(0)), BinderInfo::Default,
-                    ), BinderInfo::Default,
-                ), BinderInfo::Default,
-            ), BinderInfo::Default,
-        ), BinderInfo::Default,
-    ), BinderInfo::Default);
+    );
+    let inl_rhs = Expr::lam(
+        primary_name("α"),
+        left_type(),
+        Expr::lam(
+            primary_name("β"),
+            right_type(),
+            Expr::lam(
+                primary_name("motive"),
+                motive(),
+                Expr::lam(
+                    primary_name("inl"),
+                    inl_minor(),
+                    Expr::lam(
+                        primary_name("inr"),
+                        inr_minor(),
+                        Expr::lam(
+                            primary_name("value"),
+                            bv(4),
+                            Expr::app(bv(2), bv(0)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let inr_rhs = Expr::lam(
+        primary_name("α"),
+        left_type(),
+        Expr::lam(
+            primary_name("β"),
+            right_type(),
+            Expr::lam(
+                primary_name("motive"),
+                motive(),
+                Expr::lam(
+                    primary_name("inl"),
+                    inl_minor(),
+                    Expr::lam(
+                        primary_name("inr"),
+                        inr_minor(),
+                        Expr::lam(
+                            primary_name("value"),
+                            bv(3),
+                            Expr::app(bv(1), bv(0)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
     let inductive_type = primary_pi(
         "α",
         BinderInfo::Default,
@@ -1890,31 +2284,61 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
         ),
     );
     vec![
-        ConstantEntry::new(sum.clone(), ConstantDeclaration::inductive(
-            vec![u_name.clone(), v_name.clone()],
-            decoded(&inductive_type),
-            ConstantSafety::Safe,
-            InductiveDeclaration::new(2, 0, vec![sum.clone()], vec![inl.clone(), inr.clone()], 0, false, false),
-        )),
-        ConstantEntry::new(inl.clone(), ConstantDeclaration::constructor(
-            vec![u_name.clone(), v_name.clone()],
-            decoded(&inl_type),
-            ConstantSafety::Safe,
-            ConstructorDeclaration::new(sum.clone(), 0, 2, 1),
-        )),
-        ConstantEntry::new(inr.clone(), ConstantDeclaration::constructor(
-            vec![u_name.clone(), v_name.clone()],
-            decoded(&inr_type),
-            ConstantSafety::Safe,
-            ConstructorDeclaration::new(sum.clone(), 1, 2, 1),
-        )),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(
-            vec![w_name, u_name, v_name], decoded(&rec_type), ConstantSafety::Safe,
-            RecursorDeclaration::new(vec![sum], 2, 0, 1, 2, vec![
-                RecursorRule::new(inl, 1, decoded(&inl_rhs)),
-                RecursorRule::new(inr, 1, decoded(&inr_rhs)),
-            ], false),
-        )),
+        ConstantEntry::new(
+            sum.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone(), v_name.clone()],
+                decoded(&inductive_type),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    0,
+                    vec![sum.clone()],
+                    vec![inl.clone(), inr.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            inl.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone(), v_name.clone()],
+                decoded(&inl_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(sum.clone(), 0, 2, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            inr.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone(), v_name.clone()],
+                decoded(&inr_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(sum.clone(), 1, 2, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![w_name, u_name, v_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![sum],
+                    2,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(inl, 1, decoded(&inl_rhs)),
+                        RecursorRule::new(inr, 1, decoded(&inr_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
     ]
 }
 
@@ -1930,45 +2354,185 @@ fn init_prod_entries() -> Vec<ConstantEntry> {
     let w = Level::param(primary_name("w"));
     let left_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
     let right_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
-    let prod_type = || Expr::sort(Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs")).expect("universe successor packs"));
-    let prod_expr = |left: Expr, right: Expr| Expr::app(Expr::app(Expr::const_(primary_name("Prod"), vec![u.clone(), v.clone()]), left), right);
-    let mk_expr = |left: Expr, right: Expr, first: Expr, second: Expr| Expr::app(Expr::app(Expr::app(Expr::app(Expr::const_(Name::from_components(["Prod", "mk"]), vec![u.clone(), v.clone()]), left), right), first), second);
+    let prod_type = || {
+        Expr::sort(
+            Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs"))
+                .expect("universe successor packs"),
+        )
+    };
+    let prod_expr = |left: Expr, right: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(primary_name("Prod"), vec![u.clone(), v.clone()]),
+                left,
+            ),
+            right,
+        )
+    };
+    let mk_expr = |left: Expr, right: Expr, first: Expr, second: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(
+                        Expr::const_(
+                            Name::from_components(["Prod", "mk"]),
+                            vec![u.clone(), v.clone()],
+                        ),
+                        left,
+                    ),
+                    right,
+                ),
+                first,
+            ),
+            second,
+        )
+    };
     let bv = |index| Expr::bvar(index).expect("packs");
-    let motive = || primary_pi("t", BinderInfo::Default, prod_expr(bv(1), bv(0)), Expr::sort(w.clone()));
-    let minor = || primary_pi("fst", BinderInfo::Default, bv(2), primary_pi("snd", BinderInfo::Default, bv(2), Expr::app(bv(2), mk_expr(bv(4), bv(3), bv(1), bv(0)))));
-    let rec_type = primary_pi("α", BinderInfo::Implicit, left_type(), primary_pi(
-        "β", BinderInfo::Implicit, right_type(), primary_pi(
-            "motive", BinderInfo::Implicit, motive(), primary_pi(
-                "mk", BinderInfo::Default, minor(), primary_pi(
-                    "t", BinderInfo::Default, prod_expr(bv(3), bv(2)), Expr::app(bv(2), bv(0)),
+    let motive = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            prod_expr(bv(1), bv(0)),
+            Expr::sort(w.clone()),
+        )
+    };
+    let minor = || {
+        primary_pi(
+            "fst",
+            BinderInfo::Default,
+            bv(2),
+            primary_pi(
+                "snd",
+                BinderInfo::Default,
+                bv(2),
+                Expr::app(bv(2), mk_expr(bv(4), bv(3), bv(1), bv(0))),
+            ),
+        )
+    };
+    let rec_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        left_type(),
+        primary_pi(
+            "β",
+            BinderInfo::Implicit,
+            right_type(),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive(),
+                primary_pi(
+                    "mk",
+                    BinderInfo::Default,
+                    minor(),
+                    primary_pi(
+                        "t",
+                        BinderInfo::Default,
+                        prod_expr(bv(3), bv(2)),
+                        Expr::app(bv(2), bv(0)),
+                    ),
                 ),
             ),
         ),
-    ));
-    let minor_applied = Expr::app(Expr::app(bv(2), bv(1)), bv(0));
-    let rhs = Expr::lam(primary_name("α"), left_type(), Expr::lam(
-        primary_name("β"), right_type(), Expr::lam(
-            primary_name("motive"), motive(), Expr::lam(
-                primary_name("mk"), minor(), Expr::lam(
-                    primary_name("fst"), bv(3), Expr::lam(
-                        primary_name("snd"), bv(3), minor_applied, BinderInfo::Default,
-                    ), BinderInfo::Default,
-                ), BinderInfo::Default,
-            ), BinderInfo::Default,
-        ), BinderInfo::Default,
-    ), BinderInfo::Default);
-    let inductive_type = primary_pi(
-        "α", BinderInfo::Default, left_type(), primary_pi("β", BinderInfo::Default, right_type(), prod_type()),
     );
-    let constructor_type = primary_pi("α", BinderInfo::Default, left_type(), primary_pi(
-        "β", BinderInfo::Default, right_type(), primary_pi(
-            "fst", BinderInfo::Default, bv(1), primary_pi("snd", BinderInfo::Default, bv(1), prod_expr(bv(3), bv(2))),
+    let minor_applied = Expr::app(Expr::app(bv(2), bv(1)), bv(0));
+    let rhs = Expr::lam(
+        primary_name("α"),
+        left_type(),
+        Expr::lam(
+            primary_name("β"),
+            right_type(),
+            Expr::lam(
+                primary_name("motive"),
+                motive(),
+                Expr::lam(
+                    primary_name("mk"),
+                    minor(),
+                    Expr::lam(
+                        primary_name("fst"),
+                        bv(3),
+                        Expr::lam(
+                            primary_name("snd"),
+                            bv(3),
+                            minor_applied,
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
         ),
-    ));
+        BinderInfo::Default,
+    );
+    let inductive_type = primary_pi(
+        "α",
+        BinderInfo::Default,
+        left_type(),
+        primary_pi("β", BinderInfo::Default, right_type(), prod_type()),
+    );
+    let constructor_type = primary_pi(
+        "α",
+        BinderInfo::Default,
+        left_type(),
+        primary_pi(
+            "β",
+            BinderInfo::Default,
+            right_type(),
+            primary_pi(
+                "fst",
+                BinderInfo::Default,
+                bv(1),
+                primary_pi("snd", BinderInfo::Default, bv(1), prod_expr(bv(3), bv(2))),
+            ),
+        ),
+    );
     vec![
-        ConstantEntry::new(prod.clone(), ConstantDeclaration::inductive(vec![u_name.clone(), v_name.clone()], decoded(&inductive_type), ConstantSafety::Safe, InductiveDeclaration::new(2, 0, vec![prod.clone()], vec![mk.clone()], 0, false, false))),
-        ConstantEntry::new(mk.clone(), ConstantDeclaration::constructor(vec![u_name.clone(), v_name.clone()], decoded(&constructor_type), ConstantSafety::Safe, ConstructorDeclaration::new(prod.clone(), 0, 2, 2))),
-        ConstantEntry::new(rec, ConstantDeclaration::recursor(vec![w_name, u_name, v_name], decoded(&rec_type), ConstantSafety::Safe, RecursorDeclaration::new(vec![prod], 2, 0, 1, 1, vec![RecursorRule::new(mk, 2, decoded(&rhs))], false))),
+        ConstantEntry::new(
+            prod.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone(), v_name.clone()],
+                decoded(&inductive_type),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    0,
+                    vec![prod.clone()],
+                    vec![mk.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            mk.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone(), v_name.clone()],
+                decoded(&constructor_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(prod.clone(), 0, 2, 2),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![w_name, u_name, v_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![prod],
+                    2,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(mk, 2, decoded(&rhs))],
+                    false,
+                ),
+            ),
+        ),
     ]
 }
 
@@ -1982,26 +2546,79 @@ fn init_except_constructor_entries() -> Vec<ConstantEntry> {
     let v = Level::param(primary_name("v"));
     let error_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
     let ok_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
-    let except_expr = |error: Expr, ok: Expr| Expr::app(
-        Expr::app(Expr::const_(primary_name("Except"), vec![u.clone(), v.clone()]), error), ok,
-    );
+    let except_expr = |error: Expr, ok: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(primary_name("Except"), vec![u.clone(), v.clone()]),
+                error,
+            ),
+            ok,
+        )
+    };
     let bv = |index| Expr::bvar(index).expect("packs");
-    let error_ctor_type = primary_pi("ε", BinderInfo::Default, error_type(), primary_pi(
-        "α", BinderInfo::Default, ok_type(), primary_pi("value", BinderInfo::Default, bv(1), except_expr(bv(2), bv(1))),
-    ));
-    let ok_ctor_type = primary_pi("ε", BinderInfo::Default, error_type(), primary_pi(
-        "α", BinderInfo::Default, ok_type(), primary_pi("value", BinderInfo::Default, bv(0), except_expr(bv(2), bv(1))),
-    ));
+    let error_ctor_type = primary_pi(
+        "ε",
+        BinderInfo::Default,
+        error_type(),
+        primary_pi(
+            "α",
+            BinderInfo::Default,
+            ok_type(),
+            primary_pi(
+                "value",
+                BinderInfo::Default,
+                bv(1),
+                except_expr(bv(2), bv(1)),
+            ),
+        ),
+    );
+    let ok_ctor_type = primary_pi(
+        "ε",
+        BinderInfo::Default,
+        error_type(),
+        primary_pi(
+            "α",
+            BinderInfo::Default,
+            ok_type(),
+            primary_pi(
+                "value",
+                BinderInfo::Default,
+                bv(0),
+                except_expr(bv(2), bv(1)),
+            ),
+        ),
+    );
     vec![
-        ConstantEntry::new(error, ConstantDeclaration::constructor(vec![u_name.clone(), v_name.clone()], decoded(&error_ctor_type), ConstantSafety::Safe, ConstructorDeclaration::new(except.clone(), 0, 2, 1))),
-        ConstantEntry::new(ok, ConstantDeclaration::constructor(vec![u_name, v_name], decoded(&ok_ctor_type), ConstantSafety::Safe, ConstructorDeclaration::new(except, 1, 2, 1))),
+        ConstantEntry::new(
+            error,
+            ConstantDeclaration::constructor(
+                vec![u_name.clone(), v_name.clone()],
+                decoded(&error_ctor_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(except.clone(), 0, 2, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            ok,
+            ConstantDeclaration::constructor(
+                vec![u_name, v_name],
+                decoded(&ok_ctor_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(except, 1, 2, 1),
+            ),
+        ),
     ]
 }
 
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
-    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
     assert!(verdict.is_admitted(), "exact Init.And block: {verdict:?}");
     let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
         return;
@@ -2013,12 +2630,41 @@ fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
 fn kr600_803_init_and_refuses_a_forged_iota_rule() {
     let mut entries = init_and_entries();
     let declaration = entries[2].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[2] = ConstantEntry::new(checker_qualified(&["And", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["And", "intro"]), 2, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["And", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["And", "intro"]),
+                    2,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
     ));
-    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
@@ -2504,14 +3150,19 @@ fn kr600_803_init_and_refuses_a_forged_constructor_index() {
 fn kr600_803_init_and_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_and_entries();
     let recursor = entries[2].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 1);
     assert_eq!(metadata.num_parameters(), 2);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 1);
     assert_eq!(metadata.rules().len(), 1);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["And", "intro"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["And", "intro"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 2);
 }
 
@@ -2530,13 +3181,18 @@ fn kr600_803_init_and_fixture_pins_recursor_mutual_family_and_k() {
 fn kr600_803_init_and_fixture_pins_constructor_and_iota_rule() {
     let entries = init_and_entries();
     let constructor = entries[1].declaration();
-    let constructor_metadata = constructor.constructor_metadata().expect("fixture constructor metadata");
+    let constructor_metadata = constructor
+        .constructor_metadata()
+        .expect("fixture constructor metadata");
     assert_eq!(constructor_metadata.inductive(), &checker_name("And"));
     assert_eq!(constructor_metadata.index(), 0);
     assert_eq!(constructor_metadata.num_parameters(), 2);
     assert_eq!(constructor_metadata.num_fields(), 2);
     assert!(constructor.level_parameters().is_empty());
-    let recursor = entries[2].declaration().recursor_metadata().expect("fixture recursor metadata");
+    let recursor = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.rules()[0].constructor(), entries[1].name());
     assert_eq!(recursor.rules()[0].num_fields(), 2);
 }
@@ -2559,7 +3215,12 @@ fn kr600_803_init_and_fixture_pins_iota_rhs_closure() {
 #[test]
 fn kr600_803_init_bool_constructors_recursor_and_iota_are_reconstructed() {
     let entries = init_bool_entries();
-    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
     assert!(verdict.is_admitted(), "exact Init.Bool block: {verdict:?}");
 }
 
@@ -2567,15 +3228,44 @@ fn kr600_803_init_bool_constructors_recursor_and_iota_are_reconstructed() {
 fn kr600_803_init_bool_refuses_a_forged_true_iota_rule() {
     let mut entries = init_bool_entries();
     let declaration = entries[3].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[3] = ConstantEntry::new(checker_qualified(&["Bool", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![
-            metadata.rules()[0].clone(),
-            RecursorRule::new(checker_qualified(&["Bool", "true"]), 0, decoded(&Expr::bvar(0).expect("packs"))),
-        ], metadata.k()),
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Bool", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![
+                    metadata.rules()[0].clone(),
+                    RecursorRule::new(
+                        checker_qualified(&["Bool", "true"]),
+                        0,
+                        decoded(&Expr::bvar(0).expect("packs")),
+                    ),
+                ],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
     ));
-    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
@@ -3333,16 +4023,24 @@ fn kr600_803_init_bool_refuses_a_forged_k() {
 fn kr600_803_init_bool_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_bool_entries();
     let recursor = entries[3].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 1);
     assert_eq!(metadata.num_parameters(), 0);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 2);
     assert_eq!(metadata.rules().len(), 2);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Bool", "false"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["Bool", "false"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 0);
-    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Bool", "true"]));
+    assert_eq!(
+        metadata.rules()[1].constructor(),
+        &checker_qualified(&["Bool", "true"])
+    );
     assert_eq!(metadata.rules()[1].num_fields(), 0);
 }
 
@@ -3408,7 +4106,12 @@ fn kr600_803_init_bool_fixture_pins_iota_rhs_closure() {
 #[test]
 fn kr600_803_init_punit_universes_constructor_and_iota_are_reconstructed() {
     let entries = init_punit_entries();
-    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
     assert!(verdict.is_admitted(), "exact Init.PUnit block: {verdict:?}");
 }
 
@@ -3416,12 +4119,41 @@ fn kr600_803_init_punit_universes_constructor_and_iota_are_reconstructed() {
 fn kr600_803_init_punit_refuses_a_forged_iota_rule() {
     let mut entries = init_punit_entries();
     let declaration = entries[2].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[2] = ConstantEntry::new(checker_qualified(&["PUnit", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["PUnit", "unit"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["PUnit", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["PUnit", "unit"]),
+                    0,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
     ));
-    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
@@ -3781,14 +4513,19 @@ fn kr600_803_init_punit_refuses_a_forged_k() {
 fn kr600_803_init_punit_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_punit_entries();
     let recursor = entries[2].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 2);
     assert_eq!(metadata.num_parameters(), 0);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 1);
     assert_eq!(metadata.rules().len(), 1);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["PUnit", "unit"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["PUnit", "unit"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 0);
 }
 
@@ -3807,13 +4544,18 @@ fn kr600_803_init_punit_fixture_pins_recursor_mutual_family_and_k() {
 fn kr600_803_init_punit_fixture_pins_constructor_and_iota_rule() {
     let entries = init_punit_entries();
     let constructor = entries[1].declaration();
-    let constructor_metadata = constructor.constructor_metadata().expect("fixture constructor metadata");
+    let constructor_metadata = constructor
+        .constructor_metadata()
+        .expect("fixture constructor metadata");
     assert_eq!(constructor_metadata.inductive(), &checker_name("PUnit"));
     assert_eq!(constructor_metadata.index(), 0);
     assert_eq!(constructor_metadata.num_parameters(), 0);
     assert_eq!(constructor_metadata.num_fields(), 0);
     assert_eq!(constructor.level_parameters().len(), 1);
-    let recursor = entries[2].declaration().recursor_metadata().expect("fixture recursor metadata");
+    let recursor = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.rules()[0].constructor(), entries[1].name());
     assert_eq!(recursor.rules()[0].num_fields(), 0);
 }
@@ -3849,11 +4591,30 @@ fn kr600_803_init_unit_constructor_recursor_and_iota_are_reconstructed() {
 fn kr600_803_init_unit_refuses_a_forged_iota_rule() {
     let mut entries = init_unit_entries();
     let declaration = entries[2].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[2] = ConstantEntry::new(checker_qualified(&["Unit", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["Unit", "unit"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
-    ));
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Unit", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["Unit", "unit"]),
+                    0,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
     assert!(matches!(
         admit_inductive(
             &ConstantEnvironment::empty(),
@@ -4224,13 +4985,18 @@ fn kr600_803_init_unit_refuses_a_forged_k() {
 fn kr600_803_init_unit_fixture_pins_constructor_and_iota_rule() {
     let entries = init_unit_entries();
     let constructor = entries[1].declaration();
-    let constructor_metadata = constructor.constructor_metadata().expect("fixture constructor metadata");
+    let constructor_metadata = constructor
+        .constructor_metadata()
+        .expect("fixture constructor metadata");
     assert_eq!(constructor_metadata.inductive(), &checker_name("Unit"));
     assert_eq!(constructor_metadata.index(), 0);
     assert_eq!(constructor_metadata.num_parameters(), 0);
     assert_eq!(constructor_metadata.num_fields(), 0);
     assert!(constructor.level_parameters().is_empty());
-    let recursor = entries[2].declaration().recursor_metadata().expect("fixture recursor metadata");
+    let recursor = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.rules()[0].constructor(), entries[1].name());
     assert_eq!(recursor.rules()[0].num_fields(), 0);
 }
@@ -4329,14 +5095,33 @@ fn kr600_803_init_sum_refuses_a_forged_k() {
 fn kr600_803_init_sum_refuses_a_forged_inr_iota_rule() {
     let mut entries = init_sum_entries();
     let declaration = entries[3].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[3] = ConstantEntry::new(checker_qualified(&["Sum", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![
-            metadata.rules()[0].clone(),
-            RecursorRule::new(checker_qualified(&["Sum", "inr"]), 1, decoded(&Expr::bvar(0).expect("packs"))),
-        ], metadata.k()),
-    ));
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Sum", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![
+                    metadata.rules()[0].clone(),
+                    RecursorRule::new(
+                        checker_qualified(&["Sum", "inr"]),
+                        1,
+                        decoded(&Expr::bvar(0).expect("packs")),
+                    ),
+                ],
+                metadata.k(),
+            ),
+        ),
+    );
     assert!(matches!(
         admit_inductive(
             &ConstantEnvironment::empty(),
@@ -4687,7 +5472,12 @@ fn kr600_803_init_sum_refuses_a_forged_num_indices_count() {
 #[test]
 fn kr600_803_init_prod_pair_recursor_and_iota_are_reconstructed() {
     let entries = init_prod_entries();
-    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
     assert!(verdict.is_admitted(), "exact Init.Prod block: {verdict:?}");
 }
 
@@ -4695,7 +5485,9 @@ fn kr600_803_init_prod_pair_recursor_and_iota_are_reconstructed() {
 fn kr600_803_init_prod_fixture_pins_recursor_levels_motives_minors_and_metadata() {
     let entries = init_prod_entries();
     let recursor = entries[2].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 3);
     assert_eq!(metadata.mutual(), &[checker_name("Prod")]);
     assert_eq!(metadata.num_parameters(), 2);
@@ -4710,12 +5502,41 @@ fn kr600_803_init_prod_fixture_pins_recursor_levels_motives_minors_and_metadata(
 fn kr600_803_init_prod_refuses_a_forged_iota_rule() {
     let mut entries = init_prod_entries();
     let declaration = entries[2].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[2] = ConstantEntry::new(checker_qualified(&["Prod", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["Prod", "mk"]), 2, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Prod", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["Prod", "mk"]),
+                    2,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
     ));
-    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
@@ -5102,7 +5923,10 @@ fn kr600_803_init_prod_fixture_pins_iota_rule_constructor_and_fields() {
 fn kr600_803_init_except_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = init_except_constructor_entries();
     for (entry, expected_index) in [(&entries[0], 0), (&entries[1], 1)] {
-        let metadata = entry.declaration().constructor_metadata().expect("fixture constructor metadata");
+        let metadata = entry
+            .declaration()
+            .constructor_metadata()
+            .expect("fixture constructor metadata");
         assert_eq!(metadata.inductive(), &checker_name("Except"));
         assert_eq!(metadata.index(), expected_index);
         assert_eq!(metadata.num_parameters(), 2);
@@ -5118,20 +5942,33 @@ fn kr600_803_sum_and_prod_recursor_major_premises_close_the_bvar_span() {
             TermOutcome::Complete(facts) => facts,
             other => panic!("fixture recursor inspection must complete: {other:?}"),
         };
-        assert_eq!(facts.external_bound_span, 0, "{:?} recursor leaks a major-premise binder", recursor.name());
+        assert_eq!(
+            facts.external_bound_span,
+            0,
+            "{:?} recursor leaks a major-premise binder",
+            recursor.name()
+        );
     }
 }
 
 #[test]
 fn kr600_803_sum_and_prod_iota_rhs_close_the_bvar_span() {
     for recursor in [init_sum_entries().remove(3), init_prod_entries().remove(2)] {
-        let metadata = recursor.declaration().recursor_metadata().expect("fixture recursor metadata");
+        let metadata = recursor
+            .declaration()
+            .recursor_metadata()
+            .expect("fixture recursor metadata");
         for rule in metadata.rules() {
             let facts = match inspect(rule.rhs(), TermBudget::unlimited()) {
                 TermOutcome::Complete(facts) => facts,
                 other => panic!("fixture iota inspection must complete: {other:?}"),
             };
-            assert_eq!(facts.external_bound_span, 0, "{:?} iota RHS leaks a binder", rule.constructor());
+            assert_eq!(
+                facts.external_bound_span,
+                0,
+                "{:?} iota RHS leaks a binder",
+                rule.constructor()
+            );
         }
     }
 }
@@ -7095,16 +7932,24 @@ fn kr600_803_init_nat_refuses_a_forged_k() {
 fn kr600_803_init_nat_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = nat_entries();
     let recursor = entries[3].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 1);
     assert_eq!(metadata.num_parameters(), 0);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 2);
     assert_eq!(metadata.rules().len(), 2);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Nat", "zero"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["Nat", "zero"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 0);
-    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Nat", "succ"]));
+    assert_eq!(
+        metadata.rules()[1].constructor(),
+        &checker_qualified(&["Nat", "succ"])
+    );
     assert_eq!(metadata.rules()[1].num_fields(), 1);
 }
 
@@ -7123,7 +7968,10 @@ fn kr600_803_init_nat_fixture_pins_recursor_mutual_family_and_k() {
 fn kr600_803_init_nat_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = nat_entries();
     for (entry, expected_index, expected_fields) in [(&entries[1], 0, 0), (&entries[2], 1, 1)] {
-        let metadata = entry.declaration().constructor_metadata().expect("fixture constructor metadata");
+        let metadata = entry
+            .declaration()
+            .constructor_metadata()
+            .expect("fixture constructor metadata");
         assert_eq!(metadata.inductive(), &checker_name("Nat"));
         assert_eq!(metadata.index(), expected_index);
         assert_eq!(metadata.num_parameters(), 0);
@@ -7866,16 +8714,24 @@ fn kr600_803_init_option_refuses_a_forged_k() {
 fn kr600_803_init_option_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_option_entries();
     let recursor = entries[3].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 2);
     assert_eq!(metadata.num_parameters(), 1);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 2);
     assert_eq!(metadata.rules().len(), 2);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Option", "none"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["Option", "none"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 0);
-    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Option", "some"]));
+    assert_eq!(
+        metadata.rules()[1].constructor(),
+        &checker_qualified(&["Option", "some"])
+    );
     assert_eq!(metadata.rules()[1].num_fields(), 1);
 }
 
@@ -8621,16 +9477,24 @@ fn kr600_803_init_list_refuses_a_forged_k() {
 fn kr600_803_init_list_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_list_entries();
     let recursor = entries[3].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 2);
     assert_eq!(metadata.num_parameters(), 1);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 2);
     assert_eq!(metadata.rules().len(), 2);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["List", "nil"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["List", "nil"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 0);
-    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["List", "cons"]));
+    assert_eq!(
+        metadata.rules()[1].constructor(),
+        &checker_qualified(&["List", "cons"])
+    );
     assert_eq!(metadata.rules()[1].num_fields(), 2);
 }
 
@@ -8648,9 +9512,7 @@ fn kr600_803_init_list_fixture_pins_recursor_mutual_family_and_k() {
 #[test]
 fn kr600_803_init_list_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = init_list_entries();
-    for (entry, expected_index, expected_fields) in
-        [(&entries[1], 0, 0), (&entries[2], 1, 2)]
-    {
+    for (entry, expected_index, expected_fields) in [(&entries[1], 0, 0), (&entries[2], 1, 2)] {
         let metadata = entry
             .declaration()
             .constructor_metadata()
@@ -8908,7 +9770,9 @@ fn kr600_803_init_empty_refuses_a_forged_k() {
 fn kr600_803_init_empty_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_empty_entries();
     let recursor = entries[1].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 1);
     assert_eq!(metadata.num_parameters(), 0);
     assert_eq!(metadata.num_indices(), 0);
@@ -8941,7 +9805,12 @@ fn kr600_803_init_empty_fixture_pins_eliminator_bvar_closure() {
 #[test]
 fn kr600_803_init_false_eliminator_is_reconstructed_independently() {
     let entries = init_false_entries();
-    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
     assert!(verdict.is_admitted(), "exact Init.False block: {verdict:?}");
 }
 
@@ -8949,12 +9818,41 @@ fn kr600_803_init_false_eliminator_is_reconstructed_independently() {
 fn kr600_803_init_false_refuses_a_forged_recursor_rule() {
     let mut entries = init_false_entries();
     let declaration = entries[1].declaration();
-    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
-    entries[1] = ConstantEntry::new(checker_qualified(&["False", "rec"]), ConstantDeclaration::recursor(
-        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
-        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["False", "forged"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["False", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["False", "forged"]),
+                    0,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
     ));
-    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
@@ -9002,7 +9900,9 @@ fn kr600_803_init_false_refuses_a_forged_k() {
 fn kr600_803_init_false_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_false_entries();
     let recursor = entries[1].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 1);
     assert_eq!(metadata.num_parameters(), 0);
     assert_eq!(metadata.num_indices(), 0);
@@ -9174,7 +10074,9 @@ fn kr600_803_init_pempty_refuses_a_forged_k() {
 fn kr600_803_init_pempty_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_pempty_entries();
     let recursor = entries[1].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert_eq!(recursor.level_parameters().len(), 2);
     assert_eq!(metadata.num_parameters(), 0);
     assert_eq!(metadata.num_indices(), 0);
@@ -9647,16 +10549,24 @@ fn kr600_803_init_or_refuses_a_forged_num_rules_count() {
 fn kr600_803_init_or_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_or_entries();
     let recursor = entries[3].declaration();
-    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
     assert!(recursor.level_parameters().is_empty());
     assert_eq!(metadata.num_parameters(), 2);
     assert_eq!(metadata.num_indices(), 0);
     assert_eq!(metadata.num_motives(), 1);
     assert_eq!(metadata.num_minors(), 2);
     assert_eq!(metadata.rules().len(), 2);
-    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Or", "inl"]));
+    assert_eq!(
+        metadata.rules()[0].constructor(),
+        &checker_qualified(&["Or", "inl"])
+    );
     assert_eq!(metadata.rules()[0].num_fields(), 1);
-    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Or", "inr"]));
+    assert_eq!(
+        metadata.rules()[1].constructor(),
+        &checker_qualified(&["Or", "inr"])
+    );
     assert_eq!(metadata.rules()[1].num_fields(), 1);
 }
 
