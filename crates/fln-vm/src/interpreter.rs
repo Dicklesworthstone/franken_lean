@@ -542,6 +542,9 @@ enum IntrinsicImplementation {
     NatShiftLeft,
     NatShiftRight,
     NatXor,
+    NatDecEq,
+    NatDecLe,
+    NatDecLt,
     StringAppend,
     StringAtEnd,
     StringCompare,
@@ -560,6 +563,20 @@ enum IntrinsicImplementation {
     StringPrev,
     StringPush,
     StringTrim,
+    ByteArrayBeq,
+    ByteArrayCopySlice,
+    ByteArrayData,
+    ByteArrayDecEq,
+    ByteArrayEmptyWithCapacity,
+    ByteArrayGet,
+    ByteArrayHash,
+    ByteArrayMk,
+    ByteArrayPush,
+    ByteArraySet,
+    ByteArraySize,
+    ByteArrayUGet,
+    ByteArrayUset,
+    ByteArrayValidateUtf8,
     ArraySize,
     ArrayGetInternal,
     ArrayUGet,
@@ -617,6 +634,9 @@ impl IntrinsicImplementation {
             "extern:Nat.shiftLeft" => Self::NatShiftLeft,
             "extern:Nat.shiftRight" => Self::NatShiftRight,
             "extern:Nat.xor" => Self::NatXor,
+            "extern:Nat.decEq" => Self::NatDecEq,
+            "extern:Nat.decLe" => Self::NatDecLe,
+            "extern:Nat.decLt" => Self::NatDecLt,
             "extern:String.Internal.append" => Self::StringAppend,
             "extern:String.Internal.atEnd" => Self::StringAtEnd,
             "extern:String.Internal.length" => Self::StringLength,
@@ -644,6 +664,20 @@ impl IntrinsicImplementation {
             }
             "extern:String.push" => Self::StringPush,
             "extern:String.Internal.trim" => Self::StringTrim,
+            "extern:ByteArray.beq" => Self::ByteArrayBeq,
+            "extern:ByteArray.copySlice" => Self::ByteArrayCopySlice,
+            "extern:ByteArray.data" => Self::ByteArrayData,
+            "extern:ByteArray.decEq" => Self::ByteArrayDecEq,
+            "extern:ByteArray.emptyWithCapacity" => Self::ByteArrayEmptyWithCapacity,
+            "extern:ByteArray.get" => Self::ByteArrayGet,
+            "extern:ByteArray.hash" => Self::ByteArrayHash,
+            "extern:ByteArray.mk" => Self::ByteArrayMk,
+            "extern:ByteArray.push" => Self::ByteArrayPush,
+            "extern:ByteArray.set" => Self::ByteArraySet,
+            "extern:ByteArray.size" => Self::ByteArraySize,
+            "extern:ByteArray.uget" => Self::ByteArrayUGet,
+            "extern:ByteArray.uset" => Self::ByteArrayUset,
+            "extern:ByteArray.validateUTF8" => Self::ByteArrayValidateUtf8,
             "extern:Array.size" => Self::ArraySize,
             "extern:Array.getInternal" => Self::ArrayGetInternal,
             "extern:Array.uget" => Self::ArrayUGet,
@@ -910,6 +944,7 @@ pub enum VmRefusal {
     },
     InvalidStringObject,
     InvalidArrayObject,
+    InvalidByteArrayObject,
     InvalidCtorObject,
     InvalidRefObject,
     UnsupportedNativeClosure,
@@ -1063,6 +1098,12 @@ impl fmt::Display for VmRefusal {
             ),
             Self::InvalidStringObject => write!(f, "Marrow String object is not canonical UTF-8"),
             Self::InvalidArrayObject => write!(f, "Marrow Array object header is inconsistent"),
+            Self::InvalidByteArrayObject => {
+                write!(
+                    f,
+                    "Marrow scalar-array element size disagrees with ByteArray"
+                )
+            }
             Self::InvalidCtorObject => {
                 write!(f, "Marrow constructor object slot is past the allocation")
             }
@@ -3540,6 +3581,184 @@ fn invoke_intrinsic(
             items.push(args[1].clone_ref());
             Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
         }
+        IntrinsicImplementation::NatDecEq
+        | IntrinsicImplementation::NatDecLe
+        | IntrinsicImplementation::NatDecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::NatDecEq => "Nat.decEq",
+                IntrinsicImplementation::NatDecLe => "Nat.decLe",
+                _ => "Nat.decLt",
+            };
+            let (left, right) = with_nat_views(&args[0], &args[1], operation, |left, right| {
+                (left.to_owned(), right.to_owned())
+            })?;
+            let ordering = match implementation {
+                IntrinsicImplementation::NatDecEq => left == right,
+                IntrinsicImplementation::NatDecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        // ByteArray rows. The pin mutates in place when its refcount shows a
+        // sole owner and copies otherwise; that optimization is invisible to
+        // pure value semantics, so every handler here builds a fresh object —
+        // the same copy-always discipline as Array.push above.
+        IntrinsicImplementation::ByteArraySize => {
+            expect_arity(row, args, 1)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.size", 0)?;
+            if bytes.len() > usize::MAX >> 1 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "ByteArray.size",
+                }
+                .into());
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(bytes.len())))
+        }
+        IntrinsicImplementation::ByteArrayUGet => {
+            expect_arity(row, args, 2)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.uget", 0)?;
+            let index = nat_as_usize(&args[1], "ByteArray.uget", 1)?.ok_or(
+                VmRefusal::ArrayIndexOutOfBounds {
+                    index: usize::MAX,
+                    size: bytes.len(),
+                },
+            )?;
+            if index >= bytes.len() {
+                return Err(VmRefusal::ArrayIndexOutOfBounds {
+                    index,
+                    size: bytes.len(),
+                }
+                .into());
+            }
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                bytes[index],
+            ))))
+        }
+        IntrinsicImplementation::ByteArrayGet => {
+            expect_arity(row, args, 2)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.get", 0)?;
+            // The pin answers 0 for any out-of-bounds index — including a
+            // non-scalar Nat, which cannot name a valid byte here.
+            let byte = match nat_as_usize(&args[1], "ByteArray.get", 1)? {
+                Some(index) if index < bytes.len() => bytes[index],
+                _ => 0,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(byte))))
+        }
+        IntrinsicImplementation::ByteArraySet => {
+            expect_arity(row, args, 3)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.set", 0)?;
+            let index = nat_as_usize(&args[1], "ByteArray.set", 1)?.ok_or(
+                VmRefusal::ArrayIndexOutOfBounds {
+                    index: usize::MAX,
+                    size: bytes.len(),
+                },
+            )?;
+            let value = byte_argument(&args[2], "ByteArray.set", 2)?;
+            // The pin returns the array UNCHANGED for an out-of-range set.
+            if index < bytes.len() {
+                let mut updated = bytes;
+                updated[index] = value;
+                Ok(IntrinsicResult::owned(mk_byte_array(&updated)))
+            } else {
+                Ok(IntrinsicResult::owned(args[0].clone_ref()))
+            }
+        }
+        IntrinsicImplementation::ByteArrayUset => {
+            expect_arity(row, args, 3)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.uset", 0)?;
+            let index = nat_as_usize(&args[1], "ByteArray.uset", 1)?.ok_or(
+                VmRefusal::ArrayIndexOutOfBounds {
+                    index: usize::MAX,
+                    size: bytes.len(),
+                },
+            )?;
+            if index >= bytes.len() {
+                return Err(VmRefusal::ArrayIndexOutOfBounds {
+                    index,
+                    size: bytes.len(),
+                }
+                .into());
+            }
+            let value = byte_argument(&args[2], "ByteArray.uset", 2)?;
+            let mut updated = bytes;
+            updated[index] = value;
+            Ok(IntrinsicResult::raw_object(mk_byte_array(&updated)))
+        }
+        IntrinsicImplementation::ByteArrayPush => {
+            expect_arity(row, args, 2)?;
+            let mut bytes = byte_array_bytes(&args[0], "ByteArray.push", 0)?;
+            bytes.push(byte_argument(&args[1], "ByteArray.push", 1)?);
+            Ok(IntrinsicResult::owned(mk_byte_array(&bytes)))
+        }
+        IntrinsicImplementation::ByteArrayMk => {
+            expect_arity(row, args, 1)?;
+            let (size, _) = array_value(&args[0], "ByteArray.mk", 0)?;
+            let mut bytes = Vec::with_capacity(size);
+            for index in 0..size {
+                let element = args[0].array_child(index);
+                bytes.push(byte_argument(&element, "ByteArray.mk", 0)?);
+            }
+            Ok(IntrinsicResult::owned(mk_byte_array(&bytes)))
+        }
+        IntrinsicImplementation::ByteArrayData => {
+            expect_arity(row, args, 1)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.data", 0)?;
+            let items: Vec<Obj> = bytes
+                .iter()
+                .map(|byte| Obj::mk_nat(usize::from(*byte)))
+                .collect();
+            Ok(IntrinsicResult::owned(Obj::mk_array(items)))
+        }
+        IntrinsicImplementation::ByteArrayEmptyWithCapacity => {
+            expect_arity(row, args, 1)?;
+            // Capacity is an allocation fact; the empty value is canonical.
+            with_nat_view(&args[0], "ByteArray.emptyWithCapacity", 0, |_| ())?;
+            Ok(IntrinsicResult::owned(mk_byte_array(&[])))
+        }
+        IntrinsicImplementation::ByteArrayBeq | IntrinsicImplementation::ByteArrayDecEq => {
+            expect_arity(row, args, 2)?;
+            let left = byte_array_bytes(&args[0], "ByteArray.beq", 0)?;
+            let right = byte_array_bytes(&args[1], "ByteArray.beq", 1)?;
+            let equal = left == right;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(equal))))
+        }
+        IntrinsicImplementation::ByteArrayHash => {
+            expect_arity(row, args, 1)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.hash", 0)?;
+            // `hash_str(size, ptr, seed=11)` at the pin is MurmurHash64A. The
+            // census declares a scalar result, so hashes beyond the tagged
+            // ceiling are a typed non-answer until mpz-carrying result
+            // contracts exist for this row.
+            let hash_value = fln_core::lean_hash::murmur_hash_64a(&bytes, 11);
+            if hash_value > (usize::MAX >> 1) as u64 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "ByteArray.hash",
+                }
+                .into());
+            }
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(hash_value as usize)))
+        }
+        IntrinsicImplementation::ByteArrayCopySlice => {
+            expect_arity(row, args, 6)?;
+            let source = byte_array_bytes(&args[0], "ByteArray.copySlice", 0)?;
+            let src_off = nat_as_usize(&args[1], "ByteArray.copySlice", 1)?.unwrap_or(usize::MAX);
+            let dest = byte_array_bytes(&args[2], "ByteArray.copySlice", 2)?;
+            let dest_off = nat_as_usize(&args[3], "ByteArray.copySlice", 3)?.unwrap_or(usize::MAX);
+            let len = nat_as_usize(&args[4], "ByteArray.copySlice", 4)?.unwrap_or(usize::MAX);
+            // `exact` only shapes the C capacity policy; values are identical.
+            bool_value(&args[5], "ByteArray.copySlice", 5)?;
+            Ok(IntrinsicResult::owned(mk_byte_array(&copy_slice_bytes(
+                &source, src_off, &dest, dest_off, len,
+            ))))
+        }
+        IntrinsicImplementation::ByteArrayValidateUtf8 => {
+            expect_arity(row, args, 1)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.validateUTF8", 0)?;
+            let valid = validate_utf8_bytes(&bytes);
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(valid))))
+        }
         IntrinsicImplementation::PlatformNumBits => {
             expect_arity(row, args, 1)?;
             // Marrow refuses non-64-bit targets at compile time because its
@@ -3884,6 +4103,23 @@ fn managerless_task_application(
         | IntrinsicImplementation::StringExtract
         | IntrinsicImplementation::StringInternalIsEmpty
         | IntrinsicImplementation::StringInternalIsPrefixOf
+        | IntrinsicImplementation::NatDecEq
+        | IntrinsicImplementation::NatDecLe
+        | IntrinsicImplementation::NatDecLt
+        | IntrinsicImplementation::ByteArrayBeq
+        | IntrinsicImplementation::ByteArrayCopySlice
+        | IntrinsicImplementation::ByteArrayData
+        | IntrinsicImplementation::ByteArrayDecEq
+        | IntrinsicImplementation::ByteArrayEmptyWithCapacity
+        | IntrinsicImplementation::ByteArrayGet
+        | IntrinsicImplementation::ByteArrayHash
+        | IntrinsicImplementation::ByteArrayMk
+        | IntrinsicImplementation::ByteArrayPush
+        | IntrinsicImplementation::ByteArraySet
+        | IntrinsicImplementation::ByteArraySize
+        | IntrinsicImplementation::ByteArrayUGet
+        | IntrinsicImplementation::ByteArrayUset
+        | IntrinsicImplementation::ByteArrayValidateUtf8
         | IntrinsicImplementation::StringNext
         | IntrinsicImplementation::StringPrev
         | IntrinsicImplementation::StringPush
@@ -4251,6 +4487,111 @@ fn extract_utf8(bytes: &[u8], begin: Option<usize>, end: Option<usize>) -> Optio
         .map(std::borrow::ToOwned::to_owned)
 }
 
+fn mk_byte_array(bytes: &[u8]) -> Obj {
+    Obj::mk_sarray(1, bytes)
+}
+
+/// The bytes of a Marrow `ByteArray`: a scalar array whose element size is
+/// exactly one. Any other scalar-array element size is a different type and
+/// refuses here rather than aliasing its payload.
+fn byte_array_bytes(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<Vec<u8>, VmRefusal> {
+    if value_kind(value) != ValueKind::ScalarArray {
+        return Err(type_mismatch(operation, argument, "ByteArray", value));
+    }
+    let Some((elem_size, _, _, data)) = value.try_sarray_view() else {
+        return Err(VmRefusal::InvalidByteArrayObject);
+    };
+    if elem_size != 1 {
+        return Err(VmRefusal::InvalidByteArrayObject);
+    }
+    Ok(data)
+}
+
+/// A `UInt8` argument: any Nat that fits one byte. The pin truncates through
+/// `uint8_t` parameters; a wider value is a typed range fault here.
+fn byte_argument(value: &Obj, operation: &'static str, argument: usize) -> Result<u8, VmRefusal> {
+    match nat_as_usize(value, operation, argument)? {
+        Some(word) if word <= u8::MAX as usize => Ok(word as u8),
+        _ => Err(VmRefusal::NatOverflow { operation }),
+    }
+}
+
+/// Exact port of the pin's `lean_byte_array_copy_slice` value semantics:
+/// a source offset past the source returns the destination unchanged; the
+/// length clamps to the remaining source; a destination offset past the
+/// destination clamps to the destination end (so no gap past the old end is
+/// ever reachable); and the result grows to `max(dest_len, dest_off + len)`.
+/// The copy-always discipline makes the pin's exclusivity fast path
+/// observationally identical.
+fn copy_slice_bytes(
+    source: &[u8],
+    src_off: usize,
+    dest: &[u8],
+    dest_off: usize,
+    len: usize,
+) -> Vec<u8> {
+    if src_off > source.len() {
+        return dest.to_vec();
+    }
+    let len = len.min(source.len() - src_off);
+    let dest_off = dest_off.min(dest.len());
+    let new_size = dest.len().max(dest_off + len);
+    let mut out = vec![0u8; new_size];
+    out[..dest.len()].copy_from_slice(dest);
+    out[dest_off..dest_off + len].copy_from_slice(&source[src_off..src_off + len]);
+    out
+}
+
+/// Exact port of the pin's `validate_utf8`/`validate_utf8_one`
+/// (src/runtime/utf8.cpp): full sequence validation with the overlong,
+/// surrogate, and range checks the C encodes inline.
+fn validate_utf8_bytes(bytes: &[u8]) -> bool {
+    let mut position = 0_usize;
+    while position < bytes.len() {
+        let c = bytes[position];
+        if c & 0x80 == 0 {
+            position += 1;
+            continue;
+        }
+        let (width, minimum) = if c & 0xe0 == 0xc0 {
+            (2usize, 0x80u32)
+        } else if c & 0xf0 == 0xe0 {
+            (3, 0x800)
+        } else if c & 0xf8 == 0xf0 {
+            (4, 0x1_0000)
+        } else {
+            return false;
+        };
+        if position + width > bytes.len() {
+            return false;
+        }
+        let mut scalar = u32::from(c & (0x7f >> width));
+        for continuation in &bytes[position + 1..position + width] {
+            if continuation & 0xc0 != 0x80 {
+                return false;
+            }
+            scalar = (scalar << 6) | u32::from(continuation & 0x3f);
+        }
+        let upper = match width {
+            2 => 0x7ff,
+            3 => 0xffff,
+            _ => 0x10_ffff,
+        };
+        if scalar < minimum || scalar > upper {
+            return false;
+        }
+        if (0xd800..=0xdfff).contains(&scalar) {
+            return false;
+        }
+        position += width;
+    }
+    true
+}
+
 fn type_mismatch(
     operation: &'static str,
     argument: usize,
@@ -4615,5 +4956,214 @@ mod tests {
                 "{row} must resolve"
             );
         }
+    }
+
+    #[test]
+    fn every_byte_array_and_nat_decidable_row_resolves() {
+        let rows = [
+            "extern:ByteArray.beq",
+            "extern:ByteArray.copySlice",
+            "extern:ByteArray.data",
+            "extern:ByteArray.decEq",
+            "extern:ByteArray.emptyWithCapacity",
+            "extern:ByteArray.get",
+            "extern:ByteArray.hash",
+            "extern:ByteArray.mk",
+            "extern:ByteArray.push",
+            "extern:ByteArray.set",
+            "extern:ByteArray.size",
+            "extern:ByteArray.uget",
+            "extern:ByteArray.uset",
+            "extern:ByteArray.validateUTF8",
+            "extern:Nat.decEq",
+            "extern:Nat.decLe",
+            "extern:Nat.decLt",
+        ];
+        for row in rows {
+            assert_ne!(
+                IntrinsicImplementation::for_row(row),
+                IntrinsicImplementation::Unsupported,
+                "{row} must resolve"
+            );
+        }
+    }
+
+    fn ba(bytes: &[u8]) -> Obj {
+        mk_byte_array(bytes)
+    }
+
+    fn ba_bytes(result: Result<Obj, VmRefusal>) -> Vec<u8> {
+        let object = result.expect("the intrinsic answers");
+        byte_array_bytes(&object, "test projection", 0).expect("a byte-array result")
+    }
+
+    #[test]
+    fn byte_array_construction_and_access_follow_the_pin() {
+        let source = invoke(
+            "extern:ByteArray.mk",
+            &[Obj::mk_array(vec![n(104), n(105), n(255)])],
+        );
+        assert_eq!(ba_bytes(source), [104, 105, 255]);
+
+        let array = ba(&[104, 105, 255]);
+        assert_eq!(
+            owned_usize(invoke("extern:ByteArray.size", &[array.clone_ref()])),
+            3
+        );
+        // get answers 0 out of bounds; uget refuses typed.
+        assert_eq!(
+            owned_usize(invoke("extern:ByteArray.get", &[array.clone_ref(), n(1)])),
+            105
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:ByteArray.get", &[array.clone_ref(), n(9)])),
+            0
+        );
+        assert!(matches!(
+            invoke("extern:ByteArray.uget", &[array.clone_ref(), n(9)]),
+            Err(VmRefusal::ArrayIndexOutOfBounds { index: 9, size: 3 })
+        ));
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:ByteArray.get",
+                &[array, Obj::mk_mpz(&[u64::from(u32::MAX) + 1], false)]
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn byte_array_set_uset_push_copy_slice_port_the_pin() {
+        let array = ba(&[104, 105]);
+        // set in range replaces; set out of range returns the array unchanged.
+        assert_eq!(
+            ba_bytes(invoke(
+                "extern:ByteArray.set",
+                &[array.clone_ref(), n(1), n(98)]
+            )),
+            [104, 98]
+        );
+        assert_eq!(
+            ba_bytes(invoke(
+                "extern:ByteArray.set",
+                &[array.clone_ref(), n(9), n(98)]
+            )),
+            [104, 105]
+        );
+        assert_eq!(
+            ba_bytes(invoke(
+                "extern:ByteArray.uset",
+                &[array.clone_ref(), n(0), n(42)]
+            )),
+            [42, 105]
+        );
+        assert_eq!(
+            ba_bytes(invoke(
+                "extern:ByteArray.push",
+                &[array.clone_ref(), n(255)]
+            )),
+            [104, 105, 255]
+        );
+
+        let destination = ba(&[1, 2]);
+        // dest_off past the destination clamps to its end (the pin's rule).
+        assert_eq!(
+            ba_bytes(invoke(
+                "extern:ByteArray.copySlice",
+                &[
+                    ba(&[9, 9, 9]),
+                    n(1),
+                    destination.clone_ref(),
+                    n(4),
+                    n(2),
+                    n(0)
+                ]
+            )),
+            [1, 2, 9, 9]
+        );
+        assert_eq!(
+            ba_bytes(invoke(
+                "extern:ByteArray.copySlice",
+                &[ba(&[7]), n(5), destination, n(0), n(1), n(0)]
+            )),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn byte_array_predicates_hash_and_validate_like_the_pin() {
+        assert_eq!(
+            owned_usize(invoke("extern:ByteArray.beq", &[ba(&[1, 2]), ba(&[1, 2])])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:ByteArray.decEq", &[ba(&[1]), ba(&[2])])),
+            0
+        );
+
+        // Most 64-bit hashes exceed the tagged-Nat ceiling and are typed
+        // non-answers under this row's scalar contract; find an input whose
+        // hash fits, then pin the exact value.
+        let mut fitted = None;
+        for seed_byte in 0u8..=255 {
+            let candidate_input = [seed_byte];
+            let candidate = fln_core::lean_hash::murmur_hash_64a(&candidate_input, 11);
+            if candidate <= (usize::MAX >> 1) as u64 {
+                fitted = Some((candidate_input, candidate));
+                break;
+            }
+        }
+        let (input_bytes, expected) = fitted.expect("some byte hashes below the ceiling");
+        let hash =
+            invoke("extern:ByteArray.hash", &[ba(&input_bytes)]).expect("the fitting hash answers");
+        assert_eq!(
+            nat_as_usize(&hash, "test projection", 0)
+                .expect("well-typed")
+                .expect("machine word"),
+            expected as usize
+        );
+
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:ByteArray.validateUTF8",
+                &[ba("héllo".as_bytes())]
+            )),
+            1
+        );
+        // Overlong encoding of 'a' (c0 80) and a surrogate (ed a0 80) fail.
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:ByteArray.validateUTF8",
+                &[ba(&[0xc0, 0x80])]
+            )),
+            0
+        );
+        assert_eq!(
+            owned_usize(invoke(
+                "extern:ByteArray.validateUTF8",
+                &[ba(&[0xed, 0xa0, 0x80])]
+            )),
+            0
+        );
+        assert_eq!(
+            ba_bytes(invoke("extern:ByteArray.emptyWithCapacity", &[n(64)])),
+            []
+        );
+    }
+
+    #[test]
+    fn nat_decidable_rows_report_bool_scalars() {
+        assert_eq!(owned_usize(invoke("extern:Nat.decEq", &[n(5), n(5)])), 1);
+        assert_eq!(owned_usize(invoke("extern:Nat.decEq", &[n(5), n(6)])), 0);
+        assert_eq!(owned_usize(invoke("extern:Nat.decLe", &[n(5), n(5)])), 1);
+        assert_eq!(owned_usize(invoke("extern:Nat.decLe", &[n(6), n(5)])), 0);
+        assert_eq!(owned_usize(invoke("extern:Nat.decLt", &[n(5), n(6)])), 1);
+        assert_eq!(owned_usize(invoke("extern:Nat.decLt", &[n(5), n(5)])), 0);
+        // Arbitrary-precision operands compare by value, not representation.
+        let big = Obj::mk_mpz(&[u64::from(u32::MAX) + 1], false);
+        assert_eq!(
+            owned_usize(invoke("extern:Nat.decEq", &[big.clone_ref(), big])),
+            1
+        );
     }
 }
