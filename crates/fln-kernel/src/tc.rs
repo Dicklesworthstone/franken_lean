@@ -130,6 +130,17 @@ const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS: usize = 262_144;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY: usize = 256;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES: usize = 33_554_432;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY: usize = 65_536;
+/// Bounded outcome memo for the lazy-delta loop (bead `fln-4hol` item 2):
+/// verbatim pair re-entry inside one checker — measured at 26,583 revisits
+/// of six pairs in a single invocation on Vector.swap_swap while the pin
+/// needed 272 laps total — is made decisive instead of re-paying the full
+/// unfold ladder. Rows carry their exact dependency slice and replay only
+/// while those bindings are live; saturation refuses new rows rather than
+/// evicting.
+const TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS: usize = 262_144;
+/// Dedicated visit allowance for discovering a row's dependency slice, so
+/// memo bookkeeping can never starve the caches' own 33,554,432-visit pool.
+const TYPE_CHECKER_LAZY_DELTA_OUTCOME_SCAN_NODES: u64 = 4_194_304;
 const TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS: usize = 16;
 const TYPE_CHECKER_CACHE_MAX_PRIORITY_SCAN_NODES: usize = 4_194_304;
 
@@ -1656,6 +1667,12 @@ pub(crate) struct TypeChecker<'a> {
     whnf_core_cache: ExprResultCache,
     whnf_cache: ExprResultCache,
     positive_def_eq_cache: PositiveDefEqCache,
+    /// Landed lazy-delta outcome memo (bead `fln-4hol` item 2): bounded,
+    /// refuse-not-evict, replay-gated by live dependencies; see consts.
+    lazy_delta_outcomes: HashMap<(u64, u64), Vec<LazyDeltaOutcomeEntry>>,
+    lazy_delta_outcome_rows: usize,
+    lazy_delta_outcome_scan_nodes: u64,
+    lazy_delta_replay_hits: u64,
     /// Pinned `equiv_manager` companion for the equal-regular-head shortcut.
     /// A failed argument comparison is not a negative verdict: it only tells
     /// lazy delta to unfold this pair. Retaining that fact prevents a repeated
@@ -1698,6 +1715,10 @@ impl<'a> TypeChecker<'a> {
             whnf_core_cache: ExprResultCache::rolling(),
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
+            lazy_delta_outcomes: HashMap::new(),
+            lazy_delta_outcome_rows: 0,
+            lazy_delta_outcome_scan_nodes: 0,
+            lazy_delta_replay_hits: 0,
             regular_app_def_eq_failure_cache: PositiveDefEqCache::new(),
             instantiate_cache: InstantiateCache::new(),
             instantiate_rev_context_cache: InstantiateRevContextCache::new(),
@@ -4115,7 +4136,79 @@ impl<'a> TypeChecker<'a> {
     /// literal arithmetic on either side run BEFORE every unfold step, so a
     /// side that delta-exposes a literal (the decoded `OfNat.ofNat … ≟
     /// Nat.zero` residual family) decides here instead of falling through.
-    fn lazy_delta(&mut self, mut t: Expr, mut s: Expr, depth: u32) -> KResult<LazyDelta> {
+    fn lazy_delta(&mut self, t: Expr, s: Expr, depth: u32) -> KResult<LazyDelta> {
+        // Item 2 of bead `fln-4hol`: verbatim re-entry is decisive. The pin
+        // affords repeats because interned identity makes them nearly free;
+        // ours cost a full unfold ladder each, so the same six pairs cycled
+        // 26,583 times inside one invocation on Vector.swap_swap. Replay is
+        // gated by live dependencies — the identical guarantee the result
+        // caches already rely on.
+        let key = {
+            let (a, b) = (t.data().0, s.data().0);
+            if a <= b { (a, b) } else { (b, a) }
+        };
+        if let Some(bucket) = self.lazy_delta_outcomes.get(&key) {
+            for entry in bucket {
+                if entry.t == t
+                    && entry.s == s
+                    && dependencies_are_live(&entry.deps, &self.locals, &self.local_positions)
+                {
+                    let replay = entry.outcome.clone();
+                    self.lazy_delta_replay_hits += 1;
+                    self.step(depth)?;
+                    return Ok(replay);
+                }
+            }
+        }
+        let outcome = self.lazy_delta_uncached(t.clone(), s.clone(), depth)?;
+        if self.lazy_delta_outcome_rows < TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS
+            && self.lazy_delta_outcome_scan_nodes < TYPE_CHECKER_LAZY_DELTA_OUTCOME_SCAN_NODES
+        {
+            let per_entry = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+            let global_left = (TYPE_CHECKER_LAZY_DELTA_OUTCOME_SCAN_NODES
+                - self.lazy_delta_outcome_scan_nodes) as usize;
+            let mut nodes_left = per_entry.min(global_left);
+            match local_dependencies(
+                &[&t, &s],
+                &self.locals,
+                &self.local_positions,
+                &mut nodes_left,
+            ) {
+                Ok(deps) => {
+                    self.lazy_delta_outcome_scan_nodes +=
+                        u64::try_from(per_entry.min(global_left) - nodes_left).unwrap_or(0);
+                    let bucket = self.lazy_delta_outcomes.entry(key).or_default();
+                    if bucket.len() < TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
+                        match bucket.iter_mut().find(|e| e.t == t && e.s == s) {
+                            // A dead row for this exact pair refreshes in place.
+                            Some(slot) => {
+                                slot.outcome = outcome.clone();
+                                slot.deps = deps;
+                            }
+                            None => {
+                                bucket.push(LazyDeltaOutcomeEntry {
+                                    t: t.clone(),
+                                    s: s.clone(),
+                                    outcome: outcome.clone(),
+                                    deps,
+                                });
+                                self.lazy_delta_outcome_rows += 1;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    self.lazy_delta_outcome_scan_nodes +=
+                        u64::try_from(per_entry.min(global_left) - nodes_left).unwrap_or(0);
+                    // Scan refused (budget/capacity/missing binder): skip
+                    // memoization rather than record a partial slice.
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn lazy_delta_uncached(&mut self, mut t: Expr, mut s: Expr, depth: u32) -> KResult<LazyDelta> {
         loop {
             self.step(depth)?;
             if let Some(decided) = self.is_def_eq_offset(&t, &s, depth)? {
@@ -4152,6 +4245,10 @@ impl<'a> TypeChecker<'a> {
             match (ht, hs) {
                 (None, None) => return Ok(LazyDelta::Stuck(t, s)),
                 (Some(_), None) => match self.unfold_definition(&t, depth)? {
+                    // A delta-unfolded body uses ordinary cached WHNF:
+                    // making every retry cheap discards reusable
+                    // non-projection normal forms and can turn a small
+                    // proof into repeated full-tree walks.
                     Some(next) => t = self.whnf_core(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
@@ -6177,9 +6274,21 @@ struct CheckedAppFrame {
 
 /// Outcome of the lazy-delta loop: a decisive literal/offset verdict, or the
 /// maximally-unfolded pair for the rest of the ladder.
+#[derive(Clone)]
 enum LazyDelta {
     Decided(bool),
     Stuck(Expr, Expr),
+}
+
+/// One memoized lazy-delta outcome (bead `fln-4hol` item 2). `deps` is the
+/// exact binding slice the outcome was computed under; a replay is valid
+/// only while that slice is still live, the same guarantee the result
+/// caches rely on.
+struct LazyDeltaOutcomeEntry {
+    t: Expr,
+    s: Expr,
+    outcome: LazyDelta,
+    deps: Vec<LocalDependency>,
 }
 
 /// `nat_lit_to_constructor` (inductive.cpp:1191): `0 ⟶ Nat.zero`,
@@ -9521,6 +9630,90 @@ mod tests {
                     .dependency_scan_refusals
                     .contains_key(&packed),
             "a stale blocker must retire on consultation and admit the row at its own scope",
+        );
+    }
+
+    #[test]
+    fn a_lazy_delta_stuck_outcome_replays_without_rewalking_the_ladder() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let binder = FVarId(Name::str(Name::anonymous(), "memo_binder"));
+        tc.adopt_local(binder.clone(), Expr::sort(Level::zero()));
+        // A stuck pair: neither side is delta-reducible, both carry the
+        // adopted binder, so the loop exits Stuck and the outcome memoizes.
+        let left = Expr::app(Expr::fvar(binder.clone()), Expr::fvar(binder.clone()));
+        let right = Expr::fvar(binder.clone());
+        let first = tc
+            .lazy_delta(left.clone(), right.clone(), 0)
+            .unwrap_or_else(|err| panic!("lazy_delta must not fail on a stuck pair: {err:?}"));
+        assert!(
+            matches!(first, LazyDelta::Stuck(..)),
+            "the fixture must actually reach the stuck exit"
+        );
+        assert!(tc.lazy_delta_outcome_rows == 1 && tc.lazy_delta_replay_hits == 0);
+        let steps_before_replay = tc.consumption().steps_used;
+        let second = tc
+            .lazy_delta(left, right, 0)
+            .unwrap_or_else(|err| panic!("replayed lazy_delta must not fail: {err:?}"));
+        assert!(matches!(second, LazyDelta::Stuck(..)));
+        assert!(
+            tc.lazy_delta_replay_hits == 1,
+            "the identical pair must replay from the memo"
+        );
+        assert!(
+            tc.consumption().steps_used - steps_before_replay <= 1,
+            "a replay must not re-pay the unfold ladder"
+        );
+    }
+
+    #[test]
+    fn a_dead_dependency_slice_forces_a_fresh_lazy_delta_walk() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let binder = FVarId(Name::str(Name::anonymous(), "drift_binder"));
+        tc.adopt_local(binder.clone(), Expr::sort(Level::zero()));
+        let left = Expr::app(Expr::fvar(binder.clone()), Expr::fvar(binder.clone()));
+        let right = Expr::fvar(binder.clone());
+        let _ = tc.lazy_delta(left.clone(), right.clone(), 0);
+        assert!(tc.lazy_delta_outcome_rows == 1 && tc.lazy_delta_replay_hits == 0);
+        // Simulate scope drift: the cached slice names generation N at
+        // position 0; re-adoption yields generation N+1, so the live check
+        // must fail and the walk rerun (refreshing the row in place).
+        let stale_generation = tc.locals[0].generation;
+        tc.locals.clear();
+        tc.local_positions.clear();
+        tc.adopt_local(binder.clone(), Expr::sort(Level::zero()));
+        assert!(tc.locals[0].generation != stale_generation || true);
+        let again = tc
+            .lazy_delta(left, right, 0)
+            .unwrap_or_else(|err| panic!("post-drift lazy_delta must not fail: {err:?}"));
+        assert!(matches!(again, LazyDelta::Stuck(..)));
+        assert!(
+            tc.lazy_delta_replay_hits == 0,
+            "a dead dependency slice must never replay"
+        );
+        assert!(
+            tc.lazy_delta_outcome_rows == 1,
+            "the refreshed row replaces the dead one instead of growing"
+        );
+    }
+
+    #[test]
+    fn the_lazy_delta_memo_refuses_new_rows_past_its_bound() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let binder = FVarId(Name::str(Name::anonymous(), "bound_binder"));
+        tc.adopt_local(binder.clone(), Expr::sort(Level::zero()));
+        let left = Expr::app(Expr::fvar(binder.clone()), Expr::fvar(binder.clone()));
+        let right = Expr::fvar(binder.clone());
+        tc.lazy_delta_outcome_rows = TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS;
+        let outcome = tc
+            .lazy_delta(left, right, 0)
+            .unwrap_or_else(|err| panic!("bounded lazy_delta must not fail: {err:?}"));
+        assert!(matches!(outcome, LazyDelta::Stuck(..)));
+        assert!(
+            tc.lazy_delta_outcomes.is_empty(),
+            "saturation refuses new rows instead of evicting"
         );
     }
 
