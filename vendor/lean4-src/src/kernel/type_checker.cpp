@@ -20,6 +20,25 @@ Author: Leonardo de Moura
 #include "kernel/quot.h"
 #include "kernel/inductive.h"
 
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+
+namespace lean {
+namespace fln_probe {
+static std::atomic<unsigned long long> g_core_entries{0};
+static std::atomic<unsigned long long> g_lap_iters{0};
+static void fln_final_print() {
+    fprintf(stderr, "PINFINAL core_entries=%llu lap_iters=%llu\n",
+            g_core_entries.load(), g_lap_iters.load());
+}
+static const bool g_atexit_once = []() {
+    std::atexit(fln_final_print);
+    return true;
+}();
+}  // namespace fln_probe
+
+
 namespace lean {
 static name * g_kernel_fresh = nullptr;
 static expr * g_dont_care    = nullptr;
@@ -972,6 +991,16 @@ lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
 /** \remark t_n, s_n are updated. */
 lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
     while (true) {
+        unsigned long long fln_it =
+            fln_probe::g_lap_iters.fetch_add(1, std::memory_order_relaxed);
+        if (fln_it < 40 || (fln_it >= 100000 && fln_it % 1000000 == 0)) {
+            fprintf(stderr,
+                    "PIN lap=%llu core=%llu tHash=%u sHash=%u tKind=%d sKind=%d\n",
+                    fln_it,
+                    lean::fln_probe::g_core_entries.load(std::memory_order_relaxed),
+                    hash(t_n), hash(s_n), static_cast<int>(t_n.kind()),
+                    static_cast<int>(s_n.kind()));
+        }
         lbool r = is_def_eq_offset(t_n, s_n);
         if (r != l_undef) return r;
 
@@ -1054,6 +1083,7 @@ bool type_checker::is_def_eq_unit_like(expr const & t, expr const & s) {
 }
 
 bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
+    fln_probe::g_core_entries.fetch_add(1, std::memory_order_relaxed);
     check_system("is_definitionally_equal", /* do_check_interrupted */ true);
     bool use_hash = true;
     lbool r = quick_is_def_eq(t, s, use_hash);
