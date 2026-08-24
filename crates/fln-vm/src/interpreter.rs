@@ -547,6 +547,22 @@ enum IntrinsicImplementation {
     NatDecEq,
     NatDecLe,
     NatDecLt,
+    IntAdd,
+    IntSub,
+    IntMul,
+    IntNeg,
+    IntNegSucc,
+    IntOfNat,
+    IntNatAbs,
+    IntDecEq,
+    IntDecLe,
+    IntDecLt,
+    IntDecNonneg,
+    IntEDiv,
+    IntEMod,
+    IntTDiv,
+    IntTMod,
+    IntDivExact,
     StringAppend,
     StringAtEnd,
     StringCompare,
@@ -641,6 +657,22 @@ impl IntrinsicImplementation {
             "extern:Nat.decEq" => Self::NatDecEq,
             "extern:Nat.decLe" => Self::NatDecLe,
             "extern:Nat.decLt" => Self::NatDecLt,
+            "extern:Int.add" => Self::IntAdd,
+            "extern:Int.sub" => Self::IntSub,
+            "extern:Int.mul" => Self::IntMul,
+            "extern:Int.neg" => Self::IntNeg,
+            "extern:Int.negSucc" => Self::IntNegSucc,
+            "extern:Int.ofNat" => Self::IntOfNat,
+            "extern:Int.natAbs" => Self::IntNatAbs,
+            "extern:Int.decEq" => Self::IntDecEq,
+            "extern:Int.decLe" => Self::IntDecLe,
+            "extern:Int.decLt" => Self::IntDecLt,
+            "extern:Int.decNonneg" => Self::IntDecNonneg,
+            "extern:Int.ediv" => Self::IntEDiv,
+            "extern:Int.emod" => Self::IntEMod,
+            "extern:Int.tdiv" => Self::IntTDiv,
+            "extern:Int.tmod" => Self::IntTMod,
+            "extern:Int.divExact" => Self::IntDivExact,
             "extern:String.Internal.append" => Self::StringAppend,
             "extern:String.Internal.atEnd" => Self::StringAtEnd,
             "extern:String.Internal.length" => Self::StringLength,
@@ -3345,6 +3377,203 @@ fn invoke_intrinsic(
             )??;
             finish_nat_result(result, max_nat_magnitude_bytes)
         }
+        // Int rows (bead franken_lean-m7vm). The pin's scalar plane is
+        // i32-ranged: every fast path computes in i64 and re-boxes through
+        // lean_int64_to_int (src/include/lean/lean.h:1611-1623), while big
+        // operands take the exact mpz paths (lean_int_big_*,
+        // src/runtime/object.cpp). Both planes produce the same mathematical
+        // value, so these handlers compute on sign + magnitude pairs and
+        // canonicalize once; only the zero-divisor contracts differ per row.
+        IntrinsicImplementation::IntAdd | IntrinsicImplementation::IntSub => {
+            expect_arity(row, args, 2)?;
+            let is_add = implementation == IntrinsicImplementation::IntAdd;
+            let (negative, magnitude) = with_int_views(
+                &args[0],
+                &args[1],
+                if is_add { "Int.add" } else { "Int.sub" },
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    let estimate = u128::from(
+                        left.magnitude
+                            .bit_length()
+                            .max(right.magnitude.bit_length()),
+                    ) + 1;
+                    ensure_nat_bits(max_nat_magnitude_bytes, estimate)?;
+                    Ok(if is_add {
+                        signed_add(left, right)
+                    } else {
+                        signed_sub(left, right)
+                    })
+                },
+            )??;
+            finish_int_result(negative, magnitude, max_nat_magnitude_bytes)
+        }
+        IntrinsicImplementation::IntMul => {
+            expect_arity(row, args, 2)?;
+            let (negative, product) = with_int_views(
+                &args[0],
+                &args[1],
+                "Int.mul",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    let estimate = u128::from(left.magnitude.bit_length())
+                        .saturating_add(u128::from(right.magnitude.bit_length()));
+                    ensure_nat_bits(max_nat_magnitude_bytes, estimate)?;
+                    Ok(signed_mul(left, right))
+                },
+            )??;
+            finish_int_result(negative, product, max_nat_magnitude_bytes)
+        }
+        IntrinsicImplementation::IntNeg => {
+            expect_arity(row, args, 1)?;
+            let (negative, magnitude) = with_int_view(
+                &args[0],
+                "Int.neg",
+                0,
+                |value| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(value.magnitude.bit_length()),
+                    )?;
+                    Ok((
+                        !value.negative && !value.magnitude.is_zero(),
+                        value.magnitude.to_owned(),
+                    ))
+                },
+            )??;
+            finish_int_result(negative, magnitude, max_nat_magnitude_bytes)
+        }
+        // Init/Data/Int/Basic.lean:61 — negSucc n is -(n + 1), never zero.
+        IntrinsicImplementation::IntNegSucc => {
+            expect_arity(row, args, 1)?;
+            let (magnitude, _) = with_nat_view(&args[0], "Int.negSucc", 0, |value| {
+                let successor_bits = u128::from(value.bit_length()) + 1;
+                ensure_nat_bits(max_nat_magnitude_bytes, successor_bits)?;
+                Ok::<_, IntrinsicFailure>((
+                    value.add(BigNatView::from_limbs_le(&[1])),
+                    successor_bits,
+                ))
+            })??;
+            finish_int_result(true, magnitude, max_nat_magnitude_bytes)
+        }
+        // Init/Data/Int/Basic.lean:60 — ofNat re-boxes a Nat as an Int; the
+        // value plane is identical and only the canonical form can differ.
+        IntrinsicImplementation::IntOfNat => {
+            expect_arity(row, args, 1)?;
+            let (magnitude, _) = with_nat_view(&args[0], "Int.ofNat", 0, |value| {
+                ensure_nat_bits(max_nat_magnitude_bytes, u128::from(value.bit_length()))?;
+                Ok::<_, IntrinsicFailure>((value.to_owned(), ()))
+            })??;
+            finish_int_result(false, magnitude, max_nat_magnitude_bytes)
+        }
+        // Init/Data/Int/Basic.lean:326 — natAbs keeps nonnegative values and
+        // negates the rest; the result is a Nat, not an Int.
+        IntrinsicImplementation::IntNatAbs => {
+            expect_arity(row, args, 1)?;
+            let magnitude = with_int_view(&args[0], "Int.natAbs", 0, |value| {
+                ensure_nat_bits(
+                    max_nat_magnitude_bytes,
+                    u128::from(value.magnitude.bit_length()),
+                )?;
+                Ok::<_, IntrinsicFailure>(value.magnitude.to_owned())
+            })??;
+            finish_nat_result(magnitude, max_nat_magnitude_bytes)
+        }
+        IntrinsicImplementation::IntDecEq
+        | IntrinsicImplementation::IntDecLe
+        | IntrinsicImplementation::IntDecLt => {
+            expect_arity(row, args, 2)?;
+            use std::cmp::Ordering;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::IntDecEq => "Int.decEq",
+                IntrinsicImplementation::IntDecLe => "Int.decLe",
+                _ => "Int.decLt",
+            };
+            let ordering =
+                with_int_views(
+                    &args[0],
+                    &args[1],
+                    operation,
+                    |left, right| match implementation {
+                        IntrinsicImplementation::IntDecEq => {
+                            left.magnitude.beq(right.magnitude) && left.negative == right.negative
+                        }
+                        _ => match signed_cmp(left, right) {
+                            Ordering::Equal => implementation == IntrinsicImplementation::IntDecLe,
+                            Ordering::Less => true,
+                            Ordering::Greater => false,
+                        },
+                    },
+                )?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        // Init/Data/Int/Basic.lean:278.
+        IntrinsicImplementation::IntDecNonneg => {
+            expect_arity(row, args, 1)?;
+            let nonneg = with_int_view(&args[0], "Int.decNonneg", 0, |value| !value.negative)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(nonneg))))
+        }
+        // T-rounding division: lean_int_div and lean_int_div_exact share one
+        // body (lean.h:1698-1746); truncation toward zero, divisor zero
+        // answers box(0). Euclidean division adjusts the quotient when the
+        // truncated remainder is negative (lean.h:1765-1805).
+        IntrinsicImplementation::IntTDiv
+        | IntrinsicImplementation::IntDivExact
+        | IntrinsicImplementation::IntEDiv => {
+            expect_arity(row, args, 2)?;
+            let euclidean = implementation == IntrinsicImplementation::IntEDiv;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::IntTDiv => "Int.tdiv",
+                IntrinsicImplementation::IntDivExact => "Int.divExact",
+                _ => "Int.ediv",
+            };
+            let (negative, quotient) = with_int_views(
+                &args[0],
+                &args[1],
+                operation,
+                |numerator, denominator| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(numerator.magnitude.bit_length()),
+                    )?;
+                    if denominator.magnitude.is_zero() {
+                        return Ok((false, BigNat::zero()));
+                    }
+                    Ok(signed_quotient(numerator, denominator, euclidean))
+                },
+            )??;
+            finish_int_result(negative, quotient, max_nat_magnitude_bytes)
+        }
+        // T-rounding remainder follows the dividend's sign; a zero divisor
+        // returns the dividend itself (lean.h:1749-1762). The Euclidean
+        // remainder is normalized into 0 <= r < |d| (lean.h:1807-1845).
+        IntrinsicImplementation::IntTMod | IntrinsicImplementation::IntEMod => {
+            expect_arity(row, args, 2)?;
+            let euclidean = implementation == IntrinsicImplementation::IntEMod;
+            let operation: &'static str = if euclidean { "Int.emod" } else { "Int.tmod" };
+            let zero_divisor_identity = with_int_views(
+                &args[0],
+                &args[1],
+                operation,
+                |numerator, denominator| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(numerator.magnitude.bit_length()),
+                    )?;
+                    Ok(denominator.magnitude.is_zero())
+                },
+            )??;
+            if zero_divisor_identity {
+                return Ok(IntrinsicResult::owned(args[0].clone_ref()));
+            }
+            let (negative, remainder) = with_int_views(
+                &args[0],
+                &args[1],
+                operation,
+                |numerator, denominator| -> Result<_, IntrinsicFailure> {
+                    Ok(signed_remainder(numerator, denominator, euclidean))
+                },
+            )??;
+            finish_int_result(negative, remainder, max_nat_magnitude_bytes)
+        }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
             let mut lhs = string_value(&args[0], "String.append", 0)?;
@@ -4118,6 +4347,22 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatDecLt
         | IntrinsicImplementation::NatDivExact
         | IntrinsicImplementation::NatModCore
+        | IntrinsicImplementation::IntAdd
+        | IntrinsicImplementation::IntSub
+        | IntrinsicImplementation::IntMul
+        | IntrinsicImplementation::IntNeg
+        | IntrinsicImplementation::IntNegSucc
+        | IntrinsicImplementation::IntOfNat
+        | IntrinsicImplementation::IntNatAbs
+        | IntrinsicImplementation::IntDecEq
+        | IntrinsicImplementation::IntDecLe
+        | IntrinsicImplementation::IntDecLt
+        | IntrinsicImplementation::IntDecNonneg
+        | IntrinsicImplementation::IntEDiv
+        | IntrinsicImplementation::IntEMod
+        | IntrinsicImplementation::IntTDiv
+        | IntrinsicImplementation::IntTMod
+        | IntrinsicImplementation::IntDivExact
         | IntrinsicImplementation::ByteArrayBeq
         | IntrinsicImplementation::ByteArrayCopySlice
         | IntrinsicImplementation::ByteArrayData
@@ -4396,6 +4641,168 @@ fn bool_value(value: &Obj, operation: &'static str, argument: usize) -> Result<b
             value,
         }),
     }
+}
+
+/// A decoded Marrow `Int`: a sign plus its magnitude. The pin stores small
+/// values as i32-range scalars — `(int)((unsigned)lean_unbox(a))`,
+/// src/include/lean/lean.h:1616 — and everything else as a signed mpz whose
+/// `m_size` field carries the sign.
+struct IntView<'a> {
+    negative: bool,
+    magnitude: BigNatView<'a>,
+}
+
+fn with_int_view<R>(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+    use_view: impl FnOnce(IntView<'_>) -> R,
+) -> Result<R, VmRefusal> {
+    if value.is_scalar() {
+        let signed = i64::from(value.unbox() as u32 as i32);
+        let limbs = [signed.unsigned_abs()];
+        return Ok(use_view(IntView {
+            negative: signed < 0,
+            magnitude: BigNatView::from_limbs_le(&limbs),
+        }));
+    }
+    if value_kind(value) != ValueKind::Mpz {
+        return Err(type_mismatch(operation, argument, "Int", value));
+    }
+    let Some((_, size, limbs)) = value.try_mpz_view() else {
+        return Err(type_mismatch(operation, argument, "Int", value));
+    };
+    Ok(use_view(IntView {
+        negative: size < 0,
+        magnitude: BigNatView::from_limbs_le(limbs),
+    }))
+}
+
+fn with_int_views<R>(
+    left: &Obj,
+    right: &Obj,
+    operation: &'static str,
+    use_views: impl FnOnce(IntView<'_>, IntView<'_>) -> R,
+) -> Result<R, VmRefusal> {
+    with_int_view(left, operation, 0, |left| {
+        with_int_view(right, operation, 1, |right| use_views(left, right))
+    })?
+}
+
+fn subtract_magnitudes(minuend: IntView<'_>, subtrahend: IntView<'_>) -> (bool, BigNat) {
+    if minuend.magnitude.beq(subtrahend.magnitude) {
+        (false, BigNat::zero())
+    } else if minuend.magnitude.ble(subtrahend.magnitude) {
+        (true, subtrahend.magnitude.sub(minuend.magnitude))
+    } else {
+        (false, minuend.magnitude.sub(subtrahend.magnitude))
+    }
+}
+
+fn signed_add(left: IntView<'_>, right: IntView<'_>) -> (bool, BigNat) {
+    match (left.negative, right.negative) {
+        (false, false) => (false, left.magnitude.add(right.magnitude)),
+        (true, true) => (true, left.magnitude.add(right.magnitude)),
+        (true, false) => subtract_magnitudes(right, left),
+        (false, true) => subtract_magnitudes(left, right),
+    }
+}
+
+fn signed_sub(left: IntView<'_>, right: IntView<'_>) -> (bool, BigNat) {
+    match (left.negative, right.negative) {
+        (false, false) => subtract_magnitudes(left, right),
+        (true, true) => subtract_magnitudes(right, left),
+        (true, false) => (true, left.magnitude.add(right.magnitude)),
+        (false, true) => (false, left.magnitude.add(right.magnitude)),
+    }
+}
+
+fn signed_mul(left: IntView<'_>, right: IntView<'_>) -> (bool, BigNat) {
+    (
+        left.negative != right.negative,
+        left.magnitude.mul(right.magnitude),
+    )
+}
+
+fn cmp_magnitudes(left: BigNatView<'_>, right: BigNatView<'_>) -> std::cmp::Ordering {
+    if left.beq(right) {
+        std::cmp::Ordering::Equal
+    } else if left.ble(right) {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    }
+}
+
+fn signed_cmp(left: IntView<'_>, right: IntView<'_>) -> std::cmp::Ordering {
+    match (left.negative, right.negative) {
+        (false, true) => std::cmp::Ordering::Greater,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, false) => cmp_magnitudes(left.magnitude, right.magnitude),
+        (true, true) => cmp_magnitudes(right.magnitude, left.magnitude),
+    }
+}
+
+/// Truncated division shares its body across tdiv and divExact; the Euclidean
+/// form bumps the quotient when the truncated remainder is negative so the
+/// final remainder lands in `0 <= r < |d|` (lean.h:1765-1805).
+fn signed_quotient(
+    numerator: IntView<'_>,
+    denominator: IntView<'_>,
+    euclidean: bool,
+) -> (bool, BigNat) {
+    let truncated = numerator.magnitude.div(denominator.magnitude);
+    let remainder = numerator.magnitude.rem(denominator.magnitude);
+    let quotient = if euclidean && numerator.negative && !remainder.is_zero() {
+        truncated.as_view().add(BigNatView::from_limbs_le(&[1]))
+    } else {
+        truncated
+    };
+    let negative = (numerator.negative != denominator.negative) && !quotient.is_zero();
+    (negative, quotient)
+}
+
+/// The T-rounding remainder keeps the dividend's sign; the E-rounding form
+/// normalizes into a nonnegative residue (lean.h:1749-1845).
+fn signed_remainder(
+    numerator: IntView<'_>,
+    denominator: IntView<'_>,
+    euclidean: bool,
+) -> (bool, BigNat) {
+    let truncated = numerator.magnitude.rem(denominator.magnitude);
+    if euclidean && numerator.negative && !truncated.is_zero() {
+        (false, denominator.magnitude.sub(truncated.as_view()))
+    } else {
+        (numerator.negative && !truncated.is_zero(), truncated)
+    }
+}
+
+/// Canonicalize a signed magnitude exactly as the pin re-boxes results:
+/// scalar when it fits the i32 plane (lean_int64_to_int), signed mpz
+/// otherwise, zero always positive.
+fn int_obj(negative: bool, magnitude: &BigNat) -> Obj {
+    if magnitude.is_zero() {
+        return Obj::mk_int(0);
+    }
+    if let Some(word) = magnitude.to_u64()
+        && let Ok(small) = i32::try_from(word)
+    {
+        return Obj::mk_int(if negative {
+            -i64::from(small)
+        } else {
+            i64::from(small)
+        });
+    }
+    Obj::mk_mpz(magnitude.limbs_le(), negative)
+}
+
+fn finish_int_result(
+    negative: bool,
+    magnitude: BigNat,
+    max_nat_magnitude_bytes: u64,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    ensure_nat_bits(max_nat_magnitude_bytes, u128::from(magnitude.bit_length()))?;
+    Ok(IntrinsicResult::owned(int_obj(negative, &magnitude)))
 }
 
 fn array_value(
@@ -5204,6 +5611,202 @@ mod tests {
     #[test]
     fn nat_arith_rows_resolve_and_stay_off_managerless_task_path() {
         for row in ["extern:Nat.divExact", "extern:Nat.modCore"] {
+            assert_ne!(
+                IntrinsicImplementation::for_row(row),
+                IntrinsicImplementation::Unsupported,
+                "{row} must resolve"
+            );
+            assert!(!IntrinsicImplementation::for_row(row).is_managerless_task());
+        }
+    }
+    /// Decode an Int result the way the pin's consumers read it back: scalar
+    /// via `(int)((unsigned)lean_unbox(a))`, mpz by sign + magnitude limbs.
+    fn int_words(result: Result<Obj, VmRefusal>) -> (bool, Vec<u64>, bool) {
+        let object = result.expect("the intrinsic answers");
+        if object.is_scalar() {
+            let signed = object.unbox() as u32 as i32;
+            (signed < 0, vec![signed.unsigned_abs() as u64], true)
+        } else {
+            let (_, size, limbs) = object.mpz_view();
+            (size < 0, limbs.to_vec(), false)
+        }
+    }
+
+    fn int_i64(result: Result<Obj, VmRefusal>) -> i64 {
+        let object = result.expect("the intrinsic answers");
+        assert!(object.is_scalar(), "expected a scalar-plane Int");
+        i64::from(object.unbox() as u32 as i32)
+    }
+
+    fn i(value: i64) -> Obj {
+        Obj::mk_int(value)
+    }
+
+    #[test]
+    fn int_arithmetic_matches_the_pin_scalar_plane() {
+        assert_eq!(int_i64(invoke("extern:Int.add", &[i(7), i(-3)])), 4);
+        assert_eq!(int_i64(invoke("extern:Int.sub", &[i(7), i(-3)])), 10);
+        assert_eq!(int_i64(invoke("extern:Int.mul", &[i(-6), i(-4)])), 24);
+        assert_eq!(
+            int_i64(invoke("extern:Int.neg", &[i(-2147483647)])),
+            2147483647
+        );
+        // lean_int64_to_int re-boxes past the i32 scalar plane, so boundary
+        // arithmetic must land in the mpz plane rather than wrap.
+        let overflow = invoke("extern:Int.add", &[i(i64::from(i32::MAX)), i(1)]);
+        assert!(!overflow.as_ref().expect("answers").is_scalar());
+        let (negative, limbs, _) = int_words(overflow);
+        assert!(!negative);
+        assert_eq!(
+            BigNat::from_limbs_le(limbs),
+            BigNat::from_u64(2_147_483_648)
+        );
+        let underflow = invoke("extern:Int.sub", &[i(i64::from(i32::MIN)), i(1)]);
+        let (negative, _, _) = int_words(underflow);
+        assert!(negative);
+    }
+
+    #[test]
+    fn int_big_operands_take_the_exact_mpz_plane() {
+        // Operands beyond u64: (2^128 + 1) - 1 == 2^128 must not lose a limb.
+        let huge = Obj::mk_mpz(&[1, 0, 1], false);
+        let one = Obj::mk_mpz(&[1], false);
+        let (negative, limbs, _) = int_words(invoke("extern:Int.sub", &[huge.clone_ref(), one]));
+        assert!(!negative);
+        assert_eq!(BigNat::from_limbs_le(limbs), BigNat::from_u64(1).shl(128));
+        let (negative, limbs, _) =
+            int_words(invoke("extern:Int.mul", &[huge, Obj::mk_mpz(&[3], true)]));
+        assert!(negative);
+        assert_eq!(
+            BigNat::from_limbs_le(limbs),
+            BigNat::from_u64(3).mul(&BigNat::from_limbs_le(vec![1, 0, 1]))
+        );
+    }
+
+    #[test]
+    fn int_tdiv_tmod_follow_the_pin_truncation_contracts() {
+        // Sign matrices quoted verbatim from Init/Data/Int/DivMod/Basic.lean.
+        for (x, y, q, r) in [
+            (12, 7, 1, 5),
+            (12, -7, -1, 5),
+            (-12, 7, -1, -5),
+            (-12, -7, 1, -5),
+        ] {
+            assert_eq!(
+                int_i64(invoke("extern:Int.tdiv", &[i(x), i(y)])),
+                q,
+                "tdiv {x} {y}"
+            );
+            assert_eq!(
+                int_i64(invoke("extern:Int.tmod", &[i(x), i(y)])),
+                r,
+                "tmod {x} {y}"
+            );
+        }
+        // A zero divisor: tdiv answers box(0); tmod returns the dividend.
+        assert_eq!(int_i64(invoke("extern:Int.tdiv", &[i(7), i(0)])), 0);
+        assert_eq!(int_i64(invoke("extern:Int.tmod", &[i(7), i(0)])), 7);
+        assert_eq!(int_i64(invoke("extern:Int.tmod", &[i(-7), i(0)])), -7);
+    }
+    #[test]
+    fn int_ediv_emod_follow_the_pin_euclidean_contracts() {
+        for (x, y, q, r) in [(12, -7, -1, 5), (-12, 7, -2, 2), (-12, -7, 2, 2)] {
+            assert_eq!(
+                int_i64(invoke("extern:Int.ediv", &[i(x), i(y)])),
+                q,
+                "ediv {x} {y}"
+            );
+            assert_eq!(
+                int_i64(invoke("extern:Int.emod", &[i(x), i(y)])),
+                r,
+                "emod {x} {y}"
+            );
+        }
+        assert_eq!(int_i64(invoke("extern:Int.ediv", &[i(-12), i(7)])), -2);
+        // A zero divisor: ediv answers box(0); emod returns the dividend.
+        assert_eq!(int_i64(invoke("extern:Int.ediv", &[i(7), i(0)])), 0);
+        assert_eq!(int_i64(invoke("extern:Int.emod", &[i(-7), i(0)])), -7);
+    }
+
+    #[test]
+    fn int_div_exact_shares_tdiv_runtime() {
+        assert_eq!(int_i64(invoke("extern:Int.divExact", &[i(21), i(3)])), 7);
+        assert_eq!(int_i64(invoke("extern:Int.divExact", &[i(-21), i(3)])), -7);
+        assert_eq!(int_i64(invoke("extern:Int.divExact", &[i(21), i(-3)])), -7);
+        assert_eq!(int_i64(invoke("extern:Int.divExact", &[i(0), i(22)])), 0);
+        assert_eq!(int_i64(invoke("extern:Int.divExact", &[i(9), i(0)])), 0);
+    }
+
+    #[test]
+    fn int_neg_succ_of_nat_and_nat_abs_convert_like_the_pin() {
+        // negSucc n = -(n + 1): Basic.lean:61.
+        assert_eq!(int_i64(invoke("extern:Int.negSucc", &[n(0)])), -1);
+        assert_eq!(int_i64(invoke("extern:Int.negSucc", &[n(5)])), -6);
+        assert_eq!(int_i64(invoke("extern:Int.ofNat", &[n(5)])), 5);
+        assert_eq!(int_i64(invoke("extern:Int.natAbs", &[i(-9)])), 9);
+        assert_eq!(owned_usize(invoke("extern:Int.natAbs", &[i(5)])), 5);
+        // natAbs of a big negative keeps the exact magnitude in the Nat
+        // plane: |-(2^64)| = 2^64, one limb past the scalar Nat ceiling.
+        let big_negative = Obj::mk_mpz(&[0, 1], true);
+        let absolute = invoke("extern:Int.natAbs", &[big_negative]).expect("answers");
+        let (_, size, limbs) = absolute.mpz_view();
+        assert_eq!(size, 2);
+        assert_eq!(limbs, &[0u64, 1u64]);
+        // ofNat over a big Nat re-boxes without changing the magnitude.
+        let big_nat = Obj::mk_mpz(&[0, 1], false);
+        let widened = invoke("extern:Int.ofNat", &[big_nat]).expect("answers");
+        let (negative, limbs, _) = int_words(Ok(widened));
+        assert!(!negative);
+        assert_eq!(limbs, vec![0u64, 1u64]);
+    }
+
+    #[test]
+    fn int_decidables_span_both_planes() {
+        assert_eq!(owned_usize(invoke("extern:Int.decEq", &[i(-3), i(-3)])), 1);
+        assert_eq!(owned_usize(invoke("extern:Int.decEq", &[i(-3), i(3)])), 0);
+        assert_eq!(owned_usize(invoke("extern:Int.decLt", &[i(-4), i(-3)])), 1);
+        assert_eq!(owned_usize(invoke("extern:Int.decLt", &[i(-3), i(-4)])), 0);
+        assert_eq!(owned_usize(invoke("extern:Int.decLe", &[i(-4), i(3)])), 1);
+        // Scalar vs mpz representation of the same value compares by value.
+        let big_five = Obj::mk_mpz(&[5], false);
+        assert_eq!(
+            owned_usize(invoke("extern:Int.decEq", &[big_five, i(5)])),
+            1
+        );
+        assert_eq!(owned_usize(invoke("extern:Int.decNonneg", &[i(0)])), 1);
+        assert_eq!(owned_usize(invoke("extern:Int.decNonneg", &[i(-1)])), 0);
+    }
+
+    #[test]
+    fn int_zero_results_stay_positive_and_canonical() {
+        let product = invoke("extern:Int.mul", &[i(-5), i(0)]);
+        assert_eq!(int_i64(product), 0);
+        let difference = invoke("extern:Int.sub", &[i(-2), i(-2)]);
+        assert_eq!(int_i64(difference), 0);
+        // neg of zero keeps the canonical positive scalar.
+        assert_eq!(int_i64(invoke("extern:Int.neg", &[i(0)])), 0);
+    }
+
+    #[test]
+    fn int_rows_resolve_and_stay_off_managerless_task_path() {
+        for row in [
+            "extern:Int.add",
+            "extern:Int.sub",
+            "extern:Int.mul",
+            "extern:Int.neg",
+            "extern:Int.negSucc",
+            "extern:Int.ofNat",
+            "extern:Int.natAbs",
+            "extern:Int.decEq",
+            "extern:Int.decLe",
+            "extern:Int.decLt",
+            "extern:Int.decNonneg",
+            "extern:Int.ediv",
+            "extern:Int.emod",
+            "extern:Int.tdiv",
+            "extern:Int.tmod",
+            "extern:Int.divExact",
+        ] {
             assert_ne!(
                 IntrinsicImplementation::for_row(row),
                 IntrinsicImplementation::Unsupported,
