@@ -12961,3 +12961,282 @@ fn the_admission_module_contains_no_panicking_construct() {
          result on the real module is vacuous"
     );
 }
+
+/// An `Init.Add`-shaped class block: one family universe, one parameter, one
+/// field-bearing constructor, zero indices, and the canonical eliminator.
+/// Depths mirror the real pin data (see the `fln olean inspect --constants`
+/// sketch of `Init/Prelude.olean`).
+fn class_add_entries() -> Vec<ConstantEntry> {
+    let add = checker_qualified(&["Add"]);
+    let mk = checker_qualified(&["Add", "mk"]);
+    let rec = checker_qualified(&["Add", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let ptype = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let add_of = |parameter: Expr| {
+        Expr::app(
+            Expr::const_(primary_name("Add"), vec![u.clone()]),
+            parameter,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    // The constructor's field type `α → α → α`, written under `[α]`.
+    let arrow_alpha = || {
+        primary_pi(
+            "a",
+            BinderInfo::Default,
+            bv(0),
+            primary_pi("a", BinderInfo::Default, bv(1), bv(2)),
+        )
+    };
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            add_of(bv(0)),
+            Expr::sort(v.clone()),
+        )
+    };
+    let mk_applied = |alpha: Expr, field: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Add", "mk"]), vec![u.clone()]),
+                alpha,
+            ),
+            field,
+        )
+    };
+    // Minor: `∀ a : α → α → α, motive (mk α a)` under `[α, motive]`.
+    let minor_type = || {
+        primary_pi(
+            "a",
+            BinderInfo::Default,
+            primary_pi(
+                "a",
+                BinderInfo::Default,
+                bv(1),
+                primary_pi("a", BinderInfo::Default, bv(2), bv(3)),
+            ),
+            Expr::app(bv(1), mk_applied(bv(2), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        ptype(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "minor",
+                BinderInfo::Default,
+                minor_type(),
+                primary_pi(
+                    "major",
+                    BinderInfo::Default,
+                    add_of(bv(2)),
+                    Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        ),
+    );
+    // Iota rule: `λ α motive minor a. minor a`.
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        ptype(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("minor"),
+                minor_type(),
+                Expr::lam(
+                    primary_name("add"),
+                    arrow_alpha(),
+                    Expr::app(bv(1), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            add.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name],
+                decoded(&primary_pi("α", BinderInfo::Default, ptype(), ptype())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![add.clone()],
+                    vec![mk.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            mk.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    ptype(),
+                    primary_pi("add", BinderInfo::Default, arrow_alpha(), add_of(bv(1))),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(add.clone(), 0, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![add],
+                    1,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(mk, 1, decoded(&rule_rhs))],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_class_shaped_add_block_is_reconstructed() {
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &class_add_entries(),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "class-shaped Add block admits: {verdict:?}"
+    );
+}
+
+#[test]
+fn kr600_803_class_block_refuses_a_forged_field_count() {
+    let mut entries = class_add_entries();
+    let declaration = entries[1].declaration();
+    let metadata = declaration
+        .constructor_metadata()
+        .expect("fixture constructor metadata");
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Add", "mk"]),
+        ConstantDeclaration::constructor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            ConstructorDeclaration::new(
+                metadata.inductive().clone(),
+                metadata.index(),
+                metadata.num_parameters(),
+                2,
+            ),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { .. })
+        ),
+        "forged field count rejects: {verdict:?}"
+    );
+}
+
+#[test]
+fn kr600_803_class_block_refuses_a_motive_head_iota_rule() {
+    let mut entries = class_add_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    // A rule whose body applies the MOTIVE instead of the minor premise is
+    // not the iota law of this family.
+    let forged_rhs = Expr::lam(
+        primary_name("α"),
+        Expr::sort(Level::succ(Level::param(primary_name("u"))).expect("packs")),
+        Expr::lam(
+            primary_name("motive"),
+            primary_pi(
+                "t",
+                BinderInfo::Default,
+                Expr::app(
+                    Expr::const_(primary_name("Add"), vec![Level::param(primary_name("u"))]),
+                    Expr::bvar(0).expect("packs"),
+                ),
+                Expr::sort(Level::param(primary_name("v"))),
+            ),
+            Expr::lam(
+                primary_name("minor"),
+                Expr::bvar(1).expect("packs"),
+                Expr::lam(
+                    primary_name("add"),
+                    Expr::bvar(2).expect("packs"),
+                    Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(0).expect("packs")),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Add", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["Add", "mk"]),
+                    1,
+                    decoded(&forged_rhs),
+                )],
+                false,
+            ),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            InductiveVerdict::Rejected(InductiveRejection::RecursorShape { .. })
+        ),
+        "motive-headed iota rule rejects: {verdict:?}"
+    );
+}

@@ -5778,6 +5778,560 @@ fn admit_init_prod(
     })
 }
 
+/// Reconstruct one **class-shaped** block: exactly one constructor, zero
+/// indices, non-recursive, non-nested, non-reflexive, one family universe,
+/// and an arbitrary parameter telescope (`Init.Add`, `Init.Sub`,
+/// `Init.Inhabited`, …). Unlike the named-family reconstructions above, this
+/// judgment is keyed on SHAPE rather than on a name, because Prelude carries
+/// dozens of these blocks and they share one elimination structure.
+///
+/// What is pinned versus what is imported, and why that is sound here:
+///
+/// * The inductive TYPE is inspected, not regenerated: exactly
+///   [`fln_env::constants::InductiveVal::num_params`] leading binders and a
+///   `Sort` residue. The residue level is deliberately unconstrained — real
+///   families use both `succ u` (`Add`) and `max 1 u` (`Inhabited`) — and
+///   KR-972 has already forced the declared type through WHNF to a sort.
+/// * The CONSTRUCTOR is regenerated and compared in full. Parameter types are
+///   imported verbatim from the constructor's own telescope (identical
+///   binding context, so wire depths transfer unchanged); field types come
+///   from the same telescope at their field positions. The judgment pins the
+///   skeleton — binder count, the result application `D @ p_1 … @ p_k` with
+///   each argument the de Bruijn reference of its own parameter at its final
+///   embedding depth — while arbitrary field content arrives through the
+///   imported terms.
+/// * The RECURSOR is regenerated and compared in full against the canonical
+///   eliminator for this family: implicit-or-captured parameter binders, one
+///   motive over `D ps` into `Sort v`, one minor premise over the fields
+///   ending in `motive (mk ps xs)`, one major premise, body `motive major`.
+///   Every subtree is imported from the recursor's own decoded arena, so no
+///   depth shifting exists anywhere in this module.
+/// * The single iota rule must be exactly `minor applied to the fields`.
+///
+/// Binder styles are CAPTURED from the decoded block and reused, never
+/// assumed: upstream re-binds class parameters implicitly in constructors and
+/// recursors while keeping the inductive type's own style, but this judgment
+/// does not have to legislate that — capturing keeps it closed over whatever
+/// the pin actually emits while still forcing internal consistency between
+/// the compared sides.
+///
+/// Deviations are typed DEFERRALS (`ResultUniverse`, this catalog's
+/// established "shape did not match" signal), never rejections: this arm
+/// admits by shape class, so an off-spec block must stay a non-answer for
+/// human classification rather than become a veto the shape evidence does not
+/// support.
+#[allow(clippy::too_many_lines)]
+fn admit_class_block(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InductiveVerdict {
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
+    let Some(family_universe) = declaration.level_parameters().first() else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: 0,
+        });
+    };
+    if declaration.level_parameters().len() != 1 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: declaration.level_parameters().len(),
+        });
+    }
+    let parameter_count = metadata.num_parameters();
+    let Ok(parameter_count) = usize::try_from(parameter_count) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    };
+    if parameter_count == 0 || parameter_count > MAX_NONRECURSIVE_FIELDS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    }
+    let defer = |stage: &'static str| {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block defer at {stage} for {name:?}");
+        }
+        InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse)
+    };
+    // -- shared metadata gates --------------------------------------------
+    if metadata.mutual() != std::slice::from_ref(name)
+        || metadata.num_indices() != 0
+        || metadata.num_nested() != 0
+        || metadata.is_recursive()
+        || metadata.is_reflexive()
+        || metadata.constructors().len() != 1
+        || declarations.len() != 3
+        || environment.find(name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    }
+
+    // -- the inductive type: k binders, then a sort ------------------------
+    let Some((_type_binders, type_tail)) = peel_binders_at(
+        declaration.type_(),
+        declaration.type_().root(),
+        parameter_count,
+    ) else {
+        return defer("inductive-type-peel");
+    };
+    if !is_sort_at(declaration.type_(), type_tail) {
+        return defer("inductive-type-sort-tail");
+    }
+
+    // -- the constructor ---------------------------------------------------
+    let constructor_name = metadata.constructors()[0].clone();
+    let Some(constructor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &constructor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing {
+            name: constructor_name.clone(),
+        });
+    };
+    let Some(constructor_metadata) = constructor.declaration().constructor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: constructor_name.clone(),
+        });
+    };
+    let field_count = constructor_metadata.num_fields();
+    let Ok(field_count) = usize::try_from(field_count) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::FieldCount {
+            observed: usize::MAX,
+            limit: MAX_NONRECURSIVE_FIELDS,
+        });
+    };
+    if field_count > MAX_NONRECURSIVE_FIELDS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::FieldCount {
+            observed: field_count,
+            limit: MAX_NONRECURSIVE_FIELDS,
+        });
+    }
+    let constructor_type = constructor.declaration().type_();
+    let Some((constructor_param_binders, after_params)) =
+        peel_binders_at(constructor_type, constructor_type.root(), parameter_count)
+    else {
+        return defer("constructor-parameter-peel");
+    };
+    let Some((constructor_field_binders, _)) =
+        peel_binders_at(constructor_type, after_params, field_count)
+    else {
+        return defer("constructor-field-peel");
+    };
+
+    let mut builder = StructuralTermBuilder::new();
+    let mut imported_units = 0usize;
+    let mut imported_param_types = Vec::with_capacity(parameter_count);
+    for (binder_type, _) in &constructor_param_binders {
+        let Some(imported) = builder.import(constructor_type, *binder_type) else {
+            return defer("constructor-parameter-import");
+        };
+        imported_units += imported.index().saturating_add(1);
+        imported_param_types.push(imported);
+    }
+    let mut imported_field_types = Vec::with_capacity(field_count);
+    for (binder_type, _) in &constructor_field_binders {
+        let Some(imported) = builder.import(constructor_type, *binder_type) else {
+            return defer("constructor-field-import");
+        };
+        imported_units += imported.index().saturating_add(1);
+        imported_field_types.push(imported);
+    }
+    if imported_units.saturating_mul(8) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ExpectedArenaUnits {
+            observed: imported_units.saturating_mul(8),
+            limit: MAX_INDUCTIVE_EXPECTED_ARENA_UNITS,
+        });
+    }
+
+    // Result application `D p_1 … p_k`: under the k parameter binders and f
+    // field binders, parameter i (1-based from the outside) sits at de Bruijn
+    // depth `k + f - i`.
+    let total_binders = parameter_count + field_count;
+    let mut result = builder.constant(name, std::slice::from_ref(family_universe));
+    for index in 0..parameter_count {
+        let depth = total_binders - index;
+        let argument = builder.bvar(depth as u32 - 1);
+        result = builder.apply(result, argument);
+    }
+    for field_type in imported_field_types.iter().rev() {
+        result = builder.forall("x", BinderStyle::Default, *field_type, result);
+    }
+    for (index, (_, style)) in constructor_param_binders.iter().enumerate() {
+        result = builder.forall("p", *style, imported_param_types[index], result);
+    }
+    let Some(expected_constructor) = builder.finish(result) else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(
+        constructor_type,
+        &expected_constructor,
+        comparison,
+        cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return defer("constructor-compare"),
+    }
+    if constructor.declaration().safety() != ConstantSafety::Safe
+        || constructor.declaration().level_parameters() != std::slice::from_ref(family_universe)
+        || constructor_metadata.inductive() != name
+        || constructor_metadata.index() != 0
+        || constructor_metadata.num_parameters() != parameter_count as u32
+        || constructor_metadata.num_fields() != field_count as u32
+        || environment.find(&constructor_name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: constructor_name.clone(),
+        });
+    }
+    if let Err(verdict) =
+        declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
+    {
+        return map_member_preamble(name, verdict);
+    }
+    let mut staged =
+        match stage_inductive_member(environment, inductive, environment_budget, cancelled) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged,
+        &constructor_name,
+        constructor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&constructor_name, verdict);
+    }
+    staged = match stage_inductive_member(&staged, constructor, environment_budget, cancelled) {
+        Ok(environment) => environment,
+        Err(verdict) => return verdict,
+    };
+
+    // -- the recursor ------------------------------------------------------
+    let recursor_name = checker_child(name, "rec");
+    let Some(recursor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &recursor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing {
+            name: recursor_name,
+        });
+    };
+    let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_levels = recursor.declaration().level_parameters();
+    let Some(motive_universe) = recursor_levels.first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_reject = |stage: &'static str| {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block reject at {stage} for {recursor_name:?}");
+        }
+        InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name.clone(),
+        })
+    };
+    if recursor.declaration().safety() != ConstantSafety::Safe {
+        return recursor_reject("safety");
+    }
+    if recursor_levels.len() != 2 {
+        return recursor_reject("level-count");
+    }
+    if recursor_levels.get(1) != Some(family_universe) {
+        return recursor_reject("family-level");
+    }
+    if motive_universe == family_universe {
+        return recursor_reject("motive-level-collides");
+    }
+    if recursor_metadata.mutual() != std::slice::from_ref(name) {
+        return recursor_reject("mutual");
+    }
+    if recursor_metadata.num_parameters() != parameter_count as u32 {
+        return recursor_reject("num-parameters");
+    }
+    if recursor_metadata.num_indices() != 0 {
+        return recursor_reject("num-indices");
+    }
+    if recursor_metadata.num_motives() != 1 {
+        return recursor_reject("num-motives");
+    }
+    if recursor_metadata.num_minors() != 1 {
+        return recursor_reject("num-minors");
+    }
+    if recursor_metadata.rules().len() != 1 {
+        return recursor_reject("rule-count");
+    }
+    if recursor_metadata.k() {
+        return recursor_reject("k-flag");
+    }
+    if environment.find(&recursor_name).is_some() {
+        return recursor_reject("already-declared");
+    }
+    let recursor_type = recursor.declaration().type_();
+    let Some((recursor_param_binders, recursor_after_params)) =
+        peel_binders_at(recursor_type, recursor_type.root(), parameter_count)
+    else {
+        return defer("recursor-parameter-peel");
+    };
+    let Some((recursor_tail_binders, _)) = peel_binders_at(recursor_type, recursor_after_params, 3)
+    else {
+        return defer("recursor-tail-peel");
+    };
+    let (motive_binder, minor_binder, major_binder) = (
+        recursor_tail_binders[0],
+        recursor_tail_binders[1],
+        recursor_tail_binders[2],
+    );
+
+    let mut builder = StructuralTermBuilder::new();
+    let mut imported_units = 0usize;
+    let mut recursor_param_imports = Vec::with_capacity(parameter_count);
+    for (binder_type, _) in &recursor_param_binders {
+        let Some(imported) = builder.import(recursor_type, *binder_type) else {
+            return defer("recursor-parameter-import");
+        };
+        imported_units += imported.index().saturating_add(1);
+        recursor_param_imports.push(imported);
+    }
+    // Motive domain: `∀ t : D p_1 … p_k, Sort v`. Under the motive's own `t`
+    // binder, parameter i sits at depth `k - i + 1`; the domain of `t` sees
+    // only the parameters, so parameter i sits at depth `k - i + 1` there too
+    // when counted from inside `t`'s body — both are the same telescope.
+    let d_application_at = |builder: &mut StructuralTermBuilder, base: usize| -> Option<ExprId> {
+        let head = builder.constant(name, std::slice::from_ref(family_universe));
+        let mut applied = head;
+        for index in 0..parameter_count {
+            let depth = base - index;
+            if depth == 0 {
+                return None;
+            }
+            let argument = builder.bvar(depth as u32 - 1);
+            applied = builder.apply(applied, argument);
+        }
+        Some(applied)
+    };
+    let Some(d_under_params) = d_application_at(&mut builder, parameter_count) else {
+        return defer("motive-domain-depth");
+    };
+    let motive_sort = builder.sort_parameter(motive_universe);
+    let motive_domain = builder.forall("t", BinderStyle::Default, d_under_params, motive_sort);
+    imported_units += 4;
+
+    // Minor premise: peel the decoded minor telescope for its field types
+    // (they live in this exact binding context, so imports transfer), then
+    // rebuild its body as `motive (mk p_1 … p_k x_1 … x_f)`.
+    let Some((minor_field_binders, _)) =
+        peel_binders_at(recursor_type, minor_binder.0, field_count)
+    else {
+        return defer("minor-field-peel");
+    };
+    let mut minor_field_imports = Vec::with_capacity(field_count);
+    for (binder_type, _) in &minor_field_binders {
+        let Some(imported) = builder.import(recursor_type, *binder_type) else {
+            return defer("minor-field-import");
+        };
+        imported_units += imported.index().saturating_add(1);
+        minor_field_imports.push(imported);
+    }
+    let constructor_head =
+        builder.constant(&constructor_name, std::slice::from_ref(family_universe));
+    // Inside the minor TYPE — the domain of the minor binder, which its own
+    // body does not see: fields are innermost (`x_f .. x_1` at depths
+    // `0 .. f-1`), the motive sits at `f`, and parameter i sits at
+    // `f + k + 1 - i`. The constructor application is parameters first.
+    let mut minor_call = constructor_head;
+    for index in 0..parameter_count {
+        let depth = parameter_count + field_count + 1 - index;
+        let argument = builder.bvar(depth as u32 - 1);
+        minor_call = builder.apply(minor_call, argument);
+    }
+    for index in 0..field_count {
+        let field_depth = (field_count - 1 - index) as u32;
+        let argument = builder.bvar(field_depth);
+        minor_call = builder.apply(minor_call, argument);
+    }
+    let motive_reference = builder.bvar(field_count as u32);
+    let mut minor_body = builder.apply(motive_reference, minor_call);
+    for field_type in minor_field_imports.iter().rev() {
+        minor_body = builder.forall("x", BinderStyle::Default, *field_type, minor_body);
+    }
+    imported_units += 4;
+
+    // Major premise: `D p_1 … p_k` under the parameters, the motive, and the
+    // minor premise — all three binders precede it, so the base is `k + 2`.
+    let Some(major_type) = d_application_at(&mut builder, parameter_count + 2) else {
+        return defer("major-domain-depth");
+    };
+    let motive_at_two = builder.bvar(2);
+    let major_at_zero = builder.bvar(0);
+    let body = builder.apply(motive_at_two, major_at_zero);
+    let mut expected = builder.forall("major", major_binder.1, major_type, body);
+    expected = builder.forall("minor", minor_binder.1, minor_body, expected);
+    expected = builder.forall("motive", motive_binder.1, motive_domain, expected);
+    for (index, (_, style)) in recursor_param_binders.iter().enumerate() {
+        expected = builder.forall("p", *style, recursor_param_imports[index], expected);
+    }
+    if imported_units.saturating_mul(8) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ExpectedArenaUnits {
+            observed: imported_units.saturating_mul(8),
+            limit: MAX_INDUCTIVE_EXPECTED_ARENA_UNITS,
+        });
+    }
+    let Some(expected_recursor) = builder.finish(expected) else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(recursor_type, &expected_recursor, comparison, cancelled) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return defer("recursor-compare"),
+    }
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged,
+        &recursor_name,
+        recursor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&recursor_name, verdict);
+    }
+
+    // -- the single iota rule: `minor applied to the fields` ---------------
+    let rule = recursor_metadata.rules().first();
+    let Some(rule) = rule else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    if rule.constructor() != &constructor_name {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block reject at rule-constructor for {recursor_name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    if rule.num_fields() != field_count as u32 {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block reject at rule-field-count for {recursor_name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    if !rule_rhs_is_minor_applied_to_fields(rule.rhs(), parameter_count, field_count) {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block reject at rule-rhs-shape for {recursor_name:?}");
+            eprintln!("rhs arena: {:?}", rule.rhs().nodes());
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    if let Err(verdict) = stage_inductive_member(&staged, recursor, environment_budget, cancelled) {
+        return verdict;
+    }
+    InductiveVerdict::Admitted(InductiveAdmission {
+        members: vec![name.clone(), constructor_name, recursor_name],
+    })
+}
+
+/// Peel exactly `expected` leading `Forall` binders starting at `cursor`,
+/// returning each `(binder_type, style)` in order together with the cursor
+/// just past the last binder, or `None` when the term runs out first.
+fn peel_binders_at(
+    expression: &WireExpr,
+    cursor: ExprId,
+    expected: usize,
+) -> Option<(Vec<(ExprId, BinderStyle)>, ExprId)> {
+    let mut binders = Vec::new();
+    let mut cursor = cursor;
+    for _ in 0..expected {
+        match expression.node(cursor)? {
+            ExprNode::Forall {
+                binder_type,
+                body,
+                style,
+                ..
+            } => {
+                binders.push((*binder_type, *style));
+                cursor = *body;
+            }
+            _ => return None,
+        }
+    }
+    Some((binders, cursor))
+}
+
+fn is_sort_at(expression: &WireExpr, cursor: ExprId) -> bool {
+    matches!(expression.node(cursor), Some(ExprNode::Sort { .. }))
+}
+
+/// The iota-rule right-hand side of this family is `minor x_1 … x_f`: after
+/// the `k` parameter lambdas, the motive lambda, the minor lambda, and the
+/// `f` field lambdas, the body applies the minor reference (depth `f`) to
+/// the field references (depths `f-1 … 0`, fields in declaration order) and
+/// nothing else.
+fn rule_rhs_is_minor_applied_to_fields(
+    rhs: &WireExpr,
+    parameter_count: usize,
+    field_count: usize,
+) -> bool {
+    let mut cursor = rhs.root();
+    // Rule right-hand sides are TERMS: their binders are lambdas (the pin
+    // also emits Forall here for some families, so both are accepted).
+    for _ in 0..parameter_count + field_count + 2 {
+        match rhs.node(cursor) {
+            Some(ExprNode::Lambda { body, .. }) | Some(ExprNode::Forall { body, .. }) => {
+                cursor = *body;
+            }
+            _ => return false,
+        }
+    }
+    // Walk the application spine: head must be `Bound(f)`, arguments must be
+    // `Bound(f-1) … Bound(0)` in order.
+    let mut arguments = Vec::new();
+    loop {
+        match rhs.node(cursor) {
+            Some(ExprNode::Apply { function, argument }) => {
+                arguments.push(*argument);
+                cursor = *function;
+            }
+            Some(ExprNode::Bound { index }) => {
+                if *index != field_count as u32 {
+                    return false;
+                }
+                break;
+            }
+            _ => return false,
+        }
+    }
+    arguments.reverse();
+    arguments.iter().enumerate().all(|(position, argument)| {
+        matches!(
+            rhs.node(*argument),
+            Some(ExprNode::Bound { index })
+                if *index == (field_count - 1 - position) as u32
+        )
+    })
+}
+
 /// Reconstruct the universe-polymorphic one-constructor `Init.PUnit` block.
 fn admit_init_punit(
     environment: &ConstantEnvironment,
@@ -6375,6 +6929,29 @@ pub fn admit_inductive_with(
         && metadata.num_parameters() == 2
     {
         return admit_init_prod(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
+    // Class-shaped blocks: one constructor, zero indices, non-recursive, one
+    // family universe. Gated here so only plausible members enter the shape
+    // judgment; everything else keeps the ordinary deferral path below.
+    if declaration.level_parameters().len() == 1
+        && metadata.mutual() == std::slice::from_ref(name)
+        && metadata.num_indices() == 0
+        && metadata.num_nested() == 0
+        && !metadata.is_recursive()
+        && !metadata.is_reflexive()
+        && metadata.constructors().len() == 1
+        && declarations.len() == 3
+        && declaration.safety() == ConstantSafety::Safe
+    {
+        return admit_class_block(
             environment,
             declarations,
             inductive,

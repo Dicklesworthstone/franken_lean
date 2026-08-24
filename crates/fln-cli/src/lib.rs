@@ -15,6 +15,7 @@ use fln_core::diag::{
     ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RelatedSpan, Severity,
     StructuredDiagnostic, StructuredInconclusive, StructuredInternalFault,
 };
+use fln_core::level::LevelView;
 use fln_core::mode::Mode;
 use fln_core::outcome::BoundedText;
 use fln_hash::domain::{Digest, Domain, DomainHasher, hash as domain_hash};
@@ -1848,11 +1849,7 @@ fn run_flbc(
     execute_flbc_bytes_with_sidecar(&bytes, max_bytes, verified_sidecar.as_ref(), json)
 }
 
-fn render_olean_human(
-    bytes: usize,
-    decoded: &fln::DecodedOlean,
-    constants: bool,
-) -> String {
+fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean, constants: bool) -> String {
     let mut out = format!(
         concat!(
             "pinned .olean audit: complete\n",
@@ -1892,7 +1889,7 @@ fn render_olean_human(
 /// which is the order `fln check-olean` reports batch indices against, with a
 /// depth-and-width-bounded term sketch per constant so admission halts can be
 /// diagnosed without another tool.
-const CONSTANT_SKETCH_ROWS: usize = 128;
+const CONSTANT_SKETCH_ROWS: usize = 4096;
 const CONSTANT_SKETCH_TERM_CHARS: usize = 700;
 
 fn constant_kind_label(info: &fln::ConstantInfo) -> &'static str {
@@ -1909,37 +1906,30 @@ fn constant_kind_label(info: &fln::ConstantInfo) -> &'static str {
 }
 
 fn sketch_level(level: &fln::Level, out: &mut String) {
-    match level.node() {
-        fln::LevelNode::Zero => out.push('0'),
-        fln::LevelNode::Succ(inner) => {
+    match level.view() {
+        LevelView::Zero => out.push('0'),
+        LevelView::Succ(inner) => {
             out.push_str("succ(");
-            sketch_level_from(inner, out);
+            sketch_level(inner, out);
             out.push(')');
         }
-        fln::LevelNode::Max(lhs, rhs) => {
+        LevelView::Max(lhs, rhs) => {
             out.push_str("max(");
-            sketch_level_from(lhs, out);
+            sketch_level(lhs, out);
             out.push(',');
-            sketch_level_from(rhs, out);
+            sketch_level(rhs, out);
             out.push(')');
         }
-        fln::LevelNode::IMax(lhs, rhs) => {
+        LevelView::IMax(lhs, rhs) => {
             out.push_str("imax(");
-            sketch_level_from(lhs, out);
+            sketch_level(lhs, out);
             out.push(',');
-            sketch_level_from(rhs, out);
+            sketch_level(rhs, out);
             out.push(')');
         }
-        fln::LevelNode::Param(name) => out.push_str(&name.to_display_string()),
-        fln::LevelNode::Meta(name) => {
-            out.push('?');
-            out.push_str(&name.to_display_string());
-        }
+        LevelView::Param(name) => out.push_str(&name.to_display_string()),
+        LevelView::MVar(_) => out.push_str("?mvar"),
     }
-}
-
-fn sketch_level_from(level: &fln::Level, out: &mut String) {
-    sketch_level(level, out);
 }
 
 fn sketch_expr(expr: &fln::Expr, budget: &mut usize, out: &mut String) {
@@ -2025,7 +2015,12 @@ fn render_constant_sketch(decoded: &fln::DecodedOlean) -> String {
         "constant order (first {rendered} of {}):\n",
         decoded.constants.len()
     ));
-    for (index, info) in decoded.constants.iter().enumerate().take(CONSTANT_SKETCH_ROWS) {
+    for (index, info) in decoded
+        .constants
+        .iter()
+        .enumerate()
+        .take(CONSTANT_SKETCH_ROWS)
+    {
         let val = info.constant_val();
         let mut term = String::new();
         let mut budget = 64usize;
