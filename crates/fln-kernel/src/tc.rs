@@ -318,6 +318,7 @@ fn collect_fvar_ids(
     true
 }
 
+fn local_dependencies(
     expressions: &[&Expr],
     locals: &[LocalDecl],
     local_positions: &HashMap<FVarId, usize>,
