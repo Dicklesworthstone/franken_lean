@@ -5923,12 +5923,25 @@ fn admit_class_block(
     let Some((constructor_param_binders, after_params)) =
         peel_binders_at(constructor_type, constructor_type.root(), parameter_count)
     else {
-        return defer("constructor-parameter-peel");
+        // The constructor's own metadata demands `parameter_count` leading
+        // binders; a term that does not have them contradicts itself, which
+        // is corruption rather than an unknown family.
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block reject at constructor-parameter-peel for {name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
     };
     let Some((constructor_field_binders, _)) =
         peel_binders_at(constructor_type, after_params, field_count)
     else {
-        return defer("constructor-field-peel");
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: class-block reject at constructor-field-peel for {name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
     };
 
     let mut builder = StructuralTermBuilder::new();

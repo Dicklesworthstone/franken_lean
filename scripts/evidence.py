@@ -6299,7 +6299,14 @@ def verify_path_object_classification_site_coverage(
     # fixture fails AND a fixture tagging a site the function can no longer
     # produce fails. Fixture objects live under their own retained root and
     # are reclaimed when the cell passes (fln-selftest-eir2 convention).
-    fixture_root = fixture_parent / "fln-evidence-path-object-sites"
+    # Unique per run: two panes running the self-test concurrently must not
+    # collide on a fixed name (classification_root uses the same idiom). The
+    # pid-plus-monotonic suffix is reclaimed on success and retained on
+    # failure, so retention still names exactly one failed run.
+    fixture_root = fixture_parent / (
+        "fln-evidence-path-object-sites-"
+        f"{os.getpid()}-{time.monotonic_ns()}"
+    )
     if fixture_root.exists() or fixture_root.is_symlink():
         raise EvidenceError(
             f"path-object site fixture already exists: {fixture_root}"
@@ -6384,10 +6391,26 @@ def verify_path_object_classification_site_coverage(
 
     # Criterion 5, mutant one: a NEW return arm must fail the produced-side
     # assertion, naming the unproduced class — never a generic nonzero exit.
-    ghost_source = module_source.replace(
+    # The needle is scoped to THIS function's own segment, not to the whole
+    # module: `str.replace(..., 1)` over module_source silently mutates whichever
+    # function happens to contain the first `return "untracked"` literal, so a
+    # sibling gaining that arm above the classifier would turn this mutant into
+    # a no-op and its kill into decoration.
+    classifier_segment, _ = _function_source(
+        module_source, "verification_path_object_classification"
+    )
+    mutated_segment = classifier_segment.replace(
         'return "untracked"',
         'return "untracked"\n    return "ghost_class"',
         1,
+    )
+    require(
+        mutated_segment != classifier_segment,
+        "the ghost-arm mutant did not apply to the classifier segment; the "
+        "needle has drifted, so this cell measured nothing (VOID, never a pass)",
+    )
+    ghost_source = module_source.replace(
+        classifier_segment, mutated_segment, 1
     )
     ghost_sites = derive_sites(ghost_source)
     ghost_uncovered = sorted(set(ghost_sites) - set(tagged))

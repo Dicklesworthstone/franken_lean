@@ -55,7 +55,9 @@ EVIDENCE="$ROOT/scripts/evidence.py"
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/gate_lock.sh"
 fln_gate_acquire "kernel_replay"
-trap 'fln_gate_release_note "kernel_replay"' EXIT
+# `|| true` inside the trap: a journaling hiccup must never override the
+# script's real exit status (every sibling lane wraps the same call).
+trap 'fln_gate_release_note "kernel_replay" || true' EXIT
 RUN_ID="kernel-replay-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
