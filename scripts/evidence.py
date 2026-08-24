@@ -14,6 +14,7 @@ closed, the evidence is retained, and no cleanup/deletion is attempted.
 from __future__ import annotations
 
 import argparse
+import ast
 import ctypes
 import datetime as dt
 import errno
@@ -27,6 +28,7 @@ import re
 import resource
 import select
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -6157,6 +6159,276 @@ def verification_path_object_classification(
     if path in ignored_paths:
         return "ignored"
     return "untracked"
+
+
+def verify_path_object_classification_site_coverage(
+    fixture_parent: Path,
+) -> dict[str, Any]:
+    """Bind every value-carrying return site of the path-object classifier.
+
+    Bead fln-path-classification-coverage-unbound-9teu. The classifier above is
+    committed production code whose contract is its output vocabulary; this
+    binds BOTH the vocabulary and every return site that produces it, against
+    REAL filesystem objects (a real symlink, a real FIFO, a real directory, a
+    non-directory interior component) and never mocks. Derivation is from this
+    file's own source at run time, reconciled across two independent
+    extractors (structural AST vs textual), because a lone extractor was
+    measured wrong twice while filing the bead.
+
+    Site identity is ``(return-statement ordinal, constant value)`` so the
+    conditional-expression arm at the FileNotFoundError return binds as two
+    sites, matching how fixtures must reach it.
+    """
+    import ast as _ast
+
+    source_path = Path(__file__)
+    module_source = source_path.read_text(encoding="utf-8")
+
+    def _values_of(node: _ast.AST) -> list[str]:
+        found: list[str] = []
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, _ast.Constant) and isinstance(
+                current.value, str
+            ):
+                found.append(current.value)
+            elif isinstance(current, _ast.IfExp):
+                pending.extend((current.body, current.orelse))
+            elif isinstance(current, _ast.BoolOp):
+                pending.extend(current.values)
+        return found
+
+    def _ordered_return_sites(function_node: _ast.AST) -> list[tuple[int, str]]:
+        sites: list[tuple[int, str]] = []
+
+        def visit(node: _ast.AST) -> None:
+            for child in _ast.iter_child_nodes(node):
+                if isinstance(child, _ast.Return) and child.value is not None:
+                    for value in _values_of(child.value):
+                        sites.append((len(sites), value))
+                visit(child)
+
+        visit(function_node)
+        return sites
+
+    def _function_source(text: str, name: str) -> tuple[str, _ast.AST]:
+        tree = _ast.parse(text)
+        for node in tree.body:
+            if isinstance(node, _ast.FunctionDef) and node.name == name:
+                lines = text.splitlines(keepends=True)
+                return "".join(lines[node.lineno - 1 : node.end_lineno]), node
+        raise EvidenceError(
+            f"classification coverage scan could not locate def {name}; "
+            "a scan that cannot find its subject is broken, not clean"
+        )
+
+    def derive_sites(text: str) -> list[tuple[int, str]]:
+        _, fn = _function_source(text, "verification_path_object_classification")
+        sites = _ordered_return_sites(fn)
+        if not sites:
+            raise EvidenceError(
+                "path-object classifier derivation found zero return sites; "
+                "treat a thin scan as broken rather than clean"
+            )
+        return sites
+
+    # Extractor two: purely textual. It never sees the AST, so an error the
+    # structural walk makes silently cannot be shared here.
+    def derive_sites_textually(
+        text: str,
+    ) -> tuple[list[tuple[str, int]], int]:
+        segment, _ = _function_source(text, "verification_path_object_classification")
+        counts: dict[str, int] = {}
+        total = 0
+        for line in segment.splitlines():
+            stripped = line.strip()
+            if not (
+                stripped.startswith("return ")
+                or '" if ' in stripped
+                or " else \"" in stripped
+            ):
+                continue
+            for token in re.findall(r'"([a-z_]+)"', stripped):
+                counts[token] = counts.get(token, 0) + 1
+                total += 1
+        return [(value, count) for value, count in sorted(counts.items())], total
+
+    derived_sites = derive_sites(module_source)
+    derived_values = [value for _, value in derived_sites]
+
+    # Reconciliation (criterion 2): the two extractors must agree on the
+    # per-value multiset and on the total number of value-carrying returns.
+    textual_pairs, textual_total = derive_sites_textually(module_source)
+    ast_counts: dict[str, int] = {}
+    for value in derived_values:
+        ast_counts[value] = ast_counts.get(value, 0) + 1
+    ast_pairs = sorted(ast_counts.items())
+    require(
+        ast_pairs == textual_pairs and len(derived_values) == textual_total,
+        "classification extractors disagree: ast="
+        f"{ast_pairs!r}/{len(derived_values)} textual={textual_pairs!r}/"
+        f"{textual_total}",
+    )
+
+    # Criterion 3, exercised rather than declared: the derivation must FAIL
+    # on a missing subject and on a zero-site body — a broken scan is not a
+    # clean one. Both floors fire here through the same helpers the real
+    # derivation uses, so they cannot rot into decoration.
+    try:
+        _function_source(
+            "def unrelated():\n    return None\n",
+            "verification_path_object_classification",
+        )
+    except EvidenceError:
+        pass
+    else:
+        raise EvidenceError("missing-subject floor did not fire")
+    thin_source = (
+        "def verification_path_object_classification():\n    pass\n"
+    )
+    try:
+        derive_sites(thin_source)
+    except EvidenceError:
+        pass
+    else:
+        raise EvidenceError("zero-site floor did not fire")
+
+    # Real-fixture matrix. Tagged sites are hand-derived ONCE and then BOUND:
+    # equality below holds in both directions, so a new return arm without a
+    # fixture fails AND a fixture tagging a site the function can no longer
+    # produce fails. Fixture objects live under their own retained root and
+    # are reclaimed when the cell passes (fln-selftest-eir2 convention).
+    fixture_root = fixture_parent / "fln-evidence-path-object-sites"
+    if fixture_root.exists() or fixture_root.is_symlink():
+        raise EvidenceError(
+            f"path-object site fixture already exists: {fixture_root}"
+        )
+    fixture_root.mkdir()
+    tracked_modes: dict[str, str] = {}
+    ignored_paths: set[str] = set()
+
+    def real(name: str, content: bytes = b"x\n") -> str:
+        write_new(fixture_root / name, content)
+        return name
+
+    real("tracked.log")
+    tracked_modes["tracked.log"] = "100644"
+    real("untracked.log")
+    real("present-ignored.log")
+    ignored_paths.add("present-ignored.log")
+    ignored_paths.add("absent-ignored.log")
+    real("notadir.txt")
+    (fixture_root / "directory").mkdir()
+    os.symlink("tracked.log", fixture_root / "ondisk-link.log")
+    real("mode-symlink.log")
+    tracked_modes["mode-symlink.log"] = "120000"
+    real("mode-special.log")
+    tracked_modes["mode-special.log"] = "160000"
+    os.mkfifo(fixture_root / "pipe.fifo")
+
+    cases_matrix: list[tuple[str, str, dict[str, object], object, str]] = [
+        ("absent-and-ignored", "absent-ignored.log", tracked_modes, ignored_paths, "ignored"),
+        ("absent", "missing.log", {}, set(), "missing"),
+        ("on-disk-symlink", "ondisk-link.log", {}, set(), "symlink"),
+        ("interior-not-directory", "notadir.txt/child.log", {}, set(), "special"),
+        ("directory", "directory", {}, set(), "directory"),
+        ("fifo-final-object", "pipe.fifo", {}, set(), "special"),
+        ("tracked-regular-file", "tracked.log", tracked_modes, set(), "tracked_file"),
+        ("tracked-mode-120000", "mode-symlink.log", tracked_modes, set(), "symlink"),
+        ("tracked-mode-exotic", "mode-special.log", tracked_modes, set(), "special"),
+        ("present-untracked-ignored", "present-ignored.log", {}, ignored_paths, "ignored"),
+        ("untracked", "untracked.log", {}, set(), "untracked"),
+    ]
+    tagged: list[tuple[int, str]] = []
+    observations: list[dict[str, object]] = []
+    for label, relpath, modes, ignored, expected in cases_matrix:
+        actual = verification_path_object_classification(
+            fixture_root,
+            relpath,
+            tracked_modes=modes,  # type: ignore[arg-type]
+            ignored_paths=ignored,  # type: ignore[arg-type]
+        )
+        require(
+            actual == expected,
+            f"path-object fixture {label!r} classified as {actual!r}, "
+            f"expected {expected!r}",
+        )
+        matching = [
+            (ordinal, value)
+            for ordinal, value in derived_sites
+            if value == expected and (ordinal, value) not in tagged
+        ]
+        require(
+            bool(matching),
+            f"fixture {label!r} expects {expected!r} but the derivation "
+            "produces no uncovered return site for it",
+        )
+        chosen = matching[0]
+        tagged.append(chosen)
+        observations.append({"fixture": label, "site": chosen[0], "class": expected})
+
+    produced_not_covered = sorted(set(derived_sites) - set(tagged))
+    require(
+        not produced_not_covered,
+        "path-object return sites with no fixture: "
+        f"{produced_not_covered!r} (bead fln-path-classification-coverage-"
+        "unbound-9teu criterion 1)",
+    )
+    covered_not_produced = sorted(set(tagged) - set(derived_sites))
+    require(
+        not covered_not_produced,
+        "fixtures tag return sites the classifier no longer has: "
+        f"{covered_not_produced!r}; delete or retag the stale fixture row",
+    )
+
+    # Criterion 5, mutant one: a NEW return arm must fail the produced-side
+    # assertion, naming the unproduced class — never a generic nonzero exit.
+    ghost_source = module_source.replace(
+        'return "untracked"',
+        'return "untracked"\n    return "ghost_class"',
+        1,
+    )
+    ghost_sites = derive_sites(ghost_source)
+    ghost_uncovered = sorted(set(ghost_sites) - set(tagged))
+    require(
+        any(value == "ghost_class" for _, value in ghost_uncovered),
+        "mutant 'new return arm without expectation' was not killed by the "
+        "produced-side bind",
+    )
+
+    # Criterion 5, mutant two: a DELETED/stale fixture tag must fail at the
+    # OPPOSITE assertion (covered-side), proving the checks do not share one
+    # failure path.
+    stale_tagged = tagged[:-1]
+    stale_uncovered = sorted(set(derived_sites) - set(stale_tagged))
+    require(
+        bool(stale_uncovered),
+        "mutant 'deleted expectation row' was not killed by the covered-side "
+        "bind",
+    )
+
+    # fln-selftest-symlink-blocks-bundle-4yhd: these fixtures create a symlink
+    # and a FIFO, so they must live OUTSIDE every bundle-publication root, and
+    # that separation is derived here at exactly one site rather than assumed.
+    publication_root = Path(
+        os.environ.get("FLN_E2E_ART_ROOT", str(Path.cwd() / "target" / "e2e"))
+    ).resolve()
+    require(
+        not fixture_root.resolve().is_relative_to(publication_root),
+        "path-object site fixtures must not be created under the bundle "
+        f"publication root {publication_root} (bead fln-selftest-symlink-"
+        "blocks-bundle-4yhd)",
+    )
+
+    shutil.rmtree(fixture_root)
+    return {
+        "case": "path_object_site_coverage",
+        "ok": True,
+        "sites": len(derived_sites),
+        "classes": len(set(derived_values)),
+        "fixtures": len(cases_matrix),
+    }
 
 
 def build_verification_artifact_authority(
@@ -24508,20 +24780,93 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}": (
             "unknown_receipt"
         ),
+        # A path whose INTERIOR component is a regular file classifies as
+        # "special".  This reuses tracked.log and creates no new filesystem
+        # object -- in particular no symlink -- so it cannot reintroduce the
+        # bundle-publication refusal recorded on
+        # fln-selftest-symlink-blocks-bundle-4yhd.
+        "tracked.log/child.log": "special",
+        f"commit:{'2' * 40}": "unreachable_commit",
+        f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'a' * 64}": "receipt",
     }
+    classification_receipts = {f"sha256:{'a' * 64}": {"kind": "receipt"}}
     for artifact, expected_classification in classification_expectations.items():
         actual_classification = verification_artifact_classification(
             "rur",
             artifact,
             bead_states=classification_beads,
             authority=classification_authority,
-            receipts={},
+            receipts=classification_receipts,
         )
         require(
             actual_classification == expected_classification,
             f"verification artifact {artifact!r} classified as "
             f"{actual_classification!r}, expected {expected_classification!r}",
         )
+
+    # Every classification the artifact classifiers can PRODUCE must have an
+    # expectation row above.  BOTH sides are derived from this file's own
+    # source at run time rather than transcribed, so a new return arm cannot be
+    # added without a row, and a row cannot outlive the arm it describes
+    # (bead fln-path-classification-coverage-unbound-9teu).
+    classification_module = ast.parse(
+        Path(__file__).read_text(encoding="utf-8")
+    )
+    classification_producers = {
+        "verification_path_object_classification",
+        "verification_artifact_classification",
+        "verification_path_lexical_classification",
+    }
+    classification_produced: set[str] = set()
+    classification_seen: set[str] = set()
+    for node in ast.walk(classification_module):
+        if (
+            not isinstance(node, ast.FunctionDef)
+            or node.name not in classification_producers
+        ):
+            continue
+        classification_seen.add(node.name)
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Return) or inner.value is None:
+                continue
+            pending = [inner.value]
+            while pending:
+                current = pending.pop()
+                if isinstance(current, ast.Constant) and isinstance(
+                    current.value, str
+                ):
+                    classification_produced.add(current.value)
+                elif isinstance(current, ast.IfExp):
+                    pending.extend((current.body, current.orelse))
+                elif isinstance(current, ast.BoolOp):
+                    pending.extend(current.values)
+    require(
+        classification_seen == classification_producers,
+        "classification coverage scan did not locate "
+        f"{sorted(classification_producers - classification_seen)!r}; "
+        "a scan that cannot find its producers is broken, not clean",
+    )
+    require(
+        len(classification_produced) >= 20,
+        "classification coverage scan produced implausibly few "
+        f"classifications ({len(classification_produced)}); treat a thin "
+        "scan as broken",
+    )
+    classification_uncovered = classification_produced - set(
+        classification_expectations.values()
+    )
+    require(
+        not classification_uncovered,
+        "classifications produced with no expectation row: "
+        f"{sorted(classification_uncovered)!r}",
+    )
+
+    # fln-path-classification-coverage-unbound-9teu: drive the PATH-OBJECT
+    # classifier itself against real fixtures and bind every return site, in
+    # both directions, with the derivation reconciled across two extractors.
+    cases.append(
+        verify_path_object_classification_site_coverage(RETAINED_FIXTURE_ROOT)
+    )
 
     legacy_artifact = "legacy:terminal-evidence"
     legacy_pair_id = verification_legacy_pair_id("rur", legacy_artifact)
