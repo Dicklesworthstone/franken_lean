@@ -36,6 +36,17 @@ SCHEMA="fln.e2e/2"
 BEAD="franken_lean-w75y"
 SCENARIO="contract_handoff"
 RUN_ID="contract-handoff-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+# The build gate, taken by this lane rather than by whoever launched it — bead
+# franken_lean-gate-lock-producer-optional-o2vz. Same shape as closure_audit.sh:
+# sits before the EXIT finalizer is installed, so a contention `exit 3` writes no
+# evidence. The library is NOT added to this lane's INPUT_PATHS (that would move a
+# governed-set row build_gate_governed_sets.rs pins in both directions); SC1091 is
+# disabled because the library is checked directly by check.sh's shellcheck stage.
+# shellcheck source=scripts/lib/gate_lock.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/gate_lock.sh"
+fln_gate_acquire "$SCENARIO"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
@@ -215,6 +226,9 @@ PY
 finalize() {
   local observed_rc="$1" final_root validation_rc=0 bundle_rc=0
   trap - EXIT HUP INT TERM
+  # Journal the release before anything else can fail; `|| true` because `set -e`
+  # is in force and a journaling hiccup must never mask the real verdict.
+  fln_gate_release_note "$SCENARIO" || true
   set +e
   if [ "$FINAL_SET" -eq 0 ]; then
     if [ "$observed_rc" -eq 0 ]; then

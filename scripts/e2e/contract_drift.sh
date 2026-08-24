@@ -33,6 +33,18 @@ if [[ "${FLN_CONTRACT_DRIFT_LEGACY:-0}" != 1 ]]; then
   SCHEMA="fln.e2e/2"
   BEAD="franken_lean-smk0"
   SCENARIO="contract_drift"
+  # The build gate, taken by this OUTER invocation rather than by whoever launched
+  # it — bead franken_lean-gate-lock-producer-optional-o2vz. Same shape as
+  # closure_audit.sh, indented to this branch: sits before the EXIT finalizer is
+  # installed, so a contention `exit 3` writes no evidence. The LEGACY child body
+  # (FLN_CONTRACT_DRIFT_LEGACY=1) deliberately takes nothing: it runs under this
+  # supervisor while the gate is already held, and its supervised boundary closes
+  # inherited descriptors. Not in INPUT_PATHS; SC1091 is disabled because the
+  # library is checked directly by check.sh's shellcheck stage.
+  # shellcheck source=scripts/lib/gate_lock.sh
+  # shellcheck disable=SC1091
+  . "$ROOT/scripts/lib/gate_lock.sh"
+  fln_gate_acquire "$SCENARIO"
   RUN_ID="contract-drift-governed-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
   ART_DIR="$ART_ROOT/$RUN_ID"
@@ -110,6 +122,8 @@ if [[ "${FLN_CONTRACT_DRIFT_LEGACY:-0}" != 1 ]]; then
   finalize() {
     local observed_rc="$1" final_root validation_rc=0 bundle_rc=0
     trap - EXIT HUP INT TERM
+    # Journal the release first; `|| true` because `set -e` is in force.
+    fln_gate_release_note "$SCENARIO" || true
     set +e
     if [ "$FINAL_SET" -eq 0 ]; then
       if [ "$observed_rc" -eq 0 ]; then

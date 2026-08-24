@@ -36,6 +36,16 @@ DECLARED="$ROOT/ci/UNSAFE_NOTE_CLIPPY_SITES.txt"
 SCHEMA="fln.e2e/2"
 BEAD="franken_lean-d3-safety-note-clippy-diff-lane-5dkw"
 SCENARIO="unsafe_note_clippy"
+# The build gate, taken by this lane rather than by whoever launched it — bead
+# franken_lean-gate-lock-producer-optional-o2vz. Same shape as closure_audit.sh:
+# sits before the EXIT finalizer is installed, so a contention `exit 3` writes no
+# evidence. Not in INPUT_PATHS (a governed-set row build_gate_governed_sets.rs pins
+# would move); SC1091 disabled because check.sh's shellcheck stage checks the
+# library directly.
+# shellcheck source=scripts/lib/gate_lock.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/gate_lock.sh"
+fln_gate_acquire "$SCENARIO"
 RUN_ID="unsafe-note-clippy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
@@ -124,6 +134,8 @@ PY
 finalize() {
   local observed_rc="$1" final_root validation_rc=0 bundle_rc=0
   trap - EXIT HUP INT TERM
+  # Journal the release first; `|| true` because `set -e` is in force.
+  fln_gate_release_note "$SCENARIO" || true
   set +e
   if [ "$FINAL_SET" -eq 0 ]; then
     if [ "$observed_rc" -eq 0 ]; then

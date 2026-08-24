@@ -187,6 +187,110 @@ fn the_pre_repair_detector_is_measurably_wrong_so_cell_one_is_not_vacuous() {
     );
 }
 
+/// Hold the scratch gate from an INDEPENDENT process (no descriptor shared with the probe)
+/// and run the library-sourced probe against it, bounded by a short FLN_GATE_WAIT_S.
+/// Returns the raw probe output so each cell asserts its own observable.
+fn contended_probe(lib: &Path, lockfile: &Path) -> std::process::Output {
+    let ready = lockfile.with_extension("held");
+    let mut holder = Command::new("flock")
+        .arg(lockfile)
+        .arg("-c")
+        .arg(format!(": > '{}' && sleep 30", ready.display()))
+        .spawn()
+        .expect("flock is available; its absence is an environment fault, not a finding");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the holder never took the scratch lock, so nothing below was measured; \
+             this is an environment fault, never a pass"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let journal = lockfile.with_extension("journal");
+    let script = r#"set -u
+        . "$GATE_LIB"
+        fln_gate_acquire discriminator_probe
+        printf 'STATE=%s\n' "$FLN_GATE_STATE""#;
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("GATE_LIB", lib)
+        .env("FLN_GATE_LOCKFILE", lockfile)
+        .env("FLN_GATE_JOURNAL", &journal)
+        .env("FLN_GATE_WAIT_S", "1")
+        .output()
+        .expect("bash is available; its absence is an environment fault, not a finding");
+    let _ = holder.kill();
+    let _ = holder.wait();
+    out
+}
+
+/// CELL 4 — bead acceptance criterion 2. A second concurrent launch is REFUSED TYPED:
+/// exit 3 (the repository's inconclusive code), no gate state reported, and stderr
+/// naming the contention through `[gate] inconclusive` plus the holder namer. This is
+/// the property that turns "the lane ran" into "the lane ran under the freeze": a
+/// launch that cannot take the gate must never proceed unprotected.
+#[test]
+fn contention_is_refused_typed_instead_of_running_unprotected() {
+    let lib = library();
+    let (_guard, lock) = scratch("cell4-contention");
+    let out = contended_probe(&lib, &lock);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a launch contending for a held gate exited {:?}. It must exit 3 — typed \
+         inconclusive, never a stage failure and never silence.\nstdout: {stdout}\n\
+         stderr: {stderr}",
+        out.status.code()
+    );
+    assert!(
+        !stdout.contains("STATE="),
+        "a refused launch reported a gate state ({stdout}); refusing means nothing ran"
+    );
+    assert!(
+        stderr.contains("[gate] inconclusive"),
+        "the refusal must name its cause through the library's own message; stderr: {stderr}"
+    );
+}
+
+/// CELL 5 — bead acceptance criteria 3 and 4, the negative control for cell 4 in BOTH
+/// directions. A library whose refusal branch cannot fire (the flock failure forced
+/// away) must be measurably WRONG on exactly cell 4's input: it proceeds, reports
+/// `acquired`, and exits 0 while another process holds the gate. If this mutant passed
+/// cell 4 too, cell 4 would be green for a library that cannot refuse — a test that
+/// cannot fail for the reason it names.
+#[test]
+fn a_library_that_cannot_refuse_is_caught_by_the_contention_cell() {
+    let lib = library();
+    let source = std::fs::read_to_string(&lib).expect("the library is readable");
+    const REFUSAL_FLOCK: &str = "flock -w \"$FLN_GATE_WAIT_S\" 9";
+    let mutant_body = source.replace(REFUSAL_FLOCK, "true");
+    assert_ne!(
+        mutant_body, source,
+        "the mutant did not apply — the acquire path has been reworded, so this cell \
+         measured NOTHING. Scored VOID, never as a surviving-mutant pass. Re-derive the \
+         needle from the current library before trusting cell 4."
+    );
+    let (_guard, lock) = scratch("cell5-mutant");
+    let mutant = lock.with_extension("mutant.sh");
+    std::fs::write(&mutant, &mutant_body).expect("the mutant library is writable");
+
+    let out = contended_probe(&mutant, &lock);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("STATE=acquired"),
+        "the gutted-refusal library reported `{}` / {:?} under a held gate. It is supposed \
+         to be WRONG here — running unprotected is precisely what cell 4 exists to catch. \
+         If the mutant now refuses like the real library, the two are no longer \
+         distinguished by this input.",
+        stdout.trim(),
+        out.status.code()
+    );
+}
+
 /// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in BOTH
 /// directions for this family, never inferred from the passing cell.
 #[test]

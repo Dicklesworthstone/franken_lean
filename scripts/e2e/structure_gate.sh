@@ -32,6 +32,26 @@ EVIDENCE="$ROOT/scripts/evidence.py"
 SCHEMA="fln.e2e/2"
 BEAD="fln-8mj"
 SCENARIO="structure_gate"
+# The build gate, taken by this lane rather than by whoever launched it — bead
+# franken_lean-gate-lock-producer-optional-o2vz. Same shape as closure_audit.sh:
+# sits before the EXIT finalizer is installed, so a contention `exit 3` writes no
+# evidence. The evidence harness runs this lane's two exact internal-fault controls
+# beneath an authoritative check.sh that already owns the gate; its supervised
+# process boundary deliberately closes non-owned descriptors, so reacquiring here
+# would wait on our own ancestor for the full 2,400-second contention window.
+# Both values are terminally bound in evidence.py's self-test and cannot publish
+# an ordinary pass; every other value, including an unknown one, still takes the
+# gate. Not in INPUT_PATHS; SC1091 disabled because check.sh's shellcheck stage
+# checks the library directly.
+# shellcheck source=scripts/lib/gate_lock.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/gate_lock.sh"
+# TEST_EARLY_FAULT itself is assigned further down; read the environment
+# variable here so the bypass cannot depend on definition order.
+case "${FLN_SG_TEST_EARLY_FAULT:-}" in
+  unexpected_first_step|post_run_start_abort) ;;
+  *) fln_gate_acquire "$SCENARIO" ;;
+esac
 RUN_ID="structure-gate-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
@@ -454,6 +474,9 @@ abort_if_finalizer_signalled() {
 on_exit() {
   local observed_rc="$1" final_root="unavailable" first_divergence="none"
   local publish_rc=0 hash_rc=0
+  # Journal the release first, on every path including the early-envelope one;
+  # `|| true` because `set -e` is in force.
+  fln_gate_release_note "$SCENARIO" || true
   if [ "$RUN_STARTED" -eq 0 ]; then
     trap - EXIT
     finalize_early_envelope "$observed_rc"
