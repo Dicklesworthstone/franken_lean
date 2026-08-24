@@ -330,6 +330,12 @@ pub struct InputUsage {
     max_line_bytes_observed: u64,
     max_id_bytes_observed: u64,
     max_parse_depth_observed: u64,
+    /// Line numbers that crossed half the line budget while still loading.
+    /// Bead franken_lean-pdnq item 3: records grow monotonically (comments are
+    /// immutable and embedded), so the next dense record would otherwise be
+    /// seen only as a workspace-wide kernel_contract red. One warning per
+    /// input per load; a refusal always takes precedence over a warning.
+    line_budget_warnings: Vec<u64>,
 }
 
 impl InputUsage {
@@ -359,6 +365,10 @@ impl InputUsage {
 
     pub fn max_parse_depth_observed(&self) -> u64 {
         self.max_parse_depth_observed
+    }
+
+    pub fn line_budget_warnings(&self) -> &[u64] {
+        &self.line_budget_warnings
     }
 }
 
@@ -1200,6 +1210,23 @@ impl<'a> Loader<'a> {
                 },
                 self.location(input).at_line(line_number),
             ));
+        }
+        // Interim affordance, bead franken_lean-pdnq item 3: warn ONCE per
+        // input when a record crosses HALF the line budget, so the next dense
+        // bead is seen at filing time instead of as a workspace-wide
+        // kernel_contract red. Typed and greppable on stderr; the structured
+        // line_budget_warnings record on InputUsage is what tests assert.
+        let half_budget = self.limits.max_line_bytes / 2;
+        let line_limit = self.limits.max_line_bytes;
+        if half_budget > 0 && observed > half_budget {
+            let usage = self.input_usage_mut(input);
+            if usage.line_budget_warnings.is_empty() {
+                eprintln!(
+                    "[ownership] WARNING: line {} uses {} bytes, crossing 50% of the {}-byte line budget; records grow monotonically (comments immutable and embedded), so the next dense record refuses every pane's kernel_contract load - see bead franken_lean-pdnq",
+                    line_number, observed, line_limit
+                );
+                usage.line_budget_warnings.push(line_number);
+            }
         }
         Ok(())
     }
@@ -2501,6 +2528,57 @@ mod tests {
         assert_eq!(evidence.binding().record_count(), 2);
     }
 
+    /// franken_lean-pdnq item 3: a record crossing HALF the line budget must
+    /// warn (recorded structurally, echoed to stderr) while the load still
+    /// SUCCEEDS — the warning is filing-time visibility, never a refusal.
+    #[test]
+    fn crossing_half_the_line_budget_warns_without_refusing() {
+        let root = fixture_root("pdnq-half-crossing");
+        let padded = "x".repeat(800);
+        let dense_id = format!("fln-dense-{padded}");
+        let ids = set(&["fln-a", &dense_id]);
+        let manifest = install(&root, &ids, false);
+        // Sorted order puts the dense ~815-byte record on line 2 of the
+        // source. install(with_source=false) wrote the manifest only, so the
+        // tracker is written here with the exact record shape source_bytes
+        // emits — no second encoder to drift.
+        let mut bytes = Vec::new();
+        for id in ids.iter() {
+            bytes.extend_from_slice(b"{\"id\":\"");
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.extend_from_slice(b"\"}\n");
+        }
+        write_at(&root, SOURCE_RELATIVE_PATH, &bytes);
+        // Limits: line budget 1000 -> half is 500; id cap raised so the dense
+        // id itself is legal. Every other limit stays at default scale.
+        let limits = OwnershipLimits::try_new(32 * 1024 * 1024, 1000, 100_000, 2000, 128, 4096)
+            .expect("test limits are inside the absolute maxima");
+        let evidence = load_required(&root, &ids, limits)
+            .expect("a half-budget crossing warns but must not refuse");
+        assert_eq!(evidence.owners(), &ids);
+        assert_eq!(
+            evidence.usage().source().line_budget_warnings(),
+            &[2],
+            "exactly one warning, naming the dense record's line"
+        );
+        assert_eq!(
+            evidence.binding().manifest_digest(),
+            manifest_digest(&manifest)
+        );
+    }
+
+    /// The opposite direction: a file whose largest record sits UNDER half
+    /// the budget produces no warnings at all — silence here is meaningful.
+    #[test]
+    fn records_under_half_the_budget_stay_silent() {
+        let root = fixture_root("pdnq-under-half");
+        let ids = set(&["fln-a", "franken_lean-z6c"]);
+        install(&root, &ids, true);
+        let limits = OwnershipLimits::try_new(32 * 1024 * 1024, 1000, 100_000, 256, 128, 4096)
+            .expect("test limits are inside the absolute maxima");
+        let evidence = load_required(&root, &ids, limits).expect("valid evidence");
+        assert!(evidence.usage().source().line_budget_warnings().is_empty());
+    }
     #[test]
     fn verified_manifest_is_authoritative_only_with_explicit_exact_binding() {
         let root = fixture_root("manifest-only");
