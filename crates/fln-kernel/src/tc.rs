@@ -218,6 +218,33 @@ impl DependencyScanSeen {
     }
 }
 
+/// Why a dependency scan refused to produce dependencies.
+///
+/// `Permanent` covers context-independent causes — the per-scan node
+/// allowance, the distinct-dependency cap, or a disabled binding generation.
+/// Such a row suppresses reuse for its packed key until reclaimed, preserving
+/// the visit bound exactly as before. `MissingFvar` is different: the scan
+/// failed only because one referenced binder was absent from the *current*
+/// `local_positions` map — a property of the context, not the key. The row
+/// names that binder and suppresses only while it stays absent (bead
+/// `fln-4hol` item 3: one unresolvable context dead-keyed 884,370 later
+/// inserts on String.Decode by poisoning every same-bucket successor).
+#[derive(Clone)]
+enum DependencyScanRefusal {
+    Permanent,
+    MissingFvar(FVarId),
+}
+
+impl DependencyScanRefusal {
+    /// `true` while this row must still suppress reuse in this context.
+    fn blocks(&self, local_positions: &HashMap<FVarId, usize>) -> bool {
+        match self {
+            Self::Permanent => true,
+            Self::MissingFvar(id) => !local_positions.contains_key(id),
+        }
+    }
+}
+
 fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
@@ -285,12 +312,11 @@ fn collect_fvar_ids(
     true
 }
 
-fn local_dependencies(
     expressions: &[&Expr],
     locals: &[LocalDecl],
     local_positions: &HashMap<FVarId, usize>,
     nodes_left: &mut usize,
-) -> Option<Vec<LocalDependency>> {
+) -> Result<Vec<LocalDependency>, DependencyScanRefusal> {
     let mut ids = Vec::new();
     let mut seen_ids = HashMap::new();
     let mut seen_nodes = DependencyScanSeen::new();
@@ -302,15 +328,52 @@ fn local_dependencies(
             &mut seen_nodes,
             nodes_left,
         ) {
-            return None;
+            return Err(DependencyScanRefusal::Permanent);
         }
     }
     if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
-        return None;
+        return Err(DependencyScanRefusal::Permanent);
     }
     let mut next = 0;
     let mut dependencies = Vec::new();
     while let Some(id) = ids.get(next).cloned() {
+        next += 1;
+        // The one retryable refusal: this binder is absent from the current
+        // position map. A different context holding the same packed key may
+        // resolve it, so the caller records the blocker instead of a
+        // permanent row.
+        let Some(&position) = local_positions.get(&id) else {
+            return Err(DependencyScanRefusal::MissingFvar(id));
+        };
+        let local = locals
+            .get(position)
+            .ok_or(DependencyScanRefusal::Permanent)?;
+        if !collect_fvar_ids(
+            &local.type_,
+            &mut ids,
+            &mut seen_ids,
+            &mut seen_nodes,
+            nodes_left,
+        ) {
+            return Err(DependencyScanRefusal::Permanent);
+        }
+        if let Some(value) = &local.value
+            && !collect_fvar_ids(value, &mut ids, &mut seen_ids, &mut seen_nodes, nodes_left)
+        {
+            return Err(DependencyScanRefusal::Permanent);
+        }
+        if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+            return Err(DependencyScanRefusal::Permanent);
+        }
+        dependencies.push(LocalDependency {
+            id,
+            generation: local.generation.ok_or(DependencyScanRefusal::Permanent)?,
+            position,
+        });
+    }
+    dependencies.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    Ok(dependencies)
+}
         next += 1;
         let position = *local_positions.get(&id)?;
         let local = locals.get(position)?;
