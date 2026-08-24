@@ -91,15 +91,15 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // large term keeps its cache rows (bead `franken_lean-shgs`: family-wide
 // refusal keys turned one full bucket into a permanent reuse blackout).
 // Each cache may spend at most 33,554,432 such visits on dependency discovery
-// total. A bounded packed-key refusal set prevents a scan beyond those
+// in total. A bounded packed-key refusal set prevents a scan beyond those
 // limits from repeatedly consuming that allowance; it suppresses reuse,
 // never manufactures a result. A scan that failed only because one binder
 // was absent from the current local map records a `MissingFvar` row naming
 // that binder instead of a permanent one: it suppresses while the binder is
-// absent (same DoS bound) and retires once a context can actually resolve
-// it, so one unresolvable context no longer dead-keys every same-bucket
-// successor (bead `fln-4hol` item 3; String.Decode measured 884,370 such
-// dead inserts under the old shape).
+// absent (same DoS bound) and is retired when a later insert in the row's
+// own scope finds that binder present, so one unresolvable context no
+// longer dead-keys every same-bucket successor (bead `fln-4hol` item 3;
+// String.Decode measured 884,370 such dead inserts under the old shape).
 // Dead-generation rows are reclaimed from a touched bucket before its collision
 // cap is applied. These are shallow cardinality bounds: retained Expr DAG weight,
 // allocator failure, cancellation, and Consumption-accounted cache bookkeeping
@@ -232,9 +232,11 @@ impl DependencyScanSeen {
 /// the visit bound exactly as before. `MissingFvar` is different: the scan
 /// failed only because one referenced binder was absent from the *current*
 /// `local_positions` map — a property of the context, not the key. The row
-/// names that binder and suppresses only while it stays absent (bead
-/// `fln-4hol` item 3: one unresolvable context dead-keyed 884,370 later
-/// inserts on String.Decode by poisoning every same-bucket successor).
+/// names that binder and suppresses only while it stays absent; a later
+/// insert in the row's own scope that finds the binder present retires the
+/// row and rescans (bead `fln-4hol` item 3: one unresolvable context
+/// dead-keyed 884,370 later inserts on String.Decode by poisoning every
+/// same-bucket successor).
 #[derive(Clone, Debug)]
 enum DependencyScanRefusal {
     Permanent,
@@ -9456,7 +9458,7 @@ mod tests {
                     .infer_cache
                     .dependency_scan_refusals
                     .contains_key(&(key.data().0, tc.locals.len())),
-            "a resolved blocker must retire its refusal and admit the row"
+            "a context that resolves the binder must cache the row with no fresh refusal",
         );
     }
 
@@ -9464,42 +9466,61 @@ mod tests {
     fn a_resolved_blocker_hands_the_row_to_the_next_missing_binder() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
-        let first_id = FVarId(Name::str(Name::anonymous(), "blocker_a"));
-        let second_id = FVarId(Name::str(Name::anonymous(), "blocker_b"));
-        let pair = Expr::app(Expr::fvar(first_id.clone()), Expr::fvar(second_id.clone()));
-        let key = Expr::mdata(fln_core::options::KVMap::default(), pair);
-        tc.infer_cache
-            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
-        let packed = (key.data().0, tc.locals.len());
-        assert!(
-            matches!(
-                tc.infer_cache.dependency_scan_refusals.get(&packed),
-                Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == second_id
-            ),
-            "argument spines are walked before their head, naming the arg binder first",
+        let present_id = FVarId(Name::str(Name::anonymous(), "present"));
+        let absent_id = FVarId(Name::str(Name::anonymous(), "still_absent"));
+        tc.adopt_local(present_id.clone(), Expr::sort(Level::zero()));
+        // Argument spines are walked before their head, so the absent binder
+        // (argument) is discovered before the present one (head).
+        let pair = Expr::app(
+            Expr::fvar(present_id.clone()),
+            Expr::fvar(absent_id.clone()),
         );
-        tc.adopt_local(second_id.clone(), Expr::sort(Level::zero()));
+        let key = Expr::mdata(fln_core::options::KVMap::default(), pair);
+        let packed = (key.data().0, tc.locals.len());
+        // A stale row naming the binder that IS present at this very scope:
+        // recorded by an earlier attempt made before that binder existed.
+        tc.infer_cache.dependency_scan_refusals.insert(
+            packed,
+            DependencyScanRefusal::MissingFvar(present_id.clone()),
+        );
         tc.infer_cache.local_dependency_scan_nodes = 0;
         tc.infer_cache
             .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
-        // The key embeds locals.len(), which adoption just moved.
-        let packed_two_locals = (key.data().0, tc.locals.len());
         assert!(
             tc.infer_cache.entries == 0
                 && matches!(
-                    tc.infer_cache.dependency_scan_refusals.get(&packed_two_locals),
-                    Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == first_id
+                    tc.infer_cache.dependency_scan_refusals.get(&packed),
+                    Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == absent_id
                 ),
-            "resolving the arg blocker must surface the head binder, not cache or accept"
+            "retiring the stale blocker must rescan and name the remaining one",
         );
+    }
 
-        tc.adopt_local(first_id.clone(), Expr::sort(Level::zero()));
+    #[test]
+    fn a_stale_missing_binder_row_retires_and_admits_the_row_at_its_own_scope() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let recovered_id = FVarId(Name::str(Name::anonymous(), "recovered"));
+        tc.adopt_local(recovered_id.clone(), Expr::sort(Level::zero()));
+        let key = Expr::mdata(
+            fln_core::options::KVMap::default(),
+            Expr::fvar(recovered_id.clone()),
+        );
+        let packed = (key.data().0, tc.locals.len());
+        tc.infer_cache.dependency_scan_refusals.insert(
+            packed,
+            DependencyScanRefusal::MissingFvar(recovered_id.clone()),
+        );
         tc.infer_cache.local_dependency_scan_nodes = 0;
         tc.infer_cache
             .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
         assert!(
-            tc.infer_cache.entries == 1,
-            "with every named binder present the row must finally be cached"
+            tc.infer_cache.entries == 1
+                && !tc
+                    .infer_cache
+                    .dependency_scan_refusals
+                    .contains_key(&packed),
+            "a stale blocker must retire on consultation and admit the row at its own scope",
         );
     }
 
