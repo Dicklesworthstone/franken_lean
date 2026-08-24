@@ -563,6 +563,47 @@ enum IntrinsicImplementation {
     IntTDiv,
     IntTMod,
     IntDivExact,
+    UInt8Add,
+    UInt8Sub,
+    UInt8Mul,
+    UInt8Div,
+    UInt8Mod,
+    UInt8Land,
+    UInt8Lor,
+    UInt8Xor,
+    UInt8ShiftLeft,
+    UInt8ShiftRight,
+    UInt8Complement,
+    UInt8Neg,
+    UInt8Log2,
+    UInt8DecEq,
+    UInt8DecLe,
+    UInt8DecLt,
+    UInt8OfNat,
+    UInt8ToNat,
+    UInt8ToUInt16,
+    UInt8ToUInt32,
+    UInt8ToUInt64,
+    UInt8ToUSize,
+    Int8Add,
+    Int8Sub,
+    Int8Mul,
+    Int8Div,
+    Int8Mod,
+    Int8Land,
+    Int8Lor,
+    Int8Xor,
+    Int8ShiftLeft,
+    Int8ShiftRight,
+    Int8Complement,
+    Int8Neg,
+    Int8Abs,
+    Int8DecEq,
+    Int8DecLe,
+    Int8DecLt,
+    Int8OfNat,
+    Int8ToInt,
+    Int8ToWidth,
     StringAppend,
     StringAtEnd,
     StringCompare,
@@ -673,6 +714,52 @@ impl IntrinsicImplementation {
             "extern:Int.tdiv" => Self::IntTDiv,
             "extern:Int.tmod" => Self::IntTMod,
             "extern:Int.divExact" => Self::IntDivExact,
+            "extern:UInt8.add" => Self::UInt8Add,
+            "extern:UInt8.sub" => Self::UInt8Sub,
+            "extern:UInt8.mul" => Self::UInt8Mul,
+            "extern:UInt8.div" => Self::UInt8Div,
+            "extern:UInt8.mod" => Self::UInt8Mod,
+            "extern:UInt8.land" => Self::UInt8Land,
+            "extern:UInt8.lor" => Self::UInt8Lor,
+            "extern:UInt8.xor" => Self::UInt8Xor,
+            "extern:UInt8.shiftLeft" => Self::UInt8ShiftLeft,
+            "extern:UInt8.shiftRight" => Self::UInt8ShiftRight,
+            "extern:UInt8.complement" => Self::UInt8Complement,
+            "extern:UInt8.neg" => Self::UInt8Neg,
+            "extern:UInt8.log2" => Self::UInt8Log2,
+            "extern:UInt8.decEq" => Self::UInt8DecEq,
+            "extern:UInt8.decLe" => Self::UInt8DecLe,
+            "extern:UInt8.decLt" => Self::UInt8DecLt,
+            "extern:UInt8.ofNat" | "extern:UInt8.ofNatLT" | "extern:UInt8.ofBitVec" => {
+                Self::UInt8OfNat
+            }
+            "extern:UInt8.toNat" | "extern:UInt8.toBitVec" => Self::UInt8ToNat,
+            "extern:UInt8.toUInt16" => Self::UInt8ToUInt16,
+            "extern:UInt8.toUInt32" => Self::UInt8ToUInt32,
+            "extern:UInt8.toUInt64" => Self::UInt8ToUInt64,
+            "extern:UInt8.toUSize" => Self::UInt8ToUSize,
+            "extern:Int8.add" => Self::Int8Add,
+            "extern:Int8.sub" => Self::Int8Sub,
+            "extern:Int8.mul" => Self::Int8Mul,
+            "extern:Int8.div" => Self::Int8Div,
+            "extern:Int8.mod" => Self::Int8Mod,
+            "extern:Int8.land" => Self::Int8Land,
+            "extern:Int8.lor" => Self::Int8Lor,
+            "extern:Int8.xor" => Self::Int8Xor,
+            "extern:Int8.shiftLeft" => Self::Int8ShiftLeft,
+            "extern:Int8.shiftRight" => Self::Int8ShiftRight,
+            "extern:Int8.complement" => Self::Int8Complement,
+            "extern:Int8.neg" => Self::Int8Neg,
+            "extern:Int8.abs" => Self::Int8Abs,
+            "extern:Int8.decEq" => Self::Int8DecEq,
+            "extern:Int8.decLe" => Self::Int8DecLe,
+            "extern:Int8.decLt" => Self::Int8DecLt,
+            "extern:Int8.ofNat" | "extern:Int8.ofInt" => Self::Int8OfNat,
+            "extern:Int8.toInt" => Self::Int8ToInt,
+            "extern:Int8.toInt16"
+            | "extern:Int8.toInt32"
+            | "extern:Int8.toInt64"
+            | "extern:Int8.toISize" => Self::Int8ToWidth,
             "extern:String.Internal.append" => Self::StringAppend,
             "extern:String.Internal.atEnd" => Self::StringAtEnd,
             "extern:String.Internal.length" => Self::StringLength,
@@ -3574,6 +3661,295 @@ fn invoke_intrinsic(
             )??;
             finish_int_result(negative, remainder, max_nat_magnitude_bytes)
         }
+        // UInt8 rows. The pin's inline C computes in the byte storage plane:
+        // wrapping two's-complement arithmetic (lean.h uint8 section), C
+        // truncation for div with box(0) on a zero divisor, dividend identity
+        // for mod, and shift amounts reduced modulo 8.
+        IntrinsicImplementation::UInt8Add
+        | IntrinsicImplementation::UInt8Sub
+        | IntrinsicImplementation::UInt8Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt8Add => "UInt8.add",
+                IntrinsicImplementation::UInt8Sub => "UInt8.sub",
+                _ => "UInt8.mul",
+            };
+            let left = byte_argument(&args[0], operation, 0)?;
+            let right = byte_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt8Add => left.wrapping_add(right),
+                IntrinsicImplementation::UInt8Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(uint8_result(value))
+        }
+        IntrinsicImplementation::UInt8Div | IntrinsicImplementation::UInt8Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::UInt8Div;
+            let operation: &'static str = if is_div { "UInt8.div" } else { "UInt8.mod" };
+            let dividend = byte_argument(&args[0], operation, 0)?;
+            let divisor = byte_argument(&args[1], operation, 1)?;
+            // lean_uint8_div/mod: divisor zero answers 0 / the dividend.
+            let value = if divisor == 0 {
+                if is_div { 0 } else { dividend }
+            } else if is_div {
+                dividend / divisor
+            } else {
+                dividend % divisor
+            };
+            Ok(uint8_result(value))
+        }
+        IntrinsicImplementation::UInt8Land
+        | IntrinsicImplementation::UInt8Lor
+        | IntrinsicImplementation::UInt8Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt8Land => "UInt8.land",
+                IntrinsicImplementation::UInt8Lor => "UInt8.lor",
+                _ => "UInt8.xor",
+            };
+            let left = byte_argument(&args[0], operation, 0)?;
+            let right = byte_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt8Land => left & right,
+                IntrinsicImplementation::UInt8Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(uint8_result(value))
+        }
+        IntrinsicImplementation::UInt8ShiftLeft | IntrinsicImplementation::UInt8ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::UInt8ShiftLeft;
+            let operation: &'static str = if is_left {
+                "UInt8.shiftLeft"
+            } else {
+                "UInt8.shiftRight"
+            };
+            let value = byte_argument(&args[0], operation, 0)?;
+            let amount = byte_argument(&args[1], operation, 1)?;
+            // The pin shifts by `b % 8`; amounts past one storage byte wrap.
+            let amount = u32::from(amount % 8);
+            Ok(uint8_result(if is_left {
+                ((value as u16) << amount) as u8
+            } else {
+                value >> amount
+            }))
+        }
+        IntrinsicImplementation::UInt8Complement | IntrinsicImplementation::UInt8Neg => {
+            expect_arity(row, args, 1)?;
+            let is_complement = implementation == IntrinsicImplementation::UInt8Complement;
+            let operation: &'static str = if is_complement {
+                "UInt8.complement"
+            } else {
+                "UInt8.neg"
+            };
+            let value = byte_argument(&args[0], operation, 0)?;
+            Ok(uint8_result(if is_complement {
+                !value
+            } else {
+                value.wrapping_neg()
+            }))
+        }
+        IntrinsicImplementation::UInt8Log2 => {
+            expect_arity(row, args, 1)?;
+            let value = byte_argument(&args[0], "UInt8.log2", 0)?;
+            // lean_uint8_log2 counts halvings from >= 2; 0 and 1 answer 0.
+            Ok(uint8_result(if value < 2 {
+                0
+            } else {
+                value.ilog2() as u8
+            }))
+        }
+        IntrinsicImplementation::UInt8DecEq
+        | IntrinsicImplementation::UInt8DecLe
+        | IntrinsicImplementation::UInt8DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt8DecEq => "UInt8.decEq",
+                IntrinsicImplementation::UInt8DecLe => "UInt8.decLe",
+                _ => "UInt8.decLt",
+            };
+            let left = byte_argument(&args[0], operation, 0)?;
+            let right = byte_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::UInt8DecEq => left == right,
+                IntrinsicImplementation::UInt8DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        // ofNat, ofNatLT and ofBitVec share the pin's lean_uint8_of_nat
+        // runtime: a truncating cast of an arbitrary Nat to its low byte.
+        IntrinsicImplementation::UInt8OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = nat_low_u64(&args[0], "UInt8.ofNat", 0)?;
+            Ok(uint8_result(low as u8))
+        }
+        IntrinsicImplementation::UInt8ToNat => {
+            expect_arity(row, args, 1)?;
+            let value = byte_argument(&args[0], "UInt8.toNat", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(value))))
+        }
+        IntrinsicImplementation::UInt8ToUInt16
+        | IntrinsicImplementation::UInt8ToUInt32
+        | IntrinsicImplementation::UInt8ToUInt64
+        | IntrinsicImplementation::UInt8ToUSize => {
+            expect_arity(row, args, 1)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt8ToUInt16 => "UInt8.toUInt16",
+                IntrinsicImplementation::UInt8ToUInt32 => "UInt8.toUInt32",
+                IntrinsicImplementation::UInt8ToUInt64 => "UInt8.toUInt64",
+                _ => "UInt8.toUSize",
+            };
+            let value = byte_argument(&args[0], operation, 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(value))))
+        }
+        // Int8 rows. Storage stays in the byte plane exactly like the C:
+        // add/sub/mul/neg wrap without ever casting to int8 (the comments in
+        // lean.h forbid it — overflow there is UB); div/mod widen to int16 so
+        // INT8_MIN / -1 cannot trap; shift amounts are smod 8 with an
+        // arithmetic right shift on the signed plane.
+        IntrinsicImplementation::Int8Add
+        | IntrinsicImplementation::Int8Sub
+        | IntrinsicImplementation::Int8Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int8Add => "Int8.add",
+                IntrinsicImplementation::Int8Sub => "Int8.sub",
+                _ => "Int8.mul",
+            };
+            let left = int8_argument(&args[0], operation, 0)?;
+            let right = int8_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int8Add => left.wrapping_add(right),
+                IntrinsicImplementation::Int8Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(int8_result(value))
+        }
+        IntrinsicImplementation::Int8Div | IntrinsicImplementation::Int8Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::Int8Div;
+            let operation: &'static str = if is_div { "Int8.div" } else { "Int8.mod" };
+            let dividend = int8_argument(&args[0], operation, 0)?;
+            let divisor = int8_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0i8 } else { dividend }
+            } else {
+                let widened = i32::from(dividend) / i32::from(divisor);
+                let remainder = i32::from(dividend) % i32::from(divisor);
+                (if is_div { widened } else { remainder }) as i8
+            };
+            Ok(int8_result(value))
+        }
+        IntrinsicImplementation::Int8Land
+        | IntrinsicImplementation::Int8Lor
+        | IntrinsicImplementation::Int8Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int8Land => "Int8.land",
+                IntrinsicImplementation::Int8Lor => "Int8.lor",
+                _ => "Int8.xor",
+            };
+            let left = int8_argument(&args[0], operation, 0)?;
+            let right = int8_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int8Land => left & right,
+                IntrinsicImplementation::Int8Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(int8_result(value))
+        }
+        IntrinsicImplementation::Int8ShiftLeft | IntrinsicImplementation::Int8ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::Int8ShiftLeft;
+            let operation: &'static str = if is_left {
+                "Int8.shiftLeft"
+            } else {
+                "Int8.shiftRight"
+            };
+            let storage = byte_argument(&args[0], operation, 0)?;
+            let amount = int8_argument(&args[1], operation, 1)?;
+            // ((int8_t)a2 % 8 + 8) % 8 — the pin's smod reduction.
+            let amount = ((i32::from(amount) % 8) + 8) % 8;
+            let value = if is_left {
+                ((u16::from(storage)) << amount) as u8
+            } else {
+                ((storage as i8) >> amount) as u8
+            };
+            Ok(int8_result(value as i8))
+        }
+        IntrinsicImplementation::Int8Complement
+        | IntrinsicImplementation::Int8Neg
+        | IntrinsicImplementation::Int8Abs => {
+            expect_arity(row, args, 1)?;
+            let storage = byte_argument(
+                &args[0],
+                match implementation {
+                    IntrinsicImplementation::Int8Complement => "Int8.complement",
+                    IntrinsicImplementation::Int8Neg => "Int8.neg",
+                    _ => "Int8.abs",
+                },
+                0,
+            )?;
+            let signed = storage as i8;
+            let value = match implementation {
+                IntrinsicImplementation::Int8Complement => !signed,
+                IntrinsicImplementation::Int8Neg => signed.wrapping_neg(),
+                // -a on the unsigned storage plane wraps INT8_MIN back to
+                // itself, exactly like the C's deliberate unsigned negate.
+                _ => signed.checked_abs().unwrap_or(signed),
+            };
+            Ok(int8_result(value))
+        }
+        IntrinsicImplementation::Int8DecEq
+        | IntrinsicImplementation::Int8DecLe
+        | IntrinsicImplementation::Int8DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int8DecEq => "Int8.decEq",
+                IntrinsicImplementation::Int8DecLe => "Int8.decLe",
+                _ => "Int8.decLt",
+            };
+            let left = int8_argument(&args[0], operation, 0)?;
+            let right = int8_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::Int8DecEq => left == right,
+                IntrinsicImplementation::Int8DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        // ofNat and ofInt share the truncating low-byte cast; big operands
+        // truncate their magnitude's low limb with the sign folded in.
+        IntrinsicImplementation::Int8OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = with_int_view(&args[0], "Int8.ofNat", 0, |view| {
+                let limbs = view.magnitude.limbs_le();
+                let low_byte = limbs.first().copied().unwrap_or(0) as u8;
+                if view.negative {
+                    (!low_byte).wrapping_add(1)
+                } else {
+                    low_byte
+                }
+            })?;
+            Ok(int8_result(low as i8))
+        }
+        // Every widening target shares one scalar encoding at this VM layer:
+        // the sign-extended value re-boxed through mk_int, which reproduces
+        // the pin's per-width scalar payloads bit for bit. toInt's census
+        // contract is owned_res (a fresh object); the fixed-width targets
+        // are scalar-class rows.
+        IntrinsicImplementation::Int8ToInt => {
+            expect_arity(row, args, 1)?;
+            let value = int8_argument(&args[0], "Int8.toInt", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_int(i64::from(value))))
+        }
+        IntrinsicImplementation::Int8ToWidth => {
+            expect_arity(row, args, 1)?;
+            let value = int8_argument(&args[0], "Int8.toInt16", 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+        }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
             let mut lhs = string_value(&args[0], "String.append", 0)?;
@@ -4363,6 +4739,47 @@ fn managerless_task_application(
         | IntrinsicImplementation::IntTDiv
         | IntrinsicImplementation::IntTMod
         | IntrinsicImplementation::IntDivExact
+        | IntrinsicImplementation::UInt8Add
+        | IntrinsicImplementation::UInt8Sub
+        | IntrinsicImplementation::UInt8Mul
+        | IntrinsicImplementation::UInt8Div
+        | IntrinsicImplementation::UInt8Mod
+        | IntrinsicImplementation::UInt8Land
+        | IntrinsicImplementation::UInt8Lor
+        | IntrinsicImplementation::UInt8Xor
+        | IntrinsicImplementation::UInt8ShiftLeft
+        | IntrinsicImplementation::UInt8ShiftRight
+        | IntrinsicImplementation::UInt8Complement
+        | IntrinsicImplementation::UInt8Neg
+        | IntrinsicImplementation::UInt8Log2
+        | IntrinsicImplementation::UInt8DecEq
+        | IntrinsicImplementation::UInt8DecLe
+        | IntrinsicImplementation::UInt8DecLt
+        | IntrinsicImplementation::UInt8OfNat
+        | IntrinsicImplementation::UInt8ToNat
+        | IntrinsicImplementation::UInt8ToUInt16
+        | IntrinsicImplementation::UInt8ToUInt32
+        | IntrinsicImplementation::UInt8ToUInt64
+        | IntrinsicImplementation::UInt8ToUSize
+        | IntrinsicImplementation::Int8Add
+        | IntrinsicImplementation::Int8Sub
+        | IntrinsicImplementation::Int8Mul
+        | IntrinsicImplementation::Int8Div
+        | IntrinsicImplementation::Int8Mod
+        | IntrinsicImplementation::Int8Land
+        | IntrinsicImplementation::Int8Lor
+        | IntrinsicImplementation::Int8Xor
+        | IntrinsicImplementation::Int8ShiftLeft
+        | IntrinsicImplementation::Int8ShiftRight
+        | IntrinsicImplementation::Int8Complement
+        | IntrinsicImplementation::Int8Neg
+        | IntrinsicImplementation::Int8Abs
+        | IntrinsicImplementation::Int8DecEq
+        | IntrinsicImplementation::Int8DecLe
+        | IntrinsicImplementation::Int8DecLt
+        | IntrinsicImplementation::Int8OfNat
+        | IntrinsicImplementation::Int8ToInt
+        | IntrinsicImplementation::Int8ToWidth
         | IntrinsicImplementation::ByteArrayBeq
         | IntrinsicImplementation::ByteArrayCopySlice
         | IntrinsicImplementation::ByteArrayData
@@ -4939,6 +5356,19 @@ fn byte_argument(value: &Obj, operation: &'static str, argument: usize) -> Resul
     }
 }
 
+/// A signed byte argument: the pin stores int8 values in the same scalar
+/// word as uint8, with the sign in bit 7 (`(int8_t)a` casts).
+fn int8_argument(value: &Obj, operation: &'static str, argument: usize) -> Result<i8, VmRefusal> {
+    Ok(byte_argument(value, operation, argument)? as i8)
+}
+
+fn uint8_result(value: u8) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(usize::from(value)))
+}
+
+fn int8_result(value: i8) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(usize::from(value as u8)))
+}
 /// Exact port of the pin's `lean_byte_array_copy_slice` value semantics:
 /// a source offset past the source returns the destination unchanged; the
 /// length clamps to the remaining source; a destination offset past the
@@ -5806,6 +6236,259 @@ mod tests {
             "extern:Int.tdiv",
             "extern:Int.tmod",
             "extern:Int.divExact",
+        ] {
+            assert_ne!(
+                IntrinsicImplementation::for_row(row),
+                IntrinsicImplementation::Unsupported,
+                "{row} must resolve"
+            );
+            assert!(!IntrinsicImplementation::for_row(row).is_managerless_task());
+        }
+    }
+
+    fn b(value: u8) -> Obj {
+        Obj::mk_nat(usize::from(value))
+    }
+
+    /// Decode a byte-plane result: the storage word is the unsigned pattern.
+    fn byte_word(result: Result<Obj, VmRefusal>) -> u8 {
+        let object = result.expect("the intrinsic answers");
+        assert!(object.is_scalar(), "expected a scalar-plane result");
+        object.unbox() as u8
+    }
+
+    fn signed_byte(result: Result<Obj, VmRefusal>) -> i8 {
+        i8::from_ne_bytes([byte_word(result)])
+    }
+
+    #[test]
+    fn uint8_arithmetic_wraps_in_the_storage_plane() {
+        assert_eq!(byte_word(invoke("extern:UInt8.add", &[b(255), b(1)])), 0);
+        assert_eq!(byte_word(invoke("extern:UInt8.sub", &[b(0), b(1)])), 255);
+        assert_eq!(byte_word(invoke("extern:UInt8.mul", &[b(16), b(16)])), 0);
+        assert_eq!(byte_word(invoke("extern:UInt8.neg", &[b(0)])), 0);
+        assert_eq!(byte_word(invoke("extern:UInt8.neg", &[b(1)])), 255);
+        assert_eq!(byte_word(invoke("extern:UInt8.complement", &[b(0)])), 255);
+    }
+
+    #[test]
+    fn uint8_div_mod_follow_the_pin_zero_contracts() {
+        assert_eq!(byte_word(invoke("extern:UInt8.div", &[b(7), b(2)])), 3);
+        assert_eq!(byte_word(invoke("extern:UInt8.mod", &[b(7), b(2)])), 1);
+        // lean_uint8_div: divisor zero answers 0; mod returns the dividend.
+        assert_eq!(byte_word(invoke("extern:UInt8.div", &[b(5), b(0)])), 0);
+        assert_eq!(byte_word(invoke("extern:UInt8.mod", &[b(5), b(0)])), 5);
+    }
+
+    #[test]
+    fn uint8_shifts_reduce_amounts_modulo_eight() {
+        // 1 << 8 wraps to 1 through the pin's `a << (b % 8)`.
+        assert_eq!(
+            byte_word(invoke("extern:UInt8.shiftLeft", &[b(1), b(8)])),
+            1
+        );
+        assert_eq!(
+            byte_word(invoke("extern:UInt8.shiftLeft", &[b(1), b(4)])),
+            16
+        );
+        assert_eq!(
+            byte_word(invoke("extern:UInt8.shiftRight", &[b(255), b(4)])),
+            15
+        );
+        assert_eq!(byte_word(invoke("extern:UInt8.log2", &[b(255)])), 7);
+        assert_eq!(byte_word(invoke("extern:UInt8.log2", &[b(1)])), 0);
+        assert_eq!(byte_word(invoke("extern:UInt8.log2", &[b(0)])), 0);
+        assert_eq!(
+            byte_word(invoke("extern:UInt8.land", &[b(0b1100), b(0b1010)])),
+            0b1000
+        );
+        assert_eq!(
+            byte_word(invoke("extern:UInt8.xor", &[b(0xFF), b(0x0F)])),
+            0xF0
+        );
+    }
+
+    #[test]
+    fn uint8_of_nat_truncates_big_operands_to_the_low_byte() {
+        assert_eq!(byte_word(invoke("extern:UInt8.ofNat", &[n(300)])), 44);
+        assert_eq!(byte_word(invoke("extern:UInt8.ofNatLT", &[n(7)])), 7);
+        // ofBitVec shares of_nat_mk: truncate the wrapped Nat field.
+        assert_eq!(byte_word(invoke("extern:UInt8.ofBitVec", &[n(256 + 9)])), 9);
+        // A big mpz truncates to its magnitude's low limb low byte.
+        let big = Obj::mk_mpz(&[0x88], false);
+        assert_eq!(byte_word(invoke("extern:UInt8.ofNat", &[big])), 0x88);
+        assert_eq!(owned_usize(invoke("extern:UInt8.toNat", &[b(200)])), 200);
+        // toBitVec shares lean_uint8_to_nat.
+        assert_eq!(owned_usize(invoke("extern:UInt8.toBitVec", &[b(200)])), 200);
+    }
+
+    #[test]
+    fn uint8_widening_and_decidables_match_the_pin() {
+        for row in [
+            "extern:UInt8.toUInt16",
+            "extern:UInt8.toUInt32",
+            "extern:UInt8.toUInt64",
+            "extern:UInt8.toUSize",
+        ] {
+            assert_eq!(owned_usize(invoke(row, &[b(250)])), 250, "{row}");
+        }
+        assert_eq!(owned_usize(invoke("extern:UInt8.decEq", &[b(5), b(5)])), 1);
+        assert_eq!(owned_usize(invoke("extern:UInt8.decLt", &[b(6), b(5)])), 0);
+        assert_eq!(owned_usize(invoke("extern:UInt8.decLe", &[b(5), b(6)])), 1);
+    }
+
+    #[test]
+    fn int8_signed_arithmetic_wraps_like_the_unsigned_c() {
+        // The C computes add/sub/mul/neg on the unsigned storage byte; the
+        // byte-plane constructor `b` is how an Int8 value reaches the VM.
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.add", &[b(255), b(255)])),
+            -2
+        );
+        assert_eq!(signed_byte(invoke("extern:Int8.sub", &[b(128), b(1)])), 127);
+        assert_eq!(signed_byte(invoke("extern:Int8.mul", &[b(240), b(16)])), 0);
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.mul", &[b(255), b(128)])),
+            -128
+        );
+        assert_eq!(signed_byte(invoke("extern:Int8.neg", &[b(128)])), -128);
+        assert_eq!(signed_byte(invoke("extern:Int8.abs", &[b(251)])), 5);
+        // abs(INT8_MIN) wraps back to INT8_MIN via the unsigned negate.
+        assert_eq!(signed_byte(invoke("extern:Int8.abs", &[b(128)])), -128);
+        assert_eq!(signed_byte(invoke("extern:Int8.complement", &[b(0)])), -1);
+    }
+
+    #[test]
+    fn int8_division_widens_to_avoid_the_int_min_trap() {
+        assert_eq!(signed_byte(invoke("extern:Int8.div", &[b(249), b(2)])), -3);
+        assert_eq!(signed_byte(invoke("extern:Int8.mod", &[b(249), b(2)])), -1);
+        // The pin widens to int16 exactly so this does not trap: 128 wraps.
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.div", &[b(128), b(255)])),
+            -128
+        );
+        assert_eq!(signed_byte(invoke("extern:Int8.mod", &[b(128), b(255)])), 0);
+        // Zero divisors mirror the uint plane: div answers 0, mod identity.
+        assert_eq!(signed_byte(invoke("extern:Int8.div", &[b(251), b(0)])), 0);
+        assert_eq!(signed_byte(invoke("extern:Int8.mod", &[b(251), b(0)])), -5);
+    }
+
+    #[test]
+    fn int8_shifts_use_smod_amounts_and_arithmetic_right() {
+        // smod 8 keeps negative amounts in [0, 8): ((255 as i8 = -1) % 8 + 8) % 8 == 7.
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.shiftLeft", &[b(255), b(255)])),
+            -128
+        );
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.shiftRight", &[b(240), b(1)])),
+            -8
+        );
+        // shiftLeft stays logical on the storage byte: sign bits spill.
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.shiftLeft", &[b(64), b(1)])),
+            -128
+        );
+    }
+
+    #[test]
+    fn int8_of_nat_of_int_truncate_low_bits_with_sign() {
+        assert_eq!(signed_byte(invoke("extern:Int8.ofNat", &[n(129)])), -127);
+        // (int8_t)(-257): the low two's-complement byte is 0xFF, i.e. -1.
+        assert_eq!(signed_byte(invoke("extern:Int8.ofInt", &[i(-257)])), -1);
+        assert_eq!(signed_byte(invoke("extern:Int8.ofInt", &[i(127)])), 127);
+        // Big operands fold the sign into the magnitude's low byte: -(257)
+        // has low byte 0x01 negated, i.e. 0xFF = -1.
+        let big_negative = Obj::mk_mpz(&[257], true);
+        assert_eq!(
+            signed_byte(invoke("extern:Int8.ofInt", &[big_negative])),
+            -1
+        );
+    }
+
+    #[test]
+    fn int8_widening_sign_extends_into_the_int_plane() {
+        for row in [
+            "extern:Int8.toInt",
+            "extern:Int8.toInt16",
+            "extern:Int8.toInt32",
+            "extern:Int8.toInt64",
+            "extern:Int8.toISize",
+        ] {
+            assert_eq!(int_i64(invoke(row, &[b(254)])), -2, "{row}");
+        }
+    }
+
+    #[test]
+    fn int8_decidables_compare_signed_values() {
+        assert_eq!(owned_usize(invoke("extern:Int8.decLt", &[b(255), b(1)])), 1);
+        // Unsigned comparison would read 255 < 1 again here: -1 < -128 is
+        // false on the signed plane.
+        assert_eq!(
+            owned_usize(invoke("extern:Int8.decLt", &[b(255), b(128)])),
+            0
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:Int8.decLe", &[b(128), b(127)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:Int8.decEq", &[b(128), b(128)])),
+            1
+        );
+    }
+
+    #[test]
+    fn every_eight_bit_row_resolves_and_stays_off_managerless_task_path() {
+        for row in [
+            "extern:UInt8.add",
+            "extern:UInt8.sub",
+            "extern:UInt8.mul",
+            "extern:UInt8.div",
+            "extern:UInt8.mod",
+            "extern:UInt8.land",
+            "extern:UInt8.lor",
+            "extern:UInt8.xor",
+            "extern:UInt8.shiftLeft",
+            "extern:UInt8.shiftRight",
+            "extern:UInt8.complement",
+            "extern:UInt8.neg",
+            "extern:UInt8.log2",
+            "extern:UInt8.decEq",
+            "extern:UInt8.decLe",
+            "extern:UInt8.decLt",
+            "extern:UInt8.ofNat",
+            "extern:UInt8.ofNatLT",
+            "extern:UInt8.ofBitVec",
+            "extern:UInt8.toNat",
+            "extern:UInt8.toBitVec",
+            "extern:UInt8.toUInt16",
+            "extern:UInt8.toUInt32",
+            "extern:UInt8.toUInt64",
+            "extern:UInt8.toUSize",
+            "extern:Int8.add",
+            "extern:Int8.sub",
+            "extern:Int8.mul",
+            "extern:Int8.div",
+            "extern:Int8.mod",
+            "extern:Int8.land",
+            "extern:Int8.lor",
+            "extern:Int8.xor",
+            "extern:Int8.shiftLeft",
+            "extern:Int8.shiftRight",
+            "extern:Int8.complement",
+            "extern:Int8.neg",
+            "extern:Int8.abs",
+            "extern:Int8.decEq",
+            "extern:Int8.decLe",
+            "extern:Int8.decLt",
+            "extern:Int8.ofNat",
+            "extern:Int8.ofInt",
+            "extern:Int8.toInt",
+            "extern:Int8.toInt16",
+            "extern:Int8.toInt32",
+            "extern:Int8.toInt64",
+            "extern:Int8.toISize",
         ] {
             assert_ne!(
                 IntrinsicImplementation::for_row(row),
