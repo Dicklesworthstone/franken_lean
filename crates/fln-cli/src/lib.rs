@@ -269,6 +269,7 @@ enum MultiplexerCommand {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
+        constants: bool,
     },
     OleanDiff {
         left: PathBuf,
@@ -929,8 +930,20 @@ fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageE
 }
 
 fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut constants = false;
+    let filtered: Vec<OsString> = arguments
+        .into_iter()
+        .filter(|argument| {
+            if argument.to_string_lossy() == "--constants" {
+                constants = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     let Some((paths, max_bytes, json)) =
-        parse_path_options(arguments, "olean inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+        parse_path_options(filtered, "olean inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
     else {
         return Ok(MultiplexerCommand::Help);
     };
@@ -943,6 +956,7 @@ fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
         path: path.clone(),
         max_bytes,
         json,
+        constants,
     })
 }
 
@@ -1834,8 +1848,12 @@ fn run_flbc(
     execute_flbc_bytes_with_sidecar(&bytes, max_bytes, verified_sidecar.as_ref(), json)
 }
 
-fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean) -> String {
-    format!(
+fn render_olean_human(
+    bytes: usize,
+    decoded: &fln::DecodedOlean,
+    constants: bool,
+) -> String {
+    let mut out = format!(
         concat!(
             "pinned .olean audit: complete\n",
             "bytes: {}\n",
@@ -1861,7 +1879,190 @@ fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean) -> String {
         decoded.constants.len(),
         decoded.module.extensions.len(),
         decoded.walk.objects,
-    )
+    );
+    if constants {
+        out.push_str(&render_constant_sketch(decoded));
+    }
+    out
+}
+
+/// Bounded per-constant diagnostic sketch (`olean inspect --constants`).
+///
+/// Human-mode only. Renders the declaration order the checker council walks,
+/// which is the order `fln check-olean` reports batch indices against, with a
+/// depth-and-width-bounded term sketch per constant so admission halts can be
+/// diagnosed without another tool.
+const CONSTANT_SKETCH_ROWS: usize = 128;
+const CONSTANT_SKETCH_TERM_CHARS: usize = 700;
+
+fn constant_kind_label(info: &fln::ConstantInfo) -> &'static str {
+    match info {
+        fln::ConstantInfo::Axiom(_) => "axiom",
+        fln::ConstantInfo::Defn(_) => "def",
+        fln::ConstantInfo::Thm(_) => "thm",
+        fln::ConstantInfo::Opaque(_) => "opaque",
+        fln::ConstantInfo::Quot(_) => "quot",
+        fln::ConstantInfo::Induct(_) => "inductive",
+        fln::ConstantInfo::Ctor(_) => "ctor",
+        fln::ConstantInfo::Rec(_) => "rec",
+    }
+}
+
+fn sketch_level(level: &fln::Level, out: &mut String) {
+    match level.node() {
+        fln::LevelNode::Zero => out.push('0'),
+        fln::LevelNode::Succ(inner) => {
+            out.push_str("succ(");
+            sketch_level_from(inner, out);
+            out.push(')');
+        }
+        fln::LevelNode::Max(lhs, rhs) => {
+            out.push_str("max(");
+            sketch_level_from(lhs, out);
+            out.push(',');
+            sketch_level_from(rhs, out);
+            out.push(')');
+        }
+        fln::LevelNode::IMax(lhs, rhs) => {
+            out.push_str("imax(");
+            sketch_level_from(lhs, out);
+            out.push(',');
+            sketch_level_from(rhs, out);
+            out.push(')');
+        }
+        fln::LevelNode::Param(name) => out.push_str(&name.to_display_string()),
+        fln::LevelNode::Meta(name) => {
+            out.push('?');
+            out.push_str(&name.to_display_string());
+        }
+    }
+}
+
+fn sketch_level_from(level: &fln::Level, out: &mut String) {
+    sketch_level(level, out);
+}
+
+fn sketch_expr(expr: &fln::Expr, budget: &mut usize, out: &mut String) {
+    if *budget == 0 || out.len() > CONSTANT_SKETCH_TERM_CHARS {
+        out.push('…');
+        return;
+    }
+    *budget -= 1;
+    match expr.node() {
+        fln::ExprNode::BVar { idx } => {
+            out.push('#');
+            out.push_str(&idx.to_string());
+        }
+        fln::ExprNode::Sort { level } => {
+            out.push_str("Sort{");
+            sketch_level(level, out);
+            out.push('}');
+        }
+        fln::ExprNode::Const { name, levels } => {
+            out.push_str(&name.to_display_string());
+            if !levels.is_empty() {
+                out.push_str("@{");
+                for (index, level) in levels.iter().enumerate() {
+                    if index != 0 {
+                        out.push(',');
+                    }
+                    sketch_level(level, out);
+                }
+                out.push('}');
+            }
+        }
+        fln::ExprNode::App { f, a } => {
+            out.push('(');
+            sketch_expr(f, budget, out);
+            out.push(' ');
+            sketch_expr(a, budget, out);
+            out.push(')');
+        }
+        fln::ExprNode::Lam {
+            binder_info,
+            binder_type,
+            body,
+            ..
+        } => {
+            out.push_str("(λ");
+            out.push_str(style_marker(binder_info));
+            out.push('#');
+            sketch_expr(binder_type, budget, out);
+            out.push_str(", ");
+            sketch_expr(body, budget, out);
+            out.push(')');
+        }
+        fln::ExprNode::ForallE {
+            binder_info,
+            binder_type,
+            body,
+            ..
+        } => {
+            out.push_str("(Π");
+            out.push_str(style_marker(binder_info));
+            out.push('#');
+            sketch_expr(binder_type, budget, out);
+            out.push_str(", ");
+            sketch_expr(body, budget, out);
+            out.push(')');
+        }
+        fln::ExprNode::LetE { body, .. } => {
+            out.push_str("(let ");
+            sketch_expr(body, budget, out);
+            out.push(')');
+        }
+        fln::ExprNode::MData { expr, .. } | fln::ExprNode::Proj { expr, .. } => {
+            sketch_expr(expr, budget, out)
+        }
+        _ => out.push('…'),
+    }
+}
+
+fn render_constant_sketch(decoded: &fln::DecodedOlean) -> String {
+    let mut out = String::new();
+    let rendered = decoded.constants.len().min(CONSTANT_SKETCH_ROWS);
+    out.push_str(&format!(
+        "constant order (first {rendered} of {}):\n",
+        decoded.constants.len()
+    ));
+    for (index, info) in decoded.constants.iter().enumerate().take(CONSTANT_SKETCH_ROWS) {
+        let val = info.constant_val();
+        let mut term = String::new();
+        let mut budget = 64usize;
+        sketch_expr(&val.type_, &mut budget, &mut term);
+        let truncated = if term.len() > CONSTANT_SKETCH_TERM_CHARS {
+            term.truncate(CONSTANT_SKETCH_TERM_CHARS);
+            "…"
+        } else {
+            ""
+        };
+
+        out.push_str(&format!(
+            "[{index}] {} {} levels={:?} : {term}{truncated}\n",
+            constant_kind_label(info),
+            val.name.to_display_string(),
+            val.level_params
+                .iter()
+                .map(|level| level.to_display_string())
+                .collect::<Vec<_>>(),
+        ));
+    }
+    if decoded.constants.len() > CONSTANT_SKETCH_ROWS {
+        out.push_str(&format!(
+            "[…] {} more constants omitted\n",
+            decoded.constants.len() - CONSTANT_SKETCH_ROWS
+        ));
+    }
+    out
+}
+
+fn style_marker(info: &fln::BinderInfo) -> &'static str {
+    match info {
+        fln::BinderInfo::Default => "",
+        fln::BinderInfo::Implicit => "i",
+        fln::BinderInfo::StrictImplicit => "s",
+        fln::BinderInfo::InstImplicit => "e",
+    }
 }
 
 fn render_olean_json(bytes: usize, decoded: &fln::DecodedOlean) -> String {
@@ -1904,12 +2105,17 @@ fn render_olean_json(bytes: usize, decoded: &fln::DecodedOlean) -> String {
     )
 }
 
-fn inspect_olean_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+fn inspect_olean_bytes(
+    bytes: &[u8],
+    max_bytes: usize,
+    json: bool,
+    constants: bool,
+) -> MultiplexerOutput {
     match fln::decode_olean_artifact(bytes, fln::OleanDecodeLimits::new(max_bytes)) {
         Ok(decoded) => MultiplexerOutput::success(if json {
             render_olean_json(bytes.len(), &decoded)
         } else {
-            render_olean_human(bytes.len(), &decoded)
+            render_olean_human(bytes.len(), &decoded, constants)
         }),
         Err(error) => inspect_failure(OleanInspectFailure::Decode(error), json),
     }
@@ -1931,9 +2137,9 @@ fn inspect_failure(error: OleanInspectFailure, json: bool) -> MultiplexerOutput 
     MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
 }
 
-fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+fn inspect_olean(path: &Path, max_bytes: usize, json: bool, constants: bool) -> MultiplexerOutput {
     match read_bounded(path, max_bytes, ".olean artifact") {
-        Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json),
+        Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json, constants),
         Err(error) => inspect_failure(OleanInspectFailure::Read(error), json),
     }
 }
@@ -10596,7 +10802,8 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             path,
             max_bytes,
             json,
-        }) => inspect_olean(&path, max_bytes, json),
+            constants,
+        }) => inspect_olean(&path, max_bytes, json, constants),
         Ok(MultiplexerCommand::OleanDiff {
             left,
             right,
