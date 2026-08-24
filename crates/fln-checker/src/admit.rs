@@ -2931,13 +2931,16 @@ fn option_rule_rhs(
 }
 
 fn empty_recursor_type(empty: &WireName, motive_universe: &WireName) -> Option<WireExpr> {
-    empty_recursor_type_at_levels(empty, motive_universe, &[])
+    // Both real empty families met so far (`Init.Empty`, and `Init.False`
+    // sharing this helper) bind the motive binder Default.
+    empty_recursor_type_at_levels(empty, motive_universe, &[], BinderStyle::Default)
 }
 
 fn empty_recursor_type_at_levels(
     empty: &WireName,
     motive_universe: &WireName,
     inductive_universes: &[WireName],
+    motive_style: BinderStyle,
 ) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
     let empty_type = builder.constant(empty, inductive_universes);
@@ -2948,7 +2951,10 @@ fn empty_recursor_type_at_levels(
     let mut result = builder.apply(motive, major);
     let major_type = builder.constant(empty, inductive_universes);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
-    let root = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
+    // The pin binds this eliminator's motive Default on `Init.Empty` itself;
+    // `PEmpty` currently asserts the Implicit spelling and has not yet been
+    // confirmed against real bytes, so the style stays caller-chosen.
+    let root = builder.forall("motive", motive_style, motive_type, result);
     builder.finish(root)
 }
 
@@ -3090,8 +3096,8 @@ fn and_constructor_type(and_name: &WireName, constructor: &WireName) -> Option<W
     let result = and_application(&mut builder, and_name, left_parameter, right_parameter);
     let result = builder.forall("right", BinderStyle::Default, right_field, result);
     let result = builder.forall("left", BinderStyle::Default, left_field, result);
-    let result = builder.forall("b", BinderStyle::Default, proposition, result);
-    let root = builder.forall_name(constructor, BinderStyle::Default, proposition, result);
+    let result = builder.forall("b", BinderStyle::Implicit, proposition, result);
+    let root = builder.forall_name(constructor, BinderStyle::Implicit, proposition, result);
     builder.finish(root)
 }
 
@@ -4329,9 +4335,12 @@ fn admit_init_pempty(
             name: recursor_name,
         });
     }
-    let Some(expected_type) =
-        empty_recursor_type_at_levels(name, motive_universe, std::slice::from_ref(family_universe))
-    else {
+    let Some(expected_type) = empty_recursor_type_at_levels(
+        name,
+        motive_universe,
+        std::slice::from_ref(family_universe),
+        BinderStyle::Implicit,
+    ) else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
     match compare_inductive_expression(
@@ -5837,14 +5846,15 @@ fn admit_class_block(
             name: name.clone(),
         });
     };
-    let Some(family_universe) = declaration.level_parameters().first() else {
+    let family_universes = declaration.level_parameters();
+    if family_universes.is_empty() {
         return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
             observed: 0,
         });
-    };
-    if declaration.level_parameters().len() != 1 {
+    }
+    if family_universes.len() > 8 {
         return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
-            observed: declaration.level_parameters().len(),
+            observed: family_universes.len(),
         });
     }
     let parameter_count = metadata.num_parameters();
@@ -5973,7 +5983,7 @@ fn admit_class_block(
     // field binders, parameter i (1-based from the outside) sits at de Bruijn
     // depth `k + f - i`.
     let total_binders = parameter_count + field_count;
-    let mut result = builder.constant(name, std::slice::from_ref(family_universe));
+    let mut result = builder.constant(name, family_universes);
     for index in 0..parameter_count {
         let depth = total_binders - index;
         let argument = builder.bvar(depth as u32 - 1);
@@ -5998,7 +6008,7 @@ fn admit_class_block(
         Ok(false) | Err(_) => return defer("constructor-compare"),
     }
     if constructor.declaration().safety() != ConstantSafety::Safe
-        || constructor.declaration().level_parameters() != std::slice::from_ref(family_universe)
+        || constructor.declaration().level_parameters() != family_universes
         || constructor_metadata.inductive() != name
         || constructor_metadata.index() != 0
         || constructor_metadata.num_parameters() != parameter_count as u32
@@ -6065,13 +6075,13 @@ fn admit_class_block(
     if recursor.declaration().safety() != ConstantSafety::Safe {
         return recursor_reject("safety");
     }
-    if recursor_levels.len() != 2 {
+    if recursor_levels.len() != family_universes.len() + 1 {
         return recursor_reject("level-count");
     }
-    if recursor_levels.get(1) != Some(family_universe) {
+    if recursor_levels.get(1..) != Some(family_universes) {
         return recursor_reject("family-level");
     }
-    if motive_universe == family_universe {
+    if family_universes.contains(motive_universe) {
         return recursor_reject("motive-level-collides");
     }
     if recursor_metadata.mutual() != std::slice::from_ref(name) {
@@ -6129,7 +6139,7 @@ fn admit_class_block(
     // only the parameters, so parameter i sits at depth `k - i + 1` there too
     // when counted from inside `t`'s body — both are the same telescope.
     let d_application_at = |builder: &mut StructuralTermBuilder, base: usize| -> Option<ExprId> {
-        let head = builder.constant(name, std::slice::from_ref(family_universe));
+        let head = builder.constant(name, family_universes);
         let mut applied = head;
         for index in 0..parameter_count {
             let depth = base - index;
@@ -6164,8 +6174,7 @@ fn admit_class_block(
         imported_units += imported.index().saturating_add(1);
         minor_field_imports.push(imported);
     }
-    let constructor_head =
-        builder.constant(&constructor_name, std::slice::from_ref(family_universe));
+    let constructor_head = builder.constant(&constructor_name, family_universes);
     // Inside the minor TYPE — the domain of the minor binder, which its own
     // body does not see: fields are innermost (`x_f .. x_1` at depths
     // `0 .. f-1`), the motive sits at `f`, and parameter i sits at
@@ -6951,10 +6960,11 @@ pub fn admit_inductive_with(
             &mut cancelled,
         );
     }
-    // Class-shaped blocks: one constructor, zero indices, non-recursive, one
-    // family universe. Gated here so only plausible members enter the shape
-    // judgment; everything else keeps the ordinary deferral path below.
-    if declaration.level_parameters().len() == 1
+    // Class-shaped blocks: one constructor, zero indices, non-recursive, at
+    // least one family universe. Gated here so only plausible members enter
+    // the shape judgment; everything else keeps the ordinary deferral path
+    // below.
+    if !declaration.level_parameters().is_empty()
         && metadata.mutual() == std::slice::from_ref(name)
         && metadata.num_indices() == 0
         && metadata.num_nested() == 0
