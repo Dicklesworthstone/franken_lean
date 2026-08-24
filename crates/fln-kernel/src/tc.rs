@@ -91,9 +91,15 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // large term keeps its cache rows (bead `franken_lean-shgs`: family-wide
 // refusal keys turned one full bucket into a permanent reuse blackout).
 // Each cache may spend at most 33,554,432 such visits on dependency discovery
-// in total. A bounded packed-key refusal set prevents a scan beyond those
+// total. A bounded packed-key refusal set prevents a scan beyond those
 // limits from repeatedly consuming that allowance; it suppresses reuse,
-// never manufactures a result.
+// never manufactures a result. A scan that failed only because one binder
+// was absent from the current local map records a `MissingFvar` row naming
+// that binder instead of a permanent one: it suppresses while the binder is
+// absent (same DoS bound) and retires once a context can actually resolve
+// it, so one unresolvable context no longer dead-keys every same-bucket
+// successor (bead `fln-4hol` item 3; String.Decode measured 884,370 such
+// dead inserts under the old shape).
 // Dead-generation rows are reclaimed from a touched bucket before its collision
 // cap is applied. These are shallow cardinality bounds: retained Expr DAG weight,
 // allocator failure, cancellation, and Consumption-accounted cache bookkeeping
@@ -229,7 +235,7 @@ impl DependencyScanSeen {
 /// names that binder and suppresses only while it stays absent (bead
 /// `fln-4hol` item 3: one unresolvable context dead-keyed 884,370 later
 /// inserts on String.Decode by poisoning every same-bucket successor).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum DependencyScanRefusal {
     Permanent,
     MissingFvar(FVarId),
@@ -374,35 +380,6 @@ fn collect_fvar_ids(
     dependencies.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     Ok(dependencies)
 }
-        next += 1;
-        let position = *local_positions.get(&id)?;
-        let local = locals.get(position)?;
-        if !collect_fvar_ids(
-            &local.type_,
-            &mut ids,
-            &mut seen_ids,
-            &mut seen_nodes,
-            nodes_left,
-        ) {
-            return None;
-        }
-        if let Some(value) = &local.value
-            && !collect_fvar_ids(value, &mut ids, &mut seen_ids, &mut seen_nodes, nodes_left)
-        {
-            return None;
-        }
-        if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
-            return None;
-        }
-        dependencies.push(LocalDependency {
-            id,
-            generation: local.generation?,
-            position,
-        });
-    }
-    dependencies.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-    Some(dependencies)
-}
 
 fn dependencies_are_live(
     dependencies: &[LocalDependency],
@@ -439,9 +416,9 @@ struct ExprResultCache {
     buckets: HashMap<(u64, usize), Vec<ExprResultCacheEntry>>,
     cross_scope: HashMap<u64, Vec<ExprResultCrossScopeEntry>>,
     priority_results: Vec<ExprResultCacheEntry>,
-    priority_scan_refusals: HashMap<(u64, usize), ()>,
+    priority_scan_refusals: HashMap<(u64, usize), DependencyScanRefusal>,
     cross_scope_entries: usize,
-    dependency_scan_refusals: HashMap<(u64, usize), ()>,
+    dependency_scan_refusals: HashMap<(u64, usize), DependencyScanRefusal>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -641,9 +618,13 @@ impl ExprResultCache {
         }
 
         let packed = (key.data().0, locals.len());
-        if self.priority_scan_refusals.contains_key(&packed)
-            || self.priority_scan_refusals.len() >= TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS
-        {
+        if let Some(existing) = self.priority_scan_refusals.get(&packed) {
+            if existing.blocks(local_positions) {
+                return;
+            }
+            // The named binder resolved in this context: the row is stale.
+            self.priority_scan_refusals.remove(&packed);
+        } else if self.priority_scan_refusals.len() >= TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS {
             return;
         }
         let scan_limit = TYPE_CHECKER_CACHE_MAX_PRIORITY_SCAN_NODES
@@ -653,11 +634,14 @@ impl ExprResultCache {
         let dependencies =
             local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
         self.priority_scan_nodes += scan_limit - nodes_left;
-        let Some(dependencies) = dependencies else {
-            if self.priority_scan_refusals.len() < TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS {
-                self.priority_scan_refusals.insert(packed, ());
+        let dependencies = match dependencies {
+            Ok(dependencies) => dependencies,
+            Err(refusal) => {
+                if self.priority_scan_refusals.len() < TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS {
+                    self.priority_scan_refusals.insert(packed, refusal);
+                }
+                return;
             }
-            return;
         };
         let dependency_count = dependencies.len();
         let entry = ExprResultCacheEntry {
@@ -787,9 +771,13 @@ impl ExprResultCache {
         {
             return;
         }
-        if self.dependency_scan_refusals.contains_key(&packed)
-            || self.dependency_scan_refusals.len() >= self.max_entries
-        {
+        if let Some(existing) = self.dependency_scan_refusals.get(&packed) {
+            if existing.blocks(local_positions) {
+                return;
+            }
+            // The named binder resolved in this context: the row is stale.
+            self.dependency_scan_refusals.remove(&packed);
+        } else if self.dependency_scan_refusals.len() >= self.max_entries {
             return;
         }
         let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
@@ -799,11 +787,14 @@ impl ExprResultCache {
         let dependencies =
             local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
         self.local_dependency_scan_nodes += scan_limit - nodes_left;
-        let Some(dependencies) = dependencies else {
-            if self.dependency_scan_refusals.len() < self.max_entries {
-                self.dependency_scan_refusals.insert(packed, ());
+        let dependencies = match dependencies {
+            Ok(dependencies) => dependencies,
+            Err(refusal) => {
+                if self.dependency_scan_refusals.len() < self.max_entries {
+                    self.dependency_scan_refusals.insert(packed, refusal);
+                }
+                return;
             }
-            return;
         };
         let dependency_count = dependencies.len();
         let replaced_dependency_count = replacement
@@ -816,7 +807,8 @@ impl ExprResultCache {
             .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
         {
             if self.dependency_scan_refusals.len() < self.max_entries {
-                self.dependency_scan_refusals.insert(packed, ());
+                self.dependency_scan_refusals
+                    .insert(packed, DependencyScanRefusal::Permanent);
             }
             return;
         }
@@ -870,7 +862,7 @@ struct PositiveDefEqCache {
     buckets: HashMap<(u64, u64, usize), Vec<PositiveDefEqCacheEntry>>,
     cross_scope: HashMap<(u64, u64), Vec<PositiveDefEqCrossScopeEntry>>,
     cross_scope_entries: usize,
-    dependency_scan_refusals: HashMap<(u64, u64, usize), ()>,
+    dependency_scan_refusals: HashMap<(u64, u64, usize), DependencyScanRefusal>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -1101,9 +1093,13 @@ impl PositiveDefEqCache {
         {
             return;
         }
-        if self.dependency_scan_refusals.contains_key(&packed)
-            || self.dependency_scan_refusals.len() >= self.max_entries
-        {
+        if let Some(existing) = self.dependency_scan_refusals.get(&packed) {
+            if existing.blocks(local_positions) {
+                return;
+            }
+            // The named binder resolved in this context: the row is stale.
+            self.dependency_scan_refusals.remove(&packed);
+        } else if self.dependency_scan_refusals.len() >= self.max_entries {
             return;
         }
         let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
@@ -1113,11 +1109,14 @@ impl PositiveDefEqCache {
         let dependencies =
             local_dependencies(&[&left, &right], locals, local_positions, &mut nodes_left);
         self.local_dependency_scan_nodes += scan_limit - nodes_left;
-        let Some(dependencies) = dependencies else {
-            if self.dependency_scan_refusals.len() < self.max_entries {
-                self.dependency_scan_refusals.insert(packed, ());
+        let dependencies = match dependencies {
+            Ok(dependencies) => dependencies,
+            Err(refusal) => {
+                if self.dependency_scan_refusals.len() < self.max_entries {
+                    self.dependency_scan_refusals.insert(packed, refusal);
+                }
+                return;
             }
-            return;
         };
         let dependency_count = dependencies.len();
         let replaced_dependency_count = replacement
@@ -1130,7 +1129,8 @@ impl PositiveDefEqCache {
             .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
         {
             if self.dependency_scan_refusals.len() < self.max_entries {
-                self.dependency_scan_refusals.insert(packed, ());
+                self.dependency_scan_refusals
+                    .insert(packed, DependencyScanRefusal::Permanent);
             }
             return;
         }
@@ -7593,7 +7593,9 @@ mod tests {
         rolling.insert(second.clone(), second, &tc.locals, &tc.local_positions);
         assert!(rolling.entries == 2 && rolling.local_dependency_cells == 2);
         let scans_before_rollover = rolling.local_dependency_scan_nodes;
-        rolling.dependency_scan_refusals.insert((u64::MAX, 0), ());
+        rolling
+            .dependency_scan_refusals
+            .insert((u64::MAX, 0), DependencyScanRefusal::Permanent);
 
         rolling.insert(
             next_phase.clone(),
@@ -9253,7 +9255,7 @@ mod tests {
                 &fvar_saturated.local_positions,
                 &mut one_node_left,
             )
-            .is_none(),
+            .is_err(),
             "dependency discovery must refuse a hostile expression beyond its node ceiling"
         );
 
@@ -9349,14 +9351,17 @@ mod tests {
         refusal_full.adopt_local(full_id, Expr::sort(Level::zero()));
         refusal_full.infer_cache = ExprResultCache::bounded(1, 4);
         refusal_full.positive_def_eq_cache = PositiveDefEqCache::bounded(1, 4);
-        refusal_full
-            .infer_cache
-            .dependency_scan_refusals
-            .insert((u64::MAX, refusal_full.locals.len()), ());
+        refusal_full.infer_cache.dependency_scan_refusals.insert(
+            (u64::MAX, refusal_full.locals.len()),
+            DependencyScanRefusal::Permanent,
+        );
         refusal_full
             .positive_def_eq_cache
             .dependency_scan_refusals
-            .insert((u64::MAX, u64::MAX, refusal_full.locals.len()), ());
+            .insert(
+                (u64::MAX, u64::MAX, refusal_full.locals.len()),
+                DependencyScanRefusal::Permanent,
+            );
         refusal_full.infer_cache.insert(
             full_local.clone(),
             full_local.clone(),
@@ -9400,6 +9405,133 @@ mod tests {
         assert!(
             too_many.infer_cache.entries == 0,
             "a row with too many distinct dependencies must be an uncached fallback"
+        );
+    }
+
+    #[test]
+    fn a_missing_binder_refusal_suppresses_only_while_its_binder_is_absent() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let absent_id = FVarId(Name::str(Name::anonymous(), "absent"));
+        // The key references a binder this checker has NOT adopted, so the
+        // dependency scan cannot resolve it and must record the blocker.
+        let key = Expr::mdata(
+            fln_core::options::KVMap::default(),
+            Expr::fvar(absent_id.clone()),
+        );
+        tc.infer_cache
+            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            tc.infer_cache.entries == 0,
+            "an unresolvable binder must leave the row uncached"
+        );
+        assert!(
+            matches!(
+                tc.infer_cache
+                    .dependency_scan_refusals
+                    .get(&(key.data().0, tc.locals.len())),
+                Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == absent_id
+            ),
+            "the refusal row must name its actual blocker"
+        );
+
+        // While the binder is absent, retries must not rescan (DoS bound).
+        let scans_after_first = tc.infer_cache.local_dependency_scan_nodes;
+        tc.infer_cache
+            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            tc.infer_cache.local_dependency_scan_nodes == scans_after_first,
+            "a named blocker must suppress rescans without burning the visit allowance"
+        );
+
+        // Adopting the binder invalidates the blocker: one retry, then cached.
+        tc.adopt_local(absent_id.clone(), Expr::sort(Level::zero()));
+        tc.infer_cache.local_dependency_scan_nodes = 0;
+        tc.infer_cache
+            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            tc.infer_cache.entries == 1
+                && !tc
+                    .infer_cache
+                    .dependency_scan_refusals
+                    .contains_key(&(key.data().0, tc.locals.len())),
+            "a resolved blocker must retire its refusal and admit the row"
+        );
+    }
+
+    #[test]
+    fn a_resolved_blocker_hands_the_row_to_the_next_missing_binder() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let first_id = FVarId(Name::str(Name::anonymous(), "blocker_a"));
+        let second_id = FVarId(Name::str(Name::anonymous(), "blocker_b"));
+        let pair = Expr::app(Expr::fvar(first_id.clone()), Expr::fvar(second_id.clone()));
+        let key = Expr::mdata(fln_core::options::KVMap::default(), pair);
+        tc.infer_cache
+            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
+        let packed = (key.data().0, tc.locals.len());
+        assert!(
+            matches!(
+                tc.infer_cache.dependency_scan_refusals.get(&packed),
+                Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == second_id
+            ),
+            "argument spines are walked before their head, naming the arg binder first",
+        );
+        tc.adopt_local(second_id.clone(), Expr::sort(Level::zero()));
+        tc.infer_cache.local_dependency_scan_nodes = 0;
+        tc.infer_cache
+            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
+        // The key embeds locals.len(), which adoption just moved.
+        let packed_two_locals = (key.data().0, tc.locals.len());
+        assert!(
+            tc.infer_cache.entries == 0
+                && matches!(
+                    tc.infer_cache.dependency_scan_refusals.get(&packed_two_locals),
+                    Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == first_id
+                ),
+            "resolving the arg blocker must surface the head binder, not cache or accept"
+        );
+
+        tc.adopt_local(first_id.clone(), Expr::sort(Level::zero()));
+        tc.infer_cache.local_dependency_scan_nodes = 0;
+        tc.infer_cache
+            .insert(key.clone(), key.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            tc.infer_cache.entries == 1,
+            "with every named binder present the row must finally be cached"
+        );
+    }
+
+    #[test]
+    fn the_positive_def_eq_cache_names_missing_binders_too() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let absent_id = FVarId(Name::str(Name::anonymous(), "defeq_absent"));
+        let left = Expr::fvar(absent_id.clone());
+        let right = Expr::sort(Level::zero());
+        tc.positive_def_eq_cache.insert(
+            left.clone(),
+            right.clone(),
+            &tc.locals,
+            &tc.local_positions,
+        );
+        let packed = PositiveDefEqCache::packed_key(&left, &right);
+        assert!(
+            matches!(
+                tc.positive_def_eq_cache
+                    .dependency_scan_refusals
+                    .get(&(packed.0, packed.1, tc.locals.len())),
+                Some(DependencyScanRefusal::MissingFvar(missing)) if *missing == absent_id
+            ),
+            "the defeq cache must record the exact blocker, not a permanent row"
+        );
+        tc.adopt_local(absent_id, Expr::sort(Level::zero()));
+        tc.positive_def_eq_cache.local_dependency_scan_nodes = 0;
+        tc.positive_def_eq_cache
+            .insert(left, right, &tc.locals, &tc.local_positions);
+        assert!(
+            tc.positive_def_eq_cache.entries == 1,
+            "resolving the blocker must let the defeq row land"
         );
     }
 

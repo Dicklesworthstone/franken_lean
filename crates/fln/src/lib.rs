@@ -4722,9 +4722,17 @@ fn review_inductive_with_independent_checker(
             None,
             None,
         ),
-        CheckerInductiveVerdict::Deferred(limit) => CheckerReview::no_answer(format!(
-            "fln-checker does not yet decide this inductive shape: {limit:?}"
-        )),
+        CheckerInductiveVerdict::Deferred(limit) => {
+            let names = block
+                .types
+                .iter()
+                .map(|inductive| inductive.base.name.to_display_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            CheckerReview::no_answer(format!(
+                "fln-checker does not yet decide this inductive shape of [{names}]: {limit:?}"
+            ))
+        }
         CheckerInductiveVerdict::Inconclusive(stop) => CheckerReview::no_answer(format!(
             "fln-checker exhausted or was cancelled during inductive admission: {stop:?}"
         )),
