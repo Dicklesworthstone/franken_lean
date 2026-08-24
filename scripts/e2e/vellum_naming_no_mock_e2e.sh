@@ -37,6 +37,16 @@ EVIDENCE="$ROOT/scripts/evidence.py"
 SCHEMA="fln.e2e/2"
 BEAD="fln-7gr6"
 SCENARIO="vellum_naming_no_mock_e2e"
+# The build gate, taken by this lane rather than by whoever launched it — bead
+# franken_lean-gate-lock-producer-optional-o2vz. Same shape as closure_audit.sh:
+# sits before the EXIT finalizer is installed, so a contention `exit 3` writes no
+# evidence. This lane governs AGENTS.md/README/the plan in its INPUT_PATHS; the
+# gate library itself stays out of that list. SC1091 is disabled because the
+# library is checked directly by check.sh's shellcheck stage.
+# shellcheck source=scripts/lib/gate_lock.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/gate_lock.sh"
+fln_gate_acquire "$SCENARIO"
 RUN_ID="vellum-naming-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
@@ -429,6 +439,8 @@ abort_if_finalizer_signalled() {
 on_exit() {
   local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
   local first_divergence=none
+  # Journal the release first; `|| true` because `set -e` is in force.
+  fln_gate_release_note "$SCENARIO" || true
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM

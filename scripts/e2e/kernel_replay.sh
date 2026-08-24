@@ -45,6 +45,17 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EVIDENCE="$ROOT/scripts/evidence.py"
+
+# The build gate, taken by this lane rather than by whoever launched it — bead
+# franken_lean-gate-lock-producer-optional-o2vz. Same shape as closure_audit.sh.
+# This file has no other EXIT trap, so this one only journals the release; the
+# kernel drops the lock itself when the fd closes. Not in AP6_INPUT_PATHS; SC1091
+# disabled because check.sh's shellcheck stage checks the library directly.
+# shellcheck source=scripts/lib/gate_lock.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/gate_lock.sh"
+fln_gate_acquire "kernel_replay"
+trap 'fln_gate_release_note "kernel_replay"' EXIT
 RUN_ID="kernel-replay-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"

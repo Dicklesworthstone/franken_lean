@@ -1024,20 +1024,29 @@ fn the_scripts_e2e_total_stated_in_the_section_is_bound_to_the_directory() {
     );
 }
 
-/// Which lanes take the gate lock themselves — and every lane that does not, named.
+/// Which lanes take the gate lock themselves — and the DECLARED REMAINDER that does not.
 ///
 /// The section asserted that "no lane takes the gate lock unless its caller wraps the
-/// invocation". That was true when `franken_lean-gate-lock-producer-optional-o2vz` was filed
-/// and is false now, in the direction that matters: a reader who believes it treats a
-/// `flock -n` FREE probe as uninformative for every lane, when for the majority it is now
-/// informative. The count alone is not enough — the lanes that still do **not** take it must
-/// be named where the reader looks, the same rule
+/// invocation". That was true when `franken_lean-gate-lock-producer-optional-o2vz` was
+/// filed and false once lanes began self-acquiring; the first version of this guard
+/// required a NON-EMPTY not-taking set so its naming law could not pass vacuously. That
+/// assertion also made the bead's own acceptance criterion 1 (every lane acquires)
+/// unfinalizable, so when the last eight lanes were wired (2026-08-24) the law inverted
+/// to the repository's standard completed-migration shape: the remainder is a DECLARED
+/// constant, empty at landing, and equality holds in both directions. A lane that stops
+/// acquiring, or a new declared lane added without acquisition, fails here until it is
+/// named in this constant AND in the AGENTS.md sentence below — the same rule
 /// `the_worktree_refusal_scope_is_derived_from_the_lane_population` applies to its own
 /// unmeasured lane, because a reader acts on a specific lane and never on a ratio.
 // Deliberately carries no count. The first version read " of the 20 declared lanes source",
 // which put the lane TOTAL inside the anchor for a test about the gate-lock count — so the
 // same number lived in two places and the anchor broke the moment a lane landed.
 const GATE_LOCK_ANCHOR: &str = " declared lanes source `scripts/lib/gate_lock.sh`";
+
+/// Declared lanes that do NOT take the gate themselves. Empty because `o2vz`'s wiring
+/// half landed: every declared lane sources `scripts/lib/gate_lock.sh`. Growth here is
+/// a regression to the pre-`o2vz` world and must move the AGENTS.md sentence with it.
+const DECLARED_GATE_LOCK_LESS_LANES: &[&str] = &[];
 
 #[test]
 fn every_declared_lane_that_does_not_take_the_gate_lock_is_named_in_the_section() {
@@ -1066,15 +1075,25 @@ fn every_declared_lane_that_does_not_take_the_gate_lock_is_named_in_the_section(
         .map(|(name, _)| name)
         .collect();
 
-    // Anti-vacuity in both directions: if every lane took it the named list would be empty
-    // and the naming law below would pass without reading anything, and if none did the
-    // count would be a zero nobody can falsify.
-    assert!(
-        taking > 0 && !missing.is_empty(),
-        "the gate-lock split is degenerate ({taking} taking, {} not), so one of the two \
-         assertions below is unfalsifiable and the section must say so instead of stating a \
-         split that does not exist",
-        missing.len()
+    // The declared remainder. Before `o2vz` completed this asserted a NON-EMPTY
+    // not-taking set so the naming law below could not pass vacuously; that same
+    // assertion made "every lane acquires" unfinalizable, so completion inverted it:
+    // the remainder is now a declared constant and equality holds in BOTH directions.
+    // A regression (a lane losing its acquisition) and a new unwired lane both fail
+    // here by name, which is the anti-vacuity the old shape was protecting.
+    let missing_set: BTreeSet<String> = missing.iter().map(|name| (*name).clone()).collect();
+    let declared: BTreeSet<String> = DECLARED_GATE_LOCK_LESS_LANES
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    assert_eq!(
+        missing_set,
+        declared,
+        "the declared lanes that do NOT take the gate lock must equal the declared \
+         remainder exactly. extra (stopped acquiring, undeclared): {:?} ; absent \
+         (declared but acquiring again): {:?}",
+        missing_set.difference(&declared).collect::<Vec<_>>(),
+        declared.difference(&missing_set).collect::<Vec<_>>(),
     );
 
     let stated = stated_count_before(&agents, GATE_LOCK_ANCHOR).unwrap_or_else(|| {
