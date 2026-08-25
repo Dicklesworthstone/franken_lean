@@ -143,6 +143,15 @@ const TYPE_CHECKER_LAZY_DELTA_OUTCOME_MAX_ROWS: usize = 262_144;
 const TYPE_CHECKER_LAZY_DELTA_OUTCOME_SCAN_NODES: u64 = 4_194_304;
 const TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS: usize = 16;
 const TYPE_CHECKER_CACHE_MAX_PRIORITY_SCAN_NODES: usize = 4_194_304;
+/// Bounded outcome memo for the K-recursor major coercion (bead `fln-4hol`
+/// item 2, site-0 attribution): `major_to_cnstr_when_k`'s
+/// `app_type =?= new_type` gate alone generated 33% of all defeq queries on
+/// Vector.swap_swap — one uncached resolution per whnf encounter of a
+/// recursor application, repeated across structurally-distinct-but-
+/// equivalent majors. Rows key (recursor, major) with exact equality and a
+/// live dependency slice; refuse-not-evict like the lazy-delta memo.
+const TYPE_CHECKER_MAJOR_COERCION_MAX_ROWS: usize = 262_144;
+const TYPE_CHECKER_MAJOR_COERCION_SCAN_NODES: u64 = 4_194_304;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InferMode {
@@ -1673,6 +1682,12 @@ pub(crate) struct TypeChecker<'a> {
     lazy_delta_outcome_rows: usize,
     lazy_delta_outcome_scan_nodes: u64,
     lazy_delta_replay_hits: u64,
+    /// Landed major-coercion outcome memo (bead `fln-4hol` item 2, site 0):
+    /// bounded, refuse-not-evict, replay-gated by live dependencies.
+    major_coercion_outcomes: HashMap<(u64, u64), Vec<MajorCoercionEntry>>,
+    major_coercion_outcome_rows: usize,
+    major_coercion_scan_nodes: u64,
+    major_coercion_replay_hits: u64,
     /// Pinned `equiv_manager` companion for the equal-regular-head shortcut.
     /// A failed argument comparison is not a negative verdict: it only tells
     /// lazy delta to unfold this pair. Retaining that fact prevents a repeated
@@ -1713,6 +1728,10 @@ impl<'a> TypeChecker<'a> {
             infer_cache: ExprResultCache::new(),
             infer_only_cache: ExprResultCache::new(),
             whnf_core_cache: ExprResultCache::rolling(),
+            major_coercion_outcomes: HashMap::new(),
+            major_coercion_outcome_rows: 0,
+            major_coercion_scan_nodes: 0,
+            major_coercion_replay_hits: 0,
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
             lazy_delta_outcomes: HashMap::new(),
@@ -3421,6 +3440,78 @@ impl<'a> TypeChecker<'a> {
     /// term's type being defeq to the major's. Any gate failure returns the
     /// original major unchanged (reduction without matching the syntactic proof).
     fn major_to_cnstr_when_k(
+        &mut self,
+        rec: &RecursorVal,
+        major: &Expr,
+        depth: u32,
+    ) -> KResult<Expr> {
+        // Item 2, site 0 (bead `fln-4hol`): this gate generated 33% of all
+        // defeq queries on Vector.swap_swap — one uncached resolution per
+        // whnf encounter of a recursor application. Replay is gated by
+        // exact pair equality plus live dependencies, as everywhere else.
+        let key = (rec.base.name.hash(), major.data().0);
+        if let Some(bucket) = self.major_coercion_outcomes.get(&key) {
+            for entry in bucket {
+                if entry.rec_name == rec.base.name
+                    && entry.major == *major
+                    && dependencies_are_live(&entry.deps, &self.locals, &self.local_positions)
+                {
+                    let replay = entry.result.clone();
+                    self.major_coercion_replay_hits += 1;
+                    self.step(depth)?;
+                    return Ok(replay);
+                }
+            }
+        }
+        let result = self.major_to_cnstr_when_k_uncached(rec, major, depth)?;
+        if self.major_coercion_outcome_rows < TYPE_CHECKER_MAJOR_COERCION_MAX_ROWS
+            && self.major_coercion_scan_nodes < TYPE_CHECKER_MAJOR_COERCION_SCAN_NODES
+        {
+            let per_entry = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+            let global_left =
+                (TYPE_CHECKER_MAJOR_COERCION_SCAN_NODES - self.major_coercion_scan_nodes) as usize;
+            let mut nodes_left = per_entry.min(global_left);
+            match local_dependencies(
+                &[major][..],
+                &self.locals,
+                &self.local_positions,
+                &mut nodes_left,
+            ) {
+                Ok(deps) => {
+                    self.major_coercion_scan_nodes +=
+                        u64::try_from(per_entry.min(global_left) - nodes_left).unwrap_or(0);
+                    let bucket = self.major_coercion_outcomes.entry(key).or_default();
+                    if bucket.len() < TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
+                        match bucket
+                            .iter_mut()
+                            .find(|e| e.rec_name == rec.base.name && e.major == *major)
+                        {
+                            Some(slot) => {
+                                slot.result = result.clone();
+                                slot.deps = deps;
+                            }
+                            None => {
+                                bucket.push(MajorCoercionEntry {
+                                    rec_name: rec.base.name.clone(),
+                                    major: major.clone(),
+                                    result: result.clone(),
+                                    deps,
+                                });
+                                self.major_coercion_outcome_rows += 1;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    self.major_coercion_scan_nodes +=
+                        u64::try_from(per_entry.min(global_left) - nodes_left).unwrap_or(0);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn major_to_cnstr_when_k_uncached(
         &mut self,
         rec: &RecursorVal,
         major: &Expr,
@@ -6288,6 +6379,17 @@ struct LazyDeltaOutcomeEntry {
     t: Expr,
     s: Expr,
     outcome: LazyDelta,
+    deps: Vec<LocalDependency>,
+}
+
+/// One memoized K-major coercion outcome (bead `fln-4hol` item 2, site 0).
+/// Same live-dependency replay guarantee as the lazy-delta rows; the
+/// recursor's name is part of the exact-match validation because two
+/// recursors may coerce the same major differently.
+struct MajorCoercionEntry {
+    rec_name: Name,
+    major: Expr,
+    result: Expr,
     deps: Vec<LocalDependency>,
 }
 
@@ -9747,6 +9849,169 @@ mod tests {
         assert!(
             tc.positive_def_eq_cache.entries == 1,
             "resolving the blocker must let the defeq row land"
+        );
+    }
+
+    /// Minimal K-recursor fixture: inductive `Box` with the single
+    /// nullary constructor `mk`, and `Box.rec` with one motive and no
+    /// minors/indices, so the major premise is binder 1.
+    fn publish_box_k_recursor(env: Environment) -> (Environment, Name) {
+        use fln_env::constants::{ConstantVal, ConstructorVal, InductiveVal};
+        let box_name = Name::str(Name::anonymous(), "Box");
+        let mk_name = Name::str(box_name.clone(), "mk");
+        let rec_name = Name::str(box_name.clone(), "rec");
+        let box_ty = Expr::const_(box_name.clone(), Vec::new());
+        let env = env
+            .add_decl(ConstantInfo::Induct(InductiveVal {
+                base: ConstantVal {
+                    name: box_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                all: vec![box_name.clone()],
+                num_params: 0,
+                num_indices: 0,
+                ctors: vec![mk_name.clone()],
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: false,
+                is_reflexive: false,
+            }))
+            .expect("fixture inductive adds");
+        let env = env
+            .add_decl(ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: mk_name.clone(),
+                    level_params: Vec::new(),
+                    type_: box_ty.clone(),
+                },
+                induct: box_name.clone(),
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            }))
+            .expect("fixture ctor adds");
+        let rec_ty = Expr::forall_e(
+            Name::str(Name::anonymous(), "M"),
+            box_ty.clone(),
+            Expr::forall_e(
+                Name::str(Name::anonymous(), "x"),
+                box_ty.clone(),
+                Expr::app(
+                    Expr::bvar(1).expect("motive under major"),
+                    Expr::bvar(0).expect("major"),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let env = env
+            .add_decl(ConstantInfo::Rec(RecursorVal {
+                base: ConstantVal {
+                    name: rec_name.clone(),
+                    level_params: Vec::new(),
+                    type_: rec_ty,
+                },
+                all: vec![box_name],
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 0,
+                rules: Vec::new(),
+                k: true,
+                is_unsafe: false,
+            }))
+            .expect("fixture recursor adds");
+        (env, rec_name)
+    }
+
+    #[test]
+    fn a_k_major_coercion_outcome_replays_without_reinfering() {
+        let (env, rec_name) = publish_box_k_recursor(Environment::new());
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let binder = FVarId(Name::str(Name::anonymous(), "boxed"));
+        tc.adopt_local(
+            binder.clone(),
+            Expr::const_(Name::str(Name::anonymous(), "Box"), Vec::new()),
+        );
+        let major = Expr::fvar(binder);
+        let rec = match tc.env.find(&rec_name) {
+            Some(ConstantInfo::Rec(rec)) => rec.clone(),
+            other => panic!("fixture must publish the recursor, found {other:?}"),
+        };
+        let first = tc
+            .major_to_cnstr_when_k(&rec, &major, 0)
+            .unwrap_or_else(|err| panic!("coercion must not fail: {err:?}"));
+        assert!(tc.major_coercion_outcome_rows == 1 && tc.major_coercion_replay_hits == 0);
+        let second = tc
+            .major_to_cnstr_when_k(&rec, &major, 0)
+            .unwrap_or_else(|err| panic!("replayed coercion must not fail: {err:?}"));
+        assert_eq!(first, second, "replay must return the identical result");
+        assert!(
+            tc.major_coercion_replay_hits == 1,
+            "the identical (recursor, major) pair must replay from the memo"
+        );
+    }
+
+    #[test]
+    fn a_dead_dependency_slice_forces_a_fresh_major_coercion() {
+        let (env, rec_name) = publish_box_k_recursor(Environment::new());
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let binder = FVarId(Name::str(Name::anonymous(), "drifted"));
+        tc.adopt_local(
+            binder.clone(),
+            Expr::const_(Name::str(Name::anonymous(), "Box"), Vec::new()),
+        );
+        let major = Expr::fvar(binder.clone());
+        let rec = match tc.env.find(&rec_name) {
+            Some(ConstantInfo::Rec(rec)) => rec.clone(),
+            other => panic!("fixture must publish the recursor, found {other:?}"),
+        };
+        let _ = tc.major_to_cnstr_when_k(&rec, &major, 0);
+        assert!(tc.major_coercion_outcome_rows == 1 && tc.major_coercion_replay_hits == 0);
+        tc.locals.clear();
+        tc.local_positions.clear();
+        tc.adopt_local(
+            binder,
+            Expr::const_(Name::str(Name::anonymous(), "Box"), Vec::new()),
+        );
+        let _ = tc.major_to_cnstr_when_k(&rec, &major, 0);
+        assert!(
+            tc.major_coercion_replay_hits == 0,
+            "a dead dependency slice must never replay"
+        );
+        assert!(
+            tc.major_coercion_outcome_rows == 1,
+            "the refreshed row replaces the dead one instead of growing"
+        );
+    }
+
+    #[test]
+    fn the_major_coercion_memo_refuses_new_rows_past_its_bound() {
+        let (env, rec_name) = publish_box_k_recursor(Environment::new());
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let binder = FVarId(Name::str(Name::anonymous(), "bound_boxed"));
+        tc.adopt_local(
+            binder.clone(),
+            Expr::const_(Name::str(Name::anonymous(), "Box"), Vec::new()),
+        );
+        let major = Expr::fvar(binder);
+        let rec = match tc.env.find(&rec_name) {
+            Some(ConstantInfo::Rec(rec)) => rec.clone(),
+            other => panic!("fixture must publish the recursor, found {other:?}"),
+        };
+        tc.major_coercion_outcome_rows = TYPE_CHECKER_MAJOR_COERCION_MAX_ROWS;
+        let outcome = tc
+            .major_to_cnstr_when_k(&rec, &major, 0)
+            .unwrap_or_else(|err| panic!("bounded coercion must not fail: {err:?}"));
+        assert!(
+            matches!(&outcome, coerced if *coerced != major),
+            "the coercion itself must still work past saturation"
+        );
+        assert!(
+            tc.major_coercion_outcomes.is_empty(),
+            "saturation refuses new rows instead of evicting"
         );
     }
 
