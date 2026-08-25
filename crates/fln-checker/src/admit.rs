@@ -6576,14 +6576,26 @@ fn admit_indexed_class_block(
     //
     // 1. The motive's domain is an index_count binder telescope ending in a
     //    sort.
+    if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+        for (position, (binder_type, _)) in rec_tail_binders.iter().enumerate() {
+            let head = match recursor_type.node(*binder_type) {
+                Some(ExprNode::Forall { .. }) => "Pi".to_owned(),
+                Some(ExprNode::Bound { index }) => format!("Ref#{}", index),
+                Some(ExprNode::Sort { level }) => format!("Sort({:?})", level),
+                Some(ExprNode::Constant { name, .. }) => {
+                    format!("Const({:?})", name.to_display_string())
+                }
+                _ => "?".to_owned(),
+            };
+            eprintln!("indexed TAIL[{position}] type-head: {head}");
+        }
+    }
     let Some((_motive_index_binders, motive_domain_tail)) =
         peel_binders_at(recursor_type, motive_binder.0, index_count)
     else {
         return defer("motive-index-peel");
     };
     if !is_sort_at(recursor_type, motive_domain_tail) {
-        // Eq.rec observed shape: fields hoisted ahead of the motive; the
-        // full hoisted-field telescope support is the next structural slice.
         return defer("motive-domain-sort-tail");
     }
 
