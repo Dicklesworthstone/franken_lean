@@ -6583,7 +6583,9 @@ fn admit_indexed_class_block(
                 Some(ExprNode::Bound { index }) => format!("Ref#{}", index),
                 Some(ExprNode::Sort { level }) => format!("Sort({:?})", level),
                 Some(ExprNode::Constant { name, .. }) => {
-                    format!("Const({:?})", name.to_display_string())
+                    // WireName has no display renderer; Debug is the
+                    // checker-side rendering (fixes fdb6eb32's build break).
+                    format!("Const({name:?})")
                 }
                 _ => "?".to_owned(),
             };
