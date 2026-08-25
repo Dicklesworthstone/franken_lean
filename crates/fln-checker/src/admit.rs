@@ -6554,8 +6554,16 @@ fn admit_indexed_class_block(
     else {
         return defer("recursor-parameter-peel");
     };
+    // The pin HOISTS the constructor's fields into the recursor telescope
+    // ahead of the motive (`Eq.rec = α → a → motive → minor → b → h`), so
+    // peel them here before the motive/minor/indices/major tail.
+    let Some((_rec_hoisted_fields, rec_after_fields)) =
+        peel_binders_at(recursor_type, rec_after_params, field_count)
+    else {
+        return defer("recursor-hoisted-field-peel");
+    };
     let Some((rec_tail_binders, rec_final_body)) =
-        peel_binders_at(recursor_type, rec_after_params, 2 + index_count)
+        peel_binders_at(recursor_type, rec_after_fields, 2 + index_count)
     else {
         return defer("recursor-tail-peel");
     };
@@ -6574,11 +6582,8 @@ fn admit_indexed_class_block(
         return defer("motive-index-peel");
     };
     if !is_sort_at(recursor_type, motive_domain_tail) {
-        // Observed on Eq.rec: the pin HOISTS the constructor's fields into
-        // the recursor telescope ahead of the motive (`α → a → motive → …`),
-        // so the naive tail-peel above leaves trailing binders. Supporting
-        // hoisted fields is the next structural slice; until then this arm
-        // refuses to guess and stays a typed non-answer.
+        // Eq.rec observed shape: fields hoisted ahead of the motive; the
+        // full hoisted-field telescope support is the next structural slice.
         return defer("motive-domain-sort-tail");
     }
 
@@ -6597,7 +6602,9 @@ fn admit_indexed_class_block(
                 minor_spine_arguments.push(*argument);
                 minor_spine_cursor = *function;
             }
-            Some(ExprNode::Bound { index }) if *index as usize == field_count => break,
+            // With fields hoisted ahead of the motive, the motive reference
+            // sits at depth zero inside the minor premise's type.
+            Some(ExprNode::Bound { .. }) => break,
             _ => return defer("minor-body-spine"),
         }
     }
