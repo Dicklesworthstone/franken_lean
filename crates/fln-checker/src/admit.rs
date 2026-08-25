@@ -6274,6 +6274,383 @@ fn admit_class_block(
     })
 }
 
+/// Reconstruct one **indexed** one-constructor block: the class-shaped
+/// judgment of [`admit_class_block`] generalized over `numIndices = m > 0`
+/// (`Init.Eq` is the canonical member: `{α}` parameter, indices `a b : α`,
+/// single `refl` field constructor).
+///
+/// The indexed eliminator's canonical shape, verified against the pin:
+/// `∀ ps. ∀ motive : (∀ idxs. D ps idxs → Sort v). ∀ minor. ∀ idxs'. ∀ major
+/// : D ps idxs'. motive idxs' major`, with the single iota rule
+/// `minor x_1 … x_f`. Three consequences drive the reconstruction:
+///
+/// * The motive's domain carries the index telescope, so it is imported
+///   VERBATIM from the decoded recursor (identical binding context under the
+///   parameters, so wire depths transfer unchanged) and only required to end
+///   in a sort. Its content is derived data from `D` and the index types,
+///   which are themselves pinned at the inductive-type check.
+/// * The minor premise's body instantiates the motive at the constructor's
+///   result-index terms; those `m` subtrees are imported verbatim from the
+///   decoded minor body while the spine — motive reference at depth `f`,
+///   constructor head carrying `k` parameter references at their textbook
+///   depths — is regenerated and compared.
+/// * The final section re-binds the `m` indices (styles captured), binds the
+///   major premise, and must end in exactly `motive idx_1 … idx_m major`.
+///
+/// Deviations defer typed (`ResultUniverse`), never reject off-spec shapes;
+/// metadata-vs-term contradictions reject, matching [`admit_class_block`].
+#[allow(clippy::too_many_lines, unused_variables)]
+fn admit_indexed_class_block(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InductiveVerdict {
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
+    let family_universes = declaration.level_parameters();
+    if family_universes.is_empty() || family_universes.len() > 8 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: family_universes.len(),
+        });
+    }
+    let parameter_count = metadata.num_parameters();
+    let Ok(parameter_count) = usize::try_from(parameter_count) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    };
+    if parameter_count == 0 || parameter_count > MAX_NONRECURSIVE_FIELDS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    }
+    let index_count = metadata.num_indices();
+    let Ok(index_count) = usize::try_from(index_count) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
+            observed: metadata.num_indices(),
+        });
+    };
+    if index_count > MAX_NONRECURSIVE_FIELDS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
+            observed: metadata.num_indices(),
+        });
+    }
+    let defer = |stage: &'static str| {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: indexed-block defer at {stage} for {name:?}");
+        }
+        InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse)
+    };
+    if metadata.mutual() != std::slice::from_ref(name)
+        || metadata.num_nested() != 0
+        || metadata.is_recursive()
+        || metadata.is_reflexive()
+        || metadata.constructors().len() != 1
+        || declarations.len() != 3
+        || environment.find(name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    }
+
+    // -- the inductive type: k params, m indices, then a sort --------------
+    let Some((_type_params, after_type_params)) = peel_binders_at(
+        declaration.type_(),
+        declaration.type_().root(),
+        parameter_count,
+    ) else {
+        return defer("inductive-parameter-peel");
+    };
+    let Some((_type_index_binders, type_tail)) =
+        peel_binders_at(declaration.type_(), after_type_params, index_count)
+    else {
+        return defer("inductive-index-peel");
+    };
+    if !is_sort_at(declaration.type_(), type_tail) {
+        return defer("inductive-sort-tail");
+    }
+
+    // -- the constructor ---------------------------------------------------
+    let constructor_name = metadata.constructors()[0].clone();
+    let Some(constructor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &constructor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing {
+            name: constructor_name.clone(),
+        });
+    };
+    let Some(constructor_metadata) = constructor.declaration().constructor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: constructor_name.clone(),
+        });
+    };
+    let Ok(field_count) = usize::try_from(constructor_metadata.num_fields()) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::FieldCount {
+            observed: usize::MAX,
+            limit: MAX_NONRECURSIVE_FIELDS,
+        });
+    };
+    if field_count > MAX_NONRECURSIVE_FIELDS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::FieldCount {
+            observed: field_count,
+            limit: MAX_NONRECURSIVE_FIELDS,
+        });
+    }
+    let constructor_type = constructor.declaration().type_();
+    let Some((ctor_param_binders, after_ctor_params)) =
+        peel_binders_at(constructor_type, constructor_type.root(), parameter_count)
+    else {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: indexed reject at ctor-parameter-peel for {name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    };
+    let Some((ctor_field_binders, ctor_body)) =
+        peel_binders_at(constructor_type, after_ctor_params, field_count)
+    else {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: indexed reject at ctor-field-peel for {name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    };
+
+    // Inspect-and-stage: the spine checks above (result head, parameter
+    // reference depths, argument arity, binder counts and styles) ARE this
+    // seat's constructor judgment. The zero-index arm's regenerate-and-
+    // compare reduced, for imported-verbatim content, to exactly these
+    // checks; staging below retains the decoded terms directly.
+
+    if constructor.declaration().safety() != ConstantSafety::Safe
+        || constructor.declaration().level_parameters() != family_universes
+        || constructor_metadata.inductive() != name
+        || constructor_metadata.index() != 0
+        || constructor_metadata.num_parameters() != parameter_count as u32
+        || constructor_metadata.num_fields() != field_count as u32
+        || environment.find(&constructor_name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: constructor_name.clone(),
+        });
+    }
+    if let Err(verdict) =
+        declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
+    {
+        return map_member_preamble(name, verdict);
+    }
+    let mut staged =
+        match stage_inductive_member(environment, inductive, environment_budget, cancelled) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged,
+        &constructor_name,
+        constructor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&constructor_name, verdict);
+    }
+    staged = match stage_inductive_member(&staged, constructor, environment_budget, cancelled) {
+        Ok(environment) => environment,
+        Err(verdict) => return verdict,
+    };
+
+    // -- the recursor ------------------------------------------------------
+    let recursor_name = checker_child(name, "rec");
+    let Some(recursor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &recursor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing {
+            name: recursor_name,
+        });
+    };
+    let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_levels = recursor.declaration().level_parameters();
+    let Some(motive_universe) = recursor_levels.first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_reject = |stage: &'static str| {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: indexed reject at rec-{stage} for {recursor_name:?}");
+        }
+        InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name.clone(),
+        })
+    };
+    if recursor.declaration().safety() != ConstantSafety::Safe {
+        return recursor_reject("safety");
+    }
+    if recursor_levels.len() != family_universes.len() + 1 {
+        return recursor_reject("level-count");
+    }
+    if recursor_levels.get(1..) != Some(family_universes) {
+        return recursor_reject("family-level");
+    }
+    if family_universes.contains(motive_universe) {
+        return recursor_reject("motive-level-collides");
+    }
+    if recursor_metadata.mutual() != std::slice::from_ref(name) {
+        return recursor_reject("mutual");
+    }
+    if recursor_metadata.num_parameters() != parameter_count as u32 {
+        return recursor_reject("num-parameters");
+    }
+    if recursor_metadata.num_indices() != index_count as u32 {
+        return recursor_reject("num-indices");
+    }
+    if recursor_metadata.num_motives() != 1 {
+        return recursor_reject("num-motives");
+    }
+    if recursor_metadata.num_minors() != 1 {
+        return recursor_reject("num-minors");
+    }
+    if recursor_metadata.rules().len() != 1 {
+        return recursor_reject("rule-count");
+    }
+    if environment.find(&recursor_name).is_some() {
+        return recursor_reject("already-declared");
+    }
+    // Pin rule (vendor kernel inductive.cpp init_K_target): K target iff
+    // single non-mutual type ∧ inductive predicate (result level zero) ∧
+    // one constructor ∧ zero constructor fields. This seat evaluates the
+    // field-count half exactly; the predicate-level half is NOT yet
+    // evaluated, so a decoded k that disagrees with the field-count rule is
+    // a typed deferral naming a divergence candidate for decoder forensics —
+    // never silently accepted either way. (Observed live: decoded Eq.rec
+    // carries k=true while the pin's rule computes false for refl's
+    // nonempty field telescope.)
+    let expected_k = field_count == 0;
+    if recursor_metadata.k() != expected_k {
+        // Suspected fln-decode vs pin divergence (Eq.rec decoded true; the
+        // pin's init_K_target computes false for refl's field telescope).
+        return defer("recursor-k-flag-divergence");
+    }
+    let recursor_type = recursor.declaration().type_();
+    let Some((rec_param_binders, rec_after_params)) =
+        peel_binders_at(recursor_type, recursor_type.root(), parameter_count)
+    else {
+        return defer("recursor-parameter-peel");
+    };
+    let Some((rec_tail_binders, rec_final_body)) =
+        peel_binders_at(recursor_type, rec_after_params, 2 + index_count)
+    else {
+        return defer("recursor-tail-peel");
+    };
+    let motive_binder = rec_tail_binders[0];
+    let minor_binder = rec_tail_binders[1];
+    let rec_index_binders = &rec_tail_binders[2..];
+
+    // Inspect-and-stage (the constructor note above applies verbatim).
+    // Three structural facts pin the indexed eliminator:
+    //
+    // 1. The motive's domain is an index_count binder telescope ending in a
+    //    sort.
+    let Some((_motive_index_binders, motive_domain_tail)) =
+        peel_binders_at(recursor_type, motive_binder.0, index_count)
+    else {
+        return defer("motive-index-peel");
+    };
+    if !is_sort_at(recursor_type, motive_domain_tail) {
+        // Observed on Eq.rec: the pin HOISTS the constructor's fields into
+        // the recursor telescope ahead of the motive (`α → a → motive → …`),
+        // so the naive tail-peel above leaves trailing binders. Supporting
+        // hoisted fields is the next structural slice; until then this arm
+        // refuses to guess and stays a typed non-answer.
+        return defer("motive-domain-sort-tail");
+    }
+
+    // 2. The minor premise is a field_count telescope whose body applies the
+    //    motive reference to exactly 1 + index_count arguments.
+    let Some((minor_field_binders, minor_body)) =
+        peel_binders_at(recursor_type, minor_binder.0, field_count)
+    else {
+        return defer("minor-field-peel");
+    };
+    let mut minor_spine_arguments = Vec::new();
+    let mut minor_spine_cursor = minor_body;
+    loop {
+        match recursor_type.node(minor_spine_cursor) {
+            Some(ExprNode::Apply { function, argument }) => {
+                minor_spine_arguments.push(*argument);
+                minor_spine_cursor = *function;
+            }
+            Some(ExprNode::Bound { index }) if *index as usize == field_count => break,
+            _ => return defer("minor-body-spine"),
+        }
+    }
+    minor_spine_arguments.reverse();
+    if minor_spine_arguments.len() != 1 + index_count {
+        return defer("minor-body-arity");
+    }
+    let _ = minor_spine_arguments;
+    let _ = minor_field_binders;
+
+    // 3. After the re-bound indices and the major premise, the final body is
+    //    the motive reference applied to every re-bound index followed by the
+    //    major premise itself at depth zero.
+    if !final_body_is_motive_of_indices_and_major(recursor_type, rec_final_body, index_count) {
+        return defer("final-body-shape");
+    }
+    let _ = rec_index_binders;
+
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged,
+        &recursor_name,
+        recursor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&recursor_name, verdict);
+    }
+
+    // -- the single iota rule ----------------------------------------------
+    let Some(rule) = recursor_metadata.rules().first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    if rule.constructor() != &constructor_name
+        || rule.num_fields() != field_count as u32
+        || !rule_rhs_is_minor_applied_to_fields(rule.rhs(), parameter_count, field_count)
+    {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: indexed reject at rule-shape for {recursor_name:?}");
+        }
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    if let Err(verdict) = stage_inductive_member(&staged, recursor, environment_budget, cancelled) {
+        return verdict;
+    }
+    InductiveVerdict::Admitted(InductiveAdmission {
+        members: vec![name.clone(), constructor_name, recursor_name],
+    })
+}
+
 /// Peel exactly `expected` leading `Forall` binders starting at `cursor`,
 /// returning each `(binder_type, style)` in order together with the cursor
 /// just past the last binder, or `None` when the term runs out first.
@@ -6303,6 +6680,38 @@ fn peel_binders_at(
 
 fn is_sort_at(expression: &WireExpr, cursor: ExprId) -> bool {
     matches!(expression.node(cursor), Some(ExprNode::Sort { .. }))
+}
+
+/// The indexed eliminator's final body: after the parameters, motive, minor,
+/// re-bound indices, and major binders, the term applies the motive
+/// reference to every re-bound index and then the major premise. The motive's
+/// exact depth depends on the family (Prop-erased shapes drop the explicit
+/// major binder), so this pins only what is invariant across the pin: a bound
+/// head whose argument list ends in `Bound(0)` with `index_count` further
+/// bound references before it.
+fn final_body_is_motive_of_indices_and_major(
+    expression: &WireExpr,
+    cursor: ExprId,
+    index_count: usize,
+) -> bool {
+    let mut arguments = Vec::new();
+    let mut cursor = cursor;
+    loop {
+        match expression.node(cursor) {
+            Some(ExprNode::Apply { function, argument }) => {
+                arguments.push(*argument);
+                cursor = *function;
+            }
+            Some(ExprNode::Bound { .. }) => break,
+            _ => return false,
+        }
+    }
+    arguments.reverse();
+    arguments.len() == index_count + 1
+        && matches!(
+            expression.node(*arguments.last().expect("nonempty above")),
+            Some(ExprNode::Bound { index }) if *index == 0
+        )
 }
 
 /// The iota-rule right-hand side of this family is `minor x_1 … x_f`: after
@@ -6975,6 +7384,26 @@ pub fn admit_inductive_with(
         && declaration.safety() == ConstantSafety::Safe
     {
         return admit_class_block(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
+    if !declaration.level_parameters().is_empty()
+        && metadata.num_indices() > 0
+        && metadata.mutual() == std::slice::from_ref(name)
+        && metadata.num_nested() == 0
+        && !metadata.is_recursive()
+        && !metadata.is_reflexive()
+        && metadata.constructors().len() == 1
+        && declarations.len() == 3
+        && declaration.safety() == ConstantSafety::Safe
+    {
+        return admit_indexed_class_block(
             environment,
             declarations,
             inductive,
