@@ -1,8 +1,11 @@
 # CI — the quality gate (bead franken_lean-rur).
 #
 # The test step IS scripts/check.sh (AGENTS.md: never duplicate the gate commands
-# inline in workflow files). Stages inside check.sh: fmt, check, clippy, test,
-# structure-guard, ubs-when-present. The e2e smoke family runs beside it and all
+# inline in workflow files). check.sh's CHECK_STAGE_ORDER enumerates 16 stages:
+# evidence-self-test, verification-manifest, shellcheck, ubs-gate-classifier,
+# projection-guard-harness, fmt, check, clippy, contract-handoff-no-mock,
+# test, tribunal-manifest-inventory, epoch-lab-test, epoch-lab-live-verify,
+# structure-guard, vendor-tree, ubs. The e2e smoke family runs beside it and
 # NDJSON/console artifacts are archived so failures are diagnosable without rerun.
 
 name: ci
