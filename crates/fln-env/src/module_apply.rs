@@ -206,6 +206,97 @@ impl ModuleApplyTransaction {
     }
 }
 
+/// Caller-supplied resource budgets for one module-application transaction.
+///
+/// The manifest and graph enforce their own admission limits when a committed
+/// state is constructed; these bounds are the envelope-side complement. They cap
+/// what one transaction may carry *before* any binding work runs, so an
+/// oversized envelope is refused before manifest verification, payload
+/// comparison, extension replay, or graph preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleApplyLimits {
+    pub max_declaration_payloads: usize,
+    pub max_extra_declaration_payloads: usize,
+    pub max_extension_payloads: usize,
+    pub max_extension_payload_bytes: u128,
+}
+
+impl ModuleApplyLimits {
+    pub const fn new(
+        max_declaration_payloads: usize,
+        max_extra_declaration_payloads: usize,
+        max_extension_payloads: usize,
+        max_extension_payload_bytes: u128,
+    ) -> Self {
+        Self {
+            max_declaration_payloads,
+            max_extra_declaration_payloads,
+            max_extension_payloads,
+            max_extension_payload_bytes,
+        }
+    }
+}
+
+impl Default for ModuleApplyLimits {
+    /// Matches the generous production posture of [`crate::provenance::ModuleProvenanceLimits`]:
+    /// one million payloads per declaration class and twenty million extension
+    /// rows, bounded by four GiB of extension bytes.
+    fn default() -> Self {
+        Self::new(1_000_000, 1_000_000, 20_000_000, 4 * 1024 * 1024 * 1024)
+    }
+}
+
+/// Which envelope budget refused a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleApplyResource {
+    DeclarationPayloads,
+    ExtraDeclarationPayloads,
+    ExtensionPayloads,
+    ExtensionPayloadBytes,
+}
+
+impl fmt::Display for ModuleApplyResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::DeclarationPayloads => "declaration payloads",
+            Self::ExtraDeclarationPayloads => "extra declaration payloads",
+            Self::ExtensionPayloads => "extension payloads",
+            Self::ExtensionPayloadBytes => "extension payload bytes",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Exact usage facts measured from one transaction envelope before any binding
+/// work runs. Counts and byte totals only; nothing is allocated or charged.
+///
+/// The byte total saturates at `u128::MAX`, which every finite budget refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleApplyUsage {
+    declaration_payloads: usize,
+    extra_declaration_payloads: usize,
+    extension_payloads: usize,
+    extension_payload_bytes: u128,
+}
+
+impl ModuleApplyUsage {
+    pub const fn declaration_payloads(&self) -> usize {
+        self.declaration_payloads
+    }
+
+    pub const fn extra_declaration_payloads(&self) -> usize {
+        self.extra_declaration_payloads
+    }
+
+    pub const fn extension_payloads(&self) -> usize {
+        self.extension_payloads
+    }
+
+    pub const fn extension_payload_bytes(&self) -> u128 {
+        self.extension_payload_bytes
+    }
+}
+
 /// A completed, non-authoritative payload-binding check.
 #[derive(Debug, Clone)]
 pub struct PreflightedModuleApply {
@@ -214,6 +305,7 @@ pub struct PreflightedModuleApply {
     manifest_root: ModuleProvenanceRoot,
     declaration_identities: Arc<[Digest]>,
     transaction_id: ModuleApplyTransactionId,
+    usage: ModuleApplyUsage,
 }
 
 /// The only aggregate value an application path may expose as committed.
@@ -763,6 +855,11 @@ impl PreflightedModuleApply {
     pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
         self.transaction_id
     }
+
+    /// Exact envelope usage facts measured before any binding work ran.
+    pub const fn usage(&self) -> ModuleApplyUsage {
+        self.usage
+    }
 }
 
 /// The payload side of one contribution once its manifest binding has completed.
@@ -865,6 +962,11 @@ pub enum ModuleApplyPreflightError {
         payload_index: usize,
         expected: ExtensionEntryId,
         actual: ExtensionEntryId,
+    },
+    LimitExceeded {
+        resource: ModuleApplyResource,
+        limit: u128,
+        actual: u128,
     },
 }
 
@@ -1929,7 +2031,10 @@ pub fn replay_preflighted_extensions(
 /// this exact checked envelope.
 pub fn preflight_module_apply(
     transaction: ModuleApplyTransaction,
+    limits: &ModuleApplyLimits,
 ) -> Result<PreflightedModuleApply, ModuleApplyPreflightError> {
+    let usage = measure_module_apply_usage(&transaction);
+    enforce_module_apply_limits(limits, &usage)?;
     transaction
         .manifest
         .verify_self_consistency()
@@ -2044,6 +2149,7 @@ pub fn preflight_module_apply(
         transaction,
         declaration_identities,
         transaction_id,
+        usage,
     })
 }
 
@@ -2066,6 +2172,61 @@ fn verify_declaration_payloads(
                 index,
                 expected: expected.clone(),
                 actual: actual.name().clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Measure one envelope's resource facts without allocating or copying payload bytes.
+fn measure_module_apply_usage(transaction: &ModuleApplyTransaction) -> ModuleApplyUsage {
+    let mut extension_payload_bytes: u128 = 0;
+    for payload in transaction.extension_payloads() {
+        extension_payload_bytes =
+            extension_payload_bytes.saturating_add(payload.payload().len() as u128);
+    }
+    ModuleApplyUsage {
+        declaration_payloads: transaction.declarations().len(),
+        extra_declaration_payloads: transaction.extra_declarations().len(),
+        extension_payloads: transaction.extension_payloads().len(),
+        extension_payload_bytes,
+    }
+}
+
+/// Refuse an envelope exceeding any caller-supplied budget before any binding
+/// work runs: no manifest verification, no payload comparison, no graph work.
+fn enforce_module_apply_limits(
+    limits: &ModuleApplyLimits,
+    usage: &ModuleApplyUsage,
+) -> Result<(), ModuleApplyPreflightError> {
+    let checks = [
+        (
+            ModuleApplyResource::DeclarationPayloads,
+            limits.max_declaration_payloads as u128,
+            usage.declaration_payloads() as u128,
+        ),
+        (
+            ModuleApplyResource::ExtraDeclarationPayloads,
+            limits.max_extra_declaration_payloads as u128,
+            usage.extra_declaration_payloads() as u128,
+        ),
+        (
+            ModuleApplyResource::ExtensionPayloads,
+            limits.max_extension_payloads as u128,
+            usage.extension_payloads() as u128,
+        ),
+        (
+            ModuleApplyResource::ExtensionPayloadBytes,
+            limits.max_extension_payload_bytes,
+            usage.extension_payload_bytes(),
+        ),
+    ];
+    for (resource, limit, actual) in checks {
+        if actual > limit {
+            return Err(ModuleApplyPreflightError::LimitExceeded {
+                resource,
+                limit,
+                actual,
             });
         }
     }
@@ -2254,8 +2415,11 @@ mod tests {
         contribution: ModuleContributionRecord,
         extension_payloads: Vec<ExtensionPayload>,
     ) -> AppliedModulePayload {
-        let checked = preflight_module_apply(transaction(contribution, extension_payloads))
-            .expect("fixture payload binding is valid");
+        let checked = preflight_module_apply(
+            transaction(contribution, extension_payloads),
+            &ModuleApplyLimits::default(),
+        )
+        .expect("fixture payload binding is valid");
         AppliedModulePayload::from_preflight(&checked)
             .expect("current preflight schema retains fixture payloads")
     }
@@ -2344,20 +2508,26 @@ mod tests {
             "fixture.retry-right.extra",
             22,
         );
-        let left_preflight = preflight_module_apply(transaction_with_target(
-            vec![left.clone()],
-            left.clone(),
-            "fixture.retry-left.decl",
-            "fixture.retry-left.extra",
-        ))
+        let left_preflight = preflight_module_apply(
+            transaction_with_target(
+                vec![left.clone()],
+                left.clone(),
+                "fixture.retry-left.decl",
+                "fixture.retry-left.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("left retry fixture preflights");
         let left_publication = publish_fixture(&left_preflight, &base);
-        let right_preflight = preflight_module_apply(transaction_with_target(
-            vec![left, right.clone()],
-            right,
-            "fixture.retry-right.decl",
-            "fixture.retry-right.extra",
-        ))
+        let right_preflight = preflight_module_apply(
+            transaction_with_target(
+                vec![left, right.clone()],
+                right,
+                "fixture.retry-right.decl",
+                "fixture.retry-right.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("right descendant fixture preflights");
         let descendant = publish_fixture(&right_preflight, left_publication.state()).into_state();
         (left_preflight, left_publication, descendant)
@@ -2384,7 +2554,8 @@ mod tests {
             )],
         );
         let declaration = Arc::clone(&transaction.declarations()[0]);
-        let checked = preflight_module_apply(transaction).expect("exact payload binding");
+        let checked = preflight_module_apply(transaction, &ModuleApplyLimits::default())
+            .expect("exact payload binding");
         let applied = AppliedModulePayload::from_preflight(&checked)
             .expect("current preflight schema retains payloads");
 
@@ -2429,7 +2600,7 @@ mod tests {
         );
 
         assert!(matches!(
-            preflight_module_apply(transaction),
+            preflight_module_apply(transaction, &ModuleApplyLimits::default()),
             Err(ModuleApplyPreflightError::DeclarationName {
                 class: DeclarationClass::Declaration,
                 index: 0,
@@ -2457,7 +2628,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            preflight_module_apply(wrong_bytes),
+            preflight_module_apply(wrong_bytes, &ModuleApplyLimits::default()),
             Err(ModuleApplyPreflightError::ExtensionIdentity {
                 payload_index: 0,
                 ..
@@ -2472,7 +2643,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            preflight_module_apply(reordered),
+            preflight_module_apply(reordered, &ModuleApplyLimits::default()),
             Err(ModuleApplyPreflightError::ExtensionOccurrence {
                 payload_index: 0,
                 ..
@@ -2601,7 +2772,8 @@ mod tests {
     #[test]
     fn kernel_candidate_must_be_the_exact_declaration_delta_and_nothing_else() {
         let transaction = transaction(record(vec![]), vec![]);
-        let checked = preflight_module_apply(transaction).expect("payloads preflight");
+        let checked = preflight_module_apply(transaction, &ModuleApplyLimits::default())
+            .expect("payloads preflight");
         let base = Environment::new()
             .register_extension(descriptor())
             .expect("fixture extension is unique");
@@ -2661,15 +2833,18 @@ mod tests {
             history,
             vec![entry],
         )]);
-        let checked = preflight_module_apply(transaction(
-            contribution,
-            vec![ExtensionPayload::new(
-                0,
-                descriptor.clone(),
-                0,
-                &b"replay"[..],
-            )],
-        ))
+        let checked = preflight_module_apply(
+            transaction(
+                contribution,
+                vec![ExtensionPayload::new(
+                    0,
+                    descriptor.clone(),
+                    0,
+                    &b"replay"[..],
+                )],
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("payloads preflight");
         let candidate = base
             .add_decl((*checked.transaction().declarations()[0]).clone())
@@ -2698,15 +2873,18 @@ mod tests {
             b"replay"
         );
 
-        let stale = preflight_module_apply(transaction(
-            record(vec![ExtensionContribution::new(
-                descriptor.clone(),
-                0,
-                Digest([0; 32]),
-                vec![entry],
-            )]),
-            vec![ExtensionPayload::new(0, descriptor, 0, &b"replay"[..])],
-        ))
+        let stale = preflight_module_apply(
+            transaction(
+                record(vec![ExtensionContribution::new(
+                    descriptor.clone(),
+                    0,
+                    Digest([0; 32]),
+                    vec![entry],
+                )]),
+                vec![ExtensionPayload::new(0, descriptor, 0, &b"replay"[..])],
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("stale history does not alter payload binding");
         assert!(matches!(
             replay_preflighted_extensions(&stale, &base, &candidate),
@@ -2754,10 +2932,13 @@ mod tests {
             history,
             vec![entry],
         )]);
-        let checked = preflight_module_apply(transaction(
-            contribution.clone(),
-            vec![ExtensionPayload::new(0, descriptor, 0, &b"candidate"[..])],
-        ))
+        let checked = preflight_module_apply(
+            transaction(
+                contribution.clone(),
+                vec![ExtensionPayload::new(0, descriptor, 0, &b"candidate"[..])],
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("payloads preflight");
         assert!(matches!(
             classify_module_apply_retry(&checked, &base, None),
@@ -3097,10 +3278,13 @@ mod tests {
             contribution.extension_contributions().to_vec(),
             contribution.completeness().clone(),
         );
-        let replacement_preflight = preflight_module_apply(transaction(
-            replacement,
-            checked.transaction().extension_payloads().to_vec(),
-        ))
+        let replacement_preflight = preflight_module_apply(
+            transaction(
+                replacement,
+                checked.transaction().extension_payloads().to_vec(),
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("replacement fixture binds its own canonical manifest");
         assert!(matches!(
             prepare_module_apply(
@@ -3125,13 +3309,16 @@ mod tests {
             }
             other => panic!("fixture declaration changed kind: {other:?}"),
         };
-        let altered = preflight_module_apply(ModuleApplyTransaction::new(
-            Arc::clone(&checked.transaction().manifest),
-            contribution.clone(),
-            vec![altered_declaration],
-            checked.transaction().extra_declarations().to_vec(),
-            checked.transaction().extension_payloads().to_vec(),
-        ))
+        let altered = preflight_module_apply(
+            ModuleApplyTransaction::new(
+                Arc::clone(&checked.transaction().manifest),
+                contribution.clone(),
+                vec![altered_declaration],
+                checked.transaction().extra_declarations().to_vec(),
+                checked.transaction().extension_payloads().to_vec(),
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("same-name fixture mutation remains preflight-valid");
         assert!(matches!(
             classify_module_apply_retry(&altered, committed.state(), None),
@@ -3370,37 +3557,49 @@ mod tests {
             44,
         );
 
-        let subject_first = preflight_module_apply(transaction_with_target(
-            vec![subject.clone()],
-            subject.clone(),
-            "fixture.retry-subject.decl",
-            "fixture.retry-subject.extra",
-        ))
+        let subject_first = preflight_module_apply(
+            transaction_with_target(
+                vec![subject.clone()],
+                subject.clone(),
+                "fixture.retry-subject.decl",
+                "fixture.retry-subject.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("subject-first transaction preflights");
         let after_subject = publish_fixture(&subject_first, &base).into_state();
-        let unrelated_one_next = preflight_module_apply(transaction_with_target(
-            vec![subject.clone(), unrelated_one.clone()],
-            unrelated_one.clone(),
-            "fixture.unrelated-one.decl",
-            "fixture.unrelated-one.extra",
-        ))
+        let unrelated_one_next = preflight_module_apply(
+            transaction_with_target(
+                vec![subject.clone(), unrelated_one.clone()],
+                unrelated_one.clone(),
+                "fixture.unrelated-one.decl",
+                "fixture.unrelated-one.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("first unrelated transaction preflights");
         let after_unrelated_one = publish_fixture(&unrelated_one_next, &after_subject).into_state();
-        let unrelated_two_next = preflight_module_apply(transaction_with_target(
-            vec![subject.clone(), unrelated_one, unrelated_two.clone()],
-            unrelated_two,
-            "fixture.unrelated-two.decl",
-            "fixture.unrelated-two.extra",
-        ))
+        let unrelated_two_next = preflight_module_apply(
+            transaction_with_target(
+                vec![subject.clone(), unrelated_one, unrelated_two.clone()],
+                unrelated_two,
+                "fixture.unrelated-two.decl",
+                "fixture.unrelated-two.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("second unrelated transaction preflights");
         let current = publish_fixture(&unrelated_two_next, &after_unrelated_one).into_state();
 
-        let requested = preflight_module_apply(transaction_with_target(
-            vec![required, subject.clone()],
-            subject.clone(),
-            "fixture.retry-subject.decl",
-            "fixture.retry-subject.extra",
-        ))
+        let requested = preflight_module_apply(
+            transaction_with_target(
+                vec![required, subject.clone()],
+                subject.clone(),
+                "fixture.retry-subject.decl",
+                "fixture.retry-subject.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("subject-after-required transaction preflights");
         assert!(
             current.manifest().records().len() > requested.transaction().manifest().records().len()
@@ -3429,8 +3628,11 @@ mod tests {
     fn retry_payload_identity_collision_is_reported_not_resolved() {
         let base = empty_apply_state();
         let contribution = record(vec![]);
-        let checked = preflight_module_apply(transaction(contribution.clone(), vec![]))
-            .expect("baseline retry fixture preflights");
+        let checked = preflight_module_apply(
+            transaction(contribution.clone(), vec![]),
+            &ModuleApplyLimits::default(),
+        )
+        .expect("baseline retry fixture preflights");
         let committed = publish_fixture(&checked, &base);
 
         let altered_declaration = match checked.transaction().declarations()[0].as_ref() {
@@ -3441,13 +3643,16 @@ mod tests {
             }
             other => panic!("fixture declaration changed kind: {other:?}"),
         };
-        let mut injected = preflight_module_apply(ModuleApplyTransaction::new(
-            Arc::clone(&checked.transaction().manifest),
-            contribution,
-            vec![altered_declaration],
-            checked.transaction().extra_declarations().to_vec(),
-            vec![],
-        ))
+        let mut injected = preflight_module_apply(
+            ModuleApplyTransaction::new(
+                Arc::clone(&checked.transaction().manifest),
+                contribution,
+                vec![altered_declaration],
+                checked.transaction().extra_declarations().to_vec(),
+                vec![],
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("the unequal declaration remains structurally preflight-valid");
         assert_ne!(
             injected.transaction_id(),
@@ -3487,10 +3692,13 @@ mod tests {
             PayloadTransparency::Understood,
             vec![],
         );
-        let checked = preflight_module_apply(transaction(
-            record_with_completeness(vec![], completeness.clone()),
-            vec![],
-        ))
+        let checked = preflight_module_apply(
+            transaction(
+                record_with_completeness(vec![], completeness.clone()),
+                vec![],
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("partial capture still binds every retained payload exactly");
         let declaration_candidate = base
             .environment()
@@ -3560,14 +3768,17 @@ mod tests {
             PayloadTransparency::Understood,
             vec![missing.clone()],
         );
-        let checked = preflight_module_apply(transaction(
-            record_with_imports(
-                vec![DirectImport::new(missing.clone(), false, false, false)],
+        let checked = preflight_module_apply(
+            transaction(
+                record_with_imports(
+                    vec![DirectImport::new(missing.clone(), false, false, false)],
+                    vec![],
+                    completeness.clone(),
+                ),
                 vec![],
-                completeness.clone(),
             ),
-            vec![],
-        ))
+            &ModuleApplyLimits::default(),
+        )
         .expect("unresolved target still binds every retained payload exactly");
         let declaration_candidate = base
             .environment()
@@ -3640,26 +3851,29 @@ mod tests {
             PayloadTransparency::Opaque,
             vec![],
         );
-        let checked = preflight_module_apply(transaction(
-            record_with_completeness(
-                vec![ExtensionContribution::new(
+        let checked = preflight_module_apply(
+            transaction(
+                record_with_completeness(
+                    vec![ExtensionContribution::new(
+                        descriptor.clone(),
+                        0,
+                        environment
+                            .extension(&descriptor.name)
+                            .expect("opaque extension is registered")
+                            .content_digest(),
+                        vec![entry],
+                    )],
+                    completeness.clone(),
+                ),
+                vec![ExtensionPayload::new(
+                    0,
                     descriptor.clone(),
                     0,
-                    environment
-                        .extension(&descriptor.name)
-                        .expect("opaque extension is registered")
-                        .content_digest(),
-                    vec![entry],
+                    Arc::clone(&bytes),
                 )],
-                completeness.clone(),
             ),
-            vec![ExtensionPayload::new(
-                0,
-                descriptor.clone(),
-                0,
-                Arc::clone(&bytes),
-            )],
-        ))
+            &ModuleApplyLimits::default(),
+        )
         .expect("opaque bytes bind without decoding or normalization");
         let declaration_candidate = base
             .environment()
@@ -3731,12 +3945,15 @@ mod tests {
             12,
         );
 
-        let left_first = preflight_module_apply(transaction_with_target(
-            vec![left.clone()],
-            left.clone(),
-            "fixture.left.decl",
-            "fixture.left.extra",
-        ))
+        let left_first = preflight_module_apply(
+            transaction_with_target(
+                vec![left.clone()],
+                left.clone(),
+                "fixture.left.decl",
+                "fixture.left.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("left transaction preflights");
         let left_candidate = base
             .environment()
@@ -3753,12 +3970,15 @@ mod tests {
             .into_state(),
             other => panic!("expected a prepared left application, got {other:?}"),
         };
-        let right_after_left = preflight_module_apply(transaction_with_target(
-            vec![left.clone(), right.clone()],
-            right.clone(),
-            "fixture.right.decl",
-            "fixture.right.extra",
-        ))
+        let right_after_left = preflight_module_apply(
+            transaction_with_target(
+                vec![left.clone(), right.clone()],
+                right.clone(),
+                "fixture.right.decl",
+                "fixture.right.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("right-after-left transaction preflights");
         let right_candidate = after_left
             .environment()
@@ -3777,12 +3997,15 @@ mod tests {
                 other => panic!("expected a prepared right-after-left application, got {other:?}"),
             };
 
-        let right_first = preflight_module_apply(transaction_with_target(
-            vec![right.clone()],
-            right.clone(),
-            "fixture.right.decl",
-            "fixture.right.extra",
-        ))
+        let right_first = preflight_module_apply(
+            transaction_with_target(
+                vec![right.clone()],
+                right.clone(),
+                "fixture.right.decl",
+                "fixture.right.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("right transaction preflights");
         let right_candidate = base
             .environment()
@@ -3799,12 +4022,15 @@ mod tests {
             .into_state(),
             other => panic!("expected a prepared right application, got {other:?}"),
         };
-        let left_after_right = preflight_module_apply(transaction_with_target(
-            vec![left.clone(), right.clone()],
-            left.clone(),
-            "fixture.left.decl",
-            "fixture.left.extra",
-        ))
+        let left_after_right = preflight_module_apply(
+            transaction_with_target(
+                vec![left.clone(), right.clone()],
+                left.clone(),
+                "fixture.left.decl",
+                "fixture.left.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
         .expect("left-after-right transaction preflights");
         let left_candidate = after_right
             .environment()
@@ -3893,12 +4119,10 @@ mod tests {
             |record: ModuleContributionRecord, decl: &'static str, extra: &'static str| {
                 let base = base.clone();
                 move || {
-                    let preflight = preflight_module_apply(transaction_with_target(
-                        vec![record.clone()],
-                        record,
-                        decl,
-                        extra,
-                    ))
+                    let preflight = preflight_module_apply(
+                        transaction_with_target(vec![record.clone()], record, decl, extra),
+                        &ModuleApplyLimits::default(),
+                    )
                     .expect("transaction preflights");
                     let candidate = base
                         .environment()
@@ -3972,12 +4196,15 @@ mod tests {
             }
 
             // (2) Replaying the loser against the published state converges.
-            let replay = preflight_module_apply(transaction_with_target(
-                vec![winner_record, loser_record.clone()],
-                loser_record,
-                loser_decl,
-                loser_extra,
-            ))
+            let replay = preflight_module_apply(
+                transaction_with_target(
+                    vec![winner_record, loser_record.clone()],
+                    loser_record,
+                    loser_decl,
+                    loser_extra,
+                ),
+                &ModuleApplyLimits::default(),
+            )
             .expect("replayed transaction preflights");
             let candidate = published
                 .environment()
@@ -4052,7 +4279,7 @@ mod tests {
         );
 
         assert!(matches!(
-            preflight_module_apply(transaction),
+            preflight_module_apply(transaction, &ModuleApplyLimits::default()),
             Err(ModuleApplyPreflightError::DeclarationName {
                 class: DeclarationClass::ExtraDeclaration,
                 index: 0,
@@ -4086,11 +4313,388 @@ mod tests {
         );
 
         assert!(matches!(
-            preflight_module_apply(short),
+            preflight_module_apply(short, &ModuleApplyLimits::default()),
             Err(ModuleApplyPreflightError::ExtensionPayloadCount {
                 expected: 2,
                 actual: 1,
             })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // as7 resource-budget tranche: envelope budgets, exact usage facts, and
+    // the zero / one-under / exact / one-over fault matrix, every refusal
+    // proving zero publication followed by a clean verified recovery.
+    // -----------------------------------------------------------------------
+
+    fn preflight_under(
+        make: &impl Fn() -> ModuleApplyTransaction,
+        limits: &ModuleApplyLimits,
+    ) -> Result<PreflightedModuleApply, ModuleApplyPreflightError> {
+        preflight_module_apply(make(), limits)
+    }
+
+    fn record_with_payload_counts(
+        declarations: usize,
+        extras: usize,
+        contributions: Vec<ExtensionContribution>,
+    ) -> ModuleContributionRecord {
+        let epoch = epoch();
+        let declaration_names: Vec<Name> = (0..declarations)
+            .map(|index| name(&format!("fixture.decl{index}")))
+            .collect();
+        let extra_names: Vec<Name> = (0..extras)
+            .map(|index| name(&format!("fixture.extra{index}")))
+            .collect();
+        ModuleContributionRecord::new(
+            ModuleRecord::new(
+                ModuleId::new(name("fixture.module")),
+                true,
+                vec![],
+                ArtifactEvidence {
+                    epoch,
+                    content_digest: Digest([7; 32]),
+                    producer: ArtifactProducer::Reference,
+                    grade: ArtifactGrade::Verified,
+                },
+            ),
+            declaration_names,
+            extra_names,
+            contributions,
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
+                vec![],
+            ),
+        )
+    }
+
+    fn axioms(prefix: &str, count: usize) -> Vec<Arc<ConstantInfo>> {
+        (0..count)
+            .map(|index| axiom(&format!("{prefix}{index}")))
+            .collect()
+    }
+
+    fn sized_transaction(
+        declarations: usize,
+        extras: usize,
+        contributions: Vec<ExtensionContribution>,
+        extension_payloads: Vec<ExtensionPayload>,
+    ) -> ModuleApplyTransaction {
+        let contribution = record_with_payload_counts(declarations, extras, contributions);
+        let manifest = ModuleProvenanceManifest::new(
+            epoch(),
+            vec![contribution.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .expect("fixture manifest is valid");
+        ModuleApplyTransaction::new(
+            Arc::new(manifest),
+            contribution,
+            axioms("fixture.decl", declarations),
+            axioms("fixture.extra", extras),
+            extension_payloads,
+        )
+    }
+
+    fn expect_limit_refusal(
+        error: &ModuleApplyPreflightError,
+        resource: ModuleApplyResource,
+        limit: u128,
+        actual: u128,
+    ) {
+        assert!(
+            matches!(
+                error,
+                ModuleApplyPreflightError::LimitExceeded {
+                    resource: refused,
+                    limit: refused_limit,
+                    actual: refused_actual,
+                } if *refused == resource && *refused_limit == limit && *refused_actual == actual
+            ),
+            "expected a {resource:?} refusal at limit {limit} against {actual}, got {error:?}"
+        );
+    }
+
+    fn empty_base() -> ModuleApplyState {
+        let manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        ModuleApplyState::from_parts(Environment::new(), graph, manifest)
+            .expect("empty aggregate state is coherent")
+    }
+
+    /// Extension-bearing transactions replay onto an environment that has
+    /// already registered their descriptor; this base carries exactly that.
+    fn base_with_registered_extension() -> ModuleApplyState {
+        let environment = Environment::new()
+            .register_extension(descriptor())
+            .expect("fixture extension is unique");
+        let manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        ModuleApplyState::from_parts(environment, graph, manifest)
+            .expect("empty aggregate state is coherent")
+    }
+
+    fn committed_recovery(
+        base: &ModuleApplyState,
+        make: &impl Fn() -> ModuleApplyTransaction,
+    ) -> CommittedModuleApply {
+        let checked = preflight_module_apply(make(), &ModuleApplyLimits::default())
+            .expect("the default posture admits the recovery envelope");
+        let mut candidate = base.environment().clone();
+        for info in checked
+            .transaction()
+            .declarations()
+            .iter()
+            .chain(checked.transaction().extra_declarations())
+        {
+            candidate = candidate
+                .add_decl((**info).clone())
+                .expect("fixture declaration is unique");
+        }
+        match prepare_module_apply(&checked, base, &candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                plan.commit(base, None),
+                "uncancelled recovery application must complete",
+            )
+            .expect("the recovery base remains current"),
+            other => panic!("expected a prepared recovery plan, got {other:?}"),
+        }
+    }
+
+    /// Refuse the envelope under `limits`, prove the base published nothing,
+    /// then run one clean default-posture application to a fully verified state.
+    fn refuse_then_recover(
+        base: &ModuleApplyState,
+        make: &impl Fn() -> ModuleApplyTransaction,
+        limits: &ModuleApplyLimits,
+        resource: ModuleApplyResource,
+        limit: u128,
+        actual: u128,
+    ) -> CommittedModuleApply {
+        let before = base.clone();
+        let error =
+            preflight_under(make, limits).expect_err("an over-budget envelope must be refused");
+        expect_limit_refusal(&error, resource, limit, actual);
+        assert_eq!(base, &before, "a refused envelope publishes nothing");
+        committed_recovery(base, make)
+    }
+
+    #[test]
+    fn a_zero_budget_admits_the_empty_envelope_and_refuses_any_payload() {
+        let zero = ModuleApplyLimits::new(0, 0, 0, 0);
+        let empty = preflight_module_apply(sized_transaction(0, 0, vec![], vec![]), &zero)
+            .expect("an empty envelope carries nothing any budget could refuse");
+        assert_eq!(
+            empty.usage(),
+            ModuleApplyUsage {
+                declaration_payloads: 0,
+                extra_declaration_payloads: 0,
+                extension_payloads: 0,
+                extension_payload_bytes: 0,
+            }
+        );
+
+        let base = empty_base();
+        let error = preflight_module_apply(sized_transaction(1, 0, vec![], vec![]), &zero)
+            .expect_err("a zero budget refuses any declaration payload");
+        expect_limit_refusal(&error, ModuleApplyResource::DeclarationPayloads, 0, 1);
+        let error = preflight_module_apply(sized_transaction(0, 1, vec![], vec![]), &zero)
+            .expect_err("a zero budget refuses any extra declaration payload");
+        expect_limit_refusal(&error, ModuleApplyResource::ExtraDeclarationPayloads, 0, 1);
+        assert_eq!(base, empty_base());
+    }
+
+    #[test]
+    fn declaration_payload_budget_boundaries_refuse_then_recover() {
+        let base = empty_base();
+        let make = || sized_transaction(2, 0, vec![], vec![]);
+        let usage = 2u128;
+        let committed = refuse_then_recover(
+            &base,
+            &make,
+            &ModuleApplyLimits::new(1, usize::MAX, usize::MAX, u128::MAX),
+            ModuleApplyResource::DeclarationPayloads,
+            1,
+            usage,
+        );
+        assert_eq!(committed.state().graph().len(), 1);
+        assert_ne!(committed.state().logical_root(), base.logical_root());
+        assert_ne!(committed.state().manifest().root(), base.manifest().root());
+
+        for limit in [usage, usage + 1] {
+            let checked = preflight_module_apply(
+                make(),
+                &ModuleApplyLimits::new(limit as usize, usize::MAX, usize::MAX, u128::MAX),
+            )
+            .expect("exact and one-over budgets both admit");
+            assert_eq!(checked.usage().declaration_payloads() as u128, usage);
+        }
+    }
+
+    #[test]
+    fn extra_declaration_payload_budget_boundaries_refuse_then_recover() {
+        let base = empty_base();
+        let make = || sized_transaction(0, 2, vec![], vec![]);
+        let committed = refuse_then_recover(
+            &base,
+            &make,
+            &ModuleApplyLimits::new(usize::MAX, 1, usize::MAX, u128::MAX),
+            ModuleApplyResource::ExtraDeclarationPayloads,
+            1,
+            2,
+        );
+        assert_eq!(committed.state().graph().len(), 1);
+        assert_ne!(committed.state().manifest().root(), base.manifest().root());
+
+        for limit in [2usize, 3] {
+            let checked = preflight_module_apply(
+                make(),
+                &ModuleApplyLimits::new(usize::MAX, limit, usize::MAX, u128::MAX),
+            )
+            .expect("exact and one-over budgets both admit");
+            assert_eq!(checked.usage().extra_declaration_payloads(), 2);
+        }
+    }
+
+    #[test]
+    fn extension_payload_count_budget_boundaries_refuse_then_recover() {
+        let base = base_with_registered_extension();
+        let descriptor = descriptor();
+        let history = base
+            .environment()
+            .extension(&descriptor.name)
+            .expect("fixture extension is registered")
+            .content_digest();
+        let entries = vec![
+            ExtensionEntryId::derive(&epoch(), &descriptor, b"first"),
+            ExtensionEntryId::derive(&epoch(), &descriptor, b"second"),
+        ];
+        let contribution = vec![ExtensionContribution::new(
+            descriptor.clone(),
+            0,
+            history,
+            entries,
+        )];
+        let payloads = || {
+            vec![
+                ExtensionPayload::new(0, descriptor.clone(), 0, &b"first"[..]),
+                ExtensionPayload::new(0, descriptor.clone(), 1, &b"second"[..]),
+            ]
+        };
+        let base = base_with_registered_extension();
+        let make = || sized_transaction(0, 0, contribution.clone(), payloads());
+        let committed = refuse_then_recover(
+            &base,
+            &make,
+            &ModuleApplyLimits::new(usize::MAX, usize::MAX, 1, u128::MAX),
+            ModuleApplyResource::ExtensionPayloads,
+            1,
+            2,
+        );
+        assert_eq!(committed.state().graph().len(), 1);
+        assert_ne!(committed.state().logical_root(), base.logical_root());
+
+        for limit in [2usize, 3] {
+            let checked = preflight_module_apply(
+                make(),
+                &ModuleApplyLimits::new(usize::MAX, usize::MAX, limit, u128::MAX),
+            )
+            .expect("exact and one-over budgets both admit");
+            assert_eq!(checked.usage().extension_payloads(), 2);
+        }
+    }
+
+    #[test]
+    fn extension_payload_byte_budget_boundaries_refuse_then_recover() {
+        let base = base_with_registered_extension();
+        let descriptor = descriptor();
+        let history = base
+            .environment()
+            .extension(&descriptor.name)
+            .expect("fixture extension is registered")
+            .content_digest();
+        let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"payload");
+        let contribution = vec![ExtensionContribution::new(
+            descriptor.clone(),
+            0,
+            history,
+            vec![entry],
+        )];
+        let base = base_with_registered_extension();
+        let make = || {
+            sized_transaction(
+                0,
+                0,
+                contribution.clone(),
+                vec![ExtensionPayload::new(
+                    0,
+                    descriptor.clone(),
+                    0,
+                    &b"payload"[..],
+                )],
+            )
+        };
+        let committed = refuse_then_recover(
+            &base,
+            &make,
+            &ModuleApplyLimits::new(usize::MAX, usize::MAX, usize::MAX, 6),
+            ModuleApplyResource::ExtensionPayloadBytes,
+            6,
+            7,
+        );
+        assert_eq!(committed.state().graph().len(), 1);
+        assert_ne!(committed.state().manifest().root(), base.manifest().root());
+
+        for limit in [7u128, 8] {
+            let checked = preflight_module_apply(
+                make(),
+                &ModuleApplyLimits::new(usize::MAX, usize::MAX, usize::MAX, limit),
+            )
+            .expect("exact and one-over byte budgets both admit");
+            assert_eq!(checked.usage().extension_payload_bytes(), 7);
+        }
+    }
+
+    #[test]
+    fn usage_facts_are_recorded_exactly_for_a_mixed_envelope() {
+        let descriptor = descriptor();
+        let entries = vec![
+            ExtensionEntryId::derive(&epoch(), &descriptor, b"alpha"),
+            ExtensionEntryId::derive(&epoch(), &descriptor, b"beta"),
+        ];
+        let contribution = vec![ExtensionContribution::new(
+            descriptor.clone(),
+            0,
+            Digest([0; 32]),
+            entries,
+        )];
+        let checked = preflight_module_apply(
+            sized_transaction(
+                3,
+                2,
+                contribution,
+                vec![
+                    ExtensionPayload::new(0, descriptor.clone(), 0, &b"alpha"[..]),
+                    ExtensionPayload::new(0, descriptor, 1, &b"beta"[..]),
+                ],
+            ),
+            &ModuleApplyLimits::default(),
+        )
+        .expect("the default posture admits the mixed fixture");
+        assert_eq!(checked.usage().declaration_payloads(), 3);
+        assert_eq!(checked.usage().extra_declaration_payloads(), 2);
+        assert_eq!(checked.usage().extension_payloads(), 2);
+        assert_eq!(checked.usage().extension_payload_bytes(), 9);
     }
 }
