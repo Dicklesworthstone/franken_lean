@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fln_core::name::Name;
 use fln_core::options::KVMap;
-use fln_core::outcome::{Inconclusive, Outcome};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::LogicalRoot;
 
@@ -1784,6 +1784,211 @@ pub enum ModuleApplyCommitError {
     CandidateState(ModuleApplyStateError),
     Receipt(ModuleApplyReceiptError),
     Retry(ModuleApplyRetryError),
+}
+
+/// Refusals while staging a multi-module batch. Every arm names the failing
+/// position; no arm carries a partial application result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyBatchPrepareError {
+    /// A batch of zero stages has nothing to stage or commit.
+    Empty,
+    BaseState(ModuleApplyStateError),
+    Candidate {
+        position: usize,
+        error: ModuleApplyCandidateError,
+    },
+    /// The stage observed its module already applied at the staged state so
+    /// far; idempotent replays are handled per module, not inside a batch.
+    AlreadyApplied {
+        position: usize,
+    },
+    Stage {
+        position: usize,
+        error: Box<ModuleApplyPrepareError>,
+    },
+}
+
+/// Refusals while committing a staged batch. A refusal names the failing
+/// stage position and carries no successful prefix: every earlier staged
+/// release is dropped with the consumed plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyBatchCommitError {
+    StaleBase,
+    BaseState(ModuleApplyStateError),
+    Stage {
+        position: usize,
+        error: Box<ModuleApplyCommitError>,
+    },
+}
+
+/// The terminal result of one staged multi-module batch: the number of
+/// applied contributions and the FINAL committed apply, whose receipt binds
+/// the whole chain through its base and result provenance roots.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommittedModuleApplyBatch {
+    applied: usize,
+    final_apply: CommittedModuleApply,
+}
+
+impl CommittedModuleApplyBatch {
+    pub const fn applied(&self) -> usize {
+        self.applied
+    }
+
+    pub const fn final_apply(&self) -> &CommittedModuleApply {
+        &self.final_apply
+    }
+
+    pub const fn state(&self) -> &ModuleApplyState {
+        &self.final_apply.state
+    }
+
+    pub const fn receipt(&self) -> &ModuleApplyReceipt {
+        &self.final_apply.receipt
+    }
+}
+
+/// A privately staged multi-module application prepared against one immutable
+/// base.
+///
+/// Staging prepares every stage up front, chaining each stage onto the
+/// candidate state the previous stage produced; nothing is published during
+/// staging, and the staged plans stay private. [`Self::commit`] revalidates
+/// the original base once, then releases each staged candidate against the
+/// state its predecessor released, sampling cancellation before every stage
+/// release. Either the FINAL committed apply is returned, or a refusal names
+/// the failing position and every earlier release is dropped with the
+/// consumed plans: no code path can return a successful prefix of a failed
+/// batch, because the staged plans and intermediate states are unreachable
+/// outside this type.
+#[derive(Debug, Clone)]
+pub struct StagedModuleApplyBatch {
+    schema: u16,
+    base_snapshot: ModuleApplyState,
+    stages: Vec<PreparedModuleApply>,
+}
+
+impl StagedModuleApplyBatch {
+    /// Neither an unpublished batch nor its stages are cache entries.
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    pub const fn len(&self) -> usize {
+        self.stages.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    /// Revalidate the original base and release every staged candidate in
+    /// order, chaining each stage onto its predecessor's result. One-shot:
+    /// the staged plans are consumed whether the batch completes or refuses.
+    pub fn commit(
+        mut self,
+        base: &ModuleApplyState,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<CommittedModuleApplyBatch, ModuleApplyBatchCommitError>> {
+        if self.schema != MODULE_APPLY_SCHEMA_VERSION || self.base_snapshot != *base {
+            return Outcome::complete(Err(ModuleApplyBatchCommitError::StaleBase));
+        }
+        if let Err(error) = base.verify() {
+            return Outcome::complete(Err(ModuleApplyBatchCommitError::BaseState(error)));
+        }
+        let total = self.stages.len();
+        let mut last: Option<CommittedModuleApply> = None;
+        let mut current = base.clone();
+        for (position, plan) in std::mem::take(&mut self.stages).into_iter().enumerate() {
+            let stage_base = current;
+            match plan.commit(&stage_base, cancellation) {
+                Outcome::Complete(Ok(committed)) => {
+                    current = committed.state().clone();
+                    last = Some(committed);
+                }
+                Outcome::Complete(Err(error)) => {
+                    return Outcome::complete(Err(ModuleApplyBatchCommitError::Stage {
+                        position,
+                        error: Box::new(error),
+                    }));
+                }
+                Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            }
+        }
+        match last {
+            Some(final_apply) => Outcome::complete(Ok(CommittedModuleApplyBatch {
+                applied: total,
+                final_apply,
+            })),
+            None => Outcome::InternalFault(InternalFault::new(
+                "module_apply/batch-stage-invariant",
+                "a staged batch released zero stages; prepare_module_apply_batch refuses \
+                 empty batches, so this state is unreachable by the public API",
+            )),
+        }
+    }
+}
+
+/// Stage every preflighted application into one privately chained batch.
+///
+/// Stage N is prepared against the candidate state stage N-1 produced, so each
+/// transaction must already target the manifest containing every earlier
+/// stage's contribution plus its own — exactly the manifests a sequential
+/// composition would produce. The `candidate_for` closure supplies each
+/// stage's kernel-produced declaration candidate over the staged environment
+/// so far; kernel admission stays outside this crate's D6 boundary. An empty
+/// slice, an already-applied observation at any position, or any stage-level
+/// refusal stops staging with zero publication; `Outcome`'s outer arms carry
+/// inconclusive and internal-fault results intact.
+pub fn prepare_module_apply_batch(
+    preflights: &[PreflightedModuleApply],
+    base: &ModuleApplyState,
+    mut candidate_for: impl FnMut(usize, &Environment) -> Result<Environment, ModuleApplyCandidateError>,
+) -> Outcome<Result<StagedModuleApplyBatch, ModuleApplyBatchPrepareError>> {
+    if preflights.is_empty() {
+        return Outcome::complete(Err(ModuleApplyBatchPrepareError::Empty));
+    }
+    if let Err(error) = base.verify() {
+        return Outcome::complete(Err(ModuleApplyBatchPrepareError::BaseState(error)));
+    }
+    let mut staged = Vec::with_capacity(preflights.len());
+    let mut current = base.clone();
+    for (position, preflight) in preflights.iter().enumerate() {
+        let candidate_environment = match candidate_for(position, current.environment()) {
+            Ok(environment) => environment,
+            Err(error) => {
+                return Outcome::complete(Err(ModuleApplyBatchPrepareError::Candidate {
+                    position,
+                    error,
+                }));
+            }
+        };
+        match prepare_module_apply_inner(preflight, &current, &candidate_environment, None) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
+                current = plan.candidate.clone();
+                staged.push(*plan);
+            }
+            Outcome::Complete(Ok(ModuleApplyPlan::Retry(_))) => {
+                return Outcome::complete(Err(ModuleApplyBatchPrepareError::AlreadyApplied {
+                    position,
+                }));
+            }
+            Outcome::Complete(Err(error)) => {
+                return Outcome::complete(Err(ModuleApplyBatchPrepareError::Stage {
+                    position,
+                    error: Box::new(error),
+                }));
+            }
+            Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+    }
+    Outcome::complete(Ok(StagedModuleApplyBatch {
+        schema: MODULE_APPLY_SCHEMA_VERSION,
+        base_snapshot: base.clone(),
+        stages: staged,
+    }))
 }
 
 /// A receipt cannot be substituted for the states it reports.
@@ -4857,5 +5062,330 @@ mod tests {
             first.manifest_root(),
             "the fixture must actually move the manifest root"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // as7 batch/lifecycle tranche: privately staged multi-module batches.
+    // -----------------------------------------------------------------------
+
+    /// Build the progressive preflights a three-module batch needs: stage N
+    /// targets the manifest holding modules 0..=N, exactly as sequential
+    /// composition would produce.
+    fn batch_preflights(
+        specs: &[(&str, &str, &str, u8)],
+        order: &[usize],
+    ) -> Vec<PreflightedModuleApply> {
+        let records: Vec<ModuleContributionRecord> = specs
+            .iter()
+            .map(|(module, declaration, extra, seed)| {
+                named_record(module, declaration, extra, *seed)
+            })
+            .collect();
+        (0..order.len())
+            .map(|step| {
+                let which = order[step];
+                let target = order[..=step]
+                    .iter()
+                    .map(|&index| records[index].clone())
+                    .collect();
+                preflight_module_apply(
+                    transaction_with_target(
+                        target,
+                        records[which].clone(),
+                        specs[which].1,
+                        specs[which].2,
+                    ),
+                    &ModuleApplyLimits::default(),
+                )
+                .expect("batch stage preflights")
+            })
+            .collect()
+    }
+
+    /// Sequential fold of single applies — the reference implementation the
+    /// batch result must equal exactly.
+    fn sequential_reference(
+        base: &ModuleApplyState,
+        preflights: &[PreflightedModuleApply],
+    ) -> ModuleApplyState {
+        let mut current = base.clone();
+        for checked in preflights {
+            let candidate = current
+                .environment()
+                .add_decl((*checked.transaction().declarations()[0]).clone())
+                .expect("reference declaration is unique")
+                .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                .expect("reference extra declaration is unique");
+            current = match prepare_module_apply(checked, &current, &candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                    plan.commit(&current, None),
+                    "uncancelled reference application must complete",
+                )
+                .expect("reference base remains current")
+                .into_state(),
+                other => panic!("expected a prepared reference application, got {other:?}"),
+            };
+        }
+        current
+    }
+
+    #[test]
+    fn a_staged_three_module_batch_matches_sequential_composition_exactly() {
+        let specs = [
+            ("fixture.b1", "fixture.b1.decl", "fixture.b1.extra", 31u8),
+            ("fixture.b2", "fixture.b2.decl", "fixture.b2.extra", 32),
+            ("fixture.b3", "fixture.b3.decl", "fixture.b3.extra", 33),
+        ];
+        let preflights = batch_preflights(&specs, &[0, 1, 2]);
+        let base = empty_base();
+        let staged =
+            match prepare_module_apply_batch(&preflights, &base, |position, environment| {
+                let checked = &preflights[position];
+                let built = environment
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("batch declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("batch extra declaration is unique");
+                Ok(built)
+            }) {
+                Outcome::Complete(Ok(staged)) => staged,
+                other => panic!("expected a staged batch, got {other:?}"),
+            };
+        assert_eq!(staged.len(), 3);
+        assert!(!staged.is_empty());
+        assert!(!staged.is_cacheable());
+
+        let committed = match staged.commit(&base, None) {
+            Outcome::Complete(Ok(committed)) => committed,
+            other => panic!("expected a completed batch commit, got {other:?}"),
+        };
+        assert_eq!(committed.applied(), 3);
+        assert_eq!(committed.state(), &sequential_reference(&base, &preflights));
+        assert_eq!(committed.state().graph().len(), 3);
+        assert_ne!(committed.state().manifest().root(), base.manifest().root());
+    }
+
+    #[test]
+    fn a_mid_batch_stage_fault_names_the_position_and_publishes_nothing() {
+        let specs = [
+            ("fixture.c1", "fixture.c1.decl", "fixture.c1.extra", 41u8),
+            ("fixture.c2", "fixture.c2.decl", "fixture.c2.extra", 42),
+            ("fixture.c3", "fixture.c3.decl", "fixture.c3.extra", 43),
+        ];
+        let mut preflights = batch_preflights(&specs, &[0, 1, 2]);
+        // Stage 2 targets a manifest missing its predecessors: the chained
+        // record-count law refuses it during staging.
+        let broken = named_record("fixture.c3", "fixture.c3.decl", "fixture.c3.extra", 43);
+        preflights[2] = preflight_module_apply(
+            transaction_with_target(
+                vec![broken.clone()],
+                broken,
+                "fixture.c3.decl",
+                "fixture.c3.extra",
+            ),
+            &ModuleApplyLimits::default(),
+        )
+        .expect("the broken stage preflights in isolation");
+
+        let base = empty_base();
+        let before = base.clone();
+        let error = match prepare_module_apply_batch(&preflights, &base, |position, environment| {
+            let checked = &preflights[position];
+            Ok(environment
+                .add_decl((*checked.transaction().declarations()[0]).clone())
+                .expect("batch declaration is unique")
+                .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                .expect("batch extra declaration is unique"))
+        }) {
+            Outcome::Complete(Err(ModuleApplyBatchPrepareError::Stage { position, .. })) => {
+                position
+            }
+            other => panic!("expected a typed stage refusal, got {other:?}"),
+        };
+        assert_eq!(error, 2, "the fault names its exact stage");
+        assert_eq!(&base, &before, "a refused batch publishes nothing");
+
+        // Clean recovery: the well-formed prefix still composes afterwards.
+        let healthy = batch_preflights(&specs, &[0, 1, 2]);
+        let staged = match prepare_module_apply_batch(&healthy, &base, |position, environment| {
+            let checked = &healthy[position];
+            Ok(environment
+                .add_decl((*checked.transaction().declarations()[0]).clone())
+                .expect("recovery declaration is unique")
+                .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                .expect("recovery extra declaration is unique"))
+        }) {
+            Outcome::Complete(Ok(staged)) => staged,
+            other => panic!("expected recovery staging to succeed, got {other:?}"),
+        };
+        match staged.commit(&base, None) {
+            Outcome::Complete(Ok(committed)) => {
+                assert_eq!(committed.applied(), 3);
+                assert_eq!(committed.state().graph().len(), 3);
+            }
+            other => panic!("expected recovery to complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_already_applied_stage_is_a_typed_batch_refusal() {
+        let specs = [("fixture.d1", "fixture.d1.decl", "fixture.d1.extra", 51u8)];
+        let repeated = batch_preflights(&specs, &[0]);
+        let duplicated = vec![repeated[0].clone(), repeated[0].clone()];
+        let base = empty_base();
+        // Position 1 re-presents module d1 against a state that already
+        // holds it, so retry classification fires before any candidate use;
+        // its closure therefore returns the environment untouched.
+        let build_stage = |position: usize, environment: &Environment| {
+            if position == 0 {
+                let checked = &duplicated[0];
+                Ok(environment
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("duplicate declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("duplicate extra declaration is unique"))
+            } else {
+                Ok(environment.clone())
+            }
+        };
+        match prepare_module_apply_batch(&duplicated, &base, build_stage) {
+            Outcome::Complete(Err(ModuleApplyBatchPrepareError::AlreadyApplied { position })) => {
+                assert_eq!(position, 1);
+            }
+            other => panic!("expected a typed already-applied refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_staged_batch_refuses_to_commit_against_a_drifted_base() {
+        let specs = [
+            ("fixture.e1", "fixture.e1.decl", "fixture.e1.extra", 61u8),
+            ("fixture.e2", "fixture.e2.decl", "fixture.e2.extra", 62),
+        ];
+        let preflights = batch_preflights(&specs, &[0, 1]);
+        let base = empty_base();
+        let staged =
+            match prepare_module_apply_batch(&preflights, &base, |position, environment| {
+                let checked = &preflights[position];
+                Ok(environment
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("drift declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("drift extra declaration is unique"))
+            }) {
+                Outcome::Complete(Ok(staged)) => staged,
+                other => panic!("expected staging to succeed, got {other:?}"),
+            };
+        // A different base: one unrelated module applied since staging.
+        let drifted = sequential_reference(
+            &base,
+            &batch_preflights(
+                &[(
+                    "fixture.other",
+                    "fixture.other.decl",
+                    "fixture.other.extra",
+                    63u8,
+                )],
+                &[0],
+            )[..],
+        );
+        match staged.commit(&drifted, None) {
+            Outcome::Complete(Err(ModuleApplyBatchCommitError::StaleBase)) => {}
+            other => panic!("expected a stale-base refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_candidate_closure_failure_names_its_position() {
+        let specs = [
+            ("fixture.f1", "fixture.f1.decl", "fixture.f1.extra", 71u8),
+            ("fixture.f2", "fixture.f2.decl", "fixture.f2.extra", 72),
+        ];
+        let preflights = batch_preflights(&specs, &[0, 1]);
+        let base = empty_base();
+        match prepare_module_apply_batch(&preflights, &base, |position, environment| {
+            if position == 1 {
+                Err(ModuleApplyCandidateError::SupersededPreflightSchema { schema: 0 })
+            } else {
+                let checked = &preflights[position];
+                Ok(environment
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("candidate declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("candidate extra declaration is unique"))
+            }
+        }) {
+            Outcome::Complete(Err(ModuleApplyBatchPrepareError::Candidate {
+                position, ..
+            })) => {
+                assert_eq!(position, 1);
+            }
+            other => panic!("expected a typed candidate refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn final_cancellation_mid_batch_is_inconclusive_and_recovery_completes() {
+        struct TripAtSecond(std::cell::Cell<usize>);
+        impl CancellationProbe for TripAtSecond {
+            fn is_cancelled(&self) -> bool {
+                let seen = self.0.get() + 1;
+                self.0.set(seen);
+                seen >= 2
+            }
+        }
+        let specs = [
+            ("fixture.g1", "fixture.g1.decl", "fixture.g1.extra", 81u8),
+            ("fixture.g2", "fixture.g2.decl", "fixture.g2.extra", 82),
+        ];
+        let preflights = batch_preflights(&specs, &[0, 1]);
+        let base = empty_base();
+        let staged =
+            match prepare_module_apply_batch(&preflights, &base, |position, environment| {
+                let checked = &preflights[position];
+                Ok(environment
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("cancel declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("cancel extra declaration is unique"))
+            }) {
+                Outcome::Complete(Ok(staged)) => staged,
+                other => panic!("expected staging to succeed, got {other:?}"),
+            };
+        let probe = TripAtSecond(std::cell::Cell::new(0));
+        match staged.commit(&base, Some(&probe)) {
+            Outcome::Inconclusive(_) => {}
+            other => panic!("expected a typed cancellation, got {other:?}"),
+        }
+
+        // Clean recovery on a fresh probe publishes the whole chain.
+        let restaged =
+            match prepare_module_apply_batch(&preflights, &base, |position, environment| {
+                let checked = &preflights[position];
+                Ok(environment
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("recovery declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("recovery extra declaration is unique"))
+            }) {
+                Outcome::Complete(Ok(staged)) => staged,
+                other => panic!("expected recovery staging to succeed, got {other:?}"),
+            };
+        match restaged.commit(&base, None) {
+            Outcome::Complete(Ok(committed)) => {
+                assert_eq!(committed.applied(), 2);
+                assert_ne!(committed.state().manifest().root(), base.manifest().root());
+            }
+            other => panic!("expected recovery to complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_batch_slice_is_a_typed_prepare_refusal() {
+        let base = empty_base();
+        match prepare_module_apply_batch(&[], &base, |_, environment| Ok(environment.clone())) {
+            Outcome::Complete(Err(ModuleApplyBatchPrepareError::Empty)) => {}
+            other => panic!("expected the empty-batch refusal, got {other:?}"),
+        }
     }
 }
