@@ -5388,4 +5388,283 @@ mod tests {
             other => panic!("expected the empty-batch refusal, got {other:?}"),
         }
     }
+
+    /// Deterministic test-local xorshift64* — the closed universe has no
+    /// general-purpose RNG, and property generation must stay reproducible.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    /// The generated-model evidence class: batches of pseudo-random module
+    /// shapes applied sequentially, with BOTH provenance index directions
+    /// re-derived by an independent test-side walk over the manifest records
+    /// and probed through the public accessors after every commit. The
+    /// derivation itself is deliberately NOT re-run here — comparing a
+    /// projection to a rebuild of itself proves only that code agrees with
+    /// itself; the walk below visits every record and name independently.
+    #[test]
+    fn generated_batches_match_the_independent_index_models() {
+        let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+        let base = empty_base();
+        let mut current = base.clone();
+        let mut name_counter: usize = 0;
+        let mut total_modules = 0usize;
+
+        for _round in 0..8u32 {
+            let count = 1 + rng.below(4);
+            for _ in 0..count {
+                total_modules += 1;
+                let decls = 1 + rng.below(3);
+                let extras = rng.below(3);
+                let mut declaration_strs = Vec::with_capacity(decls);
+                let mut extra_strs = Vec::with_capacity(extras);
+                for _ in 0..decls {
+                    declaration_strs.push(format!("fixture.gen.d{}", name_counter));
+                    name_counter += 1;
+                }
+                for _ in 0..extras {
+                    extra_strs.push(format!("fixture.gen.x{}", name_counter));
+                    name_counter += 1;
+                }
+                let declaration_names: Vec<Name> =
+                    declaration_strs.iter().map(|s| name(s)).collect();
+                let extra_names: Vec<Name> = extra_strs.iter().map(|s| name(s)).collect();
+                let record = ModuleContributionRecord::new(
+                    ModuleRecord::new(
+                        ModuleId::new(name(&format!("fixture.gen.m{}", total_modules))),
+                        true,
+                        vec![],
+                        ArtifactEvidence {
+                            epoch: epoch(),
+                            content_digest: Digest([total_modules as u8; 32]),
+                            producer: ArtifactProducer::Reference,
+                            grade: ArtifactGrade::Verified,
+                        },
+                    ),
+                    declaration_names.clone(),
+                    extra_names.clone(),
+                    vec![],
+                    ProvenanceCompleteness::new(
+                        CaptureStatus::Complete,
+                        PayloadTransparency::Understood,
+                        vec![],
+                    ),
+                );
+                let mut target = current.manifest().records().to_vec();
+                target.push(record.clone());
+                let manifest = Arc::new(
+                    ModuleProvenanceManifest::new(
+                        epoch(),
+                        target,
+                        crate::provenance::ModuleProvenanceLimits::default(),
+                    )
+                    .expect("generated target manifest is valid"),
+                );
+                let declaration_payloads: Vec<Arc<ConstantInfo>> =
+                    declaration_strs.iter().map(|s| axiom(s)).collect();
+                let extra_payloads: Vec<Arc<ConstantInfo>> =
+                    extra_strs.iter().map(|s| axiom(s)).collect();
+                let checked = preflight_module_apply(
+                    ModuleApplyTransaction::new(
+                        Arc::clone(&manifest),
+                        record,
+                        declaration_payloads,
+                        extra_payloads,
+                        vec![],
+                    ),
+                    &ModuleApplyLimits::default(),
+                )
+                .expect("the generated envelope preflights");
+                let mut candidate = current.environment().clone();
+                for info in checked
+                    .transaction()
+                    .declarations()
+                    .iter()
+                    .chain(checked.transaction().extra_declarations())
+                {
+                    candidate = candidate
+                        .add_decl((**info).clone())
+                        .expect("generated declaration is unique");
+                }
+                current = match prepare_module_apply(&checked, &current, &candidate) {
+                    Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                        plan.commit(&current, None),
+                        "uncancelled generated application must complete",
+                    )
+                    .expect("generated base remains current")
+                    .into_state(),
+                    other => panic!("expected a prepared generated application, got {other:?}"),
+                };
+
+                // Independent walk: rebuild both directions from the raw
+                // records, then probe the committed projection through its
+                // public accessors.
+                current.verify().expect("staged state stays coherent");
+                let indexes = current.indexes();
+                assert_eq!(indexes.derived_from(), current.manifest().root());
+                let mut reverse_model: std::collections::BTreeMap<
+                    Name,
+                    (ModuleId, DeclarationClass),
+                > = std::collections::BTreeMap::new();
+                for held in current.manifest().records() {
+                    let module_id = held.module().id.clone();
+                    for (class, names) in [
+                        (DeclarationClass::Declaration, held.declarations()),
+                        (
+                            DeclarationClass::ExtraDeclaration,
+                            held.extra_declarations(),
+                        ),
+                    ] {
+                        for declared in names {
+                            reverse_model.insert(declared.clone(), (module_id.clone(), class));
+                        }
+                    }
+                }
+                assert_eq!(
+                    reverse_model.len(),
+                    name_counter,
+                    "every generated name must be owned exactly once"
+                );
+                for (expected_name, expected_owner) in &reverse_model {
+                    assert_eq!(
+                        indexes.owner_of(expected_name),
+                        Some(expected_owner),
+                        "reverse index disagrees at {expected_name:?}"
+                    );
+                }
+                let mut forward_total = 0usize;
+                for held in current.manifest().records() {
+                    let module_id = held.module().id.clone();
+                    let mut expected_owned: Vec<Name> = held
+                        .declarations()
+                        .iter()
+                        .chain(held.extra_declarations())
+                        .cloned()
+                        .collect();
+                    expected_owned.sort();
+                    forward_total += expected_owned.len();
+                    assert_eq!(
+                        indexes.declarations_of(&module_id),
+                        Some(expected_owned.as_slice()),
+                        "forward index disagrees for {module_id:?}"
+                    );
+                }
+                assert_eq!(forward_total, reverse_model.len());
+            }
+        }
+        assert_eq!(current.graph().len(), total_modules);
+        assert_ne!(current.logical_root(), base.logical_root());
+    }
+
+    /// The thread-order matrix widened to four modules: all four plans are
+    /// prepared against one shared base on real threads (the schedule-
+    /// sensitive phase), then published in a fixed order where only the
+    /// first can succeed directly. Every loser is refused by StaleBase and
+    /// re-prepared against the moved state before publishing; the final
+    /// state must equal plain sequential composition exactly.
+    #[test]
+    fn four_thread_preparation_race_converges_on_sequential_composition() {
+        let specs = [
+            ("fixture.t1", "fixture.t1.decl", "fixture.t1.extra", 91u8),
+            ("fixture.t2", "fixture.t2.decl", "fixture.t2.extra", 92),
+            ("fixture.t3", "fixture.t3.decl", "fixture.t3.extra", 93),
+            ("fixture.t4", "fixture.t4.decl", "fixture.t4.extra", 94),
+        ];
+        let base = empty_base();
+        let base_for_threads = base.clone();
+        let handles: Vec<_> = specs
+            .into_iter()
+            .map(|(module, declaration, extra, seed)| {
+                let record = named_record(module, declaration, extra, seed);
+                let shared = base_for_threads.clone();
+                std::thread::spawn(move || {
+                    let preflight = preflight_module_apply(
+                        transaction_with_target(vec![record.clone()], record, declaration, extra),
+                        &ModuleApplyLimits::default(),
+                    )
+                    .expect("thread transaction preflights");
+                    let candidate = shared
+                        .environment()
+                        .add_decl((*preflight.transaction().declarations()[0]).clone())
+                        .expect("thread declaration is unique")
+                        .add_decl((*preflight.transaction().extra_declarations()[0]).clone())
+                        .expect("thread extra declaration is unique");
+                    match prepare_module_apply(&preflight, &shared, &candidate) {
+                        Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+                        other => panic!("expected a prepared thread application, got {other:?}"),
+                    }
+                })
+            })
+            .collect();
+        let staged_plans: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("preparation thread"))
+            .collect();
+
+        let reprepare = |index: usize, state: &ModuleApplyState| {
+            let (module, declaration, extra, _) = specs[index];
+            let mut target = state.manifest().records().to_vec();
+            target.push(named_record(module, declaration, extra, specs[index].3));
+            let preflight = preflight_module_apply(
+                transaction_with_target(
+                    target,
+                    named_record(module, declaration, extra, specs[index].3),
+                    declaration,
+                    extra,
+                ),
+                &ModuleApplyLimits::default(),
+            )
+            .expect("reprepared transaction preflights");
+            let candidate = state
+                .environment()
+                .add_decl((*preflight.transaction().declarations()[0]).clone())
+                .expect("reprepare declaration is unique")
+                .add_decl((*preflight.transaction().extra_declarations()[0]).clone())
+                .expect("reprepare extra declaration is unique");
+            match prepare_module_apply(&preflight, state, &candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+                other => panic!("expected a reprepared application, got {other:?}"),
+            }
+        };
+
+        let mut current = base.clone();
+        let mut stale_refusals = 0usize;
+        for (position, plan) in staged_plans.into_iter().enumerate() {
+            let mut plan = plan;
+            loop {
+                match plan.commit(&current, None) {
+                    Outcome::Complete(Ok(committed)) => {
+                        current = committed.into_state();
+                        break;
+                    }
+                    Outcome::Complete(Err(ModuleApplyCommitError::StaleBase)) => {
+                        stale_refusals += 1;
+                        plan = reprepare(position, &current);
+                    }
+                    other => panic!("unexpected commit outcome: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            stale_refusals, 3,
+            "exactly the three losers must observe the moved base"
+        );
+        let reference = sequential_reference(&base, &batch_preflights(&specs, &[0, 1, 2, 3]));
+        assert_eq!(current, reference);
+        assert_eq!(current.manifest().root(), reference.manifest().root());
+        assert_eq!(current.indexes(), reference.indexes());
+    }
 }
