@@ -11605,13 +11605,13 @@ mod tests {
 
     #[test]
     fn olean_inspect_reports_a_real_pinned_artifact_in_human_and_robot_forms() {
-        let human = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len(), false);
+        let human = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len(), false, false);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stderr.is_empty());
         assert!(human.stdout.contains("pinned .olean audit: complete"));
         assert!(human.stdout.contains("constants: 2\n"));
 
-        let robot = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len(), true);
+        let robot = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len(), true, false);
         assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
         assert!(robot.stderr.is_empty());
         assert!(
@@ -12015,7 +12015,7 @@ mod tests {
         let mut bytes = PINNED_OLEAN.to_vec();
         bytes[0] ^= u8::MAX;
 
-        let output = inspect_olean_bytes(&bytes, bytes.len(), true);
+        let output = inspect_olean_bytes(&bytes, bytes.len(), true, false);
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.contains("\"outcome\":\"error\""));
@@ -12085,7 +12085,7 @@ mod tests {
         assert!(error.to_string().contains("16-byte input limit"));
         assert!(error.to_string().contains("17 bytes"));
 
-        let output = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len() - 1, true);
+        let output = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len() - 1, true, false);
         assert_eq!(output.exit_code, 3);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.contains("\"class\":\"resource\""));
