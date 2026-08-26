@@ -4697,4 +4697,165 @@ mod tests {
         assert_eq!(checked.usage().extension_payloads(), 2);
         assert_eq!(checked.usage().extension_payload_bytes(), 9);
     }
+
+    /// The broader same-base half of the bead's metamorphic requirement.
+    /// The two-module sibling above established order convergence pairwise;
+    /// this matrix widens it to every insertion order of THREE independent
+    /// modules over one empty base. Each sequence applies its modules
+    /// sequentially (every plan prepared against the state the previous one
+    /// published), and all six final states must be identical — state,
+    /// provenance root, logical root, and both index directions.
+    #[test]
+    fn three_module_insertion_orders_all_converge_on_one_committed_state() {
+        let specs = [
+            ("fixture.m1", "fixture.m1.decl", "fixture.m1.extra", 21u8),
+            ("fixture.m2", "fixture.m2.decl", "fixture.m2.extra", 22),
+            ("fixture.m3", "fixture.m3.decl", "fixture.m3.extra", 23),
+        ];
+        let records: Vec<ModuleContributionRecord> = specs
+            .iter()
+            .map(|(module, declaration, extra, seed)| {
+                named_record(module, declaration, extra, *seed)
+            })
+            .collect();
+        let run = |permutation: [usize; 3], base: &ModuleApplyState| -> ModuleApplyState {
+            let mut current = base.clone();
+            for step in 0..3 {
+                let which = permutation[step];
+                let target = permutation[..=step]
+                    .iter()
+                    .map(|&index| records[index].clone())
+                    .collect();
+                let checked = preflight_module_apply(
+                    transaction_with_target(
+                        target,
+                        records[which].clone(),
+                        specs[which].1,
+                        specs[which].2,
+                    ),
+                    &ModuleApplyLimits::default(),
+                )
+                .expect("matrix transaction preflights");
+                let candidate = current
+                    .environment()
+                    .add_decl((*checked.transaction().declarations()[0]).clone())
+                    .expect("matrix declaration is unique")
+                    .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+                    .expect("matrix extra declaration is unique");
+                current = match prepare_module_apply(&checked, &current, &candidate) {
+                    Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                        plan.commit(&current, None),
+                        "uncancelled matrix application must complete",
+                    )
+                    .expect("matrix base remains current")
+                    .into_state(),
+                    other => panic!("expected a prepared matrix application, got {other:?}"),
+                };
+            }
+            current
+        };
+
+        let empty = empty_base();
+        let reference = run([0, 1, 2], &empty);
+        assert_eq!(reference.graph().len(), 3);
+        for permutation in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let converged = run(permutation, &empty);
+            assert_eq!(
+                converged, reference,
+                "insertion order {permutation:?} diverged from the reference state"
+            );
+            assert_eq!(converged.manifest().root(), reference.manifest().root());
+            assert_eq!(converged.logical_root(), reference.logical_root());
+            assert_eq!(converged.indexes(), reference.indexes());
+        }
+    }
+
+    /// The transaction-ID matrix the bead names alongside same-base retries:
+    /// identity is a deterministic function of the manifest root plus the
+    /// retained payload values, so re-preflighting an equal envelope is
+    /// stable, while a different manifest root or a different payload set
+    /// yields a different identity even when the other component matches.
+    #[test]
+    fn transaction_identity_is_deterministic_and_sensitive_to_root_and_payload() {
+        let default_limits = ModuleApplyLimits::default();
+        let first =
+            preflight_module_apply(sized_transaction(2, 1, vec![], vec![]), &default_limits)
+                .expect("the first envelope preflights");
+        let second =
+            preflight_module_apply(sized_transaction(2, 1, vec![], vec![]), &default_limits)
+                .expect("the repeated envelope preflights");
+        assert_eq!(
+            first.transaction_id(),
+            second.transaction_id(),
+            "an equal envelope must preflight to an equal identity"
+        );
+
+        // Different payload set, same construction path: identity moves.
+        let narrower =
+            preflight_module_apply(sized_transaction(1, 1, vec![], vec![]), &default_limits)
+                .expect("the narrower envelope preflights");
+        assert_ne!(narrower.transaction_id(), first.transaction_id());
+
+        // Same retained payload VALUES under a different manifest root:
+        // identity still moves, because the preimage is root-scoped.
+        let alternate_epoch =
+            ModuleEpoch::new("v9.99.9", "ffffffffffffffffffffffffffffffffffffffff");
+        let contribution = ModuleContributionRecord::new(
+            ModuleRecord::new(
+                ModuleId::new(name("fixture.altmodule")),
+                true,
+                vec![],
+                ArtifactEvidence {
+                    epoch: alternate_epoch.clone(),
+                    content_digest: Digest([7; 32]),
+                    producer: ArtifactProducer::Reference,
+                    grade: ArtifactGrade::Verified,
+                },
+            ),
+            vec![name("fixture.decl0"), name("fixture.decl1")],
+            vec![name("fixture.extra0")],
+            vec![],
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
+                vec![],
+            ),
+        );
+        let manifest = Arc::new(
+            ModuleProvenanceManifest::new(
+                alternate_epoch,
+                vec![contribution.clone()],
+                crate::provenance::ModuleProvenanceLimits::default(),
+            )
+            .expect("alternate-epoch manifest is valid"),
+        );
+        let relocated = preflight_module_apply(
+            ModuleApplyTransaction::new(
+                manifest,
+                contribution,
+                axioms("fixture.decl", 2),
+                axioms("fixture.extra", 1),
+                vec![],
+            ),
+            &default_limits,
+        )
+        .expect("the relocated envelope preflights");
+        assert_ne!(
+            relocated.transaction_id(),
+            first.transaction_id(),
+            "equal payloads under a different manifest root cannot share an identity"
+        );
+        assert_ne!(
+            relocated.manifest_root(),
+            first.manifest_root(),
+            "the fixture must actually move the manifest root"
+        );
+    }
 }
