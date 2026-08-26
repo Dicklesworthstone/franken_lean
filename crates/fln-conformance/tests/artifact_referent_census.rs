@@ -281,6 +281,7 @@ const STRUCTURED_HEADS: &[&str] = &[
     "pending_active_work",
     "pinned-toolchain:",
     "hash_identity:",
+    "gh-run:",
 ];
 
 /// **The `povo` debt: every untracked path citation live in the manifest, declared PER
