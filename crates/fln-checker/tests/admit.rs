@@ -13069,7 +13069,7 @@ fn class_add_entries() -> Vec<ConstantEntry> {
         ConstantEntry::new(
             add.clone(),
             ConstantDeclaration::inductive(
-                vec![u_name],
+                vec![u_name.clone()],
                 decoded(&primary_pi("α", BinderInfo::Default, ptype(), ptype())),
                 ConstantSafety::Safe,
                 InductiveDeclaration::new(
@@ -13161,7 +13161,9 @@ fn kr600_803_class_block_refuses_a_forged_field_count() {
     assert!(
         matches!(
             verdict,
-            InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { .. })
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. },
+            )
         ),
         "forged field count rejects: {verdict:?}"
     );
@@ -13235,7 +13237,9 @@ fn kr600_803_class_block_refuses_a_motive_head_iota_rule() {
     assert!(
         matches!(
             verdict,
-            InductiveVerdict::Rejected(InductiveRejection::RecursorShape { .. })
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. },
+            )
         ),
         "motive-headed iota rule rejects: {verdict:?}"
     );
