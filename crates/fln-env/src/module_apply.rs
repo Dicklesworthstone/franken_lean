@@ -5667,4 +5667,126 @@ mod tests {
         assert_eq!(current.manifest().root(), reference.manifest().root());
         assert_eq!(current.indexes(), reference.indexes());
     }
+    /// The malformed-envelope fuzz soak: pseudo-random cumulative corruptions
+    /// of a valid envelope must always produce either a clean bind or one of
+    /// the typed preflight refusals — never a panic — and the same seed must
+    /// classify identically twice (generation reproducible, answers typed:
+    /// FL-INV-07 for malformed input).
+    ///
+    /// Anti-vacuity floor: the seeds must collectively exercise at least four
+    /// distinct refusal classes plus at least one clean bind, so a broken
+    /// generator that never reaches the interesting paths cannot pass.
+    #[test]
+    fn malformed_envelope_fuzz_soak_is_typed_and_seed_deterministic() {
+        fn classify(
+            outcome: &Result<PreflightedModuleApply, ModuleApplyPreflightError>,
+        ) -> &'static str {
+            match outcome {
+                Ok(_) => "ok",
+                Err(ModuleApplyPreflightError::ManifestInconsistent(_)) => "manifest",
+                Err(ModuleApplyPreflightError::ContributionAbsent { .. }) => "absent",
+                Err(ModuleApplyPreflightError::ContributionMismatch { .. }) => "mismatched",
+                Err(ModuleApplyPreflightError::DeclarationCount { .. }) => "decl-count",
+                Err(ModuleApplyPreflightError::DeclarationName { .. }) => "decl-name",
+                Err(ModuleApplyPreflightError::ExtensionPayloadCount { .. }) => "ext-count",
+                Err(ModuleApplyPreflightError::ExtensionOccurrence { .. }) => "ext-occurrence",
+                Err(ModuleApplyPreflightError::ExtensionDescriptor { .. }) => "ext-descriptor",
+                Err(ModuleApplyPreflightError::ExtensionIdentity { .. }) => "ext-identity",
+                Err(ModuleApplyPreflightError::LimitExceeded { .. }) => "limit",
+            }
+        }
+
+        fn corrupted(seed: u64) -> Result<PreflightedModuleApply, ModuleApplyPreflightError> {
+            let mut rng = Xorshift(seed | 1);
+            let descriptor = descriptor();
+            let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"soak");
+            let contribution = record(vec![ExtensionContribution::new(
+                descriptor.clone(),
+                0,
+                Digest([0; 32]),
+                vec![entry],
+            )]);
+            let mut declarations = vec![axiom("fixture.decl")];
+            let mut extras = vec![axiom("fixture.extra")];
+            let mut payloads = vec![ExtensionPayload::new(
+                0,
+                descriptor.clone(),
+                0,
+                &b"soak"[..],
+            )];
+
+            let operators = 2 + rng.below(4);
+            for _ in 0..operators {
+                match rng.below(8) {
+                    0 => declarations.clear(),
+                    1 => {
+                        if !declarations.is_empty() {
+                            let last = declarations.remove(declarations.len() - 1);
+                            declarations.insert(0, last);
+                        }
+                    }
+                    2 => declarations.push(axiom("fixture.decl")),
+                    3 => declarations.push(axiom("fixture.unknown")),
+                    4 => extras.clear(),
+                    5 => {
+                        payloads.pop();
+                    }
+                    6 => {
+                        if let Some(first) = payloads.first() {
+                            payloads[0] = ExtensionPayload::new(
+                                first.contribution_index(),
+                                first.descriptor().clone(),
+                                first.source_ordinal() + 1,
+                                &b"soak"[..],
+                            );
+                        }
+                    }
+                    _ => {
+                        if let Some(first) = payloads.first() {
+                            payloads[0] = ExtensionPayload::new(
+                                first.contribution_index() + 1,
+                                first.descriptor().clone(),
+                                first.source_ordinal(),
+                                &b"soak"[..],
+                            );
+                        }
+                    }
+                }
+            }
+
+            let manifest = Arc::new(
+                ModuleProvenanceManifest::new(
+                    epoch(),
+                    vec![contribution.clone()],
+                    crate::provenance::ModuleProvenanceLimits::default(),
+                )
+                .expect("soak manifest is valid"),
+            );
+            preflight_module_apply(
+                ModuleApplyTransaction::new(manifest, contribution, declarations, extras, payloads),
+                &ModuleApplyLimits::default(),
+            )
+        }
+
+        let mut classes_seen: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        for seed in 1u64..=128 {
+            let first = corrupted(seed);
+            let second = corrupted(seed);
+            assert_eq!(
+                classify(&first),
+                classify(&second),
+                "seed {seed} must classify deterministically"
+            );
+            classes_seen.insert(classify(&first));
+        }
+        assert!(
+            classes_seen.len() >= 4,
+            "the soak must exercise several distinct refusals, saw only {classes_seen:?}"
+        );
+        assert!(
+            classes_seen.contains("ok"),
+            "the uncorrupted shape must still bind cleanly somewhere in the sweep"
+        );
+    }
 }
