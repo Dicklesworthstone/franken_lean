@@ -924,6 +924,13 @@ impl Environment {
             .map(|(name, info)| (name, info.as_ref()))
     }
 
+    /// Borrow every registered extension in deterministic persistent-map order.
+    pub fn extensions(&self) -> impl Iterator<Item = (&Name, &crate::extensions::ExtensionState)> {
+        self.extensions
+            .iter()
+            .map(|(name, state)| (name, state.as_ref()))
+    }
+
     /// Verify that `self` differs from `base` by exactly `additions` and by nothing
     /// else. This is a comparison boundary, never declaration admission: it allocates
     /// no environment state, does not derive an authority token, and cannot make an

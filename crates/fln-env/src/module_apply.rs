@@ -145,7 +145,7 @@ impl ExtensionPayload {
         &self.payload
     }
 
-    fn payload_arc(&self) -> Arc<[u8]> {
+    pub fn payload_arc(&self) -> Arc<[u8]> {
         Arc::clone(&self.payload)
     }
 
@@ -893,6 +893,21 @@ impl AppliedModulePayload {
             extra_declarations: Arc::clone(&transaction.extra_declarations),
             extension_payloads: Arc::clone(&transaction.extension_payloads),
         })
+    }
+
+    /// Construct directly from a contribution record and validated payload slices.
+    pub fn new_with_record(
+        contribution: ModuleContributionRecord,
+        declarations: Arc<[Arc<ConstantInfo>]>,
+        extra_declarations: Arc<[Arc<ConstantInfo>]>,
+        extension_payloads: Arc<[ExtensionPayload]>,
+    ) -> Self {
+        Self {
+            contribution,
+            declarations,
+            extra_declarations,
+            extension_payloads,
+        }
     }
 
     pub fn contribution(&self) -> &ModuleContributionRecord {
