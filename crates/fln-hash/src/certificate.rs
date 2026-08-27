@@ -14,11 +14,12 @@
 
 use std::collections::BTreeSet;
 
+use fln_core::diag::ResourceReason;
 use fln_core::expr::{BinderInfo, NatLit};
 use fln_core::level::Level;
 use fln_core::mode::{BuildProfileId, ContentRoot, EpochId, Mode, ReproducibilityProfile};
 use fln_core::name::Name;
-use fln_core::outcome::{InternalFault, Outcome};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 
 use crate::canon::{
     CanonError, CanonReader, CanonWriter, Canonical, DecodeBudget, SCHEMA_DECLARATION_CERTIFICATE,
@@ -1495,5 +1496,1062 @@ fn read_nat_operation(reader: &mut CanonReader<'_>) -> Result<NatOperationV1, Ca
         13 => Ok(NatOperationV1::ShiftLeft),
         14 => Ok(NatOperationV1::ShiftRight),
         _ => Err(reader.reject("unknown nat-operation tag")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded Certificate Verifier & Governed Recomputation Fallback (W3, fln-eeyn)
+// ---------------------------------------------------------------------------
+
+/// Bounded verification budget for fast-path certificate verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierBudget {
+    pub decode_budget: DecodeBudget,
+    pub max_steps: u64,
+    pub max_extension_count: u32,
+    pub max_extension_bytes: usize,
+    pub steps_consumed: u64,
+    pub cancelled: bool,
+}
+
+impl VerifierBudget {
+    pub fn new(max_steps: u64) -> Self {
+        Self {
+            decode_budget: DecodeBudget::new(16 * 1024 * 1024, 1_000_000),
+            max_steps,
+            max_extension_count: 64,
+            max_extension_bytes: 1024 * 1024,
+            steps_consumed: 0,
+            cancelled: false,
+        }
+    }
+
+    pub fn with_decode_budget(mut self, decode_budget: DecodeBudget) -> Self {
+        self.decode_budget = decode_budget;
+        self
+    }
+
+    pub fn with_extension_limits(mut self, max_count: u32, max_bytes: usize) -> Self {
+        self.max_extension_count = max_count;
+        self.max_extension_bytes = max_bytes;
+        self
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    pub fn consume_step(&mut self, count: u64) -> Result<(), Inconclusive> {
+        if self.cancelled {
+            return Err(Inconclusive::cancelled(
+                "certificate verification cancelled",
+            ));
+        }
+        self.steps_consumed = self.steps_consumed.saturating_add(count);
+        if self.steps_consumed > self.max_steps {
+            Err(Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::ExecutionSteps,
+                allowed: self.max_steps,
+                observed: self.steps_consumed,
+            }))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Verification context specifying the expected candidate binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierContext {
+    pub expected_epoch: Option<EpochId>,
+    pub expected_mode: Option<Mode>,
+    pub expected_environment_root: Option<ContentRoot>,
+    pub expected_declaration_root: Option<ContentRoot>,
+    pub expected_build_profile: Option<BuildProfileId>,
+    pub expected_consensus_policy: Option<ConsensusPolicyV1>,
+    pub allow_advisory_extensions: bool,
+    pub allow_rejections: bool,
+}
+
+impl Default for VerifierContext {
+    fn default() -> Self {
+        Self {
+            expected_epoch: None,
+            expected_mode: None,
+            expected_environment_root: None,
+            expected_declaration_root: None,
+            expected_build_profile: None,
+            expected_consensus_policy: None,
+            allow_advisory_extensions: true,
+            allow_rejections: false,
+        }
+    }
+}
+
+impl VerifierContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn matching_binding(binding: &CertificateBindingV1) -> Self {
+        Self {
+            expected_epoch: Some(binding.epoch),
+            expected_mode: Some(binding.mode),
+            expected_environment_root: Some(binding.environment_root),
+            expected_declaration_root: Some(binding.declaration_root),
+            expected_build_profile: Some(binding.build_profile),
+            expected_consensus_policy: Some(binding.consensus_policy),
+            allow_advisory_extensions: true,
+            allow_rejections: false,
+        }
+    }
+
+    pub fn with_epoch(mut self, epoch: EpochId) -> Self {
+        self.expected_epoch = Some(epoch);
+        self
+    }
+
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.expected_mode = Some(mode);
+        self
+    }
+
+    pub fn with_environment_root(mut self, root: ContentRoot) -> Self {
+        self.expected_environment_root = Some(root);
+        self
+    }
+
+    pub fn with_declaration_root(mut self, root: ContentRoot) -> Self {
+        self.expected_declaration_root = Some(root);
+        self
+    }
+
+    pub fn with_build_profile(mut self, profile: BuildProfileId) -> Self {
+        self.expected_build_profile = Some(profile);
+        self
+    }
+
+    pub fn with_consensus_policy(mut self, policy: ConsensusPolicyV1) -> Self {
+        self.expected_consensus_policy = Some(policy);
+        self
+    }
+
+    pub fn with_allow_advisory_extensions(mut self, allow: bool) -> Self {
+        self.allow_advisory_extensions = allow;
+        self
+    }
+
+    pub fn with_allow_rejections(mut self, allow: bool) -> Self {
+        self.allow_rejections = allow;
+        self
+    }
+}
+
+/// Detailed refusal reason when a candidate certificate fails fast-path verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertificateVerificationRefusal {
+    DecodeRefused(CertificateRefusalV1),
+    StaleEpoch {
+        expected: EpochId,
+        seen: EpochId,
+    },
+    ModeMismatch {
+        expected: Mode,
+        seen: Mode,
+    },
+    EnvironmentRootMismatch {
+        expected: ContentRoot,
+        seen: ContentRoot,
+    },
+    DeclarationRootMismatch {
+        expected: ContentRoot,
+        seen: ContentRoot,
+    },
+    BuildProfileMismatch {
+        expected: BuildProfileId,
+        seen: BuildProfileId,
+    },
+    ConsensusPolicyMismatch {
+        expected: ConsensusPolicyV1,
+        seen: ConsensusPolicyV1,
+    },
+    TermRootMismatch {
+        expected: ContentRoot,
+        computed: ContentRoot,
+    },
+    InvalidJudgmentNode {
+        detail: String,
+        node_id: TermNodeId,
+        total_nodes: usize,
+    },
+    InvalidReductionHint {
+        hint_index: usize,
+        detail: String,
+    },
+    AdvisoryExtensionsDisallowed {
+        extension_ids: Vec<u32>,
+    },
+    TooManyExtensions {
+        seen: usize,
+        limit: usize,
+    },
+    ExtensionsPayloadTooLarge {
+        seen_bytes: usize,
+        limit_bytes: usize,
+    },
+    ClaimedResultRefused {
+        claimed: ClaimedRejectionV1,
+    },
+}
+
+/// Decision from the fast-path bounded certificate verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastPathVerificationDecision {
+    Verified {
+        certificate_digest: Digest,
+        declaration_name: Option<Name>,
+        judgment: CertificateJudgmentV1,
+        claimed_result: ClaimedResultV1,
+        steps_consumed: u64,
+    },
+    Refused(CertificateVerificationRefusal),
+}
+
+/// Fast-path bounded certificate verifier.
+pub struct CertificateVerifier;
+
+impl CertificateVerifier {
+    /// Verify a decoded candidate certificate against the verification context and budget.
+    pub fn verify_candidate(
+        candidate: &DeclarationCertificateV1,
+        context: &VerifierContext,
+        budget: &mut VerifierBudget,
+    ) -> Outcome<FastPathVerificationDecision> {
+        if budget.is_cancelled() {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                "certificate verification cancelled",
+            ));
+        }
+
+        // 1. Validate epoch binding
+        if let Some(expected_epoch) = context.expected_epoch {
+            if candidate.binding.epoch != expected_epoch {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::StaleEpoch {
+                        expected: expected_epoch,
+                        seen: candidate.binding.epoch,
+                    },
+                ));
+            }
+        }
+
+        // 2. Validate mode binding
+        if let Some(expected_mode) = context.expected_mode {
+            if candidate.binding.mode != expected_mode {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::ModeMismatch {
+                        expected: expected_mode,
+                        seen: candidate.binding.mode,
+                    },
+                ));
+            }
+        }
+
+        // 3. Validate environment root binding
+        if let Some(expected_env) = context.expected_environment_root {
+            if candidate.binding.environment_root != expected_env {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::EnvironmentRootMismatch {
+                        expected: expected_env,
+                        seen: candidate.binding.environment_root,
+                    },
+                ));
+            }
+        }
+
+        // 4. Validate declaration root binding
+        if let Some(expected_decl) = context.expected_declaration_root {
+            if candidate.binding.declaration_root != expected_decl {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::DeclarationRootMismatch {
+                        expected: expected_decl,
+                        seen: candidate.binding.declaration_root,
+                    },
+                ));
+            }
+        }
+
+        // 5. Validate build profile binding
+        if let Some(expected_profile) = context.expected_build_profile {
+            if candidate.binding.build_profile != expected_profile {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::BuildProfileMismatch {
+                        expected: expected_profile,
+                        seen: candidate.binding.build_profile,
+                    },
+                ));
+            }
+        }
+
+        // 6. Validate consensus policy binding
+        if let Some(expected_policy) = context.expected_consensus_policy {
+            if candidate.binding.consensus_policy != expected_policy {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::ConsensusPolicyMismatch {
+                        expected: expected_policy,
+                        seen: candidate.binding.consensus_policy,
+                    },
+                ));
+            }
+        }
+
+        // 7. Validate term root
+        let computed_term_root = candidate.term_dag.content_root();
+        if computed_term_root != candidate.binding.term_root {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::TermRootMismatch {
+                    expected: candidate.binding.term_root,
+                    computed: computed_term_root,
+                },
+            ));
+        }
+
+        // 8. Validate extension limits and policy
+        if candidate.extensions.len() > budget.max_extension_count as usize {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::TooManyExtensions {
+                    seen: candidate.extensions.len(),
+                    limit: budget.max_extension_count as usize,
+                },
+            ));
+        }
+        let total_ext_bytes: usize = candidate.extensions.iter().map(|e| e.payload.len()).sum();
+        if total_ext_bytes > budget.max_extension_bytes {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::ExtensionsPayloadTooLarge {
+                    seen_bytes: total_ext_bytes,
+                    limit_bytes: budget.max_extension_bytes,
+                },
+            ));
+        }
+        if !context.allow_advisory_extensions && !candidate.extensions.is_empty() {
+            let extension_ids = candidate.extensions.iter().map(|e| e.id).collect();
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::AdvisoryExtensionsDisallowed { extension_ids },
+            ));
+        }
+
+        // 9. Validate judgment node references
+        let total_nodes = candidate.term_dag.nodes.len();
+        match &candidate.judgment {
+            CertificateJudgmentV1::CheckDeclaration {
+                type_node,
+                value_node,
+                ..
+            } => {
+                if type_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "type_node out of bounds".to_string(),
+                            node_id: *type_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+                if let Some(val) = value_node {
+                    if val.get() as usize >= total_nodes {
+                        return Outcome::Complete(FastPathVerificationDecision::Refused(
+                            CertificateVerificationRefusal::InvalidJudgmentNode {
+                                detail: "value_node out of bounds".to_string(),
+                                node_id: *val,
+                                total_nodes,
+                            },
+                        ));
+                    }
+                }
+            }
+            CertificateJudgmentV1::InferType {
+                term_node,
+                inferred_type_node,
+            } => {
+                if term_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "term_node out of bounds".to_string(),
+                            node_id: *term_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+                if inferred_type_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "inferred_type_node out of bounds".to_string(),
+                            node_id: *inferred_type_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+            }
+            CertificateJudgmentV1::DefinitionalEquality {
+                left_node,
+                right_node,
+                type_node,
+            } => {
+                if left_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "left_node out of bounds".to_string(),
+                            node_id: *left_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+                if right_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "right_node out of bounds".to_string(),
+                            node_id: *right_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+                if let Some(tn) = type_node {
+                    if tn.get() as usize >= total_nodes {
+                        return Outcome::Complete(FastPathVerificationDecision::Refused(
+                            CertificateVerificationRefusal::InvalidJudgmentNode {
+                                detail: "type_node out of bounds".to_string(),
+                                node_id: *tn,
+                                total_nodes,
+                            },
+                        ));
+                    }
+                }
+            }
+            CertificateJudgmentV1::WeakHeadNormalForm {
+                input_node,
+                output_node,
+            } => {
+                if input_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "input_node out of bounds".to_string(),
+                            node_id: *input_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+                if output_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "output_node out of bounds".to_string(),
+                            node_id: *output_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+            }
+            CertificateJudgmentV1::ValidateInductiveGroup { type_nodes, .. } => {
+                for node in type_nodes {
+                    if node.get() as usize >= total_nodes {
+                        return Outcome::Complete(FastPathVerificationDecision::Refused(
+                            CertificateVerificationRefusal::InvalidJudgmentNode {
+                                detail: "inductive type_node out of bounds".to_string(),
+                                node_id: *node,
+                                total_nodes,
+                            },
+                        ));
+                    }
+                }
+            }
+            CertificateJudgmentV1::ValidateQuotientPackage { type_node, .. } => {
+                if type_node.get() as usize >= total_nodes {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "quotient type_node out of bounds".to_string(),
+                            node_id: *type_node,
+                            total_nodes,
+                        },
+                    ));
+                }
+            }
+        }
+
+        // 10. Validate reduction hints
+        if let Err(reason) = budget.consume_step(candidate.term_dag.nodes.len() as u64) {
+            return Outcome::Inconclusive(reason);
+        }
+
+        for (idx, hint) in candidate.reduction_hints.iter().enumerate() {
+            if let Err(reason) = budget.consume_step(1) {
+                return Outcome::Inconclusive(reason);
+            }
+            match hint {
+                ReductionHintV1::NatOperation {
+                    operation,
+                    inputs,
+                    result,
+                } => match evaluate_nat_operation(*operation, &inputs[0], &inputs[1]) {
+                    Some(expected_result) => {
+                        if expected_result != *result {
+                            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                                CertificateVerificationRefusal::InvalidReductionHint {
+                                    hint_index: idx,
+                                    detail: format!(
+                                        "nat operation {:?} on inputs gave {:?}, but hint claimed {:?}",
+                                        operation, expected_result, result
+                                    ),
+                                },
+                            ));
+                        }
+                    }
+                    None => {
+                        return Outcome::Complete(FastPathVerificationDecision::Refused(
+                            CertificateVerificationRefusal::InvalidReductionHint {
+                                hint_index: idx,
+                                detail: format!(
+                                    "nat operation {:?} exceeded bounded arithmetic capacity",
+                                    operation
+                                ),
+                            },
+                        ));
+                    }
+                },
+                ReductionHintV1::Unfold { declaration } => {
+                    if declaration.is_anonymous() {
+                        return Outcome::Complete(FastPathVerificationDecision::Refused(
+                            CertificateVerificationRefusal::InvalidReductionHint {
+                                hint_index: idx,
+                                detail: "unfold hint references anonymous declaration".to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 11. Validate claimed result
+        if let ClaimedResultV1::Rejected(rejection) = candidate.claimed_result {
+            if !context.allow_rejections {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::ClaimedResultRefused { claimed: rejection },
+                ));
+            }
+        }
+
+        // 12. Compute digest and return verification
+        let cert_digest = match candidate.digest() {
+            Ok(d) => d,
+            Err(refusal) => {
+                return Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::DecodeRefused(refusal),
+                ));
+            }
+        };
+
+        let declaration_name = match &candidate.judgment {
+            CertificateJudgmentV1::CheckDeclaration { name, .. } => Some(name.clone()),
+            CertificateJudgmentV1::ValidateQuotientPackage { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+
+        Outcome::Complete(FastPathVerificationDecision::Verified {
+            certificate_digest: cert_digest,
+            declaration_name,
+            judgment: candidate.judgment.clone(),
+            claimed_result: candidate.claimed_result,
+            steps_consumed: budget.steps_consumed,
+        })
+    }
+
+    /// Verify raw certificate bytes against context and budget.
+    pub fn verify_bytes(
+        bytes: &[u8],
+        context: &VerifierContext,
+        budget: &mut VerifierBudget,
+    ) -> Outcome<FastPathVerificationDecision> {
+        if budget.is_cancelled() {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                "certificate verification cancelled",
+            ));
+        }
+
+        let decode_outcome =
+            DeclarationCertificateV1::from_canonical_bytes_budgeted(bytes, budget.decode_budget);
+        match decode_outcome {
+            Outcome::Complete(Ok(candidate)) => Self::verify_candidate(&candidate, context, budget),
+            Outcome::Complete(Err(refusal)) => {
+                Outcome::Complete(FastPathVerificationDecision::Refused(
+                    CertificateVerificationRefusal::DecodeRefused(refusal),
+                ))
+            }
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-precision Nat arithmetic for bounded verification
+// ---------------------------------------------------------------------------
+
+pub fn nat_add(a: &NatLit, b: &NatLit) -> NatLit {
+    let a_limbs = a.limbs_le();
+    let b_limbs = b.limbs_le();
+    let max_len = a_limbs.len().max(b_limbs.len());
+    let mut result = Vec::with_capacity(max_len + 1);
+    let mut carry = 0u64;
+    for i in 0..max_len {
+        let al = a_limbs.get(i).copied().unwrap_or(0);
+        let bl = b_limbs.get(i).copied().unwrap_or(0);
+        let (sum1, c1) = al.overflowing_add(bl);
+        let (sum2, c2) = sum1.overflowing_add(carry);
+        result.push(sum2);
+        carry = (c1 as u64) + (c2 as u64);
+    }
+    if carry > 0 {
+        result.push(carry);
+    }
+    NatLit::from_limbs_le(result)
+}
+
+pub fn nat_sub(a: &NatLit, b: &NatLit) -> NatLit {
+    if a < b {
+        return NatLit::from_u64(0);
+    }
+    let a_limbs = a.limbs_le();
+    let b_limbs = b.limbs_le();
+    let mut result = Vec::with_capacity(a_limbs.len());
+    let mut borrow = 0u64;
+    for i in 0..a_limbs.len() {
+        let al = a_limbs[i];
+        let bl = b_limbs.get(i).copied().unwrap_or(0);
+        let (diff1, b1) = al.overflowing_sub(bl);
+        let (diff2, b2) = diff1.overflowing_sub(borrow);
+        result.push(diff2);
+        borrow = (b1 as u64) + (b2 as u64);
+    }
+    NatLit::from_limbs_le(result)
+}
+
+pub fn nat_mul(a: &NatLit, b: &NatLit) -> NatLit {
+    let a_limbs = a.limbs_le();
+    let b_limbs = b.limbs_le();
+    if a_limbs.is_empty() || b_limbs.is_empty() {
+        return NatLit::from_u64(0);
+    }
+    let mut result = vec![0u64; a_limbs.len() + b_limbs.len()];
+    for (i, &al) in a_limbs.iter().enumerate() {
+        let mut carry = 0u64;
+        for (j, &bl) in b_limbs.iter().enumerate() {
+            let prod = (al as u128) * (bl as u128) + (result[i + j] as u128) + (carry as u128);
+            result[i + j] = prod as u64;
+            carry = (prod >> 64) as u64;
+        }
+        let mut k = i + b_limbs.len();
+        while carry > 0 {
+            let sum = (result[k] as u128) + (carry as u128);
+            result[k] = sum as u64;
+            carry = (sum >> 64) as u64;
+            k += 1;
+        }
+    }
+    NatLit::from_limbs_le(result)
+}
+
+fn nat_bit_length(n: &NatLit) -> usize {
+    let limbs = n.limbs_le();
+    if limbs.is_empty() {
+        return 0;
+    }
+    let top = limbs[limbs.len() - 1];
+    (limbs.len() - 1) * 64 + (64 - top.leading_zeros() as usize)
+}
+
+fn nat_get_bit(n: &NatLit, bit_idx: usize) -> bool {
+    let limb_i = bit_idx / 64;
+    let bit_i = bit_idx % 64;
+    n.limbs_le()
+        .get(limb_i)
+        .map_or(false, |&limb| (limb & (1u64 << bit_i)) != 0)
+}
+
+fn nat_shift_left_1(n: &NatLit) -> NatLit {
+    let limbs = n.limbs_le();
+    if limbs.is_empty() {
+        return NatLit::from_u64(0);
+    }
+    let mut out = Vec::with_capacity(limbs.len() + 1);
+    let mut carry = 0u64;
+    for &l in limbs {
+        out.push((l << 1) | carry);
+        carry = l >> 63;
+    }
+    if carry > 0 {
+        out.push(carry);
+    }
+    NatLit::from_limbs_le(out)
+}
+
+fn nat_set_bit_0(n: &NatLit) -> NatLit {
+    let limbs = n.limbs_le();
+    if limbs.is_empty() {
+        NatLit::from_u64(1)
+    } else {
+        let mut out = limbs.to_vec();
+        out[0] |= 1;
+        NatLit::from_limbs_le(out)
+    }
+}
+
+pub fn nat_div_rem(a: &NatLit, b: &NatLit) -> (NatLit, NatLit) {
+    if b.limbs_le().is_empty() {
+        return (NatLit::from_u64(0), a.clone());
+    }
+    if a < b {
+        return (NatLit::from_u64(0), a.clone());
+    }
+    if b.limbs_le().len() == 1 {
+        let divisor = b.limbs_le()[0];
+        let mut rem = 0u128;
+        let mut quot = vec![0u64; a.limbs_le().len()];
+        for i in (0..a.limbs_le().len()).rev() {
+            let cur = (rem << 64) | (a.limbs_le()[i] as u128);
+            quot[i] = (cur / (divisor as u128)) as u64;
+            rem = cur % (divisor as u128);
+        }
+        return (NatLit::from_limbs_le(quot), NatLit::from_u64(rem as u64));
+    }
+    let a_bits = nat_bit_length(a);
+    let mut rem = NatLit::from_u64(0);
+    let mut quot_limbs = vec![0u64; (a_bits + 63) / 64];
+    for bit_idx in (0..a_bits).rev() {
+        rem = nat_shift_left_1(&rem);
+        if nat_get_bit(a, bit_idx) {
+            rem = nat_set_bit_0(&rem);
+        }
+        if rem >= *b {
+            rem = nat_sub(&rem, b);
+            let limb_i = bit_idx / 64;
+            let bit_i = bit_idx % 64;
+            quot_limbs[limb_i] |= 1u64 << bit_i;
+        }
+    }
+    (NatLit::from_limbs_le(quot_limbs), rem)
+}
+
+pub fn nat_pow(a: &NatLit, b: &NatLit, max_limbs: usize) -> Option<NatLit> {
+    if b.limbs_le().is_empty() {
+        return Some(NatLit::from_u64(1));
+    }
+    if a.limbs_le().is_empty() {
+        return Some(NatLit::from_u64(0));
+    }
+    let mut base = a.clone();
+    let mut res = NatLit::from_u64(1);
+    let b_bits = nat_bit_length(b);
+    for bit_idx in 0..b_bits {
+        if nat_get_bit(b, bit_idx) {
+            res = nat_mul(&res, &base);
+            if res.limbs_le().len() > max_limbs {
+                return None;
+            }
+        }
+        if bit_idx + 1 < b_bits {
+            base = nat_mul(&base, &base);
+            if base.limbs_le().len() > max_limbs {
+                return None;
+            }
+        }
+    }
+    Some(res)
+}
+
+pub fn nat_gcd(mut a: NatLit, mut b: NatLit) -> NatLit {
+    while !b.limbs_le().is_empty() {
+        let (_, rem) = nat_div_rem(&a, &b);
+        a = b;
+        b = rem;
+    }
+    a
+}
+
+pub fn nat_land(a: &NatLit, b: &NatLit) -> NatLit {
+    let min_len = a.limbs_le().len().min(b.limbs_le().len());
+    let mut result = Vec::with_capacity(min_len);
+    for i in 0..min_len {
+        result.push(a.limbs_le()[i] & b.limbs_le()[i]);
+    }
+    NatLit::from_limbs_le(result)
+}
+
+pub fn nat_lor(a: &NatLit, b: &NatLit) -> NatLit {
+    let max_len = a.limbs_le().len().max(b.limbs_le().len());
+    let mut result = Vec::with_capacity(max_len);
+    for i in 0..max_len {
+        let al = a.limbs_le().get(i).copied().unwrap_or(0);
+        let bl = b.limbs_le().get(i).copied().unwrap_or(0);
+        result.push(al | bl);
+    }
+    NatLit::from_limbs_le(result)
+}
+
+pub fn nat_lxor(a: &NatLit, b: &NatLit) -> NatLit {
+    let max_len = a.limbs_le().len().max(b.limbs_le().len());
+    let mut result = Vec::with_capacity(max_len);
+    for i in 0..max_len {
+        let al = a.limbs_le().get(i).copied().unwrap_or(0);
+        let bl = b.limbs_le().get(i).copied().unwrap_or(0);
+        result.push(al ^ bl);
+    }
+    NatLit::from_limbs_le(result)
+}
+
+pub fn nat_shift_left(a: &NatLit, b: &NatLit, max_limbs: usize) -> Option<NatLit> {
+    if a.limbs_le().is_empty() {
+        return Some(NatLit::from_u64(0));
+    }
+    let shift = match b.to_u64() {
+        Some(s) if (s / 64) as usize <= max_limbs => s as usize,
+        _ => return None,
+    };
+    let limb_shift = shift / 64;
+    let bit_shift = shift % 64;
+    let a_limbs = a.limbs_le();
+    if a_limbs.len() + limb_shift > max_limbs + 1 {
+        return None;
+    }
+    let mut out = vec![0u64; limb_shift];
+    if bit_shift == 0 {
+        out.extend_from_slice(a_limbs);
+    } else {
+        let mut carry = 0u64;
+        for &l in a_limbs {
+            out.push((l << bit_shift) | carry);
+            carry = l >> (64 - bit_shift);
+        }
+        if carry > 0 {
+            out.push(carry);
+        }
+    }
+    if out.len() > max_limbs {
+        return None;
+    }
+    Some(NatLit::from_limbs_le(out))
+}
+
+pub fn nat_shift_right(a: &NatLit, b: &NatLit) -> NatLit {
+    let a_limbs = a.limbs_le();
+    if a_limbs.is_empty() {
+        return NatLit::from_u64(0);
+    }
+    let shift = match b.to_u64() {
+        Some(s) => s as usize,
+        None => return NatLit::from_u64(0),
+    };
+    let limb_shift = shift / 64;
+    let bit_shift = shift % 64;
+    if limb_shift >= a_limbs.len() {
+        return NatLit::from_u64(0);
+    }
+    let slice = &a_limbs[limb_shift..];
+    if bit_shift == 0 {
+        return NatLit::from_limbs_le(slice.to_vec());
+    }
+    let mut out = Vec::with_capacity(slice.len());
+    for i in 0..slice.len() {
+        let cur = slice[i] >> bit_shift;
+        let high = slice.get(i + 1).map_or(0, |&next| next << (64 - bit_shift));
+        out.push(cur | high);
+    }
+    NatLit::from_limbs_le(out)
+}
+
+pub fn evaluate_nat_operation(
+    op: NatOperationV1,
+    a: &NatLit,
+    b: &NatLit,
+) -> Option<NatHintResultV1> {
+    const MAX_LIMBS: usize = 4096;
+    match op {
+        NatOperationV1::Add => Some(NatHintResultV1::Nat(nat_add(a, b))),
+        NatOperationV1::Sub => Some(NatHintResultV1::Nat(nat_sub(a, b))),
+        NatOperationV1::Mul => Some(NatHintResultV1::Nat(nat_mul(a, b))),
+        NatOperationV1::Div => Some(NatHintResultV1::Nat(nat_div_rem(a, b).0)),
+        NatOperationV1::Mod => Some(NatHintResultV1::Nat(nat_div_rem(a, b).1)),
+        NatOperationV1::Pow => nat_pow(a, b, MAX_LIMBS).map(NatHintResultV1::Nat),
+        NatOperationV1::Gcd => Some(NatHintResultV1::Nat(nat_gcd(a.clone(), b.clone()))),
+        NatOperationV1::Equal => Some(NatHintResultV1::Bool(a == b)),
+        NatOperationV1::LessEqual => Some(NatHintResultV1::Bool(a <= b)),
+        NatOperationV1::LessThan => Some(NatHintResultV1::Bool(a < b)),
+        NatOperationV1::BitAnd => Some(NatHintResultV1::Nat(nat_land(a, b))),
+        NatOperationV1::BitOr => Some(NatHintResultV1::Nat(nat_lor(a, b))),
+        NatOperationV1::BitXor => Some(NatHintResultV1::Nat(nat_lxor(a, b))),
+        NatOperationV1::ShiftLeft => nat_shift_left(a, b, MAX_LIMBS).map(NatHintResultV1::Nat),
+        NatOperationV1::ShiftRight => Some(NatHintResultV1::Nat(nat_shift_right(a, b))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Governed Recomputation Fallback Framework
+// ---------------------------------------------------------------------------
+
+/// Policy governing whether and how recomputation fallback is attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPolicy {
+    /// Recomputation is strictly forbidden (air-gapped receipt-only verifier).
+    StrictCertificateOnly,
+    /// If fast-path verification is refused, attempt governed recomputation with the budget.
+    RecomputeIfRefused { recomputation_budget: u64 },
+    /// Run both verifier and recomputation engine, ensuring both agree (paranoid consensus).
+    ConsensusCrossCheck { recomputation_budget: u64 },
+}
+
+/// Final outcome of governed verification with recomputation fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernedVerificationOutcome<R, E> {
+    /// Fast-path certificate verification succeeded.
+    VerifiedFastPath {
+        certificate_digest: Digest,
+        declaration_name: Option<Name>,
+        judgment: CertificateJudgmentV1,
+        steps_consumed: u64,
+    },
+    /// Fast-path was refused, and recomputation succeeded with a verdict.
+    RecomputedFallback {
+        previous_refusal: CertificateVerificationRefusal,
+        verdict: R,
+        recomputation_steps_consumed: u64,
+    },
+    /// Fast-path verified and recomputation agreed (for ConsensusCrossCheck).
+    ConsensusVerified {
+        certificate_digest: Digest,
+        verdict: R,
+        total_steps_consumed: u64,
+    },
+    /// Recomputation was attempted but failed/refused.
+    RecomputationFailed {
+        certificate_refusal: CertificateVerificationRefusal,
+        recomputation_error: E,
+    },
+    /// Fast-path was refused and no recomputation was permitted by policy.
+    RefusedNoFallback {
+        refusal: CertificateVerificationRefusal,
+    },
+    /// Consensus cross-check divergence (fast path and recomputation gave conflicting results).
+    ConsensusDivergence {
+        certificate_digest: Digest,
+        certificate_claimed: ClaimedResultV1,
+        recomputation_error: E,
+    },
+}
+
+/// Governed verification runner that integrates fast-path verifier and recomputation engine.
+pub struct GovernedRecomputeVerifier;
+
+impl GovernedRecomputeVerifier {
+    /// Run governed certificate verification with recomputation fallback under FL-INV-07 laws.
+    pub fn verify_and_govern<R, E, F>(
+        certificate_bytes: &[u8],
+        context: &VerifierContext,
+        verifier_budget: &mut VerifierBudget,
+        fallback_policy: FallbackPolicy,
+        recompute_fn: F,
+    ) -> Outcome<GovernedVerificationOutcome<R, E>>
+    where
+        F: FnOnce(&Option<Name>, u64) -> Outcome<Result<R, E>>,
+        R: PartialEq + Eq,
+    {
+        if verifier_budget.is_cancelled() {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                "governed verification cancelled",
+            ));
+        }
+
+        let fast_path =
+            CertificateVerifier::verify_bytes(certificate_bytes, context, verifier_budget);
+        match fast_path {
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            Outcome::Complete(FastPathVerificationDecision::Verified {
+                certificate_digest,
+                declaration_name,
+                judgment,
+                claimed_result,
+                steps_consumed,
+            }) => match fallback_policy {
+                FallbackPolicy::StrictCertificateOnly
+                | FallbackPolicy::RecomputeIfRefused { .. } => {
+                    Outcome::Complete(GovernedVerificationOutcome::VerifiedFastPath {
+                        certificate_digest,
+                        declaration_name,
+                        judgment,
+                        steps_consumed,
+                    })
+                }
+                FallbackPolicy::ConsensusCrossCheck {
+                    recomputation_budget,
+                } => {
+                    let recompute_outcome = recompute_fn(&declaration_name, recomputation_budget);
+                    match recompute_outcome {
+                        Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                        Outcome::Complete(Ok(verdict)) => {
+                            Outcome::Complete(GovernedVerificationOutcome::ConsensusVerified {
+                                certificate_digest,
+                                verdict,
+                                total_steps_consumed: steps_consumed
+                                    .saturating_add(recomputation_budget),
+                            })
+                        }
+                        Outcome::Complete(Err(recomputation_error)) => {
+                            Outcome::Complete(GovernedVerificationOutcome::ConsensusDivergence {
+                                certificate_digest,
+                                certificate_claimed: claimed_result,
+                                recomputation_error,
+                            })
+                        }
+                    }
+                }
+            },
+            Outcome::Complete(FastPathVerificationDecision::Refused(refusal)) => {
+                match fallback_policy {
+                    FallbackPolicy::StrictCertificateOnly => {
+                        Outcome::Complete(GovernedVerificationOutcome::RefusedNoFallback {
+                            refusal,
+                        })
+                    }
+                    FallbackPolicy::RecomputeIfRefused {
+                        recomputation_budget,
+                    }
+                    | FallbackPolicy::ConsensusCrossCheck {
+                        recomputation_budget,
+                    } => {
+                        let recompute_outcome = recompute_fn(&None, recomputation_budget);
+                        match recompute_outcome {
+                            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                            Outcome::Complete(Ok(verdict)) => {
+                                Outcome::Complete(GovernedVerificationOutcome::RecomputedFallback {
+                                    previous_refusal: refusal,
+                                    verdict,
+                                    recomputation_steps_consumed: recomputation_budget,
+                                })
+                            }
+                            Outcome::Complete(Err(recomputation_error)) => Outcome::Complete(
+                                GovernedVerificationOutcome::RecomputationFailed {
+                                    certificate_refusal: refusal,
+                                    recomputation_error,
+                                },
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 }
