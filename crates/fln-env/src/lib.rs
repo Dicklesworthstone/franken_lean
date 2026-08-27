@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attribute;
+pub mod combined_state;
 pub mod constants;
 pub mod decl_closure;
 pub mod effective_imports;

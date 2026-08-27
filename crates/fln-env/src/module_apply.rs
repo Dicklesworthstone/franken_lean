@@ -60,9 +60,14 @@ fn cancelled_before_module_publication<T>() -> Outcome<T> {
 /// records and extension entry identities, while the ordered declaration-content
 /// digests bind the Arc-backed values that the manifest intentionally does not copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ModuleApplyTransactionId(Digest);
+pub struct ModuleApplyTransactionId(pub Digest);
 
 impl ModuleApplyTransactionId {
+    /// Create a transaction ID from a raw digest.
+    pub const fn from_digest(digest: Digest) -> Self {
+        Self(digest)
+    }
+
     fn derive(manifest_root: ModuleProvenanceRoot, declaration_identities: &[Digest]) -> Self {
         let mut bytes = Vec::with_capacity(
             b"fln.env.module-apply.transaction/1"
@@ -387,6 +392,31 @@ impl AppliedExtensionRangeWitness {
 }
 
 impl ModuleApplyState {
+    /// Create an empty module apply state for a given epoch.
+    pub fn from_epoch(epoch: crate::modules::ModuleEpoch) -> Result<Self, ModuleApplyStateError> {
+        let manifest = ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![],
+            crate::provenance::ModuleProvenanceLimits::default(),
+        )
+        .map_err(ModuleApplyStateError::ManifestInconsistent)?;
+        let graph = match crate::modules::ModuleGraph::new(
+            epoch.clone(),
+            crate::modules::ModuleGraphLimits::default(),
+        )
+        .into_status()
+        {
+            Outcome::Complete(Ok(g)) => g,
+            _ => {
+                return Err(ModuleApplyStateError::GraphEpoch {
+                    graph: epoch.clone(),
+                    manifest: epoch,
+                });
+            }
+        };
+        Self::from_parts(Environment::new(), graph, Arc::new(manifest))
+    }
+
     /// Join already-published immutable components only after checking their shared
     /// provenance truth.  `indexes` are never accepted as an argument: accepting them
     /// would permit an application caller to pair a valid manifest with stale indexes.
@@ -1411,6 +1441,32 @@ pub struct ModuleApplyReceipt {
 }
 
 impl ModuleApplyReceipt {
+    /// Construct a module apply receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        schema: u16,
+        module: ModuleId,
+        contribution: ModuleContributionRecord,
+        grade: ModuleApplyGrade,
+        transaction_id: ModuleApplyTransactionId,
+        base_logical_root: LogicalRoot,
+        result_logical_root: LogicalRoot,
+        base_provenance_root: ModuleProvenanceRoot,
+        result_provenance_root: ModuleProvenanceRoot,
+    ) -> Self {
+        Self {
+            schema,
+            module,
+            contribution,
+            grade,
+            transaction_id,
+            base_logical_root,
+            result_logical_root,
+            base_provenance_root,
+            result_provenance_root,
+        }
+    }
+
     pub const fn schema(&self) -> u16 {
         self.schema
     }
@@ -1743,6 +1799,22 @@ pub struct PreparedModuleApply {
 }
 
 impl PreparedModuleApply {
+    /// Create a prepared module application plan.
+    pub fn new(
+        base: &ModuleApplyState,
+        candidate: ModuleApplyState,
+        receipt: Box<ModuleApplyReceipt>,
+    ) -> Self {
+        Self {
+            schema: MODULE_APPLY_SCHEMA_VERSION,
+            base_environment: base.environment().clone(),
+            base_graph: base.graph().clone(),
+            base_manifest: Arc::clone(&base.manifest),
+            candidate,
+            receipt,
+        }
+    }
+
     /// Prepared candidates are never cache entries or authoritative state.
     pub const fn is_cacheable(&self) -> bool {
         false

@@ -98,7 +98,7 @@ pub enum DuplicateLaw {
 }
 
 /// The census's handler-class lattice (the boundary the W6 handoff consumes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HandlerClass {
     /// Provably pure state: dispatch serves data.
     DataOnly,
@@ -134,8 +134,8 @@ impl HandlerClass {
     }
 }
 
-/// One census row, parsed into the definition substrate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An attribute definition parsed from the census.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttributeDefinition {
     pub row_id: String,
     pub name: Name,
@@ -146,7 +146,7 @@ pub struct AttributeDefinition {
 }
 
 /// The payload of one assignment, lossless (opaque payloads byte-exact).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Payload {
     /// Tag/label families: presence is the payload.
     Unit,
@@ -170,7 +170,7 @@ pub enum AttributeKind {
 
 /// One assignment: an attribute applied to a declaration, with its
 /// provenance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Assignment {
     pub attribute: Name,
     pub target: Name,
@@ -261,7 +261,7 @@ impl PKey for AttrTarget {
 /// The immutable attribute state: definitions and assignments behind
 /// persistent maps. `Clone` is O(1) — the PMap roots are `Arc` pointers, and
 /// every update rebuilds exactly the affected path.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AttributeState {
     definitions: PMap<Name, AttributeDefinition>,
     assignments: PMap<AttrTarget, Assignment>,
@@ -511,6 +511,27 @@ impl AttributeState {
     /// bead's sharing instrumentation).
     pub fn shares_structure_with(&self, other: &Self) -> bool {
         self.definitions.is_same_structure(&other.definitions)
+    }
+
+    /// Direct borrow of the definitions map.
+    pub fn definitions(&self) -> &PMap<Name, AttributeDefinition> {
+        &self.definitions
+    }
+
+    /// Direct borrow of the assignments map.
+    pub fn assignments(&self) -> &PMap<AttrTarget, Assignment> {
+        &self.assignments
+    }
+
+    /// All assignments in canonical (attribute, target) order.
+    pub fn all_assignments(&self) -> Vec<&Assignment> {
+        let mut entries: Vec<&Assignment> = self.assignments.iter().map(|(_, a)| a).collect();
+        entries.sort_by(|a, b| {
+            a.attribute
+                .cmp(&b.attribute)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        entries
     }
 }
 
@@ -872,7 +893,7 @@ impl AttributeState {
 /// a plan is inert until it is revalidated against the CURRENT base — a
 /// stale plan (the base moved since the plan was cut) is a typed refusal,
 /// never a quiet merge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttributeStatePlan {
     base_digest: String,
     assignments: Vec<Assignment>,
@@ -916,6 +937,26 @@ impl AttributeStatePlan {
             base_digest: base.state_digest(),
             assignments,
         }
+    }
+
+    /// The base digest this plan was cut against.
+    pub fn base_digest(&self) -> &str {
+        &self.base_digest
+    }
+
+    /// The planned assignments.
+    pub fn assignments(&self) -> &[Assignment] {
+        &self.assignments
+    }
+
+    /// Number of planned assignments.
+    pub fn len(&self) -> usize {
+        self.assignments.len()
+    }
+
+    /// Whether this plan has zero planned assignments.
+    pub fn is_empty(&self) -> bool {
+        self.assignments.is_empty()
     }
 
     /// Publish: revalidate the plan against the CURRENT base (digest equality
