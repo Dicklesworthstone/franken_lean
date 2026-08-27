@@ -585,6 +585,96 @@ enum IntrinsicImplementation {
     UInt8ToUInt32,
     UInt8ToUInt64,
     UInt8ToUSize,
+    UInt16Add,
+    UInt16Sub,
+    UInt16Mul,
+    UInt16Div,
+    UInt16Mod,
+    UInt16Land,
+    UInt16Lor,
+    UInt16Xor,
+    UInt16ShiftLeft,
+    UInt16ShiftRight,
+    UInt16Complement,
+    UInt16Neg,
+    UInt16Log2,
+    UInt16DecEq,
+    UInt16DecLe,
+    UInt16DecLt,
+    UInt16OfNat,
+    UInt16ToNat,
+    UInt16ToUInt8,
+    UInt16ToUInt32,
+    UInt16ToUInt64,
+    UInt16ToUSize,
+    UInt32Add,
+    UInt32Sub,
+    UInt32Mul,
+    UInt32Div,
+    UInt32Mod,
+    UInt32Land,
+    UInt32Lor,
+    UInt32Xor,
+    UInt32ShiftLeft,
+    UInt32ShiftRight,
+    UInt32Complement,
+    UInt32Neg,
+    UInt32Log2,
+    UInt32DecEq,
+    UInt32DecLe,
+    UInt32DecLt,
+    UInt32OfNat,
+    UInt32ToNat,
+    UInt32ToUInt8,
+    UInt32ToUInt16,
+    UInt32ToUInt64,
+    UInt32ToUSize,
+    UInt64Add,
+    UInt64Sub,
+    UInt64Mul,
+    UInt64Div,
+    UInt64Mod,
+    UInt64Land,
+    UInt64Lor,
+    UInt64Xor,
+    UInt64ShiftLeft,
+    UInt64ShiftRight,
+    UInt64Complement,
+    UInt64Neg,
+    UInt64Log2,
+    UInt64DecEq,
+    UInt64DecLe,
+    UInt64DecLt,
+    UInt64OfNat,
+    UInt64ToNat,
+    UInt64ToUInt8,
+    UInt64ToUInt16,
+    UInt64ToUInt32,
+    UInt64ToUSize,
+    UInt64MixHash,
+    USizeAdd,
+    USizeSub,
+    USizeMul,
+    USizeDiv,
+    USizeMod,
+    USizeLand,
+    USizeLor,
+    USizeXor,
+    USizeShiftLeft,
+    USizeShiftRight,
+    USizeComplement,
+    USizeNeg,
+    USizeLog2,
+    USizeDecEq,
+    USizeDecLe,
+    USizeDecLt,
+    USizeOfNat,
+    USizeToNat,
+    USizeToUInt8,
+    USizeToUInt16,
+    USizeToUInt32,
+    USizeToUInt64,
+    USizeRepr,
     Int8Add,
     Int8Sub,
     Int8Mul,
@@ -604,6 +694,82 @@ enum IntrinsicImplementation {
     Int8OfNat,
     Int8ToInt,
     Int8ToWidth,
+    Int16Add,
+    Int16Sub,
+    Int16Mul,
+    Int16Div,
+    Int16Mod,
+    Int16Land,
+    Int16Lor,
+    Int16Xor,
+    Int16ShiftLeft,
+    Int16ShiftRight,
+    Int16Complement,
+    Int16Neg,
+    Int16Abs,
+    Int16DecEq,
+    Int16DecLe,
+    Int16DecLt,
+    Int16OfNat,
+    Int16ToInt,
+    Int16ToWidth,
+    Int32Add,
+    Int32Sub,
+    Int32Mul,
+    Int32Div,
+    Int32Mod,
+    Int32Land,
+    Int32Lor,
+    Int32Xor,
+    Int32ShiftLeft,
+    Int32ShiftRight,
+    Int32Complement,
+    Int32Neg,
+    Int32Abs,
+    Int32DecEq,
+    Int32DecLe,
+    Int32DecLt,
+    Int32OfNat,
+    Int32ToInt,
+    Int32ToWidth,
+    Int64Add,
+    Int64Sub,
+    Int64Mul,
+    Int64Div,
+    Int64Mod,
+    Int64Land,
+    Int64Lor,
+    Int64Xor,
+    Int64ShiftLeft,
+    Int64ShiftRight,
+    Int64Complement,
+    Int64Neg,
+    Int64Abs,
+    Int64DecEq,
+    Int64DecLe,
+    Int64DecLt,
+    Int64OfNat,
+    Int64ToInt,
+    Int64ToWidth,
+    ISizeAdd,
+    ISizeSub,
+    ISizeMul,
+    ISizeDiv,
+    ISizeMod,
+    ISizeLand,
+    ISizeLor,
+    ISizeXor,
+    ISizeShiftLeft,
+    ISizeShiftRight,
+    ISizeComplement,
+    ISizeNeg,
+    ISizeAbs,
+    ISizeDecEq,
+    ISizeDecLe,
+    ISizeDecLt,
+    ISizeOfNat,
+    ISizeToInt,
+    ISizeToWidth,
     StringAppend,
     StringAtEnd,
     StringCompare,
@@ -738,6 +904,105 @@ impl IntrinsicImplementation {
             "extern:UInt8.toUInt32" => Self::UInt8ToUInt32,
             "extern:UInt8.toUInt64" => Self::UInt8ToUInt64,
             "extern:UInt8.toUSize" => Self::UInt8ToUSize,
+            "extern:UInt16.add" => Self::UInt16Add,
+            "extern:UInt16.sub" => Self::UInt16Sub,
+            "extern:UInt16.mul" => Self::UInt16Mul,
+            "extern:UInt16.div" => Self::UInt16Div,
+            "extern:UInt16.mod" => Self::UInt16Mod,
+            "extern:UInt16.land" => Self::UInt16Land,
+            "extern:UInt16.lor" => Self::UInt16Lor,
+            "extern:UInt16.xor" => Self::UInt16Xor,
+            "extern:UInt16.shiftLeft" => Self::UInt16ShiftLeft,
+            "extern:UInt16.shiftRight" => Self::UInt16ShiftRight,
+            "extern:UInt16.complement" => Self::UInt16Complement,
+            "extern:UInt16.neg" => Self::UInt16Neg,
+            "extern:UInt16.log2" => Self::UInt16Log2,
+            "extern:UInt16.decEq" => Self::UInt16DecEq,
+            "extern:UInt16.decLe" => Self::UInt16DecLe,
+            "extern:UInt16.decLt" => Self::UInt16DecLt,
+            "extern:UInt16.ofNat" | "extern:UInt16.ofNatLT" | "extern:UInt16.ofBitVec" => {
+                Self::UInt16OfNat
+            }
+            "extern:UInt16.toNat" | "extern:UInt16.toBitVec" => Self::UInt16ToNat,
+            "extern:UInt16.toUInt8" => Self::UInt16ToUInt8,
+            "extern:UInt16.toUInt32" => Self::UInt16ToUInt32,
+            "extern:UInt16.toUInt64" => Self::UInt16ToUInt64,
+            "extern:UInt16.toUSize" => Self::UInt16ToUSize,
+            "extern:UInt32.add" => Self::UInt32Add,
+            "extern:UInt32.sub" => Self::UInt32Sub,
+            "extern:UInt32.mul" => Self::UInt32Mul,
+            "extern:UInt32.div" => Self::UInt32Div,
+            "extern:UInt32.mod" => Self::UInt32Mod,
+            "extern:UInt32.land" => Self::UInt32Land,
+            "extern:UInt32.lor" => Self::UInt32Lor,
+            "extern:UInt32.xor" => Self::UInt32Xor,
+            "extern:UInt32.shiftLeft" => Self::UInt32ShiftLeft,
+            "extern:UInt32.shiftRight" => Self::UInt32ShiftRight,
+            "extern:UInt32.complement" => Self::UInt32Complement,
+            "extern:UInt32.neg" => Self::UInt32Neg,
+            "extern:UInt32.log2" => Self::UInt32Log2,
+            "extern:UInt32.decEq" => Self::UInt32DecEq,
+            "extern:UInt32.decLe" => Self::UInt32DecLe,
+            "extern:UInt32.decLt" => Self::UInt32DecLt,
+            "extern:UInt32.ofNat" | "extern:UInt32.ofNatLT" | "extern:UInt32.ofBitVec" => {
+                Self::UInt32OfNat
+            }
+            "extern:UInt32.toNat" | "extern:UInt32.toBitVec" => Self::UInt32ToNat,
+            "extern:UInt32.toUInt8" => Self::UInt32ToUInt8,
+            "extern:UInt32.toUInt16" => Self::UInt32ToUInt16,
+            "extern:UInt32.toUInt64" => Self::UInt32ToUInt64,
+            "extern:UInt32.toUSize" => Self::UInt32ToUSize,
+            "extern:UInt64.add" => Self::UInt64Add,
+            "extern:UInt64.sub" => Self::UInt64Sub,
+            "extern:UInt64.mul" => Self::UInt64Mul,
+            "extern:UInt64.div" => Self::UInt64Div,
+            "extern:UInt64.mod" => Self::UInt64Mod,
+            "extern:UInt64.land" => Self::UInt64Land,
+            "extern:UInt64.lor" => Self::UInt64Lor,
+            "extern:UInt64.xor" => Self::UInt64Xor,
+            "extern:UInt64.shiftLeft" => Self::UInt64ShiftLeft,
+            "extern:UInt64.shiftRight" => Self::UInt64ShiftRight,
+            "extern:UInt64.complement" => Self::UInt64Complement,
+            "extern:UInt64.neg" => Self::UInt64Neg,
+            "extern:UInt64.log2" => Self::UInt64Log2,
+            "extern:UInt64.decEq" => Self::UInt64DecEq,
+            "extern:UInt64.decLe" => Self::UInt64DecLe,
+            "extern:UInt64.decLt" => Self::UInt64DecLt,
+            "extern:UInt64.ofNat" | "extern:UInt64.ofNatLT" | "extern:UInt64.ofBitVec" => {
+                Self::UInt64OfNat
+            }
+            "extern:UInt64.toNat" | "extern:UInt64.toBitVec" => Self::UInt64ToNat,
+            "extern:UInt64.toUInt8" => Self::UInt64ToUInt8,
+            "extern:UInt64.toUInt16" => Self::UInt64ToUInt16,
+            "extern:UInt64.toUInt32" => Self::UInt64ToUInt32,
+            "extern:UInt64.toUSize" => Self::UInt64ToUSize,
+            "extern:mixHash" | "extern:UInt64.mixHash" => Self::UInt64MixHash,
+            "extern:USize.add" => Self::USizeAdd,
+            "extern:USize.sub" => Self::USizeSub,
+            "extern:USize.mul" => Self::USizeMul,
+            "extern:USize.div" => Self::USizeDiv,
+            "extern:USize.mod" => Self::USizeMod,
+            "extern:USize.land" => Self::USizeLand,
+            "extern:USize.lor" => Self::USizeLor,
+            "extern:USize.xor" => Self::USizeXor,
+            "extern:USize.shiftLeft" => Self::USizeShiftLeft,
+            "extern:USize.shiftRight" => Self::USizeShiftRight,
+            "extern:USize.complement" => Self::USizeComplement,
+            "extern:USize.neg" => Self::USizeNeg,
+            "extern:USize.log2" => Self::USizeLog2,
+            "extern:USize.decEq" => Self::USizeDecEq,
+            "extern:USize.decLe" => Self::USizeDecLe,
+            "extern:USize.decLt" => Self::USizeDecLt,
+            "extern:USize.ofNat"
+            | "extern:USize.ofNatLT"
+            | "extern:USize.ofNat32"
+            | "extern:USize.ofBitVec" => Self::USizeOfNat,
+            "extern:USize.toNat" | "extern:USize.toBitVec" => Self::USizeToNat,
+            "extern:USize.toUInt8" => Self::USizeToUInt8,
+            "extern:USize.toUInt16" => Self::USizeToUInt16,
+            "extern:USize.toUInt32" => Self::USizeToUInt32,
+            "extern:USize.toUInt64" => Self::USizeToUInt64,
+            "extern:USize.repr" => Self::USizeRepr,
             "extern:Int8.add" => Self::Int8Add,
             "extern:Int8.sub" => Self::Int8Sub,
             "extern:Int8.mul" => Self::Int8Mul,
@@ -760,6 +1025,94 @@ impl IntrinsicImplementation {
             | "extern:Int8.toInt32"
             | "extern:Int8.toInt64"
             | "extern:Int8.toISize" => Self::Int8ToWidth,
+            "extern:Int16.add" => Self::Int16Add,
+            "extern:Int16.sub" => Self::Int16Sub,
+            "extern:Int16.mul" => Self::Int16Mul,
+            "extern:Int16.div" => Self::Int16Div,
+            "extern:Int16.mod" => Self::Int16Mod,
+            "extern:Int16.land" => Self::Int16Land,
+            "extern:Int16.lor" => Self::Int16Lor,
+            "extern:Int16.xor" => Self::Int16Xor,
+            "extern:Int16.shiftLeft" => Self::Int16ShiftLeft,
+            "extern:Int16.shiftRight" => Self::Int16ShiftRight,
+            "extern:Int16.complement" => Self::Int16Complement,
+            "extern:Int16.neg" => Self::Int16Neg,
+            "extern:Int16.abs" => Self::Int16Abs,
+            "extern:Int16.decEq" => Self::Int16DecEq,
+            "extern:Int16.decLe" => Self::Int16DecLe,
+            "extern:Int16.decLt" => Self::Int16DecLt,
+            "extern:Int16.ofNat" | "extern:Int16.ofInt" => Self::Int16OfNat,
+            "extern:Int16.toInt" => Self::Int16ToInt,
+            "extern:Int16.toInt8"
+            | "extern:Int16.toInt32"
+            | "extern:Int16.toInt64"
+            | "extern:Int16.toISize" => Self::Int16ToWidth,
+            "extern:Int32.add" => Self::Int32Add,
+            "extern:Int32.sub" => Self::Int32Sub,
+            "extern:Int32.mul" => Self::Int32Mul,
+            "extern:Int32.div" => Self::Int32Div,
+            "extern:Int32.mod" => Self::Int32Mod,
+            "extern:Int32.land" => Self::Int32Land,
+            "extern:Int32.lor" => Self::Int32Lor,
+            "extern:Int32.xor" => Self::Int32Xor,
+            "extern:Int32.shiftLeft" => Self::Int32ShiftLeft,
+            "extern:Int32.shiftRight" => Self::Int32ShiftRight,
+            "extern:Int32.complement" => Self::Int32Complement,
+            "extern:Int32.neg" => Self::Int32Neg,
+            "extern:Int32.abs" => Self::Int32Abs,
+            "extern:Int32.decEq" => Self::Int32DecEq,
+            "extern:Int32.decLe" => Self::Int32DecLe,
+            "extern:Int32.decLt" => Self::Int32DecLt,
+            "extern:Int32.ofNat" | "extern:Int32.ofInt" => Self::Int32OfNat,
+            "extern:Int32.toInt" => Self::Int32ToInt,
+            "extern:Int32.toInt8"
+            | "extern:Int32.toInt16"
+            | "extern:Int32.toInt64"
+            | "extern:Int32.toISize" => Self::Int32ToWidth,
+            "extern:Int64.add" => Self::Int64Add,
+            "extern:Int64.sub" => Self::Int64Sub,
+            "extern:Int64.mul" => Self::Int64Mul,
+            "extern:Int64.div" => Self::Int64Div,
+            "extern:Int64.mod" => Self::Int64Mod,
+            "extern:Int64.land" => Self::Int64Land,
+            "extern:Int64.lor" => Self::Int64Lor,
+            "extern:Int64.xor" => Self::Int64Xor,
+            "extern:Int64.shiftLeft" => Self::Int64ShiftLeft,
+            "extern:Int64.shiftRight" => Self::Int64ShiftRight,
+            "extern:Int64.complement" => Self::Int64Complement,
+            "extern:Int64.neg" => Self::Int64Neg,
+            "extern:Int64.abs" => Self::Int64Abs,
+            "extern:Int64.decEq" => Self::Int64DecEq,
+            "extern:Int64.decLe" => Self::Int64DecLe,
+            "extern:Int64.decLt" => Self::Int64DecLt,
+            "extern:Int64.ofNat" | "extern:Int64.ofInt" => Self::Int64OfNat,
+            "extern:Int64.toInt" => Self::Int64ToInt,
+            "extern:Int64.toInt8"
+            | "extern:Int64.toInt16"
+            | "extern:Int64.toInt32"
+            | "extern:Int64.toISize" => Self::Int64ToWidth,
+            "extern:ISize.add" => Self::ISizeAdd,
+            "extern:ISize.sub" => Self::ISizeSub,
+            "extern:ISize.mul" => Self::ISizeMul,
+            "extern:ISize.div" => Self::ISizeDiv,
+            "extern:ISize.mod" => Self::ISizeMod,
+            "extern:ISize.land" => Self::ISizeLand,
+            "extern:ISize.lor" => Self::ISizeLor,
+            "extern:ISize.xor" => Self::ISizeXor,
+            "extern:ISize.shiftLeft" => Self::ISizeShiftLeft,
+            "extern:ISize.shiftRight" => Self::ISizeShiftRight,
+            "extern:ISize.complement" => Self::ISizeComplement,
+            "extern:ISize.neg" => Self::ISizeNeg,
+            "extern:ISize.abs" => Self::ISizeAbs,
+            "extern:ISize.decEq" => Self::ISizeDecEq,
+            "extern:ISize.decLe" => Self::ISizeDecLe,
+            "extern:ISize.decLt" => Self::ISizeDecLt,
+            "extern:ISize.ofNat" | "extern:ISize.ofInt" => Self::ISizeOfNat,
+            "extern:ISize.toInt" => Self::ISizeToInt,
+            "extern:ISize.toInt8"
+            | "extern:ISize.toInt16"
+            | "extern:ISize.toInt32"
+            | "extern:ISize.toInt64" => Self::ISizeToWidth,
             "extern:String.Internal.append" => Self::StringAppend,
             "extern:String.Internal.atEnd" => Self::StringAtEnd,
             "extern:String.Internal.length" => Self::StringLength,
@@ -3804,6 +4157,576 @@ fn invoke_intrinsic(
             let value = byte_argument(&args[0], operation, 0)?;
             Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(value))))
         }
+        IntrinsicImplementation::UInt16Add
+        | IntrinsicImplementation::UInt16Sub
+        | IntrinsicImplementation::UInt16Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt16Add => "UInt16.add",
+                IntrinsicImplementation::UInt16Sub => "UInt16.sub",
+                _ => "UInt16.mul",
+            };
+            let left = uint16_argument(&args[0], operation, 0)?;
+            let right = uint16_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt16Add => left.wrapping_add(right),
+                IntrinsicImplementation::UInt16Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(uint16_result(value))
+        }
+        IntrinsicImplementation::UInt16Div | IntrinsicImplementation::UInt16Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::UInt16Div;
+            let operation: &'static str = if is_div { "UInt16.div" } else { "UInt16.mod" };
+            let dividend = uint16_argument(&args[0], operation, 0)?;
+            let divisor = uint16_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0 } else { dividend }
+            } else if is_div {
+                dividend / divisor
+            } else {
+                dividend % divisor
+            };
+            Ok(uint16_result(value))
+        }
+        IntrinsicImplementation::UInt16Land
+        | IntrinsicImplementation::UInt16Lor
+        | IntrinsicImplementation::UInt16Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt16Land => "UInt16.land",
+                IntrinsicImplementation::UInt16Lor => "UInt16.lor",
+                _ => "UInt16.xor",
+            };
+            let left = uint16_argument(&args[0], operation, 0)?;
+            let right = uint16_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt16Land => left & right,
+                IntrinsicImplementation::UInt16Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(uint16_result(value))
+        }
+        IntrinsicImplementation::UInt16ShiftLeft | IntrinsicImplementation::UInt16ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::UInt16ShiftLeft;
+            let operation: &'static str = if is_left {
+                "UInt16.shiftLeft"
+            } else {
+                "UInt16.shiftRight"
+            };
+            let value = uint16_argument(&args[0], operation, 0)?;
+            let amount = uint16_argument(&args[1], operation, 1)?;
+            let amount = u32::from(amount % 16);
+            Ok(uint16_result(if is_left {
+                ((value as u32) << amount) as u16
+            } else {
+                value >> amount
+            }))
+        }
+        IntrinsicImplementation::UInt16Complement | IntrinsicImplementation::UInt16Neg => {
+            expect_arity(row, args, 1)?;
+            let is_complement = implementation == IntrinsicImplementation::UInt16Complement;
+            let operation: &'static str = if is_complement {
+                "UInt16.complement"
+            } else {
+                "UInt16.neg"
+            };
+            let value = uint16_argument(&args[0], operation, 0)?;
+            Ok(uint16_result(if is_complement {
+                !value
+            } else {
+                value.wrapping_neg()
+            }))
+        }
+        IntrinsicImplementation::UInt16Log2 => {
+            expect_arity(row, args, 1)?;
+            let value = uint16_argument(&args[0], "UInt16.log2", 0)?;
+            Ok(uint16_result(if value < 2 {
+                0
+            } else {
+                value.ilog2() as u16
+            }))
+        }
+        IntrinsicImplementation::UInt16DecEq
+        | IntrinsicImplementation::UInt16DecLe
+        | IntrinsicImplementation::UInt16DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt16DecEq => "UInt16.decEq",
+                IntrinsicImplementation::UInt16DecLe => "UInt16.decLe",
+                _ => "UInt16.decLt",
+            };
+            let left = uint16_argument(&args[0], operation, 0)?;
+            let right = uint16_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::UInt16DecEq => left == right,
+                IntrinsicImplementation::UInt16DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::UInt16OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = nat_low_u64(&args[0], "UInt16.ofNat", 0)?;
+            Ok(uint16_result(low as u16))
+        }
+        IntrinsicImplementation::UInt16ToNat => {
+            expect_arity(row, args, 1)?;
+            let value = uint16_argument(&args[0], "UInt16.toNat", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(value))))
+        }
+        IntrinsicImplementation::UInt16ToUInt8
+        | IntrinsicImplementation::UInt16ToUInt32
+        | IntrinsicImplementation::UInt16ToUInt64
+        | IntrinsicImplementation::UInt16ToUSize => {
+            expect_arity(row, args, 1)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt16ToUInt8 => "UInt16.toUInt8",
+                IntrinsicImplementation::UInt16ToUInt32 => "UInt16.toUInt32",
+                IntrinsicImplementation::UInt16ToUInt64 => "UInt16.toUInt64",
+                _ => "UInt16.toUSize",
+            };
+            let value = uint16_argument(&args[0], operation, 0)?;
+            Ok(match implementation {
+                IntrinsicImplementation::UInt16ToUInt8 => uint8_result(value as u8),
+                IntrinsicImplementation::UInt16ToUInt32 => uint32_result(value as u32),
+                IntrinsicImplementation::UInt16ToUInt64 => uint64_result(value as u64),
+                _ => usize_result(value as usize),
+            })
+        }
+        IntrinsicImplementation::UInt32Add
+        | IntrinsicImplementation::UInt32Sub
+        | IntrinsicImplementation::UInt32Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt32Add => "UInt32.add",
+                IntrinsicImplementation::UInt32Sub => "UInt32.sub",
+                _ => "UInt32.mul",
+            };
+            let left = uint32_argument(&args[0], operation, 0)?;
+            let right = uint32_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt32Add => left.wrapping_add(right),
+                IntrinsicImplementation::UInt32Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(uint32_result(value))
+        }
+        IntrinsicImplementation::UInt32Div | IntrinsicImplementation::UInt32Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::UInt32Div;
+            let operation: &'static str = if is_div { "UInt32.div" } else { "UInt32.mod" };
+            let dividend = uint32_argument(&args[0], operation, 0)?;
+            let divisor = uint32_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0 } else { dividend }
+            } else if is_div {
+                dividend / divisor
+            } else {
+                dividend % divisor
+            };
+            Ok(uint32_result(value))
+        }
+        IntrinsicImplementation::UInt32Land
+        | IntrinsicImplementation::UInt32Lor
+        | IntrinsicImplementation::UInt32Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt32Land => "UInt32.land",
+                IntrinsicImplementation::UInt32Lor => "UInt32.lor",
+                _ => "UInt32.xor",
+            };
+            let left = uint32_argument(&args[0], operation, 0)?;
+            let right = uint32_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt32Land => left & right,
+                IntrinsicImplementation::UInt32Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(uint32_result(value))
+        }
+        IntrinsicImplementation::UInt32ShiftLeft | IntrinsicImplementation::UInt32ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::UInt32ShiftLeft;
+            let operation: &'static str = if is_left {
+                "UInt32.shiftLeft"
+            } else {
+                "UInt32.shiftRight"
+            };
+            let value = uint32_argument(&args[0], operation, 0)?;
+            let amount = uint32_argument(&args[1], operation, 1)?;
+            let amount = amount % 32;
+            Ok(uint32_result(if is_left {
+                ((value as u64) << amount) as u32
+            } else {
+                value >> amount
+            }))
+        }
+        IntrinsicImplementation::UInt32Complement | IntrinsicImplementation::UInt32Neg => {
+            expect_arity(row, args, 1)?;
+            let is_complement = implementation == IntrinsicImplementation::UInt32Complement;
+            let operation: &'static str = if is_complement {
+                "UInt32.complement"
+            } else {
+                "UInt32.neg"
+            };
+            let value = uint32_argument(&args[0], operation, 0)?;
+            Ok(uint32_result(if is_complement {
+                !value
+            } else {
+                value.wrapping_neg()
+            }))
+        }
+        IntrinsicImplementation::UInt32Log2 => {
+            expect_arity(row, args, 1)?;
+            let value = uint32_argument(&args[0], "UInt32.log2", 0)?;
+            Ok(uint32_result(if value < 2 { 0 } else { value.ilog2() }))
+        }
+        IntrinsicImplementation::UInt32DecEq
+        | IntrinsicImplementation::UInt32DecLe
+        | IntrinsicImplementation::UInt32DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt32DecEq => "UInt32.decEq",
+                IntrinsicImplementation::UInt32DecLe => "UInt32.decLe",
+                _ => "UInt32.decLt",
+            };
+            let left = uint32_argument(&args[0], operation, 0)?;
+            let right = uint32_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::UInt32DecEq => left == right,
+                IntrinsicImplementation::UInt32DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::UInt32OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = nat_low_u64(&args[0], "UInt32.ofNat", 0)?;
+            Ok(uint32_result(low as u32))
+        }
+        IntrinsicImplementation::UInt32ToNat => {
+            expect_arity(row, args, 1)?;
+            let value = uint32_argument(&args[0], "UInt32.toNat", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(value as usize)))
+        }
+        IntrinsicImplementation::UInt32ToUInt8
+        | IntrinsicImplementation::UInt32ToUInt16
+        | IntrinsicImplementation::UInt32ToUInt64
+        | IntrinsicImplementation::UInt32ToUSize => {
+            expect_arity(row, args, 1)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt32ToUInt8 => "UInt32.toUInt8",
+                IntrinsicImplementation::UInt32ToUInt16 => "UInt32.toUInt16",
+                IntrinsicImplementation::UInt32ToUInt64 => "UInt32.toUInt64",
+                _ => "UInt32.toUSize",
+            };
+            let value = uint32_argument(&args[0], operation, 0)?;
+            Ok(match implementation {
+                IntrinsicImplementation::UInt32ToUInt8 => uint8_result(value as u8),
+                IntrinsicImplementation::UInt32ToUInt16 => uint16_result(value as u16),
+                IntrinsicImplementation::UInt32ToUInt64 => uint64_result(value as u64),
+                _ => usize_result(value as usize),
+            })
+        }
+        IntrinsicImplementation::UInt64Add
+        | IntrinsicImplementation::UInt64Sub
+        | IntrinsicImplementation::UInt64Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt64Add => "UInt64.add",
+                IntrinsicImplementation::UInt64Sub => "UInt64.sub",
+                _ => "UInt64.mul",
+            };
+            let left = uint64_argument(&args[0], operation, 0)?;
+            let right = uint64_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt64Add => left.wrapping_add(right),
+                IntrinsicImplementation::UInt64Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(uint64_result(value))
+        }
+        IntrinsicImplementation::UInt64Div | IntrinsicImplementation::UInt64Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::UInt64Div;
+            let operation: &'static str = if is_div { "UInt64.div" } else { "UInt64.mod" };
+            let dividend = uint64_argument(&args[0], operation, 0)?;
+            let divisor = uint64_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0 } else { dividend }
+            } else if is_div {
+                dividend / divisor
+            } else {
+                dividend % divisor
+            };
+            Ok(uint64_result(value))
+        }
+        IntrinsicImplementation::UInt64Land
+        | IntrinsicImplementation::UInt64Lor
+        | IntrinsicImplementation::UInt64Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt64Land => "UInt64.land",
+                IntrinsicImplementation::UInt64Lor => "UInt64.lor",
+                _ => "UInt64.xor",
+            };
+            let left = uint64_argument(&args[0], operation, 0)?;
+            let right = uint64_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::UInt64Land => left & right,
+                IntrinsicImplementation::UInt64Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(uint64_result(value))
+        }
+        IntrinsicImplementation::UInt64ShiftLeft | IntrinsicImplementation::UInt64ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::UInt64ShiftLeft;
+            let operation: &'static str = if is_left {
+                "UInt64.shiftLeft"
+            } else {
+                "UInt64.shiftRight"
+            };
+            let value = uint64_argument(&args[0], operation, 0)?;
+            let amount = uint64_argument(&args[1], operation, 1)?;
+            let amount = (amount % 64) as u32;
+            Ok(uint64_result(if is_left {
+                value.wrapping_shl(amount)
+            } else {
+                value >> amount
+            }))
+        }
+        IntrinsicImplementation::UInt64Complement | IntrinsicImplementation::UInt64Neg => {
+            expect_arity(row, args, 1)?;
+            let is_complement = implementation == IntrinsicImplementation::UInt64Complement;
+            let operation: &'static str = if is_complement {
+                "UInt64.complement"
+            } else {
+                "UInt64.neg"
+            };
+            let value = uint64_argument(&args[0], operation, 0)?;
+            Ok(uint64_result(if is_complement {
+                !value
+            } else {
+                value.wrapping_neg()
+            }))
+        }
+        IntrinsicImplementation::UInt64Log2 => {
+            expect_arity(row, args, 1)?;
+            let value = uint64_argument(&args[0], "UInt64.log2", 0)?;
+            Ok(uint64_result(if value < 2 {
+                0
+            } else {
+                u64::from(value.ilog2())
+            }))
+        }
+        IntrinsicImplementation::UInt64DecEq
+        | IntrinsicImplementation::UInt64DecLe
+        | IntrinsicImplementation::UInt64DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt64DecEq => "UInt64.decEq",
+                IntrinsicImplementation::UInt64DecLe => "UInt64.decLe",
+                _ => "UInt64.decLt",
+            };
+            let left = uint64_argument(&args[0], operation, 0)?;
+            let right = uint64_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::UInt64DecEq => left == right,
+                IntrinsicImplementation::UInt64DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::UInt64OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = nat_low_u64(&args[0], "UInt64.ofNat", 0)?;
+            Ok(uint64_result(low))
+        }
+        IntrinsicImplementation::UInt64ToNat => {
+            expect_arity(row, args, 1)?;
+            let value = uint64_argument(&args[0], "UInt64.toNat", 0)?;
+            Ok(IntrinsicResult::owned(nat_from_u64(value)))
+        }
+        IntrinsicImplementation::UInt64ToUInt8
+        | IntrinsicImplementation::UInt64ToUInt16
+        | IntrinsicImplementation::UInt64ToUInt32
+        | IntrinsicImplementation::UInt64ToUSize => {
+            expect_arity(row, args, 1)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::UInt64ToUInt8 => "UInt64.toUInt8",
+                IntrinsicImplementation::UInt64ToUInt16 => "UInt64.toUInt16",
+                IntrinsicImplementation::UInt64ToUInt32 => "UInt64.toUInt32",
+                _ => "UInt64.toUSize",
+            };
+            let value = uint64_argument(&args[0], operation, 0)?;
+            Ok(match implementation {
+                IntrinsicImplementation::UInt64ToUInt8 => uint8_result(value as u8),
+                IntrinsicImplementation::UInt64ToUInt16 => uint16_result(value as u16),
+                IntrinsicImplementation::UInt64ToUInt32 => uint32_result(value as u32),
+                _ => usize_result(value as usize),
+            })
+        }
+        IntrinsicImplementation::UInt64MixHash => {
+            expect_arity(row, args, 2)?;
+            let left = uint64_argument(&args[0], "UInt64.mixHash", 0)?;
+            let right = uint64_argument(&args[1], "UInt64.mixHash", 1)?;
+            let m: u64 = 0xc6a4_a793_5bd1_e995;
+            let r: u32 = 47;
+            let mut k = right.wrapping_mul(m);
+            k ^= k >> r;
+            k = k.wrapping_mul(m);
+            let mut h = left ^ k;
+            h = h.wrapping_mul(m);
+            Ok(uint64_result(h))
+        }
+        IntrinsicImplementation::USizeAdd
+        | IntrinsicImplementation::USizeSub
+        | IntrinsicImplementation::USizeMul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::USizeAdd => "USize.add",
+                IntrinsicImplementation::USizeSub => "USize.sub",
+                _ => "USize.mul",
+            };
+            let left = usize_argument(&args[0], operation, 0)?;
+            let right = usize_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::USizeAdd => left.wrapping_add(right),
+                IntrinsicImplementation::USizeSub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(usize_result(value))
+        }
+        IntrinsicImplementation::USizeDiv | IntrinsicImplementation::USizeMod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::USizeDiv;
+            let operation: &'static str = if is_div { "USize.div" } else { "USize.mod" };
+            let dividend = usize_argument(&args[0], operation, 0)?;
+            let divisor = usize_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0 } else { dividend }
+            } else if is_div {
+                dividend / divisor
+            } else {
+                dividend % divisor
+            };
+            Ok(usize_result(value))
+        }
+        IntrinsicImplementation::USizeLand
+        | IntrinsicImplementation::USizeLor
+        | IntrinsicImplementation::USizeXor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::USizeLand => "USize.land",
+                IntrinsicImplementation::USizeLor => "USize.lor",
+                _ => "USize.xor",
+            };
+            let left = usize_argument(&args[0], operation, 0)?;
+            let right = usize_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::USizeLand => left & right,
+                IntrinsicImplementation::USizeLor => left | right,
+                _ => left ^ right,
+            };
+            Ok(usize_result(value))
+        }
+        IntrinsicImplementation::USizeShiftLeft | IntrinsicImplementation::USizeShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::USizeShiftLeft;
+            let operation: &'static str = if is_left {
+                "USize.shiftLeft"
+            } else {
+                "USize.shiftRight"
+            };
+            let value = usize_argument(&args[0], operation, 0)?;
+            let amount = usize_argument(&args[1], operation, 1)?;
+            let amount = (amount % (std::mem::size_of::<usize>() * 8)) as u32;
+            Ok(usize_result(if is_left {
+                value.wrapping_shl(amount)
+            } else {
+                value >> amount
+            }))
+        }
+        IntrinsicImplementation::USizeComplement | IntrinsicImplementation::USizeNeg => {
+            expect_arity(row, args, 1)?;
+            let is_complement = implementation == IntrinsicImplementation::USizeComplement;
+            let operation: &'static str = if is_complement {
+                "USize.complement"
+            } else {
+                "USize.neg"
+            };
+            let value = usize_argument(&args[0], operation, 0)?;
+            Ok(usize_result(if is_complement {
+                !value
+            } else {
+                value.wrapping_neg()
+            }))
+        }
+        IntrinsicImplementation::USizeLog2 => {
+            expect_arity(row, args, 1)?;
+            let value = usize_argument(&args[0], "USize.log2", 0)?;
+            Ok(usize_result(if value < 2 {
+                0
+            } else {
+                value.ilog2() as usize
+            }))
+        }
+        IntrinsicImplementation::USizeDecEq
+        | IntrinsicImplementation::USizeDecLe
+        | IntrinsicImplementation::USizeDecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::USizeDecEq => "USize.decEq",
+                IntrinsicImplementation::USizeDecLe => "USize.decLe",
+                _ => "USize.decLt",
+            };
+            let left = usize_argument(&args[0], operation, 0)?;
+            let right = usize_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::USizeDecEq => left == right,
+                IntrinsicImplementation::USizeDecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::USizeOfNat => {
+            expect_arity(row, args, 1)?;
+            let low = nat_low_u64(&args[0], "USize.ofNat", 0)?;
+            Ok(usize_result(low as usize))
+        }
+        IntrinsicImplementation::USizeToNat => {
+            expect_arity(row, args, 1)?;
+            let value = usize_argument(&args[0], "USize.toNat", 0)?;
+            Ok(IntrinsicResult::owned(nat_from_u64(value as u64)))
+        }
+        IntrinsicImplementation::USizeToUInt8
+        | IntrinsicImplementation::USizeToUInt16
+        | IntrinsicImplementation::USizeToUInt32
+        | IntrinsicImplementation::USizeToUInt64 => {
+            expect_arity(row, args, 1)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::USizeToUInt8 => "USize.toUInt8",
+                IntrinsicImplementation::USizeToUInt16 => "USize.toUInt16",
+                IntrinsicImplementation::USizeToUInt32 => "USize.toUInt32",
+                _ => "USize.toUInt64",
+            };
+            let value = usize_argument(&args[0], operation, 0)?;
+            Ok(match implementation {
+                IntrinsicImplementation::USizeToUInt8 => uint8_result(value as u8),
+                IntrinsicImplementation::USizeToUInt16 => uint16_result(value as u16),
+                IntrinsicImplementation::USizeToUInt32 => uint32_result(value as u32),
+                _ => uint64_result(value as u64),
+            })
+        }
+        IntrinsicImplementation::USizeRepr => {
+            expect_arity(row, args, 1)?;
+            let value = usize_argument(&args[0], "USize.repr", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_string(&value.to_string())))
+        }
         // Int8 rows. Storage stays in the byte plane exactly like the C:
         // add/sub/mul/neg wrap without ever casting to int8 (the comments in
         // lean.h forbid it — overflow there is UB); div/mod widen to int16 so
@@ -3949,6 +4872,531 @@ fn invoke_intrinsic(
             expect_arity(row, args, 1)?;
             let value = int8_argument(&args[0], "Int8.toInt16", 0)?;
             Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+        }
+        IntrinsicImplementation::Int16Add
+        | IntrinsicImplementation::Int16Sub
+        | IntrinsicImplementation::Int16Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int16Add => "Int16.add",
+                IntrinsicImplementation::Int16Sub => "Int16.sub",
+                _ => "Int16.mul",
+            };
+            let left = int16_argument(&args[0], operation, 0)?;
+            let right = int16_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int16Add => left.wrapping_add(right),
+                IntrinsicImplementation::Int16Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(int16_result(value))
+        }
+        IntrinsicImplementation::Int16Div | IntrinsicImplementation::Int16Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::Int16Div;
+            let operation: &'static str = if is_div { "Int16.div" } else { "Int16.mod" };
+            let dividend = int16_argument(&args[0], operation, 0)?;
+            let divisor = int16_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0i16 } else { dividend }
+            } else {
+                let widened = i32::from(dividend) / i32::from(divisor);
+                let remainder = i32::from(dividend) % i32::from(divisor);
+                (if is_div { widened } else { remainder }) as i16
+            };
+            Ok(int16_result(value))
+        }
+        IntrinsicImplementation::Int16Land
+        | IntrinsicImplementation::Int16Lor
+        | IntrinsicImplementation::Int16Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int16Land => "Int16.land",
+                IntrinsicImplementation::Int16Lor => "Int16.lor",
+                _ => "Int16.xor",
+            };
+            let left = int16_argument(&args[0], operation, 0)?;
+            let right = int16_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int16Land => left & right,
+                IntrinsicImplementation::Int16Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(int16_result(value))
+        }
+        IntrinsicImplementation::Int16ShiftLeft | IntrinsicImplementation::Int16ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::Int16ShiftLeft;
+            let operation: &'static str = if is_left {
+                "Int16.shiftLeft"
+            } else {
+                "Int16.shiftRight"
+            };
+            let storage = uint16_argument(&args[0], operation, 0)?;
+            let amount = int16_argument(&args[1], operation, 1)?;
+            let amount = ((i32::from(amount) % 16) + 16) % 16;
+            let value = if is_left {
+                ((u32::from(storage)) << amount) as u16
+            } else {
+                ((storage as i16) >> amount) as u16
+            };
+            Ok(int16_result(value as i16))
+        }
+        IntrinsicImplementation::Int16Complement
+        | IntrinsicImplementation::Int16Neg
+        | IntrinsicImplementation::Int16Abs => {
+            expect_arity(row, args, 1)?;
+            let storage = uint16_argument(
+                &args[0],
+                match implementation {
+                    IntrinsicImplementation::Int16Complement => "Int16.complement",
+                    IntrinsicImplementation::Int16Neg => "Int16.neg",
+                    _ => "Int16.abs",
+                },
+                0,
+            )?;
+            let signed = storage as i16;
+            let value = match implementation {
+                IntrinsicImplementation::Int16Complement => !signed,
+                IntrinsicImplementation::Int16Neg => signed.wrapping_neg(),
+                _ => signed.checked_abs().unwrap_or(signed),
+            };
+            Ok(int16_result(value))
+        }
+        IntrinsicImplementation::Int16DecEq
+        | IntrinsicImplementation::Int16DecLe
+        | IntrinsicImplementation::Int16DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int16DecEq => "Int16.decEq",
+                IntrinsicImplementation::Int16DecLe => "Int16.decLe",
+                _ => "Int16.decLt",
+            };
+            let left = int16_argument(&args[0], operation, 0)?;
+            let right = int16_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::Int16DecEq => left == right,
+                IntrinsicImplementation::Int16DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::Int16OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = with_int_view(&args[0], "Int16.ofNat", 0, |view| {
+                let limbs = view.magnitude.limbs_le();
+                let low_word = limbs.first().copied().unwrap_or(0) as u16;
+                if view.negative {
+                    (!low_word).wrapping_add(1)
+                } else {
+                    low_word
+                }
+            })?;
+            Ok(int16_result(low as i16))
+        }
+        IntrinsicImplementation::Int16ToInt => {
+            expect_arity(row, args, 1)?;
+            let value = int16_argument(&args[0], "Int16.toInt", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_int(i64::from(value))))
+        }
+        IntrinsicImplementation::Int16ToWidth => {
+            expect_arity(row, args, 1)?;
+            let value = int16_argument(&args[0], "Int16.toInt32", 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+        }
+        IntrinsicImplementation::Int32Add
+        | IntrinsicImplementation::Int32Sub
+        | IntrinsicImplementation::Int32Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int32Add => "Int32.add",
+                IntrinsicImplementation::Int32Sub => "Int32.sub",
+                _ => "Int32.mul",
+            };
+            let left = int32_argument(&args[0], operation, 0)?;
+            let right = int32_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int32Add => left.wrapping_add(right),
+                IntrinsicImplementation::Int32Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(int32_result(value))
+        }
+        IntrinsicImplementation::Int32Div | IntrinsicImplementation::Int32Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::Int32Div;
+            let operation: &'static str = if is_div { "Int32.div" } else { "Int32.mod" };
+            let dividend = int32_argument(&args[0], operation, 0)?;
+            let divisor = int32_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0i32 } else { dividend }
+            } else {
+                let widened = i64::from(dividend) / i64::from(divisor);
+                let remainder = i64::from(dividend) % i64::from(divisor);
+                (if is_div { widened } else { remainder }) as i32
+            };
+            Ok(int32_result(value))
+        }
+        IntrinsicImplementation::Int32Land
+        | IntrinsicImplementation::Int32Lor
+        | IntrinsicImplementation::Int32Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int32Land => "Int32.land",
+                IntrinsicImplementation::Int32Lor => "Int32.lor",
+                _ => "Int32.xor",
+            };
+            let left = int32_argument(&args[0], operation, 0)?;
+            let right = int32_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int32Land => left & right,
+                IntrinsicImplementation::Int32Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(int32_result(value))
+        }
+        IntrinsicImplementation::Int32ShiftLeft | IntrinsicImplementation::Int32ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::Int32ShiftLeft;
+            let operation: &'static str = if is_left {
+                "Int32.shiftLeft"
+            } else {
+                "Int32.shiftRight"
+            };
+            let storage = uint32_argument(&args[0], operation, 0)?;
+            let amount = int32_argument(&args[1], operation, 1)?;
+            let amount = ((i64::from(amount) % 32) + 32) % 32;
+            let value = if is_left {
+                ((u64::from(storage)) << amount) as u32
+            } else {
+                ((storage as i32) >> amount) as u32
+            };
+            Ok(int32_result(value as i32))
+        }
+        IntrinsicImplementation::Int32Complement
+        | IntrinsicImplementation::Int32Neg
+        | IntrinsicImplementation::Int32Abs => {
+            expect_arity(row, args, 1)?;
+            let storage = uint32_argument(
+                &args[0],
+                match implementation {
+                    IntrinsicImplementation::Int32Complement => "Int32.complement",
+                    IntrinsicImplementation::Int32Neg => "Int32.neg",
+                    _ => "Int32.abs",
+                },
+                0,
+            )?;
+            let signed = storage as i32;
+            let value = match implementation {
+                IntrinsicImplementation::Int32Complement => !signed,
+                IntrinsicImplementation::Int32Neg => signed.wrapping_neg(),
+                _ => signed.checked_abs().unwrap_or(signed),
+            };
+            Ok(int32_result(value))
+        }
+        IntrinsicImplementation::Int32DecEq
+        | IntrinsicImplementation::Int32DecLe
+        | IntrinsicImplementation::Int32DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int32DecEq => "Int32.decEq",
+                IntrinsicImplementation::Int32DecLe => "Int32.decLe",
+                _ => "Int32.decLt",
+            };
+            let left = int32_argument(&args[0], operation, 0)?;
+            let right = int32_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::Int32DecEq => left == right,
+                IntrinsicImplementation::Int32DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::Int32OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = with_int_view(&args[0], "Int32.ofNat", 0, |view| {
+                let limbs = view.magnitude.limbs_le();
+                let low_word = limbs.first().copied().unwrap_or(0) as u32;
+                if view.negative {
+                    (!low_word).wrapping_add(1)
+                } else {
+                    low_word
+                }
+            })?;
+            Ok(int32_result(low as i32))
+        }
+        IntrinsicImplementation::Int32ToInt => {
+            expect_arity(row, args, 1)?;
+            let value = int32_argument(&args[0], "Int32.toInt", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_int(i64::from(value))))
+        }
+        IntrinsicImplementation::Int32ToWidth => {
+            expect_arity(row, args, 1)?;
+            let value = int32_argument(&args[0], "Int32.toInt64", 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_int(i64::from(value))))
+        }
+        IntrinsicImplementation::Int64Add
+        | IntrinsicImplementation::Int64Sub
+        | IntrinsicImplementation::Int64Mul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int64Add => "Int64.add",
+                IntrinsicImplementation::Int64Sub => "Int64.sub",
+                _ => "Int64.mul",
+            };
+            let left = int64_argument(&args[0], operation, 0)?;
+            let right = int64_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int64Add => left.wrapping_add(right),
+                IntrinsicImplementation::Int64Sub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(int64_result(value))
+        }
+        IntrinsicImplementation::Int64Div | IntrinsicImplementation::Int64Mod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::Int64Div;
+            let operation: &'static str = if is_div { "Int64.div" } else { "Int64.mod" };
+            let dividend = int64_argument(&args[0], operation, 0)?;
+            let divisor = int64_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0i64 } else { dividend }
+            } else {
+                let widened = i128::from(dividend) / i128::from(divisor);
+                let remainder = i128::from(dividend) % i128::from(divisor);
+                (if is_div { widened } else { remainder }) as i64
+            };
+            Ok(int64_result(value))
+        }
+        IntrinsicImplementation::Int64Land
+        | IntrinsicImplementation::Int64Lor
+        | IntrinsicImplementation::Int64Xor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int64Land => "Int64.land",
+                IntrinsicImplementation::Int64Lor => "Int64.lor",
+                _ => "Int64.xor",
+            };
+            let left = int64_argument(&args[0], operation, 0)?;
+            let right = int64_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::Int64Land => left & right,
+                IntrinsicImplementation::Int64Lor => left | right,
+                _ => left ^ right,
+            };
+            Ok(int64_result(value))
+        }
+        IntrinsicImplementation::Int64ShiftLeft | IntrinsicImplementation::Int64ShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::Int64ShiftLeft;
+            let operation: &'static str = if is_left {
+                "Int64.shiftLeft"
+            } else {
+                "Int64.shiftRight"
+            };
+            let storage = uint64_argument(&args[0], operation, 0)?;
+            let amount = int64_argument(&args[1], operation, 1)?;
+            let amount = (((amount % 64) + 64) % 64) as u32;
+            let value = if is_left {
+                storage.wrapping_shl(amount)
+            } else {
+                ((storage as i64) >> amount) as u64
+            };
+            Ok(int64_result(value as i64))
+        }
+        IntrinsicImplementation::Int64Complement
+        | IntrinsicImplementation::Int64Neg
+        | IntrinsicImplementation::Int64Abs => {
+            expect_arity(row, args, 1)?;
+            let storage = uint64_argument(
+                &args[0],
+                match implementation {
+                    IntrinsicImplementation::Int64Complement => "Int64.complement",
+                    IntrinsicImplementation::Int64Neg => "Int64.neg",
+                    _ => "Int64.abs",
+                },
+                0,
+            )?;
+            let signed = storage as i64;
+            let value = match implementation {
+                IntrinsicImplementation::Int64Complement => !signed,
+                IntrinsicImplementation::Int64Neg => signed.wrapping_neg(),
+                _ => signed.checked_abs().unwrap_or(signed),
+            };
+            Ok(int64_result(value))
+        }
+        IntrinsicImplementation::Int64DecEq
+        | IntrinsicImplementation::Int64DecLe
+        | IntrinsicImplementation::Int64DecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::Int64DecEq => "Int64.decEq",
+                IntrinsicImplementation::Int64DecLe => "Int64.decLe",
+                _ => "Int64.decLt",
+            };
+            let left = int64_argument(&args[0], operation, 0)?;
+            let right = int64_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::Int64DecEq => left == right,
+                IntrinsicImplementation::Int64DecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::Int64OfNat => {
+            expect_arity(row, args, 1)?;
+            let low = with_int_view(&args[0], "Int64.ofNat", 0, |view| {
+                let limbs = view.magnitude.limbs_le();
+                let low_word = limbs.first().copied().unwrap_or(0);
+                if view.negative {
+                    (!low_word).wrapping_add(1)
+                } else {
+                    low_word
+                }
+            })?;
+            Ok(int64_result(low as i64))
+        }
+        IntrinsicImplementation::Int64ToInt => {
+            expect_arity(row, args, 1)?;
+            let value = int64_argument(&args[0], "Int64.toInt", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_int(value)))
+        }
+        IntrinsicImplementation::Int64ToWidth => {
+            expect_arity(row, args, 1)?;
+            let value = int64_argument(&args[0], "Int64.toISize", 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_int(value)))
+        }
+        IntrinsicImplementation::ISizeAdd
+        | IntrinsicImplementation::ISizeSub
+        | IntrinsicImplementation::ISizeMul => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::ISizeAdd => "ISize.add",
+                IntrinsicImplementation::ISizeSub => "ISize.sub",
+                _ => "ISize.mul",
+            };
+            let left = isize_argument(&args[0], operation, 0)?;
+            let right = isize_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::ISizeAdd => left.wrapping_add(right),
+                IntrinsicImplementation::ISizeSub => left.wrapping_sub(right),
+                _ => left.wrapping_mul(right),
+            };
+            Ok(isize_result(value))
+        }
+        IntrinsicImplementation::ISizeDiv | IntrinsicImplementation::ISizeMod => {
+            expect_arity(row, args, 2)?;
+            let is_div = implementation == IntrinsicImplementation::ISizeDiv;
+            let operation: &'static str = if is_div { "ISize.div" } else { "ISize.mod" };
+            let dividend = isize_argument(&args[0], operation, 0)?;
+            let divisor = isize_argument(&args[1], operation, 1)?;
+            let value = if divisor == 0 {
+                if is_div { 0isize } else { dividend }
+            } else {
+                let widened = (dividend as i128) / (divisor as i128);
+                let remainder = (dividend as i128) % (divisor as i128);
+                (if is_div { widened } else { remainder }) as isize
+            };
+            Ok(isize_result(value))
+        }
+        IntrinsicImplementation::ISizeLand
+        | IntrinsicImplementation::ISizeLor
+        | IntrinsicImplementation::ISizeXor => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::ISizeLand => "ISize.land",
+                IntrinsicImplementation::ISizeLor => "ISize.lor",
+                _ => "ISize.xor",
+            };
+            let left = isize_argument(&args[0], operation, 0)?;
+            let right = isize_argument(&args[1], operation, 1)?;
+            let value = match implementation {
+                IntrinsicImplementation::ISizeLand => left & right,
+                IntrinsicImplementation::ISizeLor => left | right,
+                _ => left ^ right,
+            };
+            Ok(isize_result(value))
+        }
+        IntrinsicImplementation::ISizeShiftLeft | IntrinsicImplementation::ISizeShiftRight => {
+            expect_arity(row, args, 2)?;
+            let is_left = implementation == IntrinsicImplementation::ISizeShiftLeft;
+            let operation: &'static str = if is_left {
+                "ISize.shiftLeft"
+            } else {
+                "ISize.shiftRight"
+            };
+            let storage = usize_argument(&args[0], operation, 0)?;
+            let amount = isize_argument(&args[1], operation, 1)?;
+            let num_bits = (std::mem::size_of::<isize>() * 8) as isize;
+            let amount = (((amount % num_bits) + num_bits) % num_bits) as u32;
+            let value = if is_left {
+                storage.wrapping_shl(amount)
+            } else {
+                ((storage as isize) >> amount) as usize
+            };
+            Ok(isize_result(value as isize))
+        }
+        IntrinsicImplementation::ISizeComplement
+        | IntrinsicImplementation::ISizeNeg
+        | IntrinsicImplementation::ISizeAbs => {
+            expect_arity(row, args, 1)?;
+            let storage = usize_argument(
+                &args[0],
+                match implementation {
+                    IntrinsicImplementation::ISizeComplement => "ISize.complement",
+                    IntrinsicImplementation::ISizeNeg => "ISize.neg",
+                    _ => "ISize.abs",
+                },
+                0,
+            )?;
+            let signed = storage as isize;
+            let value = match implementation {
+                IntrinsicImplementation::ISizeComplement => !signed,
+                IntrinsicImplementation::ISizeNeg => signed.wrapping_neg(),
+                _ => signed.checked_abs().unwrap_or(signed),
+            };
+            Ok(isize_result(value))
+        }
+        IntrinsicImplementation::ISizeDecEq
+        | IntrinsicImplementation::ISizeDecLe
+        | IntrinsicImplementation::ISizeDecLt => {
+            expect_arity(row, args, 2)?;
+            let operation: &'static str = match implementation {
+                IntrinsicImplementation::ISizeDecEq => "ISize.decEq",
+                IntrinsicImplementation::ISizeDecLe => "ISize.decLe",
+                _ => "ISize.decLt",
+            };
+            let left = isize_argument(&args[0], operation, 0)?;
+            let right = isize_argument(&args[1], operation, 1)?;
+            let ordering = match implementation {
+                IntrinsicImplementation::ISizeDecEq => left == right,
+                IntrinsicImplementation::ISizeDecLe => left <= right,
+                _ => left < right,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
+        }
+        IntrinsicImplementation::ISizeOfNat => {
+            expect_arity(row, args, 1)?;
+            let low = with_int_view(&args[0], "ISize.ofNat", 0, |view| {
+                let limbs = view.magnitude.limbs_le();
+                let low_word = limbs.first().copied().unwrap_or(0) as usize;
+                if view.negative {
+                    (!low_word).wrapping_add(1)
+                } else {
+                    low_word
+                }
+            })?;
+            Ok(isize_result(low as isize))
+        }
+        IntrinsicImplementation::ISizeToInt => {
+            expect_arity(row, args, 1)?;
+            let value = isize_argument(&args[0], "ISize.toInt", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_int(value as i64)))
+        }
+        IntrinsicImplementation::ISizeToWidth => {
+            expect_arity(row, args, 1)?;
+            let value = isize_argument(&args[0], "ISize.toInt64", 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_int(value as i64)))
         }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
@@ -4761,6 +6209,96 @@ fn managerless_task_application(
         | IntrinsicImplementation::UInt8ToUInt32
         | IntrinsicImplementation::UInt8ToUInt64
         | IntrinsicImplementation::UInt8ToUSize
+        | IntrinsicImplementation::UInt16Add
+        | IntrinsicImplementation::UInt16Sub
+        | IntrinsicImplementation::UInt16Mul
+        | IntrinsicImplementation::UInt16Div
+        | IntrinsicImplementation::UInt16Mod
+        | IntrinsicImplementation::UInt16Land
+        | IntrinsicImplementation::UInt16Lor
+        | IntrinsicImplementation::UInt16Xor
+        | IntrinsicImplementation::UInt16ShiftLeft
+        | IntrinsicImplementation::UInt16ShiftRight
+        | IntrinsicImplementation::UInt16Complement
+        | IntrinsicImplementation::UInt16Neg
+        | IntrinsicImplementation::UInt16Log2
+        | IntrinsicImplementation::UInt16DecEq
+        | IntrinsicImplementation::UInt16DecLe
+        | IntrinsicImplementation::UInt16DecLt
+        | IntrinsicImplementation::UInt16OfNat
+        | IntrinsicImplementation::UInt16ToNat
+        | IntrinsicImplementation::UInt16ToUInt8
+        | IntrinsicImplementation::UInt16ToUInt32
+        | IntrinsicImplementation::UInt16ToUInt64
+        | IntrinsicImplementation::UInt16ToUSize
+        | IntrinsicImplementation::UInt32Add
+        | IntrinsicImplementation::UInt32Sub
+        | IntrinsicImplementation::UInt32Mul
+        | IntrinsicImplementation::UInt32Div
+        | IntrinsicImplementation::UInt32Mod
+        | IntrinsicImplementation::UInt32Land
+        | IntrinsicImplementation::UInt32Lor
+        | IntrinsicImplementation::UInt32Xor
+        | IntrinsicImplementation::UInt32ShiftLeft
+        | IntrinsicImplementation::UInt32ShiftRight
+        | IntrinsicImplementation::UInt32Complement
+        | IntrinsicImplementation::UInt32Neg
+        | IntrinsicImplementation::UInt32Log2
+        | IntrinsicImplementation::UInt32DecEq
+        | IntrinsicImplementation::UInt32DecLe
+        | IntrinsicImplementation::UInt32DecLt
+        | IntrinsicImplementation::UInt32OfNat
+        | IntrinsicImplementation::UInt32ToNat
+        | IntrinsicImplementation::UInt32ToUInt8
+        | IntrinsicImplementation::UInt32ToUInt16
+        | IntrinsicImplementation::UInt32ToUInt64
+        | IntrinsicImplementation::UInt32ToUSize
+        | IntrinsicImplementation::UInt64Add
+        | IntrinsicImplementation::UInt64Sub
+        | IntrinsicImplementation::UInt64Mul
+        | IntrinsicImplementation::UInt64Div
+        | IntrinsicImplementation::UInt64Mod
+        | IntrinsicImplementation::UInt64Land
+        | IntrinsicImplementation::UInt64Lor
+        | IntrinsicImplementation::UInt64Xor
+        | IntrinsicImplementation::UInt64ShiftLeft
+        | IntrinsicImplementation::UInt64ShiftRight
+        | IntrinsicImplementation::UInt64Complement
+        | IntrinsicImplementation::UInt64Neg
+        | IntrinsicImplementation::UInt64Log2
+        | IntrinsicImplementation::UInt64DecEq
+        | IntrinsicImplementation::UInt64DecLe
+        | IntrinsicImplementation::UInt64DecLt
+        | IntrinsicImplementation::UInt64OfNat
+        | IntrinsicImplementation::UInt64ToNat
+        | IntrinsicImplementation::UInt64ToUInt8
+        | IntrinsicImplementation::UInt64ToUInt16
+        | IntrinsicImplementation::UInt64ToUInt32
+        | IntrinsicImplementation::UInt64ToUSize
+        | IntrinsicImplementation::UInt64MixHash
+        | IntrinsicImplementation::USizeAdd
+        | IntrinsicImplementation::USizeSub
+        | IntrinsicImplementation::USizeMul
+        | IntrinsicImplementation::USizeDiv
+        | IntrinsicImplementation::USizeMod
+        | IntrinsicImplementation::USizeLand
+        | IntrinsicImplementation::USizeLor
+        | IntrinsicImplementation::USizeXor
+        | IntrinsicImplementation::USizeShiftLeft
+        | IntrinsicImplementation::USizeShiftRight
+        | IntrinsicImplementation::USizeComplement
+        | IntrinsicImplementation::USizeNeg
+        | IntrinsicImplementation::USizeLog2
+        | IntrinsicImplementation::USizeDecEq
+        | IntrinsicImplementation::USizeDecLe
+        | IntrinsicImplementation::USizeDecLt
+        | IntrinsicImplementation::USizeOfNat
+        | IntrinsicImplementation::USizeToNat
+        | IntrinsicImplementation::USizeToUInt8
+        | IntrinsicImplementation::USizeToUInt16
+        | IntrinsicImplementation::USizeToUInt32
+        | IntrinsicImplementation::USizeToUInt64
+        | IntrinsicImplementation::USizeRepr
         | IntrinsicImplementation::Int8Add
         | IntrinsicImplementation::Int8Sub
         | IntrinsicImplementation::Int8Mul
@@ -4780,6 +6318,82 @@ fn managerless_task_application(
         | IntrinsicImplementation::Int8OfNat
         | IntrinsicImplementation::Int8ToInt
         | IntrinsicImplementation::Int8ToWidth
+        | IntrinsicImplementation::Int16Add
+        | IntrinsicImplementation::Int16Sub
+        | IntrinsicImplementation::Int16Mul
+        | IntrinsicImplementation::Int16Div
+        | IntrinsicImplementation::Int16Mod
+        | IntrinsicImplementation::Int16Land
+        | IntrinsicImplementation::Int16Lor
+        | IntrinsicImplementation::Int16Xor
+        | IntrinsicImplementation::Int16ShiftLeft
+        | IntrinsicImplementation::Int16ShiftRight
+        | IntrinsicImplementation::Int16Complement
+        | IntrinsicImplementation::Int16Neg
+        | IntrinsicImplementation::Int16Abs
+        | IntrinsicImplementation::Int16DecEq
+        | IntrinsicImplementation::Int16DecLe
+        | IntrinsicImplementation::Int16DecLt
+        | IntrinsicImplementation::Int16OfNat
+        | IntrinsicImplementation::Int16ToInt
+        | IntrinsicImplementation::Int16ToWidth
+        | IntrinsicImplementation::Int32Add
+        | IntrinsicImplementation::Int32Sub
+        | IntrinsicImplementation::Int32Mul
+        | IntrinsicImplementation::Int32Div
+        | IntrinsicImplementation::Int32Mod
+        | IntrinsicImplementation::Int32Land
+        | IntrinsicImplementation::Int32Lor
+        | IntrinsicImplementation::Int32Xor
+        | IntrinsicImplementation::Int32ShiftLeft
+        | IntrinsicImplementation::Int32ShiftRight
+        | IntrinsicImplementation::Int32Complement
+        | IntrinsicImplementation::Int32Neg
+        | IntrinsicImplementation::Int32Abs
+        | IntrinsicImplementation::Int32DecEq
+        | IntrinsicImplementation::Int32DecLe
+        | IntrinsicImplementation::Int32DecLt
+        | IntrinsicImplementation::Int32OfNat
+        | IntrinsicImplementation::Int32ToInt
+        | IntrinsicImplementation::Int32ToWidth
+        | IntrinsicImplementation::Int64Add
+        | IntrinsicImplementation::Int64Sub
+        | IntrinsicImplementation::Int64Mul
+        | IntrinsicImplementation::Int64Div
+        | IntrinsicImplementation::Int64Mod
+        | IntrinsicImplementation::Int64Land
+        | IntrinsicImplementation::Int64Lor
+        | IntrinsicImplementation::Int64Xor
+        | IntrinsicImplementation::Int64ShiftLeft
+        | IntrinsicImplementation::Int64ShiftRight
+        | IntrinsicImplementation::Int64Complement
+        | IntrinsicImplementation::Int64Neg
+        | IntrinsicImplementation::Int64Abs
+        | IntrinsicImplementation::Int64DecEq
+        | IntrinsicImplementation::Int64DecLe
+        | IntrinsicImplementation::Int64DecLt
+        | IntrinsicImplementation::Int64OfNat
+        | IntrinsicImplementation::Int64ToInt
+        | IntrinsicImplementation::Int64ToWidth
+        | IntrinsicImplementation::ISizeAdd
+        | IntrinsicImplementation::ISizeSub
+        | IntrinsicImplementation::ISizeMul
+        | IntrinsicImplementation::ISizeDiv
+        | IntrinsicImplementation::ISizeMod
+        | IntrinsicImplementation::ISizeLand
+        | IntrinsicImplementation::ISizeLor
+        | IntrinsicImplementation::ISizeXor
+        | IntrinsicImplementation::ISizeShiftLeft
+        | IntrinsicImplementation::ISizeShiftRight
+        | IntrinsicImplementation::ISizeComplement
+        | IntrinsicImplementation::ISizeNeg
+        | IntrinsicImplementation::ISizeAbs
+        | IntrinsicImplementation::ISizeDecEq
+        | IntrinsicImplementation::ISizeDecLe
+        | IntrinsicImplementation::ISizeDecLt
+        | IntrinsicImplementation::ISizeOfNat
+        | IntrinsicImplementation::ISizeToInt
+        | IntrinsicImplementation::ISizeToWidth
         | IntrinsicImplementation::ByteArrayBeq
         | IntrinsicImplementation::ByteArrayCopySlice
         | IntrinsicImplementation::ByteArrayData
@@ -5368,6 +6982,108 @@ fn uint8_result(value: u8) -> IntrinsicResult {
 
 fn int8_result(value: i8) -> IntrinsicResult {
     IntrinsicResult::scalar(Obj::mk_nat(usize::from(value as u8)))
+}
+
+fn uint16_argument(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<u16, VmRefusal> {
+    match nat_as_usize(value, operation, argument)? {
+        Some(word) if word <= u16::MAX as usize => Ok(word as u16),
+        _ => Err(VmRefusal::NatOverflow { operation }),
+    }
+}
+
+fn int16_argument(value: &Obj, operation: &'static str, argument: usize) -> Result<i16, VmRefusal> {
+    Ok(uint16_argument(value, operation, argument)? as i16)
+}
+
+fn uint16_result(value: u16) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(usize::from(value)))
+}
+
+fn int16_result(value: i16) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(usize::from(value as u16)))
+}
+
+fn uint32_argument(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<u32, VmRefusal> {
+    match nat_as_usize(value, operation, argument)? {
+        Some(word) if word <= u32::MAX as usize => Ok(word as u32),
+        _ => Err(VmRefusal::NatOverflow { operation }),
+    }
+}
+
+fn int32_argument(value: &Obj, operation: &'static str, argument: usize) -> Result<i32, VmRefusal> {
+    Ok(uint32_argument(value, operation, argument)? as i32)
+}
+
+fn uint32_result(value: u32) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(value as usize))
+}
+
+fn int32_result(value: i32) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(value as u32 as usize))
+}
+
+fn uint64_argument(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<u64, VmRefusal> {
+    if value.is_scalar() {
+        return Ok(value.unbox() as u64);
+    }
+    with_nat_view(value, operation, argument, |view| view.to_u64())?
+        .ok_or(VmRefusal::NatOverflow { operation })
+}
+
+fn int64_argument(value: &Obj, operation: &'static str, argument: usize) -> Result<i64, VmRefusal> {
+    if value.is_scalar() {
+        return Ok(value.unbox() as u64 as i64);
+    }
+    with_nat_view(value, operation, argument, |view| view.to_u64())?
+        .map(|u| u as i64)
+        .ok_or(VmRefusal::NatOverflow { operation })
+}
+
+fn uint64_result(value: u64) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat((value as usize) & (usize::MAX >> 1)))
+}
+
+fn int64_result(value: i64) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat((value as usize) & (usize::MAX >> 1)))
+}
+
+fn usize_argument(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<usize, VmRefusal> {
+    if value.is_scalar() {
+        return Ok(value.unbox());
+    }
+    nat_as_usize(value, operation, argument)?.ok_or(VmRefusal::NatOverflow { operation })
+}
+
+fn isize_argument(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<isize, VmRefusal> {
+    Ok(usize_argument(value, operation, argument)? as isize)
+}
+
+fn usize_result(value: usize) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat(value & (usize::MAX >> 1)))
+}
+
+fn isize_result(value: isize) -> IntrinsicResult {
+    IntrinsicResult::scalar(Obj::mk_nat((value as usize) & (usize::MAX >> 1)))
 }
 /// Exact port of the pin's `lean_byte_array_copy_slice` value semantics:
 /// a source offset past the source returns the destination unchanged; the
@@ -6490,6 +8206,589 @@ mod tests {
             "extern:Int8.toInt64",
             "extern:Int8.toISize",
         ] {
+            assert_ne!(
+                IntrinsicImplementation::for_row(row),
+                IntrinsicImplementation::Unsupported,
+                "{row} must resolve"
+            );
+            assert!(!IntrinsicImplementation::for_row(row).is_managerless_task());
+        }
+    }
+
+    fn u16_val(result: Result<Obj, VmRefusal>) -> u16 {
+        owned_usize(result) as u16
+    }
+    fn i16_val(result: Result<Obj, VmRefusal>) -> i16 {
+        u16_val(result) as i16
+    }
+    fn u32_val(result: Result<Obj, VmRefusal>) -> u32 {
+        owned_usize(result) as u32
+    }
+    fn i32_val(result: Result<Obj, VmRefusal>) -> i32 {
+        u32_val(result) as i32
+    }
+    fn u64_val(result: Result<Obj, VmRefusal>) -> u64 {
+        let obj = result.expect("intrinsic result");
+        if obj.is_scalar() {
+            obj.unbox() as u64
+        } else {
+            with_nat_view(&obj, "test", 0, |view| view.to_u64())
+                .unwrap()
+                .unwrap()
+        }
+    }
+    fn i64_val(result: Result<Obj, VmRefusal>) -> i64 {
+        u64_val(result) as i64
+    }
+    fn usize_val(result: Result<Obj, VmRefusal>) -> usize {
+        u64_val(result) as usize
+    }
+    fn isize_val(result: Result<Obj, VmRefusal>) -> isize {
+        usize_val(result) as isize
+    }
+    fn str_val(result: Result<Obj, VmRefusal>) -> String {
+        let obj = result.expect("intrinsic result");
+        string_value(&obj, "test", 0).unwrap()
+    }
+
+    #[test]
+    fn uint16_arithmetic_and_conversions() {
+        assert_eq!(u16_val(invoke("extern:UInt16.add", &[n(65535), n(1)])), 0);
+        assert_eq!(u16_val(invoke("extern:UInt16.sub", &[n(0), n(1)])), 65535);
+        assert_eq!(
+            u16_val(invoke("extern:UInt16.mul", &[n(300), n(300)])),
+            (300u32 * 300u32) as u16
+        );
+        assert_eq!(u16_val(invoke("extern:UInt16.div", &[n(100), n(7)])), 14);
+        assert_eq!(u16_val(invoke("extern:UInt16.mod", &[n(100), n(7)])), 2);
+        assert_eq!(u16_val(invoke("extern:UInt16.div", &[n(100), n(0)])), 0);
+        assert_eq!(u16_val(invoke("extern:UInt16.mod", &[n(100), n(0)])), 100);
+        assert_eq!(
+            u16_val(invoke("extern:UInt16.shiftLeft", &[n(1), n(16)])),
+            1
+        );
+        assert_eq!(
+            u16_val(invoke("extern:UInt16.shiftLeft", &[n(1), n(4)])),
+            16
+        );
+        assert_eq!(
+            u16_val(invoke("extern:UInt16.shiftRight", &[n(65535), n(4)])),
+            4095
+        );
+        assert_eq!(u16_val(invoke("extern:UInt16.complement", &[n(0)])), 65535);
+        assert_eq!(u16_val(invoke("extern:UInt16.neg", &[n(1)])), 65535);
+        assert_eq!(u16_val(invoke("extern:UInt16.log2", &[n(65535)])), 15);
+        assert_eq!(u16_val(invoke("extern:UInt16.log2", &[n(0)])), 0);
+        assert_eq!(
+            owned_usize(invoke("extern:UInt16.decEq", &[n(42), n(42)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:UInt16.decLt", &[n(42), n(43)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:UInt16.decLe", &[n(43), n(42)])),
+            0
+        );
+        assert_eq!(
+            u16_val(invoke("extern:UInt16.ofNat", &[n(70000)])),
+            (70000 % 65536) as u16
+        );
+        assert_eq!(owned_usize(invoke("extern:UInt16.toNat", &[n(500)])), 500);
+        assert_eq!(
+            byte_word(invoke("extern:UInt16.toUInt8", &[n(0x1234)])),
+            0x34
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt16.toUInt32", &[n(0x1234)])),
+            0x1234
+        );
+        assert_eq!(
+            u64_val(invoke("extern:UInt16.toUInt64", &[n(0x1234)])),
+            0x1234
+        );
+        assert_eq!(
+            usize_val(invoke("extern:UInt16.toUSize", &[n(0x1234)])),
+            0x1234
+        );
+    }
+
+    #[test]
+    fn int16_arithmetic_widening_and_conversions() {
+        assert_eq!(
+            i16_val(invoke("extern:Int16.add", &[n(32767), n(1)])),
+            -32768
+        );
+        assert_eq!(i16_val(invoke("extern:Int16.sub", &[n(0), n(1)])), -1);
+        assert_eq!(
+            i16_val(invoke("extern:Int16.div", &[n(32768), n(65535)])),
+            -32768
+        ); // INT16_MIN / -1
+        assert_eq!(
+            i16_val(invoke("extern:Int16.mod", &[n(32768), n(65535)])),
+            0
+        );
+        assert_eq!(i16_val(invoke("extern:Int16.div", &[n(100), n(0)])), 0);
+        assert_eq!(i16_val(invoke("extern:Int16.mod", &[n(100), n(0)])), 100);
+        assert_eq!(
+            i16_val(invoke("extern:Int16.shiftLeft", &[n(65535), n(65535)])),
+            -32768
+        );
+        assert_eq!(
+            i16_val(invoke("extern:Int16.shiftRight", &[n(65535), n(1)])),
+            -1
+        );
+        assert_eq!(i16_val(invoke("extern:Int16.abs", &[n(65535)])), 1);
+        assert_eq!(i16_val(invoke("extern:Int16.abs", &[n(32768)])), -32768); // INT16_MIN abs wraps
+        assert_eq!(i16_val(invoke("extern:Int16.neg", &[n(32768)])), -32768);
+        assert_eq!(i16_val(invoke("extern:Int16.complement", &[n(0)])), -1);
+        assert_eq!(
+            owned_usize(invoke("extern:Int16.decLt", &[n(65535), n(1)])),
+            1
+        ); // -1 < 1
+        assert_eq!(
+            owned_usize(invoke("extern:Int16.decLe", &[n(1), n(65535)])),
+            0
+        ); // 1 <= -1
+        assert_eq!(i16_val(invoke("extern:Int16.ofInt", &[i(-300)])), -300);
+        assert_eq!(int_i64(invoke("extern:Int16.toInt", &[n(65535)])), -1);
+    }
+
+    #[test]
+    fn uint32_arithmetic_and_conversions() {
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.add", &[n(0xFFFF_FFFF), n(1)])),
+            0
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.sub", &[n(0), n(1)])),
+            0xFFFF_FFFF
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.mul", &[n(0x10000), n(0x10000)])),
+            0
+        );
+        assert_eq!(u32_val(invoke("extern:UInt32.div", &[n(100), n(3)])), 33);
+        assert_eq!(u32_val(invoke("extern:UInt32.mod", &[n(100), n(3)])), 1);
+        assert_eq!(u32_val(invoke("extern:UInt32.div", &[n(100), n(0)])), 0);
+        assert_eq!(u32_val(invoke("extern:UInt32.mod", &[n(100), n(0)])), 100);
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.shiftLeft", &[n(1), n(32)])),
+            1
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.shiftLeft", &[n(1), n(8)])),
+            256
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.shiftRight", &[n(0xFFFF_FFFF), n(8)])),
+            0x00FF_FFFF
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.complement", &[n(0)])),
+            0xFFFF_FFFF
+        );
+        assert_eq!(u32_val(invoke("extern:UInt32.neg", &[n(1)])), 0xFFFF_FFFF);
+        assert_eq!(u32_val(invoke("extern:UInt32.log2", &[n(0xFFFF_FFFF)])), 31);
+        assert_eq!(u32_val(invoke("extern:UInt32.log2", &[n(0)])), 0);
+        assert_eq!(
+            owned_usize(invoke("extern:UInt32.decEq", &[n(12345), n(12345)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:UInt32.decLt", &[n(12345), n(12346)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:UInt32.decLe", &[n(12346), n(12345)])),
+            0
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt32.ofNat", &[n(0x1_0000_0005)])),
+            5
+        );
+        assert_eq!(owned_usize(invoke("extern:UInt32.toNat", &[n(777)])), 777);
+        assert_eq!(
+            byte_word(invoke("extern:UInt32.toUInt8", &[n(0x1234_5678)])),
+            0x78
+        );
+        assert_eq!(
+            u16_val(invoke("extern:UInt32.toUInt16", &[n(0x1234_5678)])),
+            0x5678
+        );
+        assert_eq!(
+            u64_val(invoke("extern:UInt32.toUInt64", &[n(0x1234_5678)])),
+            0x1234_5678
+        );
+        assert_eq!(
+            usize_val(invoke("extern:UInt32.toUSize", &[n(0x1234_5678)])),
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn int32_arithmetic_widening_and_conversions() {
+        assert_eq!(
+            i32_val(invoke("extern:Int32.add", &[n(0x7FFF_FFFF), n(1)])),
+            i32::MIN
+        );
+        assert_eq!(i32_val(invoke("extern:Int32.sub", &[n(0), n(1)])), -1);
+        assert_eq!(
+            i32_val(invoke(
+                "extern:Int32.div",
+                &[n(0x8000_0000), n(0xFFFF_FFFF)]
+            )),
+            i32::MIN
+        ); // INT32_MIN / -1
+        assert_eq!(
+            i32_val(invoke(
+                "extern:Int32.mod",
+                &[n(0x8000_0000), n(0xFFFF_FFFF)]
+            )),
+            0
+        );
+        assert_eq!(i32_val(invoke("extern:Int32.div", &[n(100), n(0)])), 0);
+        assert_eq!(i32_val(invoke("extern:Int32.mod", &[n(100), n(0)])), 100);
+        assert_eq!(
+            i32_val(invoke(
+                "extern:Int32.shiftLeft",
+                &[n(0xFFFF_FFFF), n(0xFFFF_FFFF)]
+            )),
+            i32::MIN
+        );
+        assert_eq!(
+            i32_val(invoke("extern:Int32.shiftRight", &[n(0xFFFF_FFFF), n(1)])),
+            -1
+        );
+        assert_eq!(i32_val(invoke("extern:Int32.abs", &[n(0xFFFF_FFFF)])), 1);
+        assert_eq!(
+            i32_val(invoke("extern:Int32.abs", &[n(0x8000_0000)])),
+            i32::MIN
+        );
+        assert_eq!(
+            i32_val(invoke("extern:Int32.neg", &[n(0x8000_0000)])),
+            i32::MIN
+        );
+        assert_eq!(i32_val(invoke("extern:Int32.complement", &[n(0)])), -1);
+        assert_eq!(
+            owned_usize(invoke("extern:Int32.decLt", &[n(0xFFFF_FFFF), n(1)])),
+            1
+        ); // -1 < 1
+        assert_eq!(i32_val(invoke("extern:Int32.ofInt", &[i(-50000)])), -50000);
+        assert_eq!(int_i64(invoke("extern:Int32.toInt", &[n(0xFFFF_FFFF)])), -1);
+    }
+
+    #[test]
+    fn uint64_arithmetic_and_conversions() {
+        let zero = n(0);
+        let one = n(1);
+        assert_eq!(u64_val(invoke("extern:UInt64.add", &[n(100), n(200)])), 300);
+        assert_eq!(u64_val(invoke("extern:UInt64.sub", &[n(200), n(50)])), 150);
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.mul", &[n(1000), n(2000)])),
+            2_000_000
+        );
+        assert_eq!(u64_val(invoke("extern:UInt64.div", &[n(100), n(7)])), 14);
+        assert_eq!(u64_val(invoke("extern:UInt64.mod", &[n(100), n(7)])), 2);
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.div", &[n(100), zero.clone_ref()])),
+            0
+        );
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.mod", &[n(100), zero.clone_ref()])),
+            100
+        );
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.shiftLeft", &[one.clone_ref(), n(16)])),
+            0x10000
+        );
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.shiftRight", &[n(0x10000), n(8)])),
+            0x100
+        );
+        assert_eq!(u64_val(invoke("extern:UInt64.log2", &[n(0x10000)])), 16);
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.log2", &[zero.clone_ref()])),
+            0
+        );
+        assert_ne!(u64_val(invoke("extern:mixHash", &[n(12345), n(67890)])), 0);
+        assert_eq!(
+            owned_usize(invoke("extern:UInt64.decEq", &[n(999), n(999)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:UInt64.decLt", &[n(999), n(1000)])),
+            1
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:UInt64.decLe", &[n(1000), n(999)])),
+            0
+        );
+        assert_eq!(
+            byte_word(invoke("extern:UInt64.toUInt8", &[n(0x1234_5678)])),
+            0x78
+        );
+        assert_eq!(
+            u16_val(invoke("extern:UInt64.toUInt16", &[n(0x1234_5678)])),
+            0x5678
+        );
+        assert_eq!(
+            u32_val(invoke("extern:UInt64.toUInt32", &[n(0x1234_5678)])),
+            0x1234_5678
+        );
+        assert_eq!(
+            u64_val(invoke("extern:UInt64.toNat", &[n(0x1234_5678)])),
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn int64_arithmetic_widening_and_conversions() {
+        assert_eq!(i64_val(invoke("extern:Int64.add", &[n(100), n(200)])), 300);
+        assert_eq!(i64_val(invoke("extern:Int64.mul", &[n(50), n(40)])), 2000);
+        assert_eq!(i64_val(invoke("extern:Int64.div", &[n(100), n(7)])), 14);
+        assert_eq!(i64_val(invoke("extern:Int64.mod", &[n(100), n(7)])), 2);
+        assert_eq!(i64_val(invoke("extern:Int64.div", &[n(100), n(0)])), 0);
+        assert_eq!(i64_val(invoke("extern:Int64.mod", &[n(100), n(0)])), 100);
+        assert_eq!(
+            i64_val(invoke("extern:Int64.shiftLeft", &[n(1), n(8)])),
+            256
+        );
+        assert_eq!(
+            i64_val(invoke("extern:Int64.shiftRight", &[n(256), n(4)])),
+            16
+        );
+        assert_eq!(i64_val(invoke("extern:Int64.abs", &[n(50)])), 50);
+        assert_eq!(
+            owned_usize(invoke("extern:Int64.decLt", &[n(10), n(20)])),
+            1
+        );
+        assert_eq!(
+            i64_val(invoke("extern:Int64.ofInt", &[i(-999999)])),
+            (-999999i64 as usize & (usize::MAX >> 1)) as i64
+        );
+        assert_eq!(int_i64(invoke("extern:Int64.toInt", &[n(42)])), 42);
+    }
+
+    #[test]
+    fn usize_and_isize_arithmetic_and_conversions() {
+        assert_eq!(usize_val(invoke("extern:USize.add", &[n(10), n(20)])), 30);
+        assert_eq!(usize_val(invoke("extern:USize.sub", &[n(50), n(20)])), 30);
+        assert_eq!(usize_val(invoke("extern:USize.div", &[n(100), n(0)])), 0);
+        assert_eq!(usize_val(invoke("extern:USize.mod", &[n(100), n(0)])), 100);
+        assert_eq!(str_val(invoke("extern:USize.repr", &[n(42)])), "42");
+        assert_eq!(isize_val(invoke("extern:ISize.add", &[n(10), n(20)])), 30);
+        assert_eq!(isize_val(invoke("extern:ISize.sub", &[n(50), n(20)])), 30);
+        assert_eq!(isize_val(invoke("extern:ISize.div", &[n(100), n(0)])), 0);
+        assert_eq!(isize_val(invoke("extern:ISize.mod", &[n(100), n(0)])), 100);
+        assert_eq!(
+            isize_val(invoke("extern:ISize.ofInt", &[i(-42)])),
+            (-42isize as usize & (usize::MAX >> 1)) as isize
+        );
+        assert_eq!(int_i64(invoke("extern:ISize.toInt", &[n(42)])), 42);
+    }
+
+    #[test]
+    fn all_fixed_width_integer_families_resolve_and_stay_off_managerless_task_path() {
+        let all_rows = [
+            "extern:UInt16.add",
+            "extern:UInt16.sub",
+            "extern:UInt16.mul",
+            "extern:UInt16.div",
+            "extern:UInt16.mod",
+            "extern:UInt16.land",
+            "extern:UInt16.lor",
+            "extern:UInt16.xor",
+            "extern:UInt16.shiftLeft",
+            "extern:UInt16.shiftRight",
+            "extern:UInt16.complement",
+            "extern:UInt16.neg",
+            "extern:UInt16.log2",
+            "extern:UInt16.decEq",
+            "extern:UInt16.decLe",
+            "extern:UInt16.decLt",
+            "extern:UInt16.ofNat",
+            "extern:UInt16.ofNatLT",
+            "extern:UInt16.ofBitVec",
+            "extern:UInt16.toNat",
+            "extern:UInt16.toBitVec",
+            "extern:UInt16.toUInt8",
+            "extern:UInt16.toUInt32",
+            "extern:UInt16.toUInt64",
+            "extern:UInt16.toUSize",
+            "extern:UInt32.add",
+            "extern:UInt32.sub",
+            "extern:UInt32.mul",
+            "extern:UInt32.div",
+            "extern:UInt32.mod",
+            "extern:UInt32.land",
+            "extern:UInt32.lor",
+            "extern:UInt32.xor",
+            "extern:UInt32.shiftLeft",
+            "extern:UInt32.shiftRight",
+            "extern:UInt32.complement",
+            "extern:UInt32.neg",
+            "extern:UInt32.log2",
+            "extern:UInt32.decEq",
+            "extern:UInt32.decLe",
+            "extern:UInt32.decLt",
+            "extern:UInt32.ofNat",
+            "extern:UInt32.ofNatLT",
+            "extern:UInt32.ofBitVec",
+            "extern:UInt32.toNat",
+            "extern:UInt32.toBitVec",
+            "extern:UInt32.toUInt8",
+            "extern:UInt32.toUInt16",
+            "extern:UInt32.toUInt64",
+            "extern:UInt32.toUSize",
+            "extern:UInt64.add",
+            "extern:UInt64.sub",
+            "extern:UInt64.mul",
+            "extern:UInt64.div",
+            "extern:UInt64.mod",
+            "extern:UInt64.land",
+            "extern:UInt64.lor",
+            "extern:UInt64.xor",
+            "extern:UInt64.shiftLeft",
+            "extern:UInt64.shiftRight",
+            "extern:UInt64.complement",
+            "extern:UInt64.neg",
+            "extern:UInt64.log2",
+            "extern:UInt64.decEq",
+            "extern:UInt64.decLe",
+            "extern:UInt64.decLt",
+            "extern:UInt64.ofNat",
+            "extern:UInt64.ofNatLT",
+            "extern:UInt64.ofBitVec",
+            "extern:UInt64.toNat",
+            "extern:UInt64.toBitVec",
+            "extern:UInt64.toUInt8",
+            "extern:UInt64.toUInt16",
+            "extern:UInt64.toUInt32",
+            "extern:UInt64.toUSize",
+            "extern:mixHash",
+            "extern:USize.add",
+            "extern:USize.sub",
+            "extern:USize.mul",
+            "extern:USize.div",
+            "extern:USize.mod",
+            "extern:USize.land",
+            "extern:USize.lor",
+            "extern:USize.xor",
+            "extern:USize.shiftLeft",
+            "extern:USize.shiftRight",
+            "extern:USize.complement",
+            "extern:USize.neg",
+            "extern:USize.log2",
+            "extern:USize.decEq",
+            "extern:USize.decLe",
+            "extern:USize.decLt",
+            "extern:USize.ofNat",
+            "extern:USize.ofNatLT",
+            "extern:USize.ofNat32",
+            "extern:USize.ofBitVec",
+            "extern:USize.toNat",
+            "extern:USize.toBitVec",
+            "extern:USize.toUInt8",
+            "extern:USize.toUInt16",
+            "extern:USize.toUInt32",
+            "extern:USize.toUInt64",
+            "extern:USize.repr",
+            "extern:Int16.add",
+            "extern:Int16.sub",
+            "extern:Int16.mul",
+            "extern:Int16.div",
+            "extern:Int16.mod",
+            "extern:Int16.land",
+            "extern:Int16.lor",
+            "extern:Int16.xor",
+            "extern:Int16.shiftLeft",
+            "extern:Int16.shiftRight",
+            "extern:Int16.complement",
+            "extern:Int16.neg",
+            "extern:Int16.abs",
+            "extern:Int16.decEq",
+            "extern:Int16.decLe",
+            "extern:Int16.decLt",
+            "extern:Int16.ofNat",
+            "extern:Int16.ofInt",
+            "extern:Int16.toInt",
+            "extern:Int16.toInt8",
+            "extern:Int16.toInt32",
+            "extern:Int16.toInt64",
+            "extern:Int16.toISize",
+            "extern:Int32.add",
+            "extern:Int32.sub",
+            "extern:Int32.mul",
+            "extern:Int32.div",
+            "extern:Int32.mod",
+            "extern:Int32.land",
+            "extern:Int32.lor",
+            "extern:Int32.xor",
+            "extern:Int32.shiftLeft",
+            "extern:Int32.shiftRight",
+            "extern:Int32.complement",
+            "extern:Int32.neg",
+            "extern:Int32.abs",
+            "extern:Int32.decEq",
+            "extern:Int32.decLe",
+            "extern:Int32.decLt",
+            "extern:Int32.ofNat",
+            "extern:Int32.ofInt",
+            "extern:Int32.toInt",
+            "extern:Int32.toInt8",
+            "extern:Int32.toInt16",
+            "extern:Int32.toInt64",
+            "extern:Int32.toISize",
+            "extern:Int64.add",
+            "extern:Int64.sub",
+            "extern:Int64.mul",
+            "extern:Int64.div",
+            "extern:Int64.mod",
+            "extern:Int64.land",
+            "extern:Int64.lor",
+            "extern:Int64.xor",
+            "extern:Int64.shiftLeft",
+            "extern:Int64.shiftRight",
+            "extern:Int64.complement",
+            "extern:Int64.neg",
+            "extern:Int64.abs",
+            "extern:Int64.decEq",
+            "extern:Int64.decLe",
+            "extern:Int64.decLt",
+            "extern:Int64.ofNat",
+            "extern:Int64.ofInt",
+            "extern:Int64.toInt",
+            "extern:Int64.toInt8",
+            "extern:Int64.toInt16",
+            "extern:Int64.toInt32",
+            "extern:Int64.toISize",
+            "extern:ISize.add",
+            "extern:ISize.sub",
+            "extern:ISize.mul",
+            "extern:ISize.div",
+            "extern:ISize.mod",
+            "extern:ISize.land",
+            "extern:ISize.lor",
+            "extern:ISize.xor",
+            "extern:ISize.shiftLeft",
+            "extern:ISize.shiftRight",
+            "extern:ISize.complement",
+            "extern:ISize.neg",
+            "extern:ISize.abs",
+            "extern:ISize.decEq",
+            "extern:ISize.decLe",
+            "extern:ISize.decLt",
+            "extern:ISize.ofNat",
+            "extern:ISize.ofInt",
+            "extern:ISize.toInt",
+            "extern:ISize.toInt8",
+            "extern:ISize.toInt16",
+            "extern:ISize.toInt32",
+            "extern:ISize.toInt64",
+        ];
+        for row in all_rows {
             assert_ne!(
                 IntrinsicImplementation::for_row(row),
                 IntrinsicImplementation::Unsupported,
