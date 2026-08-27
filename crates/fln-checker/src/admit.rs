@@ -2931,9 +2931,7 @@ fn option_rule_rhs(
 }
 
 fn empty_recursor_type(empty: &WireName, motive_universe: &WireName) -> Option<WireExpr> {
-    // Both real empty families met so far (`Init.Empty`, and `Init.False`
-    // sharing this helper) bind the motive binder Default.
-    empty_recursor_type_at_levels(empty, motive_universe, &[], BinderStyle::Default)
+    empty_recursor_type_at_levels(empty, motive_universe, &[], BinderStyle::Implicit)
 }
 
 fn empty_recursor_type_at_levels(
@@ -3086,7 +3084,7 @@ fn and_inductive_type() -> Option<WireExpr> {
     builder.finish(root)
 }
 
-fn and_constructor_type(and_name: &WireName, constructor: &WireName) -> Option<WireExpr> {
+fn and_constructor_type(and_name: &WireName, _constructor: &WireName) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
     let proposition = builder.sort_zero();
     let left_field = builder.bvar(1);
@@ -3096,8 +3094,8 @@ fn and_constructor_type(and_name: &WireName, constructor: &WireName) -> Option<W
     let result = and_application(&mut builder, and_name, left_parameter, right_parameter);
     let result = builder.forall("right", BinderStyle::Default, right_field, result);
     let result = builder.forall("left", BinderStyle::Default, left_field, result);
-    let result = builder.forall("b", BinderStyle::Implicit, proposition, result);
-    let root = builder.forall_name(constructor, BinderStyle::Implicit, proposition, result);
+    let result = builder.forall("b", BinderStyle::Default, proposition, result);
+    let root = builder.forall("a", BinderStyle::Default, proposition, result);
     builder.finish(root)
 }
 
@@ -6717,7 +6715,7 @@ fn final_body_is_motive_of_indices_and_major(
     arguments.reverse();
     arguments.len() == index_count + 1
         && matches!(
-            expression.node(*arguments.last().expect("nonempty above")),
+            arguments.last().and_then(|id| expression.node(*id)),
             Some(ExprNode::Bound { index }) if *index == 0
         )
 }
