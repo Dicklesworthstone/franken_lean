@@ -1738,75 +1738,75 @@ impl CertificateVerifier {
         }
 
         // 1. Validate epoch binding
-        if let Some(expected_epoch) = context.expected_epoch {
-            if candidate.binding.epoch != expected_epoch {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::StaleEpoch {
-                        expected: expected_epoch,
-                        seen: candidate.binding.epoch,
-                    },
-                ));
-            }
+        if let Some(expected_epoch) = context.expected_epoch
+            && candidate.binding.epoch != expected_epoch
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::StaleEpoch {
+                    expected: expected_epoch,
+                    seen: candidate.binding.epoch,
+                },
+            ));
         }
 
         // 2. Validate mode binding
-        if let Some(expected_mode) = context.expected_mode {
-            if candidate.binding.mode != expected_mode {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::ModeMismatch {
-                        expected: expected_mode,
-                        seen: candidate.binding.mode,
-                    },
-                ));
-            }
+        if let Some(expected_mode) = context.expected_mode
+            && candidate.binding.mode != expected_mode
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::ModeMismatch {
+                    expected: expected_mode,
+                    seen: candidate.binding.mode,
+                },
+            ));
         }
 
         // 3. Validate environment root binding
-        if let Some(expected_env) = context.expected_environment_root {
-            if candidate.binding.environment_root != expected_env {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::EnvironmentRootMismatch {
-                        expected: expected_env,
-                        seen: candidate.binding.environment_root,
-                    },
-                ));
-            }
+        if let Some(expected_env) = context.expected_environment_root
+            && candidate.binding.environment_root != expected_env
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::EnvironmentRootMismatch {
+                    expected: expected_env,
+                    seen: candidate.binding.environment_root,
+                },
+            ));
         }
 
         // 4. Validate declaration root binding
-        if let Some(expected_decl) = context.expected_declaration_root {
-            if candidate.binding.declaration_root != expected_decl {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::DeclarationRootMismatch {
-                        expected: expected_decl,
-                        seen: candidate.binding.declaration_root,
-                    },
-                ));
-            }
+        if let Some(expected_decl) = context.expected_declaration_root
+            && candidate.binding.declaration_root != expected_decl
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::DeclarationRootMismatch {
+                    expected: expected_decl,
+                    seen: candidate.binding.declaration_root,
+                },
+            ));
         }
 
         // 5. Validate build profile binding
-        if let Some(expected_profile) = context.expected_build_profile {
-            if candidate.binding.build_profile != expected_profile {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::BuildProfileMismatch {
-                        expected: expected_profile,
-                        seen: candidate.binding.build_profile,
-                    },
-                ));
-            }
+        if let Some(expected_profile) = context.expected_build_profile
+            && candidate.binding.build_profile != expected_profile
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::BuildProfileMismatch {
+                    expected: expected_profile,
+                    seen: candidate.binding.build_profile,
+                },
+            ));
         }
 
         // 6. Validate consensus policy binding
-        if let Some(expected_policy) = context.expected_consensus_policy {
-            if candidate.binding.consensus_policy != expected_policy {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::ConsensusPolicyMismatch {
-                        expected: expected_policy,
-                        seen: candidate.binding.consensus_policy,
-                    },
-                ));
-            }
+        if let Some(expected_policy) = context.expected_consensus_policy
+            && candidate.binding.consensus_policy != expected_policy
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::ConsensusPolicyMismatch {
+                    expected: expected_policy,
+                    seen: candidate.binding.consensus_policy,
+                },
+            ));
         }
 
         // 7. Validate term root
@@ -1862,16 +1862,16 @@ impl CertificateVerifier {
                         },
                     ));
                 }
-                if let Some(val) = value_node {
-                    if val.get() as usize >= total_nodes {
-                        return Outcome::Complete(FastPathVerificationDecision::Refused(
-                            CertificateVerificationRefusal::InvalidJudgmentNode {
-                                detail: "value_node out of bounds".to_string(),
-                                node_id: *val,
-                                total_nodes,
-                            },
-                        ));
-                    }
+                if let Some(val) = value_node
+                    && val.get() as usize >= total_nodes
+                {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "value_node out of bounds".to_string(),
+                            node_id: *val,
+                            total_nodes,
+                        },
+                    ));
                 }
             }
             CertificateJudgmentV1::InferType {
@@ -1920,16 +1920,16 @@ impl CertificateVerifier {
                         },
                     ));
                 }
-                if let Some(tn) = type_node {
-                    if tn.get() as usize >= total_nodes {
-                        return Outcome::Complete(FastPathVerificationDecision::Refused(
-                            CertificateVerificationRefusal::InvalidJudgmentNode {
-                                detail: "type_node out of bounds".to_string(),
-                                node_id: *tn,
-                                total_nodes,
-                            },
-                        ));
-                    }
+                if let Some(tn) = type_node
+                    && tn.get() as usize >= total_nodes
+                {
+                    return Outcome::Complete(FastPathVerificationDecision::Refused(
+                        CertificateVerificationRefusal::InvalidJudgmentNode {
+                            detail: "type_node out of bounds".to_string(),
+                            node_id: *tn,
+                            total_nodes,
+                        },
+                    ));
                 }
             }
             CertificateJudgmentV1::WeakHeadNormalForm {
@@ -2035,12 +2035,12 @@ impl CertificateVerifier {
         }
 
         // 11. Validate claimed result
-        if let ClaimedResultV1::Rejected(rejection) = candidate.claimed_result {
-            if !context.allow_rejections {
-                return Outcome::Complete(FastPathVerificationDecision::Refused(
-                    CertificateVerificationRefusal::ClaimedResultRefused { claimed: rejection },
-                ));
-            }
+        if let ClaimedResultV1::Rejected(rejection) = candidate.claimed_result
+            && !context.allow_rejections
+        {
+            return Outcome::Complete(FastPathVerificationDecision::Refused(
+                CertificateVerificationRefusal::ClaimedResultRefused { claimed: rejection },
+            ));
         }
 
         // 12. Compute digest and return verification
@@ -2127,8 +2127,7 @@ pub fn nat_sub(a: &NatLit, b: &NatLit) -> NatLit {
     let b_limbs = b.limbs_le();
     let mut result = Vec::with_capacity(a_limbs.len());
     let mut borrow = 0u64;
-    for i in 0..a_limbs.len() {
-        let al = a_limbs[i];
+    for (i, &al) in a_limbs.iter().enumerate() {
         let bl = b_limbs.get(i).copied().unwrap_or(0);
         let (diff1, b1) = al.overflowing_sub(bl);
         let (diff2, b2) = diff1.overflowing_sub(borrow);
@@ -2177,7 +2176,7 @@ fn nat_get_bit(n: &NatLit, bit_idx: usize) -> bool {
     let bit_i = bit_idx % 64;
     n.limbs_le()
         .get(limb_i)
-        .map_or(false, |&limb| (limb & (1u64 << bit_i)) != 0)
+        .is_some_and(|&limb| (limb & (1u64 << bit_i)) != 0)
 }
 
 fn nat_shift_left_1(n: &NatLit) -> NatLit {
@@ -2228,7 +2227,7 @@ pub fn nat_div_rem(a: &NatLit, b: &NatLit) -> (NatLit, NatLit) {
     }
     let a_bits = nat_bit_length(a);
     let mut rem = NatLit::from_u64(0);
-    let mut quot_limbs = vec![0u64; (a_bits + 63) / 64];
+    let mut quot_limbs = vec![0u64; a_bits.div_ceil(64)];
     for bit_idx in (0..a_bits).rev() {
         rem = nat_shift_left_1(&rem);
         if nat_get_bit(a, bit_idx) {
