@@ -47,12 +47,7 @@ use fln_hash::domain::{Domain, hash};
 type TsvImportRow = (usize, Name, bool, bool, bool);
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
+    fln_conformance::checked_workspace_root!()
 }
 
 fn pinned_epoch() -> ModuleEpoch {
