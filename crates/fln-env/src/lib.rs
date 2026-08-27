@@ -30,6 +30,7 @@ pub mod effective_imports;
 pub mod environment;
 pub mod extensions;
 pub mod intern;
+pub mod invalidation;
 pub mod lifecycle;
 pub mod module_apply;
 pub mod modules;

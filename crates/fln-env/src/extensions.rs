@@ -32,7 +32,7 @@ pub(crate) fn fixture_epoch() -> ModuleEpoch {
 }
 
 /// Declared merge semantics for one extension — the contract branch/merge consults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MergeSemantics {
     /// Entries concatenate in branch order (the common upstream replay shape).
     AppendOrdered,
@@ -46,7 +46,7 @@ pub enum MergeSemantics {
 }
 
 /// Declared checkpoint semantics: what a snapshot must capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CheckpointSemantics {
     /// The journal suffix since the base commit fully describes the state.
     JournalSuffix,
@@ -55,7 +55,7 @@ pub enum CheckpointSemantics {
 }
 
 /// How well the toolchain understands a payload — provenance, not a guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PayloadProvenance {
     /// The payload schema is native-understood; fine-grained invalidation may see
     /// through it.
@@ -65,7 +65,7 @@ pub enum PayloadProvenance {
 }
 
 /// One registered extension: identity plus declared contracts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExtensionDescriptor {
     pub name: Name,
     pub merge: MergeSemantics,
