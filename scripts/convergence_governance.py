@@ -113,9 +113,12 @@ def issues_from_br(root, br_bin):
     envelope = command(
         [br_bin, "list", "--all", "--format", "json", "--no-auto-flush", "--no-auto-import"], root
     )
-    if not isinstance(envelope, dict) or not isinstance(envelope.get("issues"), list):
-        raise InputFault("br-list-schema: expected object with issues array")
-    issues = envelope["issues"]
+    if isinstance(envelope, list):
+        issues = envelope
+    elif isinstance(envelope, dict) and isinstance(envelope.get("issues"), list):
+        issues = envelope["issues"]
+    else:
+        raise InputFault("br-list-schema: expected object with issues array or issues list")
     if len(issues) > MAX_ISSUES:
         raise InputFault(f"br-list-too-many-issues: {len(issues)} > {MAX_ISSUES}")
     return issues
