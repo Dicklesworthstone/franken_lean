@@ -147,7 +147,7 @@ struct Declared {
 }
 
 fn english(word: &str) -> Option<usize> {
-    const WORDS: [(&str, usize); 22] = [
+    const WORDS: [(&str, usize); 23] = [
         ("zero", 0),
         ("one", 1),
         ("two", 2),
@@ -170,6 +170,7 @@ fn english(word: &str) -> Option<usize> {
         ("nineteen", 19),
         ("twenty", 20),
         ("twenty-one", 21),
+        ("twenty-two", 22),
     ];
     let word = word
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')

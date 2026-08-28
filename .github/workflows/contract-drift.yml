@@ -344,6 +344,29 @@ jobs:
             --commit "$artifact/bundle.complete.json" \
             --artifact-root "$artifact"
 
+      - name: run the suite-upgrade isolated-candidate no-mock lane
+        shell: bash
+        run: |
+          step_root="target/e2e/contract-drift-suite-upgrade-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/e2e/suite_upgrade_no_mock_e2e.sh
+          mapfile -d '' -t runs < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#runs[@]} != 1 )); then
+            echo "suite-upgrade lane retained ${#runs[@]} runs; expected one" >&2
+            exit 2
+          fi
+          artifact="${runs[0]}"
+          python3 -I -S scripts/evidence.py validate-run \
+            --file "$artifact/run.ndjson" --schema fln.e2e/2 \
+            --expected-verdict pass --artifact-root "$artifact" --offline
+          python3 -I -S scripts/evidence.py validate-manifest \
+            --art-dir "$artifact" --manifest "$artifact/manifest.json" \
+            --digest "$artifact/manifest.digest" --offline
+
       - name: run the G0-4 syntax and hygiene no-mock lane
         shell: bash
         run: |

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const REQUIRED_LEDGER_IDS: [&str; 6] = [
     "asupersync-ordered-merge",
@@ -245,6 +245,80 @@ pub struct CandidateEvidenceRoots {
     pub migration_root: String,
     pub rollback_root: String,
     pub external_evidence_root: String,
+}
+
+/// `suite <name>` rows from a `fln-suite-lock/1` file. Comments and every other
+/// lock kind are ignored: a hidden dependency is an undeclared *suite*, not a
+/// comment or a crate mapping.
+pub fn suite_names_from_lock(text: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("suite ") else {
+            continue;
+        };
+        if let Some(name) = rest.split_whitespace().next() {
+            names.insert(name.to_string());
+        }
+    }
+    names
+}
+
+/// Components declared by an isolated-candidate closure listing.
+pub fn component_names_from_closure(text: &str) -> Result<BTreeSet<String>, String> {
+    let mut schema = false;
+    let mut names = BTreeSet::new();
+    for (line_number, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "schema fln-suite-upgrade-closure/1" {
+            schema = true;
+            continue;
+        }
+        let Some(name) = line.strip_prefix("component ") else {
+            return Err(format!(
+                "candidate closure:{}: expected `component <name>`",
+                line_number + 1
+            ));
+        };
+        let name = name.trim();
+        if name.is_empty() || !names.insert(name.to_string()) {
+            return Err(format!(
+                "candidate closure:{}: duplicate or empty component",
+                line_number + 1
+            ));
+        }
+    }
+    if !schema {
+        return Err("candidate closure: missing `schema fln-suite-upgrade-closure/1`".to_string());
+    }
+    Ok(names)
+}
+
+/// Refuses a candidate lock that names a suite the closure evidence does not.
+/// Hash-identity of the two files can still join; this is the content-level
+/// hidden-dependency mutant the identity join cannot see.
+pub fn refuse_hidden_suite_dependency(lock_text: &str, closure_text: &str) -> Result<(), String> {
+    let suites = suite_names_from_lock(lock_text);
+    let components = component_names_from_closure(closure_text)?;
+    let hidden: Vec<&String> = suites.difference(&components).collect();
+    if hidden.is_empty() {
+        Ok(())
+    } else {
+        let listed = hidden
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Err(format!(
+            "candidate lock names suite(s) absent from closure evidence: {listed}"
+        ))
+    }
 }
 
 impl CandidateReceipt {

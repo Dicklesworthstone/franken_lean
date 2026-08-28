@@ -303,7 +303,18 @@ fn suite_upgrade_candidate_bundle_from_environment() -> Result<(), String> {
         rollback_root: root("FLN_SUITE_UPGRADE_ROLLBACK_ROOT")?,
         external_evidence_root: root("FLN_SUITE_UPGRADE_EXTERNAL_EVIDENCE_ROOT")?,
     };
-    validate_candidate_bundle(&receipt_text, &observed)
+    validate_candidate_bundle(&receipt_text, &observed)?;
+    let lock_path = std::env::var("FLN_SUITE_UPGRADE_CANDIDATE_LOCK_PATH").map_err(|error| {
+        format!("candidate preflight did not supply FLN_SUITE_UPGRADE_CANDIDATE_LOCK_PATH: {error}")
+    })?;
+    let closure_path = std::env::var("FLN_SUITE_UPGRADE_CLOSURE_PATH").map_err(|error| {
+        format!("candidate preflight did not supply FLN_SUITE_UPGRADE_CLOSURE_PATH: {error}")
+    })?;
+    let lock_text = std::fs::read_to_string(lock_path)
+        .map_err(|error| format!("cannot read candidate lock: {error}"))?;
+    let closure_text = std::fs::read_to_string(closure_path)
+        .map_err(|error| format!("cannot read candidate closure: {error}"))?;
+    suite_upgrade::refuse_hidden_suite_dependency(&lock_text, &closure_text)
 }
 
 #[test]
@@ -388,6 +399,37 @@ fn waiver_authority_model() {
     assert!(
         nonexpiring.validate().is_err(),
         "nonexpiring waiver mutant survived"
+    );
+}
+
+#[test]
+fn hidden_suite_dependency_is_refused_even_when_roots_join() {
+    let lock = concat!(
+        "schema fln-suite-lock/1\n",
+        "suite asupersync commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa path=/dp/asupersync\n",
+        "suite undeclared-hidden commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb path=/tmp/hidden\n",
+    );
+    let closure = concat!(
+        "schema fln-suite-upgrade-closure/1\n",
+        "component asupersync\n",
+    );
+    assert_eq!(
+        suite_upgrade::refuse_hidden_suite_dependency(lock, closure),
+        Err(
+            "candidate lock names suite(s) absent from closure evidence: undeclared-hidden"
+                .to_string()
+        ),
+        "an undeclared suite must fail even if file hashes would join"
+    );
+    let listed = concat!(
+        "schema fln-suite-upgrade-closure/1\n",
+        "component asupersync\n",
+        "component undeclared-hidden\n",
+    );
+    assert_eq!(
+        suite_upgrade::refuse_hidden_suite_dependency(lock, listed),
+        Ok(()),
+        "listing the suite in closure evidence must clear the hidden-dependency refusal"
     );
 }
 

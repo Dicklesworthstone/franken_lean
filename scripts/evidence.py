@@ -658,6 +658,15 @@ E2E_STEP_ORDERS = {
         "pratt_precedence_contract",
         "terminal_trivia_contract",
     ],
+    "suite_upgrade_no_mock_e2e": [
+        "isolate_candidate",
+        "failure_list",
+        "complete_evidence_pass",
+        "hidden_dependency_refused",
+        "stale_root_refused",
+        "restore",
+        "unchanged_authoritative_lock",
+    ],
     "vellum_naming_no_mock_e2e": [
         "registry_gate",
         "collision_model",

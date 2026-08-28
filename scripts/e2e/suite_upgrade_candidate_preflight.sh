@@ -98,6 +98,8 @@ rollback_root="$(digest "$CANDIDATE_DIR/rollback.ndjson")"
 external_evidence_root="$(digest "$CANDIDATE_DIR/external-evidence.ndjson")"
 
 FLN_SUITE_UPGRADE_RECEIPT_PATH="$CANDIDATE_DIR/candidate-receipt.ndjson" \
+FLN_SUITE_UPGRADE_CANDIDATE_LOCK_PATH="$CANDIDATE_DIR/SUITE.lock" \
+FLN_SUITE_UPGRADE_CLOSURE_PATH="$CANDIDATE_DIR/closure.ndjson" \
 FLN_SUITE_UPGRADE_CURRENT_LOCK_ROOT="$current_lock_root" \
 FLN_SUITE_UPGRADE_CANDIDATE_LOCK_ROOT="$candidate_lock_root" \
 FLN_SUITE_UPGRADE_CLOSURE_ROOT="$closure_root" \
