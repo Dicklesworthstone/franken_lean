@@ -48,7 +48,7 @@ use fln_env::provenance::{
     ExtensionContribution, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
     ModuleProvenanceManifest, ModuleProvenanceRoot, ProvenanceCompleteness,
 };
-use fln_hash::domain::{Digest, Domain, hash};
+use fln_hash::domain::{Domain, hash};
 use fln_hash::root::LogicalRoot;
 use fln_olean::decl::{DeclDecoder, DeclError};
 use fln_olean::region::{OleanView, RegionError, WalkBudget};
@@ -204,7 +204,6 @@ impl OleanModuleAdapter {
 
         let mut extension_entries = Vec::new();
         let mut extension_contributions = Vec::new();
-        let mut base_history_digest = Digest([0u8; 32]);
 
         for (ext_idx, ext_block) in module_data.extensions.iter().enumerate() {
             let descriptor = ExtensionDescriptor {
@@ -223,13 +222,14 @@ impl OleanModuleAdapter {
             );
             extension_entries.push(payload);
 
+            let base_history =
+                fln_env::extensions::ExtensionState::new(descriptor.clone()).content_digest();
             let contribution = ExtensionContribution::new(
                 descriptor,
                 0,
-                base_history_digest,
+                base_history,
                 vec![entry_id],
             );
-            base_history_digest = hash(Domain::Fixture, raw_data);
             extension_contributions.push(contribution);
         }
 
