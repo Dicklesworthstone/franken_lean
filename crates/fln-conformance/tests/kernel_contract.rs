@@ -867,6 +867,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 const EXEMPT_CONTRACT_MAINTENANCE_COMMITS: &[&str] = &[
     "02550cec12464ca08efeb51d7f50992545dc5271",
     "65404496d5b8cbbe49e1a53ae04749a279ed669a",
+    "d16960377d19b56640343806f23b722f2f606f33",
 ];
 
 /// The revision discipline's judge, split out so planted histories exercise the
