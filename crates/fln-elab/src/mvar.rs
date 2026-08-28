@@ -4,10 +4,10 @@
 //! delayed assignments, assignment justifications, recursive instantiation, occurs-check,
 //! and targeted wake-up dependency tracking.
 
-use std::collections::{HashMap, HashSet};
+use crate::lctx::LocalContext;
 use fln_core::expr::{Expr, ExprNode, FVarId, MVarId};
 use fln_core::name::Name;
-use crate::lctx::LocalContext;
+use std::collections::{HashMap, HashSet};
 
 /// The kind of metavariable (Lean.MetavarKind).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -71,10 +71,26 @@ pub enum MetavarError {
 impl std::fmt::Display for MetavarError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyAssigned { id } => write!(f, "metavariable ?{} is already assigned", id.0.to_display_string()),
-            Self::OccursCheckFailed { id } => write!(f, "occurs check failed for metavariable ?{}", id.0.to_display_string()),
-            Self::SyntheticOpaqueBlocked { id } => write!(f, "cannot assign synthetic opaque metavariable ?{} via standard unification", id.0.to_display_string()),
-            Self::NotDeclared { id } => write!(f, "metavariable ?{} is not declared", id.0.to_display_string()),
+            Self::AlreadyAssigned { id } => write!(
+                f,
+                "metavariable ?{} is already assigned",
+                id.0.to_display_string()
+            ),
+            Self::OccursCheckFailed { id } => write!(
+                f,
+                "occurs check failed for metavariable ?{}",
+                id.0.to_display_string()
+            ),
+            Self::SyntheticOpaqueBlocked { id } => write!(
+                f,
+                "cannot assign synthetic opaque metavariable ?{} via standard unification",
+                id.0.to_display_string()
+            ),
+            Self::NotDeclared { id } => write!(
+                f,
+                "metavariable ?{} is not declared",
+                id.0.to_display_string()
+            ),
         }
     }
 }
@@ -132,6 +148,7 @@ impl MetavarStore {
     }
 
     /// Declare a new metavariable.
+    #[allow(clippy::too_many_arguments)]
     pub fn declare(
         &mut self,
         id: MVarId,
@@ -178,8 +195,13 @@ impl MetavarStore {
         val: Expr,
         justification: AssignmentJustification,
     ) -> Result<HashSet<MVarId>, MetavarError> {
-        let decl = self.decls.get(&id).ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?;
-        if decl.kind == MetavarKind::SyntheticOpaque && justification == AssignmentJustification::DirectDefEq {
+        let decl = self
+            .decls
+            .get(&id)
+            .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?;
+        if decl.kind == MetavarKind::SyntheticOpaque
+            && justification == AssignmentJustification::DirectDefEq
+        {
             return Err(MetavarError::SyntheticOpaqueBlocked { id });
         }
         if self.assignments.contains_key(&id) {
@@ -192,10 +214,13 @@ impl MetavarStore {
         // Compute wake-ups: all entities that read `id`
         let wake_ups = self.targeted_wake_up(&id);
 
-        self.assignments.insert(id, MetavarAssignment {
-            expr: val,
-            justification,
-        });
+        self.assignments.insert(
+            id,
+            MetavarAssignment {
+                expr: val,
+                justification,
+            },
+        );
 
         Ok(wake_ups)
     }
@@ -320,23 +345,16 @@ impl MetavarStore {
                 self.collect_mvars_into(a, mvars);
             }
             ExprNode::Lam {
-                binder_type,
-                body,
-                ..
+                binder_type, body, ..
             }
             | ExprNode::ForallE {
-                binder_type,
-                body,
-                ..
+                binder_type, body, ..
             } => {
                 self.collect_mvars_into(binder_type, mvars);
                 self.collect_mvars_into(body, mvars);
             }
             ExprNode::LetE {
-                type_,
-                value,
-                body,
-                ..
+                type_, value, body, ..
             } => {
                 self.collect_mvars_into(type_, mvars);
                 self.collect_mvars_into(value, mvars);

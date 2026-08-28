@@ -1,7 +1,7 @@
 //! Universe metavariable store (`UniverseStore`) for Athanor (plan §10.1).
 
-use std::collections::HashMap;
 use fln_core::level::{LMVarId, Level, LevelTooDeep, LevelView};
+use std::collections::HashMap;
 
 /// Tracks universe metavariable assignments and instantiation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -3,17 +3,15 @@
 //! Provides structured term/tactic/command info nodes for LSP inspection,
 //! goal viewing, and semantic navigation.
 
+use crate::lctx::LocalContext;
 use fln_core::expr::{Expr, FVarId, MVarId};
 use fln_core::name::Name;
-use crate::lctx::LocalContext;
 
 /// The semantic payload of an info tree node (Lean.Elab.Info).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Info {
     /// Contextual scope info providing local context.
-    ContextInfo {
-        lctx: LocalContext,
-    },
+    ContextInfo { lctx: LocalContext },
     /// Elaborated term info associated with a syntax node.
     TermInfo {
         lctx: LocalContext,
@@ -28,14 +26,9 @@ pub enum Info {
         goals_after: Vec<MVarId>,
     },
     /// Command execution info.
-    CommandInfo {
-        name: Name,
-    },
+    CommandInfo { name: Name },
     /// Free variable binding info.
-    FVarInfo {
-        id: FVarId,
-        user_name: Name,
-    },
+    FVarInfo { id: FVarId, user_name: Name },
 }
 
 /// A node in the InfoTree hierarchy.

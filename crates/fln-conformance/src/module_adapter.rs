@@ -41,8 +41,8 @@ use fln_env::module_apply::{
     prepare_module_apply_batch,
 };
 use fln_env::modules::{
-    ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport, ModuleEpoch,
-    ModuleId, ModuleRecord,
+    ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport,
+    ModuleEpoch, ModuleId, ModuleRecord,
 };
 use fln_env::provenance::{
     ExtensionContribution, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
@@ -61,9 +61,17 @@ pub enum ModuleAdapterError {
     Manifest(ModuleProvenanceError),
     Preflight(ModuleApplyPreflightError),
     Io(String),
-    MissingDependency { module: ModuleId, dependency: ModuleId },
-    CyclicDependency { module: ModuleId },
-    StageMismatch { expected: usize, actual: usize },
+    MissingDependency {
+        module: ModuleId,
+        dependency: ModuleId,
+    },
+    CyclicDependency {
+        module: ModuleId,
+    },
+    StageMismatch {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for ModuleAdapterError {
@@ -224,12 +232,8 @@ impl OleanModuleAdapter {
 
             let base_history =
                 fln_env::extensions::ExtensionState::new(descriptor.clone()).content_digest();
-            let contribution = ExtensionContribution::new(
-                descriptor,
-                0,
-                base_history,
-                vec![entry_id],
-            );
+            let contribution =
+                ExtensionContribution::new(descriptor, 0, base_history, vec![entry_id]);
             extension_contributions.push(contribution);
         }
 
@@ -319,38 +323,58 @@ impl ModuleBatchApplyPlan {
             }));
         }
 
-        let staged_outcome = prepare_module_apply_batch(
-            preflights,
-            base,
-            |pos, staged_env| {
-                let mut candidate_env = staged_env.clone();
-                if let Some(pf) = preflights.get(pos) {
-                    for decl in pf.transaction().declarations() {
-                        candidate_env = candidate_env.add_decl((**decl).clone()).map_err(|e| {
-                            let delta_err = match e {
-                                EnvError::DuplicateDeclaration { name } => {
-                                    DeclarationDeltaError::AdditionConflictsWithBase { name }
-                                }
-                                _ => DeclarationDeltaError::ExtensionStateChanged,
-                            };
-                            ModuleApplyCandidateError::DeclarationDelta(delta_err)
-                        })?;
-                    }
-                    for extra in pf.transaction().extra_declarations() {
-                        candidate_env = candidate_env.add_decl((**extra).clone()).map_err(|e| {
-                            let delta_err = match e {
-                                EnvError::DuplicateDeclaration { name } => {
-                                    DeclarationDeltaError::AdditionConflictsWithBase { name }
-                                }
-                                _ => DeclarationDeltaError::ExtensionStateChanged,
-                            };
-                            ModuleApplyCandidateError::DeclarationDelta(delta_err)
-                        })?;
+        let staged_outcome = prepare_module_apply_batch(preflights, base, |pos, staged_env| {
+            let mut candidate_env = staged_env.clone();
+            if let Some(pf) = preflights.get(pos) {
+                for decl in pf.transaction().declarations() {
+                    match candidate_env.try_add_decl_with_budget(
+                        (**decl).clone(),
+                        1,
+                        fln_env::pmap::CollisionBudget::UNBOUNDED,
+                    ) {
+                        Outcome::Complete(fln_env::environment::DeclAdmission::Admitted(env)) => {
+                            candidate_env = env;
+                        }
+                        Outcome::Complete(fln_env::environment::DeclAdmission::Rejected(
+                            EnvError::DuplicateDeclaration { name },
+                        )) => {
+                            return Err(ModuleApplyCandidateError::DeclarationDelta(
+                                DeclarationDeltaError::AdditionConflictsWithBase { name },
+                            ));
+                        }
+                        _ => {
+                            return Err(ModuleApplyCandidateError::DeclarationDelta(
+                                DeclarationDeltaError::ExtensionStateChanged,
+                            ));
+                        }
                     }
                 }
-                Ok(candidate_env)
-            },
-        );
+                for extra in pf.transaction().extra_declarations() {
+                    match candidate_env.try_add_decl_with_budget(
+                        (**extra).clone(),
+                        1,
+                        fln_env::pmap::CollisionBudget::UNBOUNDED,
+                    ) {
+                        Outcome::Complete(fln_env::environment::DeclAdmission::Admitted(env)) => {
+                            candidate_env = env;
+                        }
+                        Outcome::Complete(fln_env::environment::DeclAdmission::Rejected(
+                            EnvError::DuplicateDeclaration { name },
+                        )) => {
+                            return Err(ModuleApplyCandidateError::DeclarationDelta(
+                                DeclarationDeltaError::AdditionConflictsWithBase { name },
+                            ));
+                        }
+                        _ => {
+                            return Err(ModuleApplyCandidateError::DeclarationDelta(
+                                DeclarationDeltaError::ExtensionStateChanged,
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(candidate_env)
+        });
 
         match staged_outcome {
             Outcome::Complete(Ok(staged_batch)) => Outcome::complete(Ok(Self {

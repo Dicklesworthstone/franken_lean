@@ -64,7 +64,13 @@ impl LocalContext {
     }
 
     /// Add a parameter declaration (non-let binder).
-    pub fn add_param(&mut self, id: FVarId, user_name: Name, type_: Expr, binder_info: BinderInfo) -> &LocalDecl {
+    pub fn add_param(
+        &mut self,
+        id: FVarId,
+        user_name: Name,
+        type_: Expr,
+        binder_info: BinderInfo,
+    ) -> &LocalDecl {
         let index = self.decls.len();
         self.decls.push(LocalDecl {
             id,

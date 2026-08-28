@@ -3,8 +3,8 @@
 //! Models defeq constraints, typing obligations, typeclass synthesis goals,
 //! and delayed assignments with targeted wake-up on metavariable assignment.
 
-use std::collections::{HashMap, HashSet};
 use fln_core::expr::{Expr, FVarId, MVarId};
+use std::collections::{HashMap, HashSet};
 
 /// Unique identifier for a postponed constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -20,7 +20,11 @@ pub enum ConstraintKind {
     /// Synthetic typeclass instance synthesis goal.
     SynthInstance { class: Expr, mvar: MVarId },
     /// Higher-order delayed assignment resolution.
-    DelayedAssign { mvar: MVarId, fvars: Vec<FVarId>, val: Expr },
+    DelayedAssign {
+        mvar: MVarId,
+        fvars: Vec<FVarId>,
+        val: Expr,
+    },
 }
 
 /// A postponed constraint with its dependency signature and depth.
@@ -59,20 +63,31 @@ impl ConstraintQueue {
     }
 
     /// Enqueue a new constraint, automatically indexing the metavariables it reads.
-    pub fn enqueue(&mut self, kind: ConstraintKind, reads_mvars: HashSet<MVarId>, depth: u32) -> ConstraintId {
+    pub fn enqueue(
+        &mut self,
+        kind: ConstraintKind,
+        reads_mvars: HashSet<MVarId>,
+        depth: u32,
+    ) -> ConstraintId {
         let id = ConstraintId(self.next_id);
         self.next_id += 1;
 
         for mvar in &reads_mvars {
-            self.mvar_to_constraints.entry(mvar.clone()).or_default().insert(id);
+            self.mvar_to_constraints
+                .entry(mvar.clone())
+                .or_default()
+                .insert(id);
         }
 
-        self.constraints.insert(id, Constraint {
+        self.constraints.insert(
             id,
-            kind,
-            reads_mvars,
-            depth,
-        });
+            Constraint {
+                id,
+                kind,
+                reads_mvars,
+                depth,
+            },
+        );
 
         id
     }
@@ -90,10 +105,10 @@ impl ConstraintQueue {
             if let Some(constraint) = self.constraints.remove(&id) {
                 // Remove from other mvar indices
                 for other_mvar in &constraint.reads_mvars {
-                    if other_mvar != mvar {
-                        if let Some(set) = self.mvar_to_constraints.get_mut(other_mvar) {
-                            set.remove(&id);
-                        }
+                    if other_mvar != mvar
+                        && let Some(set) = self.mvar_to_constraints.get_mut(other_mvar)
+                    {
+                        set.remove(&id);
                     }
                 }
                 woke_up.push(constraint);

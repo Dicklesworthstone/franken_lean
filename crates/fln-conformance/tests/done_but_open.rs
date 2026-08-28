@@ -419,10 +419,9 @@ fn json_str_field(line: &str, field: &str) -> Option<String> {
     let needle_with_space = format!("\"{field}\": \"");
     let (start, needle_len) = if let Some(pos) = line.find(&needle_no_space) {
         (pos + needle_no_space.len(), needle_no_space.len())
-    } else if let Some(pos) = line.find(&needle_with_space) {
-        (pos + needle_with_space.len(), needle_with_space.len())
     } else {
-        return None;
+        let pos = line.find(&needle_with_space)?;
+        (pos + needle_with_space.len(), needle_with_space.len())
     };
     let _ = needle_len;
     let rest = &line[start..];

@@ -34,9 +34,12 @@ pub mod universe;
 pub use constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};
 pub use decision::{DecisionLedger, DecisionRecord};
 pub use info::{Info, InfoNode, InfoTree, InfoTreeBuilder};
-pub use lctx::{LocalDecl, LocalContext};
+pub use lctx::{LocalContext, LocalDecl};
 pub use messages::{Message, MessageLog, MessageSeverity};
-pub use mvar::{AssignmentJustification, DelayedAssignment, MetavarAssignment, MetavarDecl, MetavarError, MetavarKind, MetavarStore};
+pub use mvar::{
+    AssignmentJustification, DelayedAssignment, MetavarAssignment, MetavarDecl, MetavarError,
+    MetavarKind, MetavarStore,
+};
 pub use txn::{ElabBudget, ElabTxn, TxnCheckpoint, TxnOutcome};
 pub use universe::UniverseStore;
 

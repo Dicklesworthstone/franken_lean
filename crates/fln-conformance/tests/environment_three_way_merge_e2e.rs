@@ -31,7 +31,7 @@ use fln_env::combined_state::{
 };
 use fln_env::lifecycle::ProvenanceLifecycleLimits;
 use fln_env::module_apply::{
-    ModuleApplyLimits, ModuleApplyTransaction, prepare_module_apply, preflight_module_apply,
+    ModuleApplyLimits, ModuleApplyTransaction, preflight_module_apply, prepare_module_apply,
 };
 use fln_env::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, ModuleEpoch, ModuleId,
@@ -59,7 +59,9 @@ fn load_census_state() -> AttributeState {
             census_path.display()
         )
     });
-    AttributeState::from_census(&text).expect("attribute state census must parse cleanly").0
+    AttributeState::from_census(&text)
+        .expect("attribute state census must parse cleanly")
+        .0
 }
 
 fn name(s: &str) -> Name {
@@ -113,20 +115,10 @@ fn apply_module_with_digest(
     let mut manifest_records = base.module_state().manifest().records().to_vec();
     manifest_records.push(contrib.clone());
     let manifest = Arc::new(
-        ModuleProvenanceManifest::new(
-            epoch,
-            manifest_records,
-            ModuleProvenanceLimits::default(),
-        )
-        .unwrap(),
+        ModuleProvenanceManifest::new(epoch, manifest_records, ModuleProvenanceLimits::default())
+            .unwrap(),
     );
-    let txn = ModuleApplyTransaction::new(
-        manifest,
-        contrib,
-        vec![],
-        vec![],
-        vec![],
-    );
+    let txn = ModuleApplyTransaction::new(manifest, contrib, vec![], vec![], vec![]);
     let preflight = preflight_module_apply(txn, &ModuleApplyLimits::default()).unwrap();
     let mod_plan = match prepare_module_apply(
         &preflight,
@@ -198,14 +190,25 @@ fn disjoint_branches_three_way_merge_combines_declarations_attributes_and_proven
         other => panic!("expected successful merge preflight, got {other:?}"),
     };
 
-    assert!(!plan.has_conflicts(), "disjoint branches must have no conflicts");
+    assert!(
+        !plan.has_conflicts(),
+        "disjoint branches must have no conflicts"
+    );
 
     let merged = plan.apply(&ours).expect("merge apply succeeds");
     assert!(merged.verify().is_ok());
 
     // Both attributes must be present in the merged state
-    assert!(merged.attribute_state().has_attr(&name("unbox"), &name("BranchA.lemma1")));
-    assert!(merged.attribute_state().has_attr(&name("nospecialize"), &name("BranchB.lemma2")));
+    assert!(
+        merged
+            .attribute_state()
+            .has_attr(&name("unbox"), &name("BranchA.lemma1"))
+    );
+    assert!(
+        merged
+            .attribute_state()
+            .has_attr(&name("nospecialize"), &name("BranchB.lemma2"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +223,8 @@ fn conflicting_same_name_different_value_declarations_detected_and_refused() {
 
     // Both branches try to declare the same module with conflicting digests
     let ours = apply_module_with_digest(&base, "ConflictMod", "ConflictMod.decl", "unbox", 1);
-    let theirs = apply_module_with_digest(&base, "ConflictMod", "ConflictMod.decl", "nospecialize", 2);
+    let theirs =
+        apply_module_with_digest(&base, "ConflictMod", "ConflictMod.decl", "nospecialize", 2);
 
     let limits = ProvenanceLifecycleLimits::default();
     let merge_outcome =
@@ -231,9 +235,15 @@ fn conflicting_same_name_different_value_declarations_detected_and_refused() {
         other => panic!("expected merge plan outcome, got {other:?}"),
     };
 
-    assert!(plan.has_conflicts(), "conflicting same-module branches must report conflicts");
     assert!(
-        matches!(plan.apply(&ours), Err(CombinedMergeApplyError::ConflictsPresent(_))),
+        plan.has_conflicts(),
+        "conflicting same-module branches must report conflicts"
+    );
+    assert!(
+        matches!(
+            plan.apply(&ours),
+            Err(CombinedMergeApplyError::ConflictsPresent(_))
+        ),
         "apply must refuse when conflicts are present"
     );
 }
@@ -286,7 +296,10 @@ fn conflicting_concurrent_attribute_assignments_detected() {
         other => panic!("expected preflight result, got {other:?}"),
     };
 
-    assert!(plan.has_conflicts(), "concurrent distinct attribute assignments must conflict");
+    assert!(
+        plan.has_conflicts(),
+        "concurrent distinct attribute assignments must conflict"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +349,10 @@ fn idempotent_same_value_additions_on_both_branches_merge_cleanly() {
         other => panic!("expected clean preflight, got {other:?}"),
     };
 
-    assert!(!plan.has_conflicts(), "identical attribute additions must not conflict");
+    assert!(
+        !plan.has_conflicts(),
+        "identical attribute additions must not conflict"
+    );
     let merged = plan.apply(&ours).expect("merge apply succeeds");
     assert!(merged.attribute_state().has_attr(&name("unbox"), &target));
 }
@@ -357,7 +373,8 @@ fn cancellation_during_merge_preflight_returns_typed_inconclusive() {
     let limits = ProvenanceLifecycleLimits::default();
     let probe = TestCancelProbe(AtomicBool::new(true));
 
-    let outcome = CombinedProvenanceMergePlan::preflight(&base, &ours, &theirs, &limits, Some(&probe));
+    let outcome =
+        CombinedProvenanceMergePlan::preflight(&base, &ours, &theirs, &limits, Some(&probe));
     match outcome {
         Outcome::Inconclusive(inc) => {
             assert!(matches!(
@@ -390,7 +407,10 @@ fn stale_or_mismatched_base_roots_yield_typed_merge_refusals() {
     let outcome = CombinedProvenanceMergePlan::preflight(&base, &ours, &theirs, &limits, None);
     match outcome {
         Outcome::Complete(Ok(plan)) => {
-            assert!(plan.has_conflicts(), "mismatched epoch branches must report conflicts");
+            assert!(
+                plan.has_conflicts(),
+                "mismatched epoch branches must report conflicts"
+            );
         }
         Outcome::Complete(Err(_)) => {}
         other => panic!("expected error or conflicts on mismatched epoch merge, got {other:?}"),
@@ -406,14 +426,25 @@ fn schedule_independence_matrix_1_8_32_threads() {
     let epoch = pinned_epoch();
     let census = load_census_state();
     let base = Arc::new(CombinedState::from_epoch(epoch, census).unwrap());
-    let ours = Arc::new(apply_module(&base, "MatrixOurs", "MatrixOurs.decl", "unbox"));
-    let theirs = Arc::new(apply_module(&base, "MatrixTheirs", "MatrixTheirs.decl", "nospecialize"));
+    let ours = Arc::new(apply_module(
+        &base,
+        "MatrixOurs",
+        "MatrixOurs.decl",
+        "unbox",
+    ));
+    let theirs = Arc::new(apply_module(
+        &base,
+        "MatrixTheirs",
+        "MatrixTheirs.decl",
+        "nospecialize",
+    ));
 
     let limits = ProvenanceLifecycleLimits::default();
-    let baseline_plan = match CombinedProvenanceMergePlan::preflight(&base, &ours, &theirs, &limits, None) {
-        Outcome::Complete(Ok(p)) => p,
-        other => panic!("baseline preflight failed: {other:?}"),
-    };
+    let baseline_plan =
+        match CombinedProvenanceMergePlan::preflight(&base, &ours, &theirs, &limits, None) {
+            Outcome::Complete(Ok(p)) => p,
+            other => panic!("baseline preflight failed: {other:?}"),
+        };
     let baseline_merged = baseline_plan.apply(&ours).expect("baseline apply succeeds");
     let baseline_root = baseline_merged.combined_root();
 
@@ -427,7 +458,9 @@ fn schedule_independence_matrix_1_8_32_threads() {
 
             let handle = thread::spawn(move || {
                 let limits = ProvenanceLifecycleLimits::default();
-                let plan = match CombinedProvenanceMergePlan::preflight(&base_c, &ours_c, &theirs_c, &limits, None) {
+                let plan = match CombinedProvenanceMergePlan::preflight(
+                    &base_c, &ours_c, &theirs_c, &limits, None,
+                ) {
                     Outcome::Complete(Ok(p)) => p,
                     other => panic!("thread preflight failed: {other:?}"),
                 };
@@ -440,7 +473,10 @@ fn schedule_independence_matrix_1_8_32_threads() {
 
         for handle in handles {
             let root = handle.join().expect("thread join");
-            assert_eq!(root, baseline_root, "schedule independence invariant violated");
+            assert_eq!(
+                root, baseline_root,
+                "schedule independence invariant violated"
+            );
         }
     }
 }
@@ -451,14 +487,15 @@ fn schedule_independence_matrix_1_8_32_threads() {
 
 #[test]
 fn single_charge_accounting_in_merge_plans() {
-    let mut usage = CombinedUsageSummary::default();
-    usage.modules_applied = 2;
-    usage.declarations_applied = 20;
-    usage.extensions_applied = 2;
-    usage.attribute_assignments = 8;
-    usage.attribute_bytes = 128;
-    usage.payload_bytes = 1024;
-    usage.index_rows = 4;
+    let usage = CombinedUsageSummary {
+        modules_applied: 2,
+        declarations_applied: 20,
+        extensions_applied: 2,
+        attribute_assignments: 8,
+        attribute_bytes: 128,
+        payload_bytes: 1024,
+        index_rows: 4,
+    };
 
     let charged = usage.single_charge();
     assert_eq!(charged.modules_applied, 2);
@@ -505,7 +542,13 @@ fn discriminative_mutants_are_killed() {
     let base = CombinedState::from_epoch(epoch, census).unwrap();
 
     let ours = apply_module_with_digest(&base, "MutantBranchA", "MutantBranchA.decl", "unbox", 1);
-    let theirs = apply_module_with_digest(&base, "MutantBranchA", "MutantBranchA.decl", "nospecialize", 2);
+    let theirs = apply_module_with_digest(
+        &base,
+        "MutantBranchA",
+        "MutantBranchA.decl",
+        "nospecialize",
+        2,
+    );
 
     let limits = ProvenanceLifecycleLimits::default();
     let plan = match CombinedProvenanceMergePlan::preflight(&base, &ours, &theirs, &limits, None) {
@@ -515,7 +558,10 @@ fn discriminative_mutants_are_killed() {
 
     // Mutant: Ignoring conflicts and applying anyway is killed by ConflictsPresent error
     assert!(
-        matches!(plan.apply(&ours), Err(CombinedMergeApplyError::ConflictsPresent(_))),
+        matches!(
+            plan.apply(&ours),
+            Err(CombinedMergeApplyError::ConflictsPresent(_))
+        ),
         "mutant attempting to apply conflicting plan must be killed"
     );
 }

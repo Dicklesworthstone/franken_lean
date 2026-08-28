@@ -89,9 +89,7 @@ pub enum TxnOutcome {
         obligations: Vec<MVarId>,
     },
     /// 5. Fork into deterministic alternatives.
-    Fork {
-        alternatives_count: usize,
-    },
+    Fork { alternatives_count: usize },
 }
 
 /// A checkpoint of parent state before spawning a child transaction.
@@ -169,7 +167,9 @@ impl ElabTxn {
         let mut forks = Vec::with_capacity(count);
         let mut current_seed = self.seed;
         for i in 0..count {
-            current_seed = current_seed.wrapping_mul(6364136223846793005).wrapping_add((i as u64) + 1);
+            current_seed = current_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add((i as u64) + 1);
             let mut fork_txn = self.clone();
             fork_txn.seed = current_seed;
             fork_txn.decisions.record(DecisionRecord::TransactionFork {
@@ -223,11 +223,16 @@ impl ElabTxn {
                 self.verify_no_state_leaks(checkpoint)?;
                 Ok(None)
             }
-            TxnOutcome::ExposeCandidate { candidate, obligations: _ } => {
+            TxnOutcome::ExposeCandidate {
+                candidate,
+                obligations: _,
+            } => {
                 // Return candidate expression; verify that uncommitted state is not leaked
                 Ok(Some(candidate))
             }
-            TxnOutcome::Fork { alternatives_count: _ } => {
+            TxnOutcome::Fork {
+                alternatives_count: _,
+            } => {
                 // Fork points are recorded in decision ledger
                 Ok(None)
             }

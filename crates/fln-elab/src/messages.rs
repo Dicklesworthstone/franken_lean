@@ -85,11 +85,15 @@ impl MessageLog {
     }
 
     pub fn has_errors(&self) -> bool {
-        self.messages.iter().any(|m| m.severity == MessageSeverity::Error)
+        self.messages
+            .iter()
+            .any(|m| m.severity == MessageSeverity::Error)
     }
 
     pub fn has_warnings(&self) -> bool {
-        self.messages.iter().any(|m| m.severity == MessageSeverity::Warning)
+        self.messages
+            .iter()
+            .any(|m| m.severity == MessageSeverity::Warning)
     }
 
     pub fn append(&mut self, other: &mut MessageLog) {

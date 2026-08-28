@@ -35,8 +35,8 @@ use fln_env::module_apply::{
     ModuleApplyLimits, ModuleApplyState, ModuleApplyTransaction, preflight_module_apply,
 };
 use fln_env::modules::{
-    ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport, ModuleEpoch,
-    ModuleId, ModuleRecord,
+    ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport,
+    ModuleEpoch, ModuleId, ModuleRecord,
 };
 use fln_env::provenance::{
     CaptureStatus, ModuleContributionRecord, ModuleProvenanceLimits, ModuleProvenanceManifest,
@@ -69,7 +69,8 @@ fn parse_dot_name(s: &str) -> Name {
 }
 
 fn parse_tsv_imports(path: &Path) -> BTreeMap<String, Vec<TsvImportRow>> {
-    let content = fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let content = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let mut map: BTreeMap<String, Vec<TsvImportRow>> = BTreeMap::new();
     for line in content.lines() {
         let line = line.trim();
@@ -84,9 +85,13 @@ fn parse_tsv_imports(path: &Path) -> BTreeMap<String, Vec<TsvImportRow>> {
         let import_all = cols[3].parse::<bool>().unwrap();
         let is_exported = cols[4].parse::<bool>().unwrap();
         let is_meta = cols[5].parse::<bool>().unwrap();
-        map.entry(fixture)
-            .or_default()
-            .push((index, module_name, import_all, is_exported, is_meta));
+        map.entry(fixture).or_default().push((
+            index,
+            module_name,
+            import_all,
+            is_exported,
+            is_meta,
+        ));
     }
     map
 }
@@ -113,9 +118,7 @@ fn real_pinned_fixtures_decode_and_match_c3_oracle_imports() {
     let mut total_rows = 0;
     for (fixture_name, fixture_rel_path) in fixtures {
         let fixture_path = root.join(fixture_rel_path);
-        let mod_id = ModuleId::new(parse_dot_name(
-            fixture_name.strip_suffix(".olean").unwrap(),
-        ));
+        let mod_id = ModuleId::new(parse_dot_name(fixture_name.strip_suffix(".olean").unwrap()));
         let decoded = OleanModuleAdapter::decode_file(mod_id.clone(), &fixture_path, epoch.clone())
             .unwrap_or_else(|e| panic!("failed to decode {}: {e:?}", fixture_path.display()));
 
@@ -157,7 +160,10 @@ fn real_pinned_fixtures_decode_and_match_mathlib_oracle_imports() {
     let epoch = pinned_epoch();
 
     let fixtures = [
-        ("Order.Basic.olean", "tribunal/fixtures/mathlib/Order.Basic.olean"),
+        (
+            "Order.Basic.olean",
+            "tribunal/fixtures/mathlib/Order.Basic.olean",
+        ),
         (
             "Algebra.Group.Basic.olean",
             "tribunal/fixtures/mathlib/Algebra.Group.Basic.olean",
@@ -183,9 +189,7 @@ fn real_pinned_fixtures_decode_and_match_mathlib_oracle_imports() {
     let mut total_rows = 0;
     for (fixture_name, fixture_rel_path) in fixtures {
         let fixture_path = root.join(fixture_rel_path);
-        let mod_id = ModuleId::new(parse_dot_name(
-            fixture_name.strip_suffix(".olean").unwrap(),
-        ));
+        let mod_id = ModuleId::new(parse_dot_name(fixture_name.strip_suffix(".olean").unwrap()));
         let decoded = OleanModuleAdapter::decode_file(mod_id.clone(), &fixture_path, epoch.clone())
             .unwrap_or_else(|e| panic!("failed to decode {}: {e:?}", fixture_path.display()));
 
@@ -212,7 +216,10 @@ fn real_pinned_fixtures_decode_and_match_mathlib_oracle_imports() {
         }
     }
 
-    assert_eq!(total_rows, 47, "all 47 mathlib oracle rows verified exactly");
+    assert_eq!(
+        total_rows, 47,
+        "all 47 mathlib oracle rows verified exactly"
+    );
 }
 
 #[test]
@@ -261,12 +268,7 @@ fn all_eight_import_flag_combinations_and_duplicates_preserved() {
         grade: ArtifactGrade::Verified,
     };
 
-    let record = ModuleRecord::new(
-        module_id.clone(),
-        true,
-        direct_imports.clone(),
-        evidence,
-    );
+    let record = ModuleRecord::new(module_id.clone(), true, direct_imports.clone(), evidence);
 
     assert_eq!(record.direct_imports().len(), 10);
     for (idx, imp) in record.direct_imports().iter().enumerate() {
@@ -354,14 +356,53 @@ fn module_batch_apply_plan_stages_privately_with_zero_visible_prefix_on_failure(
         Vec::new(),
     );
 
-    let c1 = ModuleContributionRecord::new(rec1, vec![decl1.name().clone()], Vec::new(), Vec::new(), comp.clone());
-    let c2 = ModuleContributionRecord::new(rec2, vec![decl2.name().clone()], Vec::new(), Vec::new(), comp.clone());
-    let c3 = ModuleContributionRecord::new(rec3, vec![decl3.name().clone()], Vec::new(), Vec::new(), comp);
+    let c1 = ModuleContributionRecord::new(
+        rec1,
+        vec![decl1.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp.clone(),
+    );
+    let c2 = ModuleContributionRecord::new(
+        rec2,
+        vec![decl2.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp.clone(),
+    );
+    let c3 = ModuleContributionRecord::new(
+        rec3,
+        vec![decl3.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp,
+    );
 
     // Chained manifests
-    let m1 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone()], ModuleProvenanceLimits::default()).unwrap());
-    let m2 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone(), c2.clone()], ModuleProvenanceLimits::default()).unwrap());
-    let m3 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone(), c2.clone(), c3.clone()], ModuleProvenanceLimits::default()).unwrap());
+    let m1 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
+    let m2 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone(), c2.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
+    let m3 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone(), c2.clone(), c3.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
 
     let txn1 = ModuleApplyTransaction::new(m1, c1, vec![decl1], Vec::new(), Vec::new());
     let txn2 = ModuleApplyTransaction::new(m2, c2, vec![decl2], Vec::new(), Vec::new());
@@ -391,7 +432,10 @@ fn module_batch_apply_plan_stages_privately_with_zero_visible_prefix_on_failure(
     assert_eq!(committed.applied_count, 3);
     assert_eq!(committed.state.graph().len(), 3);
     assert_ne!(committed.manifest_root, base_state.manifest().root());
-    assert_ne!(committed.logical_root, base_state.environment().logical_root(&KVMap::default()));
+    assert_ne!(
+        committed.logical_root,
+        base_state.environment().logical_root(&KVMap::default())
+    );
 
     // Verify zero visible prefix on mid-batch failure:
     // If we build a batch where stage 2 has a broken base (e.g. duplicate module), staging fails.
@@ -456,12 +500,29 @@ fn cancellation_at_deterministic_checkpoints_is_inconclusive_and_not_cached() {
         PayloadTransparency::Understood,
         Vec::new(),
     );
-    let c1 = ModuleContributionRecord::new(rec1, vec![decl1.name().clone()], Vec::new(), Vec::new(), comp);
-    let m1 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone()], ModuleProvenanceLimits::default()).unwrap());
+    let c1 = ModuleContributionRecord::new(
+        rec1,
+        vec![decl1.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp,
+    );
+    let m1 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
     let txn1 = ModuleApplyTransaction::new(m1, c1, vec![decl1], Vec::new(), Vec::new());
     let pf1 = preflight_module_apply(txn1, &ModuleApplyLimits::default()).unwrap();
 
-    let plan = match ModuleBatchApplyPlan::stage(&base_state, std::slice::from_ref(&pf1), vec![mod1_id.clone()]) {
+    let plan = match ModuleBatchApplyPlan::stage(
+        &base_state,
+        std::slice::from_ref(&pf1),
+        vec![mod1_id.clone()],
+    ) {
         Outcome::Complete(Ok(plan)) => plan,
         _ => panic!("expected stage"),
     };
@@ -470,7 +531,12 @@ fn cancellation_at_deterministic_checkpoints_is_inconclusive_and_not_cached() {
     let probe = StepCancellationProbe::new(0);
     let outcome = plan.commit(&base_state, Some(&probe));
 
-    assert_eq!(outcome.cache_admission(), CacheAdmission::Refused { authority: fln_core::outcome::Authority::NonAuthoritative });
+    assert_eq!(
+        outcome.cache_admission(),
+        CacheAdmission::Refused {
+            authority: fln_core::outcome::Authority::NonAuthoritative
+        }
+    );
     match outcome {
         Outcome::Inconclusive(inc) => {
             assert!(format!("{inc:?}").contains("before-publication"));
@@ -534,11 +600,37 @@ fn schedule_independence_matrix_1_8_32_threads() {
         Vec::new(),
     );
 
-    let c1 = ModuleContributionRecord::new(rec1, vec![decl1.name().clone()], Vec::new(), Vec::new(), comp.clone());
-    let c2 = ModuleContributionRecord::new(rec2, vec![decl2.name().clone()], Vec::new(), Vec::new(), comp);
+    let c1 = ModuleContributionRecord::new(
+        rec1,
+        vec![decl1.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp.clone(),
+    );
+    let c2 = ModuleContributionRecord::new(
+        rec2,
+        vec![decl2.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp,
+    );
 
-    let m1 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone()], ModuleProvenanceLimits::default()).unwrap());
-    let m2 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone(), c2.clone()], ModuleProvenanceLimits::default()).unwrap());
+    let m1 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
+    let m2 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone(), c2.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
 
     let txn1 = ModuleApplyTransaction::new(m1, c1, vec![decl1], Vec::new(), Vec::new());
     let txn2 = ModuleApplyTransaction::new(m2, c2, vec![decl2], Vec::new(), Vec::new());
@@ -554,8 +646,16 @@ fn schedule_independence_matrix_1_8_32_threads() {
             .into_complete()
             .unwrap()
             .unwrap();
-        let res = plan.commit(&base_state, None).into_complete().unwrap().unwrap();
-        (res.manifest_root, res.logical_root, res.final_receipt.transaction_id().digest())
+        let res = plan
+            .commit(&base_state, None)
+            .into_complete()
+            .unwrap()
+            .unwrap();
+        (
+            res.manifest_root,
+            res.logical_root,
+            res.final_receipt.transaction_id().digest(),
+        )
     };
 
     let reference_roots = run_once();
@@ -572,7 +672,11 @@ fn schedule_independence_matrix_1_8_32_threads() {
                         .unwrap()
                         .unwrap();
                     let res = plan.commit(&base, None).into_complete().unwrap().unwrap();
-                    (res.manifest_root, res.logical_root, res.final_receipt.transaction_id().digest())
+                    (
+                        res.manifest_root,
+                        res.logical_root,
+                        res.final_receipt.transaction_id().digest(),
+                    )
                 })
             })
             .collect();
@@ -593,12 +697,8 @@ fn single_charge_accounting_across_all_planes() {
     let epoch = pinned_epoch();
     let mod_id = ModuleId::new(Name::str(Name::anonymous(), "Init.BinderNameHint"));
     let fixture_path = root.join("tribunal/fixtures/c3/Init.BinderNameHint.olean");
-    let decoded = OleanModuleAdapter::decode_file(
-        mod_id,
-        &fixture_path,
-        epoch,
-    )
-    .expect("decode Init.BinderNameHint");
+    let decoded = OleanModuleAdapter::decode_file(mod_id, &fixture_path, epoch)
+        .expect("decode Init.BinderNameHint");
 
     let mut summary = ModuleBatchUsageSummary::default();
     summary.accumulate(&decoded);
@@ -646,8 +746,21 @@ fn mutant_kills_stale_base_and_partial_publication() {
         PayloadTransparency::Understood,
         Vec::new(),
     );
-    let c1 = ModuleContributionRecord::new(rec1, vec![decl1.name().clone()], Vec::new(), Vec::new(), comp);
-    let m1 = Arc::new(ModuleProvenanceManifest::new(epoch.clone(), vec![c1.clone()], ModuleProvenanceLimits::default()).unwrap());
+    let c1 = ModuleContributionRecord::new(
+        rec1,
+        vec![decl1.name().clone()],
+        Vec::new(),
+        Vec::new(),
+        comp,
+    );
+    let m1 = Arc::new(
+        ModuleProvenanceManifest::new(
+            epoch.clone(),
+            vec![c1.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
     let txn1 = ModuleApplyTransaction::new(m1, c1, vec![decl1], Vec::new(), Vec::new());
     let pf1 = preflight_module_apply(txn1, &ModuleApplyLimits::default()).unwrap();
 

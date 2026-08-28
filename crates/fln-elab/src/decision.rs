@@ -38,10 +38,7 @@ pub enum DecisionRecord {
         num_alternatives: usize,
     },
     /// Child transaction rolled back.
-    TransactionRollback {
-        branch_id: usize,
-        reason: String,
-    },
+    TransactionRollback { branch_id: usize, reason: String },
 }
 
 /// Append-only ledger recording elaboration decisions.

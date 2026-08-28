@@ -37,10 +37,12 @@ use fln_env::combined_state::{
 };
 use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
 use fln_env::environment::Environment;
-use fln_env::extensions::{CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance};
+use fln_env::extensions::{
+    CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
+};
 use fln_env::module_apply::{
     ModuleApplyLimits, ModuleApplyState, ModuleApplyTransaction, PreflightedModuleApply,
-    prepare_module_apply, preflight_module_apply,
+    preflight_module_apply, prepare_module_apply,
 };
 use fln_env::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, ModuleEpoch, ModuleGraph,
@@ -117,7 +119,9 @@ fn declaration_candidate_for(
 ) -> Environment {
     let mut env = base.environment().clone();
     for decl in preflight.transaction().declarations() {
-        env = env.add_decl((**decl).clone()).expect("declaration is valid");
+        env = env
+            .add_decl((**decl).clone())
+            .expect("declaration is valid");
     }
     for decl in preflight.transaction().extra_declarations() {
         env = env
@@ -221,19 +225,12 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
             }
         }
     }
-    let base_graph = ModuleGraph::new(
-        epoch.clone(),
-        ModuleGraphLimits::default(),
-    )
-    .into_admitted_value()
-    .unwrap();
+    let base_graph = ModuleGraph::new(epoch.clone(), ModuleGraphLimits::default())
+        .into_admitted_value()
+        .unwrap();
     let base_manifest = Arc::new(
-        ModuleProvenanceManifest::new(
-            epoch.clone(),
-            vec![],
-            ModuleProvenanceLimits::default(),
-        )
-        .unwrap(),
+        ModuleProvenanceManifest::new(epoch.clone(), vec![], ModuleProvenanceLimits::default())
+            .unwrap(),
     );
     let base_module_state =
         ModuleApplyState::from_parts(base_env, base_graph, base_manifest).unwrap();
@@ -294,14 +291,13 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
             .expect("preflight module apply");
 
         let candidate_env = declaration_candidate_for(&preflight, combined_state.module_state());
-        let mod_plan = match prepare_module_apply(
-            &preflight,
-            combined_state.module_state(),
-            &candidate_env,
-        ) {
-            Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(p))) => *p,
-            other => panic!("failed on {fixture_name}: expected prepared module apply plan, got {other:?}"),
-        };
+        let mod_plan =
+            match prepare_module_apply(&preflight, combined_state.module_state(), &candidate_env) {
+                Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(p))) => *p,
+                other => panic!(
+                    "failed on {fixture_name}: expected prepared module apply plan, got {other:?}"
+                ),
+            };
 
         // Prepare attribute assignments targeting decoded constants
         let mut assignments = Vec::new();
@@ -338,10 +334,7 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
             resulting_state.verify().is_ok(),
             "resulting combined state must remain internally consistent"
         );
-        assert_eq!(
-            resulting_state.module_state().manifest().records().len(),
-            1
-        );
+        assert_eq!(resulting_state.module_state().manifest().records().len(), 1);
     }
 }
 
@@ -478,7 +471,9 @@ fn opaque_and_requires_handler_queries_return_typed_grade() {
     let census_state = load_census_state();
 
     // `class` is a core attribute with requires-handler-provisional in census
-    let q_class = census_state.dispatch(&name("class")).expect("class dispatch");
+    let q_class = census_state
+        .dispatch(&name("class"))
+        .expect("class dispatch");
     match q_class {
         QueryResult::RequiresHandler(RequiresHandler { row_id, grade }) => {
             assert!(
@@ -518,12 +513,7 @@ fn staged_closure_atomicity_and_zero_visible_prefix_on_failure() {
 
     // Stage 1: ModA
     let mod_id_a = ModuleId::new(name("ModA"));
-    let mod_rec_a = ModuleRecord::new(
-        mod_id_a.clone(),
-        true,
-        vec![],
-        make_evidence(epoch.clone()),
-    );
+    let mod_rec_a = ModuleRecord::new(mod_id_a.clone(), true, vec![], make_evidence(epoch.clone()));
     let contrib_a = ModuleContributionRecord::new(
         mod_rec_a,
         vec![name("ModA.c1")],
@@ -540,20 +530,11 @@ fn staged_closure_atomicity_and_zero_visible_prefix_on_failure() {
         .unwrap(),
     );
     let c1 = make_axiom(name("ModA.c1"));
-    let txn_a = ModuleApplyTransaction::new(
-        manifest_a,
-        contrib_a,
-        vec![c1.clone()],
-        vec![],
-        vec![],
-    );
+    let txn_a =
+        ModuleApplyTransaction::new(manifest_a, contrib_a, vec![c1.clone()], vec![], vec![]);
     let preflight_a = preflight_module_apply(txn_a, &ModuleApplyLimits::default()).unwrap();
     let candidate_a = declaration_candidate_for(&preflight_a, base.module_state());
-    let mod_plan_a = match prepare_module_apply(
-        &preflight_a,
-        base.module_state(),
-        &candidate_a,
-    ) {
+    let mod_plan_a = match prepare_module_apply(&preflight_a, base.module_state(), &candidate_a) {
         Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(p))) => *p,
         other => panic!("expected prepared mod plan A, got {other:?}"),
     };
@@ -607,12 +588,7 @@ fn cancellation_at_deterministic_checkpoints_is_typed_inconclusive() {
     let base = CombinedState::from_epoch(epoch.clone(), census_state).unwrap();
 
     let mod_id = ModuleId::new(name("CancelMod"));
-    let mod_rec = ModuleRecord::new(
-        mod_id.clone(),
-        true,
-        vec![],
-        make_evidence(epoch.clone()),
-    );
+    let mod_rec = ModuleRecord::new(mod_id.clone(), true, vec![], make_evidence(epoch.clone()));
     let contrib = ModuleContributionRecord::new(
         mod_rec,
         vec![name("CancelMod.c1")],
@@ -629,20 +605,10 @@ fn cancellation_at_deterministic_checkpoints_is_typed_inconclusive() {
         .unwrap(),
     );
     let c1 = make_axiom(name("CancelMod.c1"));
-    let txn = ModuleApplyTransaction::new(
-        manifest,
-        contrib,
-        vec![c1],
-        vec![],
-        vec![],
-    );
+    let txn = ModuleApplyTransaction::new(manifest, contrib, vec![c1], vec![], vec![]);
     let preflight = preflight_module_apply(txn, &ModuleApplyLimits::default()).unwrap();
     let candidate = declaration_candidate_for(&preflight, base.module_state());
-    let mod_plan = match prepare_module_apply(
-        &preflight,
-        base.module_state(),
-        &candidate,
-    ) {
+    let mod_plan = match prepare_module_apply(&preflight, base.module_state(), &candidate) {
         Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(p))) => *p,
         other => panic!("expected prepared mod plan, got {other:?}"),
     };
@@ -732,20 +698,15 @@ fn schedule_independence_matrix_1_8_32_threads() {
                     vec![],
                     vec![],
                 );
-                let preflight =
-                    preflight_module_apply(txn, &ModuleApplyLimits::default()).unwrap();
-                let candidate =
-                    declaration_candidate_for(&preflight, base_clone.module_state());
-                let mod_plan = match prepare_module_apply(
-                    &preflight,
-                    base_clone.module_state(),
-                    &candidate,
-                ) {
-                    Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(p))) => {
-                        *p
-                    }
-                    other => panic!("expected prepared mod plan, got {other:?}"),
-                };
+                let preflight = preflight_module_apply(txn, &ModuleApplyLimits::default()).unwrap();
+                let candidate = declaration_candidate_for(&preflight, base_clone.module_state());
+                let mod_plan =
+                    match prepare_module_apply(&preflight, base_clone.module_state(), &candidate) {
+                        Outcome::Complete(Ok(
+                            fln_env::module_apply::ModuleApplyPlan::Prepared(p),
+                        )) => *p,
+                        other => panic!("expected prepared mod plan, got {other:?}"),
+                    };
 
                 let attr_plan = AttributeStatePlan::cut(
                     base_clone.attribute_state(),
@@ -872,12 +833,7 @@ fn discriminative_mutants_are_killed() {
     let base = CombinedState::from_epoch(epoch.clone(), census_state).unwrap();
 
     let mod_id = ModuleId::new(name("MutantMod"));
-    let mod_rec = ModuleRecord::new(
-        mod_id.clone(),
-        true,
-        vec![],
-        make_evidence(epoch.clone()),
-    );
+    let mod_rec = ModuleRecord::new(mod_id.clone(), true, vec![], make_evidence(epoch.clone()));
     let contrib = ModuleContributionRecord::new(
         mod_rec,
         vec![name("MutantMod.c1")],
@@ -894,20 +850,10 @@ fn discriminative_mutants_are_killed() {
         .unwrap(),
     );
     let c1 = make_axiom(name("MutantMod.c1"));
-    let txn = ModuleApplyTransaction::new(
-        manifest,
-        contrib,
-        vec![c1],
-        vec![],
-        vec![],
-    );
+    let txn = ModuleApplyTransaction::new(manifest, contrib, vec![c1], vec![], vec![]);
     let preflight = preflight_module_apply(txn, &ModuleApplyLimits::default()).unwrap();
     let candidate = declaration_candidate_for(&preflight, base.module_state());
-    let mod_plan = match prepare_module_apply(
-        &preflight,
-        base.module_state(),
-        &candidate,
-    ) {
+    let mod_plan = match prepare_module_apply(&preflight, base.module_state(), &candidate) {
         Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(p))) => *p,
         other => panic!("expected prepared mod plan, got {other:?}"),
     };
@@ -935,7 +881,10 @@ fn discriminative_mutants_are_killed() {
     );
 
     assert!(
-        matches!(prep_res, Err(CombinedPrepareError::StaleAttributePlan { .. })),
+        matches!(
+            prep_res,
+            Err(CombinedPrepareError::StaleAttributePlan { .. })
+        ),
         "stale attribute plan must be refused with StaleAttributePlan"
     );
 }
