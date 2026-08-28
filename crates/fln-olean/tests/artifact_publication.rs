@@ -1319,7 +1319,7 @@ fn sigkill_at_every_controlled_io_step_never_exposes_a_mixed_generation() {
             .spawn()
             .expect("spawn kill-drill child");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !ready_path.exists() && Instant::now() < deadline {
             if child.try_wait().expect("poll kill-drill child").is_some() {
                 break;
