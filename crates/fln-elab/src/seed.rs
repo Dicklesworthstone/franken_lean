@@ -409,6 +409,25 @@ pub fn nat_ble_seed_declaration() -> Declaration {
     nat_binary_to_bool_seed_declaration("ble")
 }
 
+/// Construct the exact `Nat.decLe : Nat -> Nat -> Bool` candidate recognized by
+/// the bounded compiler bridge and matched to the pin's `extern:Nat.decLe`
+/// row. This is the *decision-procedure* spelling, distinct from the `ble`
+/// axiom; the bounded bridge routes both through the same exec path.
+pub fn nat_dec_le_seed_declaration() -> Declaration {
+    nat_binary_to_bool_seed_declaration("decLe")
+}
+
+/// Construct the exact `Nat.decLt : Nat -> Nat -> Bool` candidate recognized by
+/// the bounded compiler bridge and matched to the pin's `extern:Nat.decLt`
+/// row. The decision-procedure spelling is the canonical "less than" for the
+/// bounded source facade; like `Nat.decLe`, it lowers through the same
+/// exec path the kernel already exercises.
+pub fn nat_dec_lt_seed_declaration() -> Declaration {
+    nat_binary_to_bool_seed_declaration("decLt")
+}
+
+
+
 /// Construct the exact `String.append : String -> String -> String` candidate
 /// recognized by the bounded compiler bridge.
 pub fn string_append_seed_declaration() -> Declaration {
@@ -525,6 +544,10 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
         Some(nat_beq_seed_declaration())
     } else if name == &Name::from_components(["Nat", "ble"]) {
         Some(nat_ble_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "decLe"]) {
+        Some(nat_dec_le_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "decLt"]) {
+        Some(nat_dec_lt_seed_declaration())
     } else if name == &Name::from_components(["String", "append"]) {
         Some(string_append_seed_declaration())
     } else if name == &Name::from_components(["String", "length"]) {
@@ -542,7 +565,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 23] {
+pub fn source_seed_declarations() -> [Declaration; 25] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
@@ -566,6 +589,8 @@ pub fn source_seed_declarations() -> [Declaration; 23] {
         string_utf8_byte_size_seed_declaration(),
         nat_beq_seed_declaration(),
         nat_ble_seed_declaration(),
+        nat_dec_le_seed_declaration(),
+        nat_dec_lt_seed_declaration(),
         string_dec_eq_seed_declaration(),
     ]
 }
@@ -661,7 +686,9 @@ mod tests {
         assert_eq!(declarations[19], string_utf8_byte_size_seed_declaration());
         assert_eq!(declarations[20], nat_beq_seed_declaration());
         assert_eq!(declarations[21], nat_ble_seed_declaration());
-        assert_eq!(declarations[22], string_dec_eq_seed_declaration());
+        assert_eq!(declarations[22], nat_dec_le_seed_declaration());
+        assert_eq!(declarations[23], nat_dec_lt_seed_declaration());
+        assert_eq!(declarations[24], string_dec_eq_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"

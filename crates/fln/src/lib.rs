@@ -5028,7 +5028,7 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             Some("Nat.add"),
         ),
         "Nat.log2" | "Nat.pred" => (vec![ValueType::Nat], ValueType::Nat, Some("Nat.pred")),
-        "Nat.beq" | "Nat.ble" => (
+        "Nat.beq" | "Nat.ble" | "Nat.decLe" | "Nat.decLt" => (
             vec![ValueType::Nat, ValueType::Nat],
             ValueType::Bool,
             Some("Nat.beq"),

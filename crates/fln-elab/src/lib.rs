@@ -883,6 +883,8 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
         ("term_<<<_", "<<<", ["Nat", "shiftLeft"]),
         ("term_>>>_", ">>>", ["Nat", "shiftRight"]),
         ("term_^_", "^", ["Nat", "pow"]),
+        ("term_<=_", "<=", ["Nat", "decLe"]),
+        ("term_<_", "<", ["Nat", "decLt"]),
     ];
     for (syntax_kind, spelling, constant) in rows {
         if kind == &Name::str(Name::anonymous(), syntax_kind) {

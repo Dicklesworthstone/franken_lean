@@ -236,6 +236,8 @@ enum BoundedInfix {
     NatShiftLeft,
     NatShiftRight,
     NatPow,
+    NatDecLe,
+    NatDecLt,
 }
 
 impl BoundedInfix {
@@ -254,9 +256,10 @@ impl BoundedInfix {
             Self::NatShiftLeft => "<<<",
             Self::NatShiftRight => ">>>",
             Self::NatPow => "^",
+            Self::NatDecLe => "<=",
+            Self::NatDecLt => "<",
         }
     }
-
     const fn precedence(self) -> u8 {
         match self {
             Self::ScalarBeq => 50,
@@ -267,6 +270,7 @@ impl BoundedInfix {
             Self::NatMul | Self::NatDiv | Self::NatMod => 70,
             Self::NatShiftLeft | Self::NatShiftRight => 75,
             Self::NatPow => 80,
+            Self::NatDecLe | Self::NatDecLt => 50,
         }
     }
 
@@ -431,14 +435,14 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "def", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+", "-", "++", "*",
-        "/", "%", "<<<", ">>>", "^",
+        "/", "%", "<<<", ">>>", "^", "<=", "<",
     ])
 }
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^",
-        "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^",
+        "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<",
     ])
 }
 
@@ -456,7 +460,8 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "++" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::StringAppend),
         "*" => Some(BoundedInfix::NatMul),
         "/" => Some(BoundedInfix::NatDiv),
-        "%" => Some(BoundedInfix::NatMod),
+        "<=" => Some(BoundedInfix::NatDecLe),
+        "<" => Some(BoundedInfix::NatDecLt),
         "<<<" => Some(BoundedInfix::NatShiftLeft),
         ">>>" => Some(BoundedInfix::NatShiftRight),
         "^" => Some(BoundedInfix::NatPow),
@@ -1986,6 +1991,8 @@ mod nat_definition_tests {
             "1 <<< 2",
             "1 >>> 2",
             "1 ^ 2",
+            "1 <= 2",
+            "1 < 2",
             "\"franken\" ++ \"lean\"",
         ] {
             let source = format!("def answer := {expression}");
