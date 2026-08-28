@@ -5028,10 +5028,15 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             Some("Nat.add"),
         ),
         "Nat.log2" | "Nat.pred" => (vec![ValueType::Nat], ValueType::Nat, Some("Nat.pred")),
-        "Nat.beq" | "Nat.ble" | "Nat.decLe" | "Nat.decLt" => (
+        "Nat.beq" | "Nat.ble" => (
             vec![ValueType::Nat, ValueType::Nat],
             ValueType::Bool,
             Some("Nat.beq"),
+        ),
+        "Nat.decLe" | "Nat.decLt" => (
+            vec![ValueType::Nat, ValueType::Nat],
+            ValueType::Bool,
+            None,
         ),
         "String.append" => (
             vec![ValueType::String, ValueType::String],
@@ -9517,7 +9522,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 26);
+        assert_eq!(engine.environment().len(), 28);
         assert!(
             engine
                 .environment()
@@ -9628,7 +9633,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 28);
+        assert_eq!(completed.engine.environment().len(), 30);
     }
 
     #[test]
@@ -12604,6 +12609,58 @@ mod tests {
             !engine
                 .environment()
                 .contains(&Name::from_components(["answer"]))
+        );
+    }
+
+    /// End-to-end test that the bounded source's new `<=` and `<` infix
+    /// spellings reach the VM and produce the right Bool. Exercises the full
+    /// source → K1 → independent checker → FIR → FLBC → Golem path with the
+    /// decision-procedure extern rows that were previously unbridged in the
+    /// bounded source bridge.
+    #[test]
+    fn bounded_source_supports_nat_le_and_lt_infix_end_to_end() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let sources: [&[u8]; 5] = [
+            b"def lt_pos : Bool := 1 < 2",
+            b"def lt_eq : Bool := 2 < 2",
+            b"def le_pos : Bool := 1 <= 2",
+            b"def le_eq : Bool := 2 <= 2",
+            b"def le_neg : Bool := 3 <= 2",
+        ];
+        let completed = engine
+            .execute_source_definitions(&sources, &options, test_limits())
+            .expect("the bounded source reaches Golem for every comparison shape")
+            .into_complete()
+            .expect("the bounded batch answers completely");
+        let vm_exits: Vec<_> = completed
+            .executions
+            .iter()
+            .map(|execution| {
+                let VmExit::Returned(returned) = &execution.exit else {
+                    panic!("the bounded comparison must return normally");
+                };
+                assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
+                let scalar = returned.value.unbox();
+                assert!(scalar == 0 || scalar == 1, "Bool must be 0 or 1, got {scalar}");
+                scalar
+            })
+            .collect();
+        assert_eq!(vm_exits, vec![1, 0, 1, 1, 0], "1<2, 2<2, 1<=2, 2<=2, 3<=2");
+        // The published engine now holds every comparison; the seed
+        // additionally exposes Nat.decLe and Nat.decLt by name.
+        assert!(
+            engine.environment().len() <= completed.engine.environment().len(),
+            "the published snapshot must extend the seed"
+        );
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["lt_pos"]))
         );
     }
 }
