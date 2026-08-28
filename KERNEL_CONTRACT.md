@@ -33,38 +33,38 @@ Dispatcher: `infer_type_core` switches on the expression kind and memoizes per
 `infer_only` mode.
 
 ### KR-100 · Preconditions — closed terms, resource hook
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:270 (infer_type_core) expect="infer_type_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:289 (infer_type_core) expect="infer_type_core"
 fixtures: stub owner=franken_lean-z6c
 Every inference first rejects loose bound variables ("replace them with free
 variables before invoking") and runs the counted resource hook (KR-400). Terms
 reaching the kernel are closed with respect to de Bruijn variables.
 
 ### KR-101 · Bound variables are unreachable
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:287 (infer_type_core) expect="BVar"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:306 (infer_type_core) expect="BVar"
 fixtures: stub owner=franken_lean-z6c
 Given KR-100 and binder telescoping (KR-106/107/108), a raw `bvar` at the dispatcher
 is an internal invariant violation, not a user-reachable state.
 
 ### KR-102 · Free variables
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:84 (infer_fvar) expect="infer_fvar"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:103 (infer_fvar) expect="infer_fvar"
 fixtures: stub owner=franken_lean-z6c
 An `fvar` types as the type recorded in its local-context declaration; an unknown
 free variable is an error.
 
 ### KR-103 · Metavariables are rejected
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:286 (infer_type_core) expect="MVar"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:305 (infer_type_core) expect="MVar"
 fixtures: stub owner=franken_lean-z6c
 The kernel never types a metavariable: elaboration artifacts must be fully
 instantiated before admission.
 
 ### KR-104 · Sort
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:289 (infer_type_core) expect="Sort"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:308 (infer_type_core) expect="Sort"
 fixtures: stub owner=franken_lean-z6c
 `Sort u : Sort (u+1)`. In checking mode, `u` must reference only declared universe
 parameters (KR-140).
 
 ### KR-105 · Constants
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:92 (infer_constant) expect="infer_constant"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:111 (infer_constant) expect="infer_constant"
 fixtures: stub owner=franken_lean-z6c
 `c.{ls}` requires the level-argument count to equal the declaration's
 level-parameter count (both modes). In checking mode additionally: the unsafe
@@ -72,7 +72,7 @@ quarantine (KR-975), the partial quarantine (KR-976), and KR-140 on every level.
 The type is the declaration's type with parameters instantiated by `ls`.
 
 ### KR-106 · Application
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:163 (infer_app) expect="infer_app"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:182 (infer_app) expect="infer_app"
 fixtures: stub owner=franken_lean-z6c
 Checking mode: the head's type is forced to a Π (via whnf; else "function
 expected"); the argument's inferred type must be defeq to the domain (else "app type
@@ -82,14 +82,14 @@ mode walks the spine peeling syntactic Πs without the defeq domain checks. The
 mode for its duration.
 
 ### KR-107 · Lambda
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:116 (infer_lambda) expect="infer_lambda"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:135 (infer_lambda) expect="infer_lambda"
 fixtures: stub owner=franken_lean-z6c
 Telescoped: each domain (checking mode) must be a sort; the body is inferred under
 the extended local context; the result is the Π-abstraction of the body type over
 the telescope, after a cheap beta-reduction of the body type.
 
 ### KR-108 · Dependent function types — the imax rule
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:134 (infer_pi) expect="infer_pi"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:153 (infer_pi) expect="infer_pi"
 fixtures: crates/fln-conformance/fixtures/core_observables.txt
 `Π (x : A), B` where `A : Sort u` and `B : Sort v` types as
 `Sort (imax u v)`, right-folded over the telescope. With KR-500's
@@ -97,24 +97,24 @@ fixtures: crates/fln-conformance/fixtures/core_observables.txt
 sort even in infer-only mode (the universe is needed).
 
 ### KR-109 · Let
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:198 (infer_let) expect="infer_let"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:217 (infer_let) expect="infer_let"
 fixtures: stub owner=franken_lean-z6c
 Telescoped with value-carrying local declarations: in checking mode the declared
 type must be a sort and the value's inferred type defeq to it ("def type
 mismatch"). The body types under the extended context.
 
 ### KR-110 · Literals
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:282 (infer_type_core) expect="Lit"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:301 (infer_type_core) expect="Lit"
 fixtures: stub owner=franken_lean-z6c
 A `Nat` literal types as `Nat`; a `String` literal as `String`. No premises.
 
 ### KR-111 · Metadata is transparent
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:283 (infer_type_core) expect="MData"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:302 (infer_type_core) expect="MData"
 fixtures: stub owner=franken_lean-z6c
 `mdata m e` types as `e`.
 
 ### KR-112 · Projections
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:221 (infer_proj) expect="infer_proj"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:240 (infer_proj) expect="infer_proj"
 fixtures: stub owner=franken_lean-z6c
 `proj I idx s`: the whnf of `s`'s type must be `I As` where `I` is an inductive with
 exactly one constructor and `|As| = nparams + nindices`. The projected type is the
@@ -127,7 +127,7 @@ see KR-901.
 ## 2. Weak-head normalization (KR-2xx)
 
 ### KR-200 · The whnf strategy
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:641 (whnf) expect="whnf"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:660 (whnf) expect="whnf"
 fixtures: stub owner=franken_lean-z6c
 Outer loop over: `whnf_core` (no delta), then native reduction (KR-318), then Nat
 literal acceleration (KR-313), then one delta unfolding (KR-309's machinery); loop
@@ -135,33 +135,33 @@ until stable; positive results cached. Easy kinds (`bvar/sort/mvar/pi/lit`) retu
 immediately and are never cached.
 
 ### KR-201 · whnf-core performs no delta
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:401 (whnf_core) expect="whnf_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:420 (whnf_core) expect="whnf_core"
 fixtures: stub owner=franken_lean-z6c
 `whnf_core` handles metadata stripping, let-fvar zeta, beta, let-zeta, projection
 reduction, and recursor dispatch — never definition unfolding and never normalizer
 extensions. Results cache only when neither cheap flag is set.
 
 ### KR-202 · Beta
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:443 (whnf_core) expect="App"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:462 (whnf_core) expect="App"
 fixtures: stub owner=franken_lean-z6c
 Multi-argument beta in one batch: peel as many lambda binders as arguments are
 available, instantiate, and continue reducing the residual application.
 
 ### KR-203 · Zeta — let and let-bound fvars
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:474 (whnf_core) expect="Let"
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:348 (whnf_fvar) expect="whnf_fvar"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:493 (whnf_core) expect="Let"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:367 (whnf_fvar) expect="whnf_fvar"
 fixtures: stub owner=franken_lean-z6c
 `let x := v; b` reduces to `b[v/x]`; a let-bound free variable unfolds to its
 recorded value.
 
 ### KR-204 · Projection reduction
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:359 (reduce_proj_core) expect="reduce_proj_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:378 (reduce_proj_core) expect="reduce_proj_core"
 fixtures: stub owner=franken_lean-z6c
 `proj I idx (mk As fs)` reduces to field `idx` (i.e. argument `nparams + idx`).
 A `String` literal scrutinee is first expanded to its constructor form.
 
 ### KR-205 · Recursor dispatch
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:333 (reduce_recursor) expect="reduce_recursor"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:352 (reduce_recursor) expect="reduce_recursor"
 fixtures: stub owner=franken_lean-z6c
 When the application head is stable, quotient computation (KR-955) is tried first
 (when initialized), then inductive iota (KR-316). Unfolds are recorded in
@@ -174,61 +174,61 @@ diagnostics when enabled (never limiting; KR-404).
 Entry: `is_def_eq`, with positive results cached in the equivalence manager.
 
 ### KR-300 · Resource hook and quick equality
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1056 (is_def_eq_core) expect="is_def_eq_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1085 (is_def_eq_core) expect="is_def_eq_core"
 fixtures: stub owner=franken_lean-z6c
 Every defeq query runs the counted resource hook, then the quick check.
 
 ### KR-301 · Quick structural/hash equality
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:740 (quick_is_def_eq) expect="quick_is_def_eq"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:759 (quick_is_def_eq) expect="quick_is_def_eq"
 fixtures: stub owner=franken_lean-z6c
 Pointer/structural/cached equality via the equivalence manager; same-kind fast
 paths: bindings (KR-302), sorts by level equivalence (KR-303), metadata by payload,
 literals by value.
 
 ### KR-302 · Binder congruence
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:690 (is_def_eq_binding) expect="is_def_eq_binding"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:709 (is_def_eq_binding) expect="is_def_eq_binding"
 fixtures: stub owner=franken_lean-z6c
 Π/λ compare domain-wise then body-wise under a fresh local (introduced only when
 the bound variable occurs).
 
 ### KR-303 · Level equality
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:719 (is_def_eq) expect="is_def_eq"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:738 (is_def_eq) expect="is_def_eq"
 fixtures: crates/fln-conformance/fixtures/core_observables.txt
 Sorts are defeq iff their levels are equivalent under level normalization (KR-500).
 
 ### KR-304 · The decide shortcut
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1066 (is_def_eq_core) expect="m_eager_reduce"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1096 (is_def_eq_core) expect="m_eager_reduce"
 fixtures: stub owner=franken_lean-z6c
 When the left side is closed (or eager reduction is on) and the right side is the
 constant `Bool.true`, a full whnf of the left side deciding to `Bool.true` closes
 the query.
 
 ### KR-305 · Cheap normalization, projections deferred
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1079 (is_def_eq_core) expect="whnf_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1109 (is_def_eq_core) expect="whnf_core"
 fixtures: stub owner=franken_lean-z6c
 Both sides normalize without delta and with projection unfolding deferred, so
 `a.i ≟ b.i` can first try `a ≟ b`.
 
 ### KR-306 · Definitional proof irrelevance in Prop
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:836 (is_def_eq_proof_irrel) expect="is_def_eq_proof_irrel"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:855 (is_def_eq_proof_irrel) expect="is_def_eq_proof_irrel"
 fixtures: stub owner=franken_lean-z6c
 If the type of the left side is a proposition, the two terms are defeq iff their
 types are defeq. The sole condition is `is_prop` of the type.
 
 ### KR-307 · The lazy-delta ladder
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:973 (lazy_delta_reduction) expect="lazy_delta_reduction"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:992 (lazy_delta_reduction) expect="lazy_delta_reduction"
 fixtures: stub owner=franken_lean-z6c
 Loop: Nat offset check (KR-308); Nat/native literal reduction on closed sides; one
 lazy delta step (KR-309); repeat until decided or stable.
 
 ### KR-308 · Nat successor offsets
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:961 (is_def_eq_offset) expect="is_def_eq_offset"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:980 (is_def_eq_offset) expect="is_def_eq_offset"
 fixtures: stub owner=franken_lean-z6c
 `Nat.succ`-shaped sides (including literals > 0 viewed as successors) compare by
 peeling predecessors — large literals never unfold unarily.
 
 ### KR-309 · Delta ordering by definitional height
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:884 (lazy_delta_reduction_step) expect="lazy_delta_reduction_step"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:903 (lazy_delta_reduction_step) expect="lazy_delta_reduction_step"
 fixtures: stub owner=franken_lean-z6c
 When only one side has an unfoldable head, unfold it — except that a projection
 application on the other side unfolds first. When both are unfoldable, the
@@ -239,20 +239,20 @@ Reducibility *attributes* never change kernel behavior — only the recorded hin
 (height) do; this is the reducibility-independence law.
 
 ### KR-310 · Post-delta syntactic closure
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1094 (is_def_eq_core) expect="is_constant"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1124 (is_def_eq_core) expect="is_constant"
 fixtures: stub owner=franken_lean-z6c
 Same-name constants with equivalent levels, identical fvars, and same-index
 projections (whose scrutinees compare under lazy projection reduction) close the
 query.
 
 ### KR-311 · Application congruence
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:815 (is_def_eq_app) expect="is_def_eq_app"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:834 (is_def_eq_app) expect="is_def_eq_app"
 fixtures: stub owner=franken_lean-z6c
 After a full-whnf projection retry, applications compare head-and-args pointwise.
 
 ### KR-312 · Eta — functions and structures
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:778 (try_eta_expansion_core) expect="try_eta_expansion_core"
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:793 (try_eta_struct_core) expect="try_eta_struct_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:797 (try_eta_expansion_core) expect="try_eta_expansion_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:812 (try_eta_struct_core) expect="try_eta_struct_core"
 fixtures: stub owner=franken_lean-z6c
 Function eta: a lambda against a non-lambda eta-expands the non-lambda through its
 Π-type, both directions. Structure eta: `t ≟ mk as fs` for a one-constructor,
@@ -260,7 +260,7 @@ non-recursive, index-free structure holds when the types agree and every field
 `fᵢ` is defeq to `t.i`, both directions.
 
 ### KR-313 · Nat literal acceleration — the exact operation set
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:609 (reduce_nat) expect="reduce_nat"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:628 (reduce_nat) expect="reduce_nat"
 fixtures: stub owner=franken_lean-z6c
 On `Nat` literals the kernel computes: `succ`, `add`, `sub`, `mul`, `div`, `mod`,
 `gcd`, `pow` (exponent capped at 2^24), `beq`, `ble`, `land`, `lor`, `xor`,
@@ -269,13 +269,13 @@ lists `blt`; at this pin there is no `Nat.blt` acceleration — only `beq`/`ble`
 Gated on closed terms (or eager reduction).
 
 ### KR-314 · String literal rules
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1030 (try_string_lit_expansion_core) expect="try_string_lit_expansion_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1059 (try_string_lit_expansion_core) expect="try_string_lit_expansion_core"
 fixtures: stub owner=franken_lean-z6c
 A `String` literal is defeq to its `String.ofList` constructor form, both
 directions; projection and recursor machinery expand literals the same way.
 
 ### KR-315 · Unit-like eta
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1044 (is_def_eq_unit_like) expect="is_def_eq_unit_like"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1073 (is_def_eq_unit_like) expect="is_def_eq_unit_like"
 fixtures: stub owner=franken_lean-z6c
 Two terms of the same one-constructor, zero-field structure type are defeq when
 their types are.
@@ -300,7 +300,7 @@ expected constructor type is replaced by the nullary constructor — reduction
 without matching the syntactic proof.
 
 ### KR-318 · Native reduction hooks
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:546 (reduce_native) expect="reduce_native"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:565 (reduce_native) expect="reduce_native"
 fixtures: stub owner=franken_lean-z6c
 `Lean.reduceBool` / `Lean.reduceNat` evaluate via the compiled evaluator — the
 `native_decide` trust surface. FrankenLean preserves the semantics and marks every
@@ -311,17 +311,17 @@ dependent theorem in provenance (plan §Limitations).
 ## 4. Resource accounting (KR-4xx) — counted, never semantic
 
 ### KR-400 · Inference hook
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:274 (infer_type_core) expect="check_system"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:293 (infer_type_core) expect="check_system"
 fixtures: stub owner=franken_lean-z6c
 Every inference node counts.
 
 ### KR-401 · Normalization hook
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:402 (whnf_core) expect="check_system"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:421 (whnf_core) expect="check_system"
 fixtures: stub owner=franken_lean-z6c
 Every whnf-core entry counts.
 
 ### KR-402 · Defeq hook
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1057 (is_def_eq_core) expect="check_system"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:1087 (is_def_eq_core) expect="check_system"
 fixtures: stub owner=franken_lean-z6c
 Every defeq query counts.
 
@@ -335,7 +335,7 @@ stack probe. In FrankenLean, every such exhaustion is a typed `KernelInconclusiv
 (FL-INV-07): a verdict about the run, never about the term.
 
 ### KR-404 · Diagnostics are never limits
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:497 (unfold_definition_core) expect="unfold_definition_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:516 (unfold_definition_core) expect="unfold_definition_core"
 fixtures: stub owner=franken_lean-z6c
 Unfold counting is instrumentation only; no diagnostic state may influence a
 verdict.
@@ -486,24 +486,24 @@ name and field count.
 ## 9. Structures and projections (KR-9xx)
 
 ### KR-900 · Projection typing
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:221 (infer_proj) expect="infer_proj"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:240 (infer_proj) expect="infer_proj"
 fixtures: stub owner=franken_lean-z6c
 As KR-112: one constructor, exact arity, telescope substitution with nested
 projections for dependent fields.
 
 ### KR-901 · No data escapes Prop through projections
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:248 (infer_proj) expect="is_prop"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:267 (infer_proj) expect="is_prop"
 fixtures: stub owner=franken_lean-z6c
 Projecting from a Prop-valued structure requires every traversed dependent field
 and the projected type itself to be a Prop.
 
 ### KR-902 · Projection computation
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:359 (reduce_proj_core) expect="reduce_proj_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:378 (reduce_proj_core) expect="reduce_proj_core"
 fixtures: stub owner=franken_lean-z6c
 `(mk … aᵢ …).i ⟶ aᵢ` — see KR-204.
 
 ### KR-903 · Structure eta coherence
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:793 (try_eta_struct_core) expect="try_eta_struct_core"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:812 (try_eta_struct_core) expect="try_eta_struct_core"
 fixtures: stub owner=franken_lean-z6c
 As KR-312's structure half; the eligible class is exactly the non-recursive,
 index-free, one-constructor structures, and the same coercion feeds recursor
@@ -584,13 +584,13 @@ recursion. Opaques are checked with the ordinary safe checker even when their
 never becomes a delta-reduction rule.
 
 ### KR-975 · The unsafe quarantine
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:101 (infer_constant) expect="is_unsafe"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:120 (infer_constant) expect="is_unsafe"
 fixtures: stub owner=franken_lean-z6c
 Safe code may not reference unsafe declarations; unsafe code may reference
 anything. One-directional, no exceptions.
 
 ### KR-976 · The partial quarantine
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:105 (infer_constant) expect="partial"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:124 (infer_constant) expect="partial"
 fixtures: stub owner=franken_lean-z6c
 Safe definitions may not reference partial definitions.
 
@@ -712,7 +712,7 @@ its crate), and mutation cells proving each refusal fires with its reason. The
 fixtures live in `crates/fln-kernel/tests/admission_laundering.rs`.
 
 ### KR-987 · Non-promotion (FL-INV-07)
-anchor: vendor/lean4-src/src/kernel/type_checker.cpp:274 (infer_type_core) expect="check_system"
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:293 (infer_type_core) expect="check_system"
 fixtures: crates/fln-kernel/tests/admission_laundering.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
 `Inconclusive` and `InternalFault` mint nothing and promote to nothing: never
 `Accepted`, never `Rejected`, never a capability, never published, never cached
