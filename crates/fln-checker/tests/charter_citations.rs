@@ -43,14 +43,10 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
+    fln_core::checked_workspace_root!()
 }
 
 fn charter() -> String {

@@ -8,7 +8,7 @@
 //! is how a rule stops being tested without any test going red.
 
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use fln_checker::admit::{
     ADMISSION_SCHEMA, AdmissionBudget, AdmissionDeferred, AdmissionGround, AdmissionPhase,
@@ -11702,11 +11702,7 @@ fn the_three_non_answers_are_never_reported_as_admitted() {
 // --------------------------------------------------------------- FL-INV-02
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the crate sits two levels below the workspace root")
-        .to_path_buf()
+    fln_core::checked_workspace_root!()
 }
 
 /// Needles assembled from parts so this scanner's OWN source cannot satisfy the

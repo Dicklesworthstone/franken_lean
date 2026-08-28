@@ -436,15 +436,14 @@ impl ResidueBreach {
 /// population was converted, and the division is re-measured on every run by
 /// [`coverage_populations`] rather than inherited from this comment:
 ///
-/// * **Product-crate residue** is now the graph-blocked remainder plus the two
-///   macro-definition sites in the rank-0 host. The convertible members (`fln-hash`,
-///   `fln-olean`, `fln-parse`, `fln-verdict`, `fln-syntax`, and `fln-core`'s own pin
-///   harnesses) converted with **no graph change**. What this bullet used to claim as
-///   still blocked by address is no longer true of those members. Remaining:
-///   `fln-rt`, `fln-unsafe-region` / `fln-unsafe-abi` (D3: a boundary crate cannot
-///   depend on a product crate that would let a checked declaration be named), and
-///   `fln-checker` (a new edge plus the §8 kernel/checker allowlist). Those are still
-///   the graph owner's call — routed, not taken.
+/// * **Product-crate residue** is the two macro-definition sites in the rank-0 host
+///   plus the two boundary-crate tests that have no `fln-core` edge. `fln-rt` already
+///   depends on `fln-core`; `fln-checker` already lists it as a *dev*-dependency — both
+///   converted with **no graph change**. The §8 concern was about adding
+///   `fln-conformance` (rank 22) to checker, not about using the rank-0 host already
+///   on the crate. Remaining: `fln-unsafe-region` / `fln-unsafe-abi` (D3: a boundary
+///   crate cannot grow a product-crate edge that would let a checked declaration be
+///   named). That is still the graph owner's call — routed, not taken.
 /// * **1 site in `tribunal/epoch-lab`**, down from 11, and what the other ten cost is the
 ///   point: **nothing**. That population read as blocked because it sits in a nested
 ///   workspace the members glob never walks — `fln-bench-apparatus-empty-referent-bkw6`'s
@@ -472,22 +471,13 @@ impl ResidueBreach {
 /// slot, and that one path could then regress up to its old count silently. With the rows
 /// gone, a raw site returning to either file is [`ResidueBreach::Undeclared`] and is named.
 pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
-    // KR-974's declaration-admission rig (`franken_lean-gii.23`), landed unprotected and
-    // reddening every pane. Declared rather than converted for the reason this module's
-    // AGENTS.md row already gives about its crate: `fln-checker` is one of the three that
-    // cannot reach the checked macro without a NEW dependency edge, and its case also
-    // touches the §8 allowlist. That is a graph decision belonging to the graph's owner,
-    // not something to take while unblocking a red workspace. The row is the honest
-    // holding position and it costs a slot that a conversion reclaims.
-    ("crates/fln-checker/tests/admit.rs", 1),
-    ("crates/fln-checker/tests/charter_citations.rs", 1),
     ("crates/fln-conformance/src/tree_identity.rs", 2),
     // Macro bodies expand `env!` at the call site; the two occurrences here are the
     // definitions, hosted at rank 0 so product crates convert with no new edges
     // (bead fln-cross-tree-baked-root-k60n, same Option B as `fln-core::scratch`).
     ("crates/fln-core/src/tree_identity.rs", 2),
-    ("crates/fln-rt/tests/region_engine.rs", 1),
-    ("crates/fln-rt/tests/region_fuzz.rs", 2),
+    // Boundary crates: D3 bars a new product-crate edge that could name a checked
+    // declaration, and they do not currently depend on fln-core.
     ("crates/fln-unsafe-abi/src/tests.rs", 1),
     ("crates/fln-unsafe-region/src/tests.rs", 1),
     ("tribunal/epoch-lab/src/main.rs", 1),
@@ -1261,8 +1251,12 @@ mod tests {
             .iter()
             .filter(|(_, text)| text.contains(MANIFEST_DIR_VAR))
             .count();
+        // Conversion of a compile-time `env!` site to `checked_workspace_root!()` drops
+        // that file from this count. The floor is anti-vacuity, not a coverage target:
+        // it must stay well above a broken scan (0–2 comment-only hits) and may fall
+        // when a real residue row is converted.
         assert!(
-            carrying >= 15,
+            carrying >= 10,
             "only {carrying} tracked sources mention the manifest-dir variable at all, so the \
              per-file reconciliation ran over almost nothing and proves nothing. A scan that \
              reads almost nothing is a broken scan, not a clean tree"

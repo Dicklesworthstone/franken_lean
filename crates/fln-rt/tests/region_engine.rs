@@ -400,8 +400,8 @@ fn envelope_laws() {
 }
 
 fn fixture(name: &str) -> Option<std::path::PathBuf> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tribunal/fixtures/c3")
+    let p = fln_core::checked_workspace_root!()
+        .join("tribunal/fixtures/c3")
         .join(name);
     p.exists().then_some(p)
 }

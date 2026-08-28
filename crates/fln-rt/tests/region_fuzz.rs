@@ -113,8 +113,8 @@ fn synthetic_seed() -> Vec<u8> {
 /// fixture is present (absence is a typed limitation, not a silent pass —
 /// the synthetic corpus still runs).
 fn real_seed() -> Option<Vec<u8>> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+    let path =
+        fln_core::checked_workspace_root!().join("tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
     let file = std::fs::read(path).ok()?;
     let env = parse_olean_envelope(&file).ok()?;
     let payload_end = env.payload_offset.checked_add(env.payload_len)?;
@@ -446,8 +446,8 @@ fn hostile_envelopes_fault_typed() {
     let v2 = {
         // A minimal well-formed file image: real header laws come from the
         // generated contract, so build one valid envelope then attack it.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+        let path = fln_core::checked_workspace_root!()
+            .join("tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
         match std::fs::read(&path) {
             Ok(f) => f,
             Err(_) => {
