@@ -118,7 +118,7 @@ CENSUS_NO_MOCK_TESTS = (
 # weakening the grandfathered set therefore requires an explicit validator
 # change, not merely recomputing a self-described manifest hash.
 VERIFICATION_ADOPTION_AUTHORITY_HASH = (
-    "sha256:30b15f035857461b2798c624c2e35f52dba0626af0667c9a2f845c074729cbbc"
+    "sha256:565e8039f2fbe808cc54c2f035f212e2f13acf3e7a6f4815ca81e50760b13224"
 )
 VERIFICATION_CLAIM_TYPES = frozenset(
     {"invariant", "proof", "bounded_model", "statistical", "slo", "benchmark"}
