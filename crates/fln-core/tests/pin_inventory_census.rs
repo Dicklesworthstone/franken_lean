@@ -32,10 +32,7 @@ use fln_core::name::{LeafView, Name};
 use fln_core::options::{DataValue, KVMap, limits};
 
 fn pin_root() -> Option<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .parent()?
-        .join("vendor/lean4-src/src");
+    let root = fln_core::checked_workspace_root!().join("vendor/lean4-src/src");
     root.is_dir().then_some(root)
 }
 

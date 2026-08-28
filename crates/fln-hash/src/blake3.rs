@@ -651,10 +651,7 @@ mod tests {
     /// fails BEFORE anyone regenerates rather than after.
     #[test]
     fn the_generator_emits_the_header_this_test_pins() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root is two levels above the crate manifest");
+        let root = fln_core::checked_workspace_root!();
         const GENERATOR: &str = "scripts/extract/convert_blake3_vectors.py";
         let script = std::fs::read_to_string(root.join(GENERATOR))
             .map_err(|error| format!("cannot read {GENERATOR}: {error}"))

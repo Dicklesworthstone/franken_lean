@@ -198,11 +198,8 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
+fn workspace_root() -> PathBuf {
+    fln_core::checked_workspace_root!()
 }
 
 /// The reviewed workspace member directories, from the root `Cargo.toml` `members`
@@ -297,7 +294,7 @@ fn no_workspace_member_outside_fln_hash_names_the_raw_hasher() {
     let mut violations = Vec::new();
     let mut scanned = 0usize;
 
-    for member_dir in workspace_member_dirs(workspace) {
+    for member_dir in workspace_member_dirs(&workspace) {
         if member_dir.file_name().and_then(|n| n.to_str()) == Some("fln-hash") {
             continue;
         }
@@ -324,7 +321,7 @@ fn the_scan_covers_tools_members_not_just_crates() {
     // tools/structure-guard) must be inside the raw-hasher scan.
     let workspace = workspace_root();
     let tools_root = workspace.join("tools");
-    let tools_members: Vec<PathBuf> = workspace_member_dirs(workspace)
+    let tools_members: Vec<PathBuf> = workspace_member_dirs(&workspace)
         .into_iter()
         .filter(|m| m.starts_with(&tools_root))
         .collect();

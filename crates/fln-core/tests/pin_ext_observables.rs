@@ -202,10 +202,7 @@ fn the_fixture_was_generated_by_the_pinned_reference() {
 /// `scripts/extract/gen_core_ext_fixtures.sh --check`, run where the pin exists.
 #[test]
 fn the_generator_named_by_the_fixture_exists() {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("crates/fln-core sits two levels below the repo root");
+    let repo_root = fln_core::checked_workspace_root!();
 
     let header = FIXTURE
         .lines()

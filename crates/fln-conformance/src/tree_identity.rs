@@ -53,11 +53,9 @@
 //! mechanism whose coverage is claimed instead of measured is the defect this bead is
 //! an instance of.
 
-use std::path::{Path, PathBuf};
-
-/// The environment variable cargo sets, at compile time for `env!` and again in the
-/// environment of the process it launches.
-pub const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
+pub use fln_core::tree_identity::{
+    CrossTreeFault, MANIFEST_DIR_VAR, cross_tree_fault, manifest_dir_of, workspace_root_of,
+};
 
 /// The precise compile-time form the census counts, assembled from fragments so this
 /// module's own source does not contain it.
@@ -67,161 +65,6 @@ pub const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
 /// both are wrong. The decoy in [`needle_decoy`] is the part that must stay independent, and
 /// it derives from [`MANIFEST_DIR_VAR`] instead.
 const RAW_NEEDLE: &str = concat!("env!(\"CARGO_", "MANIFEST_DIR\")");
-
-/// Why a run cannot be trusted to describe the tree it was launched from.
-///
-/// Both variants are refusals. There is deliberately no "probably fine" outcome: a check
-/// that cannot decide must not report a pass (FL-INV-07, and the pre-commit guard's rule
-/// that nothing exits 0 on an unanswered question).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CrossTreeFault {
-    /// The binary was compiled for a different checkout than the one running it.
-    Mismatch {
-        /// The manifest dir baked in at compile time — the tree that built the binary.
-        compiled_in: String,
-        /// The manifest dir cargo set at run time — the tree that launched it.
-        invoked_from: String,
-    },
-    /// `CARGO_MANIFEST_DIR` was absent from the environment, so the invoking tree is
-    /// unknown. Cargo always sets it; its absence means the binary was launched some
-    /// other way, and the question this module exists to answer cannot be answered.
-    InvokingTreeUnknown {
-        /// The manifest dir baked in at compile time.
-        compiled_in: String,
-    },
-}
-
-impl CrossTreeFault {
-    /// The operator-facing refusal.
-    ///
-    /// It names **both** paths and the real cause. The sibling finding
-    /// `franken_lean-worktree-gitdir-refusal-hugg` is the standing argument for spending
-    /// words here: that failure blamed `ubs`, the census and `vendor/` in three different
-    /// lanes while the true line appeared once, and a message naming neither candidate
-    /// lets every reader supply whichever cause they arrived with. The observed instance
-    /// of *this* fault reports a symlink defect on a path that is a regular file in the
-    /// tree the reader is standing in, which is exactly as misleading.
-    pub fn message(&self) -> String {
-        match self {
-            Self::Mismatch {
-                compiled_in,
-                invoked_from,
-            } => format!(
-                "this test binary was COMPILED FOR A DIFFERENT CHECKOUT than the one \
-                 running it, so every path it resolves — and every verdict it reports — \
-                 describes the other tree.\n  \
-                 compiled in:  {compiled_in}\n  \
-                 invoked from: {invoked_from}\n\
-                 CARGO_TARGET_DIR is shared across checkouts on this machine, and cargo \
-                 reuses a test binary built from an identical-bytes copy of the same \
-                 package without rebuilding it. Nothing about the reused artifact is \
-                 wrong; it is simply about a different repository. Re-run with a target \
-                 directory of your own, e.g. \
-                 CARGO_TARGET_DIR=/data/tmp/cargo-target-$USER, or run from the checkout \
-                 named on the first line. Bead fln-cross-tree-baked-root-k60n."
-            ),
-            Self::InvokingTreeUnknown { compiled_in } => format!(
-                "{MANIFEST_DIR_VAR} is absent from this process's environment, so the \
-                 checkout that launched this binary is unknown and it cannot be shown to \
-                 match the one it was compiled for ({compiled_in}). Cargo always sets \
-                 this variable for the binaries it runs, so this binary was launched \
-                 some other way. Run it through cargo. Refusing rather than guessing: a \
-                 check that cannot decide must not report a pass. Bead \
-                 fln-cross-tree-baked-root-k60n."
-            ),
-        }
-    }
-}
-
-/// Compare a call site's baked manifest dir against the invoking one, without touching
-/// the environment.
-///
-/// Split out so the decision is testable at every input, including the two that cannot
-/// be produced on demand from inside a passing test run.
-///
-/// Paths are compared canonically where both sides resolve, and literally otherwise — a
-/// bake tree that has since been deleted does not canonicalize, and must still refuse
-/// rather than be excused.
-pub fn cross_tree_fault(compiled_in: &str, invoked_from: Option<&str>) -> Option<CrossTreeFault> {
-    let Some(invoked_from) = invoked_from else {
-        return Some(CrossTreeFault::InvokingTreeUnknown {
-            compiled_in: compiled_in.to_string(),
-        });
-    };
-    if same_path(compiled_in, invoked_from) {
-        return None;
-    }
-    Some(CrossTreeFault::Mismatch {
-        compiled_in: compiled_in.to_string(),
-        invoked_from: invoked_from.to_string(),
-    })
-}
-
-/// Equality up to symlink resolution, falling back to a literal comparison when a side
-/// does not resolve. Never reports equal on an unresolvable pair that differs literally.
-fn same_path(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
-    }
-    match (
-        Path::new(left).canonicalize(),
-        Path::new(right).canonicalize(),
-    ) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
-/// The calling crate's own directory, refusing a cross-tree artifact first.
-///
-/// `compiled_in` must be the **caller's** own `env!` of [`MANIFEST_DIR_VAR`]; use
-/// [`checked_manifest_dir!`] rather than passing it by hand, so the value cannot drift
-/// from the crate it is meant to describe.
-///
-/// Panics on refusal. That is the loud direction, and the right one: the alternative is a
-/// verdict about a repository nobody asked about.
-pub fn manifest_dir_of(compiled_in: &str) -> PathBuf {
-    let invoked_from = std::env::var(MANIFEST_DIR_VAR).ok();
-    if let Some(fault) = cross_tree_fault(compiled_in, invoked_from.as_deref()) {
-        panic!("{}", fault.message());
-    }
-    PathBuf::from(compiled_in)
-}
-
-/// The workspace root for a call site, refusing a cross-tree artifact first.
-///
-/// Crate-relative rigs want [`manifest_dir_of`] instead; both refuse identically, because
-/// a receipt read out of `crates/<crate>/evidence/` in the wrong checkout is exactly as
-/// wrong as a governed document read out of the wrong root.
-pub fn workspace_root_of(compiled_in: &str) -> PathBuf {
-    manifest_dir_of(compiled_in)
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("workspace root is two levels above the crate manifest")
-}
-
-/// The workspace root of the tree this run was launched from, or a refusal.
-///
-/// Expands `env!` at the call site so the check describes the *calling* target, which is
-/// the whole point — see the module docs. Use this anywhere a rig would otherwise walk
-/// up two levels from its own compile-time manifest dir.
-#[macro_export]
-macro_rules! checked_workspace_root {
-    () => {
-        $crate::tree_identity::workspace_root_of(env!("CARGO_MANIFEST_DIR"))
-    };
-}
-
-/// The calling crate's own directory in the tree this run was launched from, or a
-/// refusal. The crate-relative sibling of [`checked_workspace_root!`]; see its docs for
-/// why this expands at the call site.
-#[macro_export]
-macro_rules! checked_manifest_dir {
-    () => {
-        $crate::tree_identity::manifest_dir_of(env!("CARGO_MANIFEST_DIR"))
-    };
-}
 
 /// How much of the workspace resolves its paths through the tree check, and how much
 /// still does not — measured, never asserted.
@@ -411,6 +254,11 @@ pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
          naming the repair, and the decoy's own format string",
     ),
     (
+        "crates/fln-core/src/tree_identity.rs",
+        "rank-0 check host: the two macro definitions expand env! at the call site, and the \
+         failure prose names CARGO_MANIFEST_DIR (bead fln-cross-tree-baked-root-k60n)",
+    ),
+    (
         "crates/fln/src/lib.rs",
         "the public olean facade tests resolve the invoking crate directory at run time so a \
          shared target cannot bake another checkout's pinned artifact into the test binary",
@@ -579,27 +427,24 @@ impl ResidueBreach {
 /// commits is a rate the slack cannot absorb, and every breach names the file, so its owner
 /// is never in doubt.
 ///
-/// **What is still unconverted, by why.** `fln-conformance`'s own four sites are the two
-/// macro definitions and two unit tests that feed the compile-time value in as known-good
-/// input; they are counted rather than exempted, because a guard that excuses its own file
-/// cannot see a regression added to it. The rest divide **two** ways — it was three until
-/// the `tools/structure-guard` population was converted, and the division is re-measured
-/// on every run by [`coverage_populations`] rather than inherited from this comment:
+/// **What is still unconverted, by why.** `fln-conformance`'s own two sites are the unit
+/// tests that feed the compile-time value in as known-good input; they are counted rather
+/// than exempted, because a guard that excuses its own file cannot see a regression added
+/// to it. The macro definitions moved to rank-0 `fln-core` (same Option B as
+/// [`fln_core::scratch`]) so already-depending product crates convert with no new edge.
+/// The rest divide **two** ways — it was three until the `tools/structure-guard`
+/// population was converted, and the division is re-measured on every run by
+/// [`coverage_populations`] rather than inherited from this comment:
 ///
-/// * **19 sites in nine product crates**, blocked by a **decision about where this check
-///   lives** rather than by an architectural impossibility — this bullet said
-///   "architecturally" until `839ff2ec`, which is an *overstatement* of a sound premise and
-///   the milder of the two directions the residue prose got wrong. The premise holds:
-///   `fln-conformance` is rank 22, `checks.rs`'s layering loop iterates `actual_edges`
-///   without consulting `dep.section`, so a dev-dependency from below is scored exactly like
-///   a normal one and `FLN-STRUCT-007` refuses it. The conclusion does not: **`fln-core` is
-///   rank 0**, every one of those crates sits at or above it, and **five of the eight
-///   already declare an edge to it** — `fln-hash`, `fln-olean`, `fln-parse`, `fln-verdict`,
-///   `fln-syntax` — so they are convertible with **no graph change at all**. Only `fln-rt`,
-///   `fln-unsafe-region` and `fln-checker` need a new edge, and only `fln-checker`'s also
-///   touches the §8 kernel/checker allowlist. The block is on this check's **address**, and
-///   moving it into the rank-0 foundation crate grows that crate's exported surface, which
-///   is the graph owner's call and plan §21's — routed, not taken.
+/// * **Product-crate residue** is now the graph-blocked remainder plus the two
+///   macro-definition sites in the rank-0 host. The convertible members (`fln-hash`,
+///   `fln-olean`, `fln-parse`, `fln-verdict`, `fln-syntax`, and `fln-core`'s own pin
+///   harnesses) converted with **no graph change**. What this bullet used to claim as
+///   still blocked by address is no longer true of those members. Remaining:
+///   `fln-rt`, `fln-unsafe-region` / `fln-unsafe-abi` (D3: a boundary crate cannot
+///   depend on a product crate that would let a checked declaration be named), and
+///   `fln-checker` (a new edge plus the §8 kernel/checker allowlist). Those are still
+///   the graph owner's call — routed, not taken.
 /// * **1 site in `tribunal/epoch-lab`**, down from 11, and what the other ten cost is the
 ///   point: **nothing**. That population read as blocked because it sits in a nested
 ///   workspace the members glob never walks — `fln-bench-apparatus-empty-referent-bkw6`'s
@@ -636,22 +481,15 @@ pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     // holding position and it costs a slot that a conversion reclaims.
     ("crates/fln-checker/tests/admit.rs", 1),
     ("crates/fln-checker/tests/charter_citations.rs", 1),
-    ("crates/fln-conformance/src/tree_identity.rs", 4),
-    ("crates/fln-core/tests/pin_ext_observables.rs", 1),
-    ("crates/fln-core/tests/pin_inventory_census.rs", 1),
-    ("crates/fln-hash/src/blake3.rs", 1),
-    ("crates/fln-hash/tests/domain_enforcement.rs", 1),
-    ("crates/fln-hash/tests/schema_registry.rs", 1),
-    ("crates/fln-olean/tests/decl_decode.rs", 1),
-    ("crates/fln-olean/tests/region_read.rs", 4),
-    ("crates/fln-parse/tests/parser_category_inventory.rs", 1),
+    ("crates/fln-conformance/src/tree_identity.rs", 2),
+    // Macro bodies expand `env!` at the call site; the two occurrences here are the
+    // definitions, hosted at rank 0 so product crates convert with no new edges
+    // (bead fln-cross-tree-baked-root-k60n, same Option B as `fln-core::scratch`).
+    ("crates/fln-core/src/tree_identity.rs", 2),
     ("crates/fln-rt/tests/region_engine.rs", 1),
     ("crates/fln-rt/tests/region_fuzz.rs", 2),
-    ("crates/fln-syntax/tests/golden_vellum.rs", 1),
     ("crates/fln-unsafe-abi/src/tests.rs", 1),
     ("crates/fln-unsafe-region/src/tests.rs", 1),
-    ("crates/fln-verdict/src/checker.rs", 1),
-    ("crates/fln-verdict/tests/input_validation.rs", 1),
     ("tribunal/epoch-lab/src/main.rs", 1),
 ];
 
@@ -717,8 +555,9 @@ pub struct CoveragePopulations {
     pub product_members: usize,
     /// Raw sites in the nested `tribunal/epoch-lab` workspace.
     pub epoch_lab_raw: usize,
-    /// Raw sites in the defining module itself: the two macro definitions and the two unit
-    /// tests that feed the compile-time value in as known-good input.
+    /// Raw sites in the defining module itself: the two unit tests that feed the
+    /// compile-time value in as known-good input. The macro definitions now live in
+    /// `fln-core` and count toward the product-crate residue.
     pub defining_module_raw: usize,
     /// Raw sites no disclosed population covers. Non-empty is a refusal, not a bucket.
     pub unclassified: std::collections::BTreeMap<String, usize>,
@@ -1000,6 +839,8 @@ pub fn disclosure_breaches(row: &str, pops: &CoveragePopulations) -> Vec<Disclos
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checked_workspace_root;
+    use std::path::PathBuf;
 
     #[test]
     fn identical_dirs_are_not_a_fault() {

@@ -1407,11 +1407,7 @@ impl CensusTree {
 }
 
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("fln-verdict must remain a direct member of the workspace crates directory")
-        .to_path_buf()
+    fln_core::checked_workspace_root!()
 }
 
 fn collect_census_inputs(

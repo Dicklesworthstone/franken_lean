@@ -1209,7 +1209,7 @@ mod receipt_serialization_guard {
     }
 
     fn production_source_corpus() -> Result<String, String> {
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let source_root = fln_core::checked_manifest_dir!().join("src");
         let mut paths = Vec::new();
         collect_rust_paths(&source_root, &mut paths)?;
         paths.sort();

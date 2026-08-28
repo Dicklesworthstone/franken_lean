@@ -26,7 +26,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use fln_hash::canon::{SCHEMA_REGISTRY, SchemaOwner};
 
@@ -122,11 +122,8 @@ fn resolve_version(source: &str, text: &str) -> Option<u16> {
     rest[..end].trim().parse().ok()
 }
 
-fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
+fn workspace_root() -> PathBuf {
+    fln_core::checked_workspace_root!()
 }
 
 /// The (name, version) pairs one owner's declaration file actually declares.

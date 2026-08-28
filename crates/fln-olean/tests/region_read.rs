@@ -6,8 +6,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
-
 use fln_core::name::Name;
 use fln_olean::format;
 use fln_olean::region::{ModuleImport, OleanView, RegionError, WalkBudget};
@@ -146,8 +144,8 @@ fn synthetic_imports(rows: &[(&str, bool, bool, bool)]) -> SyntheticImports {
 }
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tribunal/fixtures/c3")
+    let path = fln_core::checked_workspace_root!()
+        .join("tribunal/fixtures/c3")
         .join(name);
     let data = std::fs::read(&path);
     assert!(
@@ -595,7 +593,7 @@ fn seeded_byteflip_sweep_never_panics_never_lies() {
 
 #[test]
 fn manifest_matches_fixture_bytes() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tribunal/fixtures/c3");
+    let dir = fln_core::checked_workspace_root!().join("tribunal/fixtures/c3");
     let manifest = std::fs::read_to_string(dir.join("MANIFEST.txt"));
     assert!(manifest.is_ok(), "missing C3 MANIFEST.txt");
     let manifest = manifest.expect("asserted above");
@@ -628,8 +626,8 @@ fn manifest_matches_fixture_bytes() {
 /// comes back sealed (region hygiene holds while the view is live).
 #[test]
 fn mapped_load_matches_by_value_load_and_is_sealed() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+    let path =
+        fln_core::checked_workspace_root!().join("tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
     if !path.exists() {
         eprintln!("SKIP (typed limitation): c3 fixture olean not present");
         return;
@@ -702,8 +700,7 @@ fn shared_audit_rejects_corruption_typed() {
     );
 
     // The mmap door enforces the same laws before sealing.
-    let dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target_local/fln-olean-seam-tests");
+    let dir = fln_core::checked_workspace_root!().join("target_local/fln-olean-seam-tests");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let corrupt_path = dir.join(format!("corrupt-{}.olean", std::process::id()));
     std::fs::write(&corrupt_path, &hot).expect("write corrupt fixture");

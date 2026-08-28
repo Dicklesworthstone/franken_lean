@@ -67,3 +67,5 @@ pub mod syntax_hygiene;
 pub mod trace_replay;
 pub mod tree_identity;
 pub mod witness;
+
+pub use fln_core::{checked_manifest_dir, checked_workspace_root};

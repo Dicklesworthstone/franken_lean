@@ -25,6 +25,9 @@
 //! workspace's single test-scratch reclaimer lives at rank 0 so every harness
 //! stands behind one fence with zero new dependency edges (bead
 //! `franken_lean-eir2`, Option B; the decision record is the module's own header).
+//! [`tree_identity`] is the same Option B for the cross-tree bake check (bead
+//! `fln-cross-tree-baked-root-k60n`): macros expand `env!` at the call site so a
+//! test binary refuses to answer for a checkout it was not compiled in.
 
 #![forbid(unsafe_code)]
 
@@ -41,3 +44,4 @@ pub mod options;
 pub mod outcome;
 pub mod pos;
 pub mod scratch;
+pub mod tree_identity;

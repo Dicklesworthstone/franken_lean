@@ -16,8 +16,8 @@ use fln_rt::abi;
 use fln_rt::region::parse_olean_envelope;
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tribunal/fixtures/c3")
+    let path = fln_core::checked_workspace_root!()
+        .join("tribunal/fixtures/c3")
         .join(name);
     let data = std::fs::read(&path);
     assert!(

@@ -30,10 +30,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INVENTORY: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/PARSER_CATEGORY_INVENTORY.txt"
-);
+fn inventory_path() -> PathBuf {
+    fln_core::checked_manifest_dir!().join("fixtures/PARSER_CATEGORY_INVENTORY.txt")
+}
 
 /// The pin's Lean source root, or `None` when the toolchain is not installed.
 fn pin_source_root() -> Option<PathBuf> {
@@ -137,7 +136,8 @@ fn declared_categories(sources: &[String]) -> Vec<String> {
 
 /// The frozen inventory, as (builtin, declared).
 fn frozen() -> (BTreeMap<String, String>, Vec<String>) {
-    let text = fs::read_to_string(INVENTORY).expect("the inventory fixture must be readable");
+    let text =
+        fs::read_to_string(inventory_path()).expect("the inventory fixture must be readable");
     let mut builtin = BTreeMap::new();
     let mut declared = Vec::new();
     for line in text.lines() {
@@ -351,7 +351,7 @@ fn every_behaviour_the_pin_uses_has_a_variant_in_our_enum() {
 /// names, and a header that names its schema.
 #[test]
 fn the_inventory_file_is_well_formed() {
-    let text = fs::read_to_string(INVENTORY).expect("readable");
+    let text = fs::read_to_string(inventory_path()).expect("readable");
     assert!(
         text.contains("fln.parser-category-inventory/1"),
         "the fixture must name its schema, so a reader knows what they are looking at"
