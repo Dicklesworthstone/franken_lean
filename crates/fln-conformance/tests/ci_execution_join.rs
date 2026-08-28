@@ -188,6 +188,7 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-lld",
     "fln-sv7x",
     "franken_lean-l8bj",
+    "franken_lean-zht",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -233,7 +234,9 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// variable per cell: pinless 97 passed / 0.05s against with-pin 97 passed / 2.76s
 /// over the whole decl_decode target. The debt shrinks when CI installs the pin or
 /// the rows migrate off the surface.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 10;
+///
+/// 10 -> 11 at franken_lean-zht's closure: cites `reference_differential::kernel_verdicts_agree_with_the_pinned_reference`.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 11;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
