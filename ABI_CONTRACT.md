@@ -4,7 +4,7 @@
 > Layout constants are derived, never remembered; regenerate with the script.
 >
 > pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35`
-> — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> — tree `15bccb750e9d73cd2a40f488bec389504a87896c`
 > — the tag and commit above are **transcribed from `SUITE.lock`** and this
 >   extractor verifies neither. The **tree is established at the producer**:
 >   every run, before anything is rendered, invokes the one predicate in this
@@ -33,7 +33,7 @@
 >   which is the one dimension in which it is NOT short where the `.olean`
 >   extractor was (bead `franken_lean-contract-pin-tree-unestablished-monc`).
 > source: `vendor/lean4-src/src/include/lean/lean.h` (3352 lines, sha256 `22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2`)
-> inventory: `contracts/abi_inventory.json` sha256 `3eefadc8e70c2fd711a95d47e033d26f7451d6066a06adbf0eedd7790d1018f6`
+> inventory: `contracts/abi_inventory.json` sha256 `7cdc15f70575baa798590e3651c2cff372d30ebed7d0bbb4bb258f4ee5b252ac`
 > rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)
 > rust (boundary): `crates/fln-unsafe-abi/src/contract.rs` (layout partition, `pub(crate)`, same inventory)
 

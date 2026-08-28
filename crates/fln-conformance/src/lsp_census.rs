@@ -2996,7 +2996,7 @@ mod tests {
         );
         assert_eq!(
             inventory.reference.tree,
-            "ba16913719a2f6a15a826918fbe6ba9dd5413e91"
+            "15bccb750e9d73cd2a40f488bec389504a87896c"
         );
         assert!(inventory.method("initialize").is_some());
         assert!(inventory.method("$/lean/plainGoal").is_some());

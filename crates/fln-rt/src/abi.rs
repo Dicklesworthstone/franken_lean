@@ -8,7 +8,7 @@
 
 /// BLAKE-independent binding to the canonical inventory this module was rendered from
 /// (SHA-256 of `contracts/abi_inventory.json`).
-pub const INVENTORY_DIGEST: &str = "3eefadc8e70c2fd711a95d47e033d26f7451d6066a06adbf0eedd7790d1018f6";
+pub const INVENTORY_DIGEST: &str = "7cdc15f70575baa798590e3651c2cff372d30ebed7d0bbb4bb258f4ee5b252ac";
 /// The Reference pin this contract is extracted from.
 pub const PIN_TAG: &str = "v4.32.0";
 pub const PIN_COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";

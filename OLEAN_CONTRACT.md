@@ -7,7 +7,7 @@
 > — tag and commit are **established here**: cross-checked against the pinned
 >   Reference binary's `lean --version` and against every pinned `.olean`
 >   artifact's `lean_version` and `githash` fields.
-> — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91` is transcribed from `SUITE.lock` and is now
+> — tree `15bccb750e9d73cd2a40f488bec389504a87896c` is transcribed from `SUITE.lock` and is now
 >   **established at the producer**: every run, before anything is
 >   rendered, invokes the one predicate in this repository that establishes
 >   it — `scripts/evidence.py vendor-binding`, the same one
@@ -34,7 +34,7 @@
 >   extractor's own path constants rather than listed, so it cannot fall
 >   behind the reads. A change to any of them is caught; a staged tree
 >   differing from the pin in a file this extractor does not read is not.
-> inventory: `contracts/olean_inventory.json` sha256 `ecd0f18e64358bb69d1ce3e2880d08f5553d2f3789df46d531988cbfe7b577dc`
+> inventory: `contracts/olean_inventory.json` sha256 `14c1203506c4838059ddda6ba90d62742a4c1e91d0bfe44ed8df193d42c7c2f6`
 > rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)
 >
 > sources:

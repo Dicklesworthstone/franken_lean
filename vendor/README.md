@@ -17,7 +17,9 @@ crate in this workspace may reference `vendor/` at build time; release CI proves
 binaries cannot locate, spawn, or link the Reference.
 
 The current snapshot is Lean `v4.32.0` at commit
-`8c9756b28d64dab099da31a4c09229a9e6a2ef35`. Its computed Git subtree is
-`ba16913719a2f6a15a826918fbe6ba9dd5413e91`, the exact tree named by that commit. The
+`8c9756b28d64dab099da31a4c09229a9e6a2ef35`. Upstream's tree at that commit was
+`ba16913719a2f6a15a826918fbe6ba9dd5413e91`. This working copy's `vendor/lean4-src`
+subtree is `15bccb750e9d73cd2a40f488bec389504a87896c` after in-tree kernel
+instrumentation (`bc8870b6`); `SUITE.lock` names that instrumented tree. The
 pin remains governed by `SUITE.lock`; future epoch changes replace it only through the
 same reviewed pin ceremony and re-run the tree-identity proof.
