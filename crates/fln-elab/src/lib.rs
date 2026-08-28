@@ -22,17 +22,23 @@
 #![forbid(unsafe_code)]
 
 pub mod constraint;
+pub mod dataflow;
 pub mod decision;
+pub mod effects;
 pub mod info;
 pub mod lctx;
 pub mod messages;
 pub mod mvar;
+pub mod perturbation;
+pub mod scheduler;
 pub mod seed;
 pub mod txn;
 pub mod universe;
 
 pub use constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};
+pub use dataflow::{CommandElabFn, CommandId, DataflowGraph, DataflowNode, ElabUnitProduct};
 pub use decision::{DecisionLedger, DecisionRecord};
+pub use effects::{CommandEffect, DeclAspect, EffectSummary};
 pub use info::{Info, InfoNode, InfoTree, InfoTreeBuilder};
 pub use lctx::{LocalContext, LocalDecl};
 pub use messages::{Message, MessageLog, MessageSeverity};
@@ -40,6 +46,8 @@ pub use mvar::{
     AssignmentJustification, DelayedAssignment, MetavarAssignment, MetavarDecl, MetavarError,
     MetavarKind, MetavarStore,
 };
+pub use perturbation::{PerturbationKind, PerturbationResult, PerturbationValidator};
+pub use scheduler::{DeterministicScheduler, ExecutionConfig, SchedulerOutput};
 pub use txn::{ElabBudget, ElabTxn, TxnCheckpoint, TxnOutcome};
 pub use universe::UniverseStore;
 
