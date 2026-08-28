@@ -21,7 +21,24 @@
 
 #![forbid(unsafe_code)]
 
+pub mod constraint;
+pub mod decision;
+pub mod info;
+pub mod lctx;
+pub mod messages;
+pub mod mvar;
 pub mod seed;
+pub mod txn;
+pub mod universe;
+
+pub use constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};
+pub use decision::{DecisionLedger, DecisionRecord};
+pub use info::{Info, InfoNode, InfoTree, InfoTreeBuilder};
+pub use lctx::{LocalDecl, LocalContext};
+pub use messages::{Message, MessageLog, MessageSeverity};
+pub use mvar::{AssignmentJustification, DelayedAssignment, MetavarAssignment, MetavarDecl, MetavarError, MetavarKind, MetavarStore};
+pub use txn::{ElabBudget, ElabTxn, TxnCheckpoint, TxnOutcome};
+pub use universe::UniverseStore;
 
 use fln_bignum::interop::literal_from_bignat;
 use fln_bignum::nat::BigNat;
