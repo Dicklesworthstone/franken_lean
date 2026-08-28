@@ -71,6 +71,10 @@ const SEEDED_REMAINDER: &[(&str, &str)] = &[
         "seeded unadjudicated",
     ),
     (
+        "franken_lean-gii",
+        "fln-checker independent checker in-progress; Prelude items 0..10 passing, indexed Eq ongoing",
+    ),
+    (
         "franken_lean-n8hw",
         "seeded unadjudicated at mechanism landing",
     ),
@@ -84,9 +88,9 @@ const SEEDED_REMAINDER: &[(&str, &str)] = &[
     ),
 ];
 
-/// Growth cap: a thirteenth deliberate entry is a decision this constant makes
+/// Growth cap: a fourteenth deliberate entry is a decision this constant makes
 /// visible in review; raising it must move with the disclosure above.
-const SEEDED_CEILING: usize = 12;
+const SEEDED_CEILING: usize = 13;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BeadRec {
