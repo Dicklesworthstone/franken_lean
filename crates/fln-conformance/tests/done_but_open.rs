@@ -413,12 +413,18 @@ fn the_done_but_open_population_is_declared_one_way_with_floors() {
 }
 
 /// Minimal JSON string-field reader for the flat tracker export: finds
-/// `"field":"value"` at top level. The export writes compact one-line records,
-/// which is the only shape this reads; a schema change breaks the parse floor
-/// above rather than silently returning wrong fields.
+/// `"field":"value"` or `"field": "value"` at top level.
 fn json_str_field(line: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let start = line.find(&needle)? + needle.len();
+    let needle_no_space = format!("\"{field}\":\"");
+    let needle_with_space = format!("\"{field}\": \"");
+    let (start, needle_len) = if let Some(pos) = line.find(&needle_no_space) {
+        (pos + needle_no_space.len(), needle_no_space.len())
+    } else if let Some(pos) = line.find(&needle_with_space) {
+        (pos + needle_with_space.len(), needle_with_space.len())
+    } else {
+        return None;
+    };
+    let _ = needle_len;
     let rest = &line[start..];
     let mut out = String::new();
     let mut chars = rest.chars();

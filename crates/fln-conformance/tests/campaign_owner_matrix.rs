@@ -41,8 +41,13 @@ fn real_bead_ids() -> BTreeSet<String> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
-            let needle = "\"id\":\"";
-            let at = l.find(needle).expect("every tracker row carries an id") + needle.len();
+            let at = if let Some(pos) = l.find("\"id\":\"") {
+                pos + 6
+            } else if let Some(pos) = l.find("\"id\": \"") {
+                pos + 7
+            } else {
+                panic!("every tracker row carries an id");
+            };
             let rest = &l[at..];
             rest[..rest.find('"').expect("the id is quoted")].to_string()
         })
