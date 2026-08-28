@@ -1447,6 +1447,10 @@ struct CorpusModule {
     imports: BTreeSet<String>,
     decoded: u64,
     oracle_skipped: u64,
+    /// One row per `reference_replay_skips` hit, so "which declaration, and
+    /// why" is answerable without re-decoding the olean (bead `fln-7odd` /
+    /// `fln-lst4`). Conserved against `oracle_skipped`.
+    oracle_skip_rows: Vec<(String, &'static str)>,
 }
 
 struct CorpusInventory {
@@ -1457,20 +1461,153 @@ struct CorpusInventory {
     fixture_hash: String,
 }
 
+/// Safety-class tokens for rows `Lean.Replay.replay` will not submit to the
+/// Reference kernel. The list is the allowlist the inventory and the scorer
+/// both consult, so a new skip kind cannot land as an anonymous count.
+const ORACLE_REPLAY_SKIP_CLASSES: &[&str] = &[
+    "axiom_unsafe",
+    "defn_unsafe",
+    "defn_partial",
+    "opaque_unsafe",
+    "induct_unsafe",
+    "ctor_unsafe",
+    "rec_unsafe",
+];
+
 /// This mirrors the exact filter in the pinned `Lean.Replay.replay`, rather
 /// than inferring oracle authority from a successful process exit. The
 /// Reference deliberately does not submit unsafe or partial constants to its
 /// kernel; those rows therefore have no oracle verdict and are unscorable.
-fn reference_replay_skips(info: &ConstantInfo) -> bool {
+fn replay_skip_safety_class(info: &ConstantInfo) -> Option<&'static str> {
     match info {
-        ConstantInfo::Axiom(value) => value.is_unsafe,
-        ConstantInfo::Defn(value) => value.safety != DefinitionSafety::Safe,
-        ConstantInfo::Thm(_) | ConstantInfo::Quot(_) => false,
-        ConstantInfo::Opaque(value) => value.is_unsafe,
-        ConstantInfo::Induct(value) => value.is_unsafe,
-        ConstantInfo::Ctor(value) => value.is_unsafe,
-        ConstantInfo::Rec(value) => value.is_unsafe,
+        ConstantInfo::Axiom(value) if value.is_unsafe => Some("axiom_unsafe"),
+        ConstantInfo::Defn(value) => match value.safety {
+            DefinitionSafety::Safe => None,
+            DefinitionSafety::Unsafe => Some("defn_unsafe"),
+            DefinitionSafety::Partial => Some("defn_partial"),
+        },
+        ConstantInfo::Thm(_) | ConstantInfo::Quot(_) => None,
+        ConstantInfo::Opaque(value) if value.is_unsafe => Some("opaque_unsafe"),
+        ConstantInfo::Induct(value) if value.is_unsafe => Some("induct_unsafe"),
+        ConstantInfo::Ctor(value) if value.is_unsafe => Some("ctor_unsafe"),
+        ConstantInfo::Rec(value) if value.is_unsafe => Some("rec_unsafe"),
+        _ => None,
     }
+}
+
+fn reference_replay_skips(info: &ConstantInfo) -> bool {
+    replay_skip_safety_class(info).is_some()
+}
+
+/// Named, classed skip rows derived from decoded constants. The inventory
+/// stores these; the scorer re-derives them from the infos it scores so a
+/// stale stored list cannot print a different set than it counted.
+fn oracle_replay_skip_rows(infos: &[ConstantInfo]) -> Vec<(String, &'static str)> {
+    infos
+        .iter()
+        .filter_map(|info| {
+            replay_skip_safety_class(info)
+                .map(|safety_class| (info.name().to_display_string(), safety_class))
+        })
+        .collect()
+}
+
+fn oracle_replay_skip_findings(module: &str, infos: &[ConstantInfo]) -> Vec<String> {
+    oracle_replay_skip_rows(infos)
+        .into_iter()
+        .map(|(declaration, safety_class)| {
+            format!(
+                "kernel_reference_corpus finding: module={module} declaration={declaration} \
+                 direction=unscorable reason=oracle_replay_skipped safety_class={safety_class}"
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn oracle_replay_skips_are_named_with_a_safety_class() {
+    use fln_env::constants::{AxiomVal, ConstantVal, OpaqueVal};
+
+    fn axiom(name: &str, is_unsafe: bool) -> ConstantInfo {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::str(Name::anonymous(), name),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            is_unsafe,
+        })
+    }
+    fn opaque(name: &str, is_unsafe: bool) -> ConstantInfo {
+        let ident = Name::str(Name::anonymous(), name);
+        ConstantInfo::Opaque(OpaqueVal {
+            base: ConstantVal {
+                name: ident.clone(),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            value: Expr::sort(Level::zero()),
+            is_unsafe,
+            all: vec![ident],
+        })
+    }
+
+    let safe_axiom = axiom("SafeAx", false);
+    let unsafe_axiom = axiom("UnsafeAx", true);
+    let safe_opaque = opaque("SafeOpaque", false);
+    let unsafe_opaque = opaque("UnsafeOpaque", true);
+
+    assert!(!reference_replay_skips(&safe_axiom));
+    assert!(!reference_replay_skips(&safe_opaque));
+    assert_eq!(
+        replay_skip_safety_class(&unsafe_axiom),
+        Some("axiom_unsafe")
+    );
+    assert_eq!(
+        replay_skip_safety_class(&unsafe_opaque),
+        Some("opaque_unsafe")
+    );
+    assert!(
+        ORACLE_REPLAY_SKIP_CLASSES.contains(&"axiom_unsafe")
+            && ORACLE_REPLAY_SKIP_CLASSES.contains(&"opaque_unsafe"),
+        "the skip-class allowlist must name every class the filter can emit"
+    );
+
+    let infos = vec![safe_axiom, unsafe_axiom, safe_opaque, unsafe_opaque];
+    assert_eq!(
+        oracle_replay_skip_rows(&infos),
+        vec![
+            ("UnsafeAx".to_string(), "axiom_unsafe"),
+            ("UnsafeOpaque".to_string(), "opaque_unsafe"),
+        ],
+        "safe rows must stay off the skip list; skipped rows must carry a name and class"
+    );
+    let findings = oracle_replay_skip_findings("TestMod", &infos);
+    assert_eq!(
+        findings.len(),
+        2,
+        "oracle skips must be one finding per declaration, not an aggregate count"
+    );
+    assert!(
+        findings[0].contains("module=TestMod")
+            && findings[0].contains("declaration=UnsafeAx")
+            && findings[0].contains("reason=oracle_replay_skipped")
+            && findings[0].contains("safety_class=axiom_unsafe"),
+        "finding must name the module, declaration, skip reason, and safety class: {}",
+        findings[0]
+    );
+    assert!(
+        findings[1].contains("declaration=UnsafeOpaque")
+            && findings[1].contains("safety_class=opaque_unsafe"),
+        "second skip must be the unsafe opaque, not a restated first row: {}",
+        findings[1]
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.contains("SafeAx") || finding.contains("SafeOpaque")),
+        "safe declarations must not be reported as oracle skips: {findings:?}"
+    );
 }
 
 fn collect_present_oleans(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -1686,6 +1823,35 @@ fn decode_corpus_module(path: &Path, name: &str) -> Result<DecodedCorpusModule, 
     })
 }
 
+fn corpus_module_from_decode(
+    name: String,
+    path: PathBuf,
+    decoded_module: DecodedCorpusModule,
+) -> Result<CorpusModule, String> {
+    let decoded = u64::try_from(decoded_module.infos.len())
+        .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
+    let oracle_skip_rows = oracle_replay_skip_rows(&decoded_module.infos);
+    let oracle_skipped = u64::try_from(oracle_skip_rows.len())
+        .map_err(|_| "oracle-skipped declaration census overflow".to_string())?;
+    debug_assert_eq!(
+        oracle_skip_rows
+            .iter()
+            .filter(|(_, class)| ORACLE_REPLAY_SKIP_CLASSES.contains(class))
+            .count(),
+        oracle_skip_rows.len(),
+        "every stored skip class must be in ORACLE_REPLAY_SKIP_CLASSES"
+    );
+    Ok(CorpusModule {
+        name,
+        path,
+        olean_hash: decoded_module.olean_hash,
+        imports: decoded_module.imports,
+        decoded,
+        oracle_skipped,
+        oracle_skip_rows,
+    })
+}
+
 fn qualify_module_name(module_prefix: Option<&str>, relative_name: String) -> String {
     module_prefix
         .map(|prefix| format!("{prefix}.{relative_name}"))
@@ -1709,23 +1875,10 @@ fn inventory_oleans(root: &Path, module_prefix: Option<&str>) -> Result<CorpusIn
         let relative_name = module_name_from_path(root, &path)?;
         let name = qualify_module_name(module_prefix, relative_name);
         let decoded_module = decode_corpus_module(&path, &name)?;
-        let infos = decoded_module.infos;
-        let decoded_here = u64::try_from(infos.len())
-            .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
-        let skipped_here = infos
-            .iter()
-            .filter(|info| reference_replay_skips(info))
-            .count() as u64;
-        let olean_hash = decoded_module.olean_hash;
-        let imports = decoded_module.imports;
-        let module = CorpusModule {
-            name: name.clone(),
-            path,
-            olean_hash: olean_hash.clone(),
-            imports,
-            decoded: decoded_here,
-            oracle_skipped: skipped_here,
-        };
+        let module = corpus_module_from_decode(name.clone(), path, decoded_module)?;
+        let decoded_here = module.decoded;
+        let skipped_here = module.oracle_skipped;
+        let olean_hash = module.olean_hash.clone();
         if modules.insert(name.clone(), module).is_some() {
             return Err(format!("duplicate present olean module {name}"));
         }
@@ -2060,6 +2213,7 @@ fn finite_leanchecker_batches_are_exact_and_preserve_every_required_module() {
                     imports: BTreeSet::new(),
                     decoded,
                     oracle_skipped: 0,
+                    oracle_skip_rows: Vec::new(),
                 },
             )
         })
@@ -3580,6 +3734,21 @@ fn score_accepted_reference_module(
         unscorable: module.oracle_skipped,
         ..CorpusCounts::default()
     };
+    let skip_rows = oracle_replay_skip_rows(decoded_infos);
+    assert_eq!(
+        skip_rows, module.oracle_skip_rows,
+        "{}: scored oracle-skip rows must match the inventory rows, not a restated count",
+        module.name
+    );
+    assert_eq!(
+        skip_rows.len() as u64,
+        module.oracle_skipped,
+        "{}: per-declaration oracle skips must conserve the stored skip count",
+        module.name
+    );
+    for finding in oracle_replay_skip_findings(&module.name, decoded_infos) {
+        eprintln!("{finding}");
+    }
     for (item, outcome) in prep.items.iter().zip(&run.outcomes) {
         let mut applicable_members = Vec::new();
         for (member_index, name) in item.member_indices.iter().zip(&item.member_names) {
@@ -4141,6 +4310,41 @@ fn present_olean_corpus_inventory_is_closed_and_honest() {
         inventory.oracle_skipped, 3_612,
         "Lean.Replay applicability census moved; never count skipped rows as accepted"
     );
+    let skip_row_total = inventory
+        .modules
+        .values()
+        .map(|module| module.oracle_skip_rows.len() as u64)
+        .sum::<u64>();
+    assert_eq!(
+        skip_row_total, inventory.oracle_skipped,
+        "oracle skip names must conserve the skip census; an aggregate-only skip set is the 7odd gap"
+    );
+    for module in inventory.modules.values() {
+        assert_eq!(
+            module.oracle_skip_rows.len() as u64,
+            module.oracle_skipped,
+            "{}: skip rows must conserve that module's skip count",
+            module.name
+        );
+        let mut seen = BTreeSet::new();
+        for (declaration, safety_class) in &module.oracle_skip_rows {
+            assert!(
+                !declaration.is_empty(),
+                "{}: an oracle skip row must name the declaration",
+                module.name
+            );
+            assert!(
+                ORACLE_REPLAY_SKIP_CLASSES.contains(safety_class),
+                "{}: skip class `{safety_class}` for `{declaration}` is not in ORACLE_REPLAY_SKIP_CLASSES",
+                module.name
+            );
+            assert!(
+                seen.insert(declaration),
+                "{}: oracle skip declaration `{declaration}` appears twice",
+                module.name
+            );
+        }
+    }
     assert_eq!(
         order.len(),
         inventory.modules.len(),
@@ -15088,15 +15292,17 @@ fn whole_mathlib_kernel_differential() {
     );
 }
 
-/// The executable corpus obligation. It remains ignored while fln-7odd is
-/// open because the selected oracle itself supplies no verdict for 3,612
-/// decoded rows; enabling a gate that is known to fail before that contract is
-/// decided would make every ordinary `cargo test` unusable. Run explicitly:
+/// The executable corpus obligation. Oracle-skipped unsafe/partial rows are a
+/// 7odd-classified bound on the Reference replay filter, not a harness
+/// failure; they are named per declaration and excluded from the compared
+/// denominator. The remaining `subject_no_answer` rows are owned by
+/// `fln-4hol`. Enabling this gate while those remain would make every
+/// ordinary `cargo test` unusable. Run explicitly:
 ///
 /// `cargo test -p fln-conformance --test kernel_replay \
 ///  pinned_present_olean_kernel_differential -- --ignored --exact --nocapture`
 #[test]
-#[ignore = "blocked by fln-7odd: leanchecker skips unsafe and partial declarations"]
+#[ignore = "remaining subject_no_answer rows are owned by fln-4hol; 7odd-classified oracle skips are reported per declaration and are not a gate failure"]
 fn pinned_present_olean_kernel_differential() {
     let reference_lib =
         reference_lib().expect("pinned Reference stdlib required for the live corpus differential");
@@ -15535,8 +15741,9 @@ fn run_accepted_corpus_kernel_differential(
         "restrictive disagreements require repair or an explicit justified D23 row"
     );
     assert_eq!(
-        total.unscorable, 0,
-        "a non-answer from either side agrees with nothing"
+        total.subject_no_answer, 0,
+        "a subject non-answer agrees with nothing; remaining rows are owned by fln-4hol. \
+         7odd-classified oracle skips stay in `oracle_skipped` and are not a gate failure"
     );
 }
 
@@ -15554,8 +15761,9 @@ fn run_accepted_corpus_kernel_differential(
 /// in the run".
 ///
 /// **No oracle is involved, deliberately.** Comparing our own stream digests across widths
-/// needs no Reference verdict at all, so this lane is reachable while `fln-7odd` keeps
-/// `pinned_present_olean_kernel_differential` ignored. Removing that attribute to get a
+/// needs no Reference verdict at all, so this lane is reachable while
+/// `pinned_present_olean_kernel_differential` stays ignored for `fln-4hol`'s
+/// remaining subject non-answers. Removing that attribute to get a
 /// matrix running would have coupled the matrix half to the oracle half for no reason.
 ///
 /// **What a green run earns, stated because the whole bead is about not overclaiming.**
@@ -19733,31 +19941,16 @@ fn closure_inventory_from_seeds(
         let path = chosen_module_file(roots, &name)
             .ok_or_else(|| format!("no provisioned olean for import {name}"))?;
         let decoded_module = decode_corpus_module(&path, &name)?;
-        let infos = decoded_module.infos;
-        let decoded_here = u64::try_from(infos.len())
-            .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
-        let skipped_here = infos
-            .iter()
-            .filter(|info| reference_replay_skips(info))
-            .count() as u64;
-        let olean_hash = decoded_module.olean_hash;
-        let imports = decoded_module.imports;
-        for import in &imports {
+        let module = corpus_module_from_decode(name.clone(), path, decoded_module)?;
+        let decoded_here = module.decoded;
+        let skipped_here = module.oracle_skipped;
+        let olean_hash = module.olean_hash.clone();
+        for import in &module.imports {
             if !modules.contains_key(import) {
                 queue.push(import.clone());
             }
         }
-        modules.insert(
-            name.clone(),
-            CorpusModule {
-                name: name.clone(),
-                path,
-                olean_hash: olean_hash.clone(),
-                imports,
-                decoded: decoded_here,
-                oracle_skipped: skipped_here,
-            },
-        );
+        modules.insert(name.clone(), module);
         decoded = decoded
             .checked_add(decoded_here)
             .ok_or_else(|| "decoded declaration census overflow".to_string())?;
