@@ -460,6 +460,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "++" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::StringAppend),
         "*" => Some(BoundedInfix::NatMul),
         "/" => Some(BoundedInfix::NatDiv),
+        "%" => Some(BoundedInfix::NatMod),
         "<=" => Some(BoundedInfix::NatDecLe),
         "<" => Some(BoundedInfix::NatDecLt),
         "<<<" => Some(BoundedInfix::NatShiftLeft),
