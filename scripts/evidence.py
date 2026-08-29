@@ -662,6 +662,7 @@ E2E_STEP_ORDERS = {
         "isolate_candidate",
         "failure_list",
         "complete_evidence_pass",
+        "cancelled_candidate_refused",
         "hidden_dependency_refused",
         "stale_root_refused",
         "restore",

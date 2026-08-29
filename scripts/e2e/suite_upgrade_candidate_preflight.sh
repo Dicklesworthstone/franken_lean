@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # suite_upgrade_candidate_preflight.sh — refuse an incomplete suite-upgrade
 # candidate before the governed no-mock runner is allowed to derive roots or
-# invoke Cargo/Tribunal work. This is deliberately a preflight, not an
-# evidence-bundle lane: no real candidate evidence bundle exists at HEAD yet.
+# invoke Cargo/Tribunal work. The no-mock lane (`suite_upgrade_no_mock_e2e.sh`)
+# is the evidence producer; this helper is the identity+content join it drives.
 
 set -Eeuo pipefail
 
@@ -100,6 +100,7 @@ external_evidence_root="$(digest "$CANDIDATE_DIR/external-evidence.ndjson")"
 FLN_SUITE_UPGRADE_RECEIPT_PATH="$CANDIDATE_DIR/candidate-receipt.ndjson" \
 FLN_SUITE_UPGRADE_CANDIDATE_LOCK_PATH="$CANDIDATE_DIR/SUITE.lock" \
 FLN_SUITE_UPGRADE_CLOSURE_PATH="$CANDIDATE_DIR/closure.ndjson" \
+FLN_SUITE_UPGRADE_CANCELLED="${FLN_SUITE_UPGRADE_CANCELLED:-}" \
 FLN_SUITE_UPGRADE_CURRENT_LOCK_ROOT="$current_lock_root" \
 FLN_SUITE_UPGRADE_CANDIDATE_LOCK_ROOT="$candidate_lock_root" \
 FLN_SUITE_UPGRADE_CLOSURE_ROOT="$closure_root" \

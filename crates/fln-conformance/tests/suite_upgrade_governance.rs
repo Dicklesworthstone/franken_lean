@@ -303,7 +303,14 @@ fn suite_upgrade_candidate_bundle_from_environment() -> Result<(), String> {
         rollback_root: root("FLN_SUITE_UPGRADE_ROLLBACK_ROOT")?,
         external_evidence_root: root("FLN_SUITE_UPGRADE_EXTERNAL_EVIDENCE_ROOT")?,
     };
-    validate_candidate_bundle(&receipt_text, &observed)?;
+    let receipt = CandidateReceipt::from_ndjson(&receipt_text)?;
+    receipt.validate_observed_roots(&observed)?;
+    let mut candidate = candidate_from_receipt(&receipt);
+    candidate.cancelled = matches!(
+        std::env::var("FLN_SUITE_UPGRADE_CANCELLED").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    candidate.validate_publication_with_receipt(&receipt)?;
     let lock_path = std::env::var("FLN_SUITE_UPGRADE_CANDIDATE_LOCK_PATH").map_err(|error| {
         format!("candidate preflight did not supply FLN_SUITE_UPGRADE_CANDIDATE_LOCK_PATH: {error}")
     })?;
@@ -454,6 +461,11 @@ fn suite_upgrade_no_mock_e2e() {
     assert!(
         !candidate.may_publish(None),
         "cancelled candidate must remain non-authoritative"
+    );
+    assert_eq!(
+        candidate.validate_publication_with_receipt(&complete_receipt(LockChange::Upgrade)),
+        Err("candidate was cancelled".to_string()),
+        "a cancelled complete join must still refuse publication"
     );
     let after =
         std::fs::read(root().join("SUITE.lock")).expect("real current lock remains readable");

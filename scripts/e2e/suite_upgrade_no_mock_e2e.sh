@@ -2,8 +2,9 @@
 # Real no-mock suite-upgrade lane (bead fln-h25). Builds an isolated candidate
 # *outside* the authoritative checkout, proves incomplete evidence cannot
 # publish, proves a complete closure/contract/Tribunal/migration/rollback join
-# can, plants a hidden suite dependency and a stale Tribunal root and proves
-# both refuse, restores, and proves SUITE.lock is byte-identical to the start.
+# can, plants cancellation, a hidden suite dependency, and a stale Tribunal
+# root and proves each refuse, restores, and proves SUITE.lock is
+# byte-identical to the start.
 # The preflight helper remains the identity+content join; this script is the
 # fln.e2e/2 evidence producer.
 
@@ -400,6 +401,12 @@ done
 
 run_step complete_evidence_pass \
   env FLN_SUITE_UPGRADE_CANDIDATE_DIR="$CANDIDATE_DIR" \
+    CARGO_TARGET_DIR="$BUILD_TARGET" \
+    "$PREFLIGHT"
+
+run_expected_failure cancelled_candidate_refused 1 101 \
+  env FLN_SUITE_UPGRADE_CANCELLED=1 \
+    FLN_SUITE_UPGRADE_CANDIDATE_DIR="$CANDIDATE_DIR" \
     CARGO_TARGET_DIR="$BUILD_TARGET" \
     "$PREFLIGHT"
 
