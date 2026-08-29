@@ -7,20 +7,25 @@ publish = false
 
 [dependencies]
 fln-hash = { path = "../../crates/fln-hash" }
+# Rank-0 host of `checked_manifest_dir!` (bead fln-cross-tree-baked-root-k60n).
+# Already a transitive dep via fln-hash; the direct edge is so the bin can name
+# the macros. This is not the rank-22 `fln-conformance` pull the residue used
+# to refuse — fln-core is already in this binary's runtime closure.
+fln-core = { path = "../../crates/fln-core" }
 
-# Test-only, for `checked_workspace_root!`/`checked_manifest_dir!` (bead
-# fln-cross-tree-baked-root-k60n). CARGO_TARGET_DIR is shared machine-wide and
-# `env!("CARGO_MANIFEST_DIR")` is a COMPILE-TIME constant, so a test binary built
-# from another checkout is reused as fresh and answers for THAT tree while saying
-# so nowhere. The lab's rigs read epoch fixtures off disk, so a wrong root is a
-# verdict about a repository nobody asked about.
+# Test-only, for `checked_workspace_root!`/`checked_manifest_dir!` on `tests/`
+# and `examples/` (bead fln-cross-tree-baked-root-k60n). CARGO_TARGET_DIR is
+# shared machine-wide and `env!("CARGO_MANIFEST_DIR")` is a COMPILE-TIME
+# constant, so a test binary built from another checkout is reused as fresh
+# and answers for THAT tree while saying so nowhere. The lab's rigs read
+# epoch fixtures off disk, so a wrong root is a verdict about a repository
+# nobody asked about.
 #
-# A dev-dependency, not a dependency: it reaches `tests/` and `examples/` and
-# deliberately not `src/main.rs`, whose one remaining raw site stays declared in
-# RAW_SITE_RESIDUE rather than pulling a rank-22 crate into this binary's runtime
-# closure. This adds no governance row (structure-guard discovers only crates/ and
-# tools/) and touches only this nested workspace's own Cargo.lock, which is the
-# pair of concerns the comment below records.
+# A dev-dependency, not a dependency: it reaches `tests/` and `examples/`.
+# `src/main.rs` uses the rank-0 `fln-core` edge above rather than this one.
+# This adds no governance row (structure-guard discovers only crates/ and
+# tools/) and touches only this nested workspace's own Cargo.lock, which is
+# the pair of concerns the comment below records.
 [dev-dependencies]
 fln-conformance = { path = "../../crates/fln-conformance" }
 fln-olean = { path = "../../crates/fln-olean" }

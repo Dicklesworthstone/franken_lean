@@ -16,7 +16,6 @@
 #![forbid(unsafe_code)]
 
 use fln_epoch_lab::{CHAIN_FILE, publish, verify_epoch};
-use std::path::PathBuf;
 
 const MANIFEST: &str = "MANIFEST.txt";
 
@@ -30,8 +29,10 @@ fn main() -> std::process::ExitCode {
         }
     };
     // Resolved from the crate, not the cwd, so the tool cannot be pointed at a
-    // different tree by accident.
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // different tree by accident. `checked_manifest_dir!` also refuses a binary
+    // compiled for another checkout (shared CARGO_TARGET_DIR). The documented
+    // launch path is `cargo run`, which sets the invoking-package directory.
+    let dir = fln_core::checked_manifest_dir!()
         .join("../epochs")
         .join(epoch);
     if !dir.is_dir() {

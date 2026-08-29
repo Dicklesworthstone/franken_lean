@@ -40,6 +40,7 @@ version = "0.0.0"
 dependencies = [
  "fln",
  "fln-core",
+ "fln-hash",
 ]
 
 [[package]]
@@ -96,6 +97,7 @@ name = "fln-epoch-lab"
 version = "0.0.0"
 dependencies = [
  "fln-conformance",
+ "fln-core",
  "fln-hash",
  "fln-olean",
 ]

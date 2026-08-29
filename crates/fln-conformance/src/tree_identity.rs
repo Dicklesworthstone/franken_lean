@@ -444,22 +444,12 @@ impl ResidueBreach {
 ///   on the crate. Remaining: `fln-unsafe-region` / `fln-unsafe-abi` (D3: a boundary
 ///   crate cannot grow a product-crate edge that would let a checked declaration be
 ///   named). That is still the graph owner's call — routed, not taken.
-/// * **1 site in `tribunal/epoch-lab`**, down from 11, and what the other ten cost is the
-///   point: **nothing**. That population read as blocked because it sits in a nested
-///   workspace the members glob never walks — `fln-bench-apparatus-empty-referent-bkw6`'s
-///   shape, where the scope you measure and the scope you meant are different sets. But
-///   being outside the graph is the *reason it is reachable*, not a reason it is not: the
-///   lab is governed by no layering law, already path-depends into the product workspace
-///   (`fln-hash`), and owns its own `Cargo.lock`. A `dev-dependency` on `fln-conformance`
-///   therefore adds **no governance row and does not touch the root lock**, which is exactly
-///   the pair of concerns that crate's own manifest comment records. Measured, not assumed:
-///   `cargo check --tests --examples` there is clean and only `tribunal/epoch-lab/Cargo.lock`
-///   moves.
-///
-///   The one that remains is `src/main.rs`, and it is a **different** blocker rather than a
-///   leftover: a `dev-dependency` reaches `tests/` and `examples/` and not a `bin` target, so
-///   converting it means a *normal* dependency putting a rank-22 crate into the lab binary's
-///   runtime closure. That is a trade worth stating rather than making silently.
+/// * **`tribunal/epoch-lab` is converted, including the bin.** Tests and examples used a
+///   `dev-dependency` on `fln-conformance`. The bin could not: a `dev-dependency` does not
+///   reach `src/main.rs`, and putting rank-22 `fln-conformance` in the binary's runtime
+///   closure was the trade this comment used to refuse. Hosting the macros at rank 0
+///   retired that trade — `fln-core` was already in the binary via `fln-hash`. The
+///   remaining product-crate residue is the two D3 boundary tests.
 ///
 /// **`tools/structure-guard` is converted, and its rows are gone from this table rather
 /// than zeroed.** That was the population blocked on *one line*: the crate is `kind=tool`
@@ -480,7 +470,6 @@ pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     // declaration, and they do not currently depend on fln-core.
     ("crates/fln-unsafe-abi/src/tests.rs", 1),
     ("crates/fln-unsafe-region/src/tests.rs", 1),
-    ("tribunal/epoch-lab/src/main.rs", 1),
 ];
 
 /// Judge a census against a declared residue.
