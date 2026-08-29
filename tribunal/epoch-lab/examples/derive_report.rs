@@ -26,8 +26,15 @@ use fln_epoch_lab::derive::{
 use fln_epoch_lab::poison::OracleEdge;
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    fln_conformance::checked_manifest_dir!().join("../..")
+fn repo_root() -> Result<PathBuf, fln_conformance::tree_identity::CrossTreeFault> {
+    Ok(fln_conformance::checked_manifest_dir!(try)?.join("../.."))
+}
+
+fn require_repo_root() -> Result<PathBuf, std::process::ExitCode> {
+    repo_root().map_err(|fault| {
+        eprintln!("derive: inconclusive {}", fault.robot_reason());
+        std::process::ExitCode::from(2)
+    })
 }
 
 fn main() -> std::process::ExitCode {
@@ -107,7 +114,10 @@ fn report_shippability(root: &Path, targets: &[TargetScan], oracle_edges: &[Orac
 }
 
 fn report() -> std::process::ExitCode {
-    let root = repo_root();
+    let root = match require_repo_root() {
+        Ok(root) => root,
+        Err(code) => return code,
+    };
     let mut failed = false;
 
     match derive_workspace_inventory(&root) {
@@ -208,7 +218,11 @@ fn emit_modules(toolchain: &str, pin: &str) -> std::process::ExitCode {
 }
 
 fn emit_tree(epoch: &str, head_root: &str) -> std::process::ExitCode {
-    let dir = repo_root().join("tribunal/epochs").join(epoch);
+    let root = match require_repo_root() {
+        Ok(root) => root,
+        Err(code) => return code,
+    };
+    let dir = root.join("tribunal/epochs").join(epoch);
     match derive_epoch_tree(&dir, epoch, head_root) {
         Ok(d) => {
             eprintln!(

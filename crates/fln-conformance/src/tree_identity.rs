@@ -54,7 +54,8 @@
 //! an instance of.
 
 pub use fln_core::tree_identity::{
-    CrossTreeFault, MANIFEST_DIR_VAR, cross_tree_fault, manifest_dir_of, workspace_root_of,
+    CrossTreeFault, MANIFEST_DIR_VAR, cross_tree_fault, manifest_dir_of, try_manifest_dir_of,
+    workspace_root_of,
 };
 
 /// The precise compile-time form the census counts, assembled from fragments so this
@@ -79,9 +80,10 @@ pub struct RootResolutionCensus {
     /// clean tree, so callers assert a floor on this.
     pub files: usize,
     /// Occurrences of the compile-time form, which resolves against the **bake** tree.
-    /// Never zero while this module exists: the two macro definitions below are
-    /// themselves occurrences, and are deliberately not exempted — a guard that excuses
-    /// its own file cannot see a regression added to it.
+    /// Never zero while this module exists: the two unit-test sites that feed the
+    /// compile-time form as known-good input are themselves occurrences, and are
+    /// deliberately not exempted — a guard that excuses its own file cannot see a
+    /// regression added to it. The macros now live in `fln-core`.
     pub raw_sites: usize,
     /// Invocations of [`checked_workspace_root!`] / [`checked_manifest_dir!`].
     pub checked_sites: usize,
@@ -103,9 +105,9 @@ pub struct RootResolutionCensus {
 /// staging a repository.
 ///
 /// The needles are assembled at compile time from fragments so that **this file's own
-/// source does not contain them**. That is not self-exemption: the macro definitions
-/// below still count, and a raw site added to this module would still be found. It only
-/// keeps the scanner's own needle literals out of the population it measures.
+/// source does not contain them**. That is not self-exemption: the two unit-test sites
+/// in this file still count, and a raw site added to this module would still be found.
+/// It only keeps the scanner's own needle literals out of the population it measures.
 pub fn census<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> RootResolutionCensus {
     const RAW: &str = RAW_NEEDLE;
     const CHECKED_ROOT: &str = concat!("checked_workspace_", "root!(");
@@ -1261,10 +1263,11 @@ mod tests {
             measured.files
         );
 
-        // Anti-vacuity for the raw needle, scoped to the one site that can never stop
-        // carrying it. The two macro definitions below are themselves occurrences, so an
-        // empty result here means the needle stopped matching, not that the tree is clean
-        // — and a broken needle would otherwise make every count a confident zero.
+        // Anti-vacuity for the raw needle, scoped to this file. The two unit-test
+        // sites that feed the compile-time form as known-good input are themselves
+        // occurrences (the macros now live in fln-core), so an empty result here
+        // means the needle stopped matching, not that the tree is clean — and a
+        // broken needle would otherwise make every count a confident zero.
         let definition_site: Vec<&String> = measured
             .raw_files
             .keys()
@@ -1274,9 +1277,9 @@ mod tests {
             definition_site.len(),
             1,
             "the census must find exactly one tracked source ending in {:?} carrying the \
-             compile-time form — this module defines the macros in terms of it, so zero \
-             means the needle has stopped matching and every count below is a confident \
-             zero. Found: {definition_site:?}",
+             compile-time form — this module still feeds that form into its own unit \
+             tests, so zero means the needle has stopped matching and every count \
+             below is a confident zero. Found: {definition_site:?}",
             file!()
         );
         let definition_site = definition_site[0].clone();

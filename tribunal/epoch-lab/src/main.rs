@@ -29,12 +29,18 @@ fn main() -> std::process::ExitCode {
         }
     };
     // Resolved from the crate, not the cwd, so the tool cannot be pointed at a
-    // different tree by accident. `checked_manifest_dir!` also refuses a binary
-    // compiled for another checkout (shared CARGO_TARGET_DIR). The documented
-    // launch path is `cargo run`, which sets the invoking-package directory.
-    let dir = fln_core::checked_manifest_dir!()
-        .join("../epochs")
-        .join(epoch);
+    // different tree by accident. `checked_manifest_dir!(try)` also refuses a
+    // binary compiled for another checkout (shared CARGO_TARGET_DIR) without
+    // panicking: a missing or mismatched invoking tree is FL-INV-07
+    // inconclusive, not an invariant failure. The documented launch path is
+    // `cargo run`, which sets the invoking-package directory.
+    let dir = match fln_core::checked_manifest_dir!(try) {
+        Ok(path) => path.join("../epochs").join(epoch),
+        Err(fault) => {
+            eprintln!("epoch-lab: inconclusive {}", fault.robot_reason());
+            return std::process::ExitCode::from(2);
+        }
+    };
     if !dir.is_dir() {
         eprintln!(
             "epoch-lab: inconclusive reason=absent_epoch dir={}",

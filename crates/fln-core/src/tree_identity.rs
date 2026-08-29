@@ -73,6 +73,23 @@ impl CrossTreeFault {
             ),
         }
     }
+
+    /// One-line machine record of why the run cannot answer for this checkout.
+    ///
+    /// User-facing CLIs print this and exit 2: a missing or mismatched invoking
+    /// tree is FL-INV-07 inconclusive, not an invariant panic. Tests still panic
+    /// through [`manifest_dir_of`].
+    pub fn robot_reason(&self) -> String {
+        match self {
+            Self::Mismatch {
+                compiled_in,
+                invoked_from,
+            } => format!("reason=cross_tree compiled_in={compiled_in} invoked_from={invoked_from}"),
+            Self::InvokingTreeUnknown { compiled_in } => {
+                format!("reason=invoking_tree_unknown compiled_in={compiled_in}")
+            }
+        }
+    }
 }
 
 /// Compare a call site's baked manifest dir against the invoking one.
@@ -104,13 +121,28 @@ fn same_path(left: &str, right: &str) -> bool {
     }
 }
 
-/// The calling crate's own directory, refusing a cross-tree artifact first.
-pub fn manifest_dir_of(compiled_in: &str) -> PathBuf {
+/// The calling crate's own directory, or a typed refusal.
+///
+/// Prefer this from a user-facing binary: a missing `CARGO_MANIFEST_DIR` or a
+/// cross-tree bake is inconclusive, not an invariant panic (FL-INV-07).
+pub fn try_manifest_dir_of(compiled_in: &str) -> Result<PathBuf, CrossTreeFault> {
     let invoked_from = std::env::var(MANIFEST_DIR_VAR).ok();
     if let Some(fault) = cross_tree_fault(compiled_in, invoked_from.as_deref()) {
-        panic!("{}", fault.message());
+        return Err(fault);
     }
-    PathBuf::from(compiled_in)
+    Ok(PathBuf::from(compiled_in))
+}
+
+/// The calling crate's own directory, refusing a cross-tree artifact first.
+///
+/// Panics on a fault. That is the right posture for a test: the binary must not
+/// answer for another checkout. User-facing CLIs must use [`try_manifest_dir_of`]
+/// (or [`checked_manifest_dir!`] with the `try` arm) and exit typed.
+pub fn manifest_dir_of(compiled_in: &str) -> PathBuf {
+    match try_manifest_dir_of(compiled_in) {
+        Ok(path) => path,
+        Err(fault) => panic!("{}", fault.message()),
+    }
 }
 
 /// The workspace root for a call site, refusing a cross-tree artifact first.
@@ -134,9 +166,62 @@ macro_rules! checked_workspace_root {
 
 /// The calling crate's own directory in the tree this run was launched from, or a
 /// refusal.
+///
+/// The `try` arm expands the same `env!` as the panicking arm, so a CLI can take
+/// a [`Result`] without growing the k60n raw-site residue. The panicking arm is
+/// `$crate::checked_manifest_dir!(try)` plus a panic, not a second `env!`.
 #[macro_export]
 macro_rules! checked_manifest_dir {
-    () => {
-        $crate::tree_identity::manifest_dir_of(env!("CARGO_MANIFEST_DIR"))
+    (try) => {
+        $crate::tree_identity::try_manifest_dir_of(env!("CARGO_MANIFEST_DIR"))
     };
+    () => {
+        match $crate::checked_manifest_dir!(try) {
+            Ok(path) => path,
+            Err(fault) => panic!("{}", fault.message()),
+        }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn try_manifest_dir_returns_the_invoking_crate_directory() {
+        let invoked = std::env::var(MANIFEST_DIR_VAR).expect("cargo sets this for tests");
+        assert_eq!(
+            try_manifest_dir_of(&invoked).expect("the invoking tree matches itself"),
+            PathBuf::from(&invoked)
+        );
+        let via_try =
+            crate::checked_manifest_dir!(try).expect("the try arm is the same check under cargo");
+        assert_eq!(via_try, crate::checked_manifest_dir!());
+        assert!(via_try.join("Cargo.toml").is_file());
+    }
+
+    #[test]
+    fn try_manifest_dir_refuses_a_foreign_bake() {
+        let fault = try_manifest_dir_of("/data/tmp/wt-foreign/crates/fln-core")
+            .expect_err("a foreign bake tree is a fault");
+        match &fault {
+            CrossTreeFault::Mismatch { compiled_in, .. } => {
+                assert_eq!(compiled_in, "/data/tmp/wt-foreign/crates/fln-core");
+            }
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+        assert!(fault.robot_reason().starts_with("reason=cross_tree "));
+    }
+
+    #[test]
+    fn robot_reason_names_an_unknown_invoking_tree() {
+        let fault = CrossTreeFault::InvokingTreeUnknown {
+            compiled_in: "/compiled".to_string(),
+        };
+        assert_eq!(
+            fault.robot_reason(),
+            "reason=invoking_tree_unknown compiled_in=/compiled"
+        );
+    }
 }
