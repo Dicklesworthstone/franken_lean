@@ -4255,7 +4255,7 @@ fn export_io_task_wrapper_family_matches_upstream_arms() {
 /// resolved from this crate's manifest location — the file's single raw
 /// manifest-dir site, declared in tree_identity's residue at count 1.
 fn g03_fixture(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    fln_core::checked_manifest_dir!()
         .join("../fln-vm/fixtures/g03")
         .join(name)
 }

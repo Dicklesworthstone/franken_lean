@@ -200,6 +200,7 @@ name = "fln-unsafe-abi"
 version = "0.0.0"
 dependencies = [
  "fln-bignum",
+ "fln-core",
  "fln-libm",
 ]
 
@@ -210,6 +211,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-unsafe-region"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-verdict"

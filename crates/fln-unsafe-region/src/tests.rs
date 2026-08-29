@@ -9,8 +9,7 @@ use std::path::PathBuf;
 fn scratch(name: &str, bytes: &[u8]) -> PathBuf {
     // Deliberately NOT std::env::temp_dir(): /tmp is a shared tmpfs that
     // other agents can fill; scratch lives next to the build artifacts.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target_local/fln-unsafe-region-tests");
+    let dir = fln_core::checked_manifest_dir!().join("../../target_local/fln-unsafe-region-tests");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join(format!("{name}-{}", std::process::id()));
     let mut f = std::fs::File::create(&path).expect("create");

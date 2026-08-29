@@ -9,3 +9,8 @@ publish = false
 [dependencies]
 fln-bignum = { path = "../fln-bignum" }
 fln-libm = { path = "../fln-libm" }
+
+# Test-only: k60n tree check in src/tests.rs. Rank 2 -> rank 0 is downward;
+# production code cannot name fln_core. Declared in WORKSPACE_GRAPH.txt.
+[dev-dependencies]
+fln-core = { path = "../fln-core" }

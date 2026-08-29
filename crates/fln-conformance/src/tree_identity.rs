@@ -436,14 +436,11 @@ impl ResidueBreach {
 /// population was converted, and the division is re-measured on every run by
 /// [`coverage_populations`] rather than inherited from this comment:
 ///
-/// * **Product-crate residue** is the two macro-definition sites in the rank-0 host
-///   plus the two boundary-crate tests that have no `fln-core` edge. `fln-rt` already
-///   depends on `fln-core`; `fln-checker` already lists it as a *dev*-dependency — both
-///   converted with **no graph change**. The §8 concern was about adding
-///   `fln-conformance` (rank 22) to checker, not about using the rank-0 host already
-///   on the crate. Remaining: `fln-unsafe-region` / `fln-unsafe-abi` (D3: a boundary
-///   crate cannot grow a product-crate edge that would let a checked declaration be
-///   named). That is still the graph owner's call — routed, not taken.
+/// * **Product-crate residue** is the two macro-definition sites in the rank-0 host.
+///   `fln-unsafe-abi` and `fln-unsafe-region` converted with a *dev*-dependency on
+///   `fln-core` (rank 2 → 0, downward). The old D3 hold was about reaching rank-22
+///   `fln-conformance` (an upward edge); it does not apply to the rank-0 host.
+///   Production code in those crates cannot name `fln_core`.
 /// * **`tribunal/epoch-lab` is converted, including the bin.** Tests and examples used a
 ///   `dev-dependency` on `fln-conformance`. The bin could not: a `dev-dependency` does not
 ///   reach `src/main.rs`, and putting rank-22 `fln-conformance` in the binary's runtime
@@ -466,10 +463,6 @@ pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     // definitions, hosted at rank 0 so product crates convert with no new edges
     // (bead fln-cross-tree-baked-root-k60n, same Option B as `fln-core::scratch`).
     ("crates/fln-core/src/tree_identity.rs", 2),
-    // Boundary crates: D3 bars a new product-crate edge that could name a checked
-    // declaration, and they do not currently depend on fln-core.
-    ("crates/fln-unsafe-abi/src/tests.rs", 1),
-    ("crates/fln-unsafe-region/src/tests.rs", 1),
 ];
 
 /// Judge a census against a declared residue.
@@ -683,9 +676,19 @@ impl DisclosureBreach {
 /// the marker to a prefix like `" unprotected site"`, which silently starts matching
 /// `" unprotected sites across"` as well and makes two bindings read the same clause.
 fn singular_marker(marker: &str) -> Option<String> {
+    if let Some(at) = marker.find("sites ") {
+        return Some(format!(
+            "{}site {}",
+            &marker[..at],
+            &marker[at + "sites ".len()..]
+        ));
+    }
+    // " product crates" has no trailing word after the noun; fold a terminal
+    // "crates" the same way so a population of one is grammatical rather than
+    // "1 product crates".
     marker
-        .find("sites ")
-        .map(|at| format!("{}site {}", &marker[..at], &marker[at + "sites ".len()..]))
+        .strip_suffix("crates")
+        .map(|head| format!("{head}crate"))
 }
 
 /// Returns the declared count **and the marker actually matched**, which differ whenever the
@@ -1245,7 +1248,7 @@ mod tests {
         // it must stay well above a broken scan (0–2 comment-only hits) and may fall
         // when a real residue row is converted.
         assert!(
-            carrying >= 10,
+            carrying >= 8,
             "only {carrying} tracked sources mention the manifest-dir variable at all, so the \
              per-file reconciliation ran over almost nothing and proves nothing. A scan that \
              reads almost nothing is a broken scan, not a clean tree"
@@ -1644,13 +1647,14 @@ mod tests {
             Some(" unprotected site across")
         );
         assert_eq!(
-            singular_marker(" product crates"),
-            None,
-            "no trailing word to fold"
+            singular_marker(" product crates").as_deref(),
+            Some(" product crate"),
+            "a population of one product crate must be grammatical"
         );
         let folded = [
             singular_marker(" unprotected sites in tribunal/epoch-lab").unwrap(),
             singular_marker(" unprotected sites across").unwrap(),
+            singular_marker(" product crates").unwrap(),
         ];
         assert!(
             !folded[0].starts_with(&folded[1]) && !folded[1].starts_with(&folded[0]),

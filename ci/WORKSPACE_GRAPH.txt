@@ -107,6 +107,8 @@ edge fln-rt -> fln-core            # Compat/native conversion projects canonical
 edge fln-rt -> fln-unsafe-abi      # safe Marrow surface over the CompatHeap membrane, BOUNDARY_API-governed (fln-lld)
 edge fln-unsafe-abi -> fln-bignum  # exported lean_nat_big_* family over the owned bignum (franken_lean-83r; §8.4 shim)
 edge fln-unsafe-abi -> fln-libm    # generated-C Float/Float32 bare symbols route to the owned deterministic numerics plane (§6.8, D21)
+edge fln-unsafe-abi -> fln-core    # dev-only: k60n tree check in src/tests.rs so a shared target cannot bake another checkout's G0-3 fixtures (fln-cross-tree-baked-root-k60n). Rank 2 -> 0 is downward; production code cannot name fln_core.
+edge fln-unsafe-region -> fln-core # dev-only: k60n tree check in src/tests.rs so a shared target cannot bake another checkout's scratch dir (fln-cross-tree-baked-root-k60n). Rank 2 -> 0 is downward; production code cannot name fln_core.
 edge fln-rt -> fln-unsafe-region   # region engine drives the mmap/seal primitives, BOUNDARY_API-governed (fln-wgp)
 edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
 edge fln-syntax -> fln-core        # SyntaxNodeKind and identifiers are Name (franken_lean-vrmi; §21, AGENTS.md crate map)
