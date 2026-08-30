@@ -1891,7 +1891,7 @@ fn init_eq_entries() -> Vec<ConstantEntry> {
             ),
             BinderInfo::Default,
         ),
-        BinderInfo::Default,
+        BinderInfo::Implicit,
     );
     vec![
         ConstantEntry::new(
@@ -2293,8 +2293,11 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
     let right_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
     let sum_type = || {
         Expr::sort(
-            Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs"))
-                .expect("universe successor packs"),
+            Level::max(
+                Level::succ(u.clone()).expect("universe successor packs"),
+                Level::succ(v.clone()).expect("universe successor packs"),
+            )
+            .expect("universe maximum packs"),
         )
     };
     let sum_expr = |left: Expr, right: Expr| {
@@ -2555,8 +2558,11 @@ fn init_prod_entries() -> Vec<ConstantEntry> {
     let right_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
     let prod_type = || {
         Expr::sort(
-            Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs"))
-                .expect("universe successor packs"),
+            Level::max(
+                Level::succ(u.clone()).expect("universe successor packs"),
+                Level::succ(v.clone()).expect("universe successor packs"),
+            )
+            .expect("universe maximum packs"),
         )
     };
     let prod_expr = |left: Expr, right: Expr| {

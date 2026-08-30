@@ -1505,11 +1505,15 @@ impl StructuralTermBuilder {
     }
 
     fn sort_successor_max_parameters(&mut self, left: &WireName, right: &WireName) -> ExprId {
+        // The pin stores these family results as max(succ l, succ v) — the two
+        // successors live under the max, matching the pinned Except and Prod
+        // rows verbatim.
         let left = self.level(LevelNode::Parameter(left.clone()));
         let right = self.level(LevelNode::Parameter(right.clone()));
+        let left = self.level(LevelNode::Succ(left));
+        let right = self.level(LevelNode::Succ(right));
         let maximum = self.level(LevelNode::Max(left, right));
-        let level = self.level(LevelNode::Succ(maximum));
-        self.expression(ExprNode::Sort { level })
+        self.expression(ExprNode::Sort { level: maximum })
     }
 
     fn constant(&mut self, name: &WireName, parameters: &[WireName]) -> ExprId {
@@ -7275,6 +7279,22 @@ pub fn admit_inductive_with(
             &mut cancelled,
         );
     }
+    if name == &checker_atom("Except")
+        && declaration.level_parameters().len() == 2
+        && metadata.num_parameters() == 2
+    {
+        return admit_init_sum(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+            "error",
+            "ok",
+        );
+    }
     if name == &checker_atom("Or")
         && declaration.level_parameters().is_empty()
         && metadata.num_parameters() == 2
@@ -8060,7 +8080,7 @@ fn eq_rule_rhs(
     let a_domain = b.bvar(0);
     let a = b.lambda("a", BinderStyle::Default, a_domain, motive);
     let alpha_sort = b.sort_parameter(alpha_universe);
-    let root = b.lambda("α", BinderStyle::Default, alpha_sort, a);
+    let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, a);
     b.finish(root)
 }
 
@@ -8068,7 +8088,6 @@ fn eq_rule_rhs(
 /// the family as two parameters (`α`, then the fixed left side `a`) and one
 /// index (`b`); `Eq.refl` carries both parameters and zero fields, and the
 /// eliminator's major premise is bound Implicit.
-#[allow(clippy::too_many_arguments)]
 fn admit_init_eq(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
@@ -8283,6 +8302,10 @@ fn admit_init_eq(
             if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
                 eprintln!("fln-checker: eq defer at rule-rhs-compare for {recursor_name:?}");
                 eprintln!("fln-checker: eq rule rhs arena: {:?}", rule.rhs().nodes());
+                eprintln!(
+                    "fln-checker: eq rule rhs EXPECTED: {:?}",
+                    expected_rhs.nodes()
+                );
             }
             return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
         }
