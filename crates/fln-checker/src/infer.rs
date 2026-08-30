@@ -3825,9 +3825,18 @@ impl<'a> InferenceEngine<'a> {
             DefEqOutcome::NotEqual { mismatch, .. } => Err(LeafHalt::Refused(
                 InferenceRefusal::ApplicationTypeMismatch { argument, mismatch },
             )),
-            DefEqOutcome::Deferred { need, .. } => Err(LeafHalt::Deferred(
-                InferenceDeferred::ApplicationConversion { argument, need },
-            )),
+            DefEqOutcome::Deferred { need, .. } => {
+                if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                    eprintln!(
+                        "INFER_DOMAIN_DEFER arg={argument} actual={:?} expected={:?}",
+                        actual.nodes(),
+                        expected.nodes()
+                    );
+                }
+                Err(LeafHalt::Deferred(
+                    InferenceDeferred::ApplicationConversion { argument, need },
+                ))
+            }
             DefEqOutcome::Refused { side, refusal, .. } => {
                 Err(LeafHalt::Refused(InferenceRefusal::ConversionRefusal {
                     argument,
