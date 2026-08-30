@@ -8268,8 +8268,7 @@ fn admit_init_eq(
             name: recursor_name,
         });
     };
-    let Some(expected_rhs) =
-        eq_rule_rhs(name, &refl, motive_universe, recursor_alpha_universe)
+    let Some(expected_rhs) = eq_rule_rhs(name, &refl, motive_universe, recursor_alpha_universe)
     else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
@@ -8282,12 +8281,10 @@ fn admit_init_eq(
         Ok(true) => {}
         Ok(false) => {
             if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
-                eprintln!("fln-checker: eq reject at rule-rhs-compare for {recursor_name:?}");
-            }
+                eprintln!("fln-checker: eq defer at rule-rhs-compare for {recursor_name:?}");
                 eprintln!("fln-checker: eq rule rhs arena: {:?}", rule.rhs().nodes());
-            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
-                name: recursor_name,
-            });
+            }
+            return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
         }
         Err(verdict) => return verdict,
     }

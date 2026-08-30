@@ -1805,7 +1805,12 @@ fn init_eq_entries() -> Vec<ConstantEntry> {
             z,
         )
     };
-    let refl_at = |x: Expr| Expr::app(Expr::const_(Name::from_components(["Eq", "refl"]), vec![u1.clone()]), x);
+    let refl_at = |x: Expr| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Eq", "refl"]), vec![u1.clone()]),
+            x,
+        )
+    };
     // inductive Eq.{u_1} : {α : Sort u_1} → α → α → Prop
     let inductive_type = primary_pi(
         "α",
@@ -1823,7 +1828,7 @@ fn init_eq_entries() -> Vec<ConstantEntry> {
         "α",
         BinderInfo::Implicit,
         Expr::sort(u1.clone()),
-            primary_pi("a", BinderInfo::Default, bv(0), eq_at(bv(1), bv(0), bv(0))),
+        primary_pi("a", BinderInfo::Default, bv(0), eq_at(bv(1), bv(0), bv(0))),
     );
     // rec Eq.rec.{u, u_1}: implicit α a motive and major index; explicit minor and hypothesis.
     let motive_domain = primary_pi(
@@ -1876,7 +1881,12 @@ fn init_eq_entries() -> Vec<ConstantEntry> {
             Expr::lam(
                 primary_name("motive"),
                 motive_domain,
-                Expr::lam(primary_name("minor"), minor_domain, bv(0), BinderInfo::Default),
+                Expr::lam(
+                    primary_name("minor"),
+                    minor_domain,
+                    bv(0),
+                    BinderInfo::Default,
+                ),
                 BinderInfo::Default,
             ),
             BinderInfo::Default,
@@ -1967,7 +1977,10 @@ fn kr600_803_init_eq_refuses_a_forged_reflector_field_count() {
         AdmissionBudget::unlimited(),
         EnvironmentBudget::unlimited(),
     );
-    assert!(!verdict.is_admitted(), "forged Eq.refl field count: {verdict:?}");
+    assert!(
+        !verdict.is_admitted(),
+        "forged Eq.refl field count: {verdict:?}"
+    );
 }
 
 fn init_bool_entries() -> Vec<ConstantEntry> {
