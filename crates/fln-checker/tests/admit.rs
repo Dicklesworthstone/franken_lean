@@ -951,7 +951,7 @@ fn init_option_entries() -> Vec<ConstantEntry> {
                 vec![u_name.clone()],
                 decoded(&primary_pi(
                     "α",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     parameter_type(),
                     option_expr(bv(0)),
                 )),
@@ -965,7 +965,7 @@ fn init_option_entries() -> Vec<ConstantEntry> {
                 vec![u_name.clone()],
                 decoded(&primary_pi(
                     "α",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     parameter_type(),
                     primary_pi("value", BinderInfo::Default, bv(0), option_expr(bv(1))),
                 )),
@@ -1177,7 +1177,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                 vec![u_name.clone()],
                 decoded(&primary_pi(
                     "α",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     parameter_type(),
                     list_expr(bv(0)),
                 )),
@@ -1191,7 +1191,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                 vec![u_name.clone()],
                 decoded(&primary_pi(
                     "α",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     parameter_type(),
                     primary_pi(
                         "head",
@@ -1244,7 +1244,7 @@ fn init_empty_entries() -> Vec<ConstantEntry> {
     let motive_type = primary_pi("t", BinderInfo::Default, empty_expr(), Expr::sort(u));
     let recursor_type = primary_pi(
         "motive",
-        BinderInfo::Implicit,
+        BinderInfo::Default,
         motive_type.clone(),
         primary_pi(
             "t",
@@ -1285,7 +1285,7 @@ fn init_false_entries() -> Vec<ConstantEntry> {
     let motive = primary_pi("t", BinderInfo::Default, false_expr(), Expr::sort(u));
     let rec_type = primary_pi(
         "motive",
-        BinderInfo::Implicit,
+        BinderInfo::Default,
         motive,
         primary_pi(
             "t",
@@ -1555,11 +1555,11 @@ fn init_or_entries() -> Vec<ConstantEntry> {
                 Vec::new(),
                 decoded(&primary_pi(
                     "a",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     proposition(),
                     primary_pi(
                         "b",
-                        BinderInfo::Default,
+                        BinderInfo::Implicit,
                         proposition(),
                         primary_pi("h", BinderInfo::Default, bv(1), or_expr(bv(2), bv(1))),
                     ),
@@ -1574,11 +1574,11 @@ fn init_or_entries() -> Vec<ConstantEntry> {
                 Vec::new(),
                 decoded(&primary_pi(
                     "a",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     proposition(),
                     primary_pi(
                         "b",
-                        BinderInfo::Default,
+                        BinderInfo::Implicit,
                         proposition(),
                         primary_pi("h", BinderInfo::Default, bv(0), or_expr(bv(2), bv(1))),
                     ),
@@ -1746,11 +1746,11 @@ fn init_and_entries() -> Vec<ConstantEntry> {
                 Vec::new(),
                 decoded(&primary_pi(
                     "a",
-                    BinderInfo::Default,
+                    BinderInfo::Implicit,
                     prop(),
                     primary_pi(
                         "b",
-                        BinderInfo::Default,
+                        BinderInfo::Implicit,
                         prop(),
                         primary_pi(
                             "left",
@@ -1782,6 +1782,192 @@ fn init_and_entries() -> Vec<ConstantEntry> {
             ),
         ),
     ]
+}
+
+/// `Init.Eq` exercises a universe-polymorphic indexed family whose parameter,
+/// index, motive, and major-premise binders the pin encodes Implicit while its
+/// eliminator's minor premise and index hypothesis stay Default.
+fn init_eq_entries() -> Vec<ConstantEntry> {
+    let eq_name = checker_name("Eq");
+    let refl = checker_qualified(&["Eq", "refl"]);
+    let rec = checker_qualified(&["Eq", "rec"]);
+    let u_name = checker_name("u");
+    let u1_name = checker_name("u_1");
+    let u = Level::param(primary_name("u"));
+    let u1 = Level::param(primary_name("u_1"));
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let eq_at = |x: Expr, y: Expr, z: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(primary_name("Eq"), vec![u1.clone()]), x),
+                y,
+            ),
+            z,
+        )
+    };
+    let refl_at = |x: Expr| Expr::app(Expr::const_(Name::from_components(["Eq", "refl"]), vec![u1.clone()]), x);
+    // inductive Eq.{u_1} : {α : Sort u_1} → α → α → Prop
+    let inductive_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u1.clone()),
+        primary_pi(
+            "a",
+            BinderInfo::Default,
+            bv(0),
+            primary_pi("b", BinderInfo::Default, bv(1), Expr::sort(Level::zero())),
+        ),
+    );
+    // ctor Eq.refl.{u_1} : {α : Sort u_1} → (a : α) → Eq α a a
+    let refl_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u1.clone()),
+            primary_pi("a", BinderInfo::Default, bv(0), eq_at(bv(1), bv(0), bv(0))),
+    );
+    // rec Eq.rec.{u, u_1}: implicit α a motive and major index; explicit minor and hypothesis.
+    let motive_domain = primary_pi(
+        "b",
+        BinderInfo::Default,
+        bv(1),
+        primary_pi(
+            "h",
+            BinderInfo::Default,
+            eq_at(bv(2), bv(1), bv(0)),
+            Expr::sort(u.clone()),
+        ),
+    );
+    let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
+    let minor_domain = Expr::app(Expr::app(bv(0), bv(1)), refl_alpha_a);
+    let result = Expr::app(Expr::app(bv(3), bv(1)), bv(0));
+    let rec_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u1.clone()),
+        primary_pi(
+            "a",
+            BinderInfo::Implicit,
+            bv(0),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive_domain.clone(),
+                primary_pi(
+                    "minor",
+                    BinderInfo::Default,
+                    minor_domain.clone(),
+                    primary_pi(
+                        "b",
+                        BinderInfo::Implicit,
+                        bv(3),
+                        primary_pi("t", BinderInfo::Default, eq_at(bv(4), bv(3), bv(0)), result),
+                    ),
+                ),
+            ),
+        ),
+    );
+    // Iota rule rhs: λ α a motive minor → minor.
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        Expr::sort(u1.clone()),
+        Expr::lam(
+            primary_name("a"),
+            bv(0),
+            Expr::lam(
+                primary_name("motive"),
+                motive_domain,
+                Expr::lam(primary_name("minor"), minor_domain, bv(0), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            eq_name.clone(),
+            ConstantDeclaration::inductive(
+                vec![u1_name.clone()],
+                decoded(&inductive_type),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    1,
+                    vec![eq_name.clone()],
+                    vec![refl.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            refl.clone(),
+            ConstantDeclaration::constructor(
+                vec![u1_name.clone()],
+                decoded(&refl_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(eq_name.clone(), 0, 2, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u_name.clone(), u1_name.clone()],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![eq_name],
+                    2,
+                    1,
+                    1,
+                    1,
+                    vec![RecursorRule::new(refl, 0, decoded(&rule_rhs))],
+                    true,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_init_eq_block_is_reconstructed() {
+    let entries = init_eq_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.Eq block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 3);
+}
+
+#[test]
+fn kr600_803_init_eq_refuses_a_forged_reflector_field_count() {
+    let entries = init_eq_entries();
+    let declaration = entries[1].declaration();
+    let forged = ConstantEntry::new(
+        checker_qualified(&["Eq", "refl"]),
+        ConstantDeclaration::constructor(
+            vec![checker_name("u_1")],
+            declaration.type_().clone(),
+            declaration.safety(),
+            ConstructorDeclaration::new(checker_name("Eq"), 0, 2, 1),
+        ),
+    );
+    let mut entries = entries;
+    entries[1] = forged;
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(!verdict.is_admitted(), "forged Eq.refl field count: {verdict:?}");
 }
 
 fn init_bool_entries() -> Vec<ConstantEntry> {
@@ -2263,22 +2449,22 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
     );
     let inl_type = primary_pi(
         "α",
-        BinderInfo::Default,
+        BinderInfo::Implicit,
         left_type(),
         primary_pi(
             "β",
-            BinderInfo::Default,
+            BinderInfo::Implicit,
             right_type(),
             primary_pi("value", BinderInfo::Default, bv(1), sum_expr(bv(2), bv(1))),
         ),
     );
     let inr_type = primary_pi(
         "α",
-        BinderInfo::Default,
+        BinderInfo::Implicit,
         left_type(),
         primary_pi(
             "β",
-            BinderInfo::Default,
+            BinderInfo::Implicit,
             right_type(),
             primary_pi("value", BinderInfo::Default, bv(0), sum_expr(bv(2), bv(1))),
         ),
@@ -2475,11 +2661,11 @@ fn init_prod_entries() -> Vec<ConstantEntry> {
     );
     let constructor_type = primary_pi(
         "α",
-        BinderInfo::Default,
+        BinderInfo::Implicit,
         left_type(),
         primary_pi(
             "β",
-            BinderInfo::Default,
+            BinderInfo::Implicit,
             right_type(),
             primary_pi(
                 "fst",
