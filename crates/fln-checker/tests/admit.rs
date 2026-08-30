@@ -1983,6 +1983,223 @@ fn kr600_803_init_eq_refuses_a_forged_reflector_field_count() {
     );
 }
 
+/// `Init.HEq` exercises a heterogeneous equality family whose parameter, index,
+/// motive, and major-premise binders the pin encodes Implicit while the
+/// reflector's field stays Default.
+fn init_heq_entries() -> Vec<ConstantEntry> {
+    let heq_name = checker_name("HEq");
+    let refl = checker_qualified(&["HEq", "refl"]);
+    let rec = checker_qualified(&["HEq", "rec"]);
+    let u_name = checker_name("u");
+    let u1_name = checker_name("u_1");
+    let u = Level::param(primary_name("u"));
+    let u1 = Level::param(primary_name("u_1"));
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let heq_at = |w: Expr, x: Expr, y: Expr, z: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(Expr::const_(primary_name("HEq"), vec![u.clone()]), w),
+                    x,
+                ),
+                y,
+            ),
+            z,
+        )
+    };
+    let refl_at = |x: Expr| {
+        Expr::app(
+            Expr::const_(Name::from_components(["HEq", "refl"]), vec![u.clone()]),
+            x,
+        )
+    };
+    // inductive HEq.{u} : {α : Sort u} → α → {β : Sort u} → β → Prop
+    let inductive_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi(
+            "a",
+            BinderInfo::Default,
+            bv(0),
+            primary_pi(
+                "β",
+                BinderInfo::Implicit,
+                Expr::sort(u.clone()),
+                primary_pi("b", BinderInfo::Default, bv(0), Expr::sort(Level::zero())),
+            ),
+        ),
+    );
+    // ctor HEq.refl.{u} : {α : Sort u} → (a : α) → HEq α a α a
+    let refl_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi("a", BinderInfo::Default, bv(0), heq_at(bv(1), bv(0), bv(1), bv(0))),
+    );
+    // rec HEq.rec.{u_1, u}
+    let motive_domain = primary_pi(
+        "β",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi(
+            "b",
+            BinderInfo::Default,
+            bv(0),
+            primary_pi(
+                "h",
+                BinderInfo::Default,
+                heq_at(bv(3), bv(2), bv(1), bv(0)),
+                Expr::sort(u1.clone()),
+            ),
+        ),
+    );
+    let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
+    let minor_domain = Expr::app(Expr::app(bv(0), bv(1)), refl_alpha_a);
+    let result = Expr::app(Expr::app(bv(4), bv(2)), Expr::app(bv(1), bv(0)));
+    let rec_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi(
+            "a",
+            BinderInfo::Implicit,
+            bv(0),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive_domain.clone(),
+                primary_pi(
+                    "m_1",
+                    BinderInfo::Default,
+                    minor_domain.clone(),
+                    primary_pi(
+                        "β",
+                        BinderInfo::Implicit,
+                        Expr::sort(u.clone()),
+                        primary_pi(
+                            "b",
+                            BinderInfo::Implicit,
+                            bv(0),
+                            primary_pi(
+                                "h",
+                                BinderInfo::Default,
+                                heq_at(bv(5), bv(4), bv(1), bv(0)),
+                                result,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+    // Iota rule rhs: λ α a motive m_1 → m_1.
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        Expr::sort(u.clone()),
+        Expr::lam(
+            primary_name("a"),
+            bv(0),
+            Expr::lam(
+                primary_name("motive"),
+                motive_domain.clone(),
+                Expr::lam(primary_name("m_1"), minor_domain.clone(), bv(0), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    vec![
+        ConstantEntry::new(
+            heq_name.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&inductive_type),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    2,
+                    vec![heq_name.clone()],
+                    vec![refl.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            refl.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&refl_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(heq_name.clone(), 0, 2, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u1_name, u_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![heq_name],
+                    2,
+                    2,
+                    1,
+                    1,
+                    vec![RecursorRule::new(refl, 0, decoded(&rule_rhs))],
+                    true,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_init_heq_block_is_reconstructed() {
+    let entries = init_heq_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.HEq block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 3);
+}
+
+#[test]
+fn kr600_803_init_heq_refuses_a_forged_reflector_field_count() {
+    let entries = init_heq_entries();
+    let declaration = entries[1].declaration();
+    let forged = ConstantEntry::new(
+        checker_qualified(&["HEq", "refl"]),
+        ConstantDeclaration::constructor(
+            vec![checker_name("u")],
+            declaration.type_().clone(),
+            declaration.safety(),
+            ConstructorDeclaration::new(checker_name("HEq"), 0, 2, 1),
+        ),
+    );
+    let mut entries = entries;
+    entries[1] = forged;
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        !verdict.is_admitted(),
+        "forged HEq.refl field count: {verdict:?}"
+    );
+}
+
 fn init_bool_entries() -> Vec<ConstantEntry> {
     let bool_name = checker_name("Bool");
     let false_name = checker_qualified(&["Bool", "false"]);

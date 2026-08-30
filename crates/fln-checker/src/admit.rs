@@ -7279,6 +7279,20 @@ pub fn admit_inductive_with(
             &mut cancelled,
         );
     }
+    if name == &checker_atom("HEq")
+        && declaration.level_parameters().len() == 1
+        && metadata.num_parameters() == 2
+    {
+        return admit_init_heq(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
     if name == &checker_atom("Except")
         && declaration.level_parameters().len() == 2
         && metadata.num_parameters() == 2
@@ -8082,6 +8096,398 @@ fn eq_rule_rhs(
     let alpha_sort = b.sort_parameter(alpha_universe);
     let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, a);
     b.finish(root)
+}
+
+fn heq_application(
+    builder: &mut StructuralTermBuilder,
+    heq: &WireName,
+    alpha_universe: &WireName,
+    left_type: ExprId,
+    left_value: ExprId,
+    right_type: ExprId,
+    right_value: ExprId,
+) -> ExprId {
+    let heq = builder.constant(heq, std::slice::from_ref(alpha_universe));
+    let heq = builder.apply(heq, left_type);
+    let heq = builder.apply(heq, left_value);
+    let heq = builder.apply(heq, right_type);
+    builder.apply(heq, right_value)
+}
+
+fn heq_inductive_type(alpha_universe: &WireName) -> Option<WireExpr> {
+    let mut b = StructuralTermBuilder::new();
+    let proposition = b.sort_zero();
+    let b_domain = b.bvar(0);
+    let b_binder = b.forall("b", BinderStyle::Default, b_domain, proposition);
+    let beta_sort = b.sort_parameter(alpha_universe);
+    let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, b_binder);
+    let a_domain = b.bvar(0);
+    let a_binder = b.forall("a", BinderStyle::Default, a_domain, beta_binder);
+    let alpha_sort = b.sort_parameter(alpha_universe);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_binder);
+    b.finish(root)
+}
+
+fn heq_constructor_type(heq: &WireName, alpha_universe: &WireName) -> Option<WireExpr> {
+    let mut b = StructuralTermBuilder::new();
+    let alpha_sort = b.sort_parameter(alpha_universe);
+    let a_domain = b.bvar(0);
+    let heq_const = b.constant(heq, std::slice::from_ref(alpha_universe));
+    let heq_alpha_index = b.bvar(1);
+    let heq_alpha = b.apply(heq_const, heq_alpha_index);
+    let heq_a_index = b.bvar(0);
+    let heq_alpha_a = b.apply(heq_alpha, heq_a_index);
+    let heq_alpha_index_again = b.bvar(1);
+    let heq_alpha_a_alpha = b.apply(heq_alpha_a, heq_alpha_index_again);
+    let heq_a_index_again = b.bvar(0);
+    let result = b.apply(heq_alpha_a_alpha, heq_a_index_again);
+    let a = b.forall("a", BinderStyle::Default, a_domain, result);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a);
+    b.finish(root)
+}
+
+fn heq_motive_type(
+    b: &mut StructuralTermBuilder,
+    heq: &WireName,
+    motive_universe: &WireName,
+    alpha_universe: &WireName,
+) -> ExprId {
+    // Scope: α(2), a(1). The motive quantifies β Implicit and its index and
+    // hypothesis Default, exactly as the pinned eliminator states it.
+    let b_domain = b.bvar(0);
+    let h_alpha = b.bvar(3);
+    let h_a = b.bvar(2);
+    let h_beta = b.bvar(1);
+    let h_b = b.bvar(0);
+    let h_domain = heq_application(b, heq, alpha_universe, h_alpha, h_a, h_beta, h_b);
+    let motive_sort = b.sort_parameter(motive_universe);
+    let hypothesis = b.forall("h", BinderStyle::Default, h_domain, motive_sort);
+    let b_binder = b.forall("b", BinderStyle::Default, b_domain, hypothesis);
+    let beta_sort = b.sort_parameter(alpha_universe);
+    b.forall("β", BinderStyle::Implicit, beta_sort, b_binder)
+}
+
+fn heq_recursor_type(
+    heq: &WireName,
+    refl: &WireName,
+    motive_universe: &WireName,
+    alpha_universe: &WireName,
+) -> Option<WireExpr> {
+    let mut b = StructuralTermBuilder::new();
+    let motive_type = heq_motive_type(&mut b, heq, motive_universe, alpha_universe);
+    // Minor premise, scope: α(2), a(1), motive(0).
+    let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+    let refl_alpha_index = b.bvar(2);
+    let refl_alpha = b.apply(refl_const, refl_alpha_index);
+    let refl_a_index = b.bvar(1);
+    let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+    let motive_var = b.bvar(0);
+    let minor_a = b.bvar(1);
+    let motive_a = b.apply(motive_var, minor_a);
+    let minor_type = b.apply(motive_a, refl_alpha_a);
+    // Result, scope: α(6), a(5), motive(4), minor(3), β(2), b(1), h(0).
+    let motive_result = b.bvar(4);
+    let result_beta = b.bvar(2);
+    let motive_beta = b.apply(motive_result, result_beta);
+    let result_b = b.bvar(1);
+    let motive_beta_b = b.apply(motive_beta, result_b);
+    let result_h = b.bvar(0);
+    let result = b.apply(motive_beta_b, result_h);
+    // Major hypothesis, scope: α(5), a(4), motive(3), minor(2), β(1), b(0).
+    let h_alpha = b.bvar(5);
+    let h_a = b.bvar(4);
+    let h_beta = b.bvar(1);
+    let h_b = b.bvar(0);
+    let h_domain = heq_application(&mut b, heq, alpha_universe, h_alpha, h_a, h_beta, h_b);
+    let major_hypothesis = b.forall("h", BinderStyle::Default, h_domain, result);
+    // The pin binds the heterogeneous major index pair Implicit.
+    let b_domain = b.bvar(0);
+    let b_binder = b.forall("b", BinderStyle::Implicit, b_domain, major_hypothesis);
+    let beta_sort = b.sort_parameter(alpha_universe);
+    let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, b_binder);
+    let minors = b.forall("m_1", BinderStyle::Default, minor_type, beta_binder);
+    let motives = b.forall("motive", BinderStyle::Implicit, motive_type, minors);
+    let a_domain = b.bvar(0);
+    let a_implicit = b.forall("a", BinderStyle::Implicit, a_domain, motives);
+    let alpha_sort = b.sort_parameter(alpha_universe);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_implicit);
+    b.finish(root)
+}
+
+fn heq_rule_rhs(
+    heq: &WireName,
+    refl: &WireName,
+    motive_universe: &WireName,
+    alpha_universe: &WireName,
+) -> Option<WireExpr> {
+    let mut b = StructuralTermBuilder::new();
+    let motive_type = heq_motive_type(&mut b, heq, motive_universe, alpha_universe);
+    // Minor premise, scope: α(2), a(1), motive(0).
+    let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+    let refl_alpha_index = b.bvar(2);
+    let refl_alpha = b.apply(refl_const, refl_alpha_index);
+    let refl_a_index = b.bvar(1);
+    let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+    let motive_var = b.bvar(0);
+    let minor_a = b.bvar(1);
+    let motive_a = b.apply(motive_var, minor_a);
+    let minor_type = b.apply(motive_a, refl_alpha_a);
+    // The iota contraction for refl is the minor premise itself.
+    let result = b.bvar(0);
+    let m_1 = b.lambda("m_1", BinderStyle::Default, minor_type, result);
+    let motive = b.lambda("motive", BinderStyle::Default, motive_type, m_1);
+    let a_domain = b.bvar(0);
+    let a = b.lambda("a", BinderStyle::Default, a_domain, motive);
+    let alpha_sort = b.sort_parameter(alpha_universe);
+    let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, a);
+    b.finish(root)
+}
+
+/// Reconstruct the universe-polymorphic heterogeneous equality family
+/// `Init.HEq`: two parameters (`α`, then the fixed left side `a`), two indices
+/// (`β`, `b`), a zero-field reflector whose result reuses both parameters as
+/// indices, and the eliminator whose motive, index pair, and major hypothesis
+/// the pin binds Implicit while the minor and hypothesis stay Default.
+#[allow(clippy::too_many_arguments)]
+fn admit_init_heq(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InductiveVerdict {
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
+    let level_parameters = declaration.level_parameters();
+    let Some(alpha_universe) = level_parameters.first() else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: level_parameters.len(),
+        });
+    };
+    if level_parameters.len() != 1 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: level_parameters.len(),
+        });
+    }
+    if metadata.mutual() != std::slice::from_ref(name) {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::MutualMetadata);
+    }
+    if metadata.num_parameters() != 2 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    }
+    if metadata.num_indices() != 2 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
+            observed: metadata.num_indices(),
+        });
+    }
+    if metadata.num_nested() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
+            observed: metadata.num_nested(),
+        });
+    }
+    if metadata.is_recursive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
+    }
+    if metadata.is_reflexive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
+    }
+    let refl = checker_child(name, "refl");
+    if metadata.constructors() != std::slice::from_ref(&refl)
+        || declarations.len() != 3
+        || environment.find(name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    }
+    let Some(expected_type) = heq_inductive_type(alpha_universe) else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(declaration.type_(), &expected_type, comparison, cancelled) {
+        Ok(true) => {}
+        Ok(false) => return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse),
+        Err(verdict) => return verdict,
+    }
+    if let Err(verdict) =
+        declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
+    {
+        return map_member_preamble(name, verdict);
+    }
+    let mut staged =
+        match stage_inductive_member(environment, inductive, environment_budget, cancelled) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+    let Some(constructor) = declarations.iter().find(|entry| entry.name() == &refl) else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing { name: refl });
+    };
+    let Some(constructor_metadata) = constructor.declaration().constructor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: checker_child(name, "refl"),
+        });
+    };
+    let refl_levels = constructor.declaration().level_parameters();
+    let Some(refl_universe) = refl_levels.first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: checker_child(name, "refl"),
+        });
+    };
+    if constructor.declaration().safety() != ConstantSafety::Safe
+        || refl_levels.len() != 1
+        || constructor_metadata.inductive() != name
+        || constructor_metadata.index() != 0
+        || constructor_metadata.num_parameters() != 2
+        || constructor_metadata.num_fields() != 0
+        || environment.find(&refl).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { name: refl });
+    }
+    let Some(expected_ctor) = heq_constructor_type(name, refl_universe) else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(
+        constructor.declaration().type_(),
+        &expected_ctor,
+        comparison,
+        cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: checker_child(name, "refl"),
+            });
+        }
+        Err(verdict) => return verdict,
+    }
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged,
+        &refl,
+        constructor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&refl, verdict);
+    }
+    staged = match stage_inductive_member(&staged, constructor, environment_budget, cancelled) {
+        Ok(environment) => environment,
+        Err(verdict) => return verdict,
+    };
+    let recursor_name = checker_child(name, "rec");
+    let Some(recursor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &recursor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing {
+            name: recursor_name,
+        });
+    };
+    let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_levels = recursor.declaration().level_parameters();
+    let Some(motive_universe) = recursor_levels.first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let Some(recursor_alpha_universe) = recursor_levels.get(1) else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    if recursor.declaration().safety() != ConstantSafety::Safe
+        || recursor_levels.len() != 2
+        || recursor_metadata.mutual() != std::slice::from_ref(name)
+        || recursor_metadata.num_parameters() != 2
+        || recursor_metadata.num_indices() != 2
+        || recursor_metadata.num_motives() != 1
+        || recursor_metadata.num_minors() != 1
+        || recursor_metadata.rules().len() != 1
+        || !recursor_metadata.k()
+        || environment.find(&recursor_name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    let Some(expected_type) =
+        heq_recursor_type(name, &refl, motive_universe, recursor_alpha_universe)
+    else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(
+        recursor.declaration().type_(),
+        &expected_type,
+        comparison,
+        cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!("fln-checker: heq defer at rec-type-compare for {recursor_name:?}");
+                eprintln!(
+                    "fln-checker: heq rec arena: {:?}",
+                    recursor.declaration().type_().nodes()
+                );
+                eprintln!("fln-checker: heq rec EXPECTED: {:?}", expected_type.nodes());
+            }
+            return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
+        }
+        Err(verdict) => return verdict,
+    }
+    let Some(rule) = recursor_metadata.rules().first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let Some(expected_rhs) =
+        heq_rule_rhs(name, &refl, motive_universe, recursor_alpha_universe)
+    else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    if rule.constructor() != &refl || rule.num_fields() != 0 {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    match compare_inductive_expression(rule.rhs(), &expected_rhs, comparison, cancelled) {
+        Ok(true) => {}
+        Ok(false) => {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!("fln-checker: heq defer at rule-rhs-compare for {recursor_name:?}");
+                eprintln!("fln-checker: heq rule rhs arena: {:?}", rule.rhs().nodes());
+                eprintln!("fln-checker: heq rule rhs EXPECTED: {:?}", expected_rhs.nodes());
+            }
+            return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
+        }
+        Err(verdict) => return verdict,
+    }
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged,
+        &recursor_name,
+        recursor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&recursor_name, verdict);
+    }
+    if let Err(verdict) = stage_inductive_member(&staged, recursor, environment_budget, cancelled) {
+        return verdict;
+    }
+    InductiveVerdict::Admitted(InductiveAdmission {
+        members: vec![name.clone(), refl, recursor_name],
+    })
 }
 
 /// Reconstruct the universe-polymorphic `Init.Eq` block. The pin partitions
