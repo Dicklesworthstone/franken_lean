@@ -8451,8 +8451,7 @@ fn admit_init_heq(
             name: recursor_name,
         });
     };
-    let Some(expected_rhs) =
-        heq_rule_rhs(name, &refl, motive_universe, recursor_alpha_universe)
+    let Some(expected_rhs) = heq_rule_rhs(name, &refl, motive_universe, recursor_alpha_universe)
     else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
@@ -8467,7 +8466,10 @@ fn admit_init_heq(
             if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
                 eprintln!("fln-checker: heq defer at rule-rhs-compare for {recursor_name:?}");
                 eprintln!("fln-checker: heq rule rhs arena: {:?}", rule.rhs().nodes());
-                eprintln!("fln-checker: heq rule rhs EXPECTED: {:?}", expected_rhs.nodes());
+                eprintln!(
+                    "fln-checker: heq rule rhs EXPECTED: {:?}",
+                    expected_rhs.nodes()
+                );
             }
             return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
         }
