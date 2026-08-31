@@ -53,6 +53,7 @@ dependencies = [
  "fln",
  "fln-core",
  "fln-hash",
+ "fln-server",
 ]
 
 [[package]]
@@ -194,6 +195,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-tui"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-unsafe-abi"
@@ -239,6 +243,9 @@ dependencies = [
 [[package]]
 name = "fln-wasm"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "structure-guard"
