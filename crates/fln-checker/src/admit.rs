@@ -8162,7 +8162,8 @@ fn heq_motive_type(
     let rval = b.bvar(1);
     let t_domain = heq_application(b, heq, alpha_universe, ltype, lval, rtype, rval);
     let t_binder = b.forall("t", BinderStyle::Default, t_domain, motive_sort);
-    let a_hyg_inner = b.forall("a_hyg", BinderStyle::Default, b.bvar(3), t_binder);
+    let a_hyg_inner_domain = b.bvar(3);
+    let a_hyg_inner = b.forall("a_hyg", BinderStyle::Default, a_hyg_inner_domain, t_binder);
     let beta_sort = b.sort_parameter(alpha_universe);
     b.forall("β", BinderStyle::Implicit, beta_sort, a_hyg_inner)
 }
@@ -8180,32 +8181,40 @@ fn heq_recursor_type(
     let alpha_sort = b.sort_parameter(alpha_universe);
     let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
     // Minor body: motive α a_hyg_outer (HEq.refl α a_hyg_outer).
-    let refl_alpha = b.apply(refl_const, b.bvar(7));
-    let refl_a_hyg = b.apply(refl_alpha, b.bvar(6));
-    let motive_alpha = b.apply(b.bvar(5), b.bvar(7));
-    let motive_alpha_a_hyg = b.apply(motive_alpha, b.bvar(6));
+    let b7 = b.bvar(7);
+    let b6 = b.bvar(6);
+    let b5 = b.bvar(5);
+    let refl_alpha = b.apply(refl_const, b7);
+    let refl_a_hyg = b.apply(refl_alpha, b6);
+    let motive_alpha = b.apply(b5, b7);
+    let motive_alpha_a_hyg = b.apply(motive_alpha, b6);
     let minor_body = b.apply(motive_alpha_a_hyg, refl_a_hyg);
     // Major t-domain: HEq α a_hyg_inner β a_hyg_inner.
     let heq_const = b.constant(heq, std::slice::from_ref(alpha_universe));
-    let t_domain = heq_application(&mut b, heq, alpha_universe, td_ltype, td_lval, td_rtype, td_rval);
+    let td_ltype = b.bvar(7);
     let td_lval = b.bvar(1);
     let td_rtype = b.bvar(3);
     let td_rval = b.bvar(1);
-    let t_domain = heq_application(&mut b, heq_const, alpha_universe, td_ltype, td_lval, td_rtype, td_rval);
+    let t_domain = heq_application(&mut b, heq, alpha_universe, td_ltype, td_lval, td_rtype, td_rval);
     // Body: motive β a_hyg_major t.
-    let body = b.apply(
-        b.apply(b.apply(b.bvar(5), b.bvar(3)), b.bvar(2)),
-        b.bvar(0),
-    );
+    let b5b = b.bvar(5);
+    let b3 = b.bvar(3);
+    let b2 = b.bvar(2);
+    let b0 = b.bvar(0);
+    let body_1 = b.apply(b5b, b3);
+    let body_2 = b.apply(body_1, b2);
+    let body = b.apply(body_2, b0);
     let t_binder = b.forall("t", BinderStyle::Default, t_domain, body);
+    let a_hyg_major_domain = b.bvar(2);
     let a_hyg_major_binder =
-        b.forall("a_hyg", BinderStyle::Implicit, b.bvar(2), t_binder);
+        b.forall("a_hyg", BinderStyle::Implicit, a_hyg_major_domain, t_binder);
     let beta_sort = b.sort_parameter(alpha_universe);
     let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, a_hyg_major_binder);
     let refl_binder = b.forall("refl", BinderStyle::Default, minor_body, beta_binder);
     let motive_binder = b.forall("motive", BinderStyle::Implicit, motive_type, refl_binder);
+    let a_hyg_outer_domain = b.bvar(6);
     let a_hyg_outer_binder =
-        b.forall("a_hyg", BinderStyle::Implicit, b.bvar(6), motive_binder);
+        b.forall("a_hyg", BinderStyle::Implicit, a_hyg_outer_domain, motive_binder);
     let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_hyg_outer_binder);
     b.finish(root)
 }
@@ -8220,7 +8229,8 @@ fn heq_rule_rhs(
     // Telescope: α.Impl, motive.Impl, refl.Default → refl.
     let mut b = StructuralTermBuilder::new();
     let alpha_sort = b.sort_parameter(alpha_universe);
-    let refl_binder = b.forall("refl", BinderStyle::Default, alpha_sort.clone(), b.bvar(0));
+    let refl_domain = b.bvar(0);
+    let refl_binder = b.forall("refl", BinderStyle::Default, alpha_sort.clone(), refl_domain);
     let motive_binder = b.forall("motive", BinderStyle::Implicit, alpha_sort.clone(), refl_binder);
     let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, motive_binder);
     b.finish(root)
@@ -8345,6 +8355,13 @@ fn admit_init_heq(
     ) {
         Ok(true) => {}
         Ok(false) => {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!(
+                    "fln-checker: heq ctor compare failed; actual={:?} expected={:?}",
+                    constructor.declaration().type_().nodes(),
+                    expected_ctor.nodes()
+                );
+            }
             return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
                 name: checker_child(name, "refl"),
             });
