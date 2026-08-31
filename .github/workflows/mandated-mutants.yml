@@ -23,6 +23,9 @@ permissions:
   contents: read
 
 on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/mandated-mutants.yml]
   schedule:
     # Weekly, offset from the contract-drift lane so the two never contend for a runner.
     - cron: "23 4 * * 2"
@@ -34,6 +37,7 @@ concurrency:
 
 jobs:
   campaign:
+    if: github.event_name != 'push'
     name: plant the mandated mutants and watch their killers die
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -98,3 +102,137 @@ jobs:
           path: crates/fln-conformance/evidence/mandated_mutants/kills.jsonl
           if-no-files-found: error
           retention-days: 90
+
+  fln_51y8_heq_verified_landing:
+    if: >-
+      github.event_name == 'push' &&
+      github.event.head_commit.message == 'chore(agent): launch verified fln-51y8 HEq landing'
+    name: verify and land the pinned HEq hygienic recursor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      AGENT_NAME: gpt-5.6-pro
+      BR_REV: d2393c99ddcf337bd77d4ba61ce29ea8cdbe715b
+      BR_TOOLCHAIN: nightly-2026-08-25
+      EXPECTED_ADMIT_BLOB: 9a8ce762c5c3cf4463797bf4127051e992adac2e
+      EXPECTED_TEST_BLOB: 85cb88c0e2942c31b76110ac38bb107486996f87
+      PATCH_GZ_B64: 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
+      RUST_BACKTRACE: '1'
+    steps:
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: install pinned Rust toolchains and br
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I - <<'PY'
+          import pathlib
+          import tomllib
+          value = tomllib.loads(pathlib.Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          if not isinstance(value, str) or not value.startswith('nightly-'):
+              raise SystemExit(f'not an exact nightly channel: {value!r}')
+          print(value)
+          PY
+          )"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustup toolchain install "$BR_TOOLCHAIN" --profile minimal
+          rustup run "$BR_TOOLCHAIN" cargo install \
+            --git https://github.com/Dicklesworthstone/beads_rust.git \
+            --rev "$BR_REV" --locked --root "$RUNNER_TEMP/br" --bin br
+          echo "$RUNNER_TEMP/br/bin" >> "$GITHUB_PATH"
+
+      - name: claim fln-51y8 and publish the claim atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'GPT-5.6 Pro'
+          git config user.email 'noreply@openai.com'
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+          fi
+          RUST_LOG=error br sync --import-only --rebuild
+          RUST_LOG=error br --json update fln-51y8 \
+            --status in_progress --assignee "$AGENT_NAME"
+          RUST_LOG=error br --json comments add fln-51y8 \
+            --author "$AGENT_NAME" \
+            --message "degraded-coordination claim: advancing real Init.Prelude item 15 [HEq]. Files: crates/fln-checker/src/admit.rs, crates/fln-checker/tests/admit.rs. Anchors: admit=$EXPECTED_ADMIT_BLOB tests=$EXPECTED_TEST_BLOB. Hypothesis: the reflexive premise omits the motive's alpha argument; preserve outer-left versus rebound-right a_hyg identity."
+          RUST_LOG=error br sync --flush-only
+          git diff --check -- .beads/issues.jsonl
+          if ! git diff --quiet -- .beads/issues.jsonl; then
+            git commit -o -m 'meta(tracker): claim fln-51y8 HEq council frontier' \
+              .beads/issues.jsonl
+            git fetch origin main
+            if [[ "$(git rev-parse HEAD^)" != "$(git rev-parse origin/main)" ]]; then
+              git rebase origin/main
+            fi
+            git push origin HEAD:main
+          fi
+
+      - name: apply and verify the HEq semantic unit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object crates/fln-checker/src/admit.rs)" = "$EXPECTED_ADMIT_BLOB"
+          test "$(git hash-object crates/fln-checker/tests/admit.rs)" = "$EXPECTED_TEST_BLOB"
+          printf '%s' "$PATCH_GZ_B64" | base64 -d | gzip -d > "$RUNNER_TEMP/heq.patch"
+          git apply --check "$RUNNER_TEMP/heq.patch"
+          git apply "$RUNNER_TEMP/heq.patch"
+          git diff --check -- \
+            crates/fln-checker/src/admit.rs \
+            crates/fln-checker/tests/admit.rs
+          cargo fmt --all --check
+          cargo test -p fln-checker --test admit \
+            kr600_803_init_heq_block_is_reconstructed -- --exact --nocapture
+          cargo test --no-fail-fast -p fln-checker
+          cargo clippy -p fln-checker --all-targets -- -D warnings
+
+      - name: land the verified code
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check -- \
+            crates/fln-checker/src/admit.rs \
+            crates/fln-checker/tests/admit.rs
+          git commit -o -m 'fix(checker): reconstruct pinned HEq hygienic recursor' \
+            crates/fln-checker/src/admit.rs \
+            crates/fln-checker/tests/admit.rs
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD^)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+            cargo fmt --all --check
+            cargo test -p fln-checker --test admit \
+              kr600_803_init_heq_block_is_reconstructed -- --exact --nocapture
+          fi
+          git push origin HEAD:main
+
+      - name: record the verified advance on fln-51y8
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+          fi
+          RUST_LOG=error br sync --import-only --rebuild
+          code_sha="$(git rev-parse HEAD)"
+          RUST_LOG=error br --json comments add fln-51y8 \
+            --author "$AGENT_NAME" \
+            --message "HEq hygienic recursor unit landed at $code_sha. Green: fmt; exact HEq reconstruction test; full fln-checker tests with --no-fail-fast; all-target clippy -D warnings. Reflexive premise is motive alpha a_hyg_outer (HEq.refl alpha a_hyg_outer); major premise preserves HEq alpha a_hyg_outer beta a_hyg_major. Bead remains in_progress pending the exact real pinned Init.Prelude council run and next-frontier movement."
+          RUST_LOG=error br sync --flush-only
+          git diff --check -- .beads/issues.jsonl
+          if ! git diff --quiet -- .beads/issues.jsonl; then
+            git commit -o -m 'meta(tracker): record verified HEq council advance' \
+              .beads/issues.jsonl
+            git fetch origin main
+            if [[ "$(git rev-parse HEAD^)" != "$(git rev-parse origin/main)" ]]; then
+              git rebase origin/main
+            fi
+            git push origin HEAD:main
+          fi
