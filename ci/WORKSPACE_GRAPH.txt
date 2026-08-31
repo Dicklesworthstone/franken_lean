@@ -146,6 +146,8 @@ edge fln-lake -> fln-core          # build targets reference declaration Name fo
 edge fln-hound -> fln-core         # candidate cards reference Name and Expr for statements and queries (§16.1, rank 20 -> 0)
 edge fln-mcp -> fln-core           # proof-state snapshots reference Expr and Name for goals and hypotheses (§16.3, rank 20 -> 0)
 edge fln-doc -> fln-core           # documentation pages reference declaration Name (§16.2, rank 20 -> 0)
+edge fln-tui -> fln-core           # goal/progress/tribunal panel models reference Name and Expr (§16.4, rank 20 -> 0)
+edge fln-wasm -> fln-core          # capsule format and verdict types reference Name (§16.4b, rank 21 -> 0)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.
