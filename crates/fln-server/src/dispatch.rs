@@ -136,12 +136,15 @@ fn extract_content_changes_text(json: &str) -> Option<String> {
 
 /// Build the `initialize` response with FrankenLean server capabilities.
 fn initialize_response(id: i64) -> String {
+    // We use push diagnostics (textDocument/publishDiagnostics) not pull
+    // diagnostics (textDocument/diagnostic), so diagnosticProvider is not
+    // advertised. textDocumentSync with openClose + change:1 (Full) is
+    // what triggers the client to send didOpen/didChange/didClose.
     format!(
         concat!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{",
             "\"capabilities\":{{",
-            "\"textDocumentSync\":{{\"openClose\":true,\"change\":1}},",
-            "\"diagnosticProvider\":{{\"interFileDependencies\":false,\"workspaceDiagnostics\":false}}",
+            "\"textDocumentSync\":{{\"openClose\":true,\"change\":1}}",
             "}},",
             "\"serverInfo\":{{\"name\":\"FrankenLean\",\"version\":{}}}"
             ,"}}}}"
