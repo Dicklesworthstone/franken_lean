@@ -2470,9 +2470,22 @@ impl<'a> InferenceEngine<'a> {
             .sources
             .get(state.next)
             .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        // Resolve the materialized domain to its TYPE (via materialize_reference,
+        // which already recursively resolves every Free local to its registered
+        // type and walks App/Forall/Lambda subterms). Storing the raw Free
+        // form made compare_domain compare concrete inferred types against Free
+        // locals — the quick def-eq has no rule for that pair, and the
+        // Init.Prelude item 15 [HEq] member preamble defers on exactly this
+        // comparison. Storing the inferred TYPE gives every consumer of
+        // scoped_locals a canonical concrete form.
+        let domain_ref = self.store_generated(Arc::clone(&domain));
+        let type_ref = self.materialize_reference(domain_ref)?;
+        let stored_type = Arc::new(
+            inference_arena(self.input, &self.generated, type_ref.source)?.clone(),
+        );
         if self
             .scoped_locals
-            .insert(local_name.clone(), Arc::clone(&domain))
+            .insert(local_name.clone(), stored_type)
             .is_some()
         {
             return Err(LeafHalt::Fault(InferenceFault::ScopedLocalCollision {
