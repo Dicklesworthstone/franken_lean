@@ -186,6 +186,7 @@ const LEAN_USAGE: &str = concat!(
     "  lean --features\n",
     "  lean --print-prefix\n",
     "  lean --print-libdir\n",
+    "  lean --server\n",
     "\n",
     "This is FrankenLean's bounded native `lean` personality. It accepts exactly\n",
     "one source path and executes the currently supported Nat/String/Bool source\n",
@@ -220,6 +221,11 @@ const LEAN_USAGE: &str = concat!(
     "the conventional installation paths only when the running executable is\n",
     "located at <prefix>/bin/lean; development binaries outside that layout are\n",
     "refused instead of reporting a false toolchain root.\n",
+    "--server starts the LSP server over stdin/stdout, matching the Reference's\n",
+    "`lean --server` entry point used by editor extensions. The server handles\n",
+    "the LSP lifecycle and textDocument/didOpen, running opened documents through\n",
+    "the bounded source pipeline and projecting diagnostics. This is the same\n",
+    "transport as `fln serve-lsp`.\n",
     "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
     ".olean discovery, implicit Prelude processing, general Lean elaboration, or\n",
     "diagnostic parity. Discovery assumes a trusted filesystem namespace that\n",
@@ -326,6 +332,7 @@ enum LeanCommand {
     Features,
     PrintPrefix,
     PrintLibdir,
+    Server,
     Stdin { max_bytes: usize },
     SourceDependencies { path: PathBuf, max_bytes: usize },
     Source { path: PathBuf, max_bytes: usize },
@@ -1177,6 +1184,13 @@ fn parse_lean_command(
             Ok(LeanCommand::PrintLibdir)
         } else {
             Err(UsageError("--print-libdir must be used alone".to_owned()))
+        };
+    }
+    if first == "--server" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::Server)
+        } else {
+            Err(UsageError("--server must be used alone".to_owned()))
         };
     }
 
@@ -10991,6 +11005,7 @@ fn run_lean_with_optional_input(
         Ok(LeanCommand::Features) => MultiplexerOutput::success("[]\n".to_owned()),
         Ok(LeanCommand::PrintPrefix) => lean_installation_path_output(|paths| paths.prefix),
         Ok(LeanCommand::PrintLibdir) => lean_installation_path_output(|paths| paths.libdir),
+        Ok(LeanCommand::Server) => serve_lsp(),
         Ok(LeanCommand::Stdin { max_bytes }) => match input {
             Some(input) => run_lean_stdin(input, max_bytes),
             None => MultiplexerOutput::failure(
