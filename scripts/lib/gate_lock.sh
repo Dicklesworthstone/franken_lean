@@ -12,8 +12,8 @@
 # so a helper placed there would move a count those guards pin. Verified before this file was
 # written, not assumed.
 
-FLN_GATE_LOCKFILE="${FLN_GATE_LOCKFILE:-/data/tmp/fln-gate.lockfile}"
-FLN_GATE_JOURNAL="${FLN_GATE_JOURNAL:-/data/tmp/fln-gate.journal}"
+FLN_GATE_LOCKFILE="${FLN_GATE_LOCKFILE:-$(shared_dir=${FLN_GATE_SHARED_DIR:-/data/tmp}; if [ -d "$shared_dir" ] && [ -w "$shared_dir" ]; then printf '%s' "$shared_dir"; elif [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ] && [ -w "$RUNNER_TEMP" ]; then printf '%s' "$RUNNER_TEMP"; elif [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && [ -w "$TMPDIR" ]; then printf '%s' "$TMPDIR"; else printf '%s' /tmp; fi)/fln-gate.lockfile}"
+FLN_GATE_JOURNAL="${FLN_GATE_JOURNAL:-$(dirname -- "$FLN_GATE_LOCKFILE")/fln-gate.journal}"
 FLN_GATE_WAIT_S="${FLN_GATE_WAIT_S:-2400}"
 FLN_GATE_STATE="unset"
 
