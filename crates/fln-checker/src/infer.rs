@@ -2480,9 +2480,8 @@ impl<'a> InferenceEngine<'a> {
         // scoped_locals a canonical concrete form.
         let domain_ref = self.store_generated(Arc::clone(&domain));
         let type_ref = self.materialize_reference(domain_ref)?;
-        let stored_type = Arc::new(
-            inference_arena(self.input, &self.generated, type_ref.source)?.clone(),
-        );
+        let stored_type =
+            Arc::new(inference_arena(self.input, &self.generated, type_ref.source)?.clone());
         if self
             .scoped_locals
             .insert(local_name.clone(), stored_type)
