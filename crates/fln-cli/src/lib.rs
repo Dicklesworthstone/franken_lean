@@ -10793,22 +10793,38 @@ fn serve_lsp() -> MultiplexerOutput {
     };
 
     let mut on_did_open = move |uri: &str, text: &str| -> Vec<String> {
-        let snapshot = lsp_source_snapshot(text.as_bytes());
-        match fln_server::project(lsp_request, &snapshot) {
+        let snapshot = lsp_source_snapshot(uri, text.as_bytes());
+        let mut messages = match fln_server::project(lsp_request, &snapshot) {
             Ok(projection) => projection.messages,
-            Err(_refusal) => {
-                // Projection refused — fall back to an empty diagnostics
-                // notification so the client still clears stale markers.
-                vec![format!(
+            Err(_refusal) => Vec::new(),
+        };
+        // The projection generates publishDiagnostics keyed by the
+        // diagnostic's file_name (which we now set to the document URI).
+        // When there are no diagnostics at all (clean execution), the
+        // projection sends $/lean/diagnosticOutcome but no
+        // publishDiagnostics — so the editor would never clear stale
+        // markers. Ensure we always send a publishDiagnostics for the
+        // opened URI; if the projection already emitted one for this
+        // file, we still send our explicit clear first (the last one
+        // wins per the LSP spec, so the projection's version takes
+        // precedence for files with real diagnostics).
+        let has_publish_for_uri = messages
+            .iter()
+            .any(|m| m.contains("publishDiagnostics") && m.contains(uri));
+        if !has_publish_for_uri {
+            messages.insert(
+                0,
+                format!(
                     concat!(
                         "{{\"jsonrpc\":\"2.0\",",
                         "\"method\":\"textDocument/publishDiagnostics\",",
                         "\"params\":{{\"uri\":{},\"version\":null,\"diagnostics\":[]}}}}"
                     ),
                     fln_server::json_string(uri)
-                )]
-            }
+                ),
+            );
         }
+        messages
     };
 
     match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open) {
@@ -10833,7 +10849,12 @@ fn serve_lsp() -> MultiplexerOutput {
 /// snapshot suitable for LSP projection. This is the bridge between the
 /// existing source runner and the LSP transport: `didOpen` feeds text here,
 /// and the resulting `ProjectionSnapshot` is projected by `fln-server`.
-fn lsp_source_snapshot(source: &[u8]) -> ProjectionSnapshot {
+///
+/// The `uri` is the document URI from the LSP client (e.g. `file:///path/to/file.lean`).
+/// It is used as the `file_name` in any diagnostics so that `fln-server`'s
+/// projection generates `publishDiagnostics` notifications keyed to the
+/// correct document.
+fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
     let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
     let engine = match fln::Engine::with_source_seed(
         fln::EngineAdmissionLimits::new(kernel_budget),
@@ -10855,7 +10876,7 @@ fn lsp_source_snapshot(source: &[u8]) -> ProjectionSnapshot {
             });
         }
         Err(error) => {
-            return lsp_error_snapshot(&error.to_string());
+            return lsp_error_snapshot(uri, &error.to_string());
         }
     };
     let options = fln::KVMap::new();
@@ -10879,17 +10900,21 @@ fn lsp_source_snapshot(source: &[u8]) -> ProjectionSnapshot {
                 evidence: None,
             })
         }
-        Err(error) => lsp_error_snapshot(&error.to_string()),
+        Err(error) => lsp_error_snapshot(uri, &error.to_string()),
     }
 }
 
 /// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at
 /// the start of the file. Position (1, 0) is the Lean convention for
-/// file-level errors.
-fn lsp_error_snapshot(message: &str) -> ProjectionSnapshot {
+/// file-level errors. The `uri` is used as `file_name` so that the
+/// projection generates a `publishDiagnostics` for the right document.
+fn lsp_error_snapshot(uri: &str, message: &str) -> ProjectionSnapshot {
+    // Strip the `file://` prefix if present, because `complete_messages`
+    // in fln-server re-adds `file://` when building the notification URI.
+    let file_name = uri.strip_prefix("file://").unwrap_or(uri);
     ProjectionSnapshot::Complete {
         diagnostics: vec![StructuredDiagnostic {
-            file_name: BoundedText::new("input".to_owned()),
+            file_name: BoundedText::new(file_name.to_owned()),
             pos: fln_core::pos::Position { line: 1, column: 0 },
             end_pos: None,
             severity: Severity::Error,
