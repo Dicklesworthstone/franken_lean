@@ -350,6 +350,62 @@ pub fn serve(
                 // runner is stateless.
             }
 
+            // --- $/lean/plainGoal (InfoView goal request) ---
+            (Some("$/lean/plainGoal"), Some(req_id), ServerState::Running) => {
+                // The VS Code Lean 4 extension sends this request for the
+                // InfoView panel. We don't yet track cursor-position-aware
+                // proof state, so we return null (= no goals at position).
+                let response = null_response(req_id);
+                transport::write_message(output, response.as_bytes())?;
+            }
+
+            // --- $/lean/plainTermGoal (InfoView term goal request) ---
+            (Some("$/lean/plainTermGoal"), Some(req_id), ServerState::Running) => {
+                let response = null_response(req_id);
+                transport::write_message(output, response.as_bytes())?;
+            }
+
+            // --- textDocument/hover ---
+            (Some("textDocument/hover"), Some(req_id), ServerState::Running) => {
+                // Return null (= no hover information) rather than method
+                // not found, so the editor doesn't show error popups.
+                let response = null_response(req_id);
+                transport::write_message(output, response.as_bytes())?;
+            }
+
+            // --- textDocument/completion ---
+            (Some("textDocument/completion"), Some(req_id), ServerState::Running) => {
+                // Return null (= no completions) gracefully.
+                let response = null_response(req_id);
+                transport::write_message(output, response.as_bytes())?;
+            }
+
+            // --- textDocument/definition ---
+            (Some("textDocument/definition"), Some(req_id), ServerState::Running) => {
+                // Return null (= no definition location) gracefully.
+                let response = null_response(req_id);
+                transport::write_message(output, response.as_bytes())?;
+            }
+
+            // --- $/lean/rpc/connect (widget RPC session init) ---
+            (Some("$/lean/rpc/connect"), Some(req_id), ServerState::Running) => {
+                // Return a minimal session ID so the client can proceed.
+                // The RPC session is not functional yet but this prevents
+                // "method not found" error loops in the extension.
+                let response = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"sessionId\":\"fln-stub-0\"}}}}",
+                    req_id
+                );
+                transport::write_message(output, response.as_bytes())?;
+            }
+
+            // --- $/lean/rpc/call (widget RPC calls) ---
+            (Some("$/lean/rpc/call"), Some(req_id), ServerState::Running) => {
+                // Return null until the RPC infrastructure is implemented.
+                let response = null_response(req_id);
+                transport::write_message(output, response.as_bytes())?;
+            }
+
             // --- Unknown request (has id) → method not found ---
             (_, Some(req_id), _) => {
                 let response = error_response(req_id, -32601, "method not found");
@@ -445,7 +501,7 @@ mod tests {
     #[test]
     fn unknown_request_returns_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("-32601"));
@@ -525,6 +581,40 @@ mod tests {
             extract_save_text(json),
             Some("def w := 99".to_string())
         );
+    }
+
+    #[test]
+    fn plain_goal_returns_null_not_method_not_found() {
+        let (outcome, output) = lifecycle_session(
+            r#"{"jsonrpc":"2.0","id":10,"method":"$/lean/plainGoal","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":10"));
+        assert!(output.contains("\"result\":null"));
+        // Must NOT contain method not found.
+        assert!(!output.contains("-32601"));
+    }
+
+    #[test]
+    fn hover_returns_null_gracefully() {
+        let (outcome, output) = lifecycle_session(
+            r#"{"jsonrpc":"2.0","id":11,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":11"));
+        assert!(output.contains("\"result\":null"));
+        assert!(!output.contains("-32601"));
+    }
+
+    #[test]
+    fn rpc_connect_returns_session_id() {
+        let (outcome, output) = lifecycle_session(
+            r#"{"jsonrpc":"2.0","id":12,"method":"$/lean/rpc/connect","params":{"uri":"file:///test.lean"}}"#,
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":12"));
+        assert!(output.contains("fln-stub-0"));
+        assert!(!output.contains("-32601"));
     }
 
     #[test]
