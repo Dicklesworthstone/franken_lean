@@ -32,6 +32,8 @@ pub struct ServerOutcome {
     pub documents_opened: u64,
     /// Number of `textDocument/didChange` notifications processed.
     pub documents_changed: u64,
+    /// Number of `textDocument/didSave` notifications processed.
+    pub documents_saved: u64,
 }
 
 /// Extract a JSON string value for a given key from a flat JSON object.
@@ -134,17 +136,28 @@ fn extract_content_changes_text(json: &str) -> Option<String> {
     extract_escaped_text_value(json, cc_start)
 }
 
+/// Extract the params-level `text` field (for didSave with
+/// `includeText: true`). The didSave `textDocument` object contains
+/// only `uri` and `version` — no `text` — so the only `"text"` key
+/// in the message is the params-level one we want.
+fn extract_save_text(json: &str) -> Option<String> {
+    extract_escaped_text_value(json, 0)
+}
+
 /// Build the `initialize` response with FrankenLean server capabilities.
 fn initialize_response(id: i64) -> String {
     // We use push diagnostics (textDocument/publishDiagnostics) not pull
     // diagnostics (textDocument/diagnostic), so diagnosticProvider is not
     // advertised. textDocumentSync with openClose + change:1 (Full) is
     // what triggers the client to send didOpen/didChange/didClose.
+    // save.includeText tells the client to include the full document text
+    // in didSave notifications so we can re-check on save.
     format!(
         concat!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{",
             "\"capabilities\":{{",
-            "\"textDocumentSync\":{{\"openClose\":true,\"change\":1}}",
+            "\"textDocumentSync\":{{\"openClose\":true,\"change\":1,",
+            "\"save\":{{\"includeText\":true}}}}",
             "}},",
             "\"serverInfo\":{{\"name\":\"FrankenLean\",\"version\":{}}}"
             ,"}}}}"
@@ -194,6 +207,7 @@ pub fn serve(
     let mut state = ServerState::Uninitialized;
     let mut documents_opened: u64 = 0;
     let mut documents_changed: u64 = 0;
+    let mut documents_saved: u64 = 0;
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -202,6 +216,7 @@ pub fn serve(
                 clean: state == ServerState::ShuttingDown,
                 documents_opened,
                 documents_changed,
+                documents_saved,
             });
         };
 
@@ -243,6 +258,7 @@ pub fn serve(
                     clean: state == ServerState::ShuttingDown,
                     documents_opened,
                     documents_changed,
+                    documents_saved,
                 });
             }
 
@@ -273,6 +289,23 @@ pub fn serve(
                     }
                     documents_changed += 1;
                 }
+            }
+
+            // --- textDocument/didSave (with includeText) ---
+            (Some("textDocument/didSave"), None, ServerState::Running) => {
+                if let (Some(uri), Some(content)) = (
+                    extract_text_document_uri(&text),
+                    extract_save_text(&text),
+                ) {
+                    // Re-check the full document on save, same as didOpen.
+                    let notifications = on_did_open(&uri, &content);
+                    for notification in &notifications {
+                        transport::write_message(output, notification.as_bytes())?;
+                    }
+                    documents_saved += 1;
+                }
+                // If text is absent (client did not include it), accept
+                // silently — the most recent didChange already checked.
             }
 
             // --- textDocument/didClose ---
@@ -422,6 +455,30 @@ mod tests {
         assert_eq!(
             extract_content_changes_text(json),
             Some("def z := 0".to_string())
+        );
+    }
+
+    #[test]
+    fn did_save_routes_through_callback() {
+        let (outcome, output) = lifecycle_session(&[
+            // Open first.
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            // Save with included text.
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"def x := 42"}}"#,
+        ].join("\n"));
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_opened, 1);
+        assert_eq!(outcome.documents_saved, 1);
+        let diag_count = output.matches("publishDiagnostics").count();
+        assert_eq!(diag_count, 2);
+    }
+
+    #[test]
+    fn extract_save_text_works() {
+        let json = r#"{"params":{"textDocument":{"uri":"file:///x.lean","version":1},"text":"def w := 99"}}"#;
+        assert_eq!(
+            extract_save_text(json),
+            Some("def w := 99".to_string())
         );
     }
 }
