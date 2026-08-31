@@ -8129,20 +8129,20 @@ fn heq_inductive_type(alpha_universe: &WireName) -> Option<WireExpr> {
 }
 
 fn heq_constructor_type(heq: &WireName, alpha_universe: &WireName) -> Option<WireExpr> {
+    // HEq.refl : {α : Sort u_1} (a_hyg : α) → HEq α a_hyg α a_hyg.
+    // bvar(N) = (N+1)-th binder from the outermost in the FINAL telescope.
+    // FINAL telescope: [α(0), a_hyg(1)].
     let mut b = StructuralTermBuilder::new();
     let alpha_sort = b.sort_parameter(alpha_universe);
-    let a_domain = b.bvar(0);
-    let heq_const = b.constant(heq, std::slice::from_ref(alpha_universe));
-    let heq_alpha_index = b.bvar(1);
-    let heq_alpha = b.apply(heq_const, heq_alpha_index);
-    let heq_a_index = b.bvar(0);
-    let heq_alpha_a = b.apply(heq_alpha, heq_a_index);
-    let heq_alpha_index_again = b.bvar(1);
-    let heq_alpha_a_alpha = b.apply(heq_alpha_a, heq_alpha_index_again);
-    let heq_a_index_again = b.bvar(0);
-    let result = b.apply(heq_alpha_a_alpha, heq_a_index_again);
-    let a = b.forall("a", BinderStyle::Default, a_domain, result);
-    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a);
+    let _heq_const = b.constant(heq, std::slice::from_ref(alpha_universe));
+    let a_hyg_domain = b.bvar(0);
+    let ltype = b.bvar(0);
+    let lval = b.bvar(1);
+    let rtype = b.bvar(0);
+    let rval = b.bvar(1);
+    let result = heq_application(&mut b, heq, alpha_universe, ltype, lval, rtype, rval);
+    let a_hyg_binder = b.forall("a_hyg", BinderStyle::Default, a_hyg_domain, result);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_hyg_binder);
     b.finish(root)
 }
 
@@ -8152,19 +8152,21 @@ fn heq_motive_type(
     motive_universe: &WireName,
     alpha_universe: &WireName,
 ) -> ExprId {
-    // Scope: α(2), a(1). The motive quantifies β Implicit and its index and
-    // hypothesis Default, exactly as the pinned eliminator states it.
-    let b_domain = b.bvar(0);
-    let h_alpha = b.bvar(3);
-    let h_a = b.bvar(2);
-    let h_beta = b.bvar(1);
-    let h_b = b.bvar(0);
-    let h_domain = heq_application(b, heq, alpha_universe, h_alpha, h_a, h_beta, h_b);
+    // Scope at call: [α(0), a_hyg_outer(1)] (the rec's outer params).
+    // Motive inner telescope: [β(3), a_hyg_inner(4), t_inner(5)].
+    // t-domain: HEq α a_hyg_inner β a_hyg_inner (homogeneous equation).
+    let _heq_const = b.constant(heq, std::slice::from_ref(alpha_universe));
     let motive_sort = b.sort_parameter(motive_universe);
-    let hypothesis = b.forall("h", BinderStyle::Default, h_domain, motive_sort);
-    let b_binder = b.forall("b", BinderStyle::Default, b_domain, hypothesis);
+    let ltype = b.bvar(0);
+    let lval = b.bvar(4);
+    let rtype = b.bvar(3);
+    let rval = b.bvar(4);
+    let t_domain = heq_application(b, heq, alpha_universe, ltype, lval, rtype, rval);
+    let t_binder = b.forall("t", BinderStyle::Default, t_domain, motive_sort);
+    let a_hyg_inner_domain = b.bvar(3);
+    let a_hyg_inner = b.forall("a_hyg", BinderStyle::Default, a_hyg_inner_domain, t_binder);
     let beta_sort = b.sort_parameter(alpha_universe);
-    b.forall("β", BinderStyle::Implicit, beta_sort, b_binder)
+    b.forall("β", BinderStyle::Implicit, beta_sort, a_hyg_inner)
 }
 
 fn heq_recursor_type(
@@ -8173,73 +8175,76 @@ fn heq_recursor_type(
     motive_universe: &WireName,
     alpha_universe: &WireName,
 ) -> Option<WireExpr> {
+    // FINAL telescope (outer→inner): [α(0), a_hyg_outer(1), motive(2),
+    // refl(3), β(4), a_hyg_major(5), a_hyg_inner(6), t(7)].
     let mut b = StructuralTermBuilder::new();
     let motive_type = heq_motive_type(&mut b, heq, motive_universe, alpha_universe);
-    // Minor premise, scope: α(2), a(1), motive(0).
-    let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
-    let refl_alpha_index = b.bvar(2);
-    let refl_alpha = b.apply(refl_const, refl_alpha_index);
-    let refl_a_index = b.bvar(1);
-    let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
-    let motive_var = b.bvar(0);
-    let minor_a = b.bvar(1);
-    let motive_a = b.apply(motive_var, minor_a);
-    let minor_type = b.apply(motive_a, refl_alpha_a);
-    // Result, scope: α(6), a(5), motive(4), minor(3), β(2), b(1), h(0).
-    let motive_result = b.bvar(4);
-    let result_beta = b.bvar(2);
-    let motive_beta = b.apply(motive_result, result_beta);
-    let result_b = b.bvar(1);
-    let motive_beta_b = b.apply(motive_beta, result_b);
-    let result_h = b.bvar(0);
-    let result = b.apply(motive_beta_b, result_h);
-    // Major hypothesis, scope: α(5), a(4), motive(3), minor(2), β(1), b(0).
-    let h_alpha = b.bvar(5);
-    let h_a = b.bvar(4);
-    let h_beta = b.bvar(1);
-    let h_b = b.bvar(0);
-    let h_domain = heq_application(&mut b, heq, alpha_universe, h_alpha, h_a, h_beta, h_b);
-    let major_hypothesis = b.forall("h", BinderStyle::Default, h_domain, result);
-    // The pin binds the heterogeneous major index pair Implicit.
-    let b_domain = b.bvar(0);
-    let b_binder = b.forall("b", BinderStyle::Implicit, b_domain, major_hypothesis);
-    let beta_sort = b.sort_parameter(alpha_universe);
-    let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, b_binder);
-    let minors = b.forall("m_1", BinderStyle::Default, minor_type, beta_binder);
-    let motives = b.forall("motive", BinderStyle::Implicit, motive_type, minors);
-    let a_domain = b.bvar(0);
-    let a_implicit = b.forall("a", BinderStyle::Implicit, a_domain, motives);
     let alpha_sort = b.sort_parameter(alpha_universe);
-    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_implicit);
+    let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+    // Minor body: motive α a_hyg_outer (HEq.refl α a_hyg_outer).
+    // Scope: [α(0), a_hyg_outer(1), motive(2)].
+    let bvar0 = b.bvar(0);
+    let refl_alpha = b.apply(refl_const, bvar0);
+    let bvar1 = b.bvar(1);
+    let refl_a_hyg = b.apply(refl_alpha, bvar1);
+    let motive = b.bvar(2);
+    let bvar0 = b.bvar(0);
+    let motive_alpha = b.apply(motive, bvar0);
+    let bvar1 = b.bvar(1);
+    let motive_a_hyg = b.apply(motive_alpha, bvar1);
+    let minor_body = b.apply(motive_a_hyg, refl_a_hyg);
+    // t-domain: HEq α a_hyg_inner β a_hyg_inner.
+    // Scope: [α(0), a_hyg_outer(1), motive(2), refl(3), β(4), a_hyg_major(5),
+    // a_hyg_inner(6), t(7)].
+    let _heq_const = b.constant(heq, std::slice::from_ref(alpha_universe));
+    let ltype = b.bvar(0);
+    let lval = b.bvar(6);
+    let rtype = b.bvar(4);
+    let rval = b.bvar(6);
+    let t_domain = heq_application(
+        &mut b, heq, alpha_universe,
+        ltype, lval, rtype, rval,
+    );
+    // Body: motive β a_hyg_major t.
+    let bvar2 = b.bvar(2);
+    let bvar4 = b.bvar(4);
+    let bvar5 = b.bvar(5);
+    let bvar7 = b.bvar(7);
+    let app1 = b.apply(bvar2, bvar4);
+    let app2 = b.apply(app1, bvar5);
+    let body = b.apply(app2, bvar7);
+    let t_binder = b.forall("t", BinderStyle::Default, t_domain, body);
+    // a_hyg_major domain: β at the scope [α(0), a_hyg_outer(1), motive(2),
+    // refl(3), β(4), t(5)].
+    let bvar4 = b.bvar(4);
+    let a_hyg_major_binder = b.forall("a_hyg", BinderStyle::Implicit, bvar4, t_binder);
+    let beta_sort = b.sort_parameter(alpha_universe);
+    let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, a_hyg_major_binder);
+    let refl_binder = b.forall("refl", BinderStyle::Default, minor_body, beta_binder);
+    let motive_binder = b.forall("motive", BinderStyle::Implicit, motive_type, refl_binder);
+    // a_hyg_outer domain: α at the scope [α(0), motive(2), refl(3), β(4),
+    // a_hyg_major(5), t(6)].
+    let bvar0 = b.bvar(0);
+    let a_hyg_outer_binder = b.forall("a_hyg", BinderStyle::Implicit, bvar0, motive_binder);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_hyg_outer_binder);
     b.finish(root)
 }
 
 fn heq_rule_rhs(
-    heq: &WireName,
-    refl: &WireName,
-    motive_universe: &WireName,
+    _heq: &WireName,
+    _refl: &WireName,
+    _motive_universe: &WireName,
     alpha_universe: &WireName,
 ) -> Option<WireExpr> {
+    // The refl rule's rhs is the minor premise itself (single-ctor iota).
+    // Lambda telescope: α.Impl(0), motive.Impl(1), refl.Default(2).
+    // Body = refl = bvar(2).
     let mut b = StructuralTermBuilder::new();
-    let motive_type = heq_motive_type(&mut b, heq, motive_universe, alpha_universe);
-    // Minor premise, scope: α(2), a(1), motive(0).
-    let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
-    let refl_alpha_index = b.bvar(2);
-    let refl_alpha = b.apply(refl_const, refl_alpha_index);
-    let refl_a_index = b.bvar(1);
-    let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
-    let motive_var = b.bvar(0);
-    let minor_a = b.bvar(1);
-    let motive_a = b.apply(motive_var, minor_a);
-    let minor_type = b.apply(motive_a, refl_alpha_a);
-    // The iota contraction for refl is the minor premise itself.
-    let result = b.bvar(0);
-    let m_1 = b.lambda("m_1", BinderStyle::Default, minor_type, result);
-    let motive = b.lambda("motive", BinderStyle::Default, motive_type, m_1);
-    let a_domain = b.bvar(0);
-    let a = b.lambda("a", BinderStyle::Default, a_domain, motive);
     let alpha_sort = b.sort_parameter(alpha_universe);
-    let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, a);
+    let refl_body = b.bvar(2);
+    let refl_binder = b.forall("refl", BinderStyle::Default, alpha_sort.clone(), refl_body);
+    let motive_binder = b.forall("motive", BinderStyle::Implicit, alpha_sort.clone(), refl_binder);
+    let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, motive_binder);
     b.finish(root)
 }
 

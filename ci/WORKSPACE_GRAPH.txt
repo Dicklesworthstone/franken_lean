@@ -136,6 +136,11 @@ edge fln-vm -> fln-bignum          # generated Nat intrinsics execute over ABI s
 edge fln-vm -> fln-core            # shared FL-INV-07 outcomes plus the extern-dispatch e2e scratch fence (franken_lean-zoe/franken_lean-pw6t)
 edge fln-vm -> fln-hash            # inline-cache namespaces bind canonical FLBC and every semantic execution coordinate (franken_lean-zoe)
 edge fln-vm -> fln-rt              # every live FLBC register is an owned Marrow Obj handle (franken_lean-zoe prototype handoff)
+edge fln-anvil -> fln-core         # simp/egraph/grind types reference canonical Name and Expr (§12, rank 14 -> 0)
+edge fln-anvil -> fln-env          # rewrite indexes consult the environment for transparency and unfolding (§12.1, rank 14 -> 4)
+edge fln-ledger -> fln-core        # content-addressed records reference declaration Name and Mode (§13, rank 15 -> 0)
+edge fln-ledger -> fln-hash        # CAS keys, logical roots, and epoch digests (§13.1, rank 15 -> 1)
+edge fln-trace -> fln-core         # proof-graph nodes reference declaration Name and Position (§15, rank 18 -> 0)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

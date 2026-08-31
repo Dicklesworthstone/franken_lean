@@ -31,7 +31,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use fln_core::expr::Expr;
-use fln_core::level::Level;
 use fln_core::name::Name;
 
 // ---------------------------------------------------------------------------
@@ -171,7 +170,7 @@ pub struct ENode {
 }
 
 /// A recorded rewrite step for proof extraction from the e-graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteJustification {
     /// The rule that fired.
     pub rule: Name,
