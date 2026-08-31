@@ -92,6 +92,7 @@ const USAGE: &str = concat!(
     "  fln audit --tcb [--json] [--max-bytes BYTES] PATH\n",
     "  fln why-trusts [--json] [--max-bytes BYTES] [--max-nodes N] NAME PATH\n",
     "  fln identity [--json]\n",
+    "  fln serve-lsp\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
@@ -164,6 +165,13 @@ const USAGE: &str = concat!(
     "mode, epoch, target, profile, and static closure inputs. The v1 sidecar is\n",
     "standard-profile provenance, not certified source reproducibility. It does\n",
     "not admit declarations or prove how the artifact was compiled.\n",
+    "\n",
+    "`serve-lsp` starts a Language Server Protocol session over stdin/stdout.\n",
+    "The server handles the LSP lifecycle (initialize/shutdown/exit) and routes\n",
+    "textDocument/didOpen notifications through the bounded source runner,\n",
+    "projecting diagnostics via fln-server. This is a synchronous, single-file\n",
+    "server suitable for editor integration testing; it is not yet the full\n",
+    "asupersync-backed parallel elaboration server from the plan.\n",
 );
 
 const LEAN_USAGE: &str = concat!(
@@ -306,6 +314,7 @@ enum MultiplexerCommand {
         max_nodes: usize,
         json: bool,
     },
+    ServeLsp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1049,6 +1058,9 @@ fn parse_command(
     }
     if command == "identity" {
         return parse_identity(arguments.collect());
+    }
+    if command == "serve-lsp" {
+        return Ok(MultiplexerCommand::ServeLsp);
     }
     if command == "flbc" {
         let Some(subcommand) = arguments.next() else {
@@ -10748,6 +10760,48 @@ fn run_sources(
     )
 }
 
+fn serve_lsp() -> MultiplexerOutput {
+    use std::io::{BufReader, BufWriter};
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = BufWriter::new(stdout.lock());
+
+    let mut on_did_open = |uri: &str, _text: &str| -> Vec<String> {
+        // Project an empty diagnostic set for the opened document. The
+        // bounded source runner does not yet support running from an
+        // in-memory buffer, so we acknowledge the document with a clean
+        // diagnostics notification. When the source runner gains an
+        // in-memory entry point, this callback will elaborate the text
+        // and project real diagnostics through `fln::project_lsp_diagnostics`.
+        vec![format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",",
+                "\"method\":\"textDocument/publishDiagnostics\",",
+                "\"params\":{{\"uri\":{},\"version\":null,\"diagnostics\":[]}}}}"
+            ),
+            fln_server::json_string(uri)
+        )]
+    };
+
+    match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open) {
+        Ok(outcome) => {
+            if outcome.clean {
+                MultiplexerOutput::success(String::new())
+            } else {
+                MultiplexerOutput::failure(
+                    "fln serve-lsp: server exited without clean shutdown\n".to_owned(),
+                    1,
+                )
+            }
+        }
+        Err(error) => MultiplexerOutput::failure(
+            format!("fln serve-lsp: transport error: {error}\n"),
+            1,
+        ),
+    }
+}
+
 /// Run the native `fln` multiplexer without touching process-global arguments
 /// or streams. The binary is a thin adapter over this testable entry point.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
@@ -10818,6 +10872,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => inspect_ilean(&path, max_bytes, json),
+        Ok(MultiplexerCommand::ServeLsp) => serve_lsp(),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
     }
 }

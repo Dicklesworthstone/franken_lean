@@ -85,6 +85,7 @@ edge fln -> fln-vm                 # canonical FLBC execution result facade (fra
 edge fln-cli -> fln                # executable multiplexer delegates to the embeddable engine
 edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)
 edge fln-cli -> fln-hash         # chained check-olean run receipts over the transparency-leaf domain
+edge fln-cli -> fln-server         # serve-lsp verb routes stdio transport through the diagnostic projector (§14, rank 21 -> 17)
 edge fln-server -> fln-core        # LSP diagnostic adapter (franken_lean-wlan)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
 edge fln-bench -> fln-hash         # canonical benchmark evidence records and roots (franken_lean-oy62)

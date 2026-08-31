@@ -5,8 +5,16 @@
 //! Inconclusive and internal-fault outcomes use the distinct
 //! `$/lean/diagnosticOutcome` channel: neither can be mislabeled as a user error or
 //! silently converted into an empty diagnostic list.
+//!
+//! The `transport` module implements the Content-Length-framed base protocol,
+//! and the `dispatch` module routes JSON-RPC messages through the LSP
+//! lifecycle (`initialize` / `initialized` / `shutdown` / `exit`) and
+//! document events (`textDocument/didOpen`).
 
 #![forbid(unsafe_code)]
+
+pub mod dispatch;
+pub mod transport;
 
 use std::collections::BTreeMap;
 
@@ -78,7 +86,7 @@ fn projected_path(path: &str, policy: DiagnosticPathPolicy) -> &str {
     }
 }
 
-fn json_string(value: &str) -> String {
+pub fn json_string(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len() + 2);
     encoded.push('"');
     for character in value.chars() {
