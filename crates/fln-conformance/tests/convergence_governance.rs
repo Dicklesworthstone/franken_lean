@@ -63,7 +63,7 @@ fn live_policy(root: &Path, python: &Path, isolated_path: &Path, br: Option<&Pat
     command
         .args(["-I", "-S", "-B"])
         .arg(&script)
-        .args(["--root", ".", "--at", "2026-08-04T10:10:00Z", "--check"])
+        .args(["--root", ".", "--check"])
         .env("PATH", isolated_path)
         .current_dir(root);
     if let Some(br) = br {
