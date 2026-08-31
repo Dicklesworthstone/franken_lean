@@ -10767,21 +10767,34 @@ fn serve_lsp() -> MultiplexerOutput {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
 
-    let mut on_did_open = |uri: &str, _text: &str| -> Vec<String> {
-        // Project an empty diagnostic set for the opened document. The
-        // bounded source runner does not yet support running from an
-        // in-memory buffer, so we acknowledge the document with a clean
-        // diagnostics notification. When the source runner gains an
-        // in-memory entry point, this callback will elaborate the text
-        // and project real diagnostics through `fln::project_lsp_diagnostics`.
-        vec![format!(
-            concat!(
-                "{{\"jsonrpc\":\"2.0\",",
-                "\"method\":\"textDocument/publishDiagnostics\",",
-                "\"params\":{{\"uri\":{},\"version\":null,\"diagnostics\":[]}}}}"
-            ),
-            fln_server::json_string(uri)
-        )]
+    let lsp_request = ProjectionRequest {
+        epoch: fln_core::diag::DiagnosticEpoch::V4_32_0,
+        mode: fln_core::mode::Mode::Sound,
+        frontend: DiagnosticFrontend::Lsp,
+        format: DiagnosticFormat::Lsp,
+        channel: DiagnosticChannel::Protocol,
+        color: DiagnosticColorPolicy::Never,
+        path: DiagnosticPathPolicy::Preserve,
+        ordering: fln_core::diag::DiagnosticOrderPolicy::SourcePositionV1,
+    };
+
+    let mut on_did_open = move |uri: &str, text: &str| -> Vec<String> {
+        let snapshot = lsp_source_snapshot(text.as_bytes());
+        match fln_server::project(lsp_request, &snapshot) {
+            Ok(projection) => projection.messages,
+            Err(_refusal) => {
+                // Projection refused — fall back to an empty diagnostics
+                // notification so the client still clears stale markers.
+                vec![format!(
+                    concat!(
+                        "{{\"jsonrpc\":\"2.0\",",
+                        "\"method\":\"textDocument/publishDiagnostics\",",
+                        "\"params\":{{\"uri\":{},\"version\":null,\"diagnostics\":[]}}}}"
+                    ),
+                    fln_server::json_string(uri)
+                )]
+            }
+        }
     };
 
     match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open) {
@@ -10799,6 +10812,82 @@ fn serve_lsp() -> MultiplexerOutput {
             format!("fln serve-lsp: transport error: {error}\n"),
             1,
         ),
+    }
+}
+
+/// Run source bytes through the bounded Engine and produce a diagnostic
+/// snapshot suitable for LSP projection. This is the bridge between the
+/// existing source runner and the LSP transport: `didOpen` feeds text here,
+/// and the resulting `ProjectionSnapshot` is projected by `fln-server`.
+fn lsp_source_snapshot(source: &[u8]) -> ProjectionSnapshot {
+    let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+    let engine = match fln::Engine::with_source_seed(
+        fln::EngineAdmissionLimits::new(kernel_budget),
+    ) {
+        Ok(fln::Outcome::Complete(engine)) => engine,
+        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
+            return ProjectionSnapshot::Inconclusive(StructuredInconclusive {
+                cause_class: "seed",
+                detail: BoundedText::new(format!("{inconclusive:?}")),
+                diagnostic: None,
+                progress: None,
+            });
+        }
+        Ok(fln::Outcome::InternalFault(fault)) => {
+            return ProjectionSnapshot::InternalFault(StructuredInternalFault {
+                invariant: "seed-admission",
+                detail: BoundedText::new(format!("{fault:?}")),
+                evidence: None,
+            });
+        }
+        Err(error) => {
+            return lsp_error_snapshot(&error.to_string());
+        }
+    };
+    let options = fln::KVMap::new();
+    let limits = fln::EngineExecutionLimits::new(kernel_budget);
+    match engine.execute_source_commands_with_checks(source, &options, limits) {
+        Ok(fln::Outcome::Complete(_completed)) => ProjectionSnapshot::Complete {
+            diagnostics: Vec::new(),
+        },
+        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
+            ProjectionSnapshot::Inconclusive(StructuredInconclusive {
+                cause_class: "source-check",
+                detail: BoundedText::new(format!("{inconclusive:?}")),
+                diagnostic: None,
+                progress: None,
+            })
+        }
+        Ok(fln::Outcome::InternalFault(fault)) => {
+            ProjectionSnapshot::InternalFault(StructuredInternalFault {
+                invariant: "source-check",
+                detail: BoundedText::new(format!("{fault:?}")),
+                evidence: None,
+            })
+        }
+        Err(error) => lsp_error_snapshot(&error.to_string()),
+    }
+}
+
+/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at
+/// the start of the file. Position (1, 0) is the Lean convention for
+/// file-level errors.
+fn lsp_error_snapshot(message: &str) -> ProjectionSnapshot {
+    ProjectionSnapshot::Complete {
+        diagnostics: vec![StructuredDiagnostic {
+            file_name: BoundedText::new("input".to_owned()),
+            pos: fln_core::pos::Position { line: 1, column: 0 },
+            end_pos: None,
+            severity: Severity::Error,
+            error_name: None,
+            caption: BoundedText::new(message.to_owned()),
+            body: BoundedText::new(String::new()),
+            cause_class: "engine-error",
+            related: Vec::new(),
+            evidence: Vec::new(),
+            omitted_related: 0,
+            omitted_evidence: 0,
+        }],
     }
 }
 
