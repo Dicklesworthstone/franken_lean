@@ -30,6 +30,8 @@ pub struct ServerOutcome {
     pub clean: bool,
     /// Number of `textDocument/didOpen` notifications processed.
     pub documents_opened: u64,
+    /// Number of `textDocument/didChange` notifications processed.
+    pub documents_changed: u64,
 }
 
 /// Extract a JSON string value for a given key from a flat JSON object.
@@ -74,15 +76,14 @@ fn extract_text_document_uri(json: &str) -> Option<String> {
     Some(uri.to_string())
 }
 
-/// Extract the `text` from the `textDocument` parameter (for didOpen).
-fn extract_text_document_text(json: &str) -> Option<String> {
-    let td_start = json.find("\"textDocument\"")?;
-    let rest = &json[td_start..];
-    // For `text`, we need to handle the full content which may contain escaped
-    // characters. Find `"text":"` and then parse until the unescaped closing quote.
+/// Extract a JSON string value starting after a given byte offset, parsing
+/// escape sequences. The search begins at `haystack[offset..]` and looks
+/// for the first `"text"` key.
+fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
+    let region = haystack.get(offset..)?;
     let text_key = "\"text\"";
-    let key_start = rest.find(text_key)?;
-    let after_key = &rest[key_start + text_key.len()..];
+    let key_start = region.find(text_key)?;
+    let after_key = &region[key_start + text_key.len()..];
     let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
     let after_quote = after_colon.strip_prefix('"')?;
 
@@ -101,7 +102,6 @@ fn extract_text_document_text(json: &str) -> Option<String> {
                 'b' => result.push('\u{08}'),
                 'f' => result.push('\u{0c}'),
                 'u' => {
-                    // Four hex digits.
                     let hex: String = (&mut chars).take(4).collect();
                     if hex.len() == 4 {
                         if let Ok(cp) = u32::from_str_radix(&hex, 16) {
@@ -111,12 +111,27 @@ fn extract_text_document_text(json: &str) -> Option<String> {
                         }
                     }
                 }
-                _ => {} // Unknown escape — skip.
+                _ => {}
             },
             c => result.push(c),
         }
     }
     Some(result)
+}
+
+/// Extract the `text` from the `textDocument` parameter (for didOpen).
+fn extract_text_document_text(json: &str) -> Option<String> {
+    let td_start = json.find("\"textDocument\"")?;
+    extract_escaped_text_value(json, td_start)
+}
+
+/// Extract the full document text from `contentChanges` (for didChange
+/// with `TextDocumentSyncKind.Full`). The spec sends
+/// `"contentChanges":[{"text":"..."}]`; we extract the `text` from the
+/// first element.
+fn extract_content_changes_text(json: &str) -> Option<String> {
+    let cc_start = json.find("\"contentChanges\"")?;
+    extract_escaped_text_value(json, cc_start)
 }
 
 /// Build the `initialize` response with FrankenLean server capabilities.
@@ -175,6 +190,7 @@ pub fn serve(
 ) -> io::Result<ServerOutcome> {
     let mut state = ServerState::Uninitialized;
     let mut documents_opened: u64 = 0;
+    let mut documents_changed: u64 = 0;
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -182,6 +198,7 @@ pub fn serve(
             return Ok(ServerOutcome {
                 clean: state == ServerState::ShuttingDown,
                 documents_opened,
+                documents_changed,
             });
         };
 
@@ -222,6 +239,7 @@ pub fn serve(
                 return Ok(ServerOutcome {
                     clean: state == ServerState::ShuttingDown,
                     documents_opened,
+                    documents_changed,
                 });
             }
 
@@ -236,6 +254,21 @@ pub fn serve(
                         transport::write_message(output, notification.as_bytes())?;
                     }
                     documents_opened += 1;
+                }
+            }
+
+            // --- textDocument/didChange (full sync, change kind 1) ---
+            (Some("textDocument/didChange"), None, ServerState::Running) => {
+                if let (Some(uri), Some(content)) = (
+                    extract_text_document_uri(&text),
+                    extract_content_changes_text(&text),
+                ) {
+                    // Full sync: re-check the entire document, same as didOpen.
+                    let notifications = on_did_open(&uri, &content);
+                    for notification in &notifications {
+                        transport::write_message(output, notification.as_bytes())?;
+                    }
+                    documents_changed += 1;
                 }
             }
 
@@ -361,6 +394,31 @@ mod tests {
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///foo.lean".to_string())
+        );
+    }
+
+    #[test]
+    fn did_change_routes_through_callback() {
+        let (outcome, output) = lifecycle_session(&[
+            // Open first.
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            // Then change.
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"def y := 7"}]}}"#,
+        ].join("\n"));
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_opened, 1);
+        assert_eq!(outcome.documents_changed, 1);
+        // Two publishDiagnostics notifications expected.
+        let diag_count = output.matches("publishDiagnostics").count();
+        assert_eq!(diag_count, 2);
+    }
+
+    #[test]
+    fn extract_content_changes_text_works() {
+        let json = r#"{"params":{"textDocument":{"uri":"file:///x.lean","version":2},"contentChanges":[{"text":"def z := 0"}]}}"#;
+        assert_eq!(
+            extract_content_changes_text(json),
+            Some("def z := 0".to_string())
         );
     }
 }
