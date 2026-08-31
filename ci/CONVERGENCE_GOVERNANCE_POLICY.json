@@ -1,6 +1,6 @@
 {
   "schema": "fln.convergence-governance-policy/1",
-  "policy_version": "2026-08-22.1",
+  "policy_version": "2026-08-31.1",
   "workstreams": ["W1", "W2", "W3"],
   "wip": {
     "max_active_workstreams": 3,
@@ -15,7 +15,7 @@
   "review": {
     "authority": "sequencer",
     "cadence_days": 7,
-    "next_review": "2026-08-29T00:00:00Z"
+    "next_review": "2026-09-07T00:00:00Z"
   },
   "gates": [
     {"id": "G0", "state": "failed", "root_beads": ["fln-l8f"]},
@@ -30,6 +30,7 @@
   "registry": [
     {"id": "franken_lean-shgs", "class": "verification", "workstream": "W3", "gate": "G1"},
     {"id": "fln-4hol", "class": "implementation", "workstream": "W3", "gate": "G1"},
+    {"id": "fln-lst4", "class": "verification", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-3lvw", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "fln-l8f", "class": "prerequisite", "workstream": "W1", "gate": "G0"},
     {"id": "fln-private-index-worktree-sync-mbh9", "class": "verification", "workstream": "W1", "gate": "G0"},
@@ -60,9 +61,6 @@
     {"id": "franken_lean-npl", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-gii.23", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-gii.26", "class": "implementation", "workstream": "W3", "gate": "G1"},
-    {"id": "fln-s8oo", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
-    {"id": "franken_lean-closure-binding-exempt-rows-uninspected-3s8w", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
-    {"id": "franken_lean-p6x1", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"},
-    {"id": "franken_lean-parity-ledger-l2-definition-split-kl4h", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-29T00:00:00Z"}
+    {"id": "franken_lean-parity-ledger-l2-definition-split-kl4h", "class": "adoption", "workstream": "adoption", "expiry": "2026-09-07T00:00:00Z"}
   ]
 }
