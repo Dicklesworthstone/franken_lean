@@ -2470,20 +2470,9 @@ impl<'a> InferenceEngine<'a> {
             .sources
             .get(state.next)
             .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
-        // Deeply resolve the materialized domain to its TYPE before storing.
-        // The telescope materialization rewrites each binder's domain with
-        // previous binders' Bound indices as Free locals, so a domain like
-        // `b : alpha` arrives here as Free(L_alpha). Storing that form makes
-        // the local's TYPE comparison in compare_domain compare concrete
-        // types against Free locals, which the quick def-eq has no rule
-        // for (Init.Prelude declaration item 15 = HEq defers on exactly
-        // this comparison). Resolving every Free local in the domain to its
-        // registered type, recursively, gives every consumer a canonical
-        // concrete form.
-        let stored_type = self.deep_resolve_free_locals(&domain, 0);
         if self
             .scoped_locals
-            .insert(local_name.clone(), stored_type)
+            .insert(local_name.clone(), Arc::clone(&domain))
             .is_some()
         {
             return Err(LeafHalt::Fault(InferenceFault::ScopedLocalCollision {
@@ -2499,46 +2488,6 @@ impl<'a> InferenceEngine<'a> {
         });
         state.next = state.next.saturating_add(1);
         Ok(())
-    }
-
-    /// Deeply rewrite Free locals to their registered types. The preamble
-    /// telescope materialization stores each binder's domain with previous
-    /// binders' Bound indices rewritten to Free locals, so `b : alpha`
-    /// arrives as `Free(L_alpha)`. Storing that form makes the local's TYPE
-    /// comparison in compare_domain compare concrete types against free
-    /// locals, which the quick def-eq has no rule for. Resolving at
-    /// registration time gives every consumer a canonical concrete form. The
-    /// chain is bounded by telescope depth (the declaration's binder count);
-    /// a non-Free node or an unresolved tail returns the current value
-    /// unchanged.
-    fn deep_resolve_free_locals(
-        &self,
-        expr: &Arc<WireExpr>,
-        depth: u32,
-    ) -> Arc<WireExpr> {
-        const MAX_DEPTH: u32 = 256;
-        if depth > MAX_DEPTH {
-            return Arc::clone(expr);
-        }
-        let node = match expr.node(expr.root()) {
-            Some(node) => node,
-            None => return Arc::clone(expr),
-        };
-        if let ExprNode::Free { name } = node {
-            let resolved = self
-                .scoped_locals
-                .get(name)
-                .map(Arc::clone)
-                .or_else(|| {
-                    self.context
-                        .local(name)
-                        .map(|declaration| Arc::new(declaration.type_().clone()))
-                })
-                .unwrap_or_else(|| Arc::clone(expr));
-            self.deep_resolve_free_locals(&resolved, depth + 1)
-        } else {
-            Arc::clone(expr)
-        }
     }
 
     fn schedule_telescope(
