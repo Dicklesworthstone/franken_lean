@@ -182,6 +182,28 @@ fn null_response(id: i64) -> String {
     format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}", id)
 }
 
+/// Build a `$/lean/fileProgress` notification.
+///
+/// When `processing` is `true`, the notification indicates that the server
+/// is actively processing the file. When `false`, it indicates that
+/// processing is complete (the VS Code extension clears the spinner).
+fn file_progress_notification(uri: &str, processing: bool) -> String {
+    let processing_value = if processing {
+        "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"kind\":1}]"
+    } else {
+        "[]"
+    };
+    format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"$/lean/fileProgress\",",
+            "\"params\":{{\"textDocument\":{{\"uri\":{}}},",
+            "\"processing\":{}}}}}"
+        ),
+        json_string(uri),
+        processing_value
+    )
+}
+
 /// Callback invoked when a document is opened.
 ///
 /// The callback receives the document URI and text content, and returns
@@ -268,10 +290,16 @@ pub fn serve(
                     extract_text_document_uri(&text),
                     extract_text_document_text(&text),
                 ) {
+                    // Signal that we are processing this file.
+                    let started = file_progress_notification(&uri, true);
+                    transport::write_message(output, started.as_bytes())?;
                     let notifications = on_did_open(&uri, &content);
                     for notification in &notifications {
                         transport::write_message(output, notification.as_bytes())?;
                     }
+                    // Signal that processing is complete.
+                    let done = file_progress_notification(&uri, false);
+                    transport::write_message(output, done.as_bytes())?;
                     documents_opened += 1;
                 }
             }
@@ -283,10 +311,14 @@ pub fn serve(
                     extract_content_changes_text(&text),
                 ) {
                     // Full sync: re-check the entire document, same as didOpen.
+                    let started = file_progress_notification(&uri, true);
+                    transport::write_message(output, started.as_bytes())?;
                     let notifications = on_did_open(&uri, &content);
                     for notification in &notifications {
                         transport::write_message(output, notification.as_bytes())?;
                     }
+                    let done = file_progress_notification(&uri, false);
+                    transport::write_message(output, done.as_bytes())?;
                     documents_changed += 1;
                 }
             }
@@ -298,10 +330,14 @@ pub fn serve(
                     extract_save_text(&text),
                 ) {
                     // Re-check the full document on save, same as didOpen.
+                    let started = file_progress_notification(&uri, true);
+                    transport::write_message(output, started.as_bytes())?;
                     let notifications = on_did_open(&uri, &content);
                     for notification in &notifications {
                         transport::write_message(output, notification.as_bytes())?;
                     }
+                    let done = file_progress_notification(&uri, false);
+                    transport::write_message(output, done.as_bytes())?;
                     documents_saved += 1;
                 }
                 // If text is absent (client did not include it), accept
@@ -401,6 +437,9 @@ mod tests {
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
         assert!(output.contains("publishDiagnostics"));
+        // fileProgress: one "processing" start and one "complete" (empty).
+        let progress_count = output.matches("$/lean/fileProgress").count();
+        assert_eq!(progress_count, 2);
     }
 
     #[test]
@@ -447,6 +486,9 @@ mod tests {
         // Two publishDiagnostics notifications expected.
         let diag_count = output.matches("publishDiagnostics").count();
         assert_eq!(diag_count, 2);
+        // Four fileProgress notifications: start+done for open, start+done for change.
+        let progress_count = output.matches("$/lean/fileProgress").count();
+        assert_eq!(progress_count, 4);
     }
 
     #[test]
@@ -471,6 +513,9 @@ mod tests {
         assert_eq!(outcome.documents_saved, 1);
         let diag_count = output.matches("publishDiagnostics").count();
         assert_eq!(diag_count, 2);
+        // Four fileProgress notifications: start+done for open, start+done for save.
+        let progress_count = output.matches("$/lean/fileProgress").count();
+        assert_eq!(progress_count, 4);
     }
 
     #[test]
@@ -480,5 +525,18 @@ mod tests {
             extract_save_text(json),
             Some("def w := 99".to_string())
         );
+    }
+
+    #[test]
+    fn file_progress_notification_format() {
+        let started = file_progress_notification("file:///test.lean", true);
+        assert!(started.contains("$/lean/fileProgress"));
+        assert!(started.contains("\"kind\":1"));
+        assert!(started.contains("\"uri\":\"file:///test.lean\""));
+
+        let done = file_progress_notification("file:///test.lean", false);
+        assert!(done.contains("$/lean/fileProgress"));
+        assert!(done.contains("\"processing\":[]"));
+        assert!(done.contains("\"uri\":\"file:///test.lean\""));
     }
 }
