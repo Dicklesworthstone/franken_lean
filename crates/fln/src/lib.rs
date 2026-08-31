@@ -53,12 +53,11 @@ use fln_checker::wire::{
 pub use fln_comp::fir::LoweringError;
 use fln_comp::fir::ValueType;
 use fln_comp::flbc::CallableResultOwnership;
-pub use fln_comp::flbc::{CodecError, CodecLimits};
+pub use fln_comp::flbc::{CodecError, CodecLimits, ValidatedProgram};
 use fln_comp::ingress::{
     FunctionBinding, IngressResource, IntrinsicBinding, LambdaBinding, LambdaRecursion,
-    ScalarConstructorBinding,
 };
-pub use fln_comp::ingress::{IngressError, IngressLimits};
+pub use fln_comp::ingress::{IngressError, IngressLimits, ScalarConstructorBinding};
 pub use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
     DiagnosticFrontend, DiagnosticOrderPolicy, DiagnosticPathPolicy, ExitClass, ProjectionRefusal,
@@ -1855,7 +1854,14 @@ fn bounded_source_module_name_depth(
     Ok(depth)
 }
 
-fn fresh_generated_command_name(
+/// Generate a fresh anonymous-numeric name that does not collide with any
+/// existing constant in the environment. The convention is `_root_.<N>` where
+/// N begins at `command_index` and increments until a free slot is found.
+///
+/// This is the same algorithm the bounded source runner uses for synthesized
+/// `#eval` and `#check` command declarations. Embedding consumers that batch
+/// their own declarations can call this to stay collision-free.
+pub fn fresh_generated_command_name(
     environment: &Environment,
     command_index: usize,
 ) -> Result<Name, EngineExecutionError> {
@@ -4183,8 +4189,18 @@ impl Engine {
     }
 }
 
-fn execute_golem_with_options(
-    executable: &fln_comp::flbc::ValidatedProgram,
+/// Execute a validated FLBC program on the Golem VM with the given option map
+/// and execution limits. Returns the VM exit outcome — `Returned`, `Panicked`,
+/// or `Refused` — wrapped in `Outcome` for the usual
+/// `Complete`/`Inconclusive`/`InternalFault` tri-state.
+///
+/// This is the lowest-level public execution primitive: one program, one run,
+/// no source parsing or elaboration. The `execute_flbc_artifact` function wraps
+/// decoding, validation, *and* execution in one step; use this function when
+/// you already hold a `ValidatedProgram` (e.g., from your own compilation or
+/// from a cached validated artifact).
+pub fn execute_golem_with_options(
+    executable: &ValidatedProgram,
     options: &KVMap,
     limits: VmExecutionLimits,
 ) -> Outcome<VmExit> {
@@ -4967,7 +4983,16 @@ fn executable_dependencies(
     })
 }
 
-fn source_scalar_constructor_binding(
+/// Look up whether `name` is one of the Bool constructors (`Bool.false`,
+/// `Bool.true`) in the given environment, and if so return its
+/// `ScalarConstructorBinding`. The match requires that the environment's
+/// constructor metadata agrees with the seed declaration byte-for-byte.
+///
+/// This is the same predicate the bounded source compiler uses when deciding
+/// whether a constructor reference can be lowered to a scalar value. Tooling
+/// that wants to know "is this name a scalar constructor?" can call this
+/// without running the full compiler ingress.
+pub fn source_scalar_constructor_binding(
     environment: &Environment,
     name: &Name,
 ) -> Option<ScalarConstructorBinding> {
