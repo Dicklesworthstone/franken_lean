@@ -1,0 +1,265 @@
+name: fln LSP method-role landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-method-role-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP Full-sync shape landing
+      - fln LSP Full-sync shape checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-method-role-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require JSON-RPC state and Full-sync shape validation
+        shell: bash
+        run: |
+          grep -Fq 'SERVER_NOT_INITIALIZED_CODE' crates/fln-server/src/dispatch.rs
+          grep -Fq 'for forbidden in ["range", "rangeLength"]' crates/fln-server/src/dispatch.rs
+
+      - name: distinguish requests from notifications before dispatch
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "known_methods_refuse_the_wrong_request_or_notification_shape"
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"expected one dispatch anchor, observed {observed}: {old[:180]!r}")
+              text = text.replace(old, new, 1)
+
+          if marker not in text:
+              anchor = '''fn error_response(id: &RequestId, code: i32, message: &str) -> String {
+          '''
+              anchor = "\n".join(line[10:] if line.startswith("          ") else line for line in anchor.splitlines()) + "\n"
+              helpers = r'''fn method_requires_request_id(method: &str) -> bool {
+              matches!(
+                  method,
+                  "initialize"
+                      | "shutdown"
+                      | "$/lean/plainGoal"
+                      | "$/lean/plainTermGoal"
+                      | "textDocument/hover"
+                      | "textDocument/completion"
+                      | "textDocument/definition"
+                      | "$/lean/rpc/connect"
+                      | "$/lean/rpc/call"
+              )
+          }
+
+          fn method_requires_notification(method: &str) -> bool {
+              matches!(
+                  method,
+                  "initialized"
+                      | "exit"
+                      | "textDocument/didOpen"
+                      | "textDocument/didChange"
+                      | "textDocument/didSave"
+                      | "textDocument/didClose"
+                      | "$/cancelRequest"
+              )
+          }
+
+          '''
+              helpers = "\n".join(line[14:] if line.startswith("              ") else line for line in helpers.splitlines()) + "\n"
+              if text.count(anchor) != 1:
+                  raise SystemExit("error_response anchor did not match exactly once")
+              text = text.replace(anchor, helpers + anchor, 1)
+
+              dispatch_anchor = '''        if matches!(state, ServerState::Uninitialized | ServerState::Initializing)
+              && !matches!(method.as_str(), "initialize" | "initialized" | "exit")
+          {
+          '''
+              dispatch_anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in dispatch_anchor.splitlines()) + "\n"
+              validation = '''        if method_requires_request_id(&method) && id.is_none() {
+              let response = error_response_null_id(
+                  INVALID_REQUEST_CODE,
+                  "known JSON-RPC method requires a request id",
+              );
+              transport::write_message(output, response.as_bytes())?;
+              continue;
+          }
+          if method_requires_notification(&method) && id.is_some() {
+              let response = invalid_request_response(
+                  id.as_ref(),
+                  "known JSON-RPC notification method must not carry a request id",
+              );
+              transport::write_message(output, response.as_bytes())?;
+              continue;
+          }
+
+          '''
+              validation = "\n".join(line[10:] if line.startswith("          ") else line for line in validation.splitlines())
+              if text.count(dispatch_anchor) != 1:
+                  raise SystemExit("pre-initialization state anchor did not match exactly once")
+              text = text.replace(dispatch_anchor, validation + dispatch_anchor, 1)
+
+              test_anchor = '''    #[test]
+              fn envelope_fields_ignore_nested_lookalikes() {
+          '''
+              test_anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in test_anchor.splitlines()) + "\n"
+              test = r'''    #[test]
+              fn known_methods_refuse_the_wrong_request_or_notification_shape() {
+                  let mut input_buf = Vec::new();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialize","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"must not open"}}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"textDocument/hover","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let mut seen = Vec::new();
+                  let outcome = serve(
+                      &mut reader,
+                      &mut output_buf,
+                      &mut |uri, _version, text| {
+                          seen.push((uri.to_string(), text.to_string()));
+                          Vec::new()
+                      },
+                  )
+                  .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert!(seen.is_empty(), "request-shaped didOpen must not mutate state");
+                  assert!(output.contains("\"id\":null,\"error\":{\"code\":-32600"));
+                  assert!(output.contains("requires a request id"));
+                  assert!(output.contains("\"id\":3,\"error\":{\"code\":-32600"));
+                  assert!(output.contains("must not carry a request id"));
+                  assert_eq!(output.matches("requires a request id").count(), 2);
+              }
+
+              #[test]
+              fn unknown_notifications_remain_ignorable() {
+                  let (outcome, output) = lifecycle_session(
+                      r#"{"jsonrpc":"2.0","method":"extension/unknownNotification","params":{"payload":1}}"#,
+                  );
+                  assert!(outcome.clean);
+                  assert!(!output.contains("method not found"));
+                  assert!(!output.contains("unknownNotification"));
+              }
+
+          '''
+              test = "\n".join(line[14:] if line.startswith("              ") else line for line in test.splitlines())
+              if text.count(test_anchor) != 1:
+                  raise SystemExit("envelope test anchor did not match exactly once")
+              text = text.replace(test_anchor, test + test_anchor, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              for expected in [
+                  "method_requires_request_id",
+                  "method_requires_notification",
+                  "known JSON-RPC notification method must not carry a request id",
+              ]:
+                  if expected not in text:
+                      raise SystemExit(f"method-role validation is partial: missing {expected}")
+          PY
+
+          cat > .github/workflows/fln-lsp-method-role-landing.yml <<'YAML'
+          name: fln LSP method-role checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-method-role-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-method-role-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-method-role-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify request and notification roles
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test request and notification roles
+        shell: bash
+        run: cargo test -p fln-server --lib
+
+      - name: publish verified method-role validation
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-method-role-landing.yml crates/fln-server/src/dispatch.rs
+          if git diff --cached --quiet; then
+            echo "method-role validation is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): enforce request and notification roles" \
+            -m "Known request methods now require an id, known notification methods reject one, malformed invocations never touch document state, and unknown notifications remain ignorable under JSON-RPC. Add recovery and non-mutation regression cells." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
