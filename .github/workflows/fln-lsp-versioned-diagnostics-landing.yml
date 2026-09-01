@@ -1,0 +1,558 @@
+name: fln LSP versioned diagnostics landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-versioned-diagnostics-landing.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-versioned-diagnostics-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: checkout exact main head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: implement version-bound diagnostic publication
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"{path}: expected one anchor, observed {observed}: {old[:180]!r}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          dispatch = Path("crates/fln-server/src/dispatch.rs")
+          dispatch_text = dispatch.read_text(encoding="utf-8")
+          if "LSP_POSITION_ENCODING" not in dispatch_text:
+              replace_once(
+                  dispatch,
+                  "use crate::json_string;\n",
+                  "use crate::{LSP_POSITION_ENCODING, json_string};\n",
+              )
+              replace_once(
+                  dispatch,
+                  '            "\\"capabilities\\":{{",\n',
+                  '            "\\"capabilities\\":{{\\"positionEncoding\\":{},",\n',
+              )
+              replace_once(
+                  dispatch,
+                  '        id.as_json(),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+                  '        id.as_json(),\n        json_string(LSP_POSITION_ENCODING),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+              )
+              replace_once(
+                  dispatch,
+                  '        assert!(output.contains("FrankenLean"));\n',
+                  '        assert!(output.contains("FrankenLean"));\n        assert!(output.contains("\\\"positionEncoding\\\":\\\"utf-16\\\""));\n',
+              )
+
+          cli = Path("crates/fln-cli/src/lib.rs")
+          cli_text = cli.read_text(encoding="utf-8")
+          if "fln_server::project_with_sources(" not in cli_text:
+              replace_once(
+                  cli,
+                  "        let mut messages = match fln_server::project(lsp_request, &snapshot) {\n",
+                  "        let mut messages = match fln_server::project_with_sources(\n"
+                  "            lsp_request,\n"
+                  "            &snapshot,\n"
+                  "            &[fln_server::LspSource::new(uri, text)],\n"
+                  "        ) {\n",
+              )
+              replace_once(
+                  cli,
+                  "    // Strip the `file://` prefix if present, because `complete_messages`\n"
+                  "    // in fln-server re-adds `file://` when building the notification URI.\n",
+                  "    // Normalize file URIs for the semantic diagnostic while the projector\n"
+                  "    // retains the exact editor URI and unsaved source snapshot separately.\n",
+              )
+
+          server = Path("crates/fln-server/src/lib.rs")
+          server_text = server.read_text(encoding="utf-8")
+          if "pub const fn versioned(uri:" not in server_text:
+              replace_once(
+                  server,
+                  "pub struct LspSource<'a> {\n"
+                  "    pub uri: &'a str,\n"
+                  "    pub text: &'a str,\n"
+                  "}\n\n"
+                  "impl<'a> LspSource<'a> {\n"
+                  "    pub const fn new(uri: &'a str, text: &'a str) -> Self {\n"
+                  "        Self { uri, text }\n"
+                  "    }\n"
+                  "}\n",
+                  "pub struct LspSource<'a> {\n"
+                  "    pub uri: &'a str,\n"
+                  "    pub version: Option<i64>,\n"
+                  "    pub text: &'a str,\n"
+                  "}\n\n"
+                  "impl<'a> LspSource<'a> {\n"
+                  "    pub const fn new(uri: &'a str, text: &'a str) -> Self {\n"
+                  "        Self {\n"
+                  "            uri,\n"
+                  "            version: None,\n"
+                  "            text,\n"
+                  "        }\n"
+                  "    }\n\n"
+                  "    pub const fn versioned(uri: &'a str, version: i64, text: &'a str) -> Self {\n"
+                  "        Self {\n"
+                  "            uri,\n"
+                  "            version: Some(version),\n"
+                  "            text,\n"
+                  "        }\n"
+                  "    }\n"
+                  "}\n",
+              )
+              replace_once(
+                  server,
+                  "fn source_for_file<'a>(file_name: &str, sources: &[LspSource<'a>]) -> Option<&'a str> {\n"
+                  "    let file_path = path_without_file_scheme(file_name);\n"
+                  "    sources\n"
+                  "        .iter()\n"
+                  "        .find(|source| {\n"
+                  "            source.uri == file_name || path_without_file_scheme(source.uri) == file_path\n"
+                  "        })\n"
+                  "        .map(|source| source.text)\n"
+                  "}\n",
+                  "fn source_for_file<'a>(file_name: &str, sources: &[LspSource<'a>]) -> Option<LspSource<'a>> {\n"
+                  "    let file_path = path_without_file_scheme(file_name);\n"
+                  "    sources\n"
+                  "        .iter()\n"
+                  "        .find(|source| {\n"
+                  "            source.uri == file_name || path_without_file_scheme(source.uri) == file_path\n"
+                  "        })\n"
+                  "        .copied()\n"
+                  "}\n",
+              )
+              replace_once(
+                  server,
+                  "        |source| source_lsp_position(source, position),\n",
+                  "        |source| source_lsp_position(source.text, position),\n",
+              )
+              replace_once(
+                  server,
+                  "fn uri(path: &str, policy: DiagnosticPathPolicy) -> String {\n"
+                  "    let projected = projected_path(path, policy);\n"
+                  "    if projected.contains(\"://\") {\n"
+                  "        projected.to_owned()\n"
+                  "    } else {\n"
+                  "        format!(\"file://{projected}\")\n"
+                  "    }\n"
+                  "}\n",
+                  "fn has_uri_scheme(value: &str) -> bool {\n"
+                  "    let Some(colon) = value.find(':') else {\n"
+                  "        return false;\n"
+                  "    };\n"
+                  "    if colon == 1\n"
+                  "        && value.as_bytes()[0].is_ascii_alphabetic()\n"
+                  "        && value\n"
+                  "            .as_bytes()\n"
+                  "            .get(2)\n"
+                  "            .is_some_and(|byte| matches!(byte, b'/' | b'\\\\'))\n"
+                  "    {\n"
+                  "        return false;\n"
+                  "    }\n"
+                  "    let scheme = value.as_bytes().get(..colon).unwrap_or_default();\n"
+                  "    scheme.first().is_some_and(u8::is_ascii_alphabetic)\n"
+                  "        && scheme\n"
+                  "            .iter()\n"
+                  "            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))\n"
+                  "}\n\n"
+                  "fn uri(path: &str, policy: DiagnosticPathPolicy) -> String {\n"
+                  "    let projected = projected_path(path, policy);\n"
+                  "    if has_uri_scheme(projected) {\n"
+                  "        projected.to_owned()\n"
+                  "    } else {\n"
+                  "        format!(\"file://{projected}\")\n"
+                  "    }\n"
+                  "}\n\n"
+                  "fn projected_file_identity(path: &str, policy: DiagnosticPathPolicy) -> String {\n"
+                  "    path_without_file_scheme(projected_path(path, policy)).to_owned()\n"
+                  "}\n",
+              )
+              server_text = server.read_text(encoding="utf-8")
+              start = server_text.index("fn complete_messages(")
+              end = server_text.index("\nfn inconclusive_message", start)
+              replacement = r'''#[derive(Debug, Default)]
+          struct LspFileDiagnostics<'a> {
+              version: Option<i64>,
+              diagnostics: Vec<&'a StructuredDiagnostic>,
+          }
+
+          fn newest_version(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+              match (left, right) {
+                  (Some(left), Some(right)) => Some(left.max(right)),
+                  (Some(version), None) | (None, Some(version)) => Some(version),
+                  (None, None) => None,
+              }
+          }
+
+          fn complete_messages(
+              diagnostics: &[StructuredDiagnostic],
+              request: ProjectionRequest,
+              sources: &[LspSource<'_>],
+          ) -> Vec<String> {
+              let mut by_file: BTreeMap<String, LspFileDiagnostics<'_>> = BTreeMap::new();
+              for source in sources {
+                  let entry = by_file
+                      .entry(projected_file_identity(source.uri, request.path))
+                      .or_default();
+                  entry.version = newest_version(entry.version, source.version);
+              }
+              for diagnostic in diagnostics {
+                  let entry = by_file
+                      .entry(projected_file_identity(
+                          diagnostic.file_name.text(),
+                          request.path,
+                      ))
+                      .or_default();
+                  if entry.version.is_none() {
+                      entry.version = source_for_file(diagnostic.file_name.text(), sources)
+                          .and_then(|source| source.version);
+                  }
+                  entry.diagnostics.push(diagnostic);
+              }
+              if by_file.is_empty() {
+                  return vec![format!(
+                      concat!(
+                          "{{\"jsonrpc\":\"2.0\",\"method\":\"$/lean/diagnosticOutcome\",",
+                          "\"params\":{{\"schema\":{},\"outcome\":\"complete\",",
+                          "\"authority\":true,\"diagnosticCount\":0}}}}"
+                      ),
+                      json_string(DIAGNOSTIC_PROJECTION_SCHEMA)
+                  )];
+              }
+              by_file
+                  .into_iter()
+                  .map(|(file, projected)| {
+                      let encoded = projected
+                          .diagnostics
+                          .into_iter()
+                          .map(|diagnostic| lsp_diagnostic(diagnostic, request, sources))
+                          .collect::<Vec<_>>()
+                          .join(",");
+                      let version = projected
+                          .version
+                          .map_or_else(|| "null".to_owned(), |version| version.to_string());
+                      format!(
+                          concat!(
+                              "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",",
+                              "\"params\":{{\"uri\":{},\"version\":{},\"diagnostics\":[{}]}}}}"
+                          ),
+                          json_string(&uri(&file, DiagnosticPathPolicy::Preserve)),
+                          version,
+                          encoded
+                      )
+                  })
+                  .collect()
+          }
+          '''
+              replacement = "\n".join(
+                  line[10:] if line.startswith("          ") else line
+                  for line in replacement.splitlines()
+              )
+              server.write_text(
+                  server_text[:start] + replacement + server_text[end:],
+                  encoding="utf-8",
+              )
+              server_text = server.read_text(encoding="utf-8")
+              server_text = server_text.replace(
+                  'LspSource::new("file:///tmp/Emoji.lean", "a😀b\\nlast")',
+                  'LspSource::versioned("file:///tmp/Emoji.lean", 7, "a😀b\\nlast")',
+                  1,
+              )
+              server_text = server_text.replace(
+                  "        let message = &projection.messages[0];\n",
+                  "        assert_eq!(projection.messages.len(), 1);\n"
+                  "        let message = &projection.messages[0];\n"
+                  "        assert!(message.contains(\"\\\"version\\\":7\"));\n",
+                  1,
+              )
+              test_anchor = "    #[test]\n    fn source_positions_clamp_to_the_last_valid_utf16_coordinate() {\n"
+              tests = r'''    #[test]
+          fn clean_source_snapshot_emits_a_versioned_empty_diagnostic_publication() {
+              let projection = project_with_sources(
+                  request(),
+                  &ProjectionSnapshot::Complete {
+                      diagnostics: Vec::new(),
+                  },
+                  &[LspSource::versioned(
+                      "file:///tmp/Clean.lean",
+                      11,
+                      "def clean := 1",
+                  )],
+              )
+              .expect("the LSP projection tuple is supported");
+              assert_eq!(projection.messages.len(), 1);
+              assert!(projection.messages[0].contains("textDocument/publishDiagnostics"));
+              assert!(projection.messages[0].contains("\"uri\":\"file:///tmp/Clean.lean\""));
+              assert!(projection.messages[0].contains("\"version\":11"));
+              assert!(projection.messages[0].contains("\"diagnostics\":[]"));
+              assert!(!projection.messages[0].contains("diagnosticOutcome"));
+          }
+
+          #[test]
+          fn non_file_uri_schemes_are_preserved_and_windows_paths_remain_file_paths() {
+              assert_eq!(
+                  uri("untitled:proof-buffer", DiagnosticPathPolicy::Preserve),
+                  "untitled:proof-buffer"
+              );
+              assert_eq!(
+                  uri(r"C:\proofs\Main.lean", DiagnosticPathPolicy::Preserve),
+                  r"file://C:\proofs\Main.lean"
+              );
+          }
+
+'''
+              tests = "\n".join(
+                  line[10:] if line.startswith("          ") else line
+                  for line in tests.splitlines()
+              ) + "\n"
+              if server_text.count(test_anchor) != 1:
+                  raise SystemExit("server version test anchor missing")
+              server.write_text(
+                  server_text.replace(test_anchor, tests + test_anchor, 1),
+                  encoding="utf-8",
+              )
+
+              dispatch_text = dispatch.read_text(encoding="utf-8")
+              dispatch_text = dispatch_text.replace(
+                  "struct CachedDocument {\n    version: i64,\n    text: String,\n}\n",
+                  "struct CachedDocument {\n    version: Option<i64>,\n    text: String,\n}\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "    fn store(&mut self, uri: String, version: i64, text: String) -> Result<(), CacheRefusal> {\n"
+                  "        let old = self.documents.remove(&uri);\n",
+                  "    fn store(\n"
+                  "        &mut self,\n"
+                  "        uri: String,\n"
+                  "        version: impl Into<Option<i64>>,\n"
+                  "        text: String,\n"
+                  "    ) -> Result<(), CacheRefusal> {\n"
+                  "        let version = version.into();\n"
+                  "        let old = self.documents.remove(&uri);\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "    fn version(&self, uri: &str) -> Option<i64> {\n"
+                  "        self.documents.get(uri).map(|document| document.version)\n"
+                  "    }\n\n"
+                  "    fn replace_text(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {\n"
+                  "        let version = self.version(&uri).unwrap_or(0);\n"
+                  "        self.store(uri, version, text)\n"
+                  "    }\n",
+                  "    fn version(&self, uri: &str) -> Option<i64> {\n"
+                  "        self.documents\n"
+                  "            .get(uri)\n"
+                  "            .and_then(|document| document.version)\n"
+                  "    }\n\n"
+                  "    fn replace_text(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {\n"
+                  "        let version = self.version(&uri);\n"
+                  "        self.store(uri, version, text)\n"
+                  "    }\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "fn check_document(\n"
+                  "    output: &mut dyn Write,\n"
+                  "    uri: &str,\n"
+                  "    content: &str,\n"
+                  "    on_did_open: &mut OnDidOpen,\n"
+                  ") -> io::Result<()> {\n",
+                  "fn check_document(\n"
+                  "    output: &mut dyn Write,\n"
+                  "    uri: &str,\n"
+                  "    version: Option<i64>,\n"
+                  "    content: &str,\n"
+                  "    on_did_open: &mut OnDidOpen,\n"
+                  ") -> io::Result<()> {\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "    for notification in on_did_open(uri, content) {\n",
+                  "    for notification in on_did_open(uri, version, content) {\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;\n",
+                  "pub type OnDidOpen = dyn FnMut(&str, Option<i64>, &str) -> Vec<String>;\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "                            check_document(output, &uri, &content, on_did_open)?;\n"
+                  "                            documents_opened = documents_opened.saturating_add(1);\n",
+                  "                            check_document(\n"
+                  "                                output,\n"
+                  "                                &uri,\n"
+                  "                                Some(version),\n"
+                  "                                &content,\n"
+                  "                                on_did_open,\n"
+                  "                            )?;\n"
+                  "                            documents_opened = documents_opened.saturating_add(1);\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "                            check_document(output, &uri, &content, on_did_open)?;\n"
+                  "                            documents_changed = documents_changed.saturating_add(1);\n",
+                  "                            check_document(\n"
+                  "                                output,\n"
+                  "                                &uri,\n"
+                  "                                Some(version),\n"
+                  "                                &content,\n"
+                  "                                on_did_open,\n"
+                  "                            )?;\n"
+                  "                            documents_changed = documents_changed.saturating_add(1);\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "                        DecodedField::Valid(content) => {\n"
+                  "                            if let Err(refusal) = documents.replace_text(uri.clone(), content.clone()) {\n",
+                  "                        DecodedField::Valid(content) => {\n"
+                  "                            let version = documents.version(&uri);\n"
+                  "                            if let Err(refusal) = documents.replace_text(uri.clone(), content.clone()) {\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "                            check_document(output, &uri, &content, on_did_open)?;\n"
+                  "                            documents_saved = documents_saved.saturating_add(1);\n",
+                  "                            check_document(output, &uri, version, &content, on_did_open)?;\n"
+                  "                            documents_saved = documents_saved.saturating_add(1);\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "                        DecodedField::Missing => {\n"
+                  "                            if let Some(content) = documents.text(&uri) {\n"
+                  "                                check_document(output, &uri, content, on_did_open)?;\n",
+                  "                        DecodedField::Missing => {\n"
+                  "                            let version = documents.version(&uri);\n"
+                  "                            if let Some(content) = documents.text(&uri) {\n"
+                  "                                check_document(output, &uri, version, content, on_did_open)?;\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "&mut |uri, text| {",
+                  "&mut |uri, _version, text| {",
+              )
+              dispatch_text = dispatch_text.replace(
+                  "&mut |_uri, _text| Vec::new()",
+                  "&mut |_uri, _version, _text| Vec::new()",
+              )
+              dispatch.write_text(dispatch_text, encoding="utf-8")
+
+              cli_text = cli.read_text(encoding="utf-8")
+              callback_start = cli_text.index(
+                  "    let mut on_did_open = move |uri: &str, text: &str| -> Vec<String> {"
+              )
+              callback_end = cli_text.index("\n\n    match fln_server::dispatch::serve", callback_start)
+              callback = '''    let mut on_did_open =
+                  move |uri: &str, version: Option<i64>, text: &str| -> Vec<String> {
+                      let snapshot = lsp_source_snapshot(uri, text.as_bytes());
+                      let source = match version {
+                          Some(version) => fln_server::LspSource::versioned(uri, version, text),
+                          None => fln_server::LspSource::new(uri, text),
+                      };
+                      match fln_server::project_with_sources(lsp_request, &snapshot, &[source]) {
+                          Ok(projection) => projection.messages,
+                          Err(_refusal) => Vec::new(),
+                      }
+                  };'''
+              callback = "\n".join(
+                  line[14:] if line.startswith("              ") else line
+                  for line in callback.splitlines()
+              )
+              cli.write_text(
+                  cli_text[:callback_start] + callback + cli_text[callback_end:],
+                  encoding="utf-8",
+              )
+          else:
+              for path, marker in [
+                  (server, "clean_source_snapshot_emits_a_versioned_empty_diagnostic_publication"),
+                  (dispatch, "FnMut(&str, Option<i64>, &str)"),
+                  (cli, "LspSource::versioned(uri, version, text)"),
+              ]:
+                  if marker not in path.read_text(encoding="utf-8"):
+                      raise SystemExit(f"versioned diagnostics are partial in {path}: missing {marker}")
+          PY
+
+          cat > .github/workflows/fln-lsp-versioned-diagnostics-landing.yml <<'YAML'
+          name: fln LSP versioned diagnostics checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - .github/workflows/fln-lsp-versioned-diagnostics-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - .github/workflows/fln-lsp-versioned-diagnostics-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-versioned-diagnostics-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 60
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify version-bound diagnostics
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+                    cargo test -p fln-cli --lib --no-run
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: compile and test version-bound diagnostics
+        shell: bash
+        run: |
+          cargo test -p fln-server --lib
+          cargo test -p fln-cli --lib --no-run
+
+      - name: publish verified version binding
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-versioned-diagnostics-landing.yml crates/fln-server/src/lib.rs crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
+          if git diff --cached --quiet; then
+            echo "version-bound diagnostics are already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): bind diagnostics to document versions" \
+            -m "Carry optional document versions through the cache and check callback, emit versioned publishDiagnostics for both errors and clean documents, merge file URI/path identities into one publication, and preserve non-file URI schemes without inventing save-only version zero." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
