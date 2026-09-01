@@ -1,0 +1,368 @@
+name: fln LSP JSON-RPC lifecycle landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-jsonrpc-lifecycle-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout exact main head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: apply fail-closed envelope and lifecycle validation
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"expected one dispatch anchor, observed {observed}: {old[:160]!r}")
+              text = text.replace(old, new, 1)
+
+          if "const SERVER_NOT_INITIALIZED_CODE" not in text:
+              replace_once(
+                  "const REQUEST_FAILED_CODE: i32 = -32803;\n",
+                  "const INVALID_REQUEST_CODE: i32 = -32600;\n"
+                  "const METHOD_NOT_FOUND_CODE: i32 = -32601;\n"
+                  "const SERVER_NOT_INITIALIZED_CODE: i32 = -32002;\n"
+                  "const REQUEST_FAILED_CODE: i32 = -32803;\n",
+              )
+              replace_once(
+                  "fn extract_top_level_string_field(json: &str, key: &str) -> Option<String> {\n"
+                  "    match object_field(json, key) {\n"
+                  "        Field::Value(value) => decode_json_string_value(value),\n"
+                  "        Field::Missing | Field::Invalid => None,\n"
+                  "    }\n"
+                  "}\n",
+                  "fn extract_top_level_string_field(json: &str, key: &str) -> DecodedField {\n"
+                  "    match object_field(json, key) {\n"
+                  "        Field::Missing => DecodedField::Missing,\n"
+                  "        Field::Invalid => DecodedField::Invalid,\n"
+                  "        Field::Value(value) => decode_json_string_value(value)\n"
+                  "            .map(DecodedField::Valid)\n"
+                  "            .unwrap_or(DecodedField::Invalid),\n"
+                  "    }\n"
+                  "}\n",
+              )
+              replace_once(
+                  "fn null_response(id: &RequestId) -> String {\n",
+                  "fn invalid_request_response(id: Option<&RequestId>, message: &str) -> String {\n"
+                  "    id.map_or_else(\n"
+                  "        || error_response_null_id(INVALID_REQUEST_CODE, message),\n"
+                  "        |id| error_response(id, INVALID_REQUEST_CODE, message),\n"
+                  "    )\n"
+                  "}\n\n"
+                  "fn null_response(id: &RequestId) -> String {\n",
+              )
+              replace_once(
+                  "        let method = extract_top_level_string_field(&text, \"method\");\n"
+                  "        let id = match extract_request_id(&text) {\n"
+                  "            RequestIdField::Absent => None,\n"
+                  "            RequestIdField::Valid(id) => Some(id),\n"
+                  "            RequestIdField::Invalid => {\n"
+                  "                let response = error_response_null_id(-32600, \"invalid JSON-RPC request id\");\n"
+                  "                transport::write_message(output, response.as_bytes())?;\n"
+                  "                continue;\n"
+                  "            }\n"
+                  "        };\n\n"
+                  "        match (method.as_deref(), id.as_ref(), state) {\n",
+                  "        let jsonrpc = extract_top_level_string_field(&text, \"jsonrpc\");\n"
+                  "        let method = extract_top_level_string_field(&text, \"method\");\n"
+                  "        let id_field = extract_request_id(&text);\n"
+                  "        let response_id = match &id_field {\n"
+                  "            RequestIdField::Valid(id) => Some(id),\n"
+                  "            RequestIdField::Absent | RequestIdField::Invalid => None,\n"
+                  "        };\n\n"
+                  "        if !matches!(&jsonrpc, DecodedField::Valid(version) if version == \"2.0\") {\n"
+                  "            let response = invalid_request_response(\n"
+                  "                response_id,\n"
+                  "                \"JSON-RPC envelope must contain exactly jsonrpc=2.0\",\n"
+                  "            );\n"
+                  "            transport::write_message(output, response.as_bytes())?;\n"
+                  "            continue;\n"
+                  "        }\n"
+                  "        let method = match method {\n"
+                  "            DecodedField::Valid(method) => method,\n"
+                  "            DecodedField::Missing | DecodedField::Invalid => {\n"
+                  "                let response = invalid_request_response(\n"
+                  "                    response_id,\n"
+                  "                    \"JSON-RPC request must contain a valid string method\",\n"
+                  "                );\n"
+                  "                transport::write_message(output, response.as_bytes())?;\n"
+                  "                continue;\n"
+                  "            }\n"
+                  "        };\n"
+                  "        let id = match id_field {\n"
+                  "            RequestIdField::Absent => None,\n"
+                  "            RequestIdField::Valid(id) => Some(id),\n"
+                  "            RequestIdField::Invalid => {\n"
+                  "                let response = error_response_null_id(\n"
+                  "                    INVALID_REQUEST_CODE,\n"
+                  "                    \"invalid JSON-RPC request id\",\n"
+                  "                );\n"
+                  "                transport::write_message(output, response.as_bytes())?;\n"
+                  "                continue;\n"
+                  "            }\n"
+                  "        };\n\n"
+                  "        if matches!(state, ServerState::Uninitialized | ServerState::Initializing)\n"
+                  "            && !matches!(method.as_str(), \"initialize\" | \"initialized\" | \"exit\")\n"
+                  "        {\n"
+                  "            if let Some(req_id) = id.as_ref() {\n"
+                  "                transport::write_message(\n"
+                  "                    output,\n"
+                  "                    error_response(\n"
+                  "                        req_id,\n"
+                  "                        SERVER_NOT_INITIALIZED_CODE,\n"
+                  "                        \"server not initialized\",\n"
+                  "                    )\n"
+                  "                    .as_bytes(),\n"
+                  "                )?;\n"
+                  "            }\n"
+                  "            continue;\n"
+                  "        }\n"
+                  "        if state == ServerState::ShuttingDown && method != \"exit\" {\n"
+                  "            if let Some(req_id) = id.as_ref() {\n"
+                  "                transport::write_message(\n"
+                  "                    output,\n"
+                  "                    error_response(\n"
+                  "                        req_id,\n"
+                  "                        INVALID_REQUEST_CODE,\n"
+                  "                        \"server has shut down\",\n"
+                  "                    )\n"
+                  "                    .as_bytes(),\n"
+                  "                )?;\n"
+                  "            }\n"
+                  "            continue;\n"
+                  "        }\n\n"
+                  "        match (Some(method.as_str()), id.as_ref(), state) {\n",
+              )
+              text = text.replace(
+                  "error_response(req_id, -32600, \"server already initialized\")",
+                  "error_response(req_id, INVALID_REQUEST_CODE, \"server already initialized\")",
+                  1,
+              )
+              replace_once(
+                  "            (Some(\"shutdown\"), Some(req_id), _) => {\n",
+                  "            (Some(\"shutdown\"), Some(req_id), ServerState::Running) => {\n",
+              )
+              text = text.replace(
+                  "error_response(req_id, -32601, \"method not found\")",
+                  "error_response(req_id, METHOD_NOT_FOUND_CODE, \"method not found\")",
+                  1,
+              )
+              replace_once(
+                  "            extract_top_level_string_field(json, \"method\").as_deref(),\n"
+                  "            Some(\"textDocument/hover\")\n",
+                  "            extract_top_level_string_field(json, \"method\"),\n"
+                  "            DecodedField::Valid(\"textDocument/hover\".to_string())\n",
+              )
+
+              test_anchor = "    #[test]\n    fn envelope_fields_ignore_nested_lookalikes() {\n"
+              tests = r'''    #[test]
+              fn invalid_or_missing_jsonrpc_version_is_an_invalid_request() {
+                  for (message, expected_id) in [
+                      (
+                          r#"{"id":7,"method":"textDocument/hover","params":{}}"#,
+                          "\"id\":7",
+                      ),
+                      (
+                          r#"{"jsonrpc":"1.0","id":"old","method":"textDocument/hover","params":{}}"#,
+                          "\"id\":\"old\"",
+                      ),
+                      (
+                          r#"{"jsonrpc":2,"id":8,"method":"textDocument/hover","params":{}}"#,
+                          "\"id\":8",
+                      ),
+                  ] {
+                      let (outcome, output) = lifecycle_session(message);
+                      assert!(outcome.clean);
+                      assert!(output.contains(expected_id));
+                      assert!(output.contains("\"code\":-32600"));
+                      assert!(output.contains("jsonrpc=2.0"));
+                  }
+              }
+
+              #[test]
+              fn missing_or_non_string_method_is_an_invalid_request() {
+                  for message in [
+                      r#"{"jsonrpc":"2.0","id":8,"params":{}}"#,
+                      r#"{"jsonrpc":"2.0","id":8,"method":7,"params":{}}"#,
+                  ] {
+                      let (outcome, output) = lifecycle_session(message);
+                      assert!(outcome.clean);
+                      assert!(output.contains("\"id\":8,\"error\":{\"code\":-32600"));
+                      assert!(output.contains("valid string method"));
+                      assert!(!output.contains("method not found"));
+                  }
+              }
+
+              #[test]
+              fn requests_before_initialize_fail_with_server_not_initialized_and_recover() {
+                  let mut input_buf = Vec::new();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let outcome = serve(&mut reader, &mut output_buf, &mut |_uri, _text| Vec::new())
+                      .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert_eq!(output.matches("\"code\":-32002").count(), 2);
+                  assert!(output.contains("\"id\":3,\"result\""));
+                  assert!(output.contains("\"id\":4,\"result\":null"));
+              }
+
+              #[test]
+              fn requests_after_shutdown_are_invalid_without_reopening_the_server() {
+                  let mut input_buf = Vec::new();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{}}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let outcome = serve(&mut reader, &mut output_buf, &mut |_uri, _text| Vec::new())
+                      .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert!(output.contains("\"id\":3,\"error\":{\"code\":-32600"));
+                  assert!(output.contains("\"id\":4,\"error\":{\"code\":-32600"));
+                  assert_eq!(output.matches("server has shut down").count(), 2);
+              }
+
+'''
+              tests = "\n".join(line[14:] if line.startswith("              ") else line for line in tests.splitlines()) + "\n"
+              replace_once(test_anchor, tests + test_anchor)
+              path.write_text(text, encoding="utf-8")
+          else:
+              required = [
+                  "invalid_or_missing_jsonrpc_version_is_an_invalid_request",
+                  "requests_before_initialize_fail_with_server_not_initialized_and_recover",
+                  "requests_after_shutdown_are_invalid_without_reopening_the_server",
+              ]
+              for marker in required:
+                  if marker not in text:
+                      raise SystemExit(f"dispatch lifecycle wiring is partial: missing {marker}")
+          PY
+
+          cat > .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml <<'YAML'
+          name: fln LSP JSON-RPC lifecycle checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-jsonrpc-lifecycle-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: validate JSON-RPC envelope and lifecycle behavior
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test dispatcher behavior
+        shell: bash
+        run: cargo test -p fln-server --lib
+
+      - name: publish verified lifecycle validation
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml crates/fln-server/src/dispatch.rs
+          if git diff --cached --quiet; then
+            echo "JSON-RPC lifecycle validation is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): validate JSON-RPC lifecycle envelopes" \
+            -m "Require jsonrpc=2.0 and a string method, distinguish invalid requests from unknown methods, return ServerNotInitialized before the initialize handshake completes, and refuse requests after shutdown. Add recovery and terminal-state regression cells." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
