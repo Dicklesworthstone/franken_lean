@@ -14,11 +14,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use fln::{
-    Budget, Declaration, Engine, EngineAdmissionLimits, Environment, KVMap, Outcome,
-};
+use fln::{Budget, Declaration, Engine, EngineAdmissionLimits, Environment, KVMap, Outcome};
 use fln_env::constants::ConstantInfo;
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
@@ -34,16 +32,22 @@ fn reference_lib() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn pinned_nat_block() -> Option<fln_kernel::InductiveBlock> {
-    let lib = reference_lib()?;
+fn pinned_nat_block(lib: &Path) -> fln_kernel::InductiveBlock {
     let base = lib.join("Init/Prelude.olean");
-    let exported = std::fs::read(&base).ok()?;
-    let server = std::fs::read(base.with_extension("olean.server")).ok()?;
-    let private = std::fs::read(base.with_extension("olean.private")).ok()?;
-    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server]).ok()?;
+    let exported = std::fs::read(&base)
+        .unwrap_or_else(|error| panic!("read pinned exported Prelude {base:?}: {error}"));
+    let server_path = base.with_extension("olean.server");
+    let server = std::fs::read(&server_path)
+        .unwrap_or_else(|error| panic!("read pinned Prelude server part {server_path:?}: {error}"));
+    let private_path = base.with_extension("olean.private");
+    let private = std::fs::read(&private_path).unwrap_or_else(|error| {
+        panic!("read pinned Prelude private part {private_path:?}: {error}")
+    });
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse pinned Prelude private part against exported + server dependencies");
     let infos = DeclDecoder::new(&view, WalkBudget::default())
         .decode_module_constants()
-        .ok()?;
+        .expect("decode pinned Prelude private constant array");
 
     let mut nat = None;
     let mut zero = None;
@@ -56,30 +60,33 @@ fn pinned_nat_block() -> Option<fln_kernel::InductiveBlock> {
             ("Nat.zero", ConstantInfo::Ctor(value)) => zero = Some(value),
             ("Nat.succ", ConstantInfo::Ctor(value)) => succ = Some(value),
             ("Nat.rec", ConstantInfo::Rec(value)) => rec = Some(value),
+            ("Nat" | "Nat.zero" | "Nat.succ" | "Nat.rec", other) => {
+                panic!("{name} decoded with unexpected ConstantInfo kind: {other:?}")
+            }
             _ => {}
         }
     }
 
-    let nat = nat?;
-    let zero = zero?;
-    let succ = succ?;
-    let rec = rec?;
-    Some(fln_kernel::InductiveBlock {
-        types: vec![nat],
-        ctors: vec![zero, succ],
-        recursors: vec![rec],
-    })
+    fln_kernel::InductiveBlock {
+        types: vec![nat.expect("pinned Prelude contains Nat inductive row")],
+        ctors: vec![
+            zero.expect("pinned Prelude contains Nat.zero constructor row"),
+            succ.expect("pinned Prelude contains Nat.succ constructor row"),
+        ],
+        recursors: vec![rec.expect("pinned Prelude contains Nat.rec recursor row")],
+    }
 }
 
 #[test]
 fn pinned_init_nat_completes_the_two_checker_council() {
-    let Some(block) = pinned_nat_block() else {
+    let Some(lib) = reference_lib() else {
         eprintln!(
-            "SKIP: pinned Reference Init.Prelude companion chain is unavailable; \
-             this test has no synthetic substitute"
+            "SKIP: pinned Reference library is not installed; this real-artifact regression has \
+             no synthetic substitute"
         );
         return;
     };
+    let block = pinned_nat_block(&lib);
 
     assert_eq!(block.types.len(), 1, "Nat is one inductive type");
     assert!(block.types[0].is_rec, "the pin marks Nat recursive");
