@@ -1,5 +1,5 @@
-//! **fln-server** — Lantern's LSP diagnostic adapter (plan §14; bead
-//! `franken_lean-wlan`).
+//! **fln-server** — Lantern's LSP diagnostic adapter (plan §14; beads
+//! `franken_lean-wlan` and `franken_lean-v2p`).
 //!
 //! User diagnostics become `textDocument/publishDiagnostics` notifications.
 //! Inconclusive and internal-fault outcomes use the distinct
@@ -144,16 +144,79 @@ fn bounded_json(value: &BoundedText) -> String {
     )
 }
 
-fn path_without_file_scheme(path: &str) -> &str {
-    path.strip_prefix("file://").unwrap_or(path)
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    for byte in &bytes[1..] {
+        match *byte {
+            b':' => return true,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.' => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn append_percent_encoded(output: &mut String, value: &str, preserve_slash: bool) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b':')
+            || (preserve_slash && byte == b'/')
+        {
+            output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+}
+
+fn file_uri(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if let Some(network_path) = normalized.strip_prefix("//") {
+        let (authority, tail) = network_path
+            .split_once('/')
+            .map_or((network_path, ""), |(authority, tail)| (authority, tail));
+        let mut encoded = String::from("file://");
+        append_percent_encoded(&mut encoded, authority, false);
+        encoded.push('/');
+        append_percent_encoded(&mut encoded, tail, true);
+        return encoded;
+    }
+
+    let mut encoded = String::from("file://");
+    if !normalized.starts_with('/') {
+        encoded.push('/');
+    }
+    append_percent_encoded(&mut encoded, &normalized, true);
+    encoded
+}
+
+fn uri(path: &str, policy: DiagnosticPathPolicy) -> String {
+    let projected = projected_path(path, policy);
+    if !is_windows_drive_path(projected) && has_uri_scheme(projected) {
+        projected.to_owned()
+    } else {
+        file_uri(projected)
+    }
 }
 
 fn source_for_file<'a>(file_name: &str, sources: &[LspSource<'a>]) -> Option<&'a str> {
-    let file_path = path_without_file_scheme(file_name);
+    let canonical_uri = uri(file_name, DiagnosticPathPolicy::Preserve);
     sources
         .iter()
         .find(|source| {
-            source.uri == file_name || path_without_file_scheme(source.uri) == file_path
+            source.uri == file_name
+                || uri(source.uri, DiagnosticPathPolicy::Preserve) == canonical_uri
         })
         .map(|source| source.text)
 }
@@ -201,21 +264,38 @@ fn source_lsp_position(source: &str, position: Position) -> (usize, usize) {
     )
 }
 
-fn lsp_position(file_name: &str, position: Position, sources: &[LspSource<'_>]) -> String {
-    let (line, character) = source_for_file(file_name, sources).map_or_else(
+fn resolved_lsp_position(
+    file_name: &str,
+    position: Position,
+    sources: &[LspSource<'_>],
+) -> (usize, usize) {
+    source_for_file(file_name, sources).map_or_else(
         || (position.line.saturating_sub(1), position.column),
         |source| source_lsp_position(source, position),
-    );
+    )
+}
+
+fn lsp_position_json(position: (usize, usize)) -> String {
+    let (line, character) = position;
     format!("{{\"line\":{line},\"character\":{character}}}")
 }
 
-fn uri(path: &str, policy: DiagnosticPathPolicy) -> String {
-    let projected = projected_path(path, policy);
-    if projected.contains("://") {
-        projected.to_owned()
-    } else {
-        format!("file://{projected}")
+fn lsp_range(
+    file_name: &str,
+    start: Position,
+    end: Position,
+    sources: &[LspSource<'_>],
+) -> String {
+    let start = resolved_lsp_position(file_name, start, sources);
+    let mut end = resolved_lsp_position(file_name, end, sources);
+    if end < start {
+        end = start;
     }
+    format!(
+        "{{\"start\":{},\"end\":{}}}",
+        lsp_position_json(start),
+        lsp_position_json(end)
+    )
 }
 
 fn related_json(
@@ -225,12 +305,11 @@ fn related_json(
 ) -> String {
     format!(
         concat!(
-            "{{\"location\":{{\"uri\":{},\"range\":{{\"start\":{},\"end\":{}}}}},",
+            "{{\"location\":{{\"uri\":{},\"range\":{}}},",
             "\"message\":{},\"data\":{{\"truncated\":{}}}}}"
         ),
         json_string(&uri(span.file_name.text(), policy)),
-        lsp_position(span.file_name.text(), span.start, sources),
-        lsp_position(span.file_name.text(), span.end, sources),
+        lsp_range(span.file_name.text(), span.start, span.end, sources),
         json_string(span.label.text()),
         span.label.truncated()
     )
@@ -297,14 +376,18 @@ fn lsp_diagnostic(
         .join(",");
     format!(
         concat!(
-            "{{\"range\":{{\"start\":{},\"end\":{}}},\"severity\":{},",
+            "{{\"range\":{},\"severity\":{},",
             "\"code\":{},\"source\":\"FrankenLean\",\"message\":{},",
             "\"relatedInformation\":[{}],\"data\":{{\"schema\":{},",
             "\"causeClass\":{},\"behaviorNote\":{},\"bodyTruncated\":{},\"evidence\":[{}],",
             "\"omittedRelated\":{},\"omittedEvidence\":{}}}}}"
         ),
-        lsp_position(diagnostic.file_name.text(), diagnostic.pos, sources),
-        lsp_position(diagnostic.file_name.text(), end, sources),
+        lsp_range(
+            diagnostic.file_name.text(),
+            diagnostic.pos,
+            end,
+            sources
+        ),
         severity_code(diagnostic.severity),
         json_string(diagnostic.cause_class),
         json_string(&diagnostic_message(diagnostic, request.mode)),
@@ -522,6 +605,27 @@ mod tests {
     }
 
     #[test]
+    fn encoded_editor_uri_matches_raw_diagnostic_path() {
+        let mut diagnostic = diagnostic();
+        diagnostic.file_name = BoundedText::new("/tmp/Emoji File.lean");
+        diagnostic.related.clear();
+        let projection = project_with_sources(
+            request(),
+            &ProjectionSnapshot::Complete {
+                diagnostics: vec![diagnostic],
+            },
+            &[LspSource::new(
+                "file:///tmp/Emoji%20File.lean",
+                "a😀b",
+            )],
+        )
+        .expect("the LSP projection tuple is supported");
+        let message = &projection.messages[0];
+        assert!(message.contains("\"uri\":\"file:///tmp/Emoji%20File.lean\""));
+        assert!(message.contains("\"start\":{\"line\":0,\"character\":3}"));
+    }
+
+    #[test]
     fn source_positions_clamp_to_the_last_valid_utf16_coordinate() {
         assert_eq!(
             source_lsp_position(
@@ -538,6 +642,56 @@ mod tests {
             (0, 1),
             "the CRLF terminator is not part of the LSP line character count"
         );
+    }
+
+    #[test]
+    fn file_paths_are_canonical_document_uris() {
+        assert_eq!(
+            uri("/tmp/My #1%.lean", DiagnosticPathPolicy::Preserve),
+            "file:///tmp/My%20%231%25.lean"
+        );
+        assert_eq!(
+            uri("Foo.lean", DiagnosticPathPolicy::Preserve),
+            "file:///Foo.lean"
+        );
+        assert_eq!(
+            uri(r"C:\Lean Files\Foo.lean", DiagnosticPathPolicy::Preserve),
+            "file:///C:/Lean%20Files/Foo.lean"
+        );
+        assert_eq!(
+            uri(
+                r"\\server\share\Foo Bar.lean",
+                DiagnosticPathPolicy::Preserve
+            ),
+            "file://server/share/Foo%20Bar.lean"
+        );
+        assert_eq!(
+            uri("untitled:Untitled-1", DiagnosticPathPolicy::Preserve),
+            "untitled:Untitled-1"
+        );
+        assert_eq!(
+            uri("/tmp/Foo.lean", DiagnosticPathPolicy::Basename),
+            "file:///Foo.lean"
+        );
+    }
+
+    #[test]
+    fn reversed_ranges_are_clamped_to_zero_width() {
+        let mut diagnostic = diagnostic();
+        diagnostic.pos = Position { line: 1, column: 3 };
+        diagnostic.end_pos = Some(Position { line: 1, column: 1 });
+        diagnostic.related.clear();
+        let projection = project_with_sources(
+            request(),
+            &ProjectionSnapshot::Complete {
+                diagnostics: vec![diagnostic],
+            },
+            &[LspSource::new("file:///tmp/Emoji.lean", "abcd")],
+        )
+        .expect("the LSP projection tuple is supported");
+        assert!(projection.messages[0].contains(
+            "\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":3}"
+        ));
     }
 
     #[test]
