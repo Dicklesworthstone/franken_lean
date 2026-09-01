@@ -1,0 +1,295 @@
+name: fln LSP status-docs landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-status-docs-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP callback-refusal landing
+      - fln LSP callback-refusal checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-status-docs-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require the complete bounded Lantern hardening slice
+        shell: bash
+        run: |
+          grep -Fq 'pub const fn versioned(uri:' crates/fln-server/src/lib.rs
+          grep -Fq 'initialize_position_encoding_offer' crates/fln-server/src/dispatch.rs
+          grep -Fq 'SERVER_NOT_INITIALIZED_CODE' crates/fln-server/src/dispatch.rs
+          grep -Fq 'didChange for an unopened document' crates/fln-server/src/dispatch.rs
+          grep -Fq 'for forbidden in ["range", "rangeLength"]' crates/fln-server/src/dispatch.rs
+          grep -Fq 'method_requires_request_id' crates/fln-server/src/dispatch.rs
+          grep -Fq 'Result<Vec<String>, ProjectionRefusal>' crates/fln-server/src/dispatch.rs
+          grep -Fq '.map(|projection| projection.messages)' crates/fln-cli/src/lib.rs
+
+      - name: update code-facing and project-facing documentation
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import datetime as dt
+          import json
+          import subprocess
+          from pathlib import Path
+
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          short = head[:8]
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"{path}: expected one documentation anchor, observed {observed}: {old[:180]!r}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          server = Path("crates/fln-server/src/lib.rs")
+          server_text = server.read_text(encoding="utf-8")
+          old_server_docs = '''//! retained under explicit document/byte limits and monotone client versions so
+          //! textless saves can re-check the newest valid snapshot; malformed transitions
+          //! invalidate stale retained source and close clears push diagnostics. Cursor-aware
+          //! goals, hover/completion/definition semantics, Lean RPC sessions, and persistent
+          //! elaboration/import state remain outside this bounded server slice.
+          '''
+          old_server_docs = "\n".join(line[10:] if line.startswith("          ") else line for line in old_server_docs.splitlines()) + "\n"
+          new_server_docs = '''//! retained under explicit document/byte limits and monotone client versions so
+          //! textless saves can re-check the newest valid snapshot. The live server advertises
+          //! and negotiates UTF-16 positions, converts primary and related spans against the exact
+          //! unsaved source, binds push diagnostics to document versions, keeps open-document
+          //! metadata when source bytes cannot be retained, clears diagnostics whenever source
+          //! authority is lost, rejects ranged edits under Full synchronization, and validates
+          //! JSON-RPC envelope, lifecycle, and request/notification roles. Cursor-aware goals,
+          //! hover/completion/definition semantics, Lean RPC sessions, and persistent
+          //! elaboration/import state remain outside this bounded server slice.
+          '''
+          new_server_docs = "\n".join(line[10:] if line.startswith("          ") else line for line in new_server_docs.splitlines()) + "\n"
+          if old_server_docs in server_text:
+              server.write_text(server_text.replace(old_server_docs, new_server_docs, 1), encoding="utf-8")
+          elif "binds push diagnostics to document versions" not in server_text:
+              raise SystemExit("fln-server module documentation is in an unknown state")
+
+          cli = Path("crates/fln-cli/src/lib.rs")
+          old_usage = '''    "`serve-lsp` starts a Language Server Protocol session over stdin/stdout.\n",
+              "The server handles the LSP lifecycle (initialize/shutdown/exit) and routes\n",
+              "textDocument/didOpen notifications through the bounded source runner,\n",
+              "projecting diagnostics via fln-server. This is a synchronous, single-file\n",
+              "server suitable for editor integration testing; it is not yet the full\n",
+              "asupersync-backed parallel elaboration server from the plan.\n",
+          '''
+          old_usage = "\n".join(line[14:] if line.startswith("              ") else line for line in old_usage.splitlines()) + "\n"
+          new_usage = '''    "`serve-lsp` starts a Language Server Protocol session over stdin/stdout.\n",
+              "The server handles initialize/shutdown/exit plus stateful Full-sync\n",
+              "didOpen/didChange/didSave/didClose, negotiates UTF-16 positions, retains\n",
+              "bounded open-document state, and publishes version-bound diagnostics from\n",
+              "the exact unsaved source through the bounded source runner. Malformed or\n",
+              "incremental change shapes fail closed and clear stale diagnostics. This is\n",
+              "still a synchronous bounded server for editor integration testing, not the\n",
+              "shared-heap asupersync daemon, semantic InfoView, or Lean RPC system in the plan.\n",
+          '''
+          new_usage = "\n".join(line[14:] if line.startswith("              ") else line for line in new_usage.splitlines()) + "\n"
+          cli_text = cli.read_text(encoding="utf-8")
+          if old_usage in cli_text:
+              cli.write_text(cli_text.replace(old_usage, new_usage, 1), encoding="utf-8")
+          elif "publishes version-bound diagnostics" not in cli_text:
+              raise SystemExit("serve-lsp usage documentation is in an unknown state")
+
+          status = Path("IMPLEMENTATION_STATUS.md")
+          status_text = status.read_text(encoding="utf-8")
+          status_text = status_text.replace(
+              "**Status: usable bounded transport with stateful Full synchronization; advanced editor semantics remain incomplete.**",
+              "**Status: hardened bounded transport with stateful Full synchronization; advanced editor semantics and daemon architecture remain incomplete.**",
+              1,
+          )
+          status_anchor = "- unimplemented `$/lean/rpc/connect` and `$/lean/rpc/call` return LSP `RequestFailed` (`-32803`) instead of fabricating a session or successful null call.\n"
+          additions = '''- the live initialize response advertises `positionEncoding: "utf-16"`; absent legacy capability data defaults to UTF-16, explicit offers containing UTF-16 succeed, and malformed or explicitly incompatible offers fail with `InvalidParams` while leaving initialization recoverable.
+          - primary and related diagnostic spans are converted from Lean codepoint columns to LSP UTF-16 code units against the exact unsaved source snapshot, including astral characters and CRLF boundaries; invalid coordinates clamp deterministically to the last valid wire position.
+          - push diagnostics carry the exact retained document version when one exists, including clean empty publications that clear stale errors; save-only state remains explicitly unversioned rather than inventing version zero.
+          - URI handling preserves existing and non-file schemes while avoiding `file://file://` duplication and treating Windows drive paths as paths rather than URI schemes.
+          - malformed open/change/save transitions clear previously published diagnostics at the same time retained text is invalidated, so internal source refusal cannot leave stale editor errors visible.
+          - open-document metadata is distinct from retained source bytes: oversized source can remain lifecycle-open, duplicate opens cannot replace the authoritative snapshot, change/save notifications cannot implicitly open a document, and a later valid Full-sync change can recover after source invalidation.
+          - Full synchronization rejects any `contentChanges` entry carrying `range` or `rangeLength`; an incremental fragment can never be reinterpreted as the complete document.
+          - JSON-RPC envelopes require exact `jsonrpc: "2.0"` and a string method; invalid envelopes, pre-initialize requests, post-shutdown requests, and wrong request/notification ID roles are distinguished from unknown methods and tested for recovery/non-mutation.
+          - the document-check callback returns typed projection refusals. An internal projection-contract failure now emits a non-authoritative `$/lean/diagnosticOutcome`, clears diagnostics, and completes file progress instead of silently looking like an empty success.
+          '''
+          additions = "\n".join(line[10:] if line.startswith("          ") else line for line in additions.splitlines()) + "\n"
+          if additions.splitlines()[0] not in status_text:
+              if status_anchor not in status_text:
+                  raise SystemExit("IMPLEMENTATION_STATUS Lantern anchor missing")
+              status_text = status_text.replace(status_anchor, status_anchor + additions, 1)
+          old_evidence = "The latest LSP parser/state changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that session lacked a Rust toolchain."
+          new_evidence = "The bounded Lantern hardening above is **landed and focused-test observed**: its landing lanes ran the `fln-server` library suite, and every cross-crate callback change also compiled the complete `fln-cli` library target. This is not a full workspace gate, real-editor parity run, daemon-scale test, or release-level LSP claim."
+          if old_evidence in status_text:
+              status_text = status_text.replace(old_evidence, new_evidence, 1)
+          elif new_evidence not in status_text:
+              raise SystemExit("IMPLEMENTATION_STATUS evidence paragraph is in an unknown state")
+          old_commands = '''cargo fmt --all -- --check
+          cargo test --locked -p fln-server
+          cargo test --locked -p fln-checker --no-fail-fast
+          '''
+          old_commands = "\n".join(line[10:] if line.startswith("          ") else line for line in old_commands.splitlines()) + "\n"
+          new_commands = '''cargo fmt --all -- --check
+          cargo test --locked -p fln-server
+          cargo test --locked -p fln-cli --lib --no-run
+          cargo test --locked -p fln-checker --no-fail-fast
+          '''
+          new_commands = "\n".join(line[10:] if line.startswith("          ") else line for line in new_commands.splitlines()) + "\n"
+          if old_commands in status_text:
+              status_text = status_text.replace(old_commands, new_commands, 1)
+          status.write_text(status_text, encoding="utf-8")
+
+          changelog = Path("CHANGELOG.md")
+          change_text = changelog.read_text(encoding="utf-8")
+          lines = change_text.splitlines()
+          for index, line in enumerate(lines):
+              if line.startswith("Scope: project inception on **2026-07-21** through the September 1 implementation/status snapshot at"):
+                  lines[index] = (
+                      "Scope: project inception on **2026-07-21** through the September 1 implementation/status "
+                      f"snapshot at **[`{short}`](https://github.com/Dicklesworthstone/franken_lean/commit/{head})**. "
+                      "This changelog refresh follows that code snapshot."
+                  )
+                  break
+          else:
+              raise SystemExit("CHANGELOG scope line missing")
+          change_text = "\n".join(lines) + "\n"
+          timeline_anchor = "| [`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32) | 2026-09-01 | Evidence-graded checker frontier, executable agent-control tools, structurally hardened stateful Lantern document synchronization. |\n"
+          timeline_row = f"| [`{short}`](https://github.com/Dicklesworthstone/franken_lean/commit/{head}) | 2026-09-01 | Source-bound UTF-16 LSP coordinates, versioned diagnostics, fail-closed JSON-RPC/document lifecycle, and explicit projection-refusal handling. |\n"
+          if timeline_row not in change_text:
+              if timeline_anchor not in change_text:
+                  raise SystemExit("CHANGELOG timeline anchor missing")
+              change_text = change_text.replace(timeline_anchor, timeline_anchor + timeline_row, 1)
+          section_marker = "## 12) Lantern wire correctness: coordinates, versions, and lifecycle — 2026-09-01"
+          if section_marker not in change_text:
+              change_text += f'''\n---\n\n{section_marker}\n\nThis wave hardened the bounded `lean --server` / `fln serve-lsp` path at the protocol seams most likely to create convincing but wrong editor state.\n\n### Landed\n\n- Source-bound conversion from Lean codepoint columns to negotiated LSP UTF-16 code units for primary and related ranges, with astral-character, CRLF, clamping, and URI regressions.\n- Explicit UTF-16 capability advertisement and initialization-time capability negotiation; incompatible or malformed offers fail without poisoning later recovery.\n- Version-bound diagnostic publication for both errors and clean files, canonical path/URI identity joining, and no fabricated save-only version.\n- Bounded open-document metadata independent of retained source bytes, duplicate-open and unopened-change/save refusal, and recovery after malformed source invalidation.\n- Strict Full-sync shape enforcement: ranged incremental fragments are never treated as complete documents.\n- Exact JSON-RPC 2.0/method validation, `ServerNotInitialized` and post-shutdown state errors, and explicit request-versus-notification ID roles.\n- Visible typed callback refusal: projection-contract failures emit a non-authoritative outcome, clear diagnostics, and close progress instead of becoming empty success.\n- Focused permanent CI lanes for the bounded Lantern surface; every landing was gated by the `fln-server` library suite, with `fln-cli` compile coverage where cross-crate callback/projection APIs changed.\n\n### Evidence boundary\n\nThis is bounded implementation evidence. It does **not** claim unmodified vscode-lean4 parity, cursor-aware goals, semantic hover/completion/definition, Lean RPC sessions, declaration-granular incremental elaboration, one-daemon shared imports, cancellation under typing storms, PG-4/PG-6 performance, or full W9/G5 closure.\n\nRepresentative code snapshot: [`{short}`](https://github.com/Dicklesworthstone/franken_lean/commit/{head}).\n'''
+          changelog.write_text(change_text, encoding="utf-8")
+
+          issues = Path(".beads/issues.jsonl")
+          issue_lines = issues.read_text(encoding="utf-8").splitlines()
+          records = [json.loads(line) for line in issue_lines]
+          max_comment_id = max(
+              (int(comment["id"]) for record in records for comment in record.get("comments", [])),
+              default=0,
+          )
+          now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+          found = False
+          for index, record in enumerate(records):
+              if record.get("id") != "franken_lean-v2p":
+                  continue
+              found = True
+              if record.get("status") == "open":
+                  record["status"] = "in_progress"
+              note_prefix = "Bounded Lantern hardening update (2026-09-01):"
+              if not any(comment.get("text", "").startswith(note_prefix) for comment in record.get("comments", [])):
+                  record.setdefault("comments", []).append(
+                      {
+                          "id": max_comment_id + 1,
+                          "issue_id": "franken_lean-v2p",
+                          "author": "GPT-5.6-Pro",
+                          "text": (
+                              f"{note_prefix} source snapshot {head}. Landed source-bound UTF-16 primary/related positions, explicit position negotiation, version-bound clean/error diagnostics, stale-diagnostic clearing, open-document metadata and lifecycle refusal/recovery, strict Full-sync change shapes, JSON-RPC envelope/state and request/notification role validation, and typed visible projection-refusal handling. Focused fln-server tests and cross-crate fln-cli compile gates ran in the landing lanes. This is progress on the bounded wire/server slice only; it does not close franken_lean-v2p or claim vscode-lean4 parity, Lean RPC, semantic goals/hover/completion, shared imports, asupersync daemon topology, or PG-4/PG-6."
+                          ),
+                          "created_at": now,
+                      }
+                  )
+              record["updated_at"] = now
+              issue_lines[index] = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+              break
+          if not found:
+              raise SystemExit("franken_lean-v2p bead record missing")
+          issues.write_text("\n".join(issue_lines) + "\n", encoding="utf-8")
+          PY
+
+          cat > .github/workflows/fln-lsp-status-docs-landing.yml <<'YAML'
+          name: fln LSP status-docs checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - IMPLEMENTATION_STATUS.md
+                - CHANGELOG.md
+                - .beads/issues.jsonl
+                - .github/workflows/fln-lsp-status-docs-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - IMPLEMENTATION_STATUS.md
+                - CHANGELOG.md
+                - .beads/issues.jsonl
+                - .github/workflows/fln-lsp-status-docs-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-status-docs-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 75
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify bounded Lantern status and code
+                  shell: bash
+                  run: |
+                    grep -Fq 'focused-test observed' IMPLEMENTATION_STATUS.md
+                    grep -Fq 'Lantern wire correctness: coordinates, versions, and lifecycle' CHANGELOG.md
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+                    cargo test -p fln-cli --lib --no-run
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: reverify the documented bounded surface
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo test -p fln-server --lib
+          cargo test -p fln-cli --lib --no-run
+
+      - name: publish accurate bounded status
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified documentation landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-status-docs-landing.yml crates/fln-server/src/lib.rs crates/fln-cli/src/lib.rs IMPLEMENTATION_STATUS.md CHANGELOG.md .beads/issues.jsonl
+          if git diff --cached --quiet; then
+            echo "bounded Lantern status is already current"
+            exit 0
+          fi
+          git commit -m "docs(status): record bounded Lantern hardening" \
+            -m "Update module and CLI help, the evidence-graded implementation status, changelog timeline, and the existing franken_lean-v2p Beads record. The documentation names the focused test evidence and preserves the explicit boundary to unimplemented semantic LSP, RPC, daemon, and performance work." \
+            -m "Bead: franken_lean-v2p (status/comment update; no closure claim)"
+          git push origin HEAD:main
