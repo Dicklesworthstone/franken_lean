@@ -42,6 +42,13 @@ impl RequestId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestIdField {
+    Absent,
+    Valid(RequestId),
+    Invalid,
+}
+
 /// Find an unescaped JSON key at any depth. This is used only after the caller
 /// has already selected the relevant nested protocol region.
 fn find_json_key(json: &str, key: &str) -> Option<usize> {
@@ -176,6 +183,28 @@ fn decode_json_string(after_quote: &str) -> Option<String> {
     }
 }
 
+fn encoded_json_string_len(after_quote: &str) -> Option<usize> {
+    let bytes = after_quote.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return index.checked_add(1),
+            b'\\' => {
+                index = index.checked_add(2)?;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn json_value_has_terminator(rest: &str) -> bool {
+    matches!(
+        rest.trim_start().as_bytes().first().copied(),
+        None | Some(b',') | Some(b'}') | Some(b']')
+    )
+}
+
 fn string_value_after_key(json: &str, after_key: usize) -> Option<String> {
     let after_key = json.get(after_key..)?;
     let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
@@ -192,19 +221,62 @@ fn extract_top_level_string_field(json: &str, key: &str) -> Option<String> {
 }
 
 fn extract_integer_value(after_colon: &str) -> Option<i64> {
-    let end = after_colon
-        .find(|c: char| !c.is_ascii_digit() && c != '-')
-        .unwrap_or(after_colon.len());
-    after_colon[..end].parse::<i64>().ok()
+    let bytes = after_colon.as_bytes();
+    let mut index = 0usize;
+    if bytes.first().copied() == Some(b'-') {
+        index = 1;
+    }
+    let first_digit = *bytes.get(index)?;
+    match first_digit {
+        b'0' => {
+            index += 1;
+            if bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+        }
+        b'1'..=b'9' => {
+            index += 1;
+            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+        }
+        _ => return None,
+    }
+    if !json_value_has_terminator(after_colon.get(index..)?) {
+        return None;
+    }
+    after_colon.get(..index)?.parse::<i64>().ok()
 }
 
-fn extract_request_id(json: &str) -> Option<RequestId> {
-    let after_key = &json[find_top_level_json_key(json, "id")?..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+fn extract_request_id(json: &str) -> RequestIdField {
+    let Some(after_key_index) = find_top_level_json_key(json, "id") else {
+        return RequestIdField::Absent;
+    };
+    let Some(after_key) = json.get(after_key_index..) else {
+        return RequestIdField::Invalid;
+    };
+    let Some(after_colon) = after_key.trim_start().strip_prefix(':').map(str::trim_start) else {
+        return RequestIdField::Invalid;
+    };
     if let Some(after_quote) = after_colon.strip_prefix('"') {
-        return decode_json_string(after_quote).map(RequestId::Text);
+        let Some(value) = decode_json_string(after_quote) else {
+            return RequestIdField::Invalid;
+        };
+        let Some(encoded_len) = encoded_json_string_len(after_quote) else {
+            return RequestIdField::Invalid;
+        };
+        let Some(rest) = after_quote.get(encoded_len..) else {
+            return RequestIdField::Invalid;
+        };
+        if !json_value_has_terminator(rest) {
+            return RequestIdField::Invalid;
+        }
+        return RequestIdField::Valid(RequestId::Text(value));
     }
-    extract_integer_value(after_colon).map(RequestId::Integer)
+    match extract_integer_value(after_colon) {
+        Some(value) => RequestIdField::Valid(RequestId::Integer(value)),
+        None => RequestIdField::Invalid,
+    }
 }
 
 fn extract_text_document_uri(json: &str) -> Option<String> {
@@ -250,6 +322,14 @@ fn error_response(id: &RequestId, code: i32, message: &str) -> String {
     format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{},\"message\":{}}}}}",
         id.as_json(),
+        code,
+        json_string(message)
+    )
+}
+
+fn error_response_null_id(code: i32, message: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":{}}}}}",
         code,
         json_string(message)
     )
@@ -306,7 +386,15 @@ pub fn serve(
             io::Error::new(io::ErrorKind::InvalidData, "message is not valid UTF-8")
         })?;
         let method = extract_top_level_string_field(&text, "method");
-        let id = extract_request_id(&text);
+        let id = match extract_request_id(&text) {
+            RequestIdField::Absent => None,
+            RequestIdField::Valid(id) => Some(id),
+            RequestIdField::Invalid => {
+                let response = error_response_null_id(-32600, "invalid JSON-RPC request id");
+                transport::write_message(output, response.as_bytes())?;
+                continue;
+            }
+        };
 
         match (method.as_deref(), id.as_ref(), state) {
             (Some("initialize"), Some(req_id), ServerState::Uninitialized) => {
@@ -494,12 +582,48 @@ mod tests {
     fn request_id_parser_preserves_integer_and_string_ids() {
         assert_eq!(
             extract_request_id(r#"{"id":42}"#),
-            Some(RequestId::Integer(42))
+            RequestIdField::Valid(RequestId::Integer(42))
+        );
+        assert_eq!(
+            extract_request_id(r#"{"id":-1}"#),
+            RequestIdField::Valid(RequestId::Integer(-1))
         );
         assert_eq!(
             extract_request_id(r#"{"id":"req-\ud83e\udd16"}"#),
-            Some(RequestId::Text("req-🤖".to_string()))
+            RequestIdField::Valid(RequestId::Text("req-🤖".to_string()))
         );
+        assert_eq!(extract_request_id(r#"{"method":"exit"}"#), RequestIdField::Absent);
+    }
+
+    #[test]
+    fn malformed_request_ids_are_distinct_from_notifications() {
+        for json in [
+            r#"{"id":1.5}"#,
+            r#"{"id":1e2}"#,
+            r#"{"id":01}"#,
+            r#"{"id":-}"#,
+            r#"{"id":null}"#,
+            r#"{"id":{}}"#,
+            r#"{"id":9223372036854775808}"#,
+            r#"{"id":"x"true}"#,
+        ] {
+            assert_eq!(
+                extract_request_id(json),
+                RequestIdField::Invalid,
+                "malformed request id was accepted or erased: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_request_id_returns_invalid_request_with_null_id() {
+        let (outcome, output) = lifecycle_session(
+            r#"{"jsonrpc":"2.0","id":1.5,"method":"textDocument/hover","params":{}}"#,
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":null,\"error\":{\"code\":-32600"));
+        assert!(output.contains("invalid JSON-RPC request id"));
+        assert!(!output.contains("\"id\":1,\"result\":null"));
     }
 
     #[test]
@@ -507,7 +631,7 @@ mod tests {
         let json = r#"{"params":{"id":"shadow","method":"shutdown"},"id":"actual","method":"textDocument/hover"}"#;
         assert_eq!(
             extract_request_id(json),
-            Some(RequestId::Text("actual".to_string()))
+            RequestIdField::Valid(RequestId::Text("actual".to_string()))
         );
         assert_eq!(
             extract_top_level_string_field(json, "method").as_deref(),
