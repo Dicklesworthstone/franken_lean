@@ -82,6 +82,35 @@ fn extract_text_document_uri(json: &str) -> Option<String> {
 /// escape sequences. The search begins at `haystack[offset..]` and looks
 /// for the first `"text"` key.
 fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
+    fn hex_quad(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+        let mut value = 0u16;
+        for _ in 0..4 {
+            value = value.checked_mul(16)?;
+            value = value.checked_add(u16::try_from(chars.next()?.to_digit(16)?).ok()?)?;
+        }
+        Some(value)
+    }
+
+    fn unicode_escape(chars: &mut std::str::Chars<'_>) -> Option<char> {
+        let first = hex_quad(chars)?;
+        match first {
+            0xd800..=0xdbff => {
+                if chars.next()? != '\\' || chars.next()? != 'u' {
+                    return None;
+                }
+                let second = hex_quad(chars)?;
+                if !(0xdc00..=0xdfff).contains(&second) {
+                    return None;
+                }
+                let high = u32::from(first) - 0xd800;
+                let low = u32::from(second) - 0xdc00;
+                char::from_u32(0x1_0000 + (high << 10) + low)
+            }
+            0xdc00..=0xdfff => None,
+            scalar => char::from_u32(u32::from(scalar)),
+        }
+    }
+
     let region = haystack.get(offset..)?;
     let text_key = "\"text\"";
     let key_start = region.find(text_key)?;
@@ -94,28 +123,23 @@ fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
     loop {
         match chars.next()? {
             '"' => break,
-            '\\' => match chars.next()? {
-                'n' => result.push('\n'),
-                'r' => result.push('\r'),
-                't' => result.push('\t'),
-                '\\' => result.push('\\'),
-                '"' => result.push('"'),
-                '/' => result.push('/'),
-                'b' => result.push('\u{08}'),
-                'f' => result.push('\u{0c}'),
-                'u' => {
-                    let hex: String = (&mut chars).take(4).collect();
-                    if hex.len() == 4 {
-                        if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                            if let Some(c) = char::from_u32(cp) {
-                                result.push(c);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            c => result.push(c),
+            '\\' => {
+                let escaped = chars.next()?;
+                result.push(match escaped {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'b' => '\u{0008}',
+                    'f' => '\u{000c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => unicode_escape(&mut chars)?,
+                    _ => return None,
+                });
+            }
+            control if control <= '\u{001f}' => return None,
+            other => result.push(other),
         }
     }
     Some(result)
@@ -554,6 +578,32 @@ mod tests {
             extract_content_changes_text(json),
             Some("def z := 0".to_string())
         );
+    }
+
+    #[test]
+    fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
+        let json = r#"{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}"#;
+        assert_eq!(
+            extract_escaped_text_value(json, 0).as_deref(),
+            Some("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"")
+        );
+    }
+
+    #[test]
+    fn escaped_text_rejects_malformed_json_strings() {
+        for json in [
+            r#"{"text":"\ud83e"}"#,
+            r#"{"text":"\udd16"}"#,
+            r#"{"text":"\ud83e\u0041"}"#,
+            r#"{"text":"\q"}"#,
+            r#"{"text":"\u12xz"}"#,
+            "{\"text\":\"line\nfeed\"}",
+        ] {
+            assert!(
+                extract_escaped_text_value(json, 0).is_none(),
+                "malformed JSON string was accepted: {json:?}"
+            );
+        }
     }
 
     #[test]
