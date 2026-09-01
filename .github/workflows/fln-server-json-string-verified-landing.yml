@@ -1,0 +1,203 @@
+name: fln-server JSON string verified landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/fln-server/src/dispatch.rs
+      - .github/workflows/fln-server-json-string-verified-landing.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-server-json-string-verified-landing
+  cancel-in-progress: false
+
+jobs:
+  repair-test-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard the investigated source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git hash-object crates/fln-server/src/dispatch.rs)
+          expected=43e758f1d932b24ce2a396d4c63f4096723b184a
+          if [[ "$actual" != "$expected" ]]; then
+            echo "dispatch.rs moved: expected $expected, observed $actual" >&2
+            exit 1
+          fi
+
+      - name: Repair JSON string decoding and add regression cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          old = r'''fn extract_escaped_text_value(after_key: &str) -> Option<String> {
+              let start = after_key.find('"')?;
+              let after_quote = &after_key[start + 1..];
+              let mut result = String::new();
+              let mut chars = after_quote.chars();
+              while let Some(ch) = chars.next() {
+                  match ch {
+                      '"' => return Some(result),
+                      '\\' => {
+                          let escaped = chars.next()?;
+                          match escaped {
+                              '"' => result.push('"'),
+                              '\\' => result.push('\\'),
+                              'n' => result.push('\n'),
+                              'r' => result.push('\r'),
+                              't' => result.push('\t'),
+                              'u' => {
+                                  let mut hex = String::new();
+                                  for _ in 0..4 {
+                                      hex.push(chars.next()?);
+                                  }
+                                  if let Ok(code) = u32::from_str_radix(&hex, 16)
+                                      && let Some(decoded) = char::from_u32(code)
+                                  {
+                                      result.push(decoded);
+                                  }
+                              }
+                              _ => result.push(escaped),
+                          }
+                      }
+                      other => result.push(other),
+                  }
+              }
+              None
+          }
+          '''
+          new = r'''fn extract_escaped_text_value(after_key: &str) -> Option<String> {
+              fn hex_quad(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+                  let mut value = 0u16;
+                  for _ in 0..4 {
+                      value = value.checked_mul(16)?;
+                      value = value.checked_add(u16::try_from(chars.next()?.to_digit(16)?).ok()?)?;
+                  }
+                  Some(value)
+              }
+
+              fn unicode_escape(chars: &mut std::str::Chars<'_>) -> Option<char> {
+                  let first = hex_quad(chars)?;
+                  match first {
+                      0xd800..=0xdbff => {
+                          if chars.next()? != '\\' || chars.next()? != 'u' {
+                              return None;
+                          }
+                          let second = hex_quad(chars)?;
+                          if !(0xdc00..=0xdfff).contains(&second) {
+                              return None;
+                          }
+                          let high = u32::from(first) - 0xd800;
+                          let low = u32::from(second) - 0xdc00;
+                          char::from_u32(0x1_0000 + (high << 10) + low)
+                      }
+                      0xdc00..=0xdfff => None,
+                      scalar => char::from_u32(u32::from(scalar)),
+                  }
+              }
+
+              let start = after_key.find('"')?;
+              let after_quote = &after_key[start + 1..];
+              let mut result = String::new();
+              let mut chars = after_quote.chars();
+              while let Some(ch) = chars.next() {
+                  match ch {
+                      '"' => return Some(result),
+                      '\\' => {
+                          let escaped = chars.next()?;
+                          result.push(match escaped {
+                              '"' => '"',
+                              '\\' => '\\',
+                              '/' => '/',
+                              'b' => '\u{0008}',
+                              'f' => '\u{000c}',
+                              'n' => '\n',
+                              'r' => '\r',
+                              't' => '\t',
+                              'u' => unicode_escape(&mut chars)?,
+                              _ => return None,
+                          });
+                      }
+                      control if control <= '\u{001f}' => return None,
+                      other => result.push(other),
+                  }
+              }
+              None
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one decoder body, found {text.count(old)}")
+          text = text.replace(old, new)
+
+          marker = r'''              #[test]
+              fn initialize_advertises_push_diagnostics_not_pull_diagnostics() {
+          '''
+          tests = r'''              #[test]
+              fn escaped_text_decodes_utf16_surrogate_pairs() {
+                  assert_eq!(
+                      extract_escaped_text_value(r#""\ud83e\udd16""#).as_deref(),
+                      Some("🤖")
+                  );
+                  assert_eq!(
+                      extract_escaped_text_value(r#""a\/b\b\f\n\r\t""#).as_deref(),
+                      Some("a/b\u{0008}\u{000c}\n\r\t")
+                  );
+              }
+
+              #[test]
+              fn escaped_text_rejects_malformed_json_strings() {
+                  assert!(extract_escaped_text_value(r#""\ud83e""#).is_none());
+                  assert!(extract_escaped_text_value(r#""\udd16""#).is_none());
+                  assert!(extract_escaped_text_value(r#""\ud83e\u0041""#).is_none());
+                  assert!(extract_escaped_text_value(r#""\q""#).is_none());
+                  assert!(extract_escaped_text_value("\"line\nfeed\"").is_none());
+              }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit(f"expected one test insertion marker, found {text.count(marker)}")
+          text = text.replace(marker, tests + marker)
+          path.write_text(text, encoding="utf-8")
+          PY
+          cargo fmt --all
+          git diff --check -- crates/fln-server/src/dispatch.rs
+
+      - name: Verify fln-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test --manifest-path crates/fln-server/Cargo.toml
+          cargo clippy --manifest-path crates/fln-server/Cargo.toml --all-targets -- -D warnings
+
+      - name: Commit the verified repair and remove this one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/fln-server-json-string-verified-landing.yml
+          git add crates/fln-server/src/dispatch.rs .github/workflows/fln-server-json-string-verified-landing.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix(server): decode JSON strings without Unicode loss"
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          echo "failed to rebase and push verified JSON decoder repair" >&2
+          exit 1
