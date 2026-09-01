@@ -148,7 +148,7 @@ fn path_without_file_scheme(path: &str) -> &str {
     path.strip_prefix("file://").unwrap_or(path)
 }
 
-fn source_for_file<'a>(file_name: &str, sources: &'a [LspSource<'a>]) -> Option<&'a str> {
+fn source_for_file<'a>(file_name: &str, sources: &[LspSource<'a>]) -> Option<&'a str> {
     let file_path = path_without_file_scheme(file_name);
     sources
         .iter()
@@ -460,10 +460,7 @@ pub fn project_with_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fln_core::diag::{
-        DiagnosticEpoch, DiagnosticOrderPolicy, DiagnosticPathPolicy, ProjectionSnapshot,
-        RelatedSpan, StructuredDiagnostic,
-    };
+    use fln_core::diag::{DiagnosticEpoch, DiagnosticOrderPolicy};
 
     fn request() -> ProjectionRequest {
         ProjectionRequest {
