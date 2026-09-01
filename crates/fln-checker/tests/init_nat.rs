@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use fln_checker::admit::{AdmissionBudget, InductiveVerdict, admit_inductive};
+use fln_checker::admit::{
+    AdmissionBudget, InductiveRejection, InductiveVerdict, admit_inductive,
+};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
     ConstructorDeclaration, EnvironmentBudget, InductiveDeclaration, RecursorDeclaration,
@@ -87,8 +89,8 @@ fn nat_entries(recursive: bool, recursive_rule_call: bool) -> Vec<ConstantEntry>
         pi(
             "ih",
             BinderInfo::Default,
-            Expr::app(bvar(1), bvar(0)),
-            Expr::app(bvar(2), succ(bvar(1))),
+            Expr::app(bvar(2), bvar(0)),
+            Expr::app(bvar(3), succ(bvar(1))),
         ),
     );
     let recursor_type = pi(
@@ -136,8 +138,9 @@ fn nat_entries(recursive: bool, recursive_rule_call: bool) -> Vec<ConstantEntry>
             [bvar(3), bvar(2), bvar(1), bvar(0)],
         )
     } else {
-        // Well-formed and correctly typed under this deliberately forged
-        // fixture, but not the recursor's computation rule.
+        // Deliberately pass `n` where the induction hypothesis belongs. The
+        // recursor-rule comparison must reject this before it can be confused
+        // with Nat.rec's recursive iota law.
         bvar(0)
     };
     let succ_body = app(bvar(1), [bvar(0), recursive_call]);
@@ -255,9 +258,14 @@ fn kr600_803_init_nat_refuses_a_forged_nonrecursive_flag() {
         AdmissionBudget::unlimited(),
         EnvironmentBudget::unlimited(),
     );
+    let succ_name = wire_name(&qualified(&["Nat", "succ"]));
     assert!(
-        !verdict.is_admitted(),
-        "Nat.succ mentions Nat, so a nonrecursive metadata flag may not admit: {verdict:?}"
+        matches!(
+            &verdict,
+            InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { name })
+                if name == &succ_name
+        ),
+        "Nat.succ mentions Nat, so a nonrecursive metadata flag must fail at the constructor: {verdict:?}"
     );
 }
 
@@ -270,8 +278,13 @@ fn kr600_803_init_nat_refuses_a_succ_rule_without_the_recursive_call() {
         AdmissionBudget::unlimited(),
         EnvironmentBudget::unlimited(),
     );
+    let rec_name = wire_name(&qualified(&["Nat", "rec"]));
     assert!(
-        !verdict.is_admitted(),
-        "a non-recursive-looking succ rule is not Nat.rec's iota law: {verdict:?}"
+        matches!(
+            &verdict,
+            InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name })
+                if name == &rec_name
+        ),
+        "a successor rule without the recursive call must fail at Nat.rec: {verdict:?}"
     );
 }
