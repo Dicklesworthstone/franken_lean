@@ -6,10 +6,16 @@
 //! `$/lean/diagnosticOutcome` channel: neither can be mislabeled as a user error or
 //! silently converted into an empty diagnostic list.
 //!
-//! The `transport` module implements the Content-Length-framed base protocol,
-//! and the `dispatch` module routes JSON-RPC messages through the LSP
-//! lifecycle (`initialize` / `initialized` / `shutdown` / `exit`) and
-//! document events (`textDocument/didOpen`).
+//! The `transport` module implements the Content-Length-framed base protocol.
+//! The `dispatch` module owns the bounded JSON-RPC/LSP lifecycle: it parses root
+//! envelope fields structurally, preserves integer and string request IDs,
+//! refuses malformed IDs and unsupported Lean RPC calls, and routes
+//! `didOpen`/Full-sync `didChange`/`didSave`/`didClose`. Latest source text is
+//! retained under explicit document/byte limits and monotone client versions so
+//! textless saves can re-check the newest valid snapshot; malformed transitions
+//! invalidate stale retained source and close clears push diagnostics. Cursor-aware
+//! goals, hover/completion/definition semantics, Lean RPC sessions, and persistent
+//! elaboration/import state remain outside this bounded server slice.
 
 #![forbid(unsafe_code)]
 
