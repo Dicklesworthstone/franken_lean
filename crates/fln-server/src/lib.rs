@@ -32,6 +32,28 @@ use fln_core::diag::{
 };
 use fln_core::mode::Mode;
 use fln_core::outcome::BoundedText;
+use fln_core::pos::Position;
+
+/// LSP 3.17's default and FrankenLean's explicitly advertised wire encoding.
+pub const LSP_POSITION_ENCODING: &str = "utf-16";
+
+/// One source snapshot available while projecting diagnostics.
+///
+/// [`fln_core::pos::Position`] stores Lean's 1-based line and zero-based
+/// Unicode-codepoint column. LSP positions use zero-based lines and UTF-16 code
+/// units. A projector therefore needs the exact source snapshot that authorized
+/// a diagnostic; a path alone is insufficient for unsaved editor contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LspSource<'a> {
+    pub uri: &'a str,
+    pub text: &'a str,
+}
+
+impl<'a> LspSource<'a> {
+    pub const fn new(uri: &'a str, text: &'a str) -> Self {
+        Self { uri, text }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspProjection {
@@ -122,27 +144,93 @@ fn bounded_json(value: &BoundedText) -> String {
     )
 }
 
-fn lsp_position(position: fln_core::pos::Position) -> String {
-    format!(
-        "{{\"line\":{},\"character\":{}}}",
-        position.line.saturating_sub(1),
-        position.column
+fn path_without_file_scheme(path: &str) -> &str {
+    path.strip_prefix("file://").unwrap_or(path)
+}
+
+fn source_for_file<'a>(file_name: &str, sources: &'a [LspSource<'a>]) -> Option<&'a str> {
+    let file_path = path_without_file_scheme(file_name);
+    sources
+        .iter()
+        .find(|source| {
+            source.uri == file_name || path_without_file_scheme(source.uri) == file_path
+        })
+        .map(|source| source.text)
+}
+
+fn line_without_terminator(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+fn utf16_column(line: &str, codepoint_column: usize) -> usize {
+    line_without_terminator(line)
+        .chars()
+        .take(codepoint_column)
+        .map(char::len_utf16)
+        .sum()
+}
+
+/// Convert one Lean position to a valid LSP UTF-16 coordinate against the exact
+/// document snapshot. Out-of-range lines and columns are deterministically
+/// clamped to the end of the last available line rather than emitting an invalid
+/// protocol coordinate.
+fn source_lsp_position(source: &str, position: Position) -> (usize, usize) {
+    let requested_line = position.line.saturating_sub(1);
+    let mut current_line = 0usize;
+    let mut start = 0usize;
+
+    for (index, character) in source.char_indices() {
+        if character != '\n' {
+            continue;
+        }
+        let line = &source[start..index];
+        if current_line == requested_line {
+            return (current_line, utf16_column(line, position.column));
+        }
+        current_line = current_line.saturating_add(1);
+        start = index.saturating_add(character.len_utf8());
+    }
+
+    let final_line = &source[start..];
+    if current_line == requested_line {
+        return (current_line, utf16_column(final_line, position.column));
+    }
+    (
+        current_line,
+        utf16_column(final_line, usize::MAX),
     )
 }
 
-fn uri(path: &str, policy: DiagnosticPathPolicy) -> String {
-    format!("file://{}", projected_path(path, policy))
+fn lsp_position(file_name: &str, position: Position, sources: &[LspSource<'_>]) -> String {
+    let (line, character) = source_for_file(file_name, sources).map_or_else(
+        || (position.line.saturating_sub(1), position.column),
+        |source| source_lsp_position(source, position),
+    );
+    format!("{{\"line\":{line},\"character\":{character}}}")
 }
 
-fn related_json(span: &RelatedSpan, policy: DiagnosticPathPolicy) -> String {
+fn uri(path: &str, policy: DiagnosticPathPolicy) -> String {
+    let projected = projected_path(path, policy);
+    if projected.contains("://") {
+        projected.to_owned()
+    } else {
+        format!("file://{projected}")
+    }
+}
+
+fn related_json(
+    span: &RelatedSpan,
+    policy: DiagnosticPathPolicy,
+    sources: &[LspSource<'_>],
+) -> String {
     format!(
         concat!(
             "{{\"location\":{{\"uri\":{},\"range\":{{\"start\":{},\"end\":{}}}}},",
             "\"message\":{},\"data\":{{\"truncated\":{}}}}}"
         ),
         json_string(&uri(span.file_name.text(), policy)),
-        lsp_position(span.start),
-        lsp_position(span.end),
+        lsp_position(span.file_name.text(), span.start, sources),
+        lsp_position(span.file_name.text(), span.end, sources),
         json_string(span.label.text()),
         span.label.truncated()
     )
@@ -157,7 +245,18 @@ fn severity_code(severity: Severity) -> u8 {
 }
 
 fn diagnostic_message(diagnostic: &StructuredDiagnostic, mode: Mode) -> String {
-    let mut message = diagnostic.body.text().to_string();
+    let mut message = String::new();
+    if !diagnostic.caption.text().is_empty() {
+        message.push_str(diagnostic.caption.text());
+        message.push_str(":\n");
+        if diagnostic.caption.truncated() {
+            message.push_str(&format!(
+                "[diagnostic caption truncated after {} bytes]\n",
+                BoundedText::LIMIT
+            ));
+        }
+    }
+    message.push_str(diagnostic.body.text());
     if diagnostic.body.truncated() {
         message.push_str(&format!(
             "\n[diagnostic body truncated after {} bytes; typed links retained]",
@@ -173,7 +272,11 @@ fn diagnostic_message(diagnostic: &StructuredDiagnostic, mode: Mode) -> String {
     message
 }
 
-fn lsp_diagnostic(diagnostic: &StructuredDiagnostic, request: ProjectionRequest) -> String {
+fn lsp_diagnostic(
+    diagnostic: &StructuredDiagnostic,
+    request: ProjectionRequest,
+    sources: &[LspSource<'_>],
+) -> String {
     let end = diagnostic.end_pos.unwrap_or(diagnostic.pos);
     let behavior_note = if matches!(request.mode, Mode::Faithful) {
         "null".to_string()
@@ -183,7 +286,7 @@ fn lsp_diagnostic(diagnostic: &StructuredDiagnostic, request: ProjectionRequest)
     let related = diagnostic
         .related
         .iter()
-        .map(|span| related_json(span, request.path))
+        .map(|span| related_json(span, request.path, sources))
         .collect::<Vec<_>>()
         .join(",");
     let evidence = diagnostic
@@ -200,8 +303,8 @@ fn lsp_diagnostic(diagnostic: &StructuredDiagnostic, request: ProjectionRequest)
             "\"causeClass\":{},\"behaviorNote\":{},\"bodyTruncated\":{},\"evidence\":[{}],",
             "\"omittedRelated\":{},\"omittedEvidence\":{}}}}}"
         ),
-        lsp_position(diagnostic.pos),
-        lsp_position(end),
+        lsp_position(diagnostic.file_name.text(), diagnostic.pos, sources),
+        lsp_position(diagnostic.file_name.text(), end, sources),
         severity_code(diagnostic.severity),
         json_string(diagnostic.cause_class),
         json_string(&diagnostic_message(diagnostic, request.mode)),
@@ -219,6 +322,7 @@ fn lsp_diagnostic(diagnostic: &StructuredDiagnostic, request: ProjectionRequest)
 fn complete_messages(
     diagnostics: &[StructuredDiagnostic],
     request: ProjectionRequest,
+    sources: &[LspSource<'_>],
 ) -> Vec<String> {
     let mut by_file: BTreeMap<String, Vec<&StructuredDiagnostic>> = BTreeMap::new();
     for diagnostic in diagnostics {
@@ -242,7 +346,7 @@ fn complete_messages(
         .map(|(file, diagnostics)| {
             let encoded = diagnostics
                 .into_iter()
-                .map(|diagnostic| lsp_diagnostic(diagnostic, request))
+                .map(|diagnostic| lsp_diagnostic(diagnostic, request, sources))
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
@@ -250,7 +354,7 @@ fn complete_messages(
                     "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",",
                     "\"params\":{{\"uri\":{},\"version\":null,\"diagnostics\":[{}]}}}}"
                 ),
-                json_string(&format!("file://{file}")),
+                json_string(&uri(&file, DiagnosticPathPolicy::Preserve)),
                 encoded
             )
         })
@@ -313,13 +417,32 @@ fn internal_fault_message(value: &StructuredInternalFault, request: ProjectionRe
     )
 }
 
+/// Project a snapshot whose positions are already in LSP-compatible columns.
+///
+/// This compatibility entry point preserves the original API. Call
+/// [`project_with_sources`] whenever diagnostics can follow non-BMP characters;
+/// without source snapshots a Unicode-codepoint column cannot be converted to
+/// the UTF-16 units required by LSP.
 pub fn project(
     request: ProjectionRequest,
     snapshot: &ProjectionSnapshot,
 ) -> Result<LspProjection, ProjectionRefusal> {
+    project_with_sources(request, snapshot, &[])
+}
+
+/// Project diagnostics using the exact source snapshots that authorized them.
+/// Primary and related positions are independently resolved by URI/path and
+/// converted from Lean codepoint columns to LSP UTF-16 code units.
+pub fn project_with_sources(
+    request: ProjectionRequest,
+    snapshot: &ProjectionSnapshot,
+    sources: &[LspSource<'_>],
+) -> Result<LspProjection, ProjectionRefusal> {
     validate_request(request)?;
     let messages = match snapshot {
-        ProjectionSnapshot::Complete { diagnostics } => complete_messages(diagnostics, request),
+        ProjectionSnapshot::Complete { diagnostics } => {
+            complete_messages(diagnostics, request, sources)
+        }
         ProjectionSnapshot::Inconclusive(value) => {
             vec![inconclusive_message(value, request)]
         }
@@ -332,4 +455,107 @@ pub fn project(
         disposition: snapshot.exit_class(),
         semantic: snapshot.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_core::diag::{
+        DiagnosticEpoch, DiagnosticOrderPolicy, DiagnosticPathPolicy, ProjectionSnapshot,
+        RelatedSpan, StructuredDiagnostic,
+    };
+
+    fn request() -> ProjectionRequest {
+        ProjectionRequest {
+            epoch: DiagnosticEpoch::V4_32_0,
+            mode: Mode::Sound,
+            frontend: DiagnosticFrontend::Lsp,
+            format: DiagnosticFormat::Lsp,
+            channel: DiagnosticChannel::Protocol,
+            color: DiagnosticColorPolicy::Never,
+            path: DiagnosticPathPolicy::Preserve,
+            ordering: DiagnosticOrderPolicy::SourcePositionV1,
+        }
+    }
+
+    fn diagnostic() -> StructuredDiagnostic {
+        StructuredDiagnostic {
+            file_name: BoundedText::new("/tmp/Emoji.lean"),
+            pos: Position { line: 1, column: 2 },
+            end_pos: Some(Position { line: 1, column: 3 }),
+            severity: Severity::Error,
+            error_name: None,
+            caption: BoundedText::new("parser"),
+            body: BoundedText::new("unexpected token"),
+            cause_class: "SyntaxFailure",
+            related: vec![RelatedSpan::new(
+                "/tmp/Other.lean",
+                Position { line: 1, column: 1 },
+                Position { line: 1, column: 2 },
+                "introduced here",
+            )],
+            evidence: Vec::new(),
+            omitted_related: 0,
+            omitted_evidence: 0,
+        }
+    }
+
+    #[test]
+    fn source_positions_convert_codepoints_to_utf16_for_primary_and_related_ranges() {
+        let snapshot = ProjectionSnapshot::Complete {
+            diagnostics: vec![diagnostic()],
+        };
+        let projection = project_with_sources(
+            request(),
+            &snapshot,
+            &[
+                LspSource::new("file:///tmp/Emoji.lean", "a😀b\nlast"),
+                LspSource::new("/tmp/Other.lean", "🤖z"),
+            ],
+        )
+        .expect("the LSP projection tuple is supported");
+        let message = &projection.messages[0];
+        assert!(message.contains(
+            "\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":4}"
+        ));
+        assert!(message.contains(
+            "\"start\":{\"line\":0,\"character\":2},\"end\":{\"line\":0,\"character\":3}"
+        ));
+        assert!(message.contains("\"message\":\"parser:\\nunexpected token"));
+    }
+
+    #[test]
+    fn source_positions_clamp_to_the_last_valid_utf16_coordinate() {
+        assert_eq!(
+            source_lsp_position(
+                "first\n🤖z",
+                Position {
+                    line: usize::MAX,
+                    column: usize::MAX,
+                }
+            ),
+            (1, 3)
+        );
+        assert_eq!(
+            source_lsp_position("a\r\n", Position { line: 1, column: 99 }),
+            (0, 1),
+            "the CRLF terminator is not part of the LSP line character count"
+        );
+    }
+
+    #[test]
+    fn existing_file_uris_are_not_prefixed_twice() {
+        let mut diagnostic = diagnostic();
+        diagnostic.file_name = BoundedText::new("file:///tmp/Emoji.lean");
+        diagnostic.related.clear();
+        let projection = project(
+            request(),
+            &ProjectionSnapshot::Complete {
+                diagnostics: vec![diagnostic],
+            },
+        )
+        .expect("the LSP projection tuple is supported");
+        assert!(projection.messages[0].contains("\"uri\":\"file:///tmp/Emoji.lean\""));
+        assert!(!projection.messages[0].contains("file://file://"));
+    }
 }
