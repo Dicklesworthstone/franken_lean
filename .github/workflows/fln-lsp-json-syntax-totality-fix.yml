@@ -1,0 +1,201 @@
+name: fln LSP JSON syntax totality fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-json-syntax-totality-fix.yml
+  workflow_run:
+    workflows:
+      - fln LSP JSON syntax landing
+      - archived fln LSP JSON-syntax landing record
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-json-syntax-totality-fix
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require complete JSON syntax parser
+        shell: bash
+        run: grep -Fq 'struct JsonSyntax' crates/fln-server/src/dispatch.rs
+
+      - name: bind document validity to value-parser success
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "json_syntax_rejects_terminally_incomplete_values"
+          if marker not in text:
+              old = '''    fn document(mut self) -> bool {
+                  self.skip_ws();
+                  self.value(0);
+                  self.skip_ws();
+                  self.index == self.bytes.len()
+              }
+          '''
+              old = "\n".join(line[14:] if line.startswith("              ") else line for line in old.splitlines()) + "\n"
+              new = '''    fn document(mut self) -> bool {
+                  self.skip_ws();
+                  if !self.value(0) {
+                      return false;
+                  }
+                  self.skip_ws();
+                  self.index == self.bytes.len()
+              }
+          '''
+              new = "\n".join(line[14:] if line.startswith("              ") else line for line in new.splitlines()) + "\n"
+              if text.count(old) != 1:
+                  raise SystemExit("JsonSyntax::document anchor did not match exactly once")
+              text = text.replace(old, new, 1)
+              text = text.replace("fn JSON_syntax_depth_is_bounded()", "fn json_syntax_depth_is_bounded()", 1)
+              anchor = '''    #[test]
+              fn json_syntax_depth_is_bounded() {
+          '''
+              anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in anchor.splitlines()) + "\n"
+              test = r'''    #[test]
+              fn json_syntax_rejects_terminally_incomplete_values() {
+                  for malformed in [
+                      "-",
+                      "1.",
+                      "1e",
+                      "1e+",
+                      "\"unterminated",
+                      "\"trailing\\",
+                      "[1",
+                      "{\"x\":1",
+                  ] {
+                      assert!(
+                          !valid_json_document(malformed),
+                          "terminally incomplete JSON was accepted: {malformed:?}"
+                      );
+                  }
+              }
+
+          '''
+              test = "\n".join(line[14:] if line.startswith("              ") else line for line in test.splitlines())
+              if text.count(anchor) != 1:
+                  raise SystemExit("JSON depth test anchor did not match exactly once")
+              text = text.replace(anchor, test + anchor, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              if "if !self.value(0)" not in text:
+                  raise SystemExit("JSON totality fix is partial")
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: test parser totality
+        shell: bash
+        run: cargo test --locked -p fln-server --lib
+
+      - name: update status and archive the correction lane
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import datetime as dt
+          import json
+          import subprocess
+          from pathlib import Path
+
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text(encoding="utf-8")
+          anchor = "- Exact literal and number grammar, including fraction/exponent rules and leading-zero refusal.\n"
+          bullet = "- Terminal parser failure is authoritative: incomplete numbers, strings, arrays, and objects cannot become valid merely because the failing parser reached end-of-input.\n"
+          if bullet not in text:
+              if anchor not in text:
+                  raise SystemExit("CHANGELOG JSON grammar anchor missing")
+              text = text.replace(anchor, anchor + bullet, 1)
+          changelog.write_text(text, encoding="utf-8")
+
+          issues = Path(".beads/issues.jsonl")
+          lines = issues.read_text(encoding="utf-8").splitlines()
+          records = [json.loads(line) for line in lines]
+          max_comment_id = max(
+              (int(comment["id"]) for record in records for comment in record.get("comments", [])),
+              default=0,
+          )
+          now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+          for index, record in enumerate(records):
+              if record.get("id") != "franken_lean-v2p":
+                  continue
+              prefix = "JSON syntax totality correction (2026-09-01):"
+              if not any(comment.get("text", "").startswith(prefix) for comment in record.get("comments", [])):
+                  record.setdefault("comments", []).append(
+                      {
+                          "id": max_comment_id + 1,
+                          "issue_id": "franken_lean-v2p",
+                          "author": "GPT-5.6-Pro",
+                          "text": (
+                              f"{prefix} source {head}. Bound top-level validity to the value parser's boolean result and added incomplete terminal number/string/container cells. This is a focused parser correction, not a bead closure claim."
+                          ),
+                          "created_at": now,
+                      }
+                  )
+              record["updated_at"] = now
+              lines[index] = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+              break
+          else:
+              raise SystemExit("franken_lean-v2p bead missing")
+          issues.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+          cat > .github/workflows/fln-lsp-json-syntax-totality-fix.yml <<'YAML'
+          name: archived fln LSP JSON-syntax totality fix
+
+          on:
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          jobs:
+            archived:
+              runs-on: ubuntu-24.04
+              steps:
+                - name: archived landing record
+                  run: echo 'This no-deletion correction record is covered by fln-lsp-consolidated-hardening-landing.yml.'
+          YAML
+
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test --locked -p fln-server --lib
+          cargo test --locked -p structure-guard --test real_workspace
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add crates/fln-server/src/dispatch.rs CHANGELOG.md .beads/issues.jsonl \
+            .github/workflows/fln-lsp-json-syntax-totality-fix.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(server): make JSON value failure authoritative" \
+              -m "Do not accept a document merely because a failed terminal token parser advanced to end-of-input. Propagate the value parser's boolean result and cover incomplete numbers, strings, arrays, and objects." \
+              -m "Bead: franken_lean-v2p (focused correction; no closure claim)"
+          fi
+
+      - name: publish the verified correction
+        shell: bash
+        run: |
+          git fetch origin main
+          base="$(git merge-base HEAD origin/main)"
+          test "$base" = "$(git rev-parse origin/main)" || {
+            echo "main moved incompatibly during JSON totality correction" >&2
+            exit 2
+          }
+          git push origin HEAD:main
