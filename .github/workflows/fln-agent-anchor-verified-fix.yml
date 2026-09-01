@@ -1,0 +1,77 @@
+name: fln-agent-anchor verified repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/structure-guard/src/bin/fln-agent-anchor.rs
+      - .github/workflows/fln-agent-anchor-verified-fix.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-agent-anchor-verified-repair
+  cancel-in-progress: false
+
+jobs:
+  repair-test-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Repair the over-escaped test oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/structure-guard/src/bin/fln-agent-anchor.rs")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          matches = [index for index, line in enumerate(lines) if "u0007" in line]
+          if len(matches) != 1:
+              raise SystemExit(f"expected exactly one u0007 oracle line, found {matches}")
+          lines[matches[0]] = r'            "\"a\\n\\\"β\\\\\\u0007\""'
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          git diff --check -- tools/structure-guard/src/bin/fln-agent-anchor.rs
+
+      - name: Verify the anchor recorder
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test -p structure-guard --bin fln-agent-anchor
+          cargo clippy -p structure-guard --bin fln-agent-anchor -- -D warnings
+
+      - name: Commit the verified repair and remove this one-shot workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm .github/workflows/fln-agent-anchor-verified-fix.yml
+          git add tools/structure-guard/src/bin/fln-agent-anchor.rs .github/workflows/fln-agent-anchor-verified-fix.yml
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "test(agent): correct anchor recorder JSON oracle"
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          echo "failed to rebase and push verified repair" >&2
+          exit 1
