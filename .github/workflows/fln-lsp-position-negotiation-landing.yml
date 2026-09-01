@@ -1,0 +1,386 @@
+name: fln LSP position-negotiation landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-position-negotiation-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP stale-diagnostics landing
+      - fln LSP stale-diagnostics checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-position-negotiation-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require the source-aware UTF-16 projection contract
+        shell: bash
+        run: |
+          grep -Fq 'positionEncoding' crates/fln-server/src/dispatch.rs
+          grep -Fq 'pub const LSP_POSITION_ENCODING: &str = "utf-16"' crates/fln-server/src/lib.rs
+
+      - name: negotiate the only supported wire position encoding
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "initialize_refuses_clients_that_exclude_utf16_and_recovers"
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"expected one dispatch anchor, observed {observed}: {old[:180]!r}")
+              text = text.replace(old, new, 1)
+
+          if marker not in text:
+              if "const INVALID_PARAMS_CODE" not in text:
+                  if "const INVALID_REQUEST_CODE" in text:
+                      replace_once(
+                          "const INVALID_REQUEST_CODE: i32 = -32600;\n",
+                          "const INVALID_REQUEST_CODE: i32 = -32600;\nconst INVALID_PARAMS_CODE: i32 = -32602;\n",
+                      )
+                  else:
+                      replace_once(
+                          "const REQUEST_FAILED_CODE: i32 = -32803;\n",
+                          "const INVALID_PARAMS_CODE: i32 = -32602;\nconst REQUEST_FAILED_CODE: i32 = -32803;\n",
+                      )
+              if "const MAX_POSITION_ENCODINGS" not in text:
+                  replace_once(
+                      "const MAX_JSON_NESTING: usize = 256;\n",
+                      "const MAX_JSON_NESTING: usize = 256;\nconst MAX_POSITION_ENCODINGS: usize = 32;\nconst MAX_POSITION_ENCODING_BYTES: usize = 128;\n",
+                  )
+
+              anchor = '''fn initialize_response(id: &RequestId) -> String {
+          '''
+              anchor = "\n".join(line[10:] if line.startswith("          ") else line for line in anchor.splitlines()) + "\n"
+              helpers = r'''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+              enum PositionEncodingOffer {
+                  DefaultUtf16,
+                  SupportsUtf16,
+                  ExcludesUtf16,
+                  Invalid,
+              }
+
+              fn decode_bounded_string_array(value: &str) -> Option<Vec<String>> {
+                  let bytes = value.as_bytes();
+                  let mut index = skip_ws(bytes, 0);
+                  if bytes.get(index).copied() != Some(b'[') {
+                      return None;
+                  }
+                  index += 1;
+                  index = skip_ws(bytes, index);
+                  if bytes.get(index).copied() == Some(b']') {
+                      index += 1;
+                      return (skip_ws(bytes, index) == bytes.len()).then(Vec::new);
+                  }
+
+                  let mut values = Vec::new();
+                  loop {
+                      if values.len() == MAX_POSITION_ENCODINGS {
+                          return None;
+                      }
+                      let start = index;
+                      let end = scan_value_end(value, start)?;
+                      let raw = value.get(start..end)?;
+                      if raw.len() > MAX_POSITION_ENCODING_BYTES {
+                          return None;
+                      }
+                      values.push(decode_json_string_value(raw)?);
+                      index = skip_ws(bytes, end);
+                      match bytes.get(index).copied() {
+                          Some(b',') => {
+                              index += 1;
+                              index = skip_ws(bytes, index);
+                              if bytes.get(index).copied() == Some(b']') {
+                                  return None;
+                              }
+                          }
+                          Some(b']') => {
+                              index += 1;
+                              if skip_ws(bytes, index) != bytes.len() {
+                                  return None;
+                              }
+                              return Some(values);
+                          }
+                          _ => return None,
+                      }
+                  }
+              }
+
+              fn initialize_position_encoding_offer(json: &str) -> PositionEncodingOffer {
+                  let Some(params) = params_object(json) else {
+                      return PositionEncodingOffer::DefaultUtf16;
+                  };
+                  let capabilities = match object_field(params, "capabilities") {
+                      Field::Missing => return PositionEncodingOffer::DefaultUtf16,
+                      Field::Invalid => return PositionEncodingOffer::Invalid,
+                      Field::Value(value) if value.trim_start().starts_with('{') => value,
+                      Field::Value(_) => return PositionEncodingOffer::Invalid,
+                  };
+                  let general = match object_field(capabilities, "general") {
+                      Field::Missing => return PositionEncodingOffer::DefaultUtf16,
+                      Field::Invalid => return PositionEncodingOffer::Invalid,
+                      Field::Value(value) if value.trim_start().starts_with('{') => value,
+                      Field::Value(_) => return PositionEncodingOffer::Invalid,
+                  };
+                  let encodings = match object_field(general, "positionEncodings") {
+                      Field::Missing => return PositionEncodingOffer::DefaultUtf16,
+                      Field::Invalid => return PositionEncodingOffer::Invalid,
+                      Field::Value(value) => match decode_bounded_string_array(value) {
+                          Some(encodings) => encodings,
+                          None => return PositionEncodingOffer::Invalid,
+                      },
+                  };
+                  if encodings
+                      .iter()
+                      .any(|encoding| encoding == LSP_POSITION_ENCODING)
+                  {
+                      PositionEncodingOffer::SupportsUtf16
+                  } else {
+                      PositionEncodingOffer::ExcludesUtf16
+                  }
+              }
+
+          '''
+              helpers = "\n".join(line[14:] if line.startswith("              ") else line for line in helpers.splitlines()) + "\n"
+              if text.count(anchor) != 1:
+                  raise SystemExit("initialize_response anchor did not match exactly once")
+              text = text.replace(anchor, helpers + anchor, 1)
+
+              old_arm = '''            (Some("initialize"), Some(req_id), ServerState::Uninitialized) => {
+                  transport::write_message(output, initialize_response(req_id).as_bytes())?;
+                  state = ServerState::Initializing;
+              }
+          '''
+              old_arm = "\n".join(line[10:] if line.startswith("          ") else line for line in old_arm.splitlines()) + "\n"
+              new_arm = '''            (Some("initialize"), Some(req_id), ServerState::Uninitialized) => {
+                  match initialize_position_encoding_offer(&text) {
+                      PositionEncodingOffer::DefaultUtf16
+                      | PositionEncodingOffer::SupportsUtf16 => {
+                          transport::write_message(output, initialize_response(req_id).as_bytes())?;
+                          state = ServerState::Initializing;
+                      }
+                      PositionEncodingOffer::ExcludesUtf16 => {
+                          transport::write_message(
+                              output,
+                              error_response(
+                                  req_id,
+                                  INVALID_PARAMS_CODE,
+                                  "client does not support FrankenLean's required utf-16 position encoding",
+                              )
+                              .as_bytes(),
+                          )?;
+                      }
+                      PositionEncodingOffer::Invalid => {
+                          transport::write_message(
+                              output,
+                              error_response(
+                                  req_id,
+                                  INVALID_PARAMS_CODE,
+                                  "initialize capabilities contain invalid general.positionEncodings",
+                              )
+                              .as_bytes(),
+                          )?;
+                      }
+                  }
+              }
+          '''
+              new_arm = "\n".join(line[10:] if line.startswith("          ") else line for line in new_arm.splitlines()) + "\n"
+              if text.count(old_arm) != 1:
+                  raise SystemExit("initialize dispatch arm did not match exactly once")
+              text = text.replace(old_arm, new_arm, 1)
+
+              test_anchor = '''    #[test]
+              fn did_open_routes_through_callback() {
+          '''
+              test_anchor = "\n".join(line[10:] if line.startswith("          ") else line for line in test_anchor.splitlines()) + "\n"
+              tests = r'''    #[test]
+              fn initialize_accepts_an_explicit_utf16_offer() {
+                  let mut input_buf = Vec::new();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8","utf-16"]}}}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let outcome = serve(
+                      &mut reader,
+                      &mut output_buf,
+                      &mut |_uri, _version, _text| Vec::new(),
+                  )
+                  .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert!(output.contains("\"positionEncoding\":\"utf-16\""));
+                  assert!(!output.contains("required utf-16"));
+              }
+
+              #[test]
+              fn initialize_refuses_clients_that_exclude_utf16_and_recovers() {
+                  let mut input_buf = Vec::new();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8","utf-32"]}}}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-16"]}}}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let outcome = serve(
+                      &mut reader,
+                      &mut output_buf,
+                      &mut |_uri, _version, _text| Vec::new(),
+                  )
+                  .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert!(output.contains("\"id\":1,\"error\":{\"code\":-32602"));
+                  assert!(output.contains("required utf-16 position encoding"));
+                  assert!(output.contains("\"id\":2,\"result\""));
+                  assert!(output.contains("\"id\":3,\"result\":null"));
+              }
+
+              #[test]
+              fn initialize_rejects_malformed_position_encoding_arrays() {
+                  for encodings in ["[\"utf-16\",]", "[7]", "{}"] {
+                      let request = format!(
+                          "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"capabilities\":{{\"general\":{{\"positionEncodings\":{encodings}}}}}}}}}}"
+                      );
+                      let mut input_buf = Vec::new();
+                      send(&mut input_buf, &request);
+                      send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+                      let mut reader = BufReader::new(&input_buf[..]);
+                      let mut output_buf = Vec::new();
+                      let outcome = serve(
+                          &mut reader,
+                          &mut output_buf,
+                          &mut |_uri, _version, _text| Vec::new(),
+                      )
+                      .expect("protocol session");
+                      let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                      assert!(!outcome.clean);
+                      assert!(output.contains("\"code\":-32602"));
+                      assert!(output.contains("invalid general.positionEncodings"));
+                  }
+              }
+
+          '''
+              tests = "\n".join(line[14:] if line.startswith("              ") else line for line in tests.splitlines())
+              if text.count(test_anchor) != 1:
+                  raise SystemExit("did_open test anchor did not match exactly once")
+              text = text.replace(test_anchor, tests + test_anchor, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              for expected in [
+                  "initialize_position_encoding_offer",
+                  "PositionEncodingOffer::ExcludesUtf16",
+                  "INVALID_PARAMS_CODE",
+              ]:
+                  if expected not in text:
+                      raise SystemExit(f"position negotiation is partial: missing {expected}")
+          PY
+
+          cat > .github/workflows/fln-lsp-position-negotiation-landing.yml <<'YAML'
+          name: fln LSP position-negotiation checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-position-negotiation-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-position-negotiation-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-position-negotiation-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify position-encoding negotiation
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test position negotiation and recovery
+        shell: bash
+        run: cargo test -p fln-server --lib
+
+      - name: publish verified position negotiation
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-position-negotiation-landing.yml crates/fln-server/src/dispatch.rs
+          if git diff --cached --quiet; then
+            echo "position negotiation is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): negotiate the UTF-16 position contract" \
+            -m "Accept legacy/default clients and explicit offers containing utf-16, but reject malformed capability arrays and clients that explicitly exclude the server's only supported position encoding. Refused initialization leaves the state recoverable for a corrected request." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
