@@ -36,52 +36,39 @@ pub struct ServerOutcome {
     pub documents_saved: u64,
 }
 
-/// Extract a JSON string value for a given key from a flat JSON object.
+/// Find an unescaped JSON object-key spelling and return the byte immediately
+/// after its closing quote.
 ///
-/// This is intentionally limited: it finds `"key":"value"` or `"key": "value"`
-/// patterns in a single-level object. It does not handle nested objects,
-/// escaped quotes in values, or non-string value types. For the LSP lifecycle
-/// messages we handle, this is sufficient.
-fn extract_string_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+/// This scanner is deliberately narrow: keys are fixed ASCII protocol tokens,
+/// while values are decoded separately. Checking the backslash parity prevents
+/// source text such as `\"method\":\"shutdown\"` from being mistaken for the
+/// envelope's real `method` field.
+fn find_json_key(json: &str, key: &str) -> Option<usize> {
     let needle = format!("\"{key}\"");
-    let start = json.find(&needle)?;
-    let after_key = &json[start + needle.len()..];
-    // Skip optional whitespace and the colon.
-    let after_colon = after_key.trim_start().strip_prefix(':')?;
-    let after_colon = after_colon.trim_start();
-    // The value must be a string.
-    let after_quote = after_colon.strip_prefix('"')?;
-    let end = after_quote.find('"')?;
-    Some(&after_quote[..end])
+    let bytes = json.as_bytes();
+    let mut offset = 0usize;
+    loop {
+        let relative = json.get(offset..)?.find(&needle)?;
+        let start = offset.checked_add(relative)?;
+        let preceding_backslashes = bytes[..start]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        let after = start.checked_add(needle.len())?;
+        if preceding_backslashes % 2 == 0
+            && json
+                .get(after..)?
+                .trim_start()
+                .starts_with(':')
+        {
+            return Some(after);
+        }
+        offset = start.checked_add(1)?;
+    }
 }
 
-/// Extract a JSON integer value for a given key from a flat JSON object.
-fn extract_int_field(json: &str, key: &str) -> Option<i64> {
-    let needle = format!("\"{key}\"");
-    let start = json.find(&needle)?;
-    let after_key = &json[start + needle.len()..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    // Parse digits (possibly with leading minus).
-    let end = after_colon
-        .find(|c: char| !c.is_ascii_digit() && c != '-')
-        .unwrap_or(after_colon.len());
-    after_colon[..end].parse::<i64>().ok()
-}
-
-/// Extract the `uri` from a `textDocument` parameter.
-///
-/// Looks for `"textDocument"` then `"uri"` inside it.
-fn extract_text_document_uri(json: &str) -> Option<String> {
-    let td_start = json.find("\"textDocument\"")?;
-    let rest = &json[td_start..];
-    let uri = extract_string_field(rest, "uri")?;
-    Some(uri.to_string())
-}
-
-/// Extract a JSON string value starting after a given byte offset, parsing
-/// escape sequences. The search begins at `haystack[offset..]` and looks
-/// for the first `"text"` key.
-fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
+fn decode_json_string(after_quote: &str) -> Option<String> {
     fn hex_quad(chars: &mut std::str::Chars<'_>) -> Option<u16> {
         let mut value = 0u16;
         for _ in 0..4 {
@@ -111,18 +98,11 @@ fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
         }
     }
 
-    let region = haystack.get(offset..)?;
-    let text_key = "\"text\"";
-    let key_start = region.find(text_key)?;
-    let after_key = &region[key_start + text_key.len()..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    let after_quote = after_colon.strip_prefix('"')?;
-
     let mut result = String::new();
     let mut chars = after_quote.chars();
     loop {
         match chars.next()? {
-            '"' => break,
+            '"' => return Some(result),
             '\\' => {
                 let escaped = chars.next()?;
                 result.push(match escaped {
@@ -142,12 +122,43 @@ fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
             other => result.push(other),
         }
     }
-    Some(result)
+}
+
+/// Extract and decode a JSON string value for a fixed protocol key.
+fn extract_string_field(json: &str, key: &str) -> Option<String> {
+    let after_key = &json[find_json_key(json, key)?..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let after_quote = after_colon.strip_prefix('"')?;
+    decode_json_string(after_quote)
+}
+
+/// Extract a JSON integer value for a given key from a flat JSON object.
+fn extract_int_field(json: &str, key: &str) -> Option<i64> {
+    let after_key = &json[find_json_key(json, key)?..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    // Parse digits (possibly with leading minus).
+    let end = after_colon
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(after_colon.len());
+    after_colon[..end].parse::<i64>().ok()
+}
+
+/// Extract the decoded `uri` from a `textDocument` parameter.
+fn extract_text_document_uri(json: &str) -> Option<String> {
+    let td_start = find_json_key(json, "textDocument")?;
+    extract_string_field(&json[td_start..], "uri")
+}
+
+/// Extract a JSON string value starting after a given byte offset. The search
+/// begins at `haystack[offset..]` and finds the first unescaped `"text"` key.
+fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
+    let region = haystack.get(offset..)?;
+    extract_string_field(region, "text")
 }
 
 /// Extract the `text` from the `textDocument` parameter (for didOpen).
 fn extract_text_document_text(json: &str) -> Option<String> {
-    let td_start = json.find("\"textDocument\"")?;
+    let td_start = find_json_key(json, "textDocument")?;
     extract_escaped_text_value(json, td_start)
 }
 
@@ -156,13 +167,13 @@ fn extract_text_document_text(json: &str) -> Option<String> {
 /// `"contentChanges":[{"text":"..."}]`; we extract the `text` from the
 /// first element.
 fn extract_content_changes_text(json: &str) -> Option<String> {
-    let cc_start = json.find("\"contentChanges\"")?;
+    let cc_start = find_json_key(json, "contentChanges")?;
     extract_escaped_text_value(json, cc_start)
 }
 
 /// Extract the params-level `text` field (for didSave with
 /// `includeText: true`). The didSave `textDocument` object contains
-/// only `uri` and `version` — no `text` — so the only `"text"` key
+/// only `uri` and `version` — no `text` — so the only unescaped `"text"` key
 /// in the message is the params-level one we want.
 fn extract_save_text(json: &str) -> Option<String> {
     extract_escaped_text_value(json, 0)
@@ -273,7 +284,7 @@ pub fn serve(
         let method = extract_string_field(&text, "method");
         let id = extract_int_field(&text, "id");
 
-        match (method, id, state) {
+        match (method.as_deref(), id, state) {
             // --- Lifecycle: initialize ---
             (Some("initialize"), Some(req_id), ServerState::Uninitialized) => {
                 let response = initialize_response(req_id);
@@ -523,6 +534,16 @@ mod tests {
     }
 
     #[test]
+    fn did_open_ignores_method_lookalike_inside_document_text() {
+        let (outcome, output) = lifecycle_session(
+            r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_opened, 1);
+        assert!(output.contains("publishDiagnostics"));
+    }
+
+    #[test]
     fn unknown_request_returns_method_not_found() {
         let (outcome, output) = lifecycle_session(
             r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
@@ -534,12 +555,21 @@ mod tests {
     #[test]
     fn extract_string_field_works() {
         let json = r#"{"method":"initialize","id":1}"#;
-        assert_eq!(extract_string_field(json, "method"), Some("initialize"));
+        assert_eq!(extract_string_field(json, "method").as_deref(), Some("initialize"));
+    }
+
+    #[test]
+    fn extract_string_field_decodes_escapes_and_skips_escaped_key_lookalikes() {
+        let json = r#"{"note":"\"method\":\"shutdown\"","method":"textDocument\/hover"}"#;
+        assert_eq!(
+            extract_string_field(json, "method").as_deref(),
+            Some("textDocument/hover")
+        );
     }
 
     #[test]
     fn extract_int_field_works() {
-        let json = r#"{"method":"initialize","id":42}"#;
+        let json = r#"{"note":"\"id\":999","method":"initialize","id":42}"#;
         assert_eq!(extract_int_field(json, "id"), Some(42));
     }
 
@@ -549,6 +579,15 @@ mod tests {
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///foo.lean".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_text_document_uri_decodes_json_escapes() {
+        let json = r#"{"params":{"textDocument":{"uri":"file:\/\/\/tmp\/\ud83e\udd16.lean","text":"hello"}}}"#;
+        assert_eq!(
+            extract_text_document_uri(json),
+            Some("file:///tmp/🤖.lean".to_string())
         );
     }
 
