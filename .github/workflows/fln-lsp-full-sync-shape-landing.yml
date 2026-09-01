@@ -1,0 +1,180 @@
+name: fln LSP Full-sync shape landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-full-sync-shape-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP document-lifecycle landing
+      - fln LSP document-lifecycle checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-full-sync-shape-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require open-document lifecycle enforcement
+        shell: bash
+        run: |
+          grep -Fq 'didChange for an unopened document' crates/fln-server/src/dispatch.rs
+          grep -Fq 'fn invalidate_text(&mut self, uri: &str)' crates/fln-server/src/dispatch.rs
+
+      - name: reject incremental change shapes under Full synchronization
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "full_sync_rejects_ranged_incremental_changes_without_replaying_stale_source"
+          if marker not in text:
+              old = '''    let Some(change) = single_array_element(changes) else {
+                  return DecodedField::Invalid;
+              };
+              decoded_string_field(change, "text")
+          }
+          '''
+              old = "\n".join(line[14:] if line.startswith("              ") else line for line in old.splitlines()) + "\n"
+              new = '''    let Some(change) = single_array_element(changes) else {
+                  return DecodedField::Invalid;
+              };
+              for forbidden in ["range", "rangeLength"] {
+                  if !matches!(object_field(change, forbidden), Field::Missing) {
+                      return DecodedField::Invalid;
+                  }
+              }
+              decoded_string_field(change, "text")
+          }
+          '''
+              new = "\n".join(line[14:] if line.startswith("              ") else line for line in new.splitlines()) + "\n"
+              if text.count(old) != 1:
+                  raise SystemExit("Full-sync change decoder anchor did not match exactly once")
+              text = text.replace(old, new, 1)
+
+              anchor = '''    #[test]
+              fn full_sync_refuses_empty_or_multiple_content_changes() {
+          '''
+              anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in anchor.splitlines()) + "\n"
+              tests = r'''    #[test]
+              fn full_sync_rejects_ranged_incremental_changes_without_replaying_stale_source() {
+                  for ranged_change in [
+                      r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"fragment"}"#,
+                      r#"{"range":null,"text":"fragment"}"#,
+                      r#"{"rangeLength":1,"text":"fragment"}"#,
+                  ] {
+                      let change = format!(
+                          "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{\"textDocument\":{{\"uri\":\"file:///test.lean\",\"version\":2}},\"contentChanges\":[{ranged_change}]}}}}"
+                      );
+                      let (outcome, output, seen) = run_session(
+                          &[
+                              r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"authoritative"}}}"#,
+                              &change,
+                              r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                          ]
+                          .join("\n"),
+                      );
+                      assert!(outcome.clean);
+                      assert_eq!(outcome.documents_changed, 0);
+                      assert_eq!(outcome.documents_saved, 0);
+                      assert_eq!(seen.len(), 1);
+                      assert_eq!(seen[0].1, "authoritative");
+                      assert!(!seen.iter().any(|(_, source)| source == "fragment"));
+                      assert!(output.contains("exactly one Full-sync text change"));
+                      assert!(output.contains("\"diagnostics\":[]"));
+                      assert!(output.contains("no retained source exists"));
+                  }
+              }
+
+          '''
+              tests = "\n".join(line[14:] if line.startswith("              ") else line for line in tests.splitlines())
+              if text.count(anchor) != 1:
+                  raise SystemExit("Full-sync array test anchor did not match exactly once")
+              text = text.replace(anchor, tests + anchor, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              for forbidden in ['"range"', '"rangeLength"']:
+                  if forbidden not in text:
+                      raise SystemExit(f"Full-sync shape repair is partial: missing {forbidden}")
+          PY
+
+          cat > .github/workflows/fln-lsp-full-sync-shape-landing.yml <<'YAML'
+          name: fln LSP Full-sync shape checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-full-sync-shape-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-full-sync-shape-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-full-sync-shape-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify Full-sync change shape
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test Full-sync shape and stale-source recovery
+        shell: bash
+        run: cargo test -p fln-server --lib
+
+      - name: publish verified Full-sync shape repair
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-full-sync-shape-landing.yml crates/fln-server/src/dispatch.rs
+          if git diff --cached --quiet; then
+            echo "Full-sync shape validation is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): reject ranged edits in Full-sync mode" \
+            -m "A TextDocumentContentChangeEvent carrying range or rangeLength is incremental, even when it also carries text. Refuse those shapes, invalidate retained source, clear stale diagnostics, and never reinterpret the fragment as a complete document." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
