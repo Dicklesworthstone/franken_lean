@@ -78,6 +78,19 @@ enum DecodedField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionField {
+    Missing,
+    Valid(i64),
+    Invalid,
+}
+
+#[derive(Debug)]
+struct CachedDocument {
+    version: i64,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheRefusal {
     DocumentLimit,
     ByteLimit,
@@ -102,7 +115,7 @@ impl CacheRefusal {
 
 #[derive(Debug)]
 struct DocumentCache {
-    documents: BTreeMap<String, String>,
+    documents: BTreeMap<String, CachedDocument>,
     total_bytes: usize,
     max_documents: usize,
     max_bytes: usize,
@@ -122,9 +135,9 @@ impl DocumentCache {
         }
     }
 
-    fn store(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {
+    fn store(&mut self, uri: String, version: i64, text: String) -> Result<(), CacheRefusal> {
         let old = self.documents.remove(&uri);
-        let old_len = old.as_ref().map_or(0, String::len);
+        let old_len = old.as_ref().map_or(0, |document| document.text.len());
         self.total_bytes = self
             .total_bytes
             .checked_sub(old_len)
@@ -140,13 +153,22 @@ impl DocumentCache {
         if next_total > self.max_bytes {
             return Err(CacheRefusal::ByteLimit);
         }
-        self.documents.insert(uri, text);
+        self.documents.insert(uri, CachedDocument { version, text });
         self.total_bytes = next_total;
         Ok(())
     }
 
-    fn get(&self, uri: &str) -> Option<&str> {
-        self.documents.get(uri).map(String::as_str)
+    fn text(&self, uri: &str) -> Option<&str> {
+        self.documents.get(uri).map(|document| document.text.as_str())
+    }
+
+    fn version(&self, uri: &str) -> Option<i64> {
+        self.documents.get(uri).map(|document| document.version)
+    }
+
+    fn replace_text(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {
+        let version = self.version(&uri).unwrap_or(0);
+        self.store(uri, version, text)
     }
 
     fn remove(&mut self, uri: &str) -> Result<(), CacheRefusal> {
@@ -155,7 +177,7 @@ impl DocumentCache {
         };
         self.total_bytes = self
             .total_bytes
-            .checked_sub(text.len())
+            .checked_sub(text.text.len())
             .ok_or(CacheRefusal::AccountingOverflow)?;
         Ok(())
     }
@@ -422,6 +444,23 @@ fn extract_integer_value(value: &str) -> Option<i64> {
         return None;
     }
     value.parse::<i64>().ok()
+}
+
+fn decoded_integer_field(object: &str, key: &str) -> VersionField {
+    match object_field(object, key) {
+        Field::Missing => VersionField::Missing,
+        Field::Invalid => VersionField::Invalid,
+        Field::Value(value) => extract_integer_value(value)
+            .map(VersionField::Valid)
+            .unwrap_or(VersionField::Invalid),
+    }
+}
+
+fn extract_text_document_version_field(json: &str) -> VersionField {
+    let Some(text_document) = text_document_object(json) else {
+        return VersionField::Invalid;
+    };
+    decoded_integer_field(text_document, "version")
 }
 
 fn extract_request_id(json: &str) -> RequestIdField {
@@ -698,9 +737,14 @@ pub fn serve(
             }
             (Some("textDocument/didOpen"), None, ServerState::Running) => {
                 if let Some(uri) = extract_text_document_uri(&text) {
-                    match extract_text_document_text_field(&text) {
-                        DecodedField::Valid(content) => {
-                            if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                    match (
+                        extract_text_document_version_field(&text),
+                        extract_text_document_text_field(&text),
+                    ) {
+                        (VersionField::Valid(version), DecodedField::Valid(content)) => {
+                            if let Err(refusal) =
+                                documents.store(uri.clone(), version, content.clone())
+                            {
                                 transport::write_message(
                                     output,
                                     log_warning(refusal.message()).as_bytes(),
@@ -709,12 +753,12 @@ pub fn serve(
                             check_document(output, &uri, &content, on_did_open)?;
                             documents_opened = documents_opened.saturating_add(1);
                         }
-                        DecodedField::Missing | DecodedField::Invalid => {
+                        _ => {
                             invalidate_retained_source(
                                 output,
                                 &mut documents,
                                 &uri,
-                                "FrankenLean refused didOpen without a valid full document; any retained source for this URI was invalidated",
+                                "FrankenLean refused didOpen without a valid integer version and full document; any retained source for this URI was invalidated",
                             )?;
                         }
                     }
@@ -722,9 +766,27 @@ pub fn serve(
             }
             (Some("textDocument/didChange"), None, ServerState::Running) => {
                 if let Some(uri) = extract_text_document_uri(&text) {
-                    match extract_content_changes_text_field(&text) {
-                        DecodedField::Valid(content) => {
-                            if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                    match (
+                        extract_text_document_version_field(&text),
+                        extract_content_changes_text_field(&text),
+                    ) {
+                        (VersionField::Valid(version), DecodedField::Valid(content)) => {
+                            if documents
+                                .version(&uri)
+                                .is_some_and(|current| version <= current)
+                            {
+                                transport::write_message(
+                                    output,
+                                    log_warning(
+                                        "FrankenLean refused non-monotone didChange version; latest retained source remains authoritative",
+                                    )
+                                    .as_bytes(),
+                                )?;
+                                continue;
+                            }
+                            if let Err(refusal) =
+                                documents.store(uri.clone(), version, content.clone())
+                            {
                                 transport::write_message(
                                     output,
                                     log_warning(refusal.message()).as_bytes(),
@@ -733,12 +795,12 @@ pub fn serve(
                             check_document(output, &uri, &content, on_did_open)?;
                             documents_changed = documents_changed.saturating_add(1);
                         }
-                        DecodedField::Missing | DecodedField::Invalid => {
+                        _ => {
                             invalidate_retained_source(
                                 output,
                                 &mut documents,
                                 &uri,
-                                "FrankenLean refused didChange without exactly one valid Full-sync text change; retained source was invalidated",
+                                "FrankenLean refused didChange without a valid integer version and exactly one Full-sync text change; retained source was invalidated",
                             )?;
                         }
                     }
@@ -748,7 +810,7 @@ pub fn serve(
                 if let Some(uri) = extract_text_document_uri(&text) {
                     match extract_save_text_field(&text) {
                         DecodedField::Valid(content) => {
-                            if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                            if let Err(refusal) = documents.replace_text(uri.clone(), content.clone()) {
                                 transport::write_message(
                                     output,
                                     log_warning(refusal.message()).as_bytes(),
@@ -758,7 +820,7 @@ pub fn serve(
                             documents_saved = documents_saved.saturating_add(1);
                         }
                         DecodedField::Missing => {
-                            if let Some(content) = documents.get(&uri) {
+                            if let Some(content) = documents.text(&uri) {
                                 check_document(output, &uri, content, on_did_open)?;
                                 documents_saved = documents_saved.saturating_add(1);
                             } else {
@@ -1012,6 +1074,17 @@ mod tests {
     }
 
     #[test]
+    fn did_open_requires_integer_document_version() {
+        let (outcome, output, seen) = run_session(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","text":"unversioned"}}}"#,
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_opened, 0);
+        assert!(seen.is_empty());
+        assert!(output.contains("valid integer version and full document"));
+    }
+
+    #[test]
     fn did_open_ignores_method_lookalike_inside_document_text() {
         let (outcome, output) = lifecycle_session(
             r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
@@ -1075,6 +1148,55 @@ mod tests {
         );
         assert_eq!(output.matches("publishDiagnostics").count(), 2);
         assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
+    }
+
+    #[test]
+    fn did_change_refuses_non_monotone_versions_without_losing_latest_source() {
+        let (outcome, output, seen) = run_session(
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":3,"text":"v3"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":4},"contentChanges":[{"text":"v4"}]}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":4},"contentChanges":[{"text":"duplicate-v4"}]}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"stale-v2"}]}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+            ]
+            .join("\n"),
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_changed, 1);
+        assert_eq!(outcome.documents_saved, 1);
+        assert_eq!(
+            seen,
+            vec![
+                ("file:///test.lean".to_string(), "v3".to_string()),
+                ("file:///test.lean".to_string(), "v4".to_string()),
+                ("file:///test.lean".to_string(), "v4".to_string()),
+            ]
+        );
+        assert_eq!(output.matches("non-monotone didChange version").count(), 2);
+    }
+
+    #[test]
+    fn missing_or_malformed_change_version_invalidates_retained_source() {
+        for change in [
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean"},"contentChanges":[{"text":"missing-version"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":1.5},"contentChanges":[{"text":"bad-version"}]}}"#,
+        ] {
+            let (outcome, output, seen) = run_session(
+                &[
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
+                    change,
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                ]
+                .join("\n"),
+            );
+            assert!(outcome.clean);
+            assert_eq!(outcome.documents_changed, 0);
+            assert_eq!(outcome.documents_saved, 0);
+            assert_eq!(seen.len(), 1);
+            assert!(output.contains("valid integer version"));
+            assert!(output.contains("no retained source exists"));
+        }
     }
 
     #[test]
@@ -1221,30 +1343,30 @@ mod tests {
     fn document_cache_bounds_new_entries_and_invalidates_stale_replacements() {
         let mut count_limited = DocumentCache::with_limits(1, 100);
         count_limited
-            .store("a".to_string(), "one".to_string())
+            .store("a".to_string(), 1, "one".to_string())
             .unwrap();
         assert_eq!(
-            count_limited.store("b".to_string(), "two".to_string()),
+            count_limited.store("b".to_string(), 1, "two".to_string()),
             Err(CacheRefusal::DocumentLimit)
         );
-        assert_eq!(count_limited.get("a"), Some("one"));
-        assert_eq!(count_limited.get("b"), None);
+        assert_eq!(count_limited.text("a"), Some("one"));
+        assert_eq!(count_limited.text("b"), None);
 
         let mut byte_limited = DocumentCache::with_limits(2, 5);
         byte_limited
-            .store("a".to_string(), "1234".to_string())
+            .store("a".to_string(), 1, "1234".to_string())
             .unwrap();
         assert_eq!(
-            byte_limited.store("b".to_string(), "12".to_string()),
+            byte_limited.store("b".to_string(), 1, "12".to_string()),
             Err(CacheRefusal::ByteLimit)
         );
         assert_eq!(byte_limited.total_bytes, 4);
         assert_eq!(
-            byte_limited.store("a".to_string(), "123456".to_string()),
+            byte_limited.store("a".to_string(), 1, "123456".to_string()),
             Err(CacheRefusal::ByteLimit)
         );
         assert_eq!(
-            byte_limited.get("a"),
+            byte_limited.text("a"),
             None,
             "a rejected replacement must invalidate the now-stale cached text"
         );
