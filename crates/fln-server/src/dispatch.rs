@@ -213,7 +213,8 @@ fn scan_value_end(json: &str, start: usize) -> Option<usize> {
                         index += 1;
                     }
                     closer @ (b'}' | b']') => {
-                        let expected = match stack.get(depth.checked_sub(1)?)? {
+                        let opener = *stack.get(depth.checked_sub(1)?)?;
+                        let expected = match opener {
                             b'{' => b'}',
                             b'[' => b']',
                             _ => return None,
@@ -777,11 +778,11 @@ mod tests {
         let mut input_buf = Vec::new();
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
         );
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
         );
         for line in extra_messages.lines() {
             if !line.trim().is_empty() {
@@ -790,11 +791,11 @@ mod tests {
         }
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"shutdown\"}"#,
+            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
         );
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"#,
+            r#"{"jsonrpc":"2.0","method":"exit"}"#,
         );
 
         let mut reader = BufReader::new(&input_buf[..]);
@@ -836,19 +837,19 @@ mod tests {
     #[test]
     fn request_id_parser_preserves_integer_and_string_ids() {
         assert_eq!(
-            extract_request_id(r#"{\"id\":42}"#),
+            extract_request_id(r#"{"id":42}"#),
             RequestIdField::Valid(RequestId::Integer(42))
         );
         assert_eq!(
-            extract_request_id(r#"{\"id\":-1}"#),
+            extract_request_id(r#"{"id":-1}"#),
             RequestIdField::Valid(RequestId::Integer(-1))
         );
         assert_eq!(
-            extract_request_id(r#"{\"id\":\"req-\\ud83e\\udd16\"}"#),
+            extract_request_id(r#"{"id":"req-\ud83e\udd16"}"#),
             RequestIdField::Valid(RequestId::Text("req-🤖".to_string()))
         );
         assert_eq!(
-            extract_request_id(r#"{\"method\":\"exit\"}"#),
+            extract_request_id(r#"{"method":"exit"}"#),
             RequestIdField::Absent
         );
     }
@@ -856,15 +857,15 @@ mod tests {
     #[test]
     fn malformed_request_ids_are_distinct_from_notifications() {
         for json in [
-            r#"{\"id\":1.5}"#,
-            r#"{\"id\":1e2}"#,
-            r#"{\"id\":01}"#,
-            r#"{\"id\":-}"#,
-            r#"{\"id\":null}"#,
-            r#"{\"id\":{}}"#,
-            r#"{\"id\":9223372036854775808}"#,
-            r#"{\"id\":\"x\"true}"#,
-            r#"{\"id\":1,\"id\":2}"#,
+            r#"{"id":1.5}"#,
+            r#"{"id":1e2}"#,
+            r#"{"id":01}"#,
+            r#"{"id":-}"#,
+            r#"{"id":null}"#,
+            r#"{"id":{}}"#,
+            r#"{"id":9223372036854775808}"#,
+            r#"{"id":"x"true}"#,
+            r#"{"id":1,"id":2}"#,
         ] {
             assert_eq!(
                 extract_request_id(json),
@@ -877,7 +878,7 @@ mod tests {
     #[test]
     fn malformed_request_id_returns_invalid_request_with_null_id() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"textDocument/hover\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1.5,"method":"textDocument/hover","params":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":null,\"error\":{\"code\":-32600"));
@@ -887,7 +888,7 @@ mod tests {
 
     #[test]
     fn envelope_fields_ignore_nested_lookalikes() {
-        let json = r#"{\"params\":{\"id\":\"shadow\",\"method\":\"shutdown\"},\"id\":\"actual\",\"method\":\"textDocument/hover\"}"#;
+        let json = r#"{"params":{"id":"shadow","method":"shutdown"},"id":"actual","method":"textDocument/hover"}"#;
         assert_eq!(
             extract_request_id(json),
             RequestIdField::Valid(RequestId::Text("actual".to_string()))
@@ -900,9 +901,9 @@ mod tests {
 
     #[test]
     fn structural_object_field_rejects_duplicate_and_mismatched_containers() {
-        assert_eq!(object_field(r#"{\"x\":1,\"x\":2}"#, "x"), Field::Invalid);
-        assert_eq!(object_field(r#"{\"x\":[1}}"#, "x"), Field::Invalid);
-        assert_eq!(object_field(r#"{\"x\":1,}"#, "x"), Field::Invalid);
+        assert_eq!(object_field(r#"{"x":1,"x":2}"#, "x"), Field::Invalid);
+        assert_eq!(object_field(r#"{"x":[1}}"#, "x"), Field::Invalid);
+        assert_eq!(object_field(r#"{"x":1,}"#, "x"), Field::Invalid);
 
         let nested = format!(
             "{}{}",
@@ -916,7 +917,7 @@ mod tests {
     #[test]
     fn did_open_routes_through_callback() {
         let (outcome, output, seen) = run_session(
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -930,7 +931,7 @@ mod tests {
 
     #[test]
     fn document_fields_are_bound_to_exact_params_structure() {
-        let json = r#"{\"textDocument\":{\"uri\":\"file:///wrong.lean\",\"text\":\"wrong\"},\"params\":{\"metadata\":{\"textDocument\":{\"uri\":\"file:///also-wrong.lean\"}},\"textDocument\":{\"uri\":\"file:///right.lean\",\"text\":\"right\"}}}"#;
+        let json = r#"{"textDocument":{"uri":"file:///wrong.lean","text":"wrong"},"params":{"metadata":{"textDocument":{"uri":"file:///also-wrong.lean"}},"textDocument":{"uri":"file:///right.lean","text":"right"}}}"#;
         assert_eq!(
             extract_text_document_uri(json).as_deref(),
             Some("file:///right.lean")
@@ -941,7 +942,7 @@ mod tests {
     #[test]
     fn did_open_ignores_method_lookalike_inside_document_text() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"\\\"method\\\":\\\"shutdown\\\"\"}},\"method\":\"textDocument/didOpen\"}"#,
+            r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -951,7 +952,7 @@ mod tests {
     #[test]
     fn nested_method_cannot_shutdown_server() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":14,\"params\":{\"method\":\"shutdown\"},\"method\":\"textDocument/hover\"}"#,
+            r#"{"jsonrpc":"2.0","id":14,"params":{"method":"shutdown"},"method":"textDocument/hover"}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":14,\"result\":null"));
@@ -960,7 +961,7 @@ mod tests {
     #[test]
     fn unknown_request_returns_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/unknownMethod\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("-32601"));
@@ -969,7 +970,7 @@ mod tests {
     #[test]
     fn string_request_id_is_preserved_in_response() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":\"hover-\\ud83e\\udd16\",\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"},\"position\":{\"line\":0,\"character\":0}}}"#,
+            r#"{"jsonrpc":"2.0","id":"hover-\ud83e\udd16","method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":\"hover-🤖\",\"result\":null"));
@@ -977,7 +978,7 @@ mod tests {
 
     #[test]
     fn text_document_uri_decodes_json_escapes() {
-        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:\\/\\/\\/tmp\\/\\ud83e\\udd16.lean\",\"text\":\"hello\"}}}"#;
+        let json = r#"{"params":{"textDocument":{"uri":"file:\/\/\/tmp\/\ud83e\udd16.lean","text":"hello"}}}"#;
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///tmp/🤖.lean".to_string())
@@ -988,8 +989,8 @@ mod tests {
     fn did_change_routes_full_document_through_callback() {
         let (outcome, output, seen) = run_session(
             &[
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"def y := 7\"}]}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"def y := 7"}]}}"#,
             ]
             .join("\n"),
         );
@@ -1007,8 +1008,8 @@ mod tests {
     #[test]
     fn full_sync_refuses_empty_or_multiple_content_changes() {
         for json in [
-            r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\"},\"contentChanges\":[]}}"#,
-            r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\"},\"contentChanges\":[{\"text\":\"a\"},{\"text\":\"b\"}]}}"#,
+            r#"{"params":{"textDocument":{"uri":"file:///x.lean"},"contentChanges":[]}}"#,
+            r#"{"params":{"textDocument":{"uri":"file:///x.lean"},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
         ] {
             assert_eq!(
                 extract_content_changes_text(json),
@@ -1020,7 +1021,7 @@ mod tests {
 
     #[test]
     fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
-        let json = r#"{\"params\":{\"textDocument\":{\"text\":\"\\ud83e\\udd16 a\\/b\\b\\f\\n\\r\\t\\\\\\\"\"}}}"#;
+        let json = r#"{"params":{"textDocument":{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}}}"#;
         assert_eq!(
             extract_text_document_text(json).as_deref(),
             Some("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"")
@@ -1030,11 +1031,11 @@ mod tests {
     #[test]
     fn escaped_text_rejects_malformed_json_strings() {
         for value in [
-            r#"\"\\ud83e\""#,
-            r#"\"\\udd16\""#,
-            r#"\"\\ud83e\\u0041\""#,
-            r#"\"\\q\""#,
-            r#"\"\\u12xz\""#,
+            r#""\ud83e""#,
+            r#""\udd16""#,
+            r#""\ud83e\u0041""#,
+            r#""\q""#,
+            r#""\u12xz""#,
             "\"line\nfeed\"",
         ] {
             assert!(
@@ -1048,8 +1049,8 @@ mod tests {
     fn did_save_with_text_routes_through_callback() {
         let (outcome, output, seen) = run_session(
             &[
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"old\"}}}"#,
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":1},\"text\":\"saved\"}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"saved"}}"#,
             ]
             .join("\n"),
         );
@@ -1066,9 +1067,9 @@ mod tests {
     fn textless_save_rechecks_latest_cached_full_document() {
         let (outcome, _output, seen) = run_session(
             &[
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"old\"}}}"#,
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"latest\"}]}}"#,
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"latest"}]}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":2}}}"#,
             ]
             .join("\n"),
         );
@@ -1083,7 +1084,7 @@ mod tests {
     #[test]
     fn textless_save_without_retained_source_is_visible_and_not_counted() {
         let (outcome, output, seen) = run_session(
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///missing.lean\"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing.lean"}}}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_saved, 0);
@@ -1096,9 +1097,9 @@ mod tests {
     fn did_close_evicts_source_and_clears_push_diagnostics() {
         let (outcome, output, seen) = run_session(
             &[
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"open\"}}}"#,
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"}}}"#,
-                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"open"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
             ]
             .join("\n"),
         );
@@ -1145,7 +1146,7 @@ mod tests {
     #[test]
     fn rpc_connect_fails_closed_without_fabricating_session() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"$/lean/rpc/connect\",\"params\":{\"uri\":\"file:///test.lean\"}}"#,
+            r#"{"jsonrpc":"2.0","id":12,"method":"$/lean/rpc/connect","params":{"uri":"file:///test.lean"}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":12,\"error\":{\"code\":-32803"));
@@ -1156,7 +1157,7 @@ mod tests {
     #[test]
     fn rpc_call_fails_closed_without_fabricating_result() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"$/lean/rpc/call\",\"params\":{\"sessionId\":\"missing\"}}"#,
+            r#"{"jsonrpc":"2.0","id":13,"method":"$/lean/rpc/call","params":{"sessionId":"missing"}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":13,\"error\":{\"code\":-32803"));
