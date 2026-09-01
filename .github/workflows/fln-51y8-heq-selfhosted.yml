@@ -1,0 +1,326 @@
+name: fln-51y8 self-hosted HEq landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-51y8-heq-selfhosted.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-51y8-heq-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply the pinned HEq recursor correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'fn kr600_803_init_heq_block_is_reconstructed' crates/fln-checker/tests/admit.rs; then
+            echo 'HEq correction already present'
+            exit 0
+          fi
+          actual_src=$(git hash-object crates/fln-checker/src/admit.rs)
+          actual_test=$(git hash-object crates/fln-checker/tests/admit.rs)
+          expected_src=9a8ce762c5c3cf4463797bf4127051e992adac2e
+          expected_test=85cb88c0e2942c31b76110ac38bb107486996f87
+          if [[ "$actual_src" != "$expected_src" || "$actual_test" != "$expected_test" ]]; then
+            echo "HEq anchors moved: src=$actual_src test=$actual_test" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('crates/fln-checker/src/admit.rs')
+          text = source.read_text(encoding='utf-8')
+
+          replacements = [
+              (
+                  '''    // Scope: α(2), a(1). The motive quantifies β Implicit and its index and
+              // hypothesis Default, exactly as the pinned eliminator states it.
+              let b_domain = b.bvar(0);
+              let h_alpha = b.bvar(3);
+              let h_a = b.bvar(2);
+              let h_beta = b.bvar(1);
+              let h_b = b.bvar(0);
+              let h_domain = heq_application(b, heq, alpha_universe, h_alpha, h_a, h_beta, h_b);
+              let motive_sort = b.sort_parameter(motive_universe);
+              let hypothesis = b.forall("h", BinderStyle::Default, h_domain, motive_sort);
+              let b_binder = b.forall("b", BinderStyle::Default, b_domain, hypothesis);
+              let beta_sort = b.sort_parameter(alpha_universe);
+              b.forall("β", BinderStyle::Implicit, beta_sort, b_binder)
+          ''',
+                  '''    // Scope: α(1), a_hyg_outer(0). The motive re-binds a value under β;
+              // the two identically rendered `a_hyg` names remain distinct locals.
+              let right_value_domain = b.bvar(0);
+              let h_alpha = b.bvar(3);
+              let h_left = b.bvar(2);
+              let h_beta = b.bvar(1);
+              let h_right = b.bvar(0);
+              let h_domain =
+                  heq_application(b, heq, alpha_universe, h_alpha, h_left, h_beta, h_right);
+              let motive_sort = b.sort_parameter(motive_universe);
+              let hypothesis = b.forall("t", BinderStyle::Default, h_domain, motive_sort);
+              let right_value = b.forall(
+                  "a_hyg",
+                  BinderStyle::Default,
+                  right_value_domain,
+                  hypothesis,
+              );
+              let beta_sort = b.sort_parameter(alpha_universe);
+              b.forall("β", BinderStyle::Implicit, beta_sort, right_value)
+          ''',
+              ),
+              (
+                  '''    // Minor premise, scope: α(2), a(1), motive(0).
+              let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+              let refl_alpha_index = b.bvar(2);
+              let refl_alpha = b.apply(refl_const, refl_alpha_index);
+              let refl_a_index = b.bvar(1);
+              let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+              let motive_var = b.bvar(0);
+              let minor_a = b.bvar(1);
+              let motive_a = b.apply(motive_var, minor_a);
+              let minor_type = b.apply(motive_a, refl_alpha_a);
+          ''',
+                  '''    // Reflexive premise, scope: α(2), a_hyg_outer(1), motive(0).
+              // Motive has THREE arguments: the type, its value, and the HEq proof.
+              let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+              let refl_alpha_index = b.bvar(2);
+              let refl_alpha = b.apply(refl_const, refl_alpha_index);
+              let refl_a_index = b.bvar(1);
+              let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+              let motive_var = b.bvar(0);
+              let minor_alpha = b.bvar(2);
+              let motive_alpha = b.apply(motive_var, minor_alpha);
+              let minor_a_hyg = b.bvar(1);
+              let motive_alpha_a_hyg = b.apply(motive_alpha, minor_a_hyg);
+              let minor_type = b.apply(motive_alpha_a_hyg, refl_alpha_a);
+          ''',
+              ),
+              (
+                  '''    // Major hypothesis, scope: α(5), a(4), motive(3), minor(2), β(1), b(0).
+              let h_alpha = b.bvar(5);
+              let h_a = b.bvar(4);
+              let h_beta = b.bvar(1);
+              let h_b = b.bvar(0);
+              let h_domain = heq_application(&mut b, heq, alpha_universe, h_alpha, h_a, h_beta, h_b);
+              let major_hypothesis = b.forall("h", BinderStyle::Default, h_domain, result);
+              // The pin binds the heterogeneous major index pair Implicit.
+              let b_domain = b.bvar(0);
+              let b_binder = b.forall("b", BinderStyle::Implicit, b_domain, major_hypothesis);
+              let beta_sort = b.sort_parameter(alpha_universe);
+              let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, b_binder);
+              let minors = b.forall("m_1", BinderStyle::Default, minor_type, beta_binder);
+              let motives = b.forall("motive", BinderStyle::Implicit, motive_type, minors);
+              let a_domain = b.bvar(0);
+              let a_implicit = b.forall("a", BinderStyle::Implicit, a_domain, motives);
+              let alpha_sort = b.sort_parameter(alpha_universe);
+              let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a_implicit);
+          ''',
+                  '''    // Major hypothesis, scope: α(5), a_hyg_outer(4), motive(3), refl(2),
+              // β(1), a_hyg_major(0). The left and right values are different locals.
+              let h_alpha = b.bvar(5);
+              let h_left = b.bvar(4);
+              let h_beta = b.bvar(1);
+              let h_right = b.bvar(0);
+              let h_domain = heq_application(
+                  &mut b,
+                  heq,
+                  alpha_universe,
+                  h_alpha,
+                  h_left,
+                  h_beta,
+                  h_right,
+              );
+              let major_hypothesis = b.forall("t", BinderStyle::Default, h_domain, result);
+              let right_value_domain = b.bvar(0);
+              let right_value = b.forall(
+                  "a_hyg",
+                  BinderStyle::Implicit,
+                  right_value_domain,
+                  major_hypothesis,
+              );
+              let beta_sort = b.sort_parameter(alpha_universe);
+              let beta_binder = b.forall("β", BinderStyle::Implicit, beta_sort, right_value);
+              let reflexive = b.forall("refl", BinderStyle::Default, minor_type, beta_binder);
+              let motives = b.forall("motive", BinderStyle::Implicit, motive_type, reflexive);
+              let left_value_domain = b.bvar(0);
+              let left_value = b.forall(
+                  "a_hyg",
+                  BinderStyle::Implicit,
+                  left_value_domain,
+                  motives,
+              );
+              let alpha_sort = b.sort_parameter(alpha_universe);
+              let root = b.forall("α", BinderStyle::Implicit, alpha_sort, left_value);
+          ''',
+              ),
+              (
+                  '''    // The iota contraction for refl is the minor premise itself.
+              let result = b.bvar(0);
+              let m_1 = b.lambda("m_1", BinderStyle::Default, minor_type, result);
+              let motive = b.lambda("motive", BinderStyle::Default, motive_type, m_1);
+              let a_domain = b.bvar(0);
+              let a = b.lambda("a", BinderStyle::Default, a_domain, motive);
+              let alpha_sort = b.sort_parameter(alpha_universe);
+              let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, a);
+          ''',
+                  '''    // The iota contraction for HEq.refl is the reflexive premise itself.
+              let result = b.bvar(0);
+              let reflexive = b.lambda("refl", BinderStyle::Default, minor_type, result);
+              let motive = b.lambda("motive", BinderStyle::Default, motive_type, reflexive);
+              let left_value_domain = b.bvar(0);
+              let left_value = b.lambda(
+                  "a_hyg",
+                  BinderStyle::Default,
+                  left_value_domain,
+                  motive,
+              );
+              let alpha_sort = b.sort_parameter(alpha_universe);
+              let root = b.lambda("α", BinderStyle::Implicit, alpha_sort, left_value);
+          ''',
+              ),
+          ]
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'source replacement count {count} for {old[:80]!r}')
+              text = text.replace(old, new)
+          source.write_text(text, encoding='utf-8')
+
+          tests = Path('crates/fln-checker/tests/admit.rs')
+          text = tests.read_text(encoding='utf-8')
+          old_minor = '''    let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
+              let minor_domain = Expr::app(Expr::app(bv(0), bv(1)), refl_alpha_a);
+          '''
+          new_minor = '''    let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
+              let minor_domain = Expr::app(
+                  Expr::app(Expr::app(bv(0), bv(2)), bv(1)),
+                  refl_alpha_a,
+              );
+          '''
+          if text.count(old_minor) != 1:
+              raise SystemExit(f'test minor replacement count {text.count(old_minor)}')
+          text = text.replace(old_minor, new_minor)
+          text = text.replace('"b",\n            BinderInfo::Default,', '"a_hyg",\n            BinderInfo::Default,', 1)
+          text = text.replace('"a",\n        BinderInfo::Implicit,', '"a_hyg",\n        BinderInfo::Implicit,', 1)
+          text = text.replace('"m_1",\n                    BinderInfo::Default,', '"refl",\n                    BinderInfo::Default,', 1)
+          text = text.replace('"b",\n                            BinderInfo::Implicit,', '"a_hyg",\n                            BinderInfo::Implicit,', 1)
+          text = text.replace('"h",\n                                BinderInfo::Default,', '"t",\n                                BinderInfo::Default,', 1)
+          text = text.replace('// Iota rule rhs: λ α a motive m_1 → m_1.', '// Iota rule rhs: λ α a_hyg motive refl → refl.', 1)
+          text = text.replace('primary_name("a"),\n            bv(0),', 'primary_name("a_hyg"),\n            bv(0),', 1)
+          text = text.replace('primary_name("m_1"),\n                    minor_domain.clone(),', 'primary_name("refl"),\n                    minor_domain.clone(),', 1)
+          old_test = '''#[test]
+          fn kr600_803_init_heq_block_defers_typed_on_preamble_sort_arguments() {
+              let entries = init_heq_entries();
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &entries,
+                  AdmissionBudget::unlimited(),
+                  EnvironmentBudget::unlimited(),
+              );
+              // The route recognizes the block and verifies the inductive type,
+              // reflector, and eliminator shapes; the member preamble's sort inference
+              // then defers on `HEq α a β b`'s sort-typed arguments instead of admitting
+              // half-verified. When the preamble inference extends to those
+              // applications, this test graduates to the admitted contract.
+              assert!(
+                  !verdict.is_admitted(),
+                  "unexpected admission before preamble sort-argument support: {verdict:?}"
+              );
+              assert!(
+                  matches!(
+                      verdict,
+                      fln_checker::admit::InductiveVerdict::Deferred(
+                          fln_checker::admit::InductiveSupportLimit::MemberPreamble { .. }
+                      )
+                  ),
+                  "expected the typed member-preamble deferral, got: {verdict:?}"
+              );
+          }
+          '''
+          new_test = '''#[test]
+          fn kr600_803_init_heq_block_is_reconstructed() {
+              let entries = init_heq_entries();
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &entries,
+                  AdmissionBudget::unlimited(),
+                  EnvironmentBudget::unlimited(),
+              );
+              assert!(verdict.is_admitted(), "exact Init.HEq block: {verdict:?}");
+              let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+                  return;
+              };
+              assert_eq!(admission.members().len(), 3);
+          }
+          '''
+          if text.count(old_test) != 1:
+              raise SystemExit(f'test contract replacement count {text.count(old_test)}')
+          text = text.replace(old_test, new_test)
+          tests.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git diff --check -- crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
+
+      - name: Verify the corrected checker frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test -p fln-checker --test admit kr600_803_init_heq_block_is_reconstructed -- --exact
+          cargo test --no-fail-fast -p fln-checker
+          cargo clippy -p fln-checker --all-targets -- -D warnings
+
+      - name: Record the bead frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v br >/dev/null 2>&1; then
+            br update fln-51y8 --status in_progress
+            note='HEq item 15 advanced: corrected the pinned hygienic recursor to apply motive to α, outer a_hyg, and HEq.refl α a_hyg; preserved the distinct rebound major a_hyg. Verified by the exact HEq admission regression, full fln-checker suite, and clippy -D warnings. fln-51y8 remains in progress pending the real Init.Prelude council next-frontier run.'
+            if br comments add --help >/dev/null 2>&1; then
+              br comments add fln-51y8 "$note"
+            elif br comment --help >/dev/null 2>&1; then
+              br comment fln-51y8 "$note"
+            fi
+          fi
+
+      - name: Commit incrementally and retire temporary landing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet -- crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs .beads; then
+            git add crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs .beads
+            git commit -m 'fix(checker): reconstruct pinned HEq hygienic recursor'
+          fi
+          rm -f .github/workflows/fln-51y8-heq-selfhosted.yml
+          rm -f .github/workflows/fln-51y8-heq-landing.yml
+          if grep -q 'verify and land the pinned HEq hygienic recursor' .github/workflows/mandated-mutants.yml; then
+            git revert --no-commit 5a381ab7ff8f3d1808b067db29fba2c8e61df8fa
+          fi
+          git add .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore(checker): retire HEq landing scaffolding'
+          fi
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          exit 1
