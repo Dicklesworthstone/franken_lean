@@ -1,0 +1,164 @@
+name: fln LSP source-aware landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-source-aware-landing.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-source-aware-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout exact main head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: apply source-aware UTF-16 wiring
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"{path}: expected one patch anchor, observed {observed}: {old!r}")
+              file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          dispatch = Path("crates/fln-server/src/dispatch.rs")
+          dispatch_text = dispatch.read_text(encoding="utf-8")
+          wired_dispatch = "use crate::{LSP_POSITION_ENCODING, json_string};" in dispatch_text
+          if wired_dispatch:
+              for required in [
+                  '"positionEncoding":{}',
+                  'json_string(LSP_POSITION_ENCODING)',
+                  'positionEncoding\\\":\\\"utf-16',
+              ]:
+                  if required not in dispatch_text:
+                      raise SystemExit(f"dispatch.rs is partially wired: missing {required!r}")
+          else:
+              replace_once(
+                  str(dispatch),
+                  "use crate::json_string;\n",
+                  "use crate::{LSP_POSITION_ENCODING, json_string};\n",
+              )
+              replace_once(
+                  str(dispatch),
+                  '            "\\"capabilities\\":{{",\n',
+                  '            "\\"capabilities\\":{{\\"positionEncoding\\":{},",\n',
+              )
+              replace_once(
+                  str(dispatch),
+                  '        id.as_json(),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+                  '        id.as_json(),\n        json_string(LSP_POSITION_ENCODING),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+              )
+              replace_once(
+                  str(dispatch),
+                  '        assert!(output.contains("FrankenLean"));\n',
+                  '        assert!(output.contains("FrankenLean"));\n        assert!(output.contains("\\\"positionEncoding\\\":\\\"utf-16\\\""));\n',
+              )
+
+          cli = Path("crates/fln-cli/src/lib.rs")
+          cli_text = cli.read_text(encoding="utf-8")
+          if "fln_server::project_with_sources(" in cli_text:
+              if "fln_server::LspSource::new(uri, text)" not in cli_text:
+                  raise SystemExit("fln-cli is partially wired to source-aware projection")
+          else:
+              replace_once(
+                  str(cli),
+                  "        let mut messages = match fln_server::project(lsp_request, &snapshot) {\n",
+                  "        let mut messages = match fln_server::project_with_sources(\n"
+                  "            lsp_request,\n"
+                  "            &snapshot,\n"
+                  "            &[fln_server::LspSource::new(uri, text)],\n"
+                  "        ) {\n",
+              )
+              replace_once(
+                  str(cli),
+                  "    // Strip the `file://` prefix if present, because `complete_messages`\n"
+                  "    // in fln-server re-adds `file://` when building the notification URI.\n",
+                  "    // Normalize file URIs for the semantic diagnostic while the projector\n"
+                  "    // retains the exact editor URI and unsaved source snapshot separately.\n",
+              )
+          PY
+
+          cat > .github/workflows/fln-lsp-source-aware-landing.yml <<'YAML'
+          name: fln LSP source-aware checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - .github/workflows/fln-lsp-source-aware-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - .github/workflows/fln-lsp-source-aware-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-source-aware-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: format, compile, and test source-aware LSP behavior
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+                    cargo test -p fln-cli --lib --no-run
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: compile and test the bounded LSP surface
+        shell: bash
+        run: |
+          cargo test -p fln-server --lib
+          cargo test -p fln-cli --lib --no-run
+
+      - name: publish verified wiring
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-source-aware-landing.yml crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
+          if git diff --cached --quiet; then
+            echo "source-aware UTF-16 wiring is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): wire UTF-16 LSP negotiation" \
+            -m "Advertise UTF-16 during initialize and pass each exact unsaved editor snapshot into source-aware diagnostic projection. Primary and related ranges now share the negotiated unit contract on the live CLI server path." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
