@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fln-bounded-lsp-state-landing-v3
+  group: fln-bounded-lsp-state-landing-v4
   cancel-in-progress: false
 
 jobs:
@@ -28,15 +28,24 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I - <<'PY'
+          import re
           from pathlib import Path
 
           def replace_once(path: str, old: str, new: str) -> None:
               file = Path(path)
               text = file.read_text(encoding="utf-8")
-              observed = text.count(old)
-              if observed != 1:
-                  raise SystemExit(f"{path}: expected one patch anchor, observed {observed}: {old!r}")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one literal anchor, observed {count}: {old[:100]!r}")
               file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          def replace_pattern(path: str, pattern: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              text, count = re.subn(pattern, new, text, count=1, flags=re.S)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one regex anchor: {pattern[:100]!r}")
+              file.write_text(text, encoding="utf-8")
 
           dispatch = "crates/fln-server/src/dispatch.rs"
           replace_once(
@@ -44,14 +53,92 @@ jobs:
               "use crate::json_string;\nuse crate::transport;\n",
               "use crate::{LSP_POSITION_ENCODING, json_string};\nuse crate::transport;\n",
           )
-          replace_once(
+          replace_pattern(
               dispatch,
-              '''    fn replace_text(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {
-                  let version = self.version(&uri).unwrap_or(0);
-                  self.store(uri, version, text)
+              r"#\[derive\(Debug\)\]\nstruct CachedDocument \{.*?\n\}\n\nfn skip_ws",
+              '''#[derive(Debug)]
+          struct CachedDocument {
+              text: String,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          enum CacheRefusal {
+              DocumentLimit,
+              ByteLimit,
+              AccountingOverflow,
+          }
+
+          impl CacheRefusal {
+              const fn message(self) -> &'static str {
+                  match self {
+                      Self::DocumentLimit => {
+                          "FrankenLean source cache is full; current source was checked but not retained"
+                      }
+                      Self::ByteLimit => {
+                          "FrankenLean source cache byte budget is exhausted; current source was checked but not retained"
+                      }
+                      Self::AccountingOverflow => {
+                          "FrankenLean source cache accounting overflowed; current source was checked but not retained"
+                      }
+                  }
               }
-          ''',
-              '''    fn replace_text(
+          }
+
+          #[derive(Debug)]
+          struct DocumentCache {
+              documents: BTreeMap<String, CachedDocument>,
+              total_bytes: usize,
+              max_documents: usize,
+              max_bytes: usize,
+          }
+
+          impl DocumentCache {
+              fn new() -> Self {
+                  Self::with_limits(MAX_OPEN_DOCUMENTS, MAX_OPEN_DOCUMENT_BYTES)
+              }
+
+              fn with_limits(max_documents: usize, max_bytes: usize) -> Self {
+                  Self {
+                      documents: BTreeMap::new(),
+                      total_bytes: 0,
+                      max_documents,
+                      max_bytes,
+                  }
+              }
+
+              fn store(
+                  &mut self,
+                  uri: String,
+                  _version: i64,
+                  text: String,
+              ) -> Result<(), CacheRefusal> {
+                  let old = self.documents.remove(&uri);
+                  let old_len = old.as_ref().map_or(0, |document| document.text.len());
+                  self.total_bytes = self
+                      .total_bytes
+                      .checked_sub(old_len)
+                      .ok_or(CacheRefusal::AccountingOverflow)?;
+
+                  if old.is_none() && self.documents.len() >= self.max_documents {
+                      return Err(CacheRefusal::DocumentLimit);
+                  }
+                  let next_total = self
+                      .total_bytes
+                      .checked_add(text.len())
+                      .ok_or(CacheRefusal::AccountingOverflow)?;
+                  if next_total > self.max_bytes {
+                      return Err(CacheRefusal::ByteLimit);
+                  }
+                  self.documents.insert(uri, CachedDocument { text });
+                  self.total_bytes = next_total;
+                  Ok(())
+              }
+
+              fn text(&self, uri: &str) -> Option<&str> {
+                  self.documents.get(uri).map(|document| document.text.as_str())
+              }
+
+              fn replace_text(
                   &mut self,
                   uri: String,
                   version: i64,
@@ -59,19 +146,25 @@ jobs:
               ) -> Result<(), CacheRefusal> {
                   self.store(uri, version, text)
               }
-          ''',
-          )
-          replace_once(
-              dispatch,
-              '''fn extract_top_level_string_field(json: &str, key: &str) -> Option<String> {
-              match object_field(json, key) {
-                  Field::Value(value) => decode_json_string_value(value),
-                  Field::Missing | Field::Invalid => None,
+
+              fn remove(&mut self, uri: &str) -> Result<(), CacheRefusal> {
+                  let Some(text) = self.documents.remove(uri) else {
+                      return Ok(());
+                  };
+                  self.total_bytes = self
+                      .total_bytes
+                      .checked_sub(text.text.len())
+                      .ok_or(CacheRefusal::AccountingOverflow)?;
+                  Ok(())
               }
           }
 
-          ''',
-              "",
+          fn skip_ws''',
+          )
+          replace_pattern(
+              dispatch,
+              r"fn extract_top_level_string_field\(.*?\n\}\n\nfn params_object",
+              "fn params_object",
           )
           replace_once(
               dispatch,
@@ -83,17 +176,9 @@ jobs:
               '        id.as_json(),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
               '        id.as_json(),\n        json_string(LSP_POSITION_ENCODING),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
           )
-          replace_once(
+          replace_pattern(
               dispatch,
-              '''fn error_response_null_id(code: i32, message: &str) -> String {
-              format!(
-                  "{{\\"jsonrpc\\":\\"2.0\\",\\"id\\":null,\\"error\\":{{\\"code\\":{},\\"message\\":{}}}}}",
-                  code,
-                  json_string(message)
-              )
-          }
-
-          ''',
+              r"fn error_response_null_id\(.*?\n\}\n\nfn null_response",
               '''fn error_response_null_id(code: i32, message: &str) -> String {
               format!(
                   "{{\\"jsonrpc\\":\\"2.0\\",\\"id\\":null,\\"error\\":{{\\"code\\":{},\\"message\\":{}}}}}",
@@ -109,7 +194,7 @@ jobs:
               }
           }
 
-          ''',
+          fn null_response''',
           )
           replace_once(
               dispatch,
@@ -121,87 +206,46 @@ jobs:
               let mut documents = DocumentCache::new();
           ''',
           )
-          replace_once(
+          replace_pattern(
               dispatch,
-              '''        let method = extract_top_level_string_field(&text, "method");
-              let id = match extract_request_id(&text) {
-                  RequestIdField::Absent => None,
-                  RequestIdField::Valid(id) => Some(id),
-                  RequestIdField::Invalid => {
-                      let response = error_response_null_id(-32600, "invalid JSON-RPC request id");
-                      transport::write_message(output, response.as_bytes())?;
-                      continue;
-                  }
-              };
-
-          ''',
+              r"        let method = extract_top_level_string_field.*?\n\n        match \(method\.as_deref\(\), id\.as_ref\(\), state\) \{",
               '''        let id = match extract_request_id(&text) {
-                  RequestIdField::Absent => None,
-                  RequestIdField::Valid(id) => Some(id),
-                  RequestIdField::Invalid => {
-                      let response = error_response_null_id(-32600, "invalid JSON-RPC request id");
-                      transport::write_message(output, response.as_bytes())?;
-                      continue;
-                  }
-              };
-              match decoded_string_field(&text, "jsonrpc") {
-                  DecodedField::Valid(version) if version == "2.0" => {}
-                  DecodedField::Missing | DecodedField::Valid(_) | DecodedField::Invalid => {
-                      let response = invalid_request_response(
-                          id.as_ref(),
-                          "invalid or missing JSON-RPC version; expected 2.0",
-                      );
-                      transport::write_message(output, response.as_bytes())?;
-                      continue;
-                  }
+              RequestIdField::Absent => None,
+              RequestIdField::Valid(id) => Some(id),
+              RequestIdField::Invalid => {
+                  let response = error_response_null_id(-32600, "invalid JSON-RPC request id");
+                  transport::write_message(output, response.as_bytes())?;
+                  continue;
               }
-              let method = match decoded_string_field(&text, "method") {
-                  DecodedField::Valid(method) => Some(method),
-                  DecodedField::Missing | DecodedField::Invalid => {
-                      let response = invalid_request_response(
-                          id.as_ref(),
-                          "invalid or missing JSON-RPC method",
-                      );
-                      transport::write_message(output, response.as_bytes())?;
-                      continue;
-                  }
-              };
+          };
+          match decoded_string_field(&text, "jsonrpc") {
+              DecodedField::Valid(version) if version == "2.0" => {}
+              DecodedField::Missing | DecodedField::Valid(_) | DecodedField::Invalid => {
+                  let response = invalid_request_response(
+                      id.as_ref(),
+                      "invalid or missing JSON-RPC version; expected 2.0",
+                  );
+                  transport::write_message(output, response.as_bytes())?;
+                  continue;
+              }
+          }
+          let method = match decoded_string_field(&text, "method") {
+              DecodedField::Valid(method) => Some(method),
+              DecodedField::Missing | DecodedField::Invalid => {
+                  let response = invalid_request_response(
+                      id.as_ref(),
+                      "invalid or missing JSON-RPC method",
+                  );
+                  transport::write_message(output, response.as_bytes())?;
+                  continue;
+              }
+          };
 
-          ''',
+          match (method.as_deref(), id.as_ref(), state) {''',
           )
-          replace_once(
-              dispatch,
-              '''            (Some("textDocument/didOpen"), None, ServerState::Running) => {
-                  if let Some(uri) = extract_text_document_uri(&text) {
-                      match (
-                          extract_text_document_version_field(&text),
-                          extract_text_document_text_field(&text),
-                      ) {
-                          (VersionField::Valid(version), DecodedField::Valid(content)) => {
-                              if let Err(refusal) =
-                                  documents.store(uri.clone(), version, content.clone())
-                              {
-                                  transport::write_message(
-                                      output,
-                                      log_warning(refusal.message()).as_bytes(),
-                                  )?;
-                              }
-                              check_document(output, &uri, &content, on_did_open)?;
-                              documents_opened = documents_opened.saturating_add(1);
-                          }
-                          _ => {
-                              invalidate_retained_source(
-                                  output,
-                                  &mut documents,
-                                  &uri,
-                                  "FrankenLean refused didOpen without a valid integer version and full document; any retained source for this URI was invalidated",
-                              )?;
-                          }
-                      }
-                  }
-              }
-          ''',
-              '''            (Some("textDocument/didOpen"), None, ServerState::Running) => {
+
+          arms = {
+              "didOpen": '''            (Some("textDocument/didOpen"), None, ServerState::Running) => {
                   if let Some(uri) = extract_text_document_uri(&text) {
                       if open_documents.contains_key(&uri) {
                           transport::write_message(
@@ -252,53 +296,7 @@ jobs:
                   }
               }
           ''',
-          )
-          replace_once(
-              dispatch,
-              '''            (Some("textDocument/didChange"), None, ServerState::Running) => {
-                  if let Some(uri) = extract_text_document_uri(&text) {
-                      match (
-                          extract_text_document_version_field(&text),
-                          extract_content_changes_text_field(&text),
-                      ) {
-                          (VersionField::Valid(version), DecodedField::Valid(content)) => {
-                              if documents
-                                  .version(&uri)
-                                  .is_some_and(|current| version <= current)
-                              {
-                                  transport::write_message(
-                                      output,
-                                      log_warning(
-                                          "FrankenLean refused non-monotone didChange version; latest retained source remains authoritative",
-                                      )
-                                      .as_bytes(),
-                                  )?;
-                                  continue;
-                              }
-                              if let Err(refusal) =
-                                  documents.store(uri.clone(), version, content.clone())
-                              {
-                                  transport::write_message(
-                                      output,
-                                      log_warning(refusal.message()).as_bytes(),
-                                  )?;
-                              }
-                              check_document(output, &uri, &content, on_did_open)?;
-                              documents_changed = documents_changed.saturating_add(1);
-                          }
-                          _ => {
-                              invalidate_retained_source(
-                                  output,
-                                  &mut documents,
-                                  &uri,
-                                  "FrankenLean refused didChange without a valid integer version and exactly one Full-sync text change; retained source was invalidated",
-                              )?;
-                          }
-                      }
-                  }
-              }
-          ''',
-              '''            (Some("textDocument/didChange"), None, ServerState::Running) => {
+              "didChange": '''            (Some("textDocument/didChange"), None, ServerState::Running) => {
                   if let Some(uri) = extract_text_document_uri(&text) {
                       let Some(current_version) = open_documents.get(&uri).copied() else {
                           transport::write_message(
@@ -349,49 +347,7 @@ jobs:
                   }
               }
           ''',
-          )
-          replace_once(
-              dispatch,
-              '''            (Some("textDocument/didSave"), None, ServerState::Running) => {
-                  if let Some(uri) = extract_text_document_uri(&text) {
-                      match extract_save_text_field(&text) {
-                          DecodedField::Valid(content) => {
-                              if let Err(refusal) = documents.replace_text(uri.clone(), content.clone()) {
-                                  transport::write_message(
-                                      output,
-                                      log_warning(refusal.message()).as_bytes(),
-                                  )?;
-                              }
-                              check_document(output, &uri, &content, on_did_open)?;
-                              documents_saved = documents_saved.saturating_add(1);
-                          }
-                          DecodedField::Missing => {
-                              if let Some(content) = documents.text(&uri) {
-                                  check_document(output, &uri, content, on_did_open)?;
-                                  documents_saved = documents_saved.saturating_add(1);
-                              } else {
-                                  transport::write_message(
-                                      output,
-                                      log_warning(
-                                          "FrankenLean could not re-check textless didSave because no retained source exists",
-                                      )
-                                      .as_bytes(),
-                                  )?;
-                              }
-                          }
-                          DecodedField::Invalid => {
-                              invalidate_retained_source(
-                                  output,
-                                  &mut documents,
-                                  &uri,
-                                  "FrankenLean refused malformed didSave text; retained source was invalidated instead of replaying stale content",
-                              )?;
-                          }
-                      }
-                  }
-              }
-          ''',
-              '''            (Some("textDocument/didSave"), None, ServerState::Running) => {
+              "didSave": '''            (Some("textDocument/didSave"), None, ServerState::Running) => {
                   if let Some(uri) = extract_text_document_uri(&text) {
                       let Some(version) = open_documents.get(&uri).copied() else {
                           transport::write_message(
@@ -442,22 +398,7 @@ jobs:
                   }
               }
           ''',
-          )
-          replace_once(
-              dispatch,
-              '''            (Some("textDocument/didClose"), None, ServerState::Running) => {
-                  if let Some(uri) = extract_text_document_uri(&text) {
-                      if let Err(refusal) = documents.remove(&uri) {
-                          transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
-                      }
-                      transport::write_message(
-                          output,
-                          clear_diagnostics_notification(&uri).as_bytes(),
-                      )?;
-                  }
-              }
-          ''',
-              '''            (Some("textDocument/didClose"), None, ServerState::Running) => {
+              "didClose": '''            (Some("textDocument/didClose"), None, ServerState::Running) => {
                   if let Some(uri) = extract_text_document_uri(&text) {
                       if open_documents.remove(&uri).is_none() {
                           transport::write_message(
@@ -478,7 +419,28 @@ jobs:
                   }
               }
           ''',
+          }
+          replace_pattern(
+              dispatch,
+              r'            \(Some\("textDocument/didOpen"\).*?(?=            \(Some\("textDocument/didChange"\))',
+              arms["didOpen"],
           )
+          replace_pattern(
+              dispatch,
+              r'            \(Some\("textDocument/didChange"\).*?(?=            \(Some\("textDocument/didSave"\))',
+              arms["didChange"],
+          )
+          replace_pattern(
+              dispatch,
+              r'            \(Some\("textDocument/didSave"\).*?(?=            \(Some\("textDocument/didClose"\))',
+              arms["didSave"],
+          )
+          replace_pattern(
+              dispatch,
+              r'            \(Some\("textDocument/didClose"\).*?(?=            \(Some\("\$/lean/plainGoal"\))',
+              arms["didClose"],
+          )
+
           replace_once(
               dispatch,
               '''        assert_eq!(
@@ -496,6 +458,42 @@ jobs:
               dispatch,
               '        assert!(output.contains("FrankenLean"));\n',
               '        assert!(output.contains("FrankenLean"));\n        assert!(output.contains("\\\"positionEncoding\\\":\\\"utf-16\\\""));\n',
+          )
+          replace_pattern(
+              dispatch,
+              r"    #\[test\]\n    fn textless_save_without_retained_source_is_visible_and_not_counted\(\).*?\n    \}\n",
+              '''    #[test]
+          fn save_for_unopened_document_is_visible_and_not_counted() {
+              let (outcome, output, seen) = run_session(
+                  r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing.lean"}}}"#,
+              );
+              assert!(outcome.clean);
+              assert_eq!(outcome.documents_saved, 0);
+              assert!(seen.is_empty());
+              assert!(output.contains("window/logMessage"));
+              assert!(output.contains("didSave for a document that is not open"));
+          }
+          ''',
+          )
+          replace_pattern(
+              dispatch,
+              r"    #\[test\]\n    fn did_close_evicts_source_and_clears_push_diagnostics\(\).*?\n    \}\n",
+              '''    #[test]
+          fn did_close_evicts_source_and_clears_push_diagnostics() {
+              let (outcome, output, seen) = run_session(
+                  &[
+                      r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"open"}}}"#,
+                      r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                      r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                  ]
+                  .join("\\n"),
+              );
+              assert!(outcome.clean);
+              assert_eq!(seen.len(), 1, "closed source must not be reused by didSave");
+              assert!(output.contains("\\"uri\\":\\"file:///test.lean\\",\\"diagnostics\\":[]"));
+              assert!(output.contains("didSave for a document that is not open"));
+          }
+          ''',
           )
           replace_once(
               dispatch,
@@ -559,36 +557,6 @@ jobs:
               fn document_fields_are_bound_to_exact_params_structure() {
           ''',
           )
-          replace_once(
-              dispatch,
-              '''    fn textless_save_without_retained_source_is_visible_and_not_counted() {
-              let (outcome, output, seen) = run_session(
-                  r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing.lean"}}}"#,
-              );
-              assert!(outcome.clean);
-              assert_eq!(outcome.documents_saved, 0);
-              assert!(seen.is_empty());
-              assert!(output.contains("window/logMessage"));
-              assert!(output.contains("no retained source exists"));
-          }
-          ''',
-              '''    fn save_for_unopened_document_is_visible_and_not_counted() {
-              let (outcome, output, seen) = run_session(
-                  r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing.lean"}}}"#,
-              );
-              assert!(outcome.clean);
-              assert_eq!(outcome.documents_saved, 0);
-              assert!(seen.is_empty());
-              assert!(output.contains("window/logMessage"));
-              assert!(output.contains("didSave for a document that is not open"));
-          }
-          ''',
-          )
-          replace_once(
-              dispatch,
-              '        assert!(output.contains("no retained source exists"));\n    }\n\n    #[test]\n    fn document_cache_bounds_new_entries_and_invalidates_stale_replacements()',
-              '        assert!(output.contains("didSave for a document that is not open"));\n    }\n\n    #[test]\n    fn document_cache_bounds_new_entries_and_invalidates_stale_replacements()',
-          )
 
           cli = "crates/fln-cli/src/lib.rs"
           replace_once(
@@ -610,13 +578,13 @@ jobs:
 
           beads = Path(".beads/issues.jsonl")
           lines = beads.read_text(encoding="utf-8").splitlines(keepends=True)
-          matches = [index for index, line in enumerate(lines) if '"id":"franken_lean-v2p"' in line]
+          matches = [i for i, line in enumerate(lines) if '"id":"franken_lean-v2p"' in line]
           if len(matches) != 1:
               raise SystemExit(f"expected one franken_lean-v2p row, observed {len(matches)}")
-          index = matches[0]
-          if '"status":"open"' in lines[index]:
-              lines[index] = lines[index].replace('"status":"open"', '"status":"in_progress"', 1)
-          elif '"status":"in_progress"' not in lines[index]:
+          i = matches[0]
+          if '"status":"open"' in lines[i]:
+              lines[i] = lines[i].replace('"status":"open"', '"status":"in_progress"', 1)
+          elif '"status":"in_progress"' not in lines[i]:
               raise SystemExit("franken_lean-v2p has an unexpected lifecycle state")
           beads.write_text("".join(lines), encoding="utf-8")
           PY
