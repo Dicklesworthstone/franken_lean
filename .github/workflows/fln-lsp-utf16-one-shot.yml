@@ -1,0 +1,104 @@
+name: fln LSP UTF-16 one-shot landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-utf16-one-shot.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-utf16-one-shot
+  cancel-in-progress: false
+
+jobs:
+  land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout exact main head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: wire negotiated UTF-16 source projection
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"{path}: expected one patch anchor, observed {observed}: {old!r}")
+              file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          dispatch = "crates/fln-server/src/dispatch.rs"
+          replace_once(
+              dispatch,
+              "use crate::json_string;\n",
+              "use crate::{LSP_POSITION_ENCODING, json_string};\n",
+          )
+          replace_once(
+              dispatch,
+              '            "\\"capabilities\\":{{",\n',
+              '            "\\"capabilities\\":{{\\"positionEncoding\\":{},",\n',
+          )
+          replace_once(
+              dispatch,
+              '        id.as_json(),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+              '        id.as_json(),\n        json_string(LSP_POSITION_ENCODING),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+          )
+          replace_once(
+              dispatch,
+              '        assert!(output.contains("FrankenLean"));\n',
+              '        assert!(output.contains("FrankenLean"));\n        assert!(output.contains("\\\"positionEncoding\\\":\\\"utf-16\\\""));\n',
+          )
+
+          cli = "crates/fln-cli/src/lib.rs"
+          replace_once(
+              cli,
+              "        let mut messages = match fln_server::project(lsp_request, &snapshot) {\n",
+              "        let mut messages = match fln_server::project_with_sources(\n"
+              "            lsp_request,\n"
+              "            &snapshot,\n"
+              "            &[fln_server::LspSource::new(uri, text)],\n"
+              "        ) {\n",
+          )
+          replace_once(
+              cli,
+              "    // Strip the `file://` prefix if present, because `complete_messages`\n"
+              "    // in fln-server re-adds `file://` when building the notification URI.\n",
+              "    // Normalize file URIs for the semantic diagnostic while the projector\n"
+              "    // retains the exact editor URI and unsaved source snapshot separately.\n",
+          )
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: compile and test the bounded LSP surface
+        shell: bash
+        run: |
+          cargo test -p fln-server --lib
+          cargo test -p fln-cli --lib --no-run
+
+      - name: publish one reviewed incremental commit
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git rm .github/workflows/fln-lsp-utf16-one-shot.yml
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
+          git commit -m "fix(server): wire UTF-16 LSP negotiation" \
+            -m "Advertise the UTF-16 position encoding during initialize and pass each exact unsaved editor snapshot into source-aware diagnostic projection. Keep the capability, primary ranges, related ranges, and live CLI server path under one tested contract." \
+            -m "Bead: franken_lean-wlan"
+          git push origin HEAD:main
