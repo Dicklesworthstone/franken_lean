@@ -70,6 +70,13 @@ enum Field<'a> {
     Invalid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedField {
+    Missing,
+    Valid(String),
+    Invalid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheRefusal {
     DocumentLimit,
@@ -465,20 +472,28 @@ fn extract_text_document_uri(json: &str) -> Option<String> {
     }
 }
 
-fn extract_text_document_text(json: &str) -> Option<String> {
-    let text_document = text_document_object(json)?;
-    match object_field(text_document, "text") {
-        Field::Value(value) => decode_json_string_value(value),
-        Field::Missing | Field::Invalid => None,
+fn decoded_string_field(object: &str, key: &str) -> DecodedField {
+    match object_field(object, key) {
+        Field::Missing => DecodedField::Missing,
+        Field::Invalid => DecodedField::Invalid,
+        Field::Value(value) => decode_json_string_value(value)
+            .map(DecodedField::Valid)
+            .unwrap_or(DecodedField::Invalid),
     }
 }
 
-fn extract_save_text(json: &str) -> Option<String> {
-    let params = params_object(json)?;
-    match object_field(params, "text") {
-        Field::Value(value) => decode_json_string_value(value),
-        Field::Missing | Field::Invalid => None,
-    }
+fn extract_text_document_text_field(json: &str) -> DecodedField {
+    let Some(text_document) = text_document_object(json) else {
+        return DecodedField::Invalid;
+    };
+    decoded_string_field(text_document, "text")
+}
+
+fn extract_save_text_field(json: &str) -> DecodedField {
+    let Some(params) = params_object(json) else {
+        return DecodedField::Invalid;
+    };
+    decoded_string_field(params, "text")
 }
 
 fn single_array_element(value: &str) -> Option<&str> {
@@ -505,17 +520,19 @@ fn single_array_element(value: &str) -> Option<&str> {
     value.get(start..end)
 }
 
-fn extract_content_changes_text(json: &str) -> Option<String> {
-    let params = params_object(json)?;
-    let changes = match object_field(params, "contentChanges") {
-        Field::Value(value) => value,
-        Field::Missing | Field::Invalid => return None,
+fn extract_content_changes_text_field(json: &str) -> DecodedField {
+    let Some(params) = params_object(json) else {
+        return DecodedField::Invalid;
     };
-    let change = single_array_element(changes)?;
-    match object_field(change, "text") {
-        Field::Value(value) => decode_json_string_value(value),
-        Field::Missing | Field::Invalid => None,
-    }
+    let changes = match object_field(params, "contentChanges") {
+        Field::Missing => return DecodedField::Missing,
+        Field::Invalid => return DecodedField::Invalid,
+        Field::Value(value) => value,
+    };
+    let Some(change) = single_array_element(changes) else {
+        return DecodedField::Invalid;
+    };
+    decoded_string_field(change, "text")
 }
 
 fn initialize_response(id: &RequestId) -> String {
@@ -605,6 +622,18 @@ fn check_document(
     transport::write_message(output, file_progress_notification(uri, false).as_bytes())
 }
 
+fn invalidate_retained_source(
+    output: &mut dyn Write,
+    documents: &mut DocumentCache,
+    uri: &str,
+    reason: &str,
+) -> io::Result<()> {
+    if let Err(refusal) = documents.remove(uri) {
+        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+    }
+    transport::write_message(output, log_warning(reason).as_bytes())
+}
+
 pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
 
 pub fn serve(
@@ -668,48 +697,88 @@ pub fn serve(
                 });
             }
             (Some("textDocument/didOpen"), None, ServerState::Running) => {
-                if let (Some(uri), Some(content)) = (
-                    extract_text_document_uri(&text),
-                    extract_text_document_text(&text),
-                ) {
-                    if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
-                        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+                if let Some(uri) = extract_text_document_uri(&text) {
+                    match extract_text_document_text_field(&text) {
+                        DecodedField::Valid(content) => {
+                            if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                                transport::write_message(
+                                    output,
+                                    log_warning(refusal.message()).as_bytes(),
+                                )?;
+                            }
+                            check_document(output, &uri, &content, on_did_open)?;
+                            documents_opened = documents_opened.saturating_add(1);
+                        }
+                        DecodedField::Missing | DecodedField::Invalid => {
+                            invalidate_retained_source(
+                                output,
+                                &mut documents,
+                                &uri,
+                                "FrankenLean refused didOpen without a valid full document; any retained source for this URI was invalidated",
+                            )?;
+                        }
                     }
-                    check_document(output, &uri, &content, on_did_open)?;
-                    documents_opened = documents_opened.saturating_add(1);
                 }
             }
             (Some("textDocument/didChange"), None, ServerState::Running) => {
-                if let (Some(uri), Some(content)) = (
-                    extract_text_document_uri(&text),
-                    extract_content_changes_text(&text),
-                ) {
-                    if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
-                        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+                if let Some(uri) = extract_text_document_uri(&text) {
+                    match extract_content_changes_text_field(&text) {
+                        DecodedField::Valid(content) => {
+                            if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                                transport::write_message(
+                                    output,
+                                    log_warning(refusal.message()).as_bytes(),
+                                )?;
+                            }
+                            check_document(output, &uri, &content, on_did_open)?;
+                            documents_changed = documents_changed.saturating_add(1);
+                        }
+                        DecodedField::Missing | DecodedField::Invalid => {
+                            invalidate_retained_source(
+                                output,
+                                &mut documents,
+                                &uri,
+                                "FrankenLean refused didChange without exactly one valid Full-sync text change; retained source was invalidated",
+                            )?;
+                        }
                     }
-                    check_document(output, &uri, &content, on_did_open)?;
-                    documents_changed = documents_changed.saturating_add(1);
                 }
             }
             (Some("textDocument/didSave"), None, ServerState::Running) => {
                 if let Some(uri) = extract_text_document_uri(&text) {
-                    if let Some(content) = extract_save_text(&text) {
-                        if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
-                            transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+                    match extract_save_text_field(&text) {
+                        DecodedField::Valid(content) => {
+                            if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                                transport::write_message(
+                                    output,
+                                    log_warning(refusal.message()).as_bytes(),
+                                )?;
+                            }
+                            check_document(output, &uri, &content, on_did_open)?;
+                            documents_saved = documents_saved.saturating_add(1);
                         }
-                        check_document(output, &uri, &content, on_did_open)?;
-                        documents_saved = documents_saved.saturating_add(1);
-                    } else if let Some(content) = documents.get(&uri) {
-                        check_document(output, &uri, content, on_did_open)?;
-                        documents_saved = documents_saved.saturating_add(1);
-                    } else {
-                        transport::write_message(
-                            output,
-                            log_warning(
-                                "FrankenLean could not re-check textless didSave because no retained source exists",
-                            )
-                            .as_bytes(),
-                        )?;
+                        DecodedField::Missing => {
+                            if let Some(content) = documents.get(&uri) {
+                                check_document(output, &uri, content, on_did_open)?;
+                                documents_saved = documents_saved.saturating_add(1);
+                            } else {
+                                transport::write_message(
+                                    output,
+                                    log_warning(
+                                        "FrankenLean could not re-check textless didSave because no retained source exists",
+                                    )
+                                    .as_bytes(),
+                                )?;
+                            }
+                        }
+                        DecodedField::Invalid => {
+                            invalidate_retained_source(
+                                output,
+                                &mut documents,
+                                &uri,
+                                "FrankenLean refused malformed didSave text; retained source was invalidated instead of replaying stale content",
+                            )?;
+                        }
                     }
                 }
             }
@@ -936,7 +1005,10 @@ mod tests {
             extract_text_document_uri(json).as_deref(),
             Some("file:///right.lean")
         );
-        assert_eq!(extract_text_document_text(json).as_deref(), Some("right"));
+        assert_eq!(
+            extract_text_document_text_field(json),
+            DecodedField::Valid("right".to_string())
+        );
     }
 
     #[test]
@@ -1012,8 +1084,8 @@ mod tests {
             r#"{"params":{"textDocument":{"uri":"file:///x.lean"},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
         ] {
             assert_eq!(
-                extract_content_changes_text(json),
-                None,
+                extract_content_changes_text_field(json),
+                DecodedField::Invalid,
                 "invalid Full-sync change array was accepted: {json}"
             );
         }
@@ -1023,8 +1095,8 @@ mod tests {
     fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
         let json = r#"{"params":{"textDocument":{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}}}"#;
         assert_eq!(
-            extract_text_document_text(json).as_deref(),
-            Some("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"")
+            extract_text_document_text_field(json),
+            DecodedField::Valid("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"".to_string())
         );
     }
 
@@ -1094,6 +1166,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_change_invalidates_cache_before_textless_save() {
+        let (outcome, output, seen) = run_session(
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":2}}}"#,
+            ]
+            .join("\n"),
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_opened, 1);
+        assert_eq!(outcome.documents_changed, 0);
+        assert_eq!(outcome.documents_saved, 0);
+        assert_eq!(seen.len(), 1, "stale pre-change source must never be replayed");
+        assert!(output.contains("retained source was invalidated"));
+        assert!(output.contains("no retained source exists"));
+    }
+
+    #[test]
+    fn malformed_present_save_text_never_falls_back_to_cache() {
+        let (outcome, output, seen) = run_session(
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"\q"}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1}}}"#,
+            ]
+            .join("\n"),
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_saved, 0);
+        assert_eq!(seen.len(), 1, "malformed save text must invalidate cached source");
+        assert!(output.contains("malformed didSave text"));
+        assert!(output.contains("no retained source exists"));
+    }
+
+    #[test]
     fn did_close_evicts_source_and_clears_push_diagnostics() {
         let (outcome, output, seen) = run_session(
             &[
@@ -1110,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn document_cache_is_failure_atomic_at_both_limits() {
+    fn document_cache_bounds_new_entries_and_invalidates_stale_replacements() {
         let mut count_limited = DocumentCache::with_limits(1, 100);
         count_limited
             .store("a".to_string(), "one".to_string())
