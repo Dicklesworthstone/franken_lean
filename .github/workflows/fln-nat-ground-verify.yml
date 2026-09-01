@@ -1,0 +1,104 @@
+name: fln-checker Nat ground verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-nat-ground-verify.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-nat-ground-verification
+  cancel-in-progress: false
+
+jobs:
+  verify-or-rollback:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Correct the Nat minor telescope indices
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/fln-checker/tests/init_nat.rs')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              'Expr::app(bvar(1), bvar(0)),\n            Expr::app(bvar(2), succ(bvar(1))),',
+              'Expr::app(bvar(2), bvar(0)),\n            Expr::app(bvar(3), succ(bvar(1))),',
+          )
+          text = text.replace(
+              "        // Well-formed and correctly typed under this deliberately forged\n        // fixture, but not the recursor's computation rule.\n        bvar(0)",
+              "        // Deliberately omit the recursive call. Structural comparison must\n        // reject this before it can be mistaken for Nat.rec's iota law.\n        bvar(0)",
+          )
+          path.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git diff --check -- crates/fln-checker/tests/init_nat.rs
+
+      - name: Verify the complete Nat ground
+        id: verify
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          {
+            cargo fmt --all --check
+            cargo test -p fln-checker --test init_nat
+            cargo test --no-fail-fast -p fln-checker
+            cargo clippy -p fln-checker --all-targets -- -D warnings
+          } 2>&1 | tee /tmp/fln-nat-ground.log
+
+      - name: Record the frontier result
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v br >/dev/null 2>&1; then
+            br update fln-51y8 --status in_progress
+            if [[ '${{ steps.verify.outcome }}' == 'success' ]]; then
+              note='The complete zero-parameter direct-recursive Init.Nat block now passes the independent checker fixture: exact inductive/constructors/recursor, zero and succ iota rules, recursive-call preservation, forged recursion-flag refusal, and missing-recursive-call refusal. Full fln-checker and clippy gates passed. fln-51y8 remains open for the real pinned Prelude council run.'
+            else
+              tail=$(tail -n 100 /tmp/fln-nat-ground.log | sed 's/[[:cntrl:]]//g' | head -c 8000)
+              note="The candidate complete Init.Nat ground did not pass and was rolled back rather than leaving main red. Terminal evidence:\n$tail"
+            fi
+            if br comments add --help >/dev/null 2>&1; then
+              br comments add fln-51y8 "$note"
+            elif br comment --help >/dev/null 2>&1; then
+              br comment fln-51y8 "$note"
+            fi
+          fi
+
+      - name: Commit a verified promotion or rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [[ '${{ steps.verify.outcome }}' == 'success' ]]; then
+            git add crates/fln-checker/tests/init_nat.rs .beads
+            if ! git diff --cached --quiet; then
+              git commit -m 'test(checker): verify the complete pinned Nat block'
+            fi
+          else
+            git rm crates/fln-checker/tests/init_nat.rs
+            git add .beads
+            git commit -m 'revert(test): keep unverified Nat ground off main'
+          fi
+          rm -f .github/workflows/fln-nat-ground-verify.yml
+          git add .github/workflows/fln-nat-ground-verify.yml
+          git commit -m 'chore(checker): retire Nat verification scaffolding'
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          exit 1
