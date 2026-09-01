@@ -64,30 +64,35 @@ The repository contains source-to-kernel and source-to-Golem paths for a growing
 
 ### Lantern / LSP server
 
-**Status: usable bounded transport and document-checking bridge; advanced editor semantics remain incomplete.**
+**Status: usable bounded transport with stateful Full synchronization; advanced editor semantics remain incomplete.**
 
 Landed:
 
 - Content-Length framed stdio transport.
 - LSP lifecycle (`initialize`, `initialized`, `shutdown`, `exit`).
-- full-sync `didOpen`, `didChange`, `didSave`, `didClose` handling.
+- Full-sync `didOpen`, `didChange`, `didSave`, and `didClose` handling.
 - document checks routed through the bounded source engine with push diagnostics.
 - `$/lean/fileProgress` processing/complete notifications.
 - `lean --server` entrypoint compatibility.
 - fail-closed JSON string decoding with standard escapes, UTF-16 surrogate-pair handling, and raw-control rejection.
-- envelope-aware JSON-RPC routing: top-level `method`/`id` cannot be impersonated by nested payload fields.
+- structural JSON-RPC routing: root `method`/`id` cannot be impersonated by nested payload fields, and document fields are read from the exact `params.textDocument`, `params.text`, and single-element Full-sync `params.contentChanges` containers rather than arbitrary substring matches.
 - integer **and string** JSON-RPC request IDs are preserved in responses.
 - malformed request IDs are a distinct invalid class and receive `-32600` with `id:null`; fractions, exponents, leading-zero integers, overflow, `null`, objects, and malformed string tails do not degrade into notifications.
-- unimplemented `$/lean/rpc/connect` and `$/lean/rpc/call` now return LSP `RequestFailed` (`-32803`) instead of fabricating a session or successful null call.
+- a bounded session-local latest-source cache (at most 1,024 documents / 256 MiB of retained source) supports textless `didSave` rechecks without pretending unbounded persistence.
+- retained Full-sync source is versioned: `didOpen` and `didChange` require integer document versions; duplicate or regressing `didChange` notifications cannot overwrite or re-diagnose older source over a newer retained snapshot.
+- malformed or structurally incomplete open/change/save transitions invalidate any retained source for that URI rather than allowing a later textless save to replay stale content.
+- `didClose` evicts retained source and emits an empty `textDocument/publishDiagnostics` update so push diagnostics do not remain stale after a file closes.
+- unimplemented `$/lean/rpc/connect` and `$/lean/rpc/call` return LSP `RequestFailed` (`-32803`) instead of fabricating a session or successful null call.
 
 Still incomplete:
 
 - `$/lean/plainGoal` / `$/lean/plainTermGoal` do not yet expose cursor-position-aware proof state.
 - hover, completion, and definition currently return no-information `null` responses rather than semantic results.
 - Lean RPC sessions/calls are explicitly **not implemented**.
+- retained source is session-local input state, not the declaration-granular shared elaboration/import environment required by the finished Lantern design.
 - the server is not yet the full shared-heap, declaration-granular, deterministic-parallel Lantern described by the plan.
 
-The latest LSP parser/RPC changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that session lacked a Rust toolchain.
+The latest LSP parser/state changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that session lacked a Rust toolchain.
 
 ### Agent-control plane
 
@@ -115,8 +120,9 @@ These subsystems contain real contract planes, data structures, bounded executio
 1. **Advance `fln-51y8` with real pinned evidence.** Execute the pinned Nat council locally, then continue the exact Prelude first-failure frontier rather than generalizing from fixtures.
 2. **Keep independent-checker authority boundaries intact.** The checker may veto/observe; it must never become a second admission authority.
 3. **Replace LSP no-information scaffolding with truthful semantics one method at a time.** Never fabricate sessions, goals, hover data, completions, or definitions to suppress editor errors.
-4. **Keep the JSON-RPC parser narrow but structurally correct.** If the supported wire vocabulary outgrows the bounded hand parser, replace the parser deliberately rather than adding substring heuristics that blur envelope and payload.
-5. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin/artifact identity, and outcome class.
+4. **Promote source retention into real declaration/elaboration state deliberately.** The bounded latest-text cache is enough to make Full-sync lifecycle semantics truthful; it is not a substitute for dependency-aware incremental elaboration, import invalidation, or cursor-position proof state.
+5. **Keep the JSON-RPC parser narrow but structurally correct.** If the supported wire vocabulary outgrows the bounded hand parser, replace the parser deliberately rather than adding substring heuristics that blur envelope and payload.
+6. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin/artifact identity, and outcome class.
 
 ---
 
