@@ -1,0 +1,324 @@
+name: fln LSP consolidated hardening landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-consolidated-hardening-landing.yml
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: fln-lsp-consolidated-hardening-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: checkout main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: cancel superseded bounded-LSP landing runs and fast-forward
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          for status in queued in_progress; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs?status=$status&per_page=100" \
+              --jq '.workflow_runs[] | select((.name | startswith("fln LSP")) and (.id != (env.GITHUB_RUN_ID | tonumber))) | .id' |
+              while IFS= read -r run_id; do
+                [[ -n "$run_id" ]] || continue
+                gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/cancel" >/dev/null || true
+              done
+          done
+          git fetch origin main
+          git merge --ff-only origin/main
+
+      - name: configure reviewed commit identity
+        shell: bash
+        run: |
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+
+      - name: land source-aware UTF-16 and version-bound diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_and_run() {
+            local file="$1" step_name="$2" output
+            output="$(mktemp)"
+            ruby -ryaml -e '
+              document = YAML.load_file(ARGV[0])
+              step_name = ARGV[1]
+              step = document.fetch("jobs").fetch("land").fetch("steps").find { |candidate| candidate["name"] == step_name }
+              abort("missing landing step: #{step_name}") unless step
+              print step.fetch("run")
+            ' "$file" "$step_name" > "$output"
+            bash -euo pipefail "$output"
+          }
+          if ! grep -Fq 'pub const fn versioned(uri:' crates/fln-server/src/lib.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-versioned-diagnostics-landing.yml \
+              'implement version-bound diagnostic publication'
+          fi
+          grep -Fq 'pub const fn versioned(uri:' crates/fln-server/src/lib.rs
+          grep -Fq 'FnMut(&str, Option<i64>, &str)' crates/fln-server/src/dispatch.rs
+          grep -Fq 'LspSource::versioned(uri, version, text)' crates/fln-cli/src/lib.rs
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test --locked -p fln-server --lib
+          cargo test --locked -p fln-cli --lib --no-run
+          git add crates/fln-server/src/lib.rs crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs \
+            .github/workflows/fln-lsp-versioned-diagnostics-landing.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(server): bind UTF-16 diagnostics to source versions" \
+              -m "Wire the live CLI server to exact unsaved source snapshots, convert Lean codepoint columns to UTF-16 for primary and related spans, advertise the position encoding, publish clean and error diagnostics with retained versions, and preserve explicit unversioned save-only state." \
+              -m "Bead: franken_lean-v2p"
+          fi
+
+      - name: land stale clearing, position negotiation, and JSON-RPC states
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_and_run() {
+            local file="$1" step_name="$2" output
+            output="$(mktemp)"
+            ruby -ryaml -e '
+              document = YAML.load_file(ARGV[0])
+              step_name = ARGV[1]
+              step = document.fetch("jobs").fetch("land").fetch("steps").find { |candidate| candidate["name"] == step_name }
+              abort("missing landing step: #{step_name}") unless step
+              print step.fetch("run")
+            ' "$file" "$step_name" > "$output"
+            bash -euo pipefail "$output"
+          }
+          if ! grep -Fq 'malformed_transition_clears_previously_published_diagnostics' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-stale-diagnostics-landing.yml \
+              'clear diagnostics whenever retained source becomes unknowable'
+          fi
+          if ! grep -Fq 'initialize_refuses_clients_that_exclude_utf16_and_recovers' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-position-negotiation-landing.yml \
+              'negotiate the only supported wire position encoding'
+          fi
+          if ! grep -Fq 'requests_before_initialize_fail_with_server_not_initialized_and_recover' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-jsonrpc-state-recovery.yml \
+              'enforce JSON-RPC envelopes and lifecycle states'
+          fi
+          grep -Fq 'clear_diagnostics_notification(uri).as_bytes()' crates/fln-server/src/dispatch.rs
+          grep -Fq 'initialize_position_encoding_offer' crates/fln-server/src/dispatch.rs
+          grep -Fq 'SERVER_NOT_INITIALIZED_CODE' crates/fln-server/src/dispatch.rs
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test --locked -p fln-server --lib
+          git add crates/fln-server/src/dispatch.rs \
+            .github/workflows/fln-lsp-stale-diagnostics-landing.yml \
+            .github/workflows/fln-lsp-position-negotiation-landing.yml \
+            .github/workflows/fln-lsp-jsonrpc-state-recovery.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(server): enforce LSP coordinate and JSON-RPC state" \
+              -m "Clear diagnostics when source authority is lost, negotiate the only supported UTF-16 coordinate encoding, validate exact JSON-RPC 2.0 envelopes and string methods, and distinguish pre-initialize and post-shutdown request states with recovery cells." \
+              -m "Bead: franken_lean-v2p"
+          fi
+
+      - name: land document lifecycle, Full-sync shape, method roles, and typed callback faults
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_and_run() {
+            local file="$1" step_name="$2" output
+            output="$(mktemp)"
+            ruby -ryaml -e '
+              document = YAML.load_file(ARGV[0])
+              step_name = ARGV[1]
+              step = document.fetch("jobs").fetch("land").fetch("steps").find { |candidate| candidate["name"] == step_name }
+              abort("missing landing step: #{step_name}") unless step
+              print step.fetch("run")
+            ' "$file" "$step_name" > "$output"
+            bash -euo pipefail "$output"
+          }
+          if ! grep -Fq 'duplicate_did_open_does_not_overwrite_the_authoritative_snapshot' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-document-lifecycle-landing.yml \
+              'separate document lifecycle from retained source bytes'
+          fi
+          if ! grep -Fq 'full_sync_rejects_ranged_incremental_changes_without_replaying_stale_source' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-full-sync-shape-landing.yml \
+              'reject incremental change shapes under Full synchronization'
+          fi
+          if ! grep -Fq 'known_methods_refuse_the_wrong_request_or_notification_shape' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-method-role-landing.yml \
+              'distinguish requests from notifications before dispatch'
+          fi
+          if ! grep -Fq 'callback_projection_refusal_is_visible_and_clears_diagnostics' crates/fln-server/src/dispatch.rs; then
+            extract_and_run \
+              .github/workflows/fln-lsp-callback-refusal-landing.yml \
+              'make diagnostic callback refusal explicit'
+          fi
+          grep -Fq 'fn invalidate_text(&mut self, uri: &str)' crates/fln-server/src/dispatch.rs
+          grep -Fq 'for forbidden in ["range", "rangeLength"]' crates/fln-server/src/dispatch.rs
+          grep -Fq 'method_requires_request_id' crates/fln-server/src/dispatch.rs
+          grep -Fq 'Result<Vec<String>, ProjectionRefusal>' crates/fln-server/src/dispatch.rs
+          grep -Fq '.map(|projection| projection.messages)' crates/fln-cli/src/lib.rs
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test --locked -p fln-server --lib
+          cargo test --locked -p fln-cli --lib --no-run
+          git add crates/fln-server/src/lib.rs crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs \
+            .github/workflows/fln-lsp-document-lifecycle-landing.yml \
+            .github/workflows/fln-lsp-full-sync-shape-landing.yml \
+            .github/workflows/fln-lsp-method-role-landing.yml \
+            .github/workflows/fln-lsp-callback-refusal-landing.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(server): harden document lifecycle and callback faults" \
+              -m "Retain open-document metadata independently of source bytes, refuse duplicate and implicit opens, reject ranged fragments under Full synchronization, enforce known request/notification ID roles, recover after invalidated source, and surface typed projection refusals instead of empty success." \
+              -m "Bead: franken_lean-v2p"
+          fi
+
+      - name: update accurate status, Beads state, and consolidate workflow checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_and_run() {
+            local file="$1" step_name="$2" output
+            output="$(mktemp)"
+            ruby -ryaml -e '
+              document = YAML.load_file(ARGV[0])
+              step_name = ARGV[1]
+              step = document.fetch("jobs").fetch("land").fetch("steps").find { |candidate| candidate["name"] == step_name }
+              abort("missing landing step: #{step_name}") unless step
+              print step.fetch("run")
+            ' "$file" "$step_name" > "$output"
+            bash -euo pipefail "$output"
+          }
+          if ! grep -Fq 'Lantern wire correctness: coordinates, versions, and lifecycle' CHANGELOG.md; then
+            extract_and_run \
+              .github/workflows/fln-lsp-status-docs-landing.yml \
+              'update code-facing and project-facing documentation'
+          fi
+
+          write_archive_workflow() {
+            local file="$1" title="$2"
+            cat > "$file" <<YAML
+          name: archived $title
+
+          on:
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          jobs:
+            archived:
+              runs-on: ubuntu-24.04
+              steps:
+                - name: archived landing record
+                  run: echo 'This no-deletion landing record is superseded by fln-lsp-consolidated-hardening-landing.yml.'
+          YAML
+          }
+          write_archive_workflow .github/workflows/fln-lsp-utf16-one-shot.yml 'fln LSP UTF-16 landing record'
+          write_archive_workflow .github/workflows/fln-lsp-source-aware-landing.yml 'fln LSP source-aware landing record'
+          write_archive_workflow .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml 'fln LSP JSON-RPC lifecycle landing record'
+          write_archive_workflow .github/workflows/fln-lsp-versioned-diagnostics-landing.yml 'fln LSP versioned-diagnostics landing record'
+          write_archive_workflow .github/workflows/fln-lsp-stale-diagnostics-landing.yml 'fln LSP stale-diagnostics landing record'
+          write_archive_workflow .github/workflows/fln-lsp-position-negotiation-landing.yml 'fln LSP position-negotiation landing record'
+          write_archive_workflow .github/workflows/fln-lsp-jsonrpc-state-recovery.yml 'fln LSP JSON-RPC state landing record'
+          write_archive_workflow .github/workflows/fln-lsp-document-lifecycle-landing.yml 'fln LSP document-lifecycle landing record'
+          write_archive_workflow .github/workflows/fln-lsp-full-sync-shape-landing.yml 'fln LSP Full-sync landing record'
+          write_archive_workflow .github/workflows/fln-lsp-method-role-landing.yml 'fln LSP method-role landing record'
+          write_archive_workflow .github/workflows/fln-lsp-callback-refusal-landing.yml 'fln LSP callback-refusal landing record'
+          write_archive_workflow .github/workflows/fln-lsp-status-docs-landing.yml 'fln LSP status-docs landing record'
+
+          cat > .github/workflows/fln-lsp-consolidated-hardening-landing.yml <<'YAML'
+          name: fln LSP bounded hardening checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - IMPLEMENTATION_STATUS.md
+                - CHANGELOG.md
+                - .github/workflows/fln-lsp-consolidated-hardening-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - IMPLEMENTATION_STATUS.md
+                - CHANGELOG.md
+                - .github/workflows/fln-lsp-consolidated-hardening-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-bounded-hardening-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 75
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify bounded Lantern implementation and status
+                  shell: bash
+                  run: |
+                    grep -Fq 'focused-test observed' IMPLEMENTATION_STATUS.md
+                    grep -Fq 'Lantern wire correctness: coordinates, versions, and lifecycle' CHANGELOG.md
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test --locked -p fln-server --lib
+                    cargo test --locked -p fln-cli --lib --no-run
+          YAML
+
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test --locked -p fln-server --lib
+          cargo test --locked -p fln-cli --lib --no-run
+          cargo test --locked -p structure-guard --test real_workspace
+          git add .github/workflows/fln-lsp-consolidated-hardening-landing.yml \
+            .github/workflows/fln-lsp-utf16-one-shot.yml \
+            .github/workflows/fln-lsp-source-aware-landing.yml \
+            .github/workflows/fln-lsp-jsonrpc-lifecycle-landing.yml \
+            .github/workflows/fln-lsp-versioned-diagnostics-landing.yml \
+            .github/workflows/fln-lsp-stale-diagnostics-landing.yml \
+            .github/workflows/fln-lsp-position-negotiation-landing.yml \
+            .github/workflows/fln-lsp-jsonrpc-state-recovery.yml \
+            .github/workflows/fln-lsp-document-lifecycle-landing.yml \
+            .github/workflows/fln-lsp-full-sync-shape-landing.yml \
+            .github/workflows/fln-lsp-method-role-landing.yml \
+            .github/workflows/fln-lsp-callback-refusal-landing.yml \
+            .github/workflows/fln-lsp-status-docs-landing.yml \
+            crates/fln-server/src/lib.rs crates/fln-cli/src/lib.rs \
+            IMPLEMENTATION_STATUS.md CHANGELOG.md .beads/issues.jsonl
+          if ! git diff --cached --quiet; then
+            git commit -m "docs(status): record bounded Lantern hardening" \
+              -m "Update code and CLI help, the evidence-graded implementation status, changelog, and the existing franken_lean-v2p Beads record. Consolidate temporary no-deletion landing helpers into manual archival records and one resource-efficient ongoing focused check." \
+              -m "Bead: franken_lean-v2p (status/comment update; no closure claim)"
+          fi
+
+      - name: publish the verified incremental commit series
+        shell: bash
+        run: |
+          git fetch origin main
+          base="$(git merge-base HEAD origin/main)"
+          test "$base" = "$(git rev-parse origin/main)" || {
+            echo "main moved incompatibly during the consolidated landing; refusing publication" >&2
+            exit 2
+          }
+          git push origin HEAD:main
