@@ -11,7 +11,7 @@
 
 use std::io::{self, BufRead, Write};
 
-/// Maximum message size the transport will accept (64 MiB). This is a
+/// Maximum message size the transport will accept or emit (64 MiB). This is a
 /// transport-level safety ceiling, not a semantic limit.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum bytes accepted before the blank line terminating one header block.
@@ -61,13 +61,8 @@ fn read_header_line(input: &mut dyn BufRead, byte_budget: usize) -> io::Result<O
 }
 
 fn strip_line_ending(line: &[u8]) -> io::Result<&[u8]> {
-    let Some(without_lf) = line.strip_suffix(b"\n") else {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "LSP header line is not newline-terminated",
-        ));
-    };
-    Ok(without_lf.strip_suffix(b"\r").unwrap_or(without_lf))
+    line.strip_suffix(b"\r\n")
+        .ok_or_else(|| invalid_data("LSP header line must be CRLF-terminated"))
 }
 
 fn is_header_name_byte(byte: u8) -> bool {
@@ -122,12 +117,56 @@ fn parse_content_length(value: &[u8]) -> io::Result<usize> {
     })
 }
 
+fn validate_content_type(value: &[u8]) -> io::Result<()> {
+    let mut parts = value.split(|byte| *byte == b';');
+    let media_type = trim_optional_whitespace(parts.next().unwrap_or_default());
+    if !media_type.eq_ignore_ascii_case(b"application/vscode-jsonrpc") {
+        return Err(invalid_data(format!(
+            "unsupported LSP Content-Type media type: {:?}",
+            String::from_utf8_lossy(media_type)
+        )));
+    }
+
+    let mut charset_seen = false;
+    for raw_parameter in parts {
+        let parameter = trim_optional_whitespace(raw_parameter);
+        let Some(equals) = parameter.iter().position(|byte| *byte == b'=') else {
+            return Err(invalid_data("malformed LSP Content-Type parameter"));
+        };
+        let name = trim_optional_whitespace(&parameter[..equals]);
+        let parameter_value = trim_optional_whitespace(&parameter[equals + 1..]);
+        if name.is_empty() || parameter_value.is_empty() {
+            return Err(invalid_data("malformed LSP Content-Type parameter"));
+        }
+        if !name.eq_ignore_ascii_case(b"charset") {
+            return Err(invalid_data(format!(
+                "unsupported LSP Content-Type parameter: {:?}",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        if charset_seen {
+            return Err(invalid_data("duplicate LSP Content-Type charset parameter"));
+        }
+        charset_seen = true;
+        if !parameter_value.eq_ignore_ascii_case(b"utf-8")
+            && !parameter_value.eq_ignore_ascii_case(b"utf8")
+        {
+            return Err(invalid_data(format!(
+                "unsupported LSP Content-Type charset: {:?}",
+                String::from_utf8_lossy(parameter_value)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Read one Content-Length-framed LSP message from `input`.
 ///
 /// Returns `Ok(None)` only on clean EOF before a new header block begins.
 /// Partial, ambiguous, oversized, or malformed header blocks fail closed.
 pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut content_length: Option<usize> = None;
+    let mut content_type_seen = false;
     let mut header_bytes = 0usize;
     let mut header_fields = 0usize;
 
@@ -184,8 +223,14 @@ pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
                 return Err(invalid_data("duplicate Content-Length header"));
             }
             content_length = Some(parse_content_length(value)?);
+        } else if name.eq_ignore_ascii_case(b"Content-Type") {
+            if content_type_seen {
+                return Err(invalid_data("duplicate Content-Type header"));
+            }
+            validate_content_type(value)?;
+            content_type_seen = true;
         }
-        // Content-Type and extension headers are accepted after syntax validation.
+        // Syntactically valid extension headers are ignored for forward compatibility.
     }
 
     let length = content_length.ok_or_else(|| invalid_data("missing Content-Length header"))?;
@@ -199,11 +244,27 @@ pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-/// Write one Content-Length-framed LSP message to `output`.
-pub fn write_message(output: &mut dyn Write, body: &[u8]) -> io::Result<()> {
+fn write_message_with_limit(
+    output: &mut dyn Write,
+    body: &[u8],
+    max_message_bytes: usize,
+) -> io::Result<()> {
+    if body.len() > max_message_bytes {
+        return Err(invalid_data(format!(
+            "message length {} exceeds transport ceiling {max_message_bytes}",
+            body.len()
+        )));
+    }
     write!(output, "Content-Length: {}\r\n\r\n", body.len())?;
     output.write_all(body)?;
     output.flush()
+}
+
+/// Write one Content-Length-framed LSP message to `output`.
+///
+/// Oversized messages are refused before any framing bytes are written.
+pub fn write_message(output: &mut dyn Write, body: &[u8]) -> io::Result<()> {
+    write_message_with_limit(output, body, MAX_MESSAGE_BYTES)
 }
 
 #[cfg(test)]
@@ -250,11 +311,40 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_content_length_is_rejected_even_when_values_match() {
-        let raw = b"Content-Length: 2\r\ncontent-length: 2\r\n\r\n{}";
-        let error = read(raw).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("duplicate Content-Length"));
+    fn content_type_accepts_only_vscode_jsonrpc_with_utf8() {
+        for value in [
+            "application/vscode-jsonrpc",
+            "APPLICATION/VSCODE-JSONRPC; CHARSET=UTF-8",
+            "application/vscode-jsonrpc;charset=utf8",
+        ] {
+            let raw = format!("Content-Length: 2\r\nContent-Type: {value}\r\n\r\n{{}}");
+            assert_eq!(read(raw.as_bytes()).unwrap().unwrap(), b"{}", "value={value:?}");
+        }
+
+        for value in [
+            "application/json; charset=utf-8",
+            "application/vscode-jsonrpc; charset=utf-16",
+            "application/vscode-jsonrpc; charset=utf-8; charset=utf-8",
+            "application/vscode-jsonrpc; boundary=x",
+            "application/vscode-jsonrpc; charset",
+            "application/vscode-jsonrpc;",
+        ] {
+            let raw = format!("Content-Length: 2\r\nContent-Type: {value}\r\n\r\n{{}}");
+            let error = read(raw.as_bytes()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_semantic_headers_are_rejected() {
+        for raw in [
+            b"Content-Length: 2\r\ncontent-length: 2\r\n\r\n{}".as_slice(),
+            b"Content-Length: 2\r\nContent-Type: application/vscode-jsonrpc\r\ncontent-type: application/vscode-jsonrpc\r\n\r\n{}".as_slice(),
+        ] {
+            let error = read(raw).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("duplicate"));
+        }
     }
 
     #[test]
@@ -273,6 +363,7 @@ mod tests {
             b" Content-Length: 2\r\n\r\n{}".as_slice(),
             b"Content Length: 2\r\n\r\n{}".as_slice(),
             b"Content-Length:\x01 2\r\n\r\n{}".as_slice(),
+            b"Content-Length: 2\n\n{}".as_slice(),
         ] {
             assert_eq!(read(raw).unwrap_err().kind(), io::ErrorKind::InvalidData);
         }
@@ -308,6 +399,15 @@ mod tests {
         let error = read(raw.as_bytes()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("transport ceiling"));
+    }
+
+    #[test]
+    fn writer_refuses_oversized_message_before_writing() {
+        let mut output = Vec::new();
+        let error = write_message_with_limit(&mut output, b"abc", 2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("transport ceiling"));
+        assert!(output.is_empty());
     }
 
     #[test]
