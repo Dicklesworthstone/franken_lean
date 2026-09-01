@@ -78,14 +78,11 @@ fn pinned_nat_block(lib: &Path) -> fln_kernel::InductiveBlock {
 }
 
 #[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude companion chain"]
 fn pinned_init_nat_completes_the_two_checker_council() {
-    let Some(lib) = reference_lib() else {
-        eprintln!(
-            "SKIP: pinned Reference library is not installed; this real-artifact regression has \
-             no synthetic substitute"
-        );
-        return;
-    };
+    let lib = reference_lib().expect(
+        "pinned Reference library is unavailable; install Lean v4.32.0 or set FLN_REFERENCE_LIB before invoking this ignored real-artifact test",
+    );
     let block = pinned_nat_block(&lib);
 
     assert_eq!(block.types.len(), 1, "Nat is one inductive type");
