@@ -212,6 +212,11 @@ fn error_response(id: i64, code: i32, message: &str) -> String {
     )
 }
 
+/// LSP's standard `RequestFailed` code. Use it for recognized protocol
+/// requests whose implementation is not yet available; fabricating a success
+/// response would turn an unsupported capability into false state.
+const REQUEST_FAILED_CODE: i32 = -32803;
+
 /// Build a JSON-RPC success response with a null result.
 fn null_response(id: i64) -> String {
     format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}", id)
@@ -424,20 +429,26 @@ pub fn serve(
 
             // --- $/lean/rpc/connect (widget RPC session init) ---
             (Some("$/lean/rpc/connect"), Some(req_id), ServerState::Running) => {
-                // Return a minimal session ID so the client can proceed.
-                // The RPC session is not functional yet but this prevents
-                // "method not found" error loops in the extension.
-                let response = format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"sessionId\":\"fln-stub-0\"}}}}",
-                    req_id
+                // This method is known to the Lean editor protocol, but no
+                // FrankenLean RPC session exists yet. A typed request failure
+                // is honest; a synthetic session ID would fabricate state.
+                let response = error_response(
+                    req_id,
+                    REQUEST_FAILED_CODE,
+                    "Lean RPC sessions are not implemented by this FrankenLean server",
                 );
                 transport::write_message(output, response.as_bytes())?;
             }
 
             // --- $/lean/rpc/call (widget RPC calls) ---
             (Some("$/lean/rpc/call"), Some(req_id), ServerState::Running) => {
-                // Return null until the RPC infrastructure is implemented.
-                let response = null_response(req_id);
+                // No RPC session can execute calls yet, so fail closed rather
+                // than returning `null` as if a real call completed.
+                let response = error_response(
+                    req_id,
+                    REQUEST_FAILED_CODE,
+                    "Lean RPC calls are not implemented by this FrankenLean server",
+                );
                 transport::write_message(output, response.as_bytes())?;
             }
 
@@ -468,12 +479,12 @@ mod tests {
         // initialize
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"#,
         );
         // initialized
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"#,
         );
         // Extra messages go here.
         for line in extra_messages.lines() {
@@ -484,12 +495,12 @@ mod tests {
         // shutdown
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"shutdown\"}"#,
         );
         // exit
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","method":"exit"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"#,
         );
 
         let mut reader = BufReader::new(&input_buf[..]);
@@ -523,7 +534,7 @@ mod tests {
     #[test]
     fn did_open_routes_through_callback() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -536,7 +547,7 @@ mod tests {
     #[test]
     fn did_open_ignores_method_lookalike_inside_document_text() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"\\\"method\\\":\\\"shutdown\\\"\"}},\"method\":\"textDocument/didOpen\"}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -546,7 +557,7 @@ mod tests {
     #[test]
     fn unknown_request_returns_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/unknownMethod\",\"params\":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("-32601"));
@@ -554,13 +565,13 @@ mod tests {
 
     #[test]
     fn extract_string_field_works() {
-        let json = r#"{"method":"initialize","id":1}"#;
+        let json = r#"{\"method\":\"initialize\",\"id\":1}"#;
         assert_eq!(extract_string_field(json, "method").as_deref(), Some("initialize"));
     }
 
     #[test]
     fn extract_string_field_decodes_escapes_and_skips_escaped_key_lookalikes() {
-        let json = r#"{"note":"\"method\":\"shutdown\"","method":"textDocument\/hover"}"#;
+        let json = r#"{\"note\":\"\\\"method\\\":\\\"shutdown\\\"\",\"method\":\"textDocument\\/hover\"}"#;
         assert_eq!(
             extract_string_field(json, "method").as_deref(),
             Some("textDocument/hover")
@@ -569,13 +580,13 @@ mod tests {
 
     #[test]
     fn extract_int_field_works() {
-        let json = r#"{"note":"\"id\":999","method":"initialize","id":42}"#;
+        let json = r#"{\"note\":\"\\\"id\\\":999\",\"method\":\"initialize\",\"id\":42}"#;
         assert_eq!(extract_int_field(json, "id"), Some(42));
     }
 
     #[test]
     fn extract_text_document_uri_works() {
-        let json = r#"{"params":{"textDocument":{"uri":"file:///foo.lean","text":"hello"}}}"#;
+        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///foo.lean\",\"text\":\"hello\"}}}"#;
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///foo.lean".to_string())
@@ -584,7 +595,7 @@ mod tests {
 
     #[test]
     fn extract_text_document_uri_decodes_json_escapes() {
-        let json = r#"{"params":{"textDocument":{"uri":"file:\/\/\/tmp\/\ud83e\udd16.lean","text":"hello"}}}"#;
+        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:\\/\\/\\/tmp\\/\\ud83e\\udd16.lean\",\"text\":\"hello\"}}}"#;
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///tmp/🤖.lean".to_string())
@@ -595,9 +606,9 @@ mod tests {
     fn did_change_routes_through_callback() {
         let (outcome, output) = lifecycle_session(&[
             // Open first.
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
             // Then change.
-            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"def y := 7"}]}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"def y := 7\"}]}}"#,
         ].join("\n"));
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -612,7 +623,7 @@ mod tests {
 
     #[test]
     fn extract_content_changes_text_works() {
-        let json = r#"{"params":{"textDocument":{"uri":"file:///x.lean","version":2},"contentChanges":[{"text":"def z := 0"}]}}"#;
+        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"def z := 0\"}]}}"#;
         assert_eq!(
             extract_content_changes_text(json),
             Some("def z := 0".to_string())
@@ -621,7 +632,7 @@ mod tests {
 
     #[test]
     fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
-        let json = r#"{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}"#;
+        let json = r#"{\"text\":\"\\ud83e\\udd16 a\\/b\\b\\f\\n\\r\\t\\\\\\\"\"}"#;
         assert_eq!(
             extract_escaped_text_value(json, 0).as_deref(),
             Some("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"")
@@ -631,11 +642,11 @@ mod tests {
     #[test]
     fn escaped_text_rejects_malformed_json_strings() {
         for json in [
-            r#"{"text":"\ud83e"}"#,
-            r#"{"text":"\udd16"}"#,
-            r#"{"text":"\ud83e\u0041"}"#,
-            r#"{"text":"\q"}"#,
-            r#"{"text":"\u12xz"}"#,
+            r#"{\"text\":\"\\ud83e\"}"#,
+            r#"{\"text\":\"\\udd16\"}"#,
+            r#"{\"text\":\"\\ud83e\\u0041\"}"#,
+            r#"{\"text\":\"\\q\"}"#,
+            r#"{\"text\":\"\\u12xz\"}"#,
             "{\"text\":\"line\nfeed\"}",
         ] {
             assert!(
@@ -649,9 +660,9 @@ mod tests {
     fn did_save_routes_through_callback() {
         let (outcome, output) = lifecycle_session(&[
             // Open first.
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
             // Save with included text.
-            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"def x := 42"}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":1},\"text\":\"def x := 42\"}}"#,
         ].join("\n"));
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -665,7 +676,7 @@ mod tests {
 
     #[test]
     fn extract_save_text_works() {
-        let json = r#"{"params":{"textDocument":{"uri":"file:///x.lean","version":1},"text":"def w := 99"}}"#;
+        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\",\"version\":1},\"text\":\"def w := 99\"}}"#;
         assert_eq!(
             extract_save_text(json),
             Some("def w := 99".to_string())
@@ -675,7 +686,7 @@ mod tests {
     #[test]
     fn plain_goal_returns_null_not_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":10,"method":"$/lean/plainGoal","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"$/lean/plainGoal\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"},\"position\":{\"line\":0,\"character\":0}}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":10"));
@@ -687,7 +698,7 @@ mod tests {
     #[test]
     fn hover_returns_null_gracefully() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":11,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"},\"position\":{\"line\":0,\"character\":0}}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":11"));
@@ -696,14 +707,24 @@ mod tests {
     }
 
     #[test]
-    fn rpc_connect_returns_session_id() {
+    fn rpc_connect_fails_closed_without_fabricating_session() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":12,"method":"$/lean/rpc/connect","params":{"uri":"file:///test.lean"}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"$/lean/rpc/connect\",\"params\":{\"uri\":\"file:///test.lean\"}}"#,
         );
         assert!(outcome.clean);
-        assert!(output.contains("\"id\":12"));
-        assert!(output.contains("fln-stub-0"));
-        assert!(!output.contains("-32601"));
+        assert!(output.contains("\"id\":12,\"error\":{\"code\":-32803"));
+        assert!(output.contains("Lean RPC sessions are not implemented"));
+        assert!(!output.contains("fln-stub-0"));
+    }
+
+    #[test]
+    fn rpc_call_fails_closed_without_fabricating_result() {
+        let (outcome, output) = lifecycle_session(
+            r#"{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"$/lean/rpc/call\",\"params\":{\"sessionId\":\"missing\"}}"#,
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":13,\"error\":{\"code\":-32803"));
+        assert!(output.contains("Lean RPC calls are not implemented"));
     }
 
     #[test]
