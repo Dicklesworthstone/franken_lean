@@ -12,7 +12,7 @@ on:
 
 jobs:
   verify_and_land:
-    if: github.event.head_commit.message == 'chore(agent): launch macOS-verified fln-51y8 HEq landing'
+    if: "github.event.head_commit.message == 'chore(agent): launch macOS-verified fln-51y8 HEq landing'"
     runs-on: macos-14
     timeout-minutes: 90
     env:
