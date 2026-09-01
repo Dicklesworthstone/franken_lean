@@ -1,16 +1,30 @@
 //! Minimal JSON-RPC dispatch for the LSP lifecycle and document events.
 //!
-//! This module parses just enough JSON to route LSP requests and notifications
-//! to handlers. It does not depend on serde or any external JSON library
-//! (doctrine D1). The hand-rolled parsing is intentionally narrow: it handles
-//! the fixed vocabulary of LSP methods the server currently supports.
+//! This module intentionally implements only the bounded LSP surface FrankenLean
+//! currently owns. It does not depend on serde or another JSON library (doctrine
+//! D1), so the parser below is small, structural, iterative, and fail-closed.
+//!
+//! Two distinctions are load-bearing:
+//! - JSON-RPC envelope fields are read only from the root object.
+//! - LSP document fields are read from their exact `params` / `textDocument`
+//!   containers, never by searching arbitrary nested text for a matching key.
+//!
+//! Full document synchronization retains a bounded copy of the latest source so
+//! a textless `didSave` can still re-check the exact document last supplied by
+//! the client. Cache refusal is visible and never suppresses a check for source
+//! that arrived in the current notification.
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 use crate::json_string;
 use crate::transport;
 
-/// Lifecycle state of the LSP server.
+const MAX_JSON_NESTING: usize = 256;
+const MAX_OPEN_DOCUMENTS: usize = 1024;
+const MAX_OPEN_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
+const REQUEST_FAILED_CODE: i32 = -32803;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
     Uninitialized,
@@ -49,82 +63,262 @@ enum RequestIdField {
     Invalid,
 }
 
-/// Find an unescaped JSON key at any depth. This is used only after the caller
-/// has already selected the relevant nested protocol region.
-fn find_json_key(json: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{key}\"");
-    let bytes = json.as_bytes();
-    let mut offset = 0usize;
-    loop {
-        let relative = json.get(offset..)?.find(&needle)?;
-        let start = offset.checked_add(relative)?;
-        let preceding_backslashes = bytes[..start]
-            .iter()
-            .rev()
-            .take_while(|byte| **byte == b'\\')
-            .count();
-        let after = start.checked_add(needle.len())?;
-        if preceding_backslashes % 2 == 0
-            && json.get(after..)?.trim_start().starts_with(':')
-        {
-            return Some(after);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field<'a> {
+    Missing,
+    Value(&'a str),
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheRefusal {
+    DocumentLimit,
+    ByteLimit,
+    AccountingOverflow,
+}
+
+impl CacheRefusal {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::DocumentLimit => {
+                "FrankenLean source cache is full; current source was checked but not retained"
+            }
+            Self::ByteLimit => {
+                "FrankenLean source cache byte budget is exhausted; current source was checked but not retained"
+            }
+            Self::AccountingOverflow => {
+                "FrankenLean source cache accounting overflowed; current source was checked but not retained"
+            }
         }
-        offset = start.checked_add(1)?;
     }
 }
 
-/// Find a literal ASCII key on the root JSON object's own field plane.
-///
-/// JSON-RPC `method` and `id` belong to the envelope, not arbitrary nested
-/// objects. A flat substring search lets `params.id` or `params.method` hijack
-/// routing when that nested key appears first. This scanner tracks container
-/// depth while skipping complete string literals; escaped key spellings are
-/// deliberately not normalized, so unfamiliar envelope syntax fails closed.
-fn find_top_level_json_key(json: &str, key: &str) -> Option<usize> {
-    let bytes = json.as_bytes();
-    let mut index = 0usize;
-    let mut depth = 0usize;
+#[derive(Debug)]
+struct DocumentCache {
+    documents: BTreeMap<String, String>,
+    total_bytes: usize,
+    max_documents: usize,
+    max_bytes: usize,
+}
 
+impl DocumentCache {
+    fn new() -> Self {
+        Self::with_limits(MAX_OPEN_DOCUMENTS, MAX_OPEN_DOCUMENT_BYTES)
+    }
+
+    fn with_limits(max_documents: usize, max_bytes: usize) -> Self {
+        Self {
+            documents: BTreeMap::new(),
+            total_bytes: 0,
+            max_documents,
+            max_bytes,
+        }
+    }
+
+    fn store(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {
+        let old = self.documents.remove(&uri);
+        let old_len = old.as_ref().map_or(0, String::len);
+        self.total_bytes = self
+            .total_bytes
+            .checked_sub(old_len)
+            .ok_or(CacheRefusal::AccountingOverflow)?;
+
+        if old.is_none() && self.documents.len() >= self.max_documents {
+            return Err(CacheRefusal::DocumentLimit);
+        }
+        let next_total = self
+            .total_bytes
+            .checked_add(text.len())
+            .ok_or(CacheRefusal::AccountingOverflow)?;
+        if next_total > self.max_bytes {
+            return Err(CacheRefusal::ByteLimit);
+        }
+        self.documents.insert(uri, text);
+        self.total_bytes = next_total;
+        Ok(())
+    }
+
+    fn get(&self, uri: &str) -> Option<&str> {
+        self.documents.get(uri).map(String::as_str)
+    }
+
+    fn remove(&mut self, uri: &str) -> Result<(), CacheRefusal> {
+        let Some(text) = self.documents.remove(uri) else {
+            return Ok(());
+        };
+        self.total_bytes = self
+            .total_bytes
+            .checked_sub(text.len())
+            .ok_or(CacheRefusal::AccountingOverflow)?;
+        Ok(())
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
+    while matches!(
+        bytes.get(index).copied(),
+        Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')
+    ) {
+        index += 1;
+    }
+    index
+}
+
+fn scan_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start).copied()? != b'"' {
+        return None;
+    }
+    let mut index = start.checked_add(1)?;
     while index < bytes.len() {
         match bytes[index] {
-            b'{' | b'[' => {
-                depth = depth.checked_add(1)?;
-                index += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.checked_sub(1)?;
-                index += 1;
-            }
-            b'"' => {
-                let start = index.checked_add(1)?;
-                index = start;
-                while index < bytes.len() {
-                    match bytes[index] {
-                        b'\\' => {
-                            index = index.checked_add(2)?;
-                        }
-                        b'"' => break,
-                        _ => index += 1,
-                    }
-                }
-                if index >= bytes.len() {
+            b'"' => return index.checked_add(1),
+            b'\\' => {
+                index = index.checked_add(2)?;
+                if index > bytes.len() {
                     return None;
                 }
-                if depth == 1
-                    && json.get(start..index)? == key
-                    && json
-                        .get(index.checked_add(1)?..)?
-                        .trim_start()
-                        .starts_with(':')
-                {
-                    return index.checked_add(1);
-                }
-                index += 1;
             }
+            0x00..=0x1f => return None,
             _ => index += 1,
         }
     }
     None
+}
+
+/// Return the exclusive end of one JSON value without recursively descending.
+///
+/// This is a structural boundary scanner, not a generic JSON decoder. Root and
+/// selected object fields are validated separately. The fixed stack bounds
+/// adversarial nesting while preserving arbitrary strings and nested values.
+fn scan_value_end(json: &str, start: usize) -> Option<usize> {
+    let bytes = json.as_bytes();
+    let start = skip_ws(bytes, start);
+    match bytes.get(start).copied()? {
+        b'"' => scan_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut stack = [0u8; MAX_JSON_NESTING];
+            let mut depth = 0usize;
+            let mut index = start;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index = scan_string_end(bytes, index)?;
+                    }
+                    opener @ (b'{' | b'[') => {
+                        if depth == MAX_JSON_NESTING {
+                            return None;
+                        }
+                        stack[depth] = opener;
+                        depth += 1;
+                        index += 1;
+                    }
+                    closer @ (b'}' | b']') => {
+                        let expected = match stack.get(depth.checked_sub(1)?)? {
+                            b'{' => b'}',
+                            b'[' => b']',
+                            _ => return None,
+                        };
+                        if closer != expected {
+                            return None;
+                        }
+                        depth -= 1;
+                        index += 1;
+                        if depth == 0 {
+                            return Some(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut index = start;
+            while let Some(byte) = bytes.get(index).copied() {
+                if matches!(byte, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n') {
+                    break;
+                }
+                index += 1;
+            }
+            (index > start).then_some(index)
+        }
+    }
+}
+
+/// Read one literal ASCII key from one exact JSON object.
+///
+/// Duplicate selected keys, escaped keys, malformed separators, mismatched
+/// containers, excessive nesting, and trailing bytes all return `Invalid`.
+/// The parser deliberately scans through the closing brace even after finding a
+/// match so a duplicate cannot be hidden later in the object.
+fn object_field<'a>(json: &'a str, wanted: &str) -> Field<'a> {
+    let bytes = json.as_bytes();
+    let mut index = skip_ws(bytes, 0);
+    if bytes.get(index).copied() != Some(b'{') {
+        return Field::Invalid;
+    }
+    index += 1;
+    let mut found: Option<&str> = None;
+
+    loop {
+        index = skip_ws(bytes, index);
+        match bytes.get(index).copied() {
+            Some(b'}') => {
+                index += 1;
+                if skip_ws(bytes, index) != bytes.len() {
+                    return Field::Invalid;
+                }
+                return found.map_or(Field::Missing, Field::Value);
+            }
+            Some(b'"') => {}
+            _ => return Field::Invalid,
+        }
+
+        let key_end = match scan_string_end(bytes, index) {
+            Some(value) => value,
+            None => return Field::Invalid,
+        };
+        let key_raw = match json.get(index + 1..key_end - 1) {
+            Some(value) => value,
+            None => return Field::Invalid,
+        };
+        if key_raw.contains('\\') {
+            return Field::Invalid;
+        }
+        index = skip_ws(bytes, key_end);
+        if bytes.get(index).copied() != Some(b':') {
+            return Field::Invalid;
+        }
+        index += 1;
+        index = skip_ws(bytes, index);
+        let value_start = index;
+        let value_end = match scan_value_end(json, value_start) {
+            Some(value) => value,
+            None => return Field::Invalid,
+        };
+
+        if key_raw == wanted {
+            if found.is_some() {
+                return Field::Invalid;
+            }
+            found = json.get(value_start..value_end);
+            if found.is_none() {
+                return Field::Invalid;
+            }
+        }
+
+        index = skip_ws(bytes, value_end);
+        match bytes.get(index).copied() {
+            Some(b',') => {
+                index += 1;
+                if bytes.get(skip_ws(bytes, index)).copied() == Some(b'}') {
+                    return Field::Invalid;
+                }
+            }
+            Some(b'}') => {}
+            _ => return Field::Invalid,
+        }
+    }
 }
 
 fn decode_json_string(after_quote: &str) -> Option<String> {
@@ -183,45 +377,19 @@ fn decode_json_string(after_quote: &str) -> Option<String> {
     }
 }
 
-fn encoded_json_string_len(after_quote: &str) -> Option<usize> {
-    let bytes = after_quote.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'"' => return index.checked_add(1),
-            b'\\' => {
-                index = index.checked_add(2)?;
-            }
-            _ => index += 1,
-        }
+fn decode_json_string_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    let after_quote = value.strip_prefix('"')?;
+    let encoded_len = scan_string_end(value.as_bytes(), 0)?;
+    if encoded_len != value.len() {
+        return None;
     }
-    None
-}
-
-fn json_value_has_terminator(rest: &str) -> bool {
-    matches!(
-        rest.trim_start().as_bytes().first().copied(),
-        None | Some(b',') | Some(b'}') | Some(b']')
-    )
-}
-
-fn string_value_after_key(json: &str, after_key: usize) -> Option<String> {
-    let after_key = json.get(after_key..)?;
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    let after_quote = after_colon.strip_prefix('"')?;
     decode_json_string(after_quote)
 }
 
-fn extract_string_field(json: &str, key: &str) -> Option<String> {
-    string_value_after_key(json, find_json_key(json, key)?)
-}
-
-fn extract_top_level_string_field(json: &str, key: &str) -> Option<String> {
-    string_value_after_key(json, find_top_level_json_key(json, key)?)
-}
-
-fn extract_integer_value(after_colon: &str) -> Option<i64> {
-    let bytes = after_colon.as_bytes();
+fn extract_integer_value(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
     let mut index = 0usize;
     if bytes.first().copied() == Some(b'-') {
         index = 1;
@@ -242,64 +410,111 @@ fn extract_integer_value(after_colon: &str) -> Option<i64> {
         }
         _ => return None,
     }
-    if !json_value_has_terminator(after_colon.get(index..)?) {
+    if index != bytes.len() {
         return None;
     }
-    after_colon.get(..index)?.parse::<i64>().ok()
+    value.parse::<i64>().ok()
 }
 
 fn extract_request_id(json: &str) -> RequestIdField {
-    let Some(after_key_index) = find_top_level_json_key(json, "id") else {
-        return RequestIdField::Absent;
-    };
-    let Some(after_key) = json.get(after_key_index..) else {
-        return RequestIdField::Invalid;
-    };
-    let Some(after_colon) = after_key.trim_start().strip_prefix(':').map(str::trim_start) else {
-        return RequestIdField::Invalid;
-    };
-    if let Some(after_quote) = after_colon.strip_prefix('"') {
-        let Some(value) = decode_json_string(after_quote) else {
-            return RequestIdField::Invalid;
-        };
-        let Some(encoded_len) = encoded_json_string_len(after_quote) else {
-            return RequestIdField::Invalid;
-        };
-        let Some(rest) = after_quote.get(encoded_len..) else {
-            return RequestIdField::Invalid;
-        };
-        if !json_value_has_terminator(rest) {
-            return RequestIdField::Invalid;
+    match object_field(json, "id") {
+        Field::Missing => RequestIdField::Absent,
+        Field::Invalid => RequestIdField::Invalid,
+        Field::Value(value) => {
+            if value.trim_start().starts_with('"') {
+                decode_json_string_value(value)
+                    .map(RequestId::Text)
+                    .map_or(RequestIdField::Invalid, RequestIdField::Valid)
+            } else {
+                extract_integer_value(value)
+                    .map(RequestId::Integer)
+                    .map_or(RequestIdField::Invalid, RequestIdField::Valid)
+            }
         }
-        return RequestIdField::Valid(RequestId::Text(value));
     }
-    match extract_integer_value(after_colon) {
-        Some(value) => RequestIdField::Valid(RequestId::Integer(value)),
-        None => RequestIdField::Invalid,
+}
+
+fn extract_top_level_string_field(json: &str, key: &str) -> Option<String> {
+    match object_field(json, key) {
+        Field::Value(value) => decode_json_string_value(value),
+        Field::Missing | Field::Invalid => None,
+    }
+}
+
+fn params_object(json: &str) -> Option<&str> {
+    match object_field(json, "params") {
+        Field::Value(value) if value.trim_start().starts_with('{') => Some(value),
+        Field::Missing | Field::Value(_) | Field::Invalid => None,
+    }
+}
+
+fn text_document_object(json: &str) -> Option<&str> {
+    let params = params_object(json)?;
+    match object_field(params, "textDocument") {
+        Field::Value(value) if value.trim_start().starts_with('{') => Some(value),
+        Field::Missing | Field::Value(_) | Field::Invalid => None,
     }
 }
 
 fn extract_text_document_uri(json: &str) -> Option<String> {
-    let td_start = find_json_key(json, "textDocument")?;
-    extract_string_field(&json[td_start..], "uri")
-}
-
-fn extract_escaped_text_value(haystack: &str, offset: usize) -> Option<String> {
-    extract_string_field(haystack.get(offset..)?, "text")
+    let text_document = text_document_object(json)?;
+    match object_field(text_document, "uri") {
+        Field::Value(value) => decode_json_string_value(value),
+        Field::Missing | Field::Invalid => None,
+    }
 }
 
 fn extract_text_document_text(json: &str) -> Option<String> {
-    let td_start = find_json_key(json, "textDocument")?;
-    extract_escaped_text_value(json, td_start)
-}
-
-fn extract_content_changes_text(json: &str) -> Option<String> {
-    let cc_start = find_json_key(json, "contentChanges")?;
-    extract_escaped_text_value(json, cc_start)
+    let text_document = text_document_object(json)?;
+    match object_field(text_document, "text") {
+        Field::Value(value) => decode_json_string_value(value),
+        Field::Missing | Field::Invalid => None,
+    }
 }
 
 fn extract_save_text(json: &str) -> Option<String> {
-    extract_escaped_text_value(json, 0)
+    let params = params_object(json)?;
+    match object_field(params, "text") {
+        Field::Value(value) => decode_json_string_value(value),
+        Field::Missing | Field::Invalid => None,
+    }
+}
+
+fn single_array_element(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    let mut index = skip_ws(bytes, 0);
+    if bytes.get(index).copied() != Some(b'[') {
+        return None;
+    }
+    index += 1;
+    index = skip_ws(bytes, index);
+    if bytes.get(index).copied() == Some(b']') {
+        return None;
+    }
+    let start = index;
+    let end = scan_value_end(value, start)?;
+    index = skip_ws(bytes, end);
+    if bytes.get(index).copied() != Some(b']') {
+        return None;
+    }
+    index += 1;
+    if skip_ws(bytes, index) != bytes.len() {
+        return None;
+    }
+    value.get(start..end)
+}
+
+fn extract_content_changes_text(json: &str) -> Option<String> {
+    let params = params_object(json)?;
+    let changes = match object_field(params, "contentChanges") {
+        Field::Value(value) => value,
+        Field::Missing | Field::Invalid => return None,
+    };
+    let change = single_array_element(changes)?;
+    match object_field(change, "text") {
+        Field::Value(value) => decode_json_string_value(value),
+        Field::Missing | Field::Invalid => None,
+    }
 }
 
 fn initialize_response(id: &RequestId) -> String {
@@ -335,8 +550,6 @@ fn error_response_null_id(code: i32, message: &str) -> String {
     )
 }
 
-const REQUEST_FAILED_CODE: i32 = -32803;
-
 fn null_response(id: &RequestId) -> String {
     format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}",
@@ -361,6 +574,36 @@ fn file_progress_notification(uri: &str, processing: bool) -> String {
     )
 }
 
+fn clear_diagnostics_notification(uri: &str) -> String {
+    format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",",
+            "\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}"
+        ),
+        json_string(uri)
+    )
+}
+
+fn log_warning(message: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{{\"type\":2,\"message\":{}}}}}",
+        json_string(message)
+    )
+}
+
+fn check_document(
+    output: &mut dyn Write,
+    uri: &str,
+    content: &str,
+    on_did_open: &mut OnDidOpen,
+) -> io::Result<()> {
+    transport::write_message(output, file_progress_notification(uri, true).as_bytes())?;
+    for notification in on_did_open(uri, content) {
+        transport::write_message(output, notification.as_bytes())?;
+    }
+    transport::write_message(output, file_progress_notification(uri, false).as_bytes())
+}
+
 pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
 
 pub fn serve(
@@ -372,6 +615,7 @@ pub fn serve(
     let mut documents_opened = 0u64;
     let mut documents_changed = 0u64;
     let mut documents_saved = 0u64;
+    let mut documents = DocumentCache::new();
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -427,18 +671,11 @@ pub fn serve(
                     extract_text_document_uri(&text),
                     extract_text_document_text(&text),
                 ) {
-                    transport::write_message(
-                        output,
-                        file_progress_notification(&uri, true).as_bytes(),
-                    )?;
-                    for notification in on_did_open(&uri, &content) {
-                        transport::write_message(output, notification.as_bytes())?;
+                    if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
                     }
-                    transport::write_message(
-                        output,
-                        file_progress_notification(&uri, false).as_bytes(),
-                    )?;
-                    documents_opened += 1;
+                    check_document(output, &uri, &content, on_did_open)?;
+                    documents_opened = documents_opened.saturating_add(1);
                 }
             }
             (Some("textDocument/didChange"), None, ServerState::Running) => {
@@ -446,40 +683,46 @@ pub fn serve(
                     extract_text_document_uri(&text),
                     extract_content_changes_text(&text),
                 ) {
-                    transport::write_message(
-                        output,
-                        file_progress_notification(&uri, true).as_bytes(),
-                    )?;
-                    for notification in on_did_open(&uri, &content) {
-                        transport::write_message(output, notification.as_bytes())?;
+                    if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
                     }
-                    transport::write_message(
-                        output,
-                        file_progress_notification(&uri, false).as_bytes(),
-                    )?;
-                    documents_changed += 1;
+                    check_document(output, &uri, &content, on_did_open)?;
+                    documents_changed = documents_changed.saturating_add(1);
                 }
             }
             (Some("textDocument/didSave"), None, ServerState::Running) => {
-                if let (Some(uri), Some(content)) = (
-                    extract_text_document_uri(&text),
-                    extract_save_text(&text),
-                ) {
-                    transport::write_message(
-                        output,
-                        file_progress_notification(&uri, true).as_bytes(),
-                    )?;
-                    for notification in on_did_open(&uri, &content) {
-                        transport::write_message(output, notification.as_bytes())?;
+                if let Some(uri) = extract_text_document_uri(&text) {
+                    if let Some(content) = extract_save_text(&text) {
+                        if let Err(refusal) = documents.store(uri.clone(), content.clone()) {
+                            transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+                        }
+                        check_document(output, &uri, &content, on_did_open)?;
+                        documents_saved = documents_saved.saturating_add(1);
+                    } else if let Some(content) = documents.get(&uri) {
+                        check_document(output, &uri, content, on_did_open)?;
+                        documents_saved = documents_saved.saturating_add(1);
+                    } else {
+                        transport::write_message(
+                            output,
+                            log_warning(
+                                "FrankenLean could not re-check textless didSave because no retained source exists",
+                            )
+                            .as_bytes(),
+                        )?;
+                    }
+                }
+            }
+            (Some("textDocument/didClose"), None, ServerState::Running) => {
+                if let Some(uri) = extract_text_document_uri(&text) {
+                    if let Err(refusal) = documents.remove(&uri) {
+                        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
                     }
                     transport::write_message(
                         output,
-                        file_progress_notification(&uri, false).as_bytes(),
+                        clear_diagnostics_notification(&uri).as_bytes(),
                     )?;
-                    documents_saved += 1;
                 }
             }
-            (Some("textDocument/didClose"), None, ServerState::Running) => {}
             (Some("$/lean/plainGoal"), Some(req_id), ServerState::Running)
             | (Some("$/lean/plainTermGoal"), Some(req_id), ServerState::Running)
             | (Some("textDocument/hover"), Some(req_id), ServerState::Running)
@@ -530,15 +773,15 @@ mod tests {
         write_message(buf, body.as_bytes()).unwrap();
     }
 
-    fn lifecycle_session(extra_messages: &str) -> (ServerOutcome, String) {
+    fn run_session(extra_messages: &str) -> (ServerOutcome, String, Vec<(String, String)>) {
         let mut input_buf = Vec::new();
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"#,
         );
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"#,
         );
         for line in extra_messages.lines() {
             if !line.trim().is_empty() {
@@ -547,27 +790,39 @@ mod tests {
         }
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"shutdown\"}"#,
         );
         send(
             &mut input_buf,
-            r#"{"jsonrpc":"2.0","method":"exit"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"#,
         );
 
         let mut reader = BufReader::new(&input_buf[..]);
         let mut output_buf = Vec::new();
+        let mut seen = Vec::new();
         let outcome = serve(
             &mut reader,
             &mut output_buf,
-            &mut |uri, _text| {
+            &mut |uri, text| {
+                seen.push((uri.to_string(), text.to_string()));
                 vec![format!(
-                    "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
-                    json_string(uri)
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[{{\"message\":{}}}]}}}}",
+                    json_string(uri),
+                    json_string(text)
                 )]
             },
         )
         .unwrap();
-        (outcome, String::from_utf8(output_buf).unwrap())
+        (
+            outcome,
+            String::from_utf8(output_buf).unwrap(),
+            seen,
+        )
+    }
+
+    fn lifecycle_session(extra_messages: &str) -> (ServerOutcome, String) {
+        let (outcome, output, _) = run_session(extra_messages);
+        (outcome, output)
     }
 
     #[test]
@@ -581,31 +836,35 @@ mod tests {
     #[test]
     fn request_id_parser_preserves_integer_and_string_ids() {
         assert_eq!(
-            extract_request_id(r#"{"id":42}"#),
+            extract_request_id(r#"{\"id\":42}"#),
             RequestIdField::Valid(RequestId::Integer(42))
         );
         assert_eq!(
-            extract_request_id(r#"{"id":-1}"#),
+            extract_request_id(r#"{\"id\":-1}"#),
             RequestIdField::Valid(RequestId::Integer(-1))
         );
         assert_eq!(
-            extract_request_id(r#"{"id":"req-\ud83e\udd16"}"#),
+            extract_request_id(r#"{\"id\":\"req-\\ud83e\\udd16\"}"#),
             RequestIdField::Valid(RequestId::Text("req-🤖".to_string()))
         );
-        assert_eq!(extract_request_id(r#"{"method":"exit"}"#), RequestIdField::Absent);
+        assert_eq!(
+            extract_request_id(r#"{\"method\":\"exit\"}"#),
+            RequestIdField::Absent
+        );
     }
 
     #[test]
     fn malformed_request_ids_are_distinct_from_notifications() {
         for json in [
-            r#"{"id":1.5}"#,
-            r#"{"id":1e2}"#,
-            r#"{"id":01}"#,
-            r#"{"id":-}"#,
-            r#"{"id":null}"#,
-            r#"{"id":{}}"#,
-            r#"{"id":9223372036854775808}"#,
-            r#"{"id":"x"true}"#,
+            r#"{\"id\":1.5}"#,
+            r#"{\"id\":1e2}"#,
+            r#"{\"id\":01}"#,
+            r#"{\"id\":-}"#,
+            r#"{\"id\":null}"#,
+            r#"{\"id\":{}}"#,
+            r#"{\"id\":9223372036854775808}"#,
+            r#"{\"id\":\"x\"true}"#,
+            r#"{\"id\":1,\"id\":2}"#,
         ] {
             assert_eq!(
                 extract_request_id(json),
@@ -618,7 +877,7 @@ mod tests {
     #[test]
     fn malformed_request_id_returns_invalid_request_with_null_id() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":1.5,"method":"textDocument/hover","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"textDocument/hover\",\"params\":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":null,\"error\":{\"code\":-32600"));
@@ -628,7 +887,7 @@ mod tests {
 
     #[test]
     fn envelope_fields_ignore_nested_lookalikes() {
-        let json = r#"{"params":{"id":"shadow","method":"shutdown"},"id":"actual","method":"textDocument/hover"}"#;
+        let json = r#"{\"params\":{\"id\":\"shadow\",\"method\":\"shutdown\"},\"id\":\"actual\",\"method\":\"textDocument/hover\"}"#;
         assert_eq!(
             extract_request_id(json),
             RequestIdField::Valid(RequestId::Text("actual".to_string()))
@@ -640,20 +899,49 @@ mod tests {
     }
 
     #[test]
+    fn structural_object_field_rejects_duplicate_and_mismatched_containers() {
+        assert_eq!(object_field(r#"{\"x\":1,\"x\":2}"#, "x"), Field::Invalid);
+        assert_eq!(object_field(r#"{\"x\":[1}}"#, "x"), Field::Invalid);
+        assert_eq!(object_field(r#"{\"x\":1,}"#, "x"), Field::Invalid);
+
+        let nested = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING + 1),
+            "]".repeat(MAX_JSON_NESTING + 1)
+        );
+        let deep = format!("{{\"x\":{nested}}}");
+        assert_eq!(object_field(&deep, "x"), Field::Invalid);
+    }
+
+    #[test]
     fn did_open_routes_through_callback() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+        let (outcome, output, seen) = run_session(
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
+        assert_eq!(
+            seen,
+            vec![("file:///test.lean".to_string(), "def x := 42".to_string())]
+        );
         assert!(output.contains("publishDiagnostics"));
         assert_eq!(output.matches("$/lean/fileProgress").count(), 2);
     }
 
     #[test]
+    fn document_fields_are_bound_to_exact_params_structure() {
+        let json = r#"{\"textDocument\":{\"uri\":\"file:///wrong.lean\",\"text\":\"wrong\"},\"params\":{\"metadata\":{\"textDocument\":{\"uri\":\"file:///also-wrong.lean\"}},\"textDocument\":{\"uri\":\"file:///right.lean\",\"text\":\"right\"}}}"#;
+        assert_eq!(
+            extract_text_document_uri(json).as_deref(),
+            Some("file:///right.lean")
+        );
+        assert_eq!(extract_text_document_text(json).as_deref(), Some("right"));
+    }
+
+    #[test]
     fn did_open_ignores_method_lookalike_inside_document_text() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"\\\"method\\\":\\\"shutdown\\\"\"}},\"method\":\"textDocument/didOpen\"}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -663,7 +951,7 @@ mod tests {
     #[test]
     fn nested_method_cannot_shutdown_server() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":14,"params":{"method":"shutdown"},"method":"textDocument/hover"}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":14,\"params\":{\"method\":\"shutdown\"},\"method\":\"textDocument/hover\"}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":14,\"result\":null"));
@@ -672,7 +960,7 @@ mod tests {
     #[test]
     fn unknown_request_returns_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/unknownMethod\",\"params\":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("-32601"));
@@ -681,24 +969,15 @@ mod tests {
     #[test]
     fn string_request_id_is_preserved_in_response() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":"hover-\ud83e\udd16","method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":\"hover-\\ud83e\\udd16\",\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"},\"position\":{\"line\":0,\"character\":0}}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":\"hover-🤖\",\"result\":null"));
     }
 
     #[test]
-    fn extract_string_field_decodes_escapes_and_skips_escaped_key_lookalikes() {
-        let json = r#"{"note":"\"method\":\"shutdown\"","method":"textDocument\/hover"}"#;
-        assert_eq!(
-            extract_string_field(json, "method").as_deref(),
-            Some("textDocument/hover")
-        );
-    }
-
-    #[test]
-    fn extract_text_document_uri_decodes_json_escapes() {
-        let json = r#"{"params":{"textDocument":{"uri":"file:\/\/\/tmp\/\ud83e\udd16.lean","text":"hello"}}}"#;
+    fn text_document_uri_decodes_json_escapes() {
+        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:\\/\\/\\/tmp\\/\\ud83e\\udd16.lean\",\"text\":\"hello\"}}}"#;
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///tmp/🤖.lean".to_string())
@@ -706,61 +985,167 @@ mod tests {
     }
 
     #[test]
-    fn did_change_routes_through_callback() {
-        let (outcome, output) = lifecycle_session(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"def y := 7"}]}}"#,
-        ].join("\n"));
+    fn did_change_routes_full_document_through_callback() {
+        let (outcome, output, seen) = run_session(
+            &[
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"def y := 7\"}]}}"#,
+            ]
+            .join("\n"),
+        );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
         assert_eq!(outcome.documents_changed, 1);
+        assert_eq!(
+            seen.last(),
+            Some(&("file:///test.lean".to_string(), "def y := 7".to_string()))
+        );
         assert_eq!(output.matches("publishDiagnostics").count(), 2);
         assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
     }
 
     #[test]
+    fn full_sync_refuses_empty_or_multiple_content_changes() {
+        for json in [
+            r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\"},\"contentChanges\":[]}}"#,
+            r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\"},\"contentChanges\":[{\"text\":\"a\"},{\"text\":\"b\"}]}}"#,
+        ] {
+            assert_eq!(
+                extract_content_changes_text(json),
+                None,
+                "invalid Full-sync change array was accepted: {json}"
+            );
+        }
+    }
+
+    #[test]
     fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
-        let json = r#"{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}"#;
+        let json = r#"{\"params\":{\"textDocument\":{\"text\":\"\\ud83e\\udd16 a\\/b\\b\\f\\n\\r\\t\\\\\\\"\"}}}"#;
         assert_eq!(
-            extract_escaped_text_value(json, 0).as_deref(),
+            extract_text_document_text(json).as_deref(),
             Some("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"")
         );
     }
 
     #[test]
     fn escaped_text_rejects_malformed_json_strings() {
-        for json in [
-            r#"{"text":"\ud83e"}"#,
-            r#"{"text":"\udd16"}"#,
-            r#"{"text":"\ud83e\u0041"}"#,
-            r#"{"text":"\q"}"#,
-            r#"{"text":"\u12xz"}"#,
-            "{\"text\":\"line\nfeed\"}",
+        for value in [
+            r#"\"\\ud83e\""#,
+            r#"\"\\udd16\""#,
+            r#"\"\\ud83e\\u0041\""#,
+            r#"\"\\q\""#,
+            r#"\"\\u12xz\""#,
+            "\"line\nfeed\"",
         ] {
             assert!(
-                extract_escaped_text_value(json, 0).is_none(),
-                "malformed JSON string was accepted: {json:?}"
+                decode_json_string_value(value).is_none(),
+                "malformed JSON string was accepted: {value:?}"
             );
         }
     }
 
     #[test]
-    fn did_save_routes_through_callback() {
-        let (outcome, output) = lifecycle_session(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"def x := 42"}}"#,
-        ].join("\n"));
+    fn did_save_with_text_routes_through_callback() {
+        let (outcome, output, seen) = run_session(
+            &[
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"old\"}}}"#,
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":1},\"text\":\"saved\"}}"#,
+            ]
+            .join("\n"),
+        );
         assert!(outcome.clean);
-        assert_eq!(outcome.documents_opened, 1);
         assert_eq!(outcome.documents_saved, 1);
-        assert_eq!(output.matches("publishDiagnostics").count(), 2);
+        assert_eq!(
+            seen.last(),
+            Some(&("file:///test.lean".to_string(), "saved".to_string()))
+        );
         assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
+    }
+
+    #[test]
+    fn textless_save_rechecks_latest_cached_full_document() {
+        let (outcome, _output, seen) = run_session(
+            &[
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"old\"}}}"#,
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"latest\"}]}}"#,
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2}}}"#,
+            ]
+            .join("\n"),
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_saved, 1);
+        assert_eq!(
+            seen.last(),
+            Some(&("file:///test.lean".to_string(), "latest".to_string()))
+        );
+    }
+
+    #[test]
+    fn textless_save_without_retained_source_is_visible_and_not_counted() {
+        let (outcome, output, seen) = run_session(
+            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///missing.lean\"}}}"#,
+        );
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_saved, 0);
+        assert!(seen.is_empty());
+        assert!(output.contains("window/logMessage"));
+        assert!(output.contains("no retained source exists"));
+    }
+
+    #[test]
+    fn did_close_evicts_source_and_clears_push_diagnostics() {
+        let (outcome, output, seen) = run_session(
+            &[
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"open\"}}}"#,
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"}}}"#,
+                r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"}}}"#,
+            ]
+            .join("\n"),
+        );
+        assert!(outcome.clean);
+        assert_eq!(seen.len(), 1, "closed source must not be reused by didSave");
+        assert!(output.contains("\"uri\":\"file:///test.lean\",\"diagnostics\":[]"));
+        assert!(output.contains("no retained source exists"));
+    }
+
+    #[test]
+    fn document_cache_is_failure_atomic_at_both_limits() {
+        let mut count_limited = DocumentCache::with_limits(1, 100);
+        count_limited
+            .store("a".to_string(), "one".to_string())
+            .unwrap();
+        assert_eq!(
+            count_limited.store("b".to_string(), "two".to_string()),
+            Err(CacheRefusal::DocumentLimit)
+        );
+        assert_eq!(count_limited.get("a"), Some("one"));
+        assert_eq!(count_limited.get("b"), None);
+
+        let mut byte_limited = DocumentCache::with_limits(2, 5);
+        byte_limited
+            .store("a".to_string(), "1234".to_string())
+            .unwrap();
+        assert_eq!(
+            byte_limited.store("b".to_string(), "12".to_string()),
+            Err(CacheRefusal::ByteLimit)
+        );
+        assert_eq!(byte_limited.total_bytes, 4);
+        assert_eq!(
+            byte_limited.store("a".to_string(), "123456".to_string()),
+            Err(CacheRefusal::ByteLimit)
+        );
+        assert_eq!(
+            byte_limited.get("a"),
+            None,
+            "a rejected replacement must invalidate the now-stale cached text"
+        );
+        assert_eq!(byte_limited.total_bytes, 0);
     }
 
     #[test]
     fn rpc_connect_fails_closed_without_fabricating_session() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":12,"method":"$/lean/rpc/connect","params":{"uri":"file:///test.lean"}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"$/lean/rpc/connect\",\"params\":{\"uri\":\"file:///test.lean\"}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":12,\"error\":{\"code\":-32803"));
@@ -771,7 +1156,7 @@ mod tests {
     #[test]
     fn rpc_call_fails_closed_without_fabricating_result() {
         let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":13,"method":"$/lean/rpc/call","params":{"sessionId":"missing"}}"#,
+            r#"{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"$/lean/rpc/call\",\"params\":{\"sessionId\":\"missing\"}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":13,\"error\":{\"code\":-32803"));
