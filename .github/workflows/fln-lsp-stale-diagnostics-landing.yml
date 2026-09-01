@@ -1,0 +1,182 @@
+name: fln LSP stale-diagnostics landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-stale-diagnostics-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP versioned diagnostics landing
+      - fln LSP versioned diagnostics checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-stale-diagnostics-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require version-bound source state
+        shell: bash
+        run: |
+          grep -Fq 'pub const fn versioned(uri:' crates/fln-server/src/lib.rs
+          grep -Fq 'FnMut(&str, Option<i64>, &str)' crates/fln-server/src/dispatch.rs
+          grep -Fq 'LspSource::versioned(uri, version, text)' crates/fln-cli/src/lib.rs
+
+      - name: clear diagnostics whenever retained source becomes unknowable
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "malformed_transition_clears_previously_published_diagnostics"
+          if marker not in text:
+              old = '''fn invalidate_retained_source(
+              output: &mut dyn Write,
+              documents: &mut DocumentCache,
+              uri: &str,
+              reason: &str,
+          ) -> io::Result<()> {
+              if let Err(refusal) = documents.remove(uri) {
+                  transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+              }
+              transport::write_message(output, log_warning(reason).as_bytes())
+          }
+          '''
+              old = "\n".join(line[10:] if line.startswith("          ") else line for line in old.splitlines()) + "\n"
+              new = '''fn invalidate_retained_source(
+              output: &mut dyn Write,
+              documents: &mut DocumentCache,
+              uri: &str,
+              reason: &str,
+          ) -> io::Result<()> {
+              if let Err(refusal) = documents.remove(uri) {
+                  transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+              }
+              transport::write_message(output, log_warning(reason).as_bytes())?;
+              transport::write_message(output, clear_diagnostics_notification(uri).as_bytes())
+          }
+          '''
+              new = "\n".join(line[10:] if line.startswith("          ") else line for line in new.splitlines()) + "\n"
+              if text.count(old) != 1:
+                  raise SystemExit("invalidate_retained_source anchor did not match exactly once")
+              text = text.replace(old, new, 1)
+
+              anchor = '''    #[test]
+              fn malformed_change_invalidates_cache_before_textless_save() {
+          '''
+              anchor = "\n".join(line[10:] if line.startswith("          ") else line for line in anchor.splitlines()) + "\n"
+              test = r'''    #[test]
+              fn malformed_transition_clears_previously_published_diagnostics() {
+                  let (outcome, output, seen) = run_session(
+                      &[
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"broken"}}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                      ]
+                      .join("\n"),
+                  );
+                  assert!(outcome.clean);
+                  assert_eq!(seen.len(), 1, "the malformed replacement must not be checked");
+                  assert!(output.contains("retained source was invalidated"));
+                  assert!(output.contains(
+                      "\"uri\":\"file:///test.lean\",\"diagnostics\":[]"
+                  ));
+                  assert!(output.contains("no retained source exists"));
+              }
+
+          '''
+              test = "\n".join(line[14:] if line.startswith("              ") else line for line in test.splitlines())
+              if text.count(anchor) != 1:
+                  raise SystemExit("malformed-change test anchor did not match exactly once")
+              text = text.replace(anchor, test + anchor, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              required = [
+                  "transport::write_message(output, log_warning(reason).as_bytes())?;",
+                  "clear_diagnostics_notification(uri).as_bytes()",
+              ]
+              for expected in required:
+                  if expected not in text:
+                      raise SystemExit(f"stale-diagnostic repair is partial: missing {expected}")
+          PY
+
+          cat > .github/workflows/fln-lsp-stale-diagnostics-landing.yml <<'YAML'
+          name: fln LSP stale-diagnostics checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-stale-diagnostics-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-stale-diagnostics-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-stale-diagnostics-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify stale-diagnostic invalidation
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test the invalidation and recovery path
+        shell: bash
+        run: cargo test -p fln-server --lib
+
+      - name: publish verified stale-diagnostic repair
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-stale-diagnostics-landing.yml crates/fln-server/src/dispatch.rs
+          if git diff --cached --quiet; then
+            echo "stale-diagnostic invalidation is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): clear diagnostics on invalid source transitions" \
+            -m "When malformed open, change, or save input invalidates retained Full-sync source, also publish an empty diagnostic set for that URI. This prevents stale editor errors from surviving after the server has correctly refused to replay stale text." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
