@@ -1,0 +1,313 @@
+name: fln LSP callback-refusal landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-callback-refusal-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP method-role landing
+      - fln LSP method-role checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-callback-refusal-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require the hardened method-role state
+        shell: bash
+        run: |
+          grep -Fq 'method_requires_request_id' crates/fln-server/src/dispatch.rs
+          grep -Fq 'FnMut(&str, Option<i64>, &str)' crates/fln-server/src/dispatch.rs
+
+      - name: make diagnostic callback refusal explicit
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          server = Path("crates/fln-server/src/lib.rs")
+          dispatch = Path("crates/fln-server/src/dispatch.rs")
+          cli = Path("crates/fln-cli/src/lib.rs")
+          marker = "callback_projection_refusal_is_visible_and_clears_diagnostics"
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"{path}: expected one anchor, observed {observed}: {old[:180]!r}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          if marker not in dispatch.read_text(encoding="utf-8"):
+              server_text = server.read_text(encoding="utf-8")
+              function_anchor = "fn internal_fault_message(value: &StructuredInternalFault, request: ProjectionRequest) -> String {\n"
+              start = server_text.index(function_anchor)
+              end = server_text.index("\n/// Project a snapshot", start)
+              block = server_text[start:end]
+              addition = r'''
+
+          pub(crate) fn projection_refusal_notification(refusal: ProjectionRefusal) -> String {
+              let detail = BoundedText::new(format!("{refusal:?}"));
+              format!(
+                  concat!(
+                      "{\"jsonrpc\":\"2.0\",\"method\":\"$/lean/diagnosticOutcome\",",
+                      "\"params\":{\"schema\":{},\"outcome\":\"internal_fault\",",
+                      "\"authority\":false,\"invariant\":\"lsp-projection-contract\",",
+                      "\"detail\":{}}}}"
+                  ),
+                  json_string(DIAGNOSTIC_PROJECTION_SCHEMA),
+                  bounded_json(&detail)
+              )
+          }
+          '''
+              addition = "\n".join(line[10:] if line.startswith("          ") else line for line in addition.splitlines())
+              server.write_text(server_text[:end] + addition + server_text[end:], encoding="utf-8")
+
+              dispatch_text = dispatch.read_text(encoding="utf-8")
+              dispatch_text = dispatch_text.replace(
+                  "use crate::{LSP_POSITION_ENCODING, json_string};\n",
+                  "use crate::{LSP_POSITION_ENCODING, json_string, projection_refusal_notification};\n",
+                  1,
+              )
+              dispatch_text = dispatch_text.replace(
+                  "use crate::json_string;\n",
+                  "use crate::{json_string, projection_refusal_notification};\n",
+                  1,
+              )
+              if "use fln_core::diag::ProjectionRefusal;" not in dispatch_text:
+                  dispatch_text = dispatch_text.replace(
+                      "use std::io::{self, BufRead, Write};\n",
+                      "use std::io::{self, BufRead, Write};\n\nuse fln_core::diag::ProjectionRefusal;\n",
+                      1,
+                  )
+              old_check = '''    transport::write_message(output, file_progress_notification(uri, true).as_bytes())?;
+              for notification in on_did_open(uri, version, content) {
+                  transport::write_message(output, notification.as_bytes())?;
+              }
+              transport::write_message(output, file_progress_notification(uri, false).as_bytes())
+          }
+          '''
+              old_check = "\n".join(line[14:] if line.startswith("              ") else line for line in old_check.splitlines()) + "\n"
+              new_check = '''    transport::write_message(output, file_progress_notification(uri, true).as_bytes())?;
+              match on_did_open(uri, version, content) {
+                  Ok(notifications) => {
+                      for notification in notifications {
+                          transport::write_message(output, notification.as_bytes())?;
+                      }
+                  }
+                  Err(refusal) => {
+                      transport::write_message(
+                          output,
+                          projection_refusal_notification(refusal).as_bytes(),
+                      )?;
+                      transport::write_message(
+                          output,
+                          clear_diagnostics_notification(uri).as_bytes(),
+                      )?;
+                  }
+              }
+              transport::write_message(output, file_progress_notification(uri, false).as_bytes())
+          }
+          '''
+              new_check = "\n".join(line[14:] if line.startswith("              ") else line for line in new_check.splitlines()) + "\n"
+              if dispatch_text.count(old_check) != 1:
+                  raise SystemExit("check_document callback anchor did not match exactly once")
+              dispatch_text = dispatch_text.replace(old_check, new_check, 1)
+              dispatch_text = dispatch_text.replace(
+                  "pub type OnDidOpen = dyn FnMut(&str, Option<i64>, &str) -> Vec<String>;",
+                  "pub type OnDidOpen =\n    dyn FnMut(&str, Option<i64>, &str) -> Result<Vec<String>, ProjectionRefusal>;",
+                  1,
+              )
+
+              dispatch_text = dispatch_text.replace("&mut |_uri, _version, _text| Vec::new()", "&mut |_uri, _version, _text| Ok(Vec::new())")
+              dispatch_text = dispatch_text.replace("&mut |_uri, _text| Vec::new()", "&mut |_uri, _text| Ok(Vec::new())")
+              dispatch_text = dispatch_text.replace(
+                  "                vec![format!(\n",
+                  "                Ok(vec![format!(\n",
+                  1,
+              )
+              callback_close = '''                    json_string(text)
+                  )]
+              },
+          )
+          '''
+              callback_close = "\n".join(line[14:] if line.startswith("              ") else line for line in callback_close.splitlines()) + "\n"
+              callback_close_new = '''                    json_string(text)
+                  )])
+              },
+          )
+          '''
+              callback_close_new = "\n".join(line[14:] if line.startswith("              ") else line for line in callback_close_new.splitlines()) + "\n"
+              if dispatch_text.count(callback_close) != 1:
+                  raise SystemExit("run_session callback close anchor did not match exactly once")
+              dispatch_text = dispatch_text.replace(callback_close, callback_close_new, 1)
+
+              test_anchor = '''    #[test]
+              fn file_progress_notification_format() {
+          '''
+              test_anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in test_anchor.splitlines()) + "\n"
+              test = r'''    #[test]
+              fn callback_projection_refusal_is_visible_and_clears_diagnostics() {
+                  let mut input_buf = Vec::new();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"source"}}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let outcome = serve(
+                      &mut reader,
+                      &mut output_buf,
+                      &mut |_uri, _version, _text| {
+                          Err(ProjectionRefusal::UnsupportedColor {
+                              frontend: fln_core::diag::DiagnosticFrontend::Lsp,
+                              color: fln_core::diag::DiagnosticColorPolicy::Ansi,
+                          })
+                      },
+                  )
+                  .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert!(output.contains("$/lean/diagnosticOutcome"));
+                  assert!(output.contains("\"outcome\":\"internal_fault\""));
+                  assert!(output.contains("lsp-projection-contract"));
+                  assert!(output.contains("UnsupportedColor"));
+                  assert!(output.contains(
+                      "\"uri\":\"file:///test.lean\",\"diagnostics\":[]"
+                  ));
+                  assert_eq!(output.matches("$/lean/fileProgress").count(), 2);
+              }
+
+          '''
+              test = "\n".join(line[14:] if line.startswith("              ") else line for line in test.splitlines())
+              if dispatch_text.count(test_anchor) != 1:
+                  raise SystemExit("file-progress test anchor did not match exactly once")
+              dispatch_text = dispatch_text.replace(test_anchor, test + test_anchor, 1)
+              dispatch.write_text(dispatch_text, encoding="utf-8")
+
+              cli_text = cli.read_text(encoding="utf-8")
+              callback_start = cli_text.index("    let mut on_did_open =")
+              callback_end = cli_text.index("\n\n    match fln_server::dispatch::serve", callback_start)
+              current = cli_text[callback_start:callback_end]
+              if "project_with_sources" not in current:
+                  raise SystemExit("CLI callback is not source-aware")
+              replacement = '''    let mut on_did_open =
+                  move |uri: &str, version: Option<i64>, text: &str| {
+                      let snapshot = lsp_source_snapshot(uri, text.as_bytes());
+                      let source = match version {
+                          Some(version) => fln_server::LspSource::versioned(uri, version, text),
+                          None => fln_server::LspSource::new(uri, text),
+                      };
+                      fln_server::project_with_sources(lsp_request, &snapshot, &[source])
+                          .map(|projection| projection.messages)
+                  };'''
+              replacement = "\n".join(line[14:] if line.startswith("              ") else line for line in replacement.splitlines())
+              cli.write_text(cli_text[:callback_start] + replacement + cli_text[callback_end:], encoding="utf-8")
+          else:
+              for path, expected in [
+                  (server, "projection_refusal_notification"),
+                  (dispatch, "Result<Vec<String>, ProjectionRefusal>"),
+                  (cli, ".map(|projection| projection.messages)"),
+              ]:
+                  if expected not in path.read_text(encoding="utf-8"):
+                      raise SystemExit(f"callback refusal wiring is partial in {path}: missing {expected}")
+          PY
+
+          cat > .github/workflows/fln-lsp-callback-refusal-landing.yml <<'YAML'
+          name: fln LSP callback-refusal checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - .github/workflows/fln-lsp-callback-refusal-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - crates/fln-cli/**
+                - .github/workflows/fln-lsp-callback-refusal-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-callback-refusal-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 60
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify explicit callback refusals
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+                    cargo test -p fln-cli --lib --no-run
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: compile and test explicit callback refusals
+        shell: bash
+        run: |
+          cargo test -p fln-server --lib
+          cargo test -p fln-cli --lib --no-run
+
+      - name: publish verified callback refusal path
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-callback-refusal-landing.yml crates/fln-server/src/lib.rs crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
+          if git diff --cached --quiet; then
+            echo "callback refusal path is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): surface diagnostic projection refusals" \
+            -m "Make the document-check callback return the typed ProjectionRefusal instead of converting it to an empty success. The server emits a non-authoritative internal-fault outcome, clears diagnostics, and still closes file progress; the CLI now forwards the typed result directly." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
