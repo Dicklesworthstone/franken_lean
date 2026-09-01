@@ -1,0 +1,534 @@
+name: fln LSP JSON syntax landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-json-syntax-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP consolidated hardening landing
+      - fln LSP bounded hardening checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-json-syntax-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require the consolidated bounded server state
+        shell: bash
+        run: |
+          grep -Fq 'Result<Vec<String>, ProjectionRefusal>' crates/fln-server/src/dispatch.rs
+          grep -Fq 'focused-test observed' IMPLEMENTATION_STATUS.md
+
+      - name: validate every JSON byte before selected-field dispatch
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "malformed_json_in_unselected_fields_is_a_parse_error_and_recovery_is_clean"
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"expected one dispatch anchor, observed {observed}: {old[:180]!r}")
+              text = text.replace(old, new, 1)
+
+          if marker not in text:
+              if "const PARSE_ERROR_CODE" not in text:
+                  replace_once(
+                      "const INVALID_REQUEST_CODE: i32 = -32600;\n",
+                      "const PARSE_ERROR_CODE: i32 = -32700;\nconst INVALID_REQUEST_CODE: i32 = -32600;\n",
+                  )
+
+              anchor = '''fn scan_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+          '''
+              anchor = "\n".join(line[10:] if line.startswith("          ") else line for line in anchor.splitlines()) + "\n"
+              parser = r'''struct JsonSyntax<'a> {
+              bytes: &'a [u8],
+              index: usize,
+          }
+
+          impl<'a> JsonSyntax<'a> {
+              fn new(json: &'a str) -> Self {
+                  Self {
+                      bytes: json.as_bytes(),
+                      index: 0,
+                  }
+              }
+
+              fn document(mut self) -> bool {
+                  self.skip_ws();
+                  self.value(0);
+                  self.skip_ws();
+                  self.index == self.bytes.len()
+              }
+
+              fn skip_ws(&mut self) {
+                  self.index = skip_ws(self.bytes, self.index);
+              }
+
+              fn value(&mut self, depth: usize) -> bool {
+                  self.skip_ws();
+                  match self.bytes.get(self.index).copied() {
+                      Some(b'"') => self.string(),
+                      Some(b'{') if depth < MAX_JSON_NESTING => self.object(depth + 1),
+                      Some(b'[') if depth < MAX_JSON_NESTING => self.array(depth + 1),
+                      Some(b't') => self.literal(b"true"),
+                      Some(b'f') => self.literal(b"false"),
+                      Some(b'n') => self.literal(b"null"),
+                      Some(b'-' | b'0'..=b'9') => self.number(),
+                      _ => false,
+                  }
+              }
+
+              fn string(&mut self) -> bool {
+                  if self.bytes.get(self.index).copied() != Some(b'"') {
+                      return false;
+                  }
+                  self.index += 1;
+                  while let Some(byte) = self.bytes.get(self.index).copied() {
+                      match byte {
+                          b'"' => {
+                              self.index += 1;
+                              return true;
+                          }
+                          b'\\' => {
+                              self.index += 1;
+                              match self.bytes.get(self.index).copied() {
+                                  Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                                      self.index += 1;
+                                  }
+                                  Some(b'u') => {
+                                      self.index += 1;
+                                      for _ in 0..4 {
+                                          if !self
+                                              .bytes
+                                              .get(self.index)
+                                              .is_some_and(u8::is_ascii_hexdigit)
+                                          {
+                                              return false;
+                                          }
+                                          self.index += 1;
+                                      }
+                                  }
+                                  _ => return false,
+                              }
+                          }
+                          0x00..=0x1f => return false,
+                          _ => self.index += 1,
+                      }
+                  }
+                  false
+              }
+
+              fn object(&mut self, depth: usize) -> bool {
+                  self.index += 1;
+                  self.skip_ws();
+                  if self.bytes.get(self.index).copied() == Some(b'}') {
+                      self.index += 1;
+                      return true;
+                  }
+                  loop {
+                      if !self.string() {
+                          return false;
+                      }
+                      self.skip_ws();
+                      if self.bytes.get(self.index).copied() != Some(b':') {
+                          return false;
+                      }
+                      self.index += 1;
+                      if !self.value(depth) {
+                          return false;
+                      }
+                      self.skip_ws();
+                      match self.bytes.get(self.index).copied() {
+                          Some(b',') => {
+                              self.index += 1;
+                              self.skip_ws();
+                              if self.bytes.get(self.index).copied() == Some(b'}') {
+                                  return false;
+                              }
+                          }
+                          Some(b'}') => {
+                              self.index += 1;
+                              return true;
+                          }
+                          _ => return false,
+                      }
+                  }
+              }
+
+              fn array(&mut self, depth: usize) -> bool {
+                  self.index += 1;
+                  self.skip_ws();
+                  if self.bytes.get(self.index).copied() == Some(b']') {
+                      self.index += 1;
+                      return true;
+                  }
+                  loop {
+                      if !self.value(depth) {
+                          return false;
+                      }
+                      self.skip_ws();
+                      match self.bytes.get(self.index).copied() {
+                          Some(b',') => {
+                              self.index += 1;
+                              self.skip_ws();
+                              if self.bytes.get(self.index).copied() == Some(b']') {
+                                  return false;
+                              }
+                          }
+                          Some(b']') => {
+                              self.index += 1;
+                              return true;
+                          }
+                          _ => return false,
+                      }
+                  }
+              }
+
+              fn literal(&mut self, expected: &[u8]) -> bool {
+                  let Some(end) = self.index.checked_add(expected.len()) else {
+                      return false;
+                  };
+                  if self.bytes.get(self.index..end) != Some(expected) {
+                      return false;
+                  }
+                  self.index = end;
+                  true
+              }
+
+              fn number(&mut self) -> bool {
+                  if self.bytes.get(self.index).copied() == Some(b'-') {
+                      self.index += 1;
+                  }
+                  match self.bytes.get(self.index).copied() {
+                      Some(b'0') => {
+                          self.index += 1;
+                          if self.bytes.get(self.index).is_some_and(u8::is_ascii_digit) {
+                              return false;
+                          }
+                      }
+                      Some(b'1'..=b'9') => {
+                          self.index += 1;
+                          while self.bytes.get(self.index).is_some_and(u8::is_ascii_digit) {
+                              self.index += 1;
+                          }
+                      }
+                      _ => return false,
+                  }
+                  if self.bytes.get(self.index).copied() == Some(b'.') {
+                      self.index += 1;
+                      if !self.bytes.get(self.index).is_some_and(u8::is_ascii_digit) {
+                          return false;
+                      }
+                      while self.bytes.get(self.index).is_some_and(u8::is_ascii_digit) {
+                          self.index += 1;
+                      }
+                  }
+                  if matches!(self.bytes.get(self.index).copied(), Some(b'e' | b'E')) {
+                      self.index += 1;
+                      if matches!(self.bytes.get(self.index).copied(), Some(b'+' | b'-')) {
+                          self.index += 1;
+                      }
+                      if !self.bytes.get(self.index).is_some_and(u8::is_ascii_digit) {
+                          return false;
+                      }
+                      while self.bytes.get(self.index).is_some_and(u8::is_ascii_digit) {
+                          self.index += 1;
+                      }
+                  }
+                  true
+              }
+          }
+
+          fn valid_json_document(json: &str) -> bool {
+              JsonSyntax::new(json).document()
+          }
+
+          '''
+              parser = "\n".join(line[14:] if line.startswith("              ") else line for line in parser.splitlines()) + "\n"
+              if text.count(anchor) != 1:
+                  raise SystemExit("scan_string_end anchor did not match exactly once")
+              text = text.replace(anchor, parser + anchor, 1)
+
+              old_utf8 = '''        let text = String::from_utf8(message).map_err(|_| {
+                  io::Error::new(io::ErrorKind::InvalidData, "message is not valid UTF-8")
+              })?;
+              let jsonrpc = extract_top_level_string_field(&text, "jsonrpc");
+          '''
+              old_utf8 = "\n".join(line[14:] if line.startswith("              ") else line for line in old_utf8.splitlines()) + "\n"
+              new_utf8 = '''        let text = match String::from_utf8(message) {
+                  Ok(text) => text,
+                  Err(_) => {
+                      let response = error_response_null_id(
+                          PARSE_ERROR_CODE,
+                          "parse error: JSON-RPC message is not valid UTF-8",
+                      );
+                      transport::write_message(output, response.as_bytes())?;
+                      continue;
+                  }
+              };
+              if !valid_json_document(&text) {
+                  let response = error_response_null_id(PARSE_ERROR_CODE, "parse error");
+                  transport::write_message(output, response.as_bytes())?;
+                  continue;
+              }
+              let jsonrpc = extract_top_level_string_field(&text, "jsonrpc");
+          '''
+              new_utf8 = "\n".join(line[14:] if line.startswith("              ") else line for line in new_utf8.splitlines()) + "\n"
+              replace_once(old_utf8, new_utf8)
+
+              test_anchor = '''    #[test]
+              fn request_id_parser_preserves_integer_and_string_ids() {
+          '''
+              test_anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in test_anchor.splitlines()) + "\n"
+              tests = r'''    #[test]
+              fn malformed_json_in_unselected_fields_is_a_parse_error_and_recovery_is_clean() {
+                  let malformed = [
+                      r#"{"jsonrpc":"2.0","method":"extension/ignored","x":tru}"#,
+                      r#"{"jsonrpc":"2.0","method":"extension/ignored","x":"\q"}"#,
+                      r#"{"jsonrpc":"2.0","method":"extension/ignored","x":{"a" 1}}"#,
+                      r#"{"jsonrpc":"2.0","method":"extension/ignored","x":01}"#,
+                      r#"{"jsonrpc":"2.0","method":"extension/ignored","x":[true,]}"#,
+                  ];
+                  let (outcome, output) = lifecycle_session(&malformed.join("\n"));
+                  assert!(outcome.clean);
+                  assert_eq!(output.matches("\"code\":-32700").count(), malformed.len());
+                  assert_eq!(output.matches("\"id\":null").count(), malformed.len());
+                  assert!(!output.contains("method not found"));
+              }
+
+              #[test]
+              fn valid_unknown_json_values_remain_ignorable() {
+                  let (outcome, output) = lifecycle_session(
+                      r#"{"jsonrpc":"2.0","method":"extension/unknown","x":{"a":[true,false,null,-1.25e+3,"\u0041"]}}"#,
+                  );
+                  assert!(outcome.clean);
+                  assert!(!output.contains("parse error"));
+                  assert!(!output.contains("method not found"));
+              }
+
+              #[test]
+              fn valid_json_batch_is_an_invalid_request_not_a_parse_error() {
+                  let (outcome, output) = lifecycle_session(
+                      r#"[{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{}}]"#,
+                  );
+                  assert!(outcome.clean);
+                  assert!(output.contains("\"code\":-32600"));
+                  assert!(!output.contains("\"code\":-32700"));
+              }
+
+              #[test]
+              fn invalid_utf8_is_a_recoverable_parse_error() {
+                  let mut input_buf = Vec::new();
+                  write_message(&mut input_buf, &[0xff, 0xfe, 0xfd]).unwrap();
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                  );
+                  send(
+                      &mut input_buf,
+                      r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+                  );
+                  send(&mut input_buf, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+                  let mut reader = BufReader::new(&input_buf[..]);
+                  let mut output_buf = Vec::new();
+                  let outcome = serve(
+                      &mut reader,
+                      &mut output_buf,
+                      &mut |_uri, _version, _text| Ok(Vec::new()),
+                  )
+                  .expect("protocol session");
+                  let output = String::from_utf8(output_buf).expect("UTF-8 protocol output");
+                  assert!(outcome.clean);
+                  assert!(output.contains("\"code\":-32700"));
+                  assert!(output.contains("not valid UTF-8"));
+                  assert!(output.contains("\"id\":1,\"result\""));
+                  assert!(output.contains("\"id\":2,\"result\":null"));
+              }
+
+              #[test]
+              fn JSON_syntax_depth_is_bounded() {
+                  let nested = format!(
+                      "{}0{}",
+                      "[".repeat(MAX_JSON_NESTING + 1),
+                      "]".repeat(MAX_JSON_NESTING + 1)
+                  );
+                  assert!(!valid_json_document(&nested));
+                  let accepted = format!(
+                      "{}0{}",
+                      "[".repeat(MAX_JSON_NESTING),
+                      "]".repeat(MAX_JSON_NESTING)
+                  );
+                  assert!(valid_json_document(&accepted));
+              }
+
+          '''
+              tests = "\n".join(line[14:] if line.startswith("              ") else line for line in tests.splitlines())
+              if text.count(test_anchor) != 1:
+                  raise SystemExit("request-id test anchor did not match exactly once")
+              text = text.replace(test_anchor, tests + test_anchor, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              for expected in ["struct JsonSyntax", "PARSE_ERROR_CODE", "valid_json_document"]:
+                  if expected not in text:
+                      raise SystemExit(f"JSON syntax validation is partial: missing {expected}")
+          PY
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test complete JSON syntax and recovery
+        shell: bash
+        run: cargo test --locked -p fln-server --lib
+
+      - name: commit JSON syntax validation
+        shell: bash
+        run: |
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add crates/fln-server/src/dispatch.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(server): validate complete JSON syntax before dispatch" \
+              -m "Add a depth-bounded dependency-free JSON syntax validator covering containers, strings and escapes, literals, and the complete number grammar. Malformed unknown fields and invalid UTF-8 now yield recoverable JSON-RPC ParseError responses instead of bypassing selected-field validation or terminating the server." \
+              -m "Bead: franken_lean-v2p"
+          fi
+
+      - name: update bounded status and consolidate this landing record
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import datetime as dt
+          import json
+          import subprocess
+          from pathlib import Path
+
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          short = head[:8]
+          status = Path("IMPLEMENTATION_STATUS.md")
+          text = status.read_text(encoding="utf-8")
+          anchor = "- fail-closed JSON string decoding with standard escapes, UTF-16 surrogate-pair handling, and raw-control rejection.\n"
+          bullet = "- complete depth-bounded JSON syntax validation now covers every selected and unselected value, including container grammar, escapes, literals, and numbers; malformed JSON and invalid UTF-8 produce recoverable JSON-RPC `ParseError` (`-32700`) responses instead of terminating the session.\n"
+          if bullet not in text:
+              if anchor not in text:
+                  raise SystemExit("IMPLEMENTATION_STATUS JSON anchor missing")
+              text = text.replace(anchor, anchor + bullet, 1)
+          status.write_text(text, encoding="utf-8")
+
+          changelog = Path("CHANGELOG.md")
+          change = changelog.read_text(encoding="utf-8")
+          marker = "## 13) Complete JSON syntax validation and recovery — 2026-09-01"
+          if marker not in change:
+              change += f'''\n---\n\n{marker}\n\nThe bounded server's selected-field scanner was intentionally narrow, but that left a validity gap: malformed JSON could hide in an unknown field and never reach a selected decoder. A complete dependency-free, depth-bounded JSON syntax pass now runs before JSON-RPC envelope extraction.\n\n### Landed\n\n- Full object/array grammar validation with bounded nesting.\n- Complete JSON string escape syntax and raw-control rejection for every field, not just selected strings.\n- Exact literal and number grammar, including fraction/exponent rules and leading-zero refusal.\n- Invalid UTF-8 and malformed JSON produce `-32700` with `id: null`, and the server remains available for a subsequent valid initialize/shutdown lifecycle.\n- Valid non-request JSON remains distinct: a syntactically valid batch is `InvalidRequest`, while unknown notifications with valid nested values remain ignorable.\n\nFocused evidence: the `fln-server` library suite passed before commit [`{short}`](https://github.com/Dicklesworthstone/franken_lean/commit/{head}). This remains bounded protocol evidence, not full LSP/editor parity.\n'''
+          changelog.write_text(change, encoding="utf-8")
+
+          issues = Path(".beads/issues.jsonl")
+          lines = issues.read_text(encoding="utf-8").splitlines()
+          records = [json.loads(line) for line in lines]
+          max_comment_id = max(
+              (int(comment["id"]) for record in records for comment in record.get("comments", [])),
+              default=0,
+          )
+          now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+          for index, record in enumerate(records):
+              if record.get("id") != "franken_lean-v2p":
+                  continue
+              prefix = "Bounded Lantern JSON syntax update (2026-09-01):"
+              if not any(comment.get("text", "").startswith(prefix) for comment in record.get("comments", [])):
+                  record.setdefault("comments", []).append(
+                      {
+                          "id": max_comment_id + 1,
+                          "issue_id": "franken_lean-v2p",
+                          "author": "GPT-5.6-Pro",
+                          "text": (
+                              f"{prefix} commit {head}. Added a complete depth-bounded JSON syntax validator before selected-field extraction, recoverable -32700 handling for malformed JSON and invalid UTF-8, valid-batch InvalidRequest separation, and clean recovery tests. Focused fln-server tests passed. This advances only the bounded wire parser and does not close the daemon/editor/RPC/performance bead."
+                          ),
+                          "created_at": now,
+                      }
+                  )
+              record["updated_at"] = now
+              lines[index] = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+              break
+          else:
+              raise SystemExit("franken_lean-v2p bead missing")
+          issues.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+          cat > .github/workflows/fln-lsp-json-syntax-landing.yml <<'YAML'
+          name: archived fln LSP JSON-syntax landing record
+
+          on:
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          jobs:
+            archived:
+              runs-on: ubuntu-24.04
+              steps:
+                - name: archived landing record
+                  run: echo 'This no-deletion landing record is covered by fln-lsp-consolidated-hardening-landing.yml.'
+          YAML
+
+          python3 -I - <<'PY'
+          from pathlib import Path
+          path = Path(".github/workflows/fln-lsp-consolidated-hardening-landing.yml")
+          text = path.read_text(encoding="utf-8")
+          anchor = "                    grep -Fq 'focused-test observed' IMPLEMENTATION_STATUS.md\n"
+          check = "                    grep -Fq 'struct JsonSyntax' crates/fln-server/src/dispatch.rs\n"
+          if check not in text:
+              if anchor not in text:
+                  raise SystemExit("consolidated checker anchor missing")
+              text = text.replace(anchor, anchor + check, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test --locked -p fln-server --lib
+          cargo test --locked -p structure-guard --test real_workspace
+          git add IMPLEMENTATION_STATUS.md CHANGELOG.md .beads/issues.jsonl \
+            .github/workflows/fln-lsp-json-syntax-landing.yml \
+            .github/workflows/fln-lsp-consolidated-hardening-landing.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "docs(status): record complete JSON syntax validation" \
+              -m "Update the evidence-graded Lantern status, changelog, and existing franken_lean-v2p progress record, archive the no-deletion landing helper, and fold the new parser invariant into the consolidated focused check." \
+              -m "Bead: franken_lean-v2p (progress only; no closure claim)"
+          fi
+
+      - name: publish the verified incremental commits
+        shell: bash
+        run: |
+          git fetch origin main
+          base="$(git merge-base HEAD origin/main)"
+          test "$base" = "$(git rev-parse origin/main)" || {
+            echo "main moved incompatibly during JSON syntax landing" >&2
+            exit 2
+          }
+          git push origin HEAD:main
