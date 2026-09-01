@@ -151,6 +151,19 @@ class FrontierSelectTests(unittest.TestCase):
         with self.assertRaisesRegex(fs.FrontierError, "dangling blocker"):
             fs.load_issues(dangling)
 
+    def test_blocking_cycle_fails_with_a_deterministic_witness(self):
+        cycle = self.write_issues(
+            [
+                issue("b", blockers=("a",)),
+                issue("a", blockers=("b",)),
+            ]
+        )
+        with self.assertRaisesRegex(
+            fs.FrontierError,
+            r"blocking dependency cycle: a -> b -> a",
+        ):
+            fs.load_issues(cycle)
+
     def test_missing_acceptance_is_not_a_candidate(self):
         path = self.write_issues([issue("a", acceptance="")])
         issues, _ = fs.load_issues(path)
