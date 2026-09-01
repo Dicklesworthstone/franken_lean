@@ -1,0 +1,137 @@
+# One-shot, fail-closed landing lane for the fln-51y8 HEq semantic unit.
+# Remove this workflow after either landing path records the verified commit.
+name: fln-51y8 HEq verified landing
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/fln-51y8-heq-landing.yml]
+
+jobs:
+  verify_and_land:
+    if: github.event.head_commit.message == 'chore(agent): launch macOS-verified fln-51y8 HEq landing'
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      EXPECTED_ADMIT_BLOB: 9a8ce762c5c3cf4463797bf4127051e992adac2e
+      EXPECTED_TEST_BLOB: 85cb88c0e2942c31b76110ac38bb107486996f87
+      BR_REV: d2393c99ddcf337bd77d4ba61ce29ea8cdbe715b
+      BR_TOOLCHAIN: nightly-2026-08-25
+      PATCH_GZ_B64: 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
+      AGENT_NAME: gpt-5.6-pro
+    steps:
+      - name: checkout current main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I - <<'PY2'
+          import pathlib
+          import tomllib
+          value = tomllib.loads(pathlib.Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          if not isinstance(value, str) or not value.startswith('nightly-'):
+              raise SystemExit(f'not an exact nightly channel: {value!r}')
+          print(value)
+          PY2
+          )"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+
+      - name: rebase and verify immutable patch anchors
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'GPT-5.6 Pro'
+          git config user.email 'noreply@openai.com'
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+          fi
+          test "$(git hash-object crates/fln-checker/src/admit.rs)" = "$EXPECTED_ADMIT_BLOB"
+          test "$(git hash-object crates/fln-checker/tests/admit.rs)" = "$EXPECTED_TEST_BLOB"
+
+      - name: apply the HEq semantic unit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY2'
+          import base64
+          import gzip
+          import os
+          import pathlib
+          payload = base64.b64decode(os.environ['PATCH_GZ_B64'], validate=True)
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'heq.patch').write_bytes(gzip.decompress(payload))
+          PY2
+          git apply --check "$RUNNER_TEMP/heq.patch"
+          git apply "$RUNNER_TEMP/heq.patch"
+          git diff --check --             crates/fln-checker/src/admit.rs             crates/fln-checker/tests/admit.rs
+
+      - name: verify the exact and full checker surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test -p fln-checker --test admit \
+            kr600_803_init_heq_block_is_reconstructed -- --exact --nocapture
+          cargo test --no-fail-fast -p fln-checker
+          cargo clippy -p fln-checker --all-targets -- -D warnings
+
+      - name: commit and push the verified code
+        shell: bash
+        run: |
+          set -euo pipefail
+          git commit -o -m 'fix(checker): reconstruct pinned HEq hygienic recursor' \
+            crates/fln-checker/src/admit.rs \
+            crates/fln-checker/tests/admit.rs
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD^)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+            cargo fmt --all --check
+            cargo test -p fln-checker --test admit \
+              kr600_803_init_heq_block_is_reconstructed -- --exact --nocapture
+            cargo test --no-fail-fast -p fln-checker
+            cargo clippy -p fln-checker --all-targets -- -D warnings
+          fi
+          git push origin HEAD:main
+
+      - name: install the pinned bead client
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$BR_TOOLCHAIN" --profile minimal
+          rustup run "$BR_TOOLCHAIN" cargo install \
+            --git https://github.com/Dicklesworthstone/beads_rust.git \
+            --rev "$BR_REV" --locked --root "$RUNNER_TEMP/br" --bin br
+          echo "$RUNNER_TEMP/br/bin" >> "$GITHUB_PATH"
+
+      - name: record the verified frontier advance
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+          fi
+          RUST_LOG=error br sync --import-only --rebuild
+          code_sha="$(git log -1 --format=%H -- crates/fln-checker/src/admit.rs)"
+          RUST_LOG=error br --json update fln-51y8 \
+            --status in_progress --assignee "$AGENT_NAME"
+          RUST_LOG=error br --json comments add fln-51y8 \
+            --author "$AGENT_NAME" \
+            --message "Verified HEq semantic unit landed at $code_sha on macos-14. Green: cargo fmt --all --check; exact kr600_803_init_heq_block_is_reconstructed; full fln-checker --no-fail-fast; fln-checker all-target clippy -D warnings. The reflexive premise now supplies motive alpha a_hyg_outer (HEq.refl alpha a_hyg_outer), while the major premise preserves distinct outer-left and rebound-right hygienic locals. fln-51y8 remains in_progress pending the exact real pinned Init.Prelude council rerun and next-frontier capture."
+          RUST_LOG=error br sync --flush-only
+          git diff --check -- .beads/issues.jsonl
+          git commit -o -m 'meta(tracker): record verified HEq council advance' \
+            .beads/issues.jsonl
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD^)" != "$(git rev-parse origin/main)" ]]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
