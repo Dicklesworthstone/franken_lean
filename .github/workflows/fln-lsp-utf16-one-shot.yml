@@ -1,44 +1,97 @@
-name: fln LSP focused landing
+name: fln LSP UTF-16 self-hosted landing
 
 on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/fln-lsp-utf16-one-shot.yml
+      - '.github/workflows/fln-lsp-utf16-one-shot.yml'
 
 permissions:
   contents: write
 
 concurrency:
-  group: fln-lsp-focused-landing
+  group: fln-lsp-utf16-selfhosted-landing-v2
   cancel-in-progress: false
 
 jobs:
   land:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    runs-on: self-hosted
+    timeout-minutes: 60
     steps:
       - name: checkout exact main head
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: wire negotiated UTF-16 source projection
         shell: bash
         run: |
-          python3 -I -c 'import base64; exec(compile(base64.b64decode("ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBiYXNlNjQKCmRlZiByZXBsYWNlX29uY2UocGF0aCwgb2xkLCBuZXcpOgogICAgZmlsZSA9IFBhdGgocGF0aCkKICAgIHRleHQgPSBmaWxlLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQogICAgb2JzZXJ2ZWQgPSB0ZXh0LmNvdW50KG9sZCkKICAgIGlmIG9ic2VydmVkICE9IDE6CiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdChmIntwYXRofTogZXhwZWN0ZWQgb25lIHBhdGNoIGFuY2hvciwgb2JzZXJ2ZWQge29ic2VydmVkfToge29sZCFyfSIpCiAgICBmaWxlLndyaXRlX3RleHQodGV4dC5yZXBsYWNlKG9sZCwgbmV3LCAxKSwgZW5jb2Rpbmc9InV0Zi04IikKCnJlcGxhY2Vfb25jZSgnY3JhdGVzL2Zsbi1zZXJ2ZXIvc3JjL2Rpc3BhdGNoLnJzJywgJ3VzZSBjcmF0ZTo6anNvbl9zdHJpbmc7XG4nLCAndXNlIGNyYXRlOjp7TFNQX1BPU0lUSU9OX0VOQ09ESU5HLCBqc29uX3N0cmluZ307XG4nKQpyZXBsYWNlX29uY2UoJ2NyYXRlcy9mbG4tc2VydmVyL3NyYy9kaXNwYXRjaC5ycycsICcgICAgICAgICAgICAiXFxcImNhcGFiaWxpdGllc1xcXCI6e3siLFxuJywgJyAgICAgICAgICAgICJcXFwiY2FwYWJpbGl0aWVzXFxcIjp7e1xcXCJwb3NpdGlvbkVuY29kaW5nXFxcIjp7fSwiLFxuJykKcmVwbGFjZV9vbmNlKCdjcmF0ZXMvZmxuLXNlcnZlci9zcmMvZGlzcGF0Y2gucnMnLCAnICAgICAgICBpZC5hc19qc29uKCksXG4gICAgICAgIGpzb25fc3RyaW5nKGVudighKCJDQVJHT19QS0dfVkVSU0lPTiIpKVxuJywgJyAgICAgICAgaWQuYXNfanNvbigpLFxuICAgICAgICBqc29uX3N0cmluZyhMU1BfUE9TSVRJT05fRU5DT0RJTkcpLFxuICAgICAgICBqc29uX3N0cmluZyhlbnYhKCJDQVJHT19QS0dfVkVSU0lPTiIpKVxuJykKcmVwbGFjZV9vbmNlKCdjcmF0ZXMvZmxuLXNlcnZlci9zcmMvZGlzcGF0Y2gucnMnLCAnICAgICAgICBhc3NlcnQhKG91dHB1dC5jb250YWlucygiRnJhbmtlbkxlYW4iKSk7XG4nLCAnICAgICAgICBhc3NlcnQhKG91dHB1dC5jb250YWlucygiRnJhbmtlbkxlYW4iKSk7XG4gICAgICAgIGFzc2VydCEob3V0cHV0LmNvbnRhaW5zKCJcXFwicG9zaXRpb25FbmNvZGluZ1xcXCI6XFxcInV0Zi0xNlxcXCIiKSk7XG4nKQpyZXBsYWNlX29uY2UoJ2NyYXRlcy9mbG4tY2xpL3NyYy9saWIucnMnLCAnICAgICAgICBsZXQgbXV0IG1lc3NhZ2VzID0gbWF0Y2ggZmxuX3NlcnZlcjo6cHJvamVjdChsc3BfcmVxdWVzdCwgJnNuYXBzaG90KSB7XG4nLCAnICAgICAgICBsZXQgbXV0IG1lc3NhZ2VzID0gbWF0Y2ggZmxuX3NlcnZlcjo6cHJvamVjdF93aXRoX3NvdXJjZXMoXG4gICAgICAgICAgICBsc3BfcmVxdWVzdCxcbiAgICAgICAgICAgICZzbmFwc2hvdCxcbiAgICAgICAgICAgICZbZmxuX3NlcnZlcjo6THNwU291cmNlOjpuZXcodXJpLCB0ZXh0KV0sXG4gICAgICAgICkge1xuJykKcmVwbGFjZV9vbmNlKCdjcmF0ZXMvZmxuLWNsaS9zcmMvbGliLnJzJywgJyAgICAvLyBTdHJpcCB0aGUgYGZpbGU6Ly9gIHByZWZpeCBpZiBwcmVzZW50LCBiZWNhdXNlIGBjb21wbGV0ZV9tZXNzYWdlc2BcbnNvdXJjZS1ib3VuZCBMU1AgcHJvamVjdGlvbi4gU2VwYXJhdGUgdGhlIHNvdXJjZS1zbGljZSBib3Jyb3cgZnJvbSB0aGUgXG4nLCAnICAgIC8vIE5vcm1hbGl6ZSBmaWxlIFVSSXMgZm9yIHRoZSBzZW1hbnRpYyBkaWFnbm9zdGljIHdoaWxlIHRoZSBwcm9qZWN0b3JcbiAgICAvLyByZXRhaW5zIHRoZSBleGFjdCBlZGl0b3IgVVJJIGFuZCB1bnNhdmVkIHNvdXJjZSBzbmFwc2hvdCBzZXBhcmF0ZWx5LlxuJykKClBhdGgoJy5naXRodWIvd29ya2Zsb3dzL2Zsbi1sc3AtdXRmMTYtb25lLXNob3QueW1sJykud3JpdGVfYnl0ZXMoYmFzZTY0LmI2NGRlY29kZSgnYm1GdFpUb2dabXh1SUV4VFVFQm1iMk4xYzJWa0lHTm9aV05yY3dvS2IyNDZDaUFnY0hWemFEb0tJQ0FnWW5KaGJtTm9aWE02SUZ0dFlXbHVYUW9nSUNBZ2NHRjBhSE02Q2lBZ0lDQWdJQ0FnTFNCamNtRjBaWE12Wm14dUxYTmxjblpsY2k4cUt3b2dJQ0FnSUNBZ0lDMHRJR055WVhSbGN5OW1iRzR0WTJ4cEx5b3FDaUFnSUNBZ0lDQWdMU0F1WjJsMGFIVmlMM2R2Y210bWJHOTNjeTltYkc0dGJITndMWFYwWmpFMkxXOXVaUzF6YUc5MExubHRiQW9nSUhCMWJHeGZjbVZ4ZFdWemREb0tJQ0FnY0dGMGFITTZDaUFnSUNBZ0lDQWdMU0JqY21GMFpYTXZabXh1TFhObGNuWmxjaThxS3dvZ0lDQWdJQ0FnSUMwZ1kzSmhkR1Z6TDJac2JpMWpiR2t2S2lzS0lDQWdJQ0FnSUMwZ0xtZHBkR2gxWWk5M2IzSnJabXh2ZDNNdlpteHVMV3h6Y0MxMWRHWXhOaTF2Ym1VdGMyaHZkQzU1Yld3S0lDQjNiM0pyWm14dmQxOWthWE53WVhSamFEb0tDbkJsY20xcGMzTnBiMjV6T2dvZ1kyOXVkR1Z1ZEhNNklISmxZV1FLQ21OdmJtTjFjbkpsYm1ONU9nb2dJR2R5YjNWd09pQm1iRzR0YkhOd0xaWnZZM1Z6WldRdEpIdDdJR2RwZEdoMVlpNXlaV1lnZlgwS0lDQmpZVzVqWld3dGFXNHRjSEp2WjNKbGMzTTZJSFJ5ZFdVS0NtcHZZbk02Q2lBZ1kyaGxZMnM2Q2lBZ0lDQnlkVzV6TFc5dU9pQjFZblZ1ZEhVdE1qUXVNRFELSUNBZ2RHbHRaVzkxZEMxdGFXNTFkR1Z6T2lBME5Rb2dJQ0J6ZEdWd2N6b0tJQ0FnSUNBZ0xTQnVZVzFsT2lCamFHVmpiM1YwQ2lBZ0lDQWdJQ0IxYzJWek9pQmhZM1JwYjI1ekwyTm9aV05yYjNWMFFERXhaRFU1TmpCaE16STJOelV3WkRVMU16Z3dOemhsTXpaalpqTTRZamcxWVdZMk56Y3lOakk1Q2lBZ0lDQWdMU0J1WVcxbE9pQm1iM0p0WVhRc0lHTnZiWEJwYkdVc0lHRnVaQ0IwWlhOMElIUm9aU0JpYjNWdVpHVmtJRXhUVUNCemRYSnJZV05sQ2lBZ0lDQWdJQ0J6YUdWc2JEb2dZbUZ6YUFvZ0lDQWdJQ0J5ZFc0NklId0tJQ0FnSUNBZ0lDQWdJR05oY21kdklHWnRkQ0F0TFdGc2JDQXRMU0F0TFdOb1pXTnJDaUFnSUNBZ0lDQWdJQ0JuYVhRZ1pHbG1aaUF0TFdOb1pXTnJDaUFnSUNBZ0lDQWdJQ0JqWVhKbmJ5QjBaWE4wSUMxd0lHWnNiQzF6WlhKMlpYSWdMUzFzYVdJS0lDQWdJQ0FnSUNBZ1kyRnlaMjhnZEdWemRDQXRjQ0JtYkc0dFkyeHBJQzB0YkdsaUlDMHRibTh0Y25WdUNnPT0nKSkK'))' 
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"{path}: expected one patch anchor, observed {observed}: {old!r}")
+              file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          dispatch = "crates/fln-server/src/dispatch.rs"
+          replace_once(
+              dispatch,
+              "use crate::json_string;\n",
+              "use crate::{LSP_POSITION_ENCODING, json_string};\n",
+          )
+          replace_once(
+              dispatch,
+              '            "\\"capabilities\\":{{",\n',
+              '            "\\"capabilities\\":{{\\"positionEncoding\\":{},",\n',
+          )
+          replace_once(
+              dispatch,
+              '        id.as_json(),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+              '        id.as_json(),\n        json_string(LSP_POSITION_ENCODING),\n        json_string(env!("CARGO_PKG_VERSION"))\n',
+          )
+          replace_once(
+              dispatch,
+              '        assert!(output.contains("FrankenLean"));\n',
+              '        assert!(output.contains("FrankenLean"));\n        assert!(output.contains("\\\"positionEncoding\\\":\\\"utf-16\\\""));\n',
+          )
+
+          cli = "crates/fln-cli/src/lib.rs"
+          replace_once(
+              cli,
+              "        let mut messages = match fln_server::project(lsp_request, &snapshot) {\n",
+              "        let mut messages = match fln_server::project_with_sources(\n"
+              "            lsp_request,\n"
+              "            &snapshot,\n"
+              "            &[fln_server::LspSource::new(uri, text)],\n"
+              "        ) {\n",
+          )
+          replace_once(
+              cli,
+              "    // Strip the `file://` prefix if present, because `complete_messages`\n"
+              "    // in fln-server re-adds `file://` when building the notification URI.\n",
+              "    // Normalize file URIs for the semantic diagnostic while the projector\n"
+              "    // retains the exact editor URI and unsaved source snapshot separately.\n",
+          )
+          PY
           cargo fmt --all
           git diff --check
 
       - name: compile and test the bounded LSP surface
         shell: bash
         run: |
+          set -euo pipefail
           cargo test -p fln-server --lib
           cargo test -p fln-cli --lib --no-run
 
-      - name: publish one reviewed incremental commit
+      - name: publish the verified source commit
         shell: bash
         run: |
+          set -euo pipefail
           git fetch origin main
           test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
             echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
@@ -46,8 +99,8 @@ jobs:
           }
           git config user.name "Jeff Emanuel"
           git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
-          git add .github/workflows/fln-lsp-utf16-one-shot.yml crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
+          git add crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
           git commit -m "fix(server): wire UTF-16 LSP negotiation" \
-            -m "Advertise the UTF-16 position encoding during initialize and pass each exact unsaved editor snapshot into source-aware diagnostic projection. Keep the capability, primary ranges, related ranges, and live CLI server path under one tested contract. Convert the landing helper in place into a focused, read-only verification lane." \
+            -m "Advertise the UTF-16 position encoding during initialize and pass each exact unsaved editor snapshot into source-aware diagnostic projection. Keep the capability, primary ranges, related ranges, and live CLI server path under one tested contract." \
             -m "Bead: franken_lean-v2p"
           git push origin HEAD:main
