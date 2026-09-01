@@ -1,0 +1,181 @@
+name: fln-server JSON string self-hosted landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-server-json-string-selfhosted.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-server-json-string-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply the bounded JSON decoder repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=crates/fln-server/src/dispatch.rs
+          if grep -q 'escaped_text_decodes_utf16_surrogate_pairs' "$file"; then
+            echo 'decoder repair already present'
+            exit 0
+          fi
+          actual=$(git hash-object "$file")
+          expected=43e758f1d932b24ce2a396d4c63f4096723b184a
+          if [[ "$actual" != "$expected" ]]; then
+            echo "dispatch.rs moved: expected $expected, observed $actual" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/fln-server/src/dispatch.rs')
+          text = path.read_text(encoding='utf-8')
+          needle = 'fn extract_escaped_text_value(after_key: &str) -> Option<String> {'
+          start = text.index(needle)
+          depth = 0
+          end = None
+          for index in range(start, len(text)):
+              character = text[index]
+              if character == '{':
+                  depth += 1
+              elif character == '}':
+                  depth -= 1
+                  if depth == 0:
+                      end = index + 1
+                      break
+          if end is None:
+              raise SystemExit('decoder function did not close')
+          replacement = r'''fn extract_escaped_text_value(after_key: &str) -> Option<String> {
+              fn hex_quad(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+                  let mut value = 0u16;
+                  for _ in 0..4 {
+                      value = value.checked_mul(16)?;
+                      value = value.checked_add(u16::try_from(chars.next()?.to_digit(16)?).ok()?)?;
+                  }
+                  Some(value)
+              }
+
+              fn unicode_escape(chars: &mut std::str::Chars<'_>) -> Option<char> {
+                  let first = hex_quad(chars)?;
+                  match first {
+                      0xd800..=0xdbff => {
+                          if chars.next()? != '\\' || chars.next()? != 'u' {
+                              return None;
+                          }
+                          let second = hex_quad(chars)?;
+                          if !(0xdc00..=0xdfff).contains(&second) {
+                              return None;
+                          }
+                          let high = u32::from(first) - 0xd800;
+                          let low = u32::from(second) - 0xdc00;
+                          char::from_u32(0x1_0000 + (high << 10) + low)
+                      }
+                      0xdc00..=0xdfff => None,
+                      scalar => char::from_u32(u32::from(scalar)),
+                  }
+              }
+
+              let start = after_key.find('"')?;
+              let after_quote = &after_key[start + 1..];
+              let mut result = String::new();
+              let mut chars = after_quote.chars();
+              while let Some(ch) = chars.next() {
+                  match ch {
+                      '"' => return Some(result),
+                      '\\' => {
+                          let escaped = chars.next()?;
+                          result.push(match escaped {
+                              '"' => '"',
+                              '\\' => '\\',
+                              '/' => '/',
+                              'b' => '\u{0008}',
+                              'f' => '\u{000c}',
+                              'n' => '\n',
+                              'r' => '\r',
+                              't' => '\t',
+                              'u' => unicode_escape(&mut chars)?,
+                              _ => return None,
+                          });
+                      }
+                      control if control <= '\u{001f}' => return None,
+                      other => result.push(other),
+                  }
+              }
+              None
+          }'''
+          text = text[:start] + replacement + text[end:]
+          marker = '    #[test]\n    fn initialize_advertises_push_diagnostics_not_pull_diagnostics() {'
+          tests = r'''    #[test]
+              fn escaped_text_decodes_utf16_surrogate_pairs() {
+                  assert_eq!(
+                      extract_escaped_text_value(r#""\ud83e\udd16""#).as_deref(),
+                      Some("🤖")
+                  );
+                  assert_eq!(
+                      extract_escaped_text_value(r#""a\/b\b\f\n\r\t""#).as_deref(),
+                      Some("a/b\u{0008}\u{000c}\n\r\t")
+                  );
+              }
+
+              #[test]
+              fn escaped_text_rejects_malformed_json_strings() {
+                  assert!(extract_escaped_text_value(r#""\ud83e""#).is_none());
+                  assert!(extract_escaped_text_value(r#""\udd16""#).is_none());
+                  assert!(extract_escaped_text_value(r#""\ud83e\u0041""#).is_none());
+                  assert!(extract_escaped_text_value(r#""\q""#).is_none());
+                  assert!(extract_escaped_text_value("\"line\nfeed\"").is_none());
+              }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit(f'test marker count {text.count(marker)}')
+          text = text.replace(marker, tests + marker)
+          path.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git diff --check -- crates/fln-server/src/dispatch.rs
+
+      - name: Verify fln-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test --manifest-path crates/fln-server/Cargo.toml
+          cargo clippy --manifest-path crates/fln-server/Cargo.toml --all-targets -- -D warnings
+
+      - name: Commit the repair and retire landing workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet -- crates/fln-server/src/dispatch.rs; then
+            git add crates/fln-server/src/dispatch.rs
+            git commit -m 'fix(server): decode JSON strings without Unicode loss'
+          fi
+          rm -f .github/workflows/fln-server-json-string-verified-landing.yml
+          rm -f .github/workflows/fln-server-json-string-selfhosted.yml
+          git add .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore(server): retire JSON decoder landing scaffolding'
+          fi
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          exit 1
