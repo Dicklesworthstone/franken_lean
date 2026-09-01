@@ -1,0 +1,180 @@
+name: fln-51y8 self-hosted HEq landing v3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-51y8-heq-selfhosted-v3.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-51y8-heq-landing
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply only the missing motive argument
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'fn kr600_803_init_heq_block_is_reconstructed' crates/fln-checker/tests/admit.rs; then
+            echo 'HEq correction already present'
+            exit 0
+          fi
+          actual_src=$(git hash-object crates/fln-checker/src/admit.rs)
+          actual_test=$(git hash-object crates/fln-checker/tests/admit.rs)
+          expected_src=9a8ce762c5c3cf4463797bf4127051e992adac2e
+          expected_test=85cb88c0e2942c31b76110ac38bb107486996f87
+          if [[ "$actual_src" != "$expected_src" || "$actual_test" != "$expected_test" ]]; then
+            echo "HEq anchors moved: src=$actual_src test=$actual_test" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def bounded(text: str, start_marker: str, end_marker: str) -> tuple[str, str, str]:
+              start = text.index(start_marker)
+              end = text.index(end_marker, start)
+              return text[:start], text[start:end], text[end:]
+
+          old = '''    // Minor premise, scope: α(2), a(1), motive(0).
+              let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+              let refl_alpha_index = b.bvar(2);
+              let refl_alpha = b.apply(refl_const, refl_alpha_index);
+              let refl_a_index = b.bvar(1);
+              let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+              let motive_var = b.bvar(0);
+              let minor_a = b.bvar(1);
+              let motive_a = b.apply(motive_var, minor_a);
+              let minor_type = b.apply(motive_a, refl_alpha_a);
+          '''
+          new = '''    // Reflexive premise, scope: α(2), a_hyg_outer(1), motive(0).
+              // `motive` takes the type, its value, and then the HEq proof.
+              let refl_const = b.constant(refl, std::slice::from_ref(alpha_universe));
+              let refl_alpha_index = b.bvar(2);
+              let refl_alpha = b.apply(refl_const, refl_alpha_index);
+              let refl_a_index = b.bvar(1);
+              let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+              let motive_var = b.bvar(0);
+              let minor_alpha = b.bvar(2);
+              let motive_alpha = b.apply(motive_var, minor_alpha);
+              let minor_a_hyg = b.bvar(1);
+              let motive_alpha_a_hyg = b.apply(motive_alpha, minor_a_hyg);
+              let minor_type = b.apply(motive_alpha_a_hyg, refl_alpha_a);
+          '''
+          source = Path('crates/fln-checker/src/admit.rs')
+          whole = source.read_text(encoding='utf-8')
+          prefix, section, suffix = bounded(
+              whole,
+              'fn heq_motive_type(',
+              '/// Reconstruct the universe-polymorphic heterogeneous equality family',
+          )
+          if section.count(old) != 2:
+              raise SystemExit(f'expected two HEq reflexive-premise sites, found {section.count(old)}')
+          source.write_text(prefix + section.replace(old, new) + suffix, encoding='utf-8')
+
+          tests = Path('crates/fln-checker/tests/admit.rs')
+          whole = tests.read_text(encoding='utf-8')
+          prefix, section, suffix = bounded(
+              whole,
+              'fn init_heq_entries()',
+              '#[test]\nfn kr600_803_init_heq_refuses_a_forged_reflector_field_count()',
+          )
+          old_fixture = '''    let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
+              let minor_domain = Expr::app(Expr::app(bv(0), bv(1)), refl_alpha_a);
+          '''
+          new_fixture = '''    let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
+              let minor_domain = Expr::app(
+                  Expr::app(Expr::app(bv(0), bv(2)), bv(1)),
+                  refl_alpha_a,
+              );
+          '''
+          if section.count(old_fixture) != 1:
+              raise SystemExit(f'expected one HEq fixture premise, found {section.count(old_fixture)}')
+          section = section.replace(old_fixture, new_fixture)
+          test_start = section.index('#[test]\nfn kr600_803_init_heq_block_defers_typed_on_preamble_sort_arguments()')
+          test_end = len(section)
+          replacement = '''#[test]
+          fn kr600_803_init_heq_block_is_reconstructed() {
+              let entries = init_heq_entries();
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &entries,
+                  AdmissionBudget::unlimited(),
+                  EnvironmentBudget::unlimited(),
+              );
+              assert!(verdict.is_admitted(), "exact Init.HEq block: {verdict:?}");
+              let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+                  return;
+              };
+              assert_eq!(admission.members().len(), 3);
+          }
+
+          '''
+          section = section[:test_start] + replacement
+          tests.write_text(prefix + section + suffix, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git diff --check -- crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
+
+      - name: Verify the corrected checker frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test -p fln-checker --test admit kr600_803_init_heq_block_is_reconstructed -- --exact
+          cargo test --no-fail-fast -p fln-checker
+          cargo clippy -p fln-checker --all-targets -- -D warnings
+
+      - name: Record the bead frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v br >/dev/null 2>&1; then
+            br update fln-51y8 --status in_progress
+            note='HEq item 15 advanced by the minimal semantic correction: the reflexive premise now applies motive to α, outer a_hyg, and HEq.refl α a_hyg. The distinct rebound major a_hyg path was unchanged. Verified by the exact HEq admission regression, full fln-checker suite, and clippy -D warnings. fln-51y8 remains in progress pending the real Init.Prelude council next-frontier run.'
+            if br comments add --help >/dev/null 2>&1; then
+              br comments add fln-51y8 "$note"
+            elif br comment --help >/dev/null 2>&1; then
+              br comment fln-51y8 "$note"
+            fi
+          fi
+
+      - name: Commit incrementally and retire temporary landing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet -- crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs .beads; then
+            git add crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs .beads
+            git commit -m 'fix(checker): reconstruct pinned HEq hygienic recursor'
+          fi
+          rm -f .github/workflows/fln-51y8-heq-selfhosted.yml
+          rm -f .github/workflows/fln-51y8-heq-selfhosted-v2.yml
+          rm -f .github/workflows/fln-51y8-heq-selfhosted-v3.yml
+          rm -f .github/workflows/fln-51y8-heq-landing.yml
+          if grep -q 'verify and land the pinned HEq hygienic recursor' .github/workflows/mandated-mutants.yml; then
+            git revert --no-commit 5a381ab7ff8f3d1808b067db29fba2c8e61df8fa
+          fi
+          git add .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore(checker): retire HEq landing scaffolding'
+          fi
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          exit 1
