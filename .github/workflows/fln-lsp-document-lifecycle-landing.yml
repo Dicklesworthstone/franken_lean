@@ -1,0 +1,445 @@
+name: fln LSP document-lifecycle landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-lsp-document-lifecycle-landing.yml
+  workflow_run:
+    workflows:
+      - fln LSP JSON-RPC state recovery landing
+      - fln LSP JSON-RPC state checks
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-lsp-document-lifecycle-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout latest main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: require the version-aware protocol state
+        shell: bash
+        run: |
+          grep -Fq 'FnMut(&str, Option<i64>, &str)' crates/fln-server/src/dispatch.rs
+          grep -Fq 'SERVER_NOT_INITIALIZED_CODE' crates/fln-server/src/dispatch.rs
+
+      - name: separate document lifecycle from retained source bytes
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/fln-server/src/dispatch.rs")
+          text = path.read_text(encoding="utf-8")
+          marker = "duplicate_did_open_does_not_overwrite_the_authoritative_snapshot"
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              observed = text.count(old)
+              if observed != 1:
+                  raise SystemExit(f"expected one dispatch anchor, observed {observed}: {old[:180]!r}")
+              text = text.replace(old, new, 1)
+
+          if marker not in text:
+              replace_once(
+                  "struct CachedDocument {\n    version: Option<i64>,\n    text: String,\n}\n",
+                  "struct CachedDocument {\n    version: Option<i64>,\n    text: Option<String>,\n}\n",
+              )
+
+              impl_start = text.index("impl DocumentCache {")
+              impl_end = text.index("\nfn skip_ws", impl_start)
+              implementation = r'''impl DocumentCache {
+              fn new() -> Self {
+                  Self::with_limits(MAX_OPEN_DOCUMENTS, MAX_OPEN_DOCUMENT_BYTES)
+              }
+
+              fn with_limits(max_documents: usize, max_bytes: usize) -> Self {
+                  Self {
+                      documents: BTreeMap::new(),
+                      total_bytes: 0,
+                      max_documents,
+                      max_bytes,
+                  }
+              }
+
+              fn store(
+                  &mut self,
+                  uri: String,
+                  version: impl Into<Option<i64>>,
+                  text: String,
+              ) -> Result<(), CacheRefusal> {
+                  let version = version.into();
+                  let is_new = !self.documents.contains_key(&uri);
+                  if is_new && self.documents.len() >= self.max_documents {
+                      return Err(CacheRefusal::DocumentLimit);
+                  }
+                  let old_len = self
+                      .documents
+                      .get(&uri)
+                      .and_then(|document| document.text.as_ref())
+                      .map_or(0, String::len);
+                  let base_total = self
+                      .total_bytes
+                      .checked_sub(old_len)
+                      .ok_or(CacheRefusal::AccountingOverflow)?;
+                  let next_total = match base_total.checked_add(text.len()) {
+                      Some(total) => total,
+                      None => {
+                          self.documents.insert(
+                              uri,
+                              CachedDocument {
+                                  version,
+                                  text: None,
+                              },
+                          );
+                          self.total_bytes = base_total;
+                          return Err(CacheRefusal::AccountingOverflow);
+                      }
+                  };
+                  if next_total > self.max_bytes {
+                      self.documents.insert(
+                          uri,
+                          CachedDocument {
+                              version,
+                              text: None,
+                          },
+                      );
+                      self.total_bytes = base_total;
+                      return Err(CacheRefusal::ByteLimit);
+                  }
+                  self.documents.insert(
+                      uri,
+                      CachedDocument {
+                          version,
+                          text: Some(text),
+                      },
+                  );
+                  self.total_bytes = next_total;
+                  Ok(())
+              }
+
+              fn text(&self, uri: &str) -> Option<&str> {
+                  self.documents
+                      .get(uri)
+                      .and_then(|document| document.text.as_deref())
+              }
+
+              fn version(&self, uri: &str) -> Option<i64> {
+                  self.documents
+                      .get(uri)
+                      .and_then(|document| document.version)
+              }
+
+              fn is_open(&self, uri: &str) -> bool {
+                  self.documents.contains_key(uri)
+              }
+
+              fn replace_text(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {
+                  let version = self.version(&uri);
+                  self.store(uri, version, text)
+              }
+
+              fn invalidate_text(&mut self, uri: &str) -> Result<bool, CacheRefusal> {
+                  let Some(document) = self.documents.get(uri) else {
+                      return Ok(false);
+                  };
+                  let old_len = document.text.as_ref().map_or(0, String::len);
+                  let next_total = self
+                      .total_bytes
+                      .checked_sub(old_len)
+                      .ok_or(CacheRefusal::AccountingOverflow)?;
+                  let document = self
+                      .documents
+                      .get_mut(uri)
+                      .expect("document existence checked above");
+                  document.version = None;
+                  document.text = None;
+                  self.total_bytes = next_total;
+                  Ok(true)
+              }
+
+              fn remove(&mut self, uri: &str) -> Result<(), CacheRefusal> {
+                  let Some(document) = self.documents.get(uri) else {
+                      return Ok(());
+                  };
+                  let old_len = document.text.as_ref().map_or(0, String::len);
+                  let next_total = self
+                      .total_bytes
+                      .checked_sub(old_len)
+                      .ok_or(CacheRefusal::AccountingOverflow)?;
+                  self.documents.remove(uri);
+                  self.total_bytes = next_total;
+                  Ok(())
+              }
+          }
+          '''
+              implementation = "\n".join(
+                  line[14:] if line.startswith("              ") else line
+                  for line in implementation.splitlines()
+              )
+              text = text[:impl_start] + implementation + text[impl_end:]
+
+              replace_once(
+                  "    if let Err(refusal) = documents.remove(uri) {\n"
+                  "        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;\n"
+                  "    }\n"
+                  "    transport::write_message(output, log_warning(reason).as_bytes())?;\n",
+                  "    if let Err(refusal) = documents.invalidate_text(uri) {\n"
+                  "        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;\n"
+                  "    }\n"
+                  "    transport::write_message(output, log_warning(reason).as_bytes())?;\n",
+              )
+
+              replace_once(
+                  "            (Some(\"textDocument/didOpen\"), None, ServerState::Running) => {\n"
+                  "                if let Some(uri) = extract_text_document_uri(&text) {\n"
+                  "                    match (\n",
+                  "            (Some(\"textDocument/didOpen\"), None, ServerState::Running) => {\n"
+                  "                if let Some(uri) = extract_text_document_uri(&text) {\n"
+                  "                    if documents.is_open(&uri) {\n"
+                  "                        transport::write_message(\n"
+                  "                            output,\n"
+                  "                            log_warning(\n"
+                  "                                \"FrankenLean refused duplicate didOpen; the existing document snapshot remains authoritative\",\n"
+                  "                            )\n"
+                  "                            .as_bytes(),\n"
+                  "                        )?;\n"
+                  "                        continue;\n"
+                  "                    }\n"
+                  "                    match (\n",
+              )
+              replace_once(
+                  "            (Some(\"textDocument/didChange\"), None, ServerState::Running) => {\n"
+                  "                if let Some(uri) = extract_text_document_uri(&text) {\n"
+                  "                    match (\n",
+                  "            (Some(\"textDocument/didChange\"), None, ServerState::Running) => {\n"
+                  "                if let Some(uri) = extract_text_document_uri(&text) {\n"
+                  "                    if !documents.is_open(&uri) {\n"
+                  "                        transport::write_message(\n"
+                  "                            output,\n"
+                  "                            log_warning(\n"
+                  "                                \"FrankenLean refused didChange for an unopened document\",\n"
+                  "                            )\n"
+                  "                            .as_bytes(),\n"
+                  "                        )?;\n"
+                  "                        transport::write_message(\n"
+                  "                            output,\n"
+                  "                            clear_diagnostics_notification(&uri).as_bytes(),\n"
+                  "                        )?;\n"
+                  "                        continue;\n"
+                  "                    }\n"
+                  "                    match (\n",
+              )
+              replace_once(
+                  "            (Some(\"textDocument/didSave\"), None, ServerState::Running) => {\n"
+                  "                if let Some(uri) = extract_text_document_uri(&text) {\n"
+                  "                    match extract_save_text_field(&text) {\n",
+                  "            (Some(\"textDocument/didSave\"), None, ServerState::Running) => {\n"
+                  "                if let Some(uri) = extract_text_document_uri(&text) {\n"
+                  "                    if !documents.is_open(&uri) {\n"
+                  "                        transport::write_message(\n"
+                  "                            output,\n"
+                  "                            log_warning(\n"
+                  "                                \"FrankenLean refused didSave for an unopened document; no retained source exists\",\n"
+                  "                            )\n"
+                  "                            .as_bytes(),\n"
+                  "                        )?;\n"
+                  "                        transport::write_message(\n"
+                  "                            output,\n"
+                  "                            clear_diagnostics_notification(&uri).as_bytes(),\n"
+                  "                        )?;\n"
+                  "                        continue;\n"
+                  "                    }\n"
+                  "                    match extract_save_text_field(&text) {\n",
+              )
+
+              test_anchor = '''    #[test]
+              fn did_open_requires_integer_document_version() {
+          '''
+              test_anchor = "\n".join(line[14:] if line.startswith("              ") else line for line in test_anchor.splitlines()) + "\n"
+              tests = r'''    #[test]
+              fn duplicate_did_open_does_not_overwrite_the_authoritative_snapshot() {
+                  let (outcome, output, seen) = run_session(
+                      &[
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"original"}}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":99,"text":"duplicate"}}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                      ]
+                      .join("\n"),
+                  );
+                  assert!(outcome.clean);
+                  assert_eq!(outcome.documents_opened, 1);
+                  assert_eq!(outcome.documents_saved, 1);
+                  assert_eq!(
+                      seen,
+                      vec![
+                          ("file:///test.lean".to_string(), "original".to_string()),
+                          ("file:///test.lean".to_string(), "original".to_string()),
+                      ]
+                  );
+                  assert!(output.contains("refused duplicate didOpen"));
+                  assert!(!seen.iter().any(|(_, source)| source == "duplicate"));
+              }
+
+              #[test]
+              fn change_and_save_notifications_do_not_implicitly_open_documents() {
+                  let (outcome, output, seen) = run_session(
+                      &[
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///missing.lean","version":1},"contentChanges":[{"text":"change"}]}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing.lean"},"text":"save"}}"#,
+                      ]
+                      .join("\n"),
+                  );
+                  assert!(outcome.clean);
+                  assert_eq!(outcome.documents_changed, 0);
+                  assert_eq!(outcome.documents_saved, 0);
+                  assert!(seen.is_empty());
+                  assert!(output.contains("didChange for an unopened document"));
+                  assert!(output.contains("didSave for an unopened document"));
+                  assert_eq!(output.matches("\"diagnostics\":[]").count(), 2);
+              }
+
+              #[test]
+              fn a_valid_change_recovers_an_open_document_after_source_invalidation() {
+                  let (outcome, output, seen) = run_session(
+                      &[
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":3},"contentChanges":[{"text":"recovered"}]}}"#,
+                          r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
+                      ]
+                      .join("\n"),
+                  );
+                  assert!(outcome.clean);
+                  assert_eq!(outcome.documents_changed, 1);
+                  assert_eq!(outcome.documents_saved, 1);
+                  assert_eq!(
+                      seen,
+                      vec![
+                          ("file:///test.lean".to_string(), "old".to_string()),
+                          ("file:///test.lean".to_string(), "recovered".to_string()),
+                          ("file:///test.lean".to_string(), "recovered".to_string()),
+                      ]
+                  );
+                  assert!(output.contains("retained source was invalidated"));
+              }
+
+          '''
+              tests = "\n".join(line[14:] if line.startswith("              ") else line for line in tests.splitlines())
+              if text.count(test_anchor) != 1:
+                  raise SystemExit("didOpen version test anchor did not match exactly once")
+              text = text.replace(test_anchor, tests + test_anchor, 1)
+
+              old_assertion = '''        assert_eq!(
+                  byte_limited.text("a"),
+                  None,
+                  "a rejected replacement must invalidate the now-stale cached text"
+              );
+              assert_eq!(byte_limited.total_bytes, 0);
+          '''
+              old_assertion = "\n".join(line[14:] if line.startswith("              ") else line for line in old_assertion.splitlines()) + "\n"
+              new_assertion = '''        assert_eq!(
+                  byte_limited.text("a"),
+                  None,
+                  "a rejected replacement must invalidate the now-stale cached text"
+              );
+              assert!(byte_limited.is_open("a"));
+              assert_eq!(byte_limited.version("a"), Some(1));
+              assert_eq!(byte_limited.total_bytes, 0);
+              byte_limited
+                  .store("a".to_string(), 2, "12".to_string())
+                  .expect("metadata-only open state can recover with a bounded replacement");
+              assert_eq!(byte_limited.text("a"), Some("12"));
+              assert_eq!(byte_limited.version("a"), Some(2));
+          '''
+              new_assertion = "\n".join(line[14:] if line.startswith("              ") else line for line in new_assertion.splitlines()) + "\n"
+              if text.count(old_assertion) != 1:
+                  raise SystemExit("cache invalidation assertion anchor did not match exactly once")
+              text = text.replace(old_assertion, new_assertion, 1)
+              path.write_text(text, encoding="utf-8")
+          else:
+              for expected in [
+                  "fn invalidate_text(&mut self, uri: &str)",
+                  "refused duplicate didOpen",
+                  "didChange for an unopened document",
+              ]:
+                  if expected not in text:
+                      raise SystemExit(f"document lifecycle repair is partial: missing {expected}")
+          PY
+
+          cat > .github/workflows/fln-lsp-document-lifecycle-landing.yml <<'YAML'
+          name: fln LSP document-lifecycle checks
+
+          on:
+            push:
+              branches: [main]
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-document-lifecycle-landing.yml
+            pull_request:
+              paths:
+                - crates/fln-server/**
+                - .github/workflows/fln-lsp-document-lifecycle-landing.yml
+            workflow_dispatch:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: fln-lsp-document-lifecycle-checks
+            cancel-in-progress: true
+
+          jobs:
+            check:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+              steps:
+                - name: checkout
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                - name: verify document lifecycle and bounded retention
+                  shell: bash
+                  run: |
+                    cargo fmt --all -- --check
+                    git diff --check
+                    cargo test -p fln-server --lib
+          YAML
+
+          cargo fmt --all
+          git diff --check
+
+      - name: test document lifecycle and recovery
+        shell: bash
+        run: cargo test -p fln-server --lib
+
+      - name: publish verified document lifecycle
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
+            exit 2
+          }
+          git config user.name "Jeff Emanuel"
+          git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
+          git add .github/workflows/fln-lsp-document-lifecycle-landing.yml crates/fln-server/src/dispatch.rs
+          if git diff --cached --quiet; then
+            echo "document lifecycle enforcement is already complete"
+            exit 0
+          fi
+          git commit -m "fix(server): enforce open-document lifecycle" \
+            -m "Keep open-document metadata even when source bytes exceed the retention budget, refuse duplicate opens and implicit opens from change/save notifications, preserve the authoritative snapshot, and allow a later valid Full-sync change to recover after malformed source invalidation." \
+            -m "Bead: franken_lean-v2p"
+          git push origin HEAD:main
