@@ -36,6 +36,26 @@ pub struct ServerOutcome {
     pub documents_saved: u64,
 }
 
+/// JSON-RPC request identifiers supported by the LSP wire contract.
+///
+/// LSP clients may use either integer or string IDs. Keeping the distinction
+/// typed prevents a valid string-ID request from degrading into a notification
+/// merely because an integer-only parser could not represent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestId {
+    Integer(i64),
+    Text(String),
+}
+
+impl RequestId {
+    fn as_json(&self) -> String {
+        match self {
+            Self::Integer(value) => value.to_string(),
+            Self::Text(value) => json_string(value),
+        }
+    }
+}
+
 /// Find an unescaped JSON object-key spelling and return the byte immediately
 /// after its closing quote.
 ///
@@ -132,15 +152,21 @@ fn extract_string_field(json: &str, key: &str) -> Option<String> {
     decode_json_string(after_quote)
 }
 
-/// Extract a JSON integer value for a given key from a flat JSON object.
-fn extract_int_field(json: &str, key: &str) -> Option<i64> {
-    let after_key = &json[find_json_key(json, key)?..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    // Parse digits (possibly with leading minus).
+fn extract_integer_value(after_colon: &str) -> Option<i64> {
     let end = after_colon
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(after_colon.len());
     after_colon[..end].parse::<i64>().ok()
+}
+
+/// Extract a JSON-RPC request ID without changing its wire type.
+fn extract_request_id(json: &str) -> Option<RequestId> {
+    let after_key = &json[find_json_key(json, "id")?..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    if let Some(after_quote) = after_colon.strip_prefix('"') {
+        return decode_json_string(after_quote).map(RequestId::Text);
+    }
+    extract_integer_value(after_colon).map(RequestId::Integer)
 }
 
 /// Extract the decoded `uri` from a `textDocument` parameter.
@@ -180,13 +206,7 @@ fn extract_save_text(json: &str) -> Option<String> {
 }
 
 /// Build the `initialize` response with FrankenLean server capabilities.
-fn initialize_response(id: i64) -> String {
-    // We use push diagnostics (textDocument/publishDiagnostics) not pull
-    // diagnostics (textDocument/diagnostic), so diagnosticProvider is not
-    // advertised. textDocumentSync with openClose + change:1 (Full) is
-    // what triggers the client to send didOpen/didChange/didClose.
-    // save.includeText tells the client to include the full document text
-    // in didSave notifications so we can re-check on save.
+fn initialize_response(id: &RequestId) -> String {
     format!(
         concat!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{",
@@ -197,16 +217,16 @@ fn initialize_response(id: i64) -> String {
             "\"serverInfo\":{{\"name\":\"FrankenLean\",\"version\":{}}}"
             ,"}}}}"
         ),
-        id,
+        id.as_json(),
         json_string(env!("CARGO_PKG_VERSION"))
     )
 }
 
 /// Build a JSON-RPC error response.
-fn error_response(id: i64, code: i32, message: &str) -> String {
+fn error_response(id: &RequestId, code: i32, message: &str) -> String {
     format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{},\"message\":{}}}}}",
-        id,
+        id.as_json(),
         code,
         json_string(message)
     )
@@ -218,15 +238,14 @@ fn error_response(id: i64, code: i32, message: &str) -> String {
 const REQUEST_FAILED_CODE: i32 = -32803;
 
 /// Build a JSON-RPC success response with a null result.
-fn null_response(id: i64) -> String {
-    format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}", id)
+fn null_response(id: &RequestId) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}",
+        id.as_json()
+    )
 }
 
 /// Build a `$/lean/fileProgress` notification.
-///
-/// When `processing` is `true`, the notification indicates that the server
-/// is actively processing the file. When `false`, it indicates that
-/// processing is complete (the VS Code extension clears the spinner).
 fn file_progress_notification(uri: &str, processing: bool) -> String {
     let processing_value = if processing {
         "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"kind\":1}]"
@@ -245,22 +264,9 @@ fn file_progress_notification(uri: &str, processing: bool) -> String {
 }
 
 /// Callback invoked when a document is opened.
-///
-/// The callback receives the document URI and text content, and returns
-/// zero or more JSON-RPC notification strings to send to the client.
 pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
 
 /// Run the LSP server loop over the given I/O streams.
-///
-/// This function blocks until the client sends `exit` or the input stream
-/// closes. It handles the full LSP lifecycle (`initialize` / `initialized` /
-/// `shutdown` / `exit`) and routes `textDocument/didOpen` notifications
-/// through the provided callback.
-///
-/// The `on_did_open` callback receives `(uri, text)` and should return
-/// any JSON-RPC notification bodies (without Content-Length framing) to
-/// send back. In production, this runs the source through the checker
-/// and projects diagnostics via `fln_server::project`.
 pub fn serve(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
@@ -273,7 +279,6 @@ pub fn serve(
 
     loop {
         let Some(message) = transport::read_message(input)? else {
-            // EOF — unclean exit if we never got shutdown.
             return Ok(ServerOutcome {
                 clean: state == ServerState::ShuttingDown,
                 documents_opened,
@@ -285,36 +290,27 @@ pub fn serve(
         let text = String::from_utf8(message).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "message is not valid UTF-8")
         })?;
-
         let method = extract_string_field(&text, "method");
-        let id = extract_int_field(&text, "id");
+        let id = extract_request_id(&text);
 
-        match (method.as_deref(), id, state) {
-            // --- Lifecycle: initialize ---
+        match (method.as_deref(), id.as_ref(), state) {
             (Some("initialize"), Some(req_id), ServerState::Uninitialized) => {
                 let response = initialize_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
                 state = ServerState::Initializing;
             }
             (Some("initialize"), Some(req_id), _) => {
-                // Already initialized.
                 let response = error_response(req_id, -32600, "server already initialized");
                 transport::write_message(output, response.as_bytes())?;
             }
-
-            // --- Lifecycle: initialized ---
             (Some("initialized"), None, ServerState::Initializing) => {
                 state = ServerState::Running;
             }
-
-            // --- Lifecycle: shutdown ---
             (Some("shutdown"), Some(req_id), _) => {
                 let response = null_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
                 state = ServerState::ShuttingDown;
             }
-
-            // --- Lifecycle: exit ---
             (Some("exit"), None, _) => {
                 return Ok(ServerOutcome {
                     clean: state == ServerState::ShuttingDown,
@@ -323,8 +319,6 @@ pub fn serve(
                     documents_saved,
                 });
             }
-
-            // --- textDocument/didOpen ---
             (Some("textDocument/didOpen"), None, ServerState::Running) => {
                 if let (Some(uri), Some(content)) = (
                     extract_text_document_uri(&text),
@@ -341,8 +335,6 @@ pub fn serve(
                     documents_opened += 1;
                 }
             }
-
-            // --- textDocument/didChange (full sync, change kind 1) ---
             (Some("textDocument/didChange"), None, ServerState::Running) => {
                 if let (Some(uri), Some(content)) = (
                     extract_text_document_uri(&text),
@@ -359,8 +351,6 @@ pub fn serve(
                     documents_changed += 1;
                 }
             }
-
-            // --- textDocument/didSave (with includeText) ---
             (Some("textDocument/didSave"), None, ServerState::Running) => {
                 if let (Some(uri), Some(content)) = (
                     extract_text_document_uri(&text),
@@ -377,41 +367,15 @@ pub fn serve(
                     documents_saved += 1;
                 }
             }
-
-            // --- textDocument/didClose ---
             (Some("textDocument/didClose"), None, ServerState::Running) => {}
-
-            // --- $/lean/plainGoal (InfoView goal request) ---
-            (Some("$/lean/plainGoal"), Some(req_id), ServerState::Running) => {
+            (Some("$/lean/plainGoal"), Some(req_id), ServerState::Running)
+            | (Some("$/lean/plainTermGoal"), Some(req_id), ServerState::Running)
+            | (Some("textDocument/hover"), Some(req_id), ServerState::Running)
+            | (Some("textDocument/completion"), Some(req_id), ServerState::Running)
+            | (Some("textDocument/definition"), Some(req_id), ServerState::Running) => {
                 let response = null_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
             }
-
-            // --- $/lean/plainTermGoal (InfoView term goal request) ---
-            (Some("$/lean/plainTermGoal"), Some(req_id), ServerState::Running) => {
-                let response = null_response(req_id);
-                transport::write_message(output, response.as_bytes())?;
-            }
-
-            // --- textDocument/hover ---
-            (Some("textDocument/hover"), Some(req_id), ServerState::Running) => {
-                let response = null_response(req_id);
-                transport::write_message(output, response.as_bytes())?;
-            }
-
-            // --- textDocument/completion ---
-            (Some("textDocument/completion"), Some(req_id), ServerState::Running) => {
-                let response = null_response(req_id);
-                transport::write_message(output, response.as_bytes())?;
-            }
-
-            // --- textDocument/definition ---
-            (Some("textDocument/definition"), Some(req_id), ServerState::Running) => {
-                let response = null_response(req_id);
-                transport::write_message(output, response.as_bytes())?;
-            }
-
-            // --- $/lean/rpc/connect (widget RPC session init) ---
             (Some("$/lean/rpc/connect"), Some(req_id), ServerState::Running) => {
                 let response = error_response(
                     req_id,
@@ -420,8 +384,6 @@ pub fn serve(
                 );
                 transport::write_message(output, response.as_bytes())?;
             }
-
-            // --- $/lean/rpc/call (widget RPC calls) ---
             (Some("$/lean/rpc/call"), Some(req_id), ServerState::Running) => {
                 let response = error_response(
                     req_id,
@@ -430,14 +392,10 @@ pub fn serve(
                 );
                 transport::write_message(output, response.as_bytes())?;
             }
-
-            // --- Unknown request (has id) → method not found ---
             (_, Some(req_id), _) => {
                 let response = error_response(req_id, -32601, "method not found");
                 transport::write_message(output, response.as_bytes())?;
             }
-
-            // --- Unknown notification (no id) → silently drop ---
             (_, None, _) => {}
         }
     }
@@ -446,8 +404,8 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufReader;
     use crate::transport::write_message;
+    use std::io::BufReader;
 
     fn send(buf: &mut Vec<u8>, body: &str) {
         write_message(buf, body.as_bytes()).unwrap();
@@ -503,6 +461,18 @@ mod tests {
     }
 
     #[test]
+    fn request_id_parser_preserves_integer_and_string_ids() {
+        assert_eq!(
+            extract_request_id(r#"{"id":42}"#),
+            Some(RequestId::Integer(42))
+        );
+        assert_eq!(
+            extract_request_id(r#"{"id":"req-\ud83e\udd16"}"#),
+            Some(RequestId::Text("req-🤖".to_string()))
+        );
+    }
+
+    #[test]
     fn did_open_routes_through_callback() {
         let (outcome, output) = lifecycle_session(
             r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
@@ -533,6 +503,15 @@ mod tests {
     }
 
     #[test]
+    fn string_request_id_is_preserved_in_response() {
+        let (outcome, output) = lifecycle_session(
+            r#"{"jsonrpc":"2.0","id":"hover-\ud83e\udd16","method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"hover-🤖\",\"result\":null"));
+    }
+
+    #[test]
     fn extract_string_field_works() {
         let json = r#"{"method":"initialize","id":1}"#;
         assert_eq!(extract_string_field(json, "method").as_deref(), Some("initialize"));
@@ -545,12 +524,6 @@ mod tests {
             extract_string_field(json, "method").as_deref(),
             Some("textDocument/hover")
         );
-    }
-
-    #[test]
-    fn extract_int_field_works() {
-        let json = r#"{"note":"\"id\":999","method":"initialize","id":42}"#;
-        assert_eq!(extract_int_field(json, "id"), Some(42));
     }
 
     #[test]
