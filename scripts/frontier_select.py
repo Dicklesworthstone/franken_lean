@@ -189,7 +189,44 @@ def load_issues(path: Path) -> tuple[dict[str, Issue], str]:
         for blocker in issue.blockers:
             if blocker not in issues:
                 raise FrontierError(f"{issue.id} has dangling blocker {blocker!r}")
+    validate_block_graph_acyclic(issues)
     return issues, digest
+
+
+def validate_block_graph_acyclic(issues: dict[str, Issue]) -> None:
+    reverse = reverse_block_graph(issues)
+    indegree = {issue.id: len(issue.blockers) for issue in issues.values()}
+    ready = deque(
+        sorted(issue_id for issue_id, degree in indegree.items() if degree == 0)
+    )
+    visited = 0
+    while ready:
+        issue_id = ready.popleft()
+        visited += 1
+        for child in reverse.get(issue_id, ()):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if visited == len(issues):
+        return
+
+    remaining = {issue_id for issue_id, degree in indegree.items() if degree > 0}
+    start = min(remaining)
+    path: list[str] = []
+    positions: dict[str, int] = {}
+    current = start
+    while current not in positions:
+        positions[current] = len(path)
+        path.append(current)
+        candidates = sorted(set(issues[current].blockers) & remaining)
+        if not candidates:
+            raise FrontierError(
+                "blocking graph is cyclic but no cycle witness was recoverable "
+                f"from {start!r}"
+            )
+        current = candidates[0]
+    cycle = path[positions[current] :] + [current]
+    raise FrontierError(f"blocking dependency cycle: {' -> '.join(cycle)}")
 
 
 def load_overlays(path: Path | None, issue_ids: set[str]) -> dict[str, Overlay]:
