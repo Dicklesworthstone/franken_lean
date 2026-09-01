@@ -330,14 +330,12 @@ pub fn serve(
                     extract_text_document_uri(&text),
                     extract_text_document_text(&text),
                 ) {
-                    // Signal that we are processing this file.
                     let started = file_progress_notification(&uri, true);
                     transport::write_message(output, started.as_bytes())?;
                     let notifications = on_did_open(&uri, &content);
                     for notification in &notifications {
                         transport::write_message(output, notification.as_bytes())?;
                     }
-                    // Signal that processing is complete.
                     let done = file_progress_notification(&uri, false);
                     transport::write_message(output, done.as_bytes())?;
                     documents_opened += 1;
@@ -350,7 +348,6 @@ pub fn serve(
                     extract_text_document_uri(&text),
                     extract_content_changes_text(&text),
                 ) {
-                    // Full sync: re-check the entire document, same as didOpen.
                     let started = file_progress_notification(&uri, true);
                     transport::write_message(output, started.as_bytes())?;
                     let notifications = on_did_open(&uri, &content);
@@ -369,7 +366,6 @@ pub fn serve(
                     extract_text_document_uri(&text),
                     extract_save_text(&text),
                 ) {
-                    // Re-check the full document on save, same as didOpen.
                     let started = file_progress_notification(&uri, true);
                     transport::write_message(output, started.as_bytes())?;
                     let notifications = on_did_open(&uri, &content);
@@ -380,21 +376,13 @@ pub fn serve(
                     transport::write_message(output, done.as_bytes())?;
                     documents_saved += 1;
                 }
-                // If text is absent (client did not include it), accept
-                // silently — the most recent didChange already checked.
             }
 
             // --- textDocument/didClose ---
-            (Some("textDocument/didClose"), None, ServerState::Running) => {
-                // Accepted but no action needed yet; the bounded source
-                // runner is stateless.
-            }
+            (Some("textDocument/didClose"), None, ServerState::Running) => {}
 
             // --- $/lean/plainGoal (InfoView goal request) ---
             (Some("$/lean/plainGoal"), Some(req_id), ServerState::Running) => {
-                // The VS Code Lean 4 extension sends this request for the
-                // InfoView panel. We don't yet track cursor-position-aware
-                // proof state, so we return null (= no goals at position).
                 let response = null_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
             }
@@ -407,31 +395,24 @@ pub fn serve(
 
             // --- textDocument/hover ---
             (Some("textDocument/hover"), Some(req_id), ServerState::Running) => {
-                // Return null (= no hover information) rather than method
-                // not found, so the editor doesn't show error popups.
                 let response = null_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
             }
 
             // --- textDocument/completion ---
             (Some("textDocument/completion"), Some(req_id), ServerState::Running) => {
-                // Return null (= no completions) gracefully.
                 let response = null_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
             }
 
             // --- textDocument/definition ---
             (Some("textDocument/definition"), Some(req_id), ServerState::Running) => {
-                // Return null (= no definition location) gracefully.
                 let response = null_response(req_id);
                 transport::write_message(output, response.as_bytes())?;
             }
 
             // --- $/lean/rpc/connect (widget RPC session init) ---
             (Some("$/lean/rpc/connect"), Some(req_id), ServerState::Running) => {
-                // This method is known to the Lean editor protocol, but no
-                // FrankenLean RPC session exists yet. A typed request failure
-                // is honest; a synthetic session ID would fabricate state.
                 let response = error_response(
                     req_id,
                     REQUEST_FAILED_CODE,
@@ -442,8 +423,6 @@ pub fn serve(
 
             // --- $/lean/rpc/call (widget RPC calls) ---
             (Some("$/lean/rpc/call"), Some(req_id), ServerState::Running) => {
-                // No RPC session can execute calls yet, so fail closed rather
-                // than returning `null` as if a real call completed.
                 let response = error_response(
                     req_id,
                     REQUEST_FAILED_CODE,
@@ -476,36 +455,30 @@ mod tests {
 
     fn lifecycle_session(extra_messages: &str) -> (ServerOutcome, String) {
         let mut input_buf = Vec::new();
-        // initialize
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
         );
-        // initialized
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
         );
-        // Extra messages go here.
         for line in extra_messages.lines() {
             if !line.trim().is_empty() {
                 send(&mut input_buf, line.trim());
             }
         }
-        // shutdown
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"shutdown\"}"#,
+            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
         );
-        // exit
         send(
             &mut input_buf,
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"#,
+            r#"{"jsonrpc":"2.0","method":"exit"}"#,
         );
 
         let mut reader = BufReader::new(&input_buf[..]);
         let mut output_buf = Vec::new();
-
         let outcome = serve(
             &mut reader,
             &mut output_buf,
@@ -517,9 +490,7 @@ mod tests {
             },
         )
         .unwrap();
-
-        let output_text = String::from_utf8(output_buf).unwrap();
-        (outcome, output_text)
+        (outcome, String::from_utf8(output_buf).unwrap())
     }
 
     #[test]
@@ -534,20 +505,18 @@ mod tests {
     #[test]
     fn did_open_routes_through_callback() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
         assert!(output.contains("publishDiagnostics"));
-        // fileProgress: one "processing" start and one "complete" (empty).
-        let progress_count = output.matches("$/lean/fileProgress").count();
-        assert_eq!(progress_count, 2);
+        assert_eq!(output.matches("$/lean/fileProgress").count(), 2);
     }
 
     #[test]
     fn did_open_ignores_method_lookalike_inside_document_text() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"\\\"method\\\":\\\"shutdown\\\"\"}},\"method\":\"textDocument/didOpen\"}"#,
+            r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
         );
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
@@ -557,7 +526,7 @@ mod tests {
     #[test]
     fn unknown_request_returns_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/unknownMethod\",\"params\":{}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("-32601"));
@@ -565,13 +534,13 @@ mod tests {
 
     #[test]
     fn extract_string_field_works() {
-        let json = r#"{\"method\":\"initialize\",\"id\":1}"#;
+        let json = r#"{"method":"initialize","id":1}"#;
         assert_eq!(extract_string_field(json, "method").as_deref(), Some("initialize"));
     }
 
     #[test]
     fn extract_string_field_decodes_escapes_and_skips_escaped_key_lookalikes() {
-        let json = r#"{\"note\":\"\\\"method\\\":\\\"shutdown\\\"\",\"method\":\"textDocument\\/hover\"}"#;
+        let json = r#"{"note":"\"method\":\"shutdown\"","method":"textDocument\/hover"}"#;
         assert_eq!(
             extract_string_field(json, "method").as_deref(),
             Some("textDocument/hover")
@@ -580,13 +549,13 @@ mod tests {
 
     #[test]
     fn extract_int_field_works() {
-        let json = r#"{\"note\":\"\\\"id\\\":999\",\"method\":\"initialize\",\"id\":42}"#;
+        let json = r#"{"note":"\"id\":999","method":"initialize","id":42}"#;
         assert_eq!(extract_int_field(json, "id"), Some(42));
     }
 
     #[test]
     fn extract_text_document_uri_works() {
-        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///foo.lean\",\"text\":\"hello\"}}}"#;
+        let json = r#"{"params":{"textDocument":{"uri":"file:///foo.lean","text":"hello"}}}"#;
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///foo.lean".to_string())
@@ -595,7 +564,7 @@ mod tests {
 
     #[test]
     fn extract_text_document_uri_decodes_json_escapes() {
-        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:\\/\\/\\/tmp\\/\\ud83e\\udd16.lean\",\"text\":\"hello\"}}}"#;
+        let json = r#"{"params":{"textDocument":{"uri":"file:\/\/\/tmp\/\ud83e\udd16.lean","text":"hello"}}}"#;
         assert_eq!(
             extract_text_document_uri(json),
             Some("file:///tmp/🤖.lean".to_string())
@@ -605,25 +574,19 @@ mod tests {
     #[test]
     fn did_change_routes_through_callback() {
         let (outcome, output) = lifecycle_session(&[
-            // Open first.
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
-            // Then change.
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"def y := 7\"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"def y := 7"}]}}"#,
         ].join("\n"));
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
         assert_eq!(outcome.documents_changed, 1);
-        // Two publishDiagnostics notifications expected.
-        let diag_count = output.matches("publishDiagnostics").count();
-        assert_eq!(diag_count, 2);
-        // Four fileProgress notifications: start+done for open, start+done for change.
-        let progress_count = output.matches("$/lean/fileProgress").count();
-        assert_eq!(progress_count, 4);
+        assert_eq!(output.matches("publishDiagnostics").count(), 2);
+        assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
     }
 
     #[test]
     fn extract_content_changes_text_works() {
-        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\",\"version\":2},\"contentChanges\":[{\"text\":\"def z := 0\"}]}}"#;
+        let json = r#"{"params":{"textDocument":{"uri":"file:///x.lean","version":2},"contentChanges":[{"text":"def z := 0"}]}}"#;
         assert_eq!(
             extract_content_changes_text(json),
             Some("def z := 0".to_string())
@@ -632,7 +595,7 @@ mod tests {
 
     #[test]
     fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
-        let json = r#"{\"text\":\"\\ud83e\\udd16 a\\/b\\b\\f\\n\\r\\t\\\\\\\"\"}"#;
+        let json = r#"{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}"#;
         assert_eq!(
             extract_escaped_text_value(json, 0).as_deref(),
             Some("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"")
@@ -642,11 +605,11 @@ mod tests {
     #[test]
     fn escaped_text_rejects_malformed_json_strings() {
         for json in [
-            r#"{\"text\":\"\\ud83e\"}"#,
-            r#"{\"text\":\"\\udd16\"}"#,
-            r#"{\"text\":\"\\ud83e\\u0041\"}"#,
-            r#"{\"text\":\"\\q\"}"#,
-            r#"{\"text\":\"\\u12xz\"}"#,
+            r#"{"text":"\ud83e"}"#,
+            r#"{"text":"\udd16"}"#,
+            r#"{"text":"\ud83e\u0041"}"#,
+            r#"{"text":"\q"}"#,
+            r#"{"text":"\u12xz"}"#,
             "{\"text\":\"line\nfeed\"}",
         ] {
             assert!(
@@ -659,24 +622,19 @@ mod tests {
     #[test]
     fn did_save_routes_through_callback() {
         let (outcome, output) = lifecycle_session(&[
-            // Open first.
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"languageId\":\"lean4\",\"version\":1,\"text\":\"def x := 42\"}}}"#,
-            // Save with included text.
-            r#"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\",\"version\":1},\"text\":\"def x := 42\"}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"def x := 42"}}"#,
         ].join("\n"));
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
         assert_eq!(outcome.documents_saved, 1);
-        let diag_count = output.matches("publishDiagnostics").count();
-        assert_eq!(diag_count, 2);
-        // Four fileProgress notifications: start+done for open, start+done for save.
-        let progress_count = output.matches("$/lean/fileProgress").count();
-        assert_eq!(progress_count, 4);
+        assert_eq!(output.matches("publishDiagnostics").count(), 2);
+        assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
     }
 
     #[test]
     fn extract_save_text_works() {
-        let json = r#"{\"params\":{\"textDocument\":{\"uri\":\"file:///x.lean\",\"version\":1},\"text\":\"def w := 99\"}}"#;
+        let json = r#"{"params":{"textDocument":{"uri":"file:///x.lean","version":1},"text":"def w := 99"}}"#;
         assert_eq!(
             extract_save_text(json),
             Some("def w := 99".to_string())
@@ -686,19 +644,18 @@ mod tests {
     #[test]
     fn plain_goal_returns_null_not_method_not_found() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"$/lean/plainGoal\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"},\"position\":{\"line\":0,\"character\":0}}}"#,
+            r#"{"jsonrpc":"2.0","id":10,"method":"$/lean/plainGoal","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":10"));
         assert!(output.contains("\"result\":null"));
-        // Must NOT contain method not found.
         assert!(!output.contains("-32601"));
     }
 
     #[test]
     fn hover_returns_null_gracefully() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///test.lean\"},\"position\":{\"line\":0,\"character\":0}}}"#,
+            r#"{"jsonrpc":"2.0","id":11,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":11"));
@@ -709,7 +666,7 @@ mod tests {
     #[test]
     fn rpc_connect_fails_closed_without_fabricating_session() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"$/lean/rpc/connect\",\"params\":{\"uri\":\"file:///test.lean\"}}"#,
+            r#"{"jsonrpc":"2.0","id":12,"method":"$/lean/rpc/connect","params":{"uri":"file:///test.lean"}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":12,\"error\":{\"code\":-32803"));
@@ -720,7 +677,7 @@ mod tests {
     #[test]
     fn rpc_call_fails_closed_without_fabricating_result() {
         let (outcome, output) = lifecycle_session(
-            r#"{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"$/lean/rpc/call\",\"params\":{\"sessionId\":\"missing\"}}"#,
+            r#"{"jsonrpc":"2.0","id":13,"method":"$/lean/rpc/call","params":{"sessionId":"missing"}}"#,
         );
         assert!(outcome.clean);
         assert!(output.contains("\"id\":13,\"error\":{\"code\":-32803"));
