@@ -1,4 +1,4 @@
-name: fln LSP UTF-16 one-shot landing
+name: fln LSP focused landing
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fln-lsp-utf16-one-shot
+  group: fln-lsp-focused-landing
   cancel-in-progress: false
 
 jobs:
@@ -76,6 +76,46 @@ jobs:
               "    // Normalize file URIs for the semantic diagnostic while the projector\n"
               "    // retains the exact editor URI and unsaved source snapshot separately.\n",
           )
+
+          focused = '''name: fln LSP focused checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/fln-server/**
+      - crates/fln-cli/**
+      - .github/workflows/fln-lsp-utf16-one-shot.yml
+  pull_request:
+    paths:
+      - crates/fln-server/**
+      - crates/fln-cli/**
+      - .github/workflows/fln-lsp-utf16-one-shot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fln-lsp-focused-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: format, compile, and test the bounded LSP surface
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          git diff --check
+          cargo test -p fln-server --lib
+          cargo test -p fln-cli --lib --no-run
+'''
+          Path(".github/workflows/fln-lsp-utf16-one-shot.yml").write_text(focused, encoding="utf-8")
           PY
           cargo fmt --all
           git diff --check
@@ -94,11 +134,10 @@ jobs:
             echo "main moved during the verified landing; refusing a non-fast-forward write" >&2
             exit 2
           }
-          git rm .github/workflows/fln-lsp-utf16-one-shot.yml
           git config user.name "Jeff Emanuel"
           git config user.email "35050222+Dicklesworthstone@users.noreply.github.com"
-          git add crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
+          git add .github/workflows/fln-lsp-utf16-one-shot.yml crates/fln-server/src/dispatch.rs crates/fln-cli/src/lib.rs
           git commit -m "fix(server): wire UTF-16 LSP negotiation" \
-            -m "Advertise the UTF-16 position encoding during initialize and pass each exact unsaved editor snapshot into source-aware diagnostic projection. Keep the capability, primary ranges, related ranges, and live CLI server path under one tested contract." \
-            -m "Bead: franken_lean-wlan"
+            -m "Advertise the UTF-16 position encoding during initialize and pass each exact unsaved editor snapshot into source-aware diagnostic projection. Keep the capability, primary ranges, related ranges, and live CLI server path under one tested contract. Convert the landing helper in place into a focused, read-only verification lane." \
+            -m "Bead: franken_lean-v2p"
           git push origin HEAD:main
