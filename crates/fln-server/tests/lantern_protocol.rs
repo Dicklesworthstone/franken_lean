@@ -1,0 +1,210 @@
+use std::io::BufReader;
+
+use fln_server::dispatch::{ServerOutcome, serve};
+use fln_server::transport::{read_message, write_message};
+
+fn frame(output: &mut Vec<u8>, body: &[u8]) {
+    write_message(output, body).expect("frame test input");
+}
+
+fn framed_json(output: &mut Vec<u8>, body: &str) {
+    frame(output, body.as_bytes());
+}
+
+fn protocol_session(extra: &[&str]) -> Vec<u8> {
+    let mut input = Vec::new();
+    framed_json(
+        &mut input,
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+    );
+    framed_json(
+        &mut input,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
+    for message in extra {
+        framed_json(&mut input, message);
+    }
+    framed_json(
+        &mut input,
+        r#"{"jsonrpc":"2.0","id":99,"method":"shutdown","params":null}"#,
+    );
+    framed_json(
+        &mut input,
+        r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+    );
+    input
+}
+
+fn decode_frames(output: &[u8]) -> Vec<String> {
+    let mut reader = BufReader::new(output);
+    let mut messages = Vec::new();
+    while let Some(body) = read_message(&mut reader).expect("decode server frame") {
+        messages.push(String::from_utf8(body).expect("server emits UTF-8 JSON"));
+    }
+    messages
+}
+
+fn run(
+    input: Vec<u8>,
+    callback: &mut dyn FnMut(&str, &str) -> Vec<String>,
+) -> (ServerOutcome, Vec<String>) {
+    let mut reader = BufReader::new(input.as_slice());
+    let mut output = Vec::new();
+    let outcome = serve(&mut reader, &mut output, callback).expect("serve protocol transcript");
+    (outcome, decode_frames(&output))
+}
+
+#[test]
+fn full_sync_transcript_is_ordered_versioned_and_cleanly_closed() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Main.lean","languageId":"lean4","version":1,"text":"def x := 1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Main.lean","version":2},"contentChanges":[{"text":"def x := 2"}]}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///Main.lean"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///Main.lean"}}}"#,
+    ]);
+    let mut seen = Vec::new();
+    let (outcome, output) = run(input, &mut |uri, text| {
+        seen.push((uri.to_string(), text.to_string()));
+        vec![format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+            fln_server::json_string(uri)
+        )]
+    });
+
+    assert!(outcome.clean);
+    assert_eq!(outcome.documents_opened, 1);
+    assert_eq!(outcome.documents_changed, 1);
+    assert_eq!(outcome.documents_saved, 1);
+    assert_eq!(
+        seen,
+        vec![
+            ("file:///Main.lean".to_string(), "def x := 1".to_string()),
+            ("file:///Main.lean".to_string(), "def x := 2".to_string()),
+            ("file:///Main.lean".to_string(), "def x := 2".to_string()),
+        ]
+    );
+    assert!(output[0].contains("\"id\":\"init\""));
+    assert!(output[0].contains("\"positionEncoding\":\"utf-16\""));
+    assert_eq!(
+        output
+            .iter()
+            .filter(|message| message.contains("$/lean/fileProgress"))
+            .count(),
+        6
+    );
+    assert!(output.iter().any(|message| {
+        message.contains("textDocument/publishDiagnostics")
+            && message.contains("\"uri\":\"file:///Main.lean\"")
+            && message.contains("\"diagnostics\":[]")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":99") && message.contains("\"result\":null")
+    }));
+}
+
+#[test]
+fn malformed_json_and_invalid_utf8_recover_before_the_next_request() {
+    let mut input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"bad":tru}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{}}"#,
+    ]);
+    let shutdown = protocol_session(&[]);
+    let shutdown_frames = decode_frames(&shutdown);
+    assert!(shutdown_frames.is_empty(), "input frames are not output frames");
+
+    let mut prefix = Vec::new();
+    framed_json(
+        &mut prefix,
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+    );
+    framed_json(
+        &mut prefix,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
+    frame(&mut prefix, &[0xff, 0xfe]);
+    framed_json(
+        &mut prefix,
+        r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/hover","params":{}}"#,
+    );
+    framed_json(
+        &mut prefix,
+        r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+    );
+    framed_json(
+        &mut prefix,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    );
+
+    let (outcome, output) = run(prefix, &mut |_, _| Vec::new());
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":null")
+            && message.contains("\"code\":-32700")
+            && message.contains("not valid UTF-8")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":7") && message.contains("\"result\":null")
+    }));
+
+    let (outcome, output) = run(input.split_off(0), &mut |_, _| Vec::new());
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":null") && message.contains("\"code\":-32700")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":6") && message.contains("\"result\":null")
+    }));
+}
+
+#[test]
+fn empty_callback_cannot_masquerade_as_a_clean_diagnostic_result() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Fault.lean","version":1,"text":"source"}}}"#,
+    ]);
+    let (outcome, output) = run(input, &mut |_, _| Vec::new());
+
+    assert!(outcome.clean);
+    assert_eq!(outcome.documents_opened, 1);
+    assert!(output.iter().any(|message| {
+        message.contains("textDocument/publishDiagnostics")
+            && message.contains("\"uri\":\"file:///Fault.lean\"")
+            && message.contains("\"diagnostics\":[]")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("$/lean/diagnosticOutcome")
+            && message.contains("diagnostic-callback-terminal-message")
+            && message.contains("\"authority\":false")
+    }));
+}
+
+#[test]
+fn request_notification_roles_and_server_state_fail_closed() {
+    let mut input = Vec::new();
+    for message in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/didOpen","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/hover","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"$/lean/rpc/connect","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ] {
+        framed_json(&mut input, message);
+    }
+
+    let (outcome, output) = run(input, &mut |_, _| Vec::new());
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":1") && message.contains("\"code\":-32002")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":2") && message.contains("\"code\":-32600")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("request-only LSP method sent as a notification")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":3") && message.contains("\"code\":-32803")
+    }));
+}
