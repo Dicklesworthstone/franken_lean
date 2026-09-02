@@ -225,7 +225,7 @@ pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptStats, String> {
 pub fn render_validation(stats: TranscriptStats) -> String {
     format!(
         concat!(
-            "{\"schema\":\"fln.lsp-transcript-validation/2\",",
+            "{{\"schema\":\"fln.lsp-transcript-validation/2\",",
             "\"frames\":{},\"requests\":{},\"notifications\":{},",
             "\"wireBytes\":{},\"bodyBytes\":{}}}\n"
         ),
