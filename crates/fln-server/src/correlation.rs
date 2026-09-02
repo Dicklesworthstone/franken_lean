@@ -5,13 +5,16 @@ use crate::server_transcript::{
     ServerFrameRole, ServerTranscriptEvidence, ServerTranscriptStats,
     validate_server_transcript_bytes,
 };
-use crate::session_transcript::{ClientSessionStats, validate_client_session_bytes};
+use crate::session_transcript::{
+    ClientSessionStats, MAX_SESSION_REQUEST_ID_BYTES, MAX_SESSION_REQUEST_IDS,
+    validate_client_session_bytes,
+};
 use crate::transcript::{self, TranscriptRole};
 
 /// Maximum unique request IDs retained on either side of one correlation join.
-pub const MAX_CORRELATED_REQUESTS: usize = 262_144;
+pub const MAX_CORRELATED_REQUESTS: usize = MAX_SESSION_REQUEST_IDS;
 /// Maximum canonical request-ID bytes retained in each side's join index.
-pub const MAX_CORRELATION_ID_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_CORRELATION_ID_BYTES: u64 = MAX_SESSION_REQUEST_ID_BYTES as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorrelationStats {
@@ -160,6 +163,27 @@ fn server_response_ids(
     )
 }
 
+fn validate_client_index_consistency(
+    client: &ClientSessionStats,
+    requests: &IdIndex,
+) -> Result<(), String> {
+    let indexed = u64::try_from(requests.frames.len())
+        .map_err(|_| "correlation client request-ID count does not fit u64".to_string())?;
+    if indexed != client.unique_request_ids {
+        return Err(format!(
+            "client request-ID count differs across validation passes: session {}, correlation {indexed}",
+            client.unique_request_ids
+        ));
+    }
+    if requests.id_bytes != client.request_id_bytes {
+        return Err(format!(
+            "client request-ID bytes differ across validation passes: session {}, correlation {}",
+            client.request_id_bytes, requests.id_bytes
+        ));
+    }
+    Ok(())
+}
+
 pub fn correlate_transcripts(
     client_bytes: &[u8],
     server_bytes: &[u8],
@@ -167,6 +191,7 @@ pub fn correlate_transcripts(
     let client = validate_client_session_bytes(client_bytes)
         .map_err(|error| format!("client session validation failed: {error}"))?;
     let requests = client_request_ids(client_bytes)?;
+    validate_client_index_consistency(&client, &requests)?;
     let server = validate_server_transcript_bytes(server_bytes)
         .map_err(|error| format!("server transcript validation failed: {error}"))?;
     let responses = server_response_ids(&server, &requests.frames)?;
@@ -207,7 +232,8 @@ pub fn correlate_transcripts(
 pub fn render_correlation(stats: CorrelationStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-server-correlation/2\",",
+            "{{\"schema\":\"fln.lsp-client-server-correlation/3\",",
+            "\"clientSessionSchema\":\"fln.lsp-client-session/3\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -217,11 +243,16 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "\"errorResponses\":{},\"serverNotifications\":{},",
             "\"clientWireBytes\":{},\"serverWireBytes\":{},",
             "\"serverMetadataBytes\":{},",
+            "\"clientSessionRequestIdBytes\":{},",
             "\"clientRequestIdBytes\":{},\"serverResponseIdBytes\":{},",
+            "\"clientUniqueRequestIds\":{},",
             "\"requestIdCountCeiling\":{},\"requestIdByteCeiling\":{},",
             "\"documentsOpened\":{},\"documentsChanged\":{},",
             "\"documentsSaved\":{},\"documentsClosed\":{},",
-            "\"diagnosticWaits\":{},\"cancellations\":{},",
+            "\"diagnosticWaits\":{},\"coveredVersionWaits\":{},",
+            "\"futureVersionWaits\":{},\"cancellations\":{},",
+            "\"diagnosticWaitCancellationTargets\":{},",
+            "\"otherRequestCancellationTargets\":{},",
             "\"finalOpenDocuments\":{}}}\n"
         ),
         stats.client.lifecycle.transcript.frames,
@@ -235,8 +266,10 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
         stats.client.lifecycle.transcript.wire_bytes,
         stats.server.wire_bytes,
         stats.server.metadata_bytes,
+        stats.client.request_id_bytes,
         stats.client_request_id_bytes,
         stats.server_response_id_bytes,
+        stats.client.unique_request_ids,
         MAX_CORRELATED_REQUESTS,
         MAX_CORRELATION_ID_BYTES,
         stats.client.documents_opened,
@@ -244,7 +277,11 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
         stats.client.documents_saved,
         stats.client.documents_closed,
         stats.client.diagnostic_waits,
+        stats.client.covered_version_waits,
+        stats.client.future_version_waits,
         stats.client.cancellations,
+        stats.client.diagnostic_wait_cancellation_targets,
+        stats.client.other_request_cancellation_targets,
         stats.client.final_open_documents
     )
 }
@@ -292,15 +329,62 @@ mod tests {
         assert_eq!(stats.matched_responses, 3);
         assert_eq!(stats.server.result_responses, 3);
         assert_eq!(stats.server.notifications, 1);
+        assert_eq!(stats.client_request_id_bytes, stats.client.request_id_bytes);
         assert_eq!(stats.client_request_id_bytes, stats.server_response_id_bytes);
         let receipt = render_correlation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/2\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/3\""));
+        assert!(receipt.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
         assert!(receipt.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
         assert!(receipt.contains("\"matchedResponses\":3"));
         assert!(receipt.contains("\"unmatchedClientRequests\":0"));
         assert!(receipt.contains("\"unsolicitedServerResponses\":0"));
+        assert!(receipt.contains("\"clientUniqueRequestIds\":3"));
         assert!(receipt.contains("\"requestIdCountCeiling\":262144"));
         assert!(receipt.contains("\"requestIdByteCeiling\":33554432"));
+    }
+
+    #[test]
+    fn client_index_must_match_session_evidence() {
+        let mut client_stats = validate_client_session_bytes(&client()).unwrap();
+        let index = client_request_ids(&client()).unwrap();
+        validate_client_index_consistency(&client_stats, &index).unwrap();
+
+        client_stats.unique_request_ids += 1;
+        assert!(
+            validate_client_index_consistency(&client_stats, &index)
+                .unwrap_err()
+                .contains("count differs across validation passes")
+        );
+        client_stats.unique_request_ids -= 1;
+        client_stats.request_id_bytes += 1;
+        assert!(
+            validate_client_index_consistency(&client_stats, &index)
+                .unwrap_err()
+                .contains("bytes differ across validation passes")
+        );
+    }
+
+    #[test]
+    fn joined_receipt_carries_wait_and_cancellation_classes() {
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1,"text":"a"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":2}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let server = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait","error":{"code":-32800,"message":"request cancelled"}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+        ]);
+        let receipt = render_correlation(correlate_transcripts(&client, &server).unwrap());
+        assert!(receipt.contains("\"futureVersionWaits\":1"));
+        assert!(receipt.contains("\"cancellations\":1"));
+        assert!(receipt.contains("\"diagnosticWaitCancellationTargets\":1"));
+        assert!(receipt.contains("\"otherRequestCancellationTargets\":0"));
     }
 
     #[test]
