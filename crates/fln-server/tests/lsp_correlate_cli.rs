@@ -39,7 +39,7 @@ fn server() -> Vec<u8> {
         r#"{"jsonrpc":"2.0","id":"init","result":{"capabilities":{}}}"#,
         r#"{"jsonrpc":"2.0","method":"$/lean/fileProgress","params":{"textDocument":{"uri":"file:///A.lean"},"processing":[{"kind":"processing"}]}}"#,
         r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///A.lean","diagnostics":[]}}"#,
-        r#"{"jsonrpc":"2.0","id":1.25e2,"error":{"code":-32601,"message":"method not found"}}"#,
+        r#"{"jsonrpc":"2.0","id":1.25e2,"result":null}"#,
         r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
     ])
 }
@@ -71,6 +71,7 @@ fn help_and_usage_refusals_are_side_effect_free() {
     assert!(stdout.contains("Number lexemes"));
     assert!(stdout.contains("string IDs compare by decoded value"));
     assert!(stdout.contains("cancellation to target one prior non-null"));
+    assert!(stdout.contains("response must match the current bounded dispatcher contract"));
     assert!(stdout.contains("not cross-stream timing"));
 
     let missing = correlator().output().unwrap();
@@ -82,7 +83,7 @@ fn help_and_usage_refusals_are_side_effect_free() {
 }
 
 #[test]
-fn successful_join_emits_zero_unmatched_resource_receipt() {
+fn successful_join_emits_zero_unmatched_method_bound_receipt() {
     let (client_path, server_path) = write_pair("success", &client(), &server());
     let output = correlator()
         .arg(&client_path)
@@ -92,17 +93,26 @@ fn successful_join_emits_zero_unmatched_resource_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/4\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/5\""));
     assert!(stdout.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
     assert!(stdout.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
+    assert!(stdout.contains("\"methodResponseSchema\":\"fln.lsp-method-response/1\""));
     assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));
     assert!(stdout.contains("\"matchedResponses\":3"));
     assert!(stdout.contains("\"unmatchedClientRequests\":0"));
     assert!(stdout.contains("\"unsolicitedServerResponses\":0"));
-    assert!(stdout.contains("\"resultResponses\":2"));
-    assert!(stdout.contains("\"errorResponses\":1"));
+    assert!(stdout.contains("\"resultResponses\":3"));
+    assert!(stdout.contains("\"errorResponses\":0"));
+    assert!(stdout.contains("\"methodContractResponses\":3"));
+    assert!(stdout.contains("\"methodContractViolations\":0"));
+    assert!(stdout.contains("\"initializeResults\":1"));
+    assert!(stdout.contains("\"shutdownResults\":1"));
+    assert!(stdout.contains("\"noInformationQueryResults\":1"));
+    assert!(stdout.contains("\"diagnosticWaitResults\":0"));
+    assert!(stdout.contains("\"rpcUnsupportedErrors\":0"));
+    assert!(stdout.contains("\"unknownMethodNotFoundErrors\":0"));
     assert!(stdout.contains("\"clientWireBytes\":"));
     assert!(stdout.contains("\"serverWireBytes\":"));
     assert!(stdout.contains("\"serverMetadataBytes\":"));
@@ -120,6 +130,30 @@ fn successful_join_emits_zero_unmatched_resource_receipt() {
     assert!(stdout.contains("\"cancelledTargetRequestCancelledResponses\":0"));
     assert!(stdout.contains("\"cancelledTargetResultResponses\":0"));
     assert!(stdout.contains("\"cancelledTargetOtherErrorResponses\":0"));
+
+    fs::remove_file(client_path).unwrap();
+    fs::remove_file(server_path).unwrap();
+}
+
+#[test]
+fn method_contract_mismatch_fails_without_success_receipt() {
+    let invalid_server = framed(&[
+        r#"{"jsonrpc":"2.0","id":"init","result":{"capabilities":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":1.25e2,"error":{"code":-32601,"message":"method not found"}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+    ]);
+    let (client_path, server_path) = write_pair("method-mismatch", &client(), &invalid_server);
+    let output = correlator()
+        .arg(&client_path)
+        .arg(&server_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("no-information-query method contract"));
+    assert!(stderr.contains("expected the current null no-information result"));
+    assert!(stderr.contains("observed error code -32601"));
 
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
@@ -155,6 +189,7 @@ fn cancelled_future_wait_is_joined_as_typed_evidence() {
     assert!(stdout.contains("\"cancellations\":1"));
     assert!(stdout.contains("\"diagnosticWaitCancellationTargets\":1"));
     assert!(stdout.contains("\"otherRequestCancellationTargets\":0"));
+    assert!(stdout.contains("\"diagnosticWaitCancelledErrors\":1"));
     assert!(stdout.contains("\"cancellationTargetIdBytes\":6"));
     assert!(stdout.contains("\"cancelledTargetRequestCancelledResponses\":1"));
     assert!(stdout.contains("\"cancelledTargetResultResponses\":0"));
