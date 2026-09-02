@@ -57,7 +57,7 @@ impl SessionRefusal {
                 "FrankenLean refused non-monotone didChange version; the latest accepted version remains authoritative"
             }
             Self::AccountingInvariant => {
-                "FrankenLean retained-source accounting invariant failed; retained text was discarded"
+                "FrankenLean retained-source accounting invariant failed; all retained text was discarded"
             }
         }
     }
@@ -120,6 +120,13 @@ impl DocumentSession {
         (Some(text), RetentionOutcome::Retained)
     }
 
+    fn discard_all_text(&mut self) {
+        for document in self.documents.values_mut() {
+            document.text = None;
+        }
+        self.retained_bytes = 0;
+    }
+
     pub(super) fn open(
         &mut self,
         uri: String,
@@ -150,8 +157,8 @@ impl DocumentSession {
         let old_len = document.text.as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
             document.text = None;
-            self.retained_bytes = 0;
             self.documents.insert(uri.to_string(), document);
+            self.discard_all_text();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -189,15 +196,17 @@ impl DocumentSession {
     }
 
     pub(super) fn invalidate_text(&mut self, uri: &str) -> Result<(), SessionRefusal> {
-        let Some(document) = self.documents.get_mut(uri) else {
+        let Some(mut document) = self.documents.remove(uri) else {
             return Err(SessionRefusal::NotOpen);
         };
         let old_len = document.text.take().as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
-            self.retained_bytes = 0;
+            self.documents.insert(uri.to_string(), document);
+            self.discard_all_text();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
+        self.documents.insert(uri.to_string(), document);
         Ok(())
     }
 
@@ -207,7 +216,7 @@ impl DocumentSession {
         };
         let old_len = document.text.as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
-            self.retained_bytes = 0;
+            self.discard_all_text();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -279,5 +288,37 @@ mod tests {
         assert!(!session.is_open("file:///x"));
         assert_eq!(session.retained_bytes, 0);
         assert_eq!(session.close("file:///x"), Ok(false));
+    }
+
+    #[test]
+    fn accounting_recovery_invalidates_every_cached_text_but_preserves_authority() {
+        let mut session = DocumentSession::with_limits(3, 64);
+        session
+            .open("file:///a".to_string(), 1, "alpha".to_string())
+            .unwrap();
+        session
+            .open("file:///b".to_string(), 4, "beta".to_string())
+            .unwrap();
+
+        session.retained_bytes = 0;
+        assert_eq!(
+            session.change("file:///a", 2, "new".to_string()),
+            Err(SessionRefusal::AccountingInvariant)
+        );
+        assert!(session.is_open("file:///a"));
+        assert!(session.is_open("file:///b"));
+        assert_eq!(session.version("file:///a"), Some(1));
+        assert_eq!(session.version("file:///b"), Some(4));
+        assert_eq!(session.text("file:///a"), None);
+        assert_eq!(session.text("file:///b"), None);
+        assert_eq!(session.retained_bytes, 0);
+
+        assert_eq!(
+            session.change("file:///a", 2, "new".to_string()),
+            Ok(RetentionOutcome::Retained)
+        );
+        assert_eq!(session.version("file:///a"), Some(2));
+        assert_eq!(session.text("file:///a"), Some("new"));
+        assert_eq!(session.retained_bytes, 3);
     }
 }
