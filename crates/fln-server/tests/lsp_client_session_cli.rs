@@ -62,7 +62,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 #[test]
-fn validator_emits_document_semantic_session_receipt() {
+fn validator_emits_cancellation_bound_session_receipt() {
     let input = transcript(&[
         r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A.lean","version":1,"text":"def a := 1"}}}"#,
         r#"{"jsonrpc":"2.0","id":"wait","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A.lean","version":2}}"#,
@@ -78,7 +78,8 @@ fn validator_emits_document_semantic_session_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-session/2\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-session/3\""));
+    assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"documentsOpened\":1"));
     assert!(stdout.contains("\"documentsChanged\":1"));
     assert!(stdout.contains("\"documentsSaved\":1"));
@@ -87,6 +88,12 @@ fn validator_emits_document_semantic_session_receipt() {
     assert!(stdout.contains("\"coveredVersionWaits\":0"));
     assert!(stdout.contains("\"futureVersionWaits\":1"));
     assert!(stdout.contains("\"cancellations\":1"));
+    assert!(stdout.contains("\"diagnosticWaitCancellationTargets\":1"));
+    assert!(stdout.contains("\"otherRequestCancellationTargets\":0"));
+    assert!(stdout.contains("\"uniqueRequestIds\":3"));
+    assert!(stdout.contains("\"requestIdBytes\":"));
+    assert!(stdout.contains("\"requestIdCountCeiling\":262144"));
+    assert!(stdout.contains("\"requestIdByteCeiling\":33554432"));
     assert!(stdout.contains("\"finalOpenDocuments\":0"));
 }
 
@@ -118,6 +125,37 @@ fn lifecycle_and_session_modes_have_deliberately_different_authority() {
 }
 
 #[test]
+fn cancellation_target_errors_are_visible_and_receipt_free() {
+    let unknown = transcript(&[
+        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#,
+    ]);
+    let output = run_stdin(
+        validator().args(["--client-session", "-"]),
+        &unknown,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("unknown prior canonical request ID"));
+
+    let duplicate = transcript(&[
+        r#"{"jsonrpc":"2.0","id":"request","method":"textDocument/hover","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"request"}}"#,
+        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"request"}}"#,
+    ]);
+    let output = run_stdin(
+        validator().args(["--client-session", "-"]),
+        &duplicate,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("repeats cancellation"));
+}
+
+#[test]
 fn replay_session_preflight_fails_before_output_publication() {
     let input_path = scratch("invalid-session.frames");
     let output_path = scratch("invalid-session.server.frames");
@@ -126,7 +164,7 @@ fn replay_session_preflight_fails_before_output_publication() {
     fs::write(
         &input_path,
         transcript(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///Missing.lean"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#,
         ]),
     )
     .unwrap();
@@ -143,7 +181,7 @@ fn replay_session_preflight_fails_before_output_publication() {
     assert!(!output_path.exists());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("client session validation failed"));
-    assert!(stderr.contains("didSave targets unopened document"));
+    assert!(stderr.contains("unknown prior canonical request ID"));
 
     fs::remove_file(input_path).unwrap();
 }
