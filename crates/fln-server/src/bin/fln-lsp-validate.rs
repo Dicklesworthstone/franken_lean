@@ -23,7 +23,8 @@ By default only framing and JSON-RPC shape are validated, which preserves\n\
 negative replay fixtures. --client-lifecycle additionally requires known\n\
 method roles and a complete initialize/initialized/shutdown/exit handshake.\n\
 --client-session also validates Full-sync document membership, required text,\n\
-monotone versions, wait targets, cancellation IDs, and bounded URI state.\n";
+monotone versions, diagnostic-wait targets, canonical unique request IDs,\n\
+and cancellation targets bound to prior non-null requests under explicit budgets.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidationMode {
@@ -185,7 +186,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A.lean","version":1,"text":"def a := 1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A.lean","version":2}}"#,
             r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///A.lean","version":2},"contentChanges":[{"text":"def a := 2"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,
             r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///A.lean"}}}"#,
             r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A.lean"}}}"#,
             r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
@@ -324,21 +327,45 @@ mod tests {
     }
 
     #[test]
-    fn session_mode_emits_document_semantic_receipt() {
+    fn session_mode_emits_request_and_cancellation_evidence() {
         let receipt = validate_reader(
             &mut BufReader::new(Cursor::new(client_session())),
             ValidationMode::ClientSession,
         )
         .unwrap();
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/2\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/3\""));
+        assert!(receipt.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
         assert!(receipt.contains("\"documentsOpened\":1"));
         assert!(receipt.contains("\"documentsChanged\":1"));
         assert!(receipt.contains("\"documentsSaved\":1"));
         assert!(receipt.contains("\"documentsClosed\":1"));
-        assert!(receipt.contains("\"diagnosticWaits\":0"));
+        assert!(receipt.contains("\"diagnosticWaits\":1"));
         assert!(receipt.contains("\"coveredVersionWaits\":0"));
-        assert!(receipt.contains("\"futureVersionWaits\":0"));
+        assert!(receipt.contains("\"futureVersionWaits\":1"));
+        assert!(receipt.contains("\"cancellations\":1"));
+        assert!(receipt.contains("\"diagnosticWaitCancellationTargets\":1"));
+        assert!(receipt.contains("\"otherRequestCancellationTargets\":0"));
+        assert!(receipt.contains("\"uniqueRequestIds\":3"));
+        assert!(receipt.contains("\"requestIdCountCeiling\":262144"));
+        assert!(receipt.contains("\"requestIdByteCeiling\":33554432"));
         assert!(receipt.contains("\"finalOpenDocuments\":0"));
+    }
+
+    #[test]
+    fn session_mode_rejects_unknown_cancellation_target() {
+        let bytes = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let error = validate_reader(
+            &mut BufReader::new(Cursor::new(bytes)),
+            ValidationMode::ClientSession,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown prior canonical request ID"));
     }
 
     #[test]
