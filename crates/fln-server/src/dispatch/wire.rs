@@ -4,6 +4,7 @@ use crate::{LSP_POSITION_ENCODING, json_string};
 
 use super::json::RequestId;
 
+pub(super) const REQUEST_CANCELLED_CODE: i32 = -32800;
 pub(super) const REQUEST_FAILED_CODE: i32 = -32803;
 pub(super) const SERVER_NOT_INITIALIZED_CODE: i32 = -32002;
 
@@ -50,6 +51,13 @@ pub(super) fn invalid_request_response(id: Option<&RequestId>, message: &str) ->
 pub(super) fn null_response(id: &RequestId) -> String {
     format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}",
+        id.as_json()
+    )
+}
+
+pub(super) fn empty_object_response(id: &RequestId) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{}}}}",
         id.as_json()
     )
 }
@@ -132,9 +140,11 @@ mod tests {
         let text = RequestId::Text("request-🤖".to_string());
         let messages = [
             error_response(&number, -32601, "unknown \"method\""),
+            error_response(&text, REQUEST_CANCELLED_CODE, "request cancelled"),
             error_response_null_id(-32700, "parse error"),
             invalid_request_response(Some(&text), "invalid request"),
             null_response(&text),
+            empty_object_response(&number),
             file_progress_notification("file:///tmp/a b.lean", true),
             file_progress_notification("file:///tmp/a b.lean", false),
             clear_diagnostics_notification("file:///tmp/a b.lean"),
@@ -146,6 +156,8 @@ mod tests {
         }
 
         let response = parse_envelope(&null_response(&number)).expect("valid response");
+        assert_eq!(response.id, RequestIdField::Valid(number.clone()));
+        let response = parse_envelope(&empty_object_response(&number)).expect("valid response");
         assert_eq!(response.id, RequestIdField::Valid(number));
         let response = parse_envelope(&null_response(&text)).expect("valid response");
         assert_eq!(response.id, RequestIdField::Valid(text));

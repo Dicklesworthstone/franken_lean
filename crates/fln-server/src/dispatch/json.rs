@@ -572,6 +572,22 @@ pub(super) fn save_text(params: RawField<'_>) -> DecodedField {
     decoded_string_field(params_object(params), "text")
 }
 
+pub(super) fn direct_uri(params: RawField<'_>) -> DecodedField {
+    decoded_string_field(params_object(params), "uri")
+}
+
+pub(super) fn direct_version(params: RawField<'_>) -> VersionField {
+    decoded_integer_field(params_object(params), "version")
+}
+
+pub(super) fn direct_request_id(params: RawField<'_>) -> RequestIdField {
+    match params_object(params) {
+        RawField::Value(value) => request_id(object_field(value, "id")),
+        RawField::Missing => RequestIdField::Absent,
+        RawField::Invalid => RequestIdField::Invalid,
+    }
+}
+
 fn single_array_element(value: &str) -> Option<&str> {
     let bytes = value.as_bytes();
     let mut index = skip_ws(bytes, 0);
@@ -685,6 +701,24 @@ mod tests {
             text_document_text(envelope.params),
             DecodedField::Valid("ok".to_string())
         );
+    }
+
+    #[test]
+    fn direct_params_fields_are_exact_and_ambiguity_safe() {
+        let params = RawField::Value(r#"{"uri":"file:///x","version":3,"id":"wait"}"#);
+        assert_eq!(
+            direct_uri(params),
+            DecodedField::Valid("file:///x".to_string())
+        );
+        assert_eq!(direct_version(params), VersionField::Valid(3));
+        assert_eq!(
+            direct_request_id(params),
+            RequestIdField::Valid(RequestId::Text("wait".to_string()))
+        );
+
+        let duplicate = RawField::Value(r#"{"uri":"a","uri":"b","version":1,"id":1,"id":2}"#);
+        assert_eq!(direct_uri(duplicate), DecodedField::Invalid);
+        assert_eq!(direct_request_id(duplicate), RequestIdField::Invalid);
     }
 
     #[test]

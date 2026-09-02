@@ -1,8 +1,9 @@
 //! Bounded JSON-RPC dispatch for the LSP lifecycle and Full document sync.
 //!
-//! JSON syntax, document-session authority, and deterministic wire encoding live
-//! in dedicated submodules. The dispatcher is intentionally synchronous: it owns
-//! protocol ordering and delegates source checking through one callback.
+//! JSON syntax, document-session authority, pending diagnostic waits, and
+//! deterministic wire encoding live in dedicated submodules. The dispatcher is
+//! intentionally synchronous: it owns protocol ordering and delegates source
+//! checking through one callback.
 
 use std::io::{self, BufRead, Write};
 
@@ -10,19 +11,21 @@ use crate::transport;
 
 mod json;
 mod session;
+mod wait;
 mod wire;
 
 use json::{
     DecodedField, Envelope, EnvelopeError, RawField, RequestId, RequestIdField, VersionField,
-    content_changes_text, parse_envelope, save_text, text_document_text, text_document_uri,
-    text_document_version,
+    content_changes_text, direct_request_id, direct_uri, direct_version, parse_envelope,
+    save_text, text_document_text, text_document_uri, text_document_version,
 };
 use session::{DocumentSession, RetentionOutcome, SessionRefusal};
+use wait::{PendingDiagnosticWaits, WaitRefusal};
 use wire::{
-    REQUEST_FAILED_CODE, SERVER_NOT_INITIALIZED_CODE, clear_diagnostics_notification,
-    diagnostic_callback_failure_notification, error_response, error_response_null_id,
-    file_progress_notification, initialize_response, invalid_request_response, log_warning,
-    null_response,
+    REQUEST_CANCELLED_CODE, REQUEST_FAILED_CODE, SERVER_NOT_INITIALIZED_CODE,
+    clear_diagnostics_notification, diagnostic_callback_failure_notification,
+    empty_object_response, error_response, error_response_null_id, file_progress_notification,
+    initialize_response, invalid_request_response, log_warning, null_response,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,12 @@ pub struct ServerOutcome {
     pub documents_opened: u64,
     pub documents_changed: u64,
     pub documents_saved: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedVersion {
+    uri: String,
+    version: i64,
 }
 
 pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
@@ -85,6 +94,20 @@ fn check_document(
         write_protocol_message(output, diagnostic_callback_failure_notification(uri))?;
     }
     write_protocol_message(output, file_progress_notification(uri, false))
+}
+
+fn complete_waits(output: &mut dyn Write, ids: Vec<RequestId>) -> io::Result<()> {
+    for id in ids {
+        write_protocol_message(output, empty_object_response(&id))?;
+    }
+    Ok(())
+}
+
+fn fail_waits(output: &mut dyn Write, ids: Vec<RequestId>, message: &str) -> io::Result<()> {
+    for id in ids {
+        write_protocol_message(output, error_response(&id, REQUEST_FAILED_CODE, message))?;
+    }
+    Ok(())
 }
 
 fn invalidate_source_and_clear(
@@ -138,31 +161,59 @@ fn decoded_change_text(params: RawField<'_>) -> Result<String, &'static str> {
     }
 }
 
+fn decoded_wait_target(params: RawField<'_>) -> Result<(String, i64), &'static str> {
+    let uri = match direct_uri(params) {
+        DecodedField::Valid(uri) if !uri.is_empty() => uri,
+        DecodedField::Valid(_) => {
+            return Err("waitForDiagnostics uri must not be empty");
+        }
+        DecodedField::Missing => {
+            return Err("waitForDiagnostics requires uri");
+        }
+        DecodedField::Invalid => {
+            return Err("waitForDiagnostics uri is malformed or ambiguous");
+        }
+    };
+    let version = match direct_version(params) {
+        VersionField::Valid(version) if version >= 0 => version,
+        VersionField::Valid(_) => {
+            return Err("waitForDiagnostics version must be a nonnegative integer");
+        }
+        VersionField::Missing => {
+            return Err("waitForDiagnostics requires version");
+        }
+        VersionField::Invalid => {
+            return Err("waitForDiagnostics version is malformed or ambiguous");
+        }
+    };
+    Ok((uri, version))
+}
+
 fn handle_open(
     output: &mut dyn Write,
     session: &mut DocumentSession,
     params: RawField<'_>,
     on_did_open: &mut OnDidOpen,
-) -> io::Result<bool> {
+) -> io::Result<Option<PublishedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
             write_warning(output, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
     let version = match decoded_version(params) {
         Ok(version) => version,
         Err(message) => {
             write_warning(output, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
     let text = match decoded_open_text(params) {
         Ok(text) => text,
         Err(message) => {
             write_warning(output, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
 
@@ -170,11 +221,11 @@ fn handle_open(
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
             check_document(output, &uri, &text, on_did_open)?;
-            Ok(true)
+            Ok(Some(PublishedVersion { uri, version }))
         }
         Err(refusal) => {
             write_warning(output, refusal.message())?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -184,30 +235,30 @@ fn handle_change(
     session: &mut DocumentSession,
     params: RawField<'_>,
     on_did_open: &mut OnDidOpen,
-) -> io::Result<bool> {
+) -> io::Result<Option<PublishedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
             write_warning(output, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
     if !session.is_open(&uri) {
         write_warning(output, SessionRefusal::NotOpen.message())?;
-        return Ok(false);
+        return Ok(None);
     }
     let version = match decoded_version(params) {
         Ok(version) => version,
         Err(message) => {
             invalidate_source_and_clear(output, session, &uri, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
     let text = match decoded_change_text(params) {
         Ok(text) => text,
         Err(message) => {
             invalidate_source_and_clear(output, session, &uri, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
 
@@ -215,11 +266,11 @@ fn handle_change(
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
             check_document(output, &uri, &text, on_did_open)?;
-            Ok(true)
+            Ok(Some(PublishedVersion { uri, version }))
         }
         Err(refusal) => {
             write_warning(output, refusal.message())?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -282,12 +333,12 @@ fn handle_close(
     output: &mut dyn Write,
     session: &mut DocumentSession,
     params: RawField<'_>,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
             write_warning(output, message)?;
-            return Ok(());
+            return Ok(None);
         }
     };
     match session.close(&uri) {
@@ -298,7 +349,91 @@ fn handle_close(
         )?,
         Err(refusal) => write_warning(output, refusal.message())?,
     }
-    write_protocol_message(output, clear_diagnostics_notification(&uri))
+    write_protocol_message(output, clear_diagnostics_notification(&uri))?;
+    Ok(Some(uri))
+}
+
+fn handle_wait_for_diagnostics(
+    output: &mut dyn Write,
+    session: &DocumentSession,
+    waits: &mut PendingDiagnosticWaits,
+    id: &RequestId,
+    params: RawField<'_>,
+) -> io::Result<()> {
+    if waits.contains(id) {
+        return write_protocol_message(
+            output,
+            error_response(id, -32600, WaitRefusal::DuplicateId.message()),
+        );
+    }
+    let (uri, version) = match decoded_wait_target(params) {
+        Ok(target) => target,
+        Err(message) => {
+            return write_protocol_message(output, error_response(id, -32602, message));
+        }
+    };
+    if !session.is_open(&uri) {
+        return write_protocol_message(
+            output,
+            error_response(
+                id,
+                REQUEST_FAILED_CODE,
+                "waitForDiagnostics requires an open document",
+            ),
+        );
+    }
+    if session
+        .version(&uri)
+        .is_some_and(|current| current >= version)
+    {
+        return write_protocol_message(output, empty_object_response(id));
+    }
+    match waits.register(id.clone(), uri, version) {
+        Ok(()) => Ok(()),
+        Err(WaitRefusal::DuplicateId) => write_protocol_message(
+            output,
+            error_response(id, -32600, WaitRefusal::DuplicateId.message()),
+        ),
+        Err(WaitRefusal::Capacity) => write_protocol_message(
+            output,
+            error_response(id, REQUEST_FAILED_CODE, WaitRefusal::Capacity.message()),
+        ),
+    }
+}
+
+fn handle_cancel_request(
+    output: &mut dyn Write,
+    waits: &mut PendingDiagnosticWaits,
+    params: RawField<'_>,
+) -> io::Result<()> {
+    let id = match direct_request_id(params) {
+        RequestIdField::Valid(RequestId::Null) => {
+            return write_warning(
+                output,
+                "FrankenLean ignored $/cancelRequest with a null request id",
+            );
+        }
+        RequestIdField::Valid(id) => id,
+        RequestIdField::Absent => {
+            return write_warning(
+                output,
+                "FrankenLean ignored $/cancelRequest without a request id",
+            );
+        }
+        RequestIdField::Invalid => {
+            return write_warning(
+                output,
+                "FrankenLean ignored $/cancelRequest with a malformed or ambiguous request id",
+            );
+        }
+    };
+    if let Some(id) = waits.cancel(&id) {
+        write_protocol_message(
+            output,
+            error_response(&id, REQUEST_CANCELLED_CODE, "request cancelled"),
+        )?;
+    }
+    Ok(())
 }
 
 fn request_id(envelope: &Envelope<'_>) -> Result<Option<&RequestId>, String> {
@@ -353,6 +488,9 @@ fn is_notification_method(method: &str) -> bool {
         method,
         "initialized"
             | "exit"
+            | "$/cancelRequest"
+            | "$/lean/rpc/keepAlive"
+            | "$/lean/rpc/release"
             | "textDocument/didOpen"
             | "textDocument/didChange"
             | "textDocument/didSave"
@@ -367,11 +505,12 @@ fn is_request_method(method: &str) -> bool {
             | "shutdown"
             | "$/lean/plainGoal"
             | "$/lean/plainTermGoal"
-            | "textDocument/hover"
-            | "textDocument/completion"
-            | "textDocument/definition"
             | "$/lean/rpc/connect"
             | "$/lean/rpc/call"
+            | "textDocument/completion"
+            | "textDocument/definition"
+            | "textDocument/hover"
+            | "textDocument/waitForDiagnostics"
     )
 }
 
@@ -435,6 +574,7 @@ pub fn serve(
     let mut documents_changed = 0u64;
     let mut documents_saved = 0u64;
     let mut session = DocumentSession::new();
+    let mut waits = PendingDiagnosticWaits::new();
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -490,6 +630,21 @@ pub fn serve(
         if !validate_method_role(output, &method, id)? {
             continue;
         }
+        if method != "textDocument/waitForDiagnostics" {
+            if let Some(request_id) = id {
+                if waits.contains(request_id) {
+                    write_protocol_message(
+                        output,
+                        error_response(
+                            request_id,
+                            -32600,
+                            "FrankenLean refused a duplicate outstanding JSON-RPC request id",
+                        ),
+                    )?;
+                    continue;
+                }
+            }
+        }
 
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
@@ -509,6 +664,11 @@ pub fn serve(
                 write_warning(output, "FrankenLean ignored initialized outside initialization")?;
             }
             ("shutdown", Some(request_id), ServerState::Running) => {
+                fail_waits(
+                    output,
+                    waits.drain_all(),
+                    "server shut down before the requested diagnostics version was published",
+                )?;
                 write_protocol_message(output, null_response(request_id))?;
                 state = ServerState::ShuttingDown;
             }
@@ -526,13 +686,25 @@ pub fn serve(
                 });
             }
             ("textDocument/didOpen", None, ServerState::Running) => {
-                if handle_open(output, &mut session, envelope.params, on_did_open)? {
+                if let Some(published) =
+                    handle_open(output, &mut session, envelope.params, on_did_open)?
+                {
                     documents_opened = documents_opened.saturating_add(1);
+                    complete_waits(
+                        output,
+                        waits.complete_ready(&published.uri, published.version),
+                    )?;
                 }
             }
             ("textDocument/didChange", None, ServerState::Running) => {
-                if handle_change(output, &mut session, envelope.params, on_did_open)? {
+                if let Some(published) =
+                    handle_change(output, &mut session, envelope.params, on_did_open)?
+                {
                     documents_changed = documents_changed.saturating_add(1);
+                    complete_waits(
+                        output,
+                        waits.complete_ready(&published.uri, published.version),
+                    )?;
                 }
             }
             ("textDocument/didSave", None, ServerState::Running) => {
@@ -541,8 +713,30 @@ pub fn serve(
                 }
             }
             ("textDocument/didClose", None, ServerState::Running) => {
-                handle_close(output, &mut session, envelope.params)?;
+                if let Some(uri) = handle_close(output, &mut session, envelope.params)? {
+                    fail_waits(
+                        output,
+                        waits.drain_uri(&uri),
+                        "document closed before the requested diagnostics version was published",
+                    )?;
+                }
             }
+            ("textDocument/waitForDiagnostics", Some(request_id), state) => {
+                if running_request(output, state, request_id)? {
+                    handle_wait_for_diagnostics(
+                        output,
+                        &session,
+                        &mut waits,
+                        request_id,
+                        envelope.params,
+                    )?;
+                }
+            }
+            ("$/cancelRequest", None, ServerState::Running) => {
+                handle_cancel_request(output, &mut waits, envelope.params)?;
+            }
+            ("$/lean/rpc/keepAlive", None, ServerState::Running)
+            | ("$/lean/rpc/release", None, ServerState::Running) => {}
             (method, None, state) if is_notification_method(method) => {
                 let message = match state {
                     ServerState::Uninitialized | ServerState::Initializing => {
@@ -760,6 +954,61 @@ mod tests {
         assert!(outcome.clean);
         assert!(output.contains("\"id\":\"rpc\",\"error\":{\"code\":-32803"));
         assert!(output.contains("Lean RPC sessions are not implemented"));
+    }
+
+    #[test]
+    fn wait_for_diagnostics_completes_immediately_and_after_version_advance() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"ready","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":1}}"#,
+            r#"{"jsonrpc":"2.0","id":"future","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":3}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":2},"contentChanges":[{"text":"v2"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":3},"contentChanges":[{"text":"v3"}]}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"ready\",\"result\":{}"));
+        assert!(output.contains("\"id\":\"future\",\"result\":{}"));
+        assert!(!output.contains("\"id\":\"future\",\"error\""));
+    }
+
+    #[test]
+    fn pending_wait_can_be_cancelled_by_exact_lexical_id() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"cancel-me","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":9}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"cancel-me"}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert!(output.contains(
+            "\"id\":\"cancel-me\",\"error\":{\"code\":-32800,\"message\":\"request cancelled\"}"
+        ));
+        assert_eq!(output.matches("\"id\":\"cancel-me\"").count(), 1);
+    }
+
+    #[test]
+    fn closing_a_document_fails_its_pending_waits() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":21,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":9}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///x"}}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":21,\"error\":{\"code\":-32803"));
+        assert!(output.contains("document closed before the requested diagnostics version"));
+    }
+
+    #[test]
+    fn invalid_and_duplicate_waits_fail_closed() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"negative","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":-1}}"#,
+            r#"{"jsonrpc":"2.0","id":"duplicate","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":9}}"#,
+            r#"{"jsonrpc":"2.0","id":"duplicate","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":10}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"negative\",\"error\":{\"code\":-32602"));
+        assert!(output.contains("\"id\":\"duplicate\",\"error\":{\"code\":-32600"));
+        assert!(output.contains("duplicate outstanding JSON-RPC request id"));
     }
 
     #[test]
