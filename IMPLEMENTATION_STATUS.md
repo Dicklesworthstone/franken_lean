@@ -64,7 +64,7 @@ The repository contains source-to-kernel and source-to-Golem paths for a growing
 
 ### Lantern / LSP server
 
-**Status: usable bounded transport, Full document synchronization, and synchronous diagnostic waiting; semantic editor and daemon architecture remain incomplete.**
+**Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, and transcript tooling; semantic editor and daemon architecture remain incomplete.**
 
 Landed transport and syntax ground:
 
@@ -79,15 +79,18 @@ Landed lifecycle and document authority:
 - LSP lifecycle (`initialize`, `initialized`, `shutdown`, `exit`) with `utf-16` position-encoding advertisement and Full text synchronization.
 - Full-sync `didOpen`, `didChange`, `didSave`, and `didClose` handling. Ranged/incremental fragments, duplicate opens, unopened changes/saves, non-monotone versions, and malformed transitions fail closed rather than silently changing state.
 - Open-document membership and accepted versions are authoritative independently of retained source bytes. Cache pressure therefore cannot implicitly close a document or erase version monotonicity.
-- Session-local source retention is bounded to 1,024 documents and 256 MiB. Textless `didSave` rechecks the newest retained full snapshot; missing or invalidated text is visible and cannot replay stale content.
-- Retained-source accounting recovery invalidates the affected text and rebuilds the exact aggregate from unaffected documents where possible; impossible or over-budget reconstructed states discard all retained text while preserving open/version authority.
-- `didClose` removes document/source/publication state, clears push diagnostics, and deterministically fails waits that can no longer complete.
+- Session-local state is independently bounded to 1,024 open documents, 256 MiB of retained source, and 4 MiB of aggregate document-URI keys. An oversized URI is refused before source-retention accounting changes or source checking begins.
+- Textless `didSave` rechecks the newest retained full snapshot; missing or invalidated text is visible and cannot replay stale content.
+- Accounting recovery invalidates affected text and rebuilds both source-byte and URI-key aggregates from surviving open documents. Impossible or over-budget source reconstruction discards retained text while preserving open/version and URI authority.
+- `didClose` removes document/source/publication state, releases both source and URI accounting, clears push diagnostics, and deterministically fails waits that can no longer complete.
 
 Landed diagnostic-publication authority:
 
 - Document checks are bracketed by `$/lean/fileProgress` processing/complete notifications.
 - Callback output is parsed structurally before being written. A nested method-looking string, malformed JSON, response-shaped message, duplicate terminal class, or `publishDiagnostics` for another URI cannot masquerade as the current document's terminal result.
-- Exactly one current-document diagnostic publication class may coexist with one canonical `$/lean/diagnosticOutcome`. Canonical `authority:true` advances the publication frontier; `authority:false` is retained as diagnostic evidence but grades the frontier failed and forces an editor-visible diagnostic clear.
+- Exactly one current-document diagnostic publication class may coexist with one canonical `$/lean/diagnosticOutcome`.
+- Canonical zero-diagnostic success is a four-part covenant: the current diagnostic-projection schema, `outcome:"complete"`, `authority:true`, and the exact unsigned integer `diagnosticCount:0`. Missing, nonzero, negative, fractional, string, overflowed, or duplicate diagnostic accounting cannot release the publication frontier.
+- `inconclusive` and `internal_fault` outcomes require `authority:false` and omit the complete-only `diagnosticCount` field. Their detailed outcome remains visible, but the frontier is failed and editor diagnostics are cleared.
 - Missing, malformed, or ambiguous terminal callback output is withheld as authority, clears stale diagnostics, and emits a schema-bound non-authoritative internal-fault outcome. The callback cannot turn “no answer” into an empty success.
 - Accepted document text/version and emitted diagnostic authority are separate frontiers. `textDocument/waitForDiagnostics` is satisfied only by the latter.
 
@@ -97,7 +100,14 @@ Landed bounded diagnostic synchronization:
 - Immediate and future-version waits use the same monotone publication frontier. A non-authoritative result fails matching waits with `RequestFailed` instead of claiming diagnostic completion; a later authoritative save at the same version can recover the frontier.
 - Pending waits are bounded to 4,096 requests and 4 MiB of retained request-ID/URI metadata. Duplicate outstanding IDs and capacity overflow are typed failures.
 - `$/cancelRequest`, document close, and shutdown release every pending wait exactly once and in deterministic registration order.
-- Public framed-stdio transcript tests cover lifecycle ordering, Full-sync replay, malformed JSON and UTF-8 recovery, callback spoofing and malformed output, wait success/failure/recovery, cancellation, close, shutdown, and unsupported RPC.
+- Public framed-stdio transcript tests cover lifecycle ordering, Full-sync replay, malformed JSON and UTF-8 recovery, callback spoofing and malformed output, diagnostic accounting, wait success/failure/recovery, URI-budget failure isolation, cancellation, close, shutdown, and unsupported RPC.
+
+Landed transcript evidence tools:
+
+- `fln-lsp-validate`, `fln-lsp-inspect`, and `fln-lsp-replay` share the repository's strict frame/parser model rather than maintaining independent JSON-RPC interpretations.
+- Validation and replay cap the complete framed stream, not merely JSON bodies; replay output is independently bounded.
+- `fln.lsp-transcript-validation/2` receipts expose both `wireBytes` and `bodyBytes`, so the enforced resource decision and framing overhead are reproducible rather than hidden behind a body-only statistic.
+- The inspector omits full source text from its line-oriented projection, and the replay path preserves exact framed bytes for byte-for-byte comparison.
 
 Still incomplete:
 
@@ -106,9 +116,9 @@ Still incomplete:
 - Hover, completion, and definition currently return no-information `null` responses rather than semantic results.
 - Lean RPC sessions/calls are explicitly **not implemented**. `rpc/connect` and `rpc/call` return `RequestFailed`; session-only keepAlive/release notifications are visibly ignored rather than fabricating state.
 - Retained source is session-local input state, not the declaration-granular shared elaboration/import environment required by the finished Lantern design.
-- The server is synchronous and does not yet implement asupersync regions, cancellation of active elaboration, shared immutable import heaps, stable diagnostic identities, replay bundles, or the full unmodified-vscode-lean4 parity matrix.
+- The server is synchronous and does not yet implement asupersync regions, cancellation of active elaboration, shared immutable import heaps, stable diagnostic identities, complete replay bundles, or the full unmodified-vscode-lean4 parity matrix.
 
-The latest Lantern parser, session, callback-authority, and wait changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that execution environment lacked a Rust toolchain and hosted Actions were unavailable.
+The latest Lantern accounting, transcript, callback-authority, and wait changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that execution environment lacked a Rust toolchain and hosted Actions were unavailable.
 
 ### Agent-control plane
 
@@ -139,7 +149,8 @@ These subsystems contain real contract planes, data structures, bounded executio
 4. **Replace LSP no-information scaffolding with truthful semantics one method at a time.** Never fabricate sessions, goals, hover data, completions, or definitions to suppress editor errors.
 5. **Promote source retention into real declaration/elaboration state deliberately.** The bounded latest-text cache is enough to make Full-sync lifecycle semantics truthful; it is not a substitute for dependency-aware incremental elaboration, import invalidation, or cursor-position proof state.
 6. **Keep the JSON-RPC parser narrow but structurally correct.** Extend its typed extraction vocabulary deliberately; do not reintroduce substring routing or unbounded generic decoding.
-7. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin/artifact identity, and outcome class.
+7. **Turn transcript utilities into complete replay evidence deliberately.** Current validation/inspection/replay tools establish bounded exact wire handling; they do not yet provide the full epoch, environment, cancellation, first-divergence, cleanup, and final-state bundle required by the W9 acceptance contract.
+8. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin/artifact identity, and outcome class.
 
 ---
 
@@ -149,7 +160,7 @@ On a host with the pinned Rust and Reference toolchains:
 
 ```bash
 cargo fmt --all -- --check
-cargo test --locked -p fln-server --no-fail-fast
+cargo test --locked -p fln-server --all-targets --no-fail-fast
 cargo clippy --locked -p fln-server --all-targets -- -D warnings
 cargo test --locked -p fln-checker --no-fail-fast
 cargo test --locked -p fln-conformance --test pinned_nat_council
