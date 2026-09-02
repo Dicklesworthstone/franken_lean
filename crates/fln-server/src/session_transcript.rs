@@ -139,10 +139,7 @@ fn document_event(method: &str, params: RawField<'_>) -> Result<Option<DocumentE
             Ok(Some(DocumentEvent::Wait { uri, version }))
         }
         "$/cancelRequest" => match direct_request_id(params) {
-            RequestIdField::Valid(RequestId::Number(_) | RequestId::Text(_)) as id => {
-                let RequestIdField::Valid(id) = id else {
-                    unreachable!();
-                };
+            RequestIdField::Valid(id @ (RequestId::Number(_) | RequestId::Text(_))) => {
                 Ok(Some(DocumentEvent::Cancel { id: id.as_json() }))
             }
             RequestIdField::Valid(RequestId::Null) => {
