@@ -57,7 +57,7 @@ impl SessionRefusal {
                 "FrankenLean refused non-monotone didChange version; the latest accepted version remains authoritative"
             }
             Self::AccountingInvariant => {
-                "FrankenLean retained-source accounting invariant failed; all retained text was discarded"
+                "FrankenLean retained-source accounting invariant failed; affected text was invalidated and accounting was rebuilt"
             }
         }
     }
@@ -127,6 +127,17 @@ impl DocumentSession {
         self.retained_bytes = 0;
     }
 
+    fn rebuild_retained_bytes(&mut self) {
+        let rebuilt = self.documents.values().try_fold(0usize, |total, document| {
+            let len = document.text.as_ref().map_or(0, String::len);
+            total.checked_add(len)
+        });
+        match rebuilt {
+            Some(total) if total <= self.max_retained_bytes => self.retained_bytes = total,
+            Some(_) | None => self.discard_all_text(),
+        }
+    }
+
     pub(super) fn open(
         &mut self,
         uri: String,
@@ -158,7 +169,7 @@ impl DocumentSession {
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
             document.text = None;
             self.documents.insert(uri.to_string(), document);
-            self.discard_all_text();
+            self.rebuild_retained_bytes();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -202,7 +213,7 @@ impl DocumentSession {
         let old_len = document.text.take().as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
             self.documents.insert(uri.to_string(), document);
-            self.discard_all_text();
+            self.rebuild_retained_bytes();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -216,7 +227,7 @@ impl DocumentSession {
         };
         let old_len = document.text.as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
-            self.discard_all_text();
+            self.rebuild_retained_bytes();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -291,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_recovery_invalidates_every_cached_text_but_preserves_authority() {
+    fn accounting_recovery_invalidates_only_affected_text_when_rebuild_is_safe() {
         let mut session = DocumentSession::with_limits(3, 64);
         session
             .open("file:///a".to_string(), 1, "alpha".to_string())
@@ -310,8 +321,8 @@ mod tests {
         assert_eq!(session.version("file:///a"), Some(1));
         assert_eq!(session.version("file:///b"), Some(4));
         assert_eq!(session.text("file:///a"), None);
-        assert_eq!(session.text("file:///b"), None);
-        assert_eq!(session.retained_bytes, 0);
+        assert_eq!(session.text("file:///b"), Some("beta"));
+        assert_eq!(session.retained_bytes, 4);
 
         assert_eq!(
             session.change("file:///a", 2, "new".to_string()),
@@ -319,6 +330,32 @@ mod tests {
         );
         assert_eq!(session.version("file:///a"), Some(2));
         assert_eq!(session.text("file:///a"), Some("new"));
-        assert_eq!(session.retained_bytes, 3);
+        assert_eq!(session.retained_bytes, 7);
+    }
+
+    #[test]
+    fn impossible_rebuild_fails_closed_by_discarding_every_text() {
+        let mut session = DocumentSession::with_limits(3, 8);
+        session.documents.insert(
+            "file:///a".to_string(),
+            OpenDocument {
+                version: 1,
+                text: Some("oversized".to_string()),
+            },
+        );
+        session.documents.insert(
+            "file:///b".to_string(),
+            OpenDocument {
+                version: 2,
+                text: Some("also-oversized".to_string()),
+            },
+        );
+        session.retained_bytes = 0;
+        session.rebuild_retained_bytes();
+        assert_eq!(session.retained_bytes, 0);
+        assert_eq!(session.text("file:///a"), None);
+        assert_eq!(session.text("file:///b"), None);
+        assert_eq!(session.version("file:///a"), Some(1));
+        assert_eq!(session.version("file:///b"), Some(2));
     }
 }
