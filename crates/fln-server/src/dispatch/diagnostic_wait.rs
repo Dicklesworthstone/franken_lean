@@ -74,14 +74,14 @@ impl DiagnosticWaitRegistry {
         version: i64,
         id: RequestId,
     ) -> Result<RegisterOutcome, WaitRefusal> {
+        if self.request_id_is_pending(&id) {
+            return Err(WaitRefusal::DuplicateRequestId);
+        }
         if self
             .completed_version(&uri)
             .is_some_and(|completed| completed >= version)
         {
             return Ok(RegisterOutcome::Ready);
-        }
-        if self.request_id_is_pending(&id) {
-            return Err(WaitRefusal::DuplicateRequestId);
         }
         if self.pending_count >= self.max_pending {
             return Err(WaitRefusal::Capacity);
@@ -95,7 +95,8 @@ impl DiagnosticWaitRegistry {
     }
 
     pub(super) fn mark_completed(&mut self, uri: &str, version: i64) -> Vec<RequestId> {
-        self.completed_versions
+        let completed = *self
+            .completed_versions
             .entry(uri.to_string())
             .and_modify(|completed| *completed = (*completed).max(version))
             .or_insert(version);
@@ -106,13 +107,16 @@ impl DiagnosticWaitRegistry {
         let mut ready = Vec::new();
         let mut remaining = Vec::new();
         for waiter in waiters {
-            if waiter.version <= version {
+            if waiter.version <= completed {
                 ready.push(waiter.id);
             } else {
                 remaining.push(waiter);
             }
         }
-        self.pending_count = self.pending_count.saturating_sub(ready.len());
+        self.pending_count = self
+            .pending_count
+            .checked_sub(ready.len())
+            .expect("diagnostic-wait count matches stored waiters");
         if !remaining.is_empty() {
             self.pending.insert(uri.to_string(), remaining);
         }
@@ -135,7 +139,10 @@ impl DiagnosticWaitRegistry {
             self.pending.remove(&uri);
         }
         if cancelled.is_some() {
-            self.pending_count = self.pending_count.saturating_sub(1);
+            self.pending_count = self
+                .pending_count
+                .checked_sub(1)
+                .expect("diagnostic-wait count matches stored waiters");
         }
         cancelled
     }
@@ -143,7 +150,10 @@ impl DiagnosticWaitRegistry {
     pub(super) fn close(&mut self, uri: &str) -> Vec<RequestId> {
         self.completed_versions.remove(uri);
         let cancelled = self.pending.remove(uri).unwrap_or_default();
-        self.pending_count = self.pending_count.saturating_sub(cancelled.len());
+        self.pending_count = self
+            .pending_count
+            .checked_sub(cancelled.len())
+            .expect("diagnostic-wait count matches stored waiters");
         cancelled.into_iter().map(|waiter| waiter.id).collect()
     }
 
@@ -207,18 +217,33 @@ mod tests {
     }
 
     #[test]
+    fn defensive_regression_in_completion_never_strands_ready_waiters() {
+        let mut waits = DiagnosticWaitRegistry::new();
+        assert_eq!(waits.mark_completed("file:///x", 7), Vec::new());
+        assert_eq!(
+            waits.register("file:///x".to_string(), 8, id("eight")),
+            Ok(RegisterOutcome::Pending)
+        );
+        assert_eq!(waits.mark_completed("file:///x", 6), Vec::new());
+        assert_eq!(waits.mark_completed("file:///x", 7), Vec::new());
+        assert_eq!(waits.mark_completed("file:///x", 8), vec![id("eight")]);
+    }
+
+    #[test]
     fn duplicate_ids_and_capacity_are_typed_refusals() {
         let mut waits = DiagnosticWaitRegistry::with_limit(1);
         assert_eq!(
             waits.register("file:///x".to_string(), 1, id("same")),
             Ok(RegisterOutcome::Pending)
         );
+        waits.mark_completed("file:///y", 10);
         assert_eq!(
             waits.register("file:///y".to_string(), 1, id("same")),
-            Err(WaitRefusal::DuplicateRequestId)
+            Err(WaitRefusal::DuplicateRequestId),
+            "an immediately ready request cannot reuse an outstanding id"
         );
         assert_eq!(
-            waits.register("file:///y".to_string(), 1, id("other")),
+            waits.register("file:///y".to_string(), 11, id("other")),
             Err(WaitRefusal::Capacity)
         );
     }
