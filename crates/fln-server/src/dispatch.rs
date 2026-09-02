@@ -18,9 +18,10 @@ mod wait;
 mod wire;
 
 use json::{
-    DecodedField, Envelope, EnvelopeError, RawField, RequestId, RequestIdField, VersionField,
-    content_changes_text, direct_request_id, direct_uri, direct_version, parse_envelope,
-    save_text, text_document_text, text_document_uri, text_document_version,
+    BooleanField, DecodedField, Envelope, EnvelopeError, RawField, RequestId, RequestIdField,
+    VersionField, content_changes_text, direct_authority, direct_request_id, direct_uri,
+    direct_version, parse_envelope, save_text, text_document_text, text_document_uri,
+    text_document_version,
 };
 use session::{DocumentSession, RetentionOutcome, SessionRefusal};
 use wait::{PendingDiagnosticWaits, WaitRefusal};
@@ -94,16 +95,6 @@ fn write_retention_outcome(
     Ok(())
 }
 
-fn canonical_outcome_authority(message: &str) -> Option<bool> {
-    let true_count = message.matches("\"authority\":true").count();
-    let false_count = message.matches("\"authority\":false").count();
-    match (true_count, false_count) {
-        (1, 0) => Some(true),
-        (0, 1) => Some(false),
-        _ => None,
-    }
-}
-
 fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessageClass {
     let Ok(envelope) = parse_envelope(message) else {
         return CallbackMessageClass::Invalid;
@@ -122,17 +113,14 @@ fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessa
         return CallbackMessageClass::Invalid;
     }
     match method.as_str() {
-        "$/lean/diagnosticOutcome" => match envelope.params {
-            RawField::Value(_) => match canonical_outcome_authority(message) {
-                Some(true) => {
-                    CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Complete)
-                }
-                Some(false) => {
-                    CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Failed)
-                }
-                None => CallbackMessageClass::Invalid,
-            },
-            RawField::Missing | RawField::Invalid => CallbackMessageClass::Invalid,
+        "$/lean/diagnosticOutcome" => match direct_authority(envelope.params) {
+            BooleanField::Valid(true) => {
+                CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Complete)
+            }
+            BooleanField::Valid(false) => {
+                CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Failed)
+            }
+            BooleanField::Missing | BooleanField::Invalid => CallbackMessageClass::Invalid,
         },
         "textDocument/publishDiagnostics" => match direct_uri(envelope.params) {
             DecodedField::Valid(uri) if uri == document_uri => {
