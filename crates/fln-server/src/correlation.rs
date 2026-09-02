@@ -20,6 +20,8 @@ pub const MAX_CORRELATED_REQUESTS: usize = MAX_SESSION_REQUEST_IDS;
 /// Maximum canonical request-ID bytes retained in each side's join index.
 pub const MAX_CORRELATION_ID_BYTES: u64 = MAX_SESSION_REQUEST_ID_BYTES as u64;
 const REQUEST_CANCELLED_CODE: i64 = -32800;
+const REQUEST_FAILED_CODE: i64 = -32803;
+const METHOD_NOT_FOUND_CODE: i64 = -32601;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorrelationStats {
@@ -28,15 +30,68 @@ pub struct CorrelationStats {
     pub matched_responses: u64,
     pub client_request_id_bytes: u64,
     pub server_response_id_bytes: u64,
+    pub method_contract_responses: u64,
+    pub initialize_results: u64,
+    pub shutdown_results: u64,
+    pub diagnostic_wait_results: u64,
+    pub diagnostic_wait_cancelled_errors: u64,
+    pub diagnostic_wait_failed_errors: u64,
+    pub no_information_query_results: u64,
+    pub rpc_unsupported_errors: u64,
+    pub unknown_method_not_found_errors: u64,
     pub cancellation_target_id_bytes: u64,
     pub cancelled_target_request_cancelled_responses: u64,
     pub cancelled_target_result_responses: u64,
     pub cancelled_target_other_error_responses: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestContract {
+    Initialize,
+    Shutdown,
+    DiagnosticWait,
+    NoInformationQuery,
+    UnsupportedRpc,
+    UnknownMethod,
+}
+
+impl RequestContract {
+    const fn for_method(method: &str) -> Self {
+        match method {
+            "initialize" => Self::Initialize,
+            "shutdown" => Self::Shutdown,
+            "textDocument/waitForDiagnostics" => Self::DiagnosticWait,
+            "$/lean/plainGoal"
+            | "$/lean/plainTermGoal"
+            | "textDocument/hover"
+            | "textDocument/completion"
+            | "textDocument/definition" => Self::NoInformationQuery,
+            "$/lean/rpc/connect" | "$/lean/rpc/call" => Self::UnsupportedRpc,
+            _ => Self::UnknownMethod,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::Shutdown => "shutdown",
+            Self::DiagnosticWait => "diagnostic-wait",
+            Self::NoInformationQuery => "no-information-query",
+            Self::UnsupportedRpc => "unsupported-rpc",
+            Self::UnknownMethod => "unknown-method",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexedId {
+    frame: u64,
+    request_contract: Option<RequestContract>,
+}
+
 #[derive(Debug)]
 struct IdIndex {
-    frames: BTreeMap<String, u64>,
+    frames: BTreeMap<String, IndexedId>,
     id_bytes: u64,
 }
 
@@ -62,17 +117,104 @@ impl CancellationResponseStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodResponseClass {
+    InitializeResult,
+    ShutdownResult,
+    DiagnosticWaitResult,
+    DiagnosticWaitCancelledError,
+    DiagnosticWaitFailedError,
+    NoInformationQueryResult,
+    RpcUnsupportedError,
+    UnknownMethodNotFoundError,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MethodResponseStats {
+    initialize_results: u64,
+    shutdown_results: u64,
+    diagnostic_wait_results: u64,
+    diagnostic_wait_cancelled_errors: u64,
+    diagnostic_wait_failed_errors: u64,
+    no_information_query_results: u64,
+    rpc_unsupported_errors: u64,
+    unknown_method_not_found_errors: u64,
+}
+
+impl MethodResponseStats {
+    fn bump(counter: &mut u64, label: &str) -> Result<(), String> {
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| format!("{label} response count overflow"))?;
+        Ok(())
+    }
+
+    fn observe(&mut self, class: MethodResponseClass) -> Result<(), String> {
+        match class {
+            MethodResponseClass::InitializeResult => {
+                Self::bump(&mut self.initialize_results, "initialize-result")
+            }
+            MethodResponseClass::ShutdownResult => {
+                Self::bump(&mut self.shutdown_results, "shutdown-result")
+            }
+            MethodResponseClass::DiagnosticWaitResult => {
+                Self::bump(&mut self.diagnostic_wait_results, "diagnostic-wait-result")
+            }
+            MethodResponseClass::DiagnosticWaitCancelledError => Self::bump(
+                &mut self.diagnostic_wait_cancelled_errors,
+                "diagnostic-wait RequestCancelled",
+            ),
+            MethodResponseClass::DiagnosticWaitFailedError => Self::bump(
+                &mut self.diagnostic_wait_failed_errors,
+                "diagnostic-wait RequestFailed",
+            ),
+            MethodResponseClass::NoInformationQueryResult => Self::bump(
+                &mut self.no_information_query_results,
+                "no-information-query result",
+            ),
+            MethodResponseClass::RpcUnsupportedError => Self::bump(
+                &mut self.rpc_unsupported_errors,
+                "unsupported-RPC RequestFailed",
+            ),
+            MethodResponseClass::UnknownMethodNotFoundError => Self::bump(
+                &mut self.unknown_method_not_found_errors,
+                "unknown-method MethodNotFound",
+            ),
+        }
+    }
+
+    fn result_total(self) -> Option<u64> {
+        self.initialize_results
+            .checked_add(self.shutdown_results)?
+            .checked_add(self.diagnostic_wait_results)?
+            .checked_add(self.no_information_query_results)
+    }
+
+    fn error_total(self) -> Option<u64> {
+        self.diagnostic_wait_cancelled_errors
+            .checked_add(self.diagnostic_wait_failed_errors)?
+            .checked_add(self.rpc_unsupported_errors)?
+            .checked_add(self.unknown_method_not_found_errors)
+    }
+
+    fn total(self) -> Option<u64> {
+        self.result_total()?.checked_add(self.error_total()?)
+    }
+}
+
 fn insert_unique_id(
     index: &mut IdIndex,
     id: String,
     frame: u64,
+    request_contract: Option<RequestContract>,
     side: &str,
     max_ids: usize,
     max_id_bytes: u64,
 ) -> Result<(), String> {
     if let Some(first) = index.frames.get(&id) {
         return Err(format!(
-            "{side} ID {id} is repeated at frames {first} and {frame}; bidirectional correlation requires unique canonical IDs"
+            "{side} ID {id} is repeated at frames {} and {frame}; bidirectional correlation requires unique canonical IDs",
+            first.frame
         ));
     }
     if index.frames.len() >= max_ids {
@@ -91,7 +233,13 @@ fn insert_unique_id(
             "{side} canonical request-ID bytes exceed the {max_id_bytes}-byte ceiling at frame {frame}"
         ));
     }
-    index.frames.insert(id, frame);
+    index.frames.insert(
+        id,
+        IndexedId {
+            frame,
+            request_contract,
+        },
+    );
     index.id_bytes = next_id_bytes;
     Ok(())
 }
@@ -127,6 +275,7 @@ fn client_request_ids_with_limits(
                 &mut requests,
                 id,
                 frame.index,
+                Some(RequestContract::for_method(&frame.method)),
                 "client request",
                 max_ids,
                 max_id_bytes,
@@ -201,6 +350,7 @@ fn client_cancellation_targets_with_limits(
             &mut targets,
             id,
             frame,
+            None,
             "client cancellation target",
             max_ids,
             max_id_bytes,
@@ -219,7 +369,7 @@ fn client_cancellation_targets(bytes: &[u8]) -> Result<IdIndex, String> {
 
 fn server_response_ids_with_limits(
     evidence: &ServerTranscriptEvidence,
-    client: &BTreeMap<String, u64>,
+    client: &BTreeMap<String, IndexedId>,
     max_ids: usize,
     max_id_bytes: u64,
 ) -> Result<IdIndex, String> {
@@ -247,6 +397,7 @@ fn server_response_ids_with_limits(
             &mut responses,
             id,
             frame.index,
+            None,
             "server response",
             max_ids,
             max_id_bytes,
@@ -257,7 +408,7 @@ fn server_response_ids_with_limits(
 
 fn server_response_ids(
     evidence: &ServerTranscriptEvidence,
-    client: &BTreeMap<String, u64>,
+    client: &BTreeMap<String, IndexedId>,
 ) -> Result<IdIndex, String> {
     server_response_ids_with_limits(
         evidence,
@@ -267,23 +418,188 @@ fn server_response_ids(
     )
 }
 
-fn response_disposition(json: &str, frame: u64) -> Result<ResponseDisposition, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseShape<'a> {
+    Result(&'a str),
+    Error(i64),
+}
+
+fn response_shape(json: &str, frame: u64) -> Result<ResponseShape<'_>, String> {
     match (response_result(json), response_error(json)) {
-        (RawField::Value(_), RawField::Missing) => Ok(ResponseDisposition::Result),
+        (RawField::Value(result), RawField::Missing) => Ok(ResponseShape::Result(result)),
         (RawField::Missing, RawField::Value(error)) => {
             match response_error_code(RawField::Value(error)) {
-                VersionField::Valid(REQUEST_CANCELLED_CODE) => {
-                    Ok(ResponseDisposition::RequestCancelled)
-                }
-                VersionField::Valid(_) => Ok(ResponseDisposition::OtherError),
+                VersionField::Valid(code) => Ok(ResponseShape::Error(code)),
                 VersionField::Missing | VersionField::Invalid => Err(format!(
-                    "server frame {frame} lost its validated error code during cancellation classification"
+                    "server frame {frame} lost its validated error code during response classification"
                 )),
             }
         }
         _ => Err(format!(
-            "server frame {frame} lost its validated result/error shape during cancellation classification"
+            "server frame {frame} lost its validated result/error shape during response classification"
         )),
+    }
+}
+
+fn result_kind(value: &str) -> &'static str {
+    let value = value.trim_start();
+    match value.as_bytes().first() {
+        Some(b'{') => "object result",
+        Some(b'[') => "array result",
+        Some(b'\"') => "string result",
+        Some(b't' | b'f') => "boolean result",
+        Some(b'n') => "null result",
+        Some(b'-' | b'0'..=b'9') => "number result",
+        _ => "unclassified result",
+    }
+}
+
+fn classify_method_response(
+    request: IndexedId,
+    response: ResponseShape<'_>,
+    response_frame: u64,
+    id: &str,
+) -> Result<MethodResponseClass, String> {
+    let contract = request.request_contract.ok_or_else(|| {
+        format!(
+            "client request frame {} with canonical ID {id} lost its method contract",
+            request.frame
+        )
+    })?;
+    let mismatch = |observed: String, expected: &str| {
+        Err(format!(
+            "server frame {response_frame} response for client frame {} canonical ID {id} violates the {} method contract: expected {expected}, observed {observed}",
+            request.frame,
+            contract.name()
+        ))
+    };
+    match (contract, response) {
+        (RequestContract::Initialize, ResponseShape::Result(value))
+            if value.trim_start().starts_with('{') =>
+        {
+            Ok(MethodResponseClass::InitializeResult)
+        }
+        (RequestContract::Initialize, ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_string(),
+            "an object-valued initialize result",
+        ),
+        (RequestContract::Initialize, ResponseShape::Error(code)) => mismatch(
+            format!("error code {code}"),
+            "an object-valued initialize result",
+        ),
+        (RequestContract::Shutdown, ResponseShape::Result(value)) if value.trim() == "null" => {
+            Ok(MethodResponseClass::ShutdownResult)
+        }
+        (RequestContract::Shutdown, ResponseShape::Result(value)) => {
+            mismatch(result_kind(value).to_string(), "the null shutdown result")
+        }
+        (RequestContract::Shutdown, ResponseShape::Error(code)) => mismatch(
+            format!("error code {code}"),
+            "the null shutdown result",
+        ),
+        (RequestContract::DiagnosticWait, ResponseShape::Result(value))
+            if value.trim_start().starts_with('{') =>
+        {
+            Ok(MethodResponseClass::DiagnosticWaitResult)
+        }
+        (
+            RequestContract::DiagnosticWait,
+            ResponseShape::Error(REQUEST_CANCELLED_CODE),
+        ) => Ok(MethodResponseClass::DiagnosticWaitCancelledError),
+        (RequestContract::DiagnosticWait, ResponseShape::Error(REQUEST_FAILED_CODE)) => {
+            Ok(MethodResponseClass::DiagnosticWaitFailedError)
+        }
+        (RequestContract::DiagnosticWait, ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_string(),
+            "an object result, RequestCancelled, or RequestFailed",
+        ),
+        (RequestContract::DiagnosticWait, ResponseShape::Error(code)) => mismatch(
+            format!("error code {code}"),
+            "an object result, RequestCancelled, or RequestFailed",
+        ),
+        (RequestContract::NoInformationQuery, ResponseShape::Result(value))
+            if value.trim() == "null" =>
+        {
+            Ok(MethodResponseClass::NoInformationQueryResult)
+        }
+        (RequestContract::NoInformationQuery, ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_string(),
+            "the current null no-information result",
+        ),
+        (RequestContract::NoInformationQuery, ResponseShape::Error(code)) => mismatch(
+            format!("error code {code}"),
+            "the current null no-information result",
+        ),
+        (RequestContract::UnsupportedRpc, ResponseShape::Error(REQUEST_FAILED_CODE)) => {
+            Ok(MethodResponseClass::RpcUnsupportedError)
+        }
+        (RequestContract::UnsupportedRpc, ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_string(),
+            "RequestFailed because Lean RPC sessions are not implemented",
+        ),
+        (RequestContract::UnsupportedRpc, ResponseShape::Error(code)) => mismatch(
+            format!("error code {code}"),
+            "RequestFailed because Lean RPC sessions are not implemented",
+        ),
+        (RequestContract::UnknownMethod, ResponseShape::Error(METHOD_NOT_FOUND_CODE)) => {
+            Ok(MethodResponseClass::UnknownMethodNotFoundError)
+        }
+        (RequestContract::UnknownMethod, ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_string(),
+            "MethodNotFound for the current bounded dispatcher",
+        ),
+        (RequestContract::UnknownMethod, ResponseShape::Error(code)) => mismatch(
+            format!("error code {code}"),
+            "MethodNotFound for the current bounded dispatcher",
+        ),
+    }
+}
+
+fn classify_method_responses(
+    server_bytes: &[u8],
+    requests: &IdIndex,
+) -> Result<MethodResponseStats, String> {
+    let mut stats = MethodResponseStats::default();
+    let mut input = Cursor::new(server_bytes);
+    let mut frame = 0u64;
+    while let Some(body) = crate::transport::read_message(&mut input)
+        .map_err(|error| format!("server method-contract pass transport failure: {error}"))?
+    {
+        frame = frame
+            .checked_add(1)
+            .ok_or_else(|| "server method-contract frame count overflow".to_string())?;
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| format!("server frame {frame} body is not valid UTF-8"))?;
+        let envelope = parse_envelope(text).map_err(|error| match error {
+            EnvelopeError::MalformedJson => {
+                format!("server frame {frame} contains malformed JSON")
+            }
+            EnvelopeError::NotObject => {
+                format!("server frame {frame} is not a JSON-RPC object")
+            }
+        })?;
+        let id = match (&envelope.method, &envelope.id) {
+            (DecodedField::Missing, RequestIdField::Valid(id)) => id.as_json(),
+            _ => continue,
+        };
+        let request = requests.frames.get(&id).copied().ok_or_else(|| {
+            format!("server frame {frame} has no client method contract for canonical ID {id}")
+        })?;
+        stats.observe(classify_method_response(
+            request,
+            response_shape(text, frame)?,
+            frame,
+            &id,
+        )?)?;
+    }
+    Ok(stats)
+}
+
+fn response_disposition(json: &str, frame: u64) -> Result<ResponseDisposition, String> {
+    match response_shape(json, frame)? {
+        ResponseShape::Result(_) => Ok(ResponseDisposition::Result),
+        ResponseShape::Error(REQUEST_CANCELLED_CODE) => Ok(ResponseDisposition::RequestCancelled),
+        ResponseShape::Error(_) => Ok(ResponseDisposition::OtherError),
     }
 }
 
@@ -378,15 +694,17 @@ fn validate_client_index_consistency(
             client.cancellations
         ));
     }
-    for (id, cancel_frame) in &cancellations.frames {
-        let Some(request_frame) = requests.frames.get(id) else {
+    for (id, cancellation) in &cancellations.frames {
+        let Some(request) = requests.frames.get(id) else {
             return Err(format!(
-                "cancellation target {id} at frame {cancel_frame} is absent from the client request index"
+                "cancellation target {id} at frame {} is absent from the client request index",
+                cancellation.frame
             ));
         };
-        if request_frame >= cancel_frame {
+        if request.frame >= cancellation.frame {
             return Err(format!(
-                "cancellation target {id} at frame {cancel_frame} does not refer to an earlier request frame"
+                "cancellation target {id} at frame {} does not refer to an earlier request frame",
+                cancellation.frame
             ));
         }
     }
@@ -406,14 +724,15 @@ pub fn correlate_transcripts(
         .map_err(|error| format!("server transcript validation failed: {error}"))?;
     let responses = server_response_ids(&server, &requests.frames)?;
 
-    if let Some((id, frame)) = requests
+    if let Some((id, request)) = requests
         .frames
         .iter()
         .filter(|(id, _)| !responses.frames.contains_key(*id))
-        .min_by_key(|(_, frame)| **frame)
+        .min_by_key(|(_, request)| request.frame)
     {
         return Err(format!(
-            "client request frame {frame} with canonical ID {id} has no server response"
+            "client request frame {} with canonical ID {id} has no server response",
+            request.frame
         ));
     }
     let matched_responses = u64::try_from(responses.frames.len())
@@ -430,6 +749,33 @@ pub fn correlate_transcripts(
             client.lifecycle.transcript.requests
         ));
     }
+    let method_responses = classify_method_responses(server_bytes, &requests)?;
+    let method_contract_responses = method_responses
+        .total()
+        .ok_or_else(|| "method-response total overflow".to_string())?;
+    if method_contract_responses != matched_responses {
+        return Err(format!(
+            "method-response accounting mismatch: classified {method_contract_responses}, joined {matched_responses}"
+        ));
+    }
+    let method_results = method_responses
+        .result_total()
+        .ok_or_else(|| "method-result total overflow".to_string())?;
+    if method_results != server.stats.result_responses {
+        return Err(format!(
+            "method-result accounting mismatch: classified {method_results}, server validated {}",
+            server.stats.result_responses
+        ));
+    }
+    let method_errors = method_responses
+        .error_total()
+        .ok_or_else(|| "method-error total overflow".to_string())?;
+    if method_errors != server.stats.error_responses {
+        return Err(format!(
+            "method-error accounting mismatch: classified {method_errors}, server validated {}",
+            server.stats.error_responses
+        ));
+    }
     let cancellation_responses =
         classify_cancelled_target_responses(server_bytes, &cancellations)?;
     Ok(CorrelationStats {
@@ -438,6 +784,15 @@ pub fn correlate_transcripts(
         matched_responses,
         client_request_id_bytes: requests.id_bytes,
         server_response_id_bytes: responses.id_bytes,
+        method_contract_responses,
+        initialize_results: method_responses.initialize_results,
+        shutdown_results: method_responses.shutdown_results,
+        diagnostic_wait_results: method_responses.diagnostic_wait_results,
+        diagnostic_wait_cancelled_errors: method_responses.diagnostic_wait_cancelled_errors,
+        diagnostic_wait_failed_errors: method_responses.diagnostic_wait_failed_errors,
+        no_information_query_results: method_responses.no_information_query_results,
+        rpc_unsupported_errors: method_responses.rpc_unsupported_errors,
+        unknown_method_not_found_errors: method_responses.unknown_method_not_found_errors,
         cancellation_target_id_bytes: cancellations.id_bytes,
         cancelled_target_request_cancelled_responses: cancellation_responses.request_cancelled,
         cancelled_target_result_responses: cancellation_responses.result,
@@ -448,9 +803,10 @@ pub fn correlate_transcripts(
 pub fn render_correlation(stats: CorrelationStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-server-correlation/4\",",
+            "{{\"schema\":\"fln.lsp-client-server-correlation/5\",",
             "\"clientSessionSchema\":\"fln.lsp-client-session/3\",",
             "\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\",",
+            "\"methodResponseSchema\":\"fln.lsp-method-response/1\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -458,6 +814,14 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "\"unsolicitedServerResponses\":0,\"duplicateRequestIds\":0,",
             "\"duplicateResponseIds\":0,\"resultResponses\":{},",
             "\"errorResponses\":{},\"serverNotifications\":{},",
+            "\"methodContractResponses\":{},\"methodContractViolations\":0,",
+            "\"initializeResults\":{},\"shutdownResults\":{},",
+            "\"diagnosticWaitResults\":{},",
+            "\"diagnosticWaitCancelledErrors\":{},",
+            "\"diagnosticWaitFailedErrors\":{},",
+            "\"noInformationQueryResults\":{},",
+            "\"rpcUnsupportedErrors\":{},",
+            "\"unknownMethodNotFoundErrors\":{},",
             "\"clientWireBytes\":{},\"serverWireBytes\":{},",
             "\"serverMetadataBytes\":{},",
             "\"clientSessionRequestIdBytes\":{},",
@@ -484,6 +848,15 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
         stats.server.result_responses,
         stats.server.error_responses,
         stats.server.notifications,
+        stats.method_contract_responses,
+        stats.initialize_results,
+        stats.shutdown_results,
+        stats.diagnostic_wait_results,
+        stats.diagnostic_wait_cancelled_errors,
+        stats.diagnostic_wait_failed_errors,
+        stats.no_information_query_results,
+        stats.rpc_unsupported_errors,
+        stats.unknown_method_not_found_errors,
         stats.client.lifecycle.transcript.wire_bytes,
         stats.server.wire_bytes,
         stats.server.metadata_bytes,
@@ -549,28 +922,28 @@ mod tests {
     }
 
     #[test]
-    fn correlates_unique_canonical_ids_and_renders_zero_unmatched_evidence() {
+    fn correlates_unique_canonical_ids_and_method_contracts() {
         let stats = correlate_transcripts(&client(), &server()).unwrap();
         assert_eq!(stats.matched_responses, 3);
         assert_eq!(stats.server.result_responses, 3);
         assert_eq!(stats.server.notifications, 1);
         assert_eq!(stats.client_request_id_bytes, stats.client.request_id_bytes);
         assert_eq!(stats.client_request_id_bytes, stats.server_response_id_bytes);
+        assert_eq!(stats.method_contract_responses, 3);
+        assert_eq!(stats.initialize_results, 1);
+        assert_eq!(stats.shutdown_results, 1);
+        assert_eq!(stats.no_information_query_results, 1);
         assert_eq!(stats.cancellation_target_id_bytes, 0);
         let receipt = render_correlation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/4\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/5\""));
+        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/1\""));
         assert!(receipt.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
         assert!(receipt.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
-        assert!(receipt.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
-        assert!(receipt.contains("\"matchedResponses\":3"));
-        assert!(receipt.contains("\"unmatchedClientRequests\":0"));
-        assert!(receipt.contains("\"unsolicitedServerResponses\":0"));
-        assert!(receipt.contains("\"clientUniqueRequestIds\":3"));
-        assert!(receipt.contains("\"requestIdCountCeiling\":262144"));
-        assert!(receipt.contains("\"requestIdByteCeiling\":33554432"));
+        assert!(receipt.contains("\"methodContractResponses\":3"));
+        assert!(receipt.contains("\"methodContractViolations\":0"));
+        assert!(receipt.contains("\"initializeResults\":1"));
+        assert!(receipt.contains("\"noInformationQueryResults\":1"));
         assert!(receipt.contains("\"cancelledTargetRequestCancelledResponses\":0"));
-        assert!(receipt.contains("\"cancelledTargetResultResponses\":0"));
-        assert!(receipt.contains("\"cancelledTargetOtherErrorResponses\":0"));
     }
 
     #[test]
@@ -649,6 +1022,106 @@ mod tests {
             );
             assert_eq!(stats.client.cancellations, 1);
             assert_eq!(stats.client.diagnostic_wait_cancellation_targets, 1);
+        }
+    }
+
+    #[test]
+    fn validates_every_current_request_contract_class() {
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1,"text":"a"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait-ok","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":1}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait-cancel","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":2}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait-fail","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":3}}"#,
+            r#"{"jsonrpc":"2.0","id":"hover","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"rpc","method":"$/lean/rpc/connect","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"unknown","method":"workspace/unknown","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let server = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","result":{"capabilities":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait-ok","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait-cancel","error":{"code":-32800,"message":"request cancelled"}}"#,
+            r#"{"jsonrpc":"2.0","id":"wait-fail","error":{"code":-32803,"message":"request failed"}}"#,
+            r#"{"jsonrpc":"2.0","id":"hover","result":null}"#,
+            r#"{"jsonrpc":"2.0","id":"rpc","error":{"code":-32803,"message":"RPC unsupported"}}"#,
+            r#"{"jsonrpc":"2.0","id":"unknown","error":{"code":-32601,"message":"method not found"}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+        ]);
+        let stats = correlate_transcripts(&client, &server).unwrap();
+        assert_eq!(stats.method_contract_responses, 8);
+        assert_eq!(stats.initialize_results, 1);
+        assert_eq!(stats.shutdown_results, 1);
+        assert_eq!(stats.diagnostic_wait_results, 1);
+        assert_eq!(stats.diagnostic_wait_cancelled_errors, 1);
+        assert_eq!(stats.diagnostic_wait_failed_errors, 1);
+        assert_eq!(stats.no_information_query_results, 1);
+        assert_eq!(stats.rpc_unsupported_errors, 1);
+        assert_eq!(stats.unknown_method_not_found_errors, 1);
+    }
+
+    #[test]
+    fn rejects_method_response_shape_mismatches() {
+        let cases = [
+            (
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+                    r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+                ]),
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","result":null}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+                ]),
+                "initialize method contract",
+            ),
+            (
+                client(),
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":1.25e2,"error":{"code":-32601,"message":"method not found"}}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+                ]),
+                "no-information-query method contract",
+            ),
+            (
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"rpc","method":"$/lean/rpc/call","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+                    r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+                ]),
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"rpc","result":null}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+                ]),
+                "unsupported-rpc method contract",
+            ),
+            (
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"unknown","method":"workspace/unknown","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+                    r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+                ]),
+                framed(&[
+                    r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":"unknown","result":null}"#,
+                    r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+                ]),
+                "unknown-method method contract",
+            ),
+        ];
+        for (client, server, expected) in cases {
+            let error = correlate_transcripts(&client, &server).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
         }
     }
 
@@ -779,14 +1252,22 @@ mod tests {
     }
 
     #[test]
-    fn error_responses_are_correlated_without_becoming_successes() {
+    fn unknown_method_errors_are_correlated_without_becoming_successes() {
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"unknown","method":"workspace/unknown","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
         let server = framed(&[
             r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
-            r#"{"jsonrpc":"2.0","id":1.25e2,"error":{"code":-32601,"message":"method not found"}}"#,
+            r#"{"jsonrpc":"2.0","id":"unknown","error":{"code":-32601,"message":"method not found"}}"#,
             r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
         ]);
-        let stats = correlate_transcripts(&client(), &server).unwrap();
+        let stats = correlate_transcripts(&client, &server).unwrap();
         assert_eq!(stats.server.result_responses, 2);
         assert_eq!(stats.server.error_responses, 1);
+        assert_eq!(stats.unknown_method_not_found_errors, 1);
     }
 }
