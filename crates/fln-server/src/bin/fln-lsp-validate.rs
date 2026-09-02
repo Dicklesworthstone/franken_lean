@@ -2,17 +2,17 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-pub use fln_server::json_string;
+pub use fln_server::{json_string, transport};
 
 #[path = "../json.rs"]
 mod json;
+#[path = "../transcript.rs"]
+mod transcript;
 
-const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_FRAMES: u64 = 1_000_000;
 const USAGE: &str = "Usage: fln-lsp-validate [--] INPUT\n\
 \n\
 Validate one exact Content-Length-framed JSON-RPC client transcript.\n\
@@ -22,14 +22,6 @@ Use INPUT=- to read standard input.\n";
 enum Command {
     Help,
     Validate(PathBuf),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Stats {
-    frames: u64,
-    requests: u64,
-    notifications: u64,
-    body_bytes: u64,
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -60,125 +52,24 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
         .ok_or_else(|| "missing input transcript".to_string())
 }
 
-fn validate_envelope(body: &[u8], frame: u64) -> Result<bool, String> {
-    let text = std::str::from_utf8(body)
-        .map_err(|_| format!("frame {frame} body is not valid UTF-8"))?;
-    let envelope = json::parse_envelope(text).map_err(|error| match error {
-        json::EnvelopeError::MalformedJson => format!("frame {frame} contains malformed JSON"),
-        json::EnvelopeError::NotObject => {
-            format!("frame {frame} is not a JSON-RPC object")
-        }
-    })?;
-    match envelope.jsonrpc {
-        json::DecodedField::Valid(version) if version == "2.0" => {}
-        json::DecodedField::Missing => {
-            return Err(format!("frame {frame} is missing jsonrpc=2.0"));
-        }
-        json::DecodedField::Valid(version) => {
-            return Err(format!(
-                "frame {frame} has unsupported JSON-RPC version {version:?}"
-            ));
-        }
-        json::DecodedField::Invalid => {
-            return Err(format!("frame {frame} has a non-string jsonrpc field"));
-        }
-    }
-    match envelope.method {
-        json::DecodedField::Valid(_) => {}
-        json::DecodedField::Missing => {
-            return Err(format!("frame {frame} is missing a method"));
-        }
-        json::DecodedField::Invalid => {
-            return Err(format!("frame {frame} has a non-string method"));
-        }
-    }
-    match envelope.params {
-        json::RawField::Missing => {}
-        json::RawField::Value(value)
-            if matches!(value.trim_start().as_bytes().first(), Some(b'{' | b'[')) => {}
-        json::RawField::Value(_) => {
-            return Err(format!(
-                "frame {frame} params must be an object or array when present"
-            ));
-        }
-        json::RawField::Invalid => {
-            return Err(format!("frame {frame} has ambiguous params"));
-        }
-    }
-    match envelope.id {
-        json::RequestIdField::Absent => Ok(false),
-        json::RequestIdField::Valid(_) => Ok(true),
-        json::RequestIdField::Invalid => Err(format!("frame {frame} has an invalid request id")),
-    }
-}
-
-fn validate_reader(input: &mut dyn BufRead) -> Result<Stats, String> {
-    let mut stats = Stats::default();
-    loop {
-        let Some(body) = fln_server::transport::read_message(input)
-            .map_err(|error| format!("frame {} transport failure: {error}", stats.frames + 1))?
-        else {
-            break;
-        };
-        stats.frames = stats
-            .frames
-            .checked_add(1)
-            .ok_or_else(|| "frame count overflow".to_string())?;
-        if stats.frames > MAX_FRAMES {
-            return Err(format!("transcript exceeds the {MAX_FRAMES}-frame ceiling"));
-        }
-        stats.body_bytes = stats
-            .body_bytes
-            .checked_add(u64::try_from(body.len()).unwrap_or(u64::MAX))
-            .ok_or_else(|| "transcript byte accounting overflow".to_string())?;
-        if stats.body_bytes > MAX_TRANSCRIPT_BYTES {
-            return Err(format!(
-                "transcript bodies exceed the {MAX_TRANSCRIPT_BYTES}-byte aggregate ceiling"
-            ));
-        }
-        if validate_envelope(&body, stats.frames)? {
-            stats.requests = stats
-                .requests
-                .checked_add(1)
-                .ok_or_else(|| "request count overflow".to_string())?;
-        } else {
-            stats.notifications = stats
-                .notifications
-                .checked_add(1)
-                .ok_or_else(|| "notification count overflow".to_string())?;
-        }
-    }
-    Ok(stats)
-}
-
-fn validate_path(path: &Path) -> Result<Stats, String> {
+fn validate_path(path: &Path) -> Result<transcript::TranscriptStats, String> {
     if path == Path::new("-") {
         let stdin = io::stdin();
-        return validate_reader(&mut BufReader::new(stdin.lock()));
+        return transcript::validate_reader(&mut BufReader::new(stdin.lock()));
     }
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-    if metadata.len() > MAX_TRANSCRIPT_BYTES {
+    if metadata.len() > transcript::MAX_TRANSCRIPT_BYTES {
         return Err(format!(
-            "{} is {} bytes; the transcript ceiling is {MAX_TRANSCRIPT_BYTES}",
+            "{} is {} bytes; the transcript ceiling is {}",
             path.display(),
-            metadata.len()
+            metadata.len(),
+            transcript::MAX_TRANSCRIPT_BYTES
         ));
     }
     let file = File::open(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    validate_reader(&mut BufReader::new(file))
-}
-
-fn render(stats: Stats) -> String {
-    format!(
-        concat!(
-            "{{\"schema\":\"fln.lsp-transcript-validation/1\",",
-            "\"frames\":{},\"requests\":{},\"notifications\":{},",
-            "\"bodyBytes\":{}}}\n"
-        ),
-        stats.frames, stats.requests, stats.notifications, stats.body_bytes
-    )
+    transcript::validate_reader(&mut BufReader::new(file))
 }
 
 fn main() -> ExitCode {
@@ -196,7 +87,7 @@ fn main() -> ExitCode {
         }
         Command::Validate(path) => match validate_path(&path) {
             Ok(stats) => {
-                print!("{}", render(stats));
+                print!("{}", transcript::render_validation(stats));
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -210,6 +101,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufReader, Cursor};
 
     fn frame(body: &str) -> Vec<u8> {
         let mut framed = Vec::new();
@@ -219,29 +111,34 @@ mod tests {
 
     #[test]
     fn validates_requests_and_notifications_without_normalizing_ids() {
-        let mut transcript = Vec::new();
-        transcript.extend(frame(
+        let bodies = [
             r#"{"jsonrpc":"2.0","id":1.25e2,"method":"initialize","params":{}}"#,
-        ));
-        transcript.extend(frame(
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-        ));
-        transcript.extend(frame(
             r#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#,
-        ));
-        let stats = validate_reader(&mut BufReader::new(Cursor::new(transcript))).unwrap();
+        ];
+        let expected_body_bytes = bodies
+            .iter()
+            .map(|body| u64::try_from(body.len()).unwrap())
+            .sum();
+        let mut bytes = Vec::new();
+        for body in bodies {
+            bytes.extend(frame(body));
+        }
+        let stats = transcript::validate_reader(&mut BufReader::new(Cursor::new(bytes))).unwrap();
         assert_eq!(
             stats,
-            Stats {
+            transcript::TranscriptStats {
                 frames: 3,
                 requests: 2,
                 notifications: 1,
-                body_bytes: 199,
+                body_bytes: expected_body_bytes,
             }
         );
         assert_eq!(
-            render(stats),
-            "{\"schema\":\"fln.lsp-transcript-validation/1\",\"frames\":3,\"requests\":2,\"notifications\":1,\"bodyBytes\":199}\n"
+            transcript::render_validation(stats),
+            format!(
+                "{{\"schema\":\"fln.lsp-transcript-validation/1\",\"frames\":3,\"requests\":2,\"notifications\":1,\"bodyBytes\":{expected_body_bytes}}}\n"
+            )
         );
     }
 
@@ -249,12 +146,18 @@ mod tests {
     fn names_the_first_invalid_frame_and_reason() {
         for (body, reason) in [
             (r#"{"jsonrpc":"2.0","method":3}"#, "non-string method"),
-            (r#"{"jsonrpc":"1.0","method":"x"}"#, "unsupported JSON-RPC version"),
-            (r#"{"jsonrpc":"2.0","method":"x","params":3}"#, "params must be an object or array"),
+            (
+                r#"{"jsonrpc":"1.0","method":"x"}"#,
+                "unsupported JSON-RPC version",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"x","params":3}"#,
+                "params must be an object or array",
+            ),
             (r#"[]"#, "not a JSON-RPC object"),
             (r#"{"jsonrpc":"2.0","method":"x",}"#, "malformed JSON"),
         ] {
-            let error = validate_reader(&mut BufReader::new(Cursor::new(frame(body)))).unwrap_err();
+            let error = transcript::validate_bytes(&frame(body)).unwrap_err();
             assert!(error.contains("frame 1"));
             assert!(error.contains(reason), "{error}");
         }
