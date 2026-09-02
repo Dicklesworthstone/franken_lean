@@ -30,7 +30,9 @@ and the server may not emit unsolicited or duplicate responses. Number lexemes\n
 remain exact; string IDs compare by decoded value and canonical JSON escaping.\n\
 The client pass also requires each cancellation to target one prior non-null\n\
 request and carries wait/cancellation classes into the joined receipt.\n\
-This proves identity and accounting correlation, not cross-stream timing.\n";
+Each response must match the current bounded dispatcher contract for initialize,\n\
+shutdown, diagnostic waits, editor queries, unsupported RPC, or unknown methods.\n\
+This proves identity, shape, and accounting correlation, not cross-stream timing.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
