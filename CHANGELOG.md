@@ -2,7 +2,7 @@
 
 This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed; the [`README.md`](README.md) intentionally describes the finished 1.0 target state, and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded status companion.
 
-Scope: project inception on **2026-07-21** through the September 2 Lantern authority tranche at **[`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387)**. This changelog refresh follows that implementation snapshot.
+Scope: project inception on **2026-07-21** through the September 2 Lantern resource/evidence tranche at **[`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3)**. This changelog refresh follows that implementation snapshot.
 
 No GitHub Releases were published when this file was refreshed on **2026-09-02**. Do not infer or invent a `v0.x` release from commit activity.
 
@@ -26,6 +26,7 @@ Representative commits are examples, not substitutes for the tracker/evidence gr
 | [`9a8860ab`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8860aba1bf88cf68d4c01785126e8dca6d9435) | 2026-08-19 | Bounded native `lean` personality, checker/olean reconstruction, Golem source execution. |
 | [`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32) | 2026-09-01 | Evidence-graded checker frontier, executable agent-control tools, structurally hardened stateful Lantern document synchronization. |
 | [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387) | 2026-09-02 | Modular Lantern dispatcher, structural callback authority, bounded versioned diagnostic waits, and public framed protocol transcripts. |
+| [`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3) | 2026-09-02 | Exact zero-diagnostic authority accounting, full-wire transcript receipts, and bounded open-document URI metadata. |
 
 ---
 
@@ -272,7 +273,7 @@ This continuation replaced overlapping protocol implementations with one typed c
 - Stopped treating arbitrary callback bytes or method-looking substrings as terminal diagnostics.
 - Callback messages must be valid JSON-RPC 2.0 notifications. `publishDiagnostics` counts for the current check only when `params.uri` exactly matches the checked document; wrong-URI publications remain auxiliary.
 - Missing, malformed, response-shaped, or duplicate terminal output is withheld as authority, followed by explicit diagnostic clearing and a schema-bound non-authoritative fault.
-- Canonical `$/lean/diagnosticOutcome` authority now grades the publication frontier: `authority:true` completes it, while `authority:false` preserves the detailed outcome, clears editor diagnostics, and fails dependent waits.
+- Canonical `$/lean/diagnosticOutcome` authority grades the publication frontier: `authority:true` completes it, while `authority:false` preserves the detailed outcome, clears editor diagnostics, and fails dependent waits.
 - The expected empty-diagnostic publication plus one canonical outcome is treated as one coherent terminal result rather than as duplicate success.
 
 ### Bounded diagnostic waiting
@@ -291,6 +292,36 @@ This continuation replaced overlapping protocol implementations with one typed c
 **Evidence boundary:** these changes are landed with repository-owned unit and public transcript tests. The editing environment did not contain `cargo`/`rustc`, so this changelog does not claim those tests were executed in the same session. The live CLI callback still uses the compatibility source-blind projector; source-aware unsaved-text projection remains explicitly open.
 
 Representative commits: [`57a268bc`](https://github.com/Dicklesworthstone/franken_lean/commit/57a268bcd1a5656b3bf4d983a7630eb709bc819f), [`be2ffcf9`](https://github.com/Dicklesworthstone/franken_lean/commit/be2ffcf91ed60eb7a8fbd3605e101fdbe5d2ba54), [`32713f48`](https://github.com/Dicklesworthstone/franken_lean/commit/32713f480a77e94d8331ba064841bf72ca20377a), [`6ba4ef42`](https://github.com/Dicklesworthstone/franken_lean/commit/6ba4ef42310c9f3d12be0b5d2460c96716dd991c), [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387).
+
+---
+
+## 13) Diagnostic accounting, transcript receipts, and URI resource bounds — 2026-09-02
+
+This tranche tightened three places where the implementation enforced a policy but did not yet expose or fully bind the corresponding authority fact.
+
+### Exact diagnostic accounting
+
+- A canonical zero-diagnostic completion now requires the current projection schema, `outcome:"complete"`, `authority:true`, and exact unsigned `diagnosticCount:0` as one structural tuple.
+- Missing, nonzero, negative, fractional, string, overflowing, or duplicate decoded counts are withheld rather than releasing `waitForDiagnostics` as a false clean result.
+- `inconclusive` and `internal_fault` outcomes must remain `authority:false` and may not carry the complete-only count field.
+- Exported framed-stdio tests prove malformed accounting clears editor diagnostics, emits a non-authoritative callback fault, and resolves the wait with `RequestFailed`.
+
+### Reproducible transcript resource evidence
+
+- The shared transcript reader already bounded complete Content-Length wire bytes, including extension headers and framing, while separately counting JSON body bytes.
+- `TranscriptStats` now publishes both facts, and the validation receipt advances to `fln.lsp-transcript-validation/2` with `wireBytes` and `bodyBytes`.
+- Library, validator-binary, empty-stdin, and extension-header tests bind the receipt to the exact complete framed byte length rather than an inferred body-only approximation.
+
+### Open-document metadata budget
+
+- Added a separate 4 MiB aggregate budget for retained open-document URI keys alongside the existing 1,024-document and 256 MiB source limits.
+- URI capacity is checked before source retention changes, so a rejected giant URI cannot consume source bytes, lifecycle slots, or checker work.
+- Close and invariant recovery rebuild/release source and URI accounting independently while preserving open/version authority.
+- A public framed-stdio test sends an over-budget URI and then a normal document in the same session, proving the refusal is isolated and the ordinary document still reaches diagnostics.
+
+**Evidence boundary:** the code and tests are landed, but this session had no Rust toolchain and GitHub Actions were unavailable. This changelog therefore records implementation and executable test ownership, not same-session execution evidence. `franken_lean-v2p` remains open because cursor semantics, source-aware live projection, Lean RPC, shared import state, asynchronous cancellation, and full editor parity are not complete.
+
+Representative commits: [`9a8f2362`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8f2362992d781da04419471475f3a02851d71c), [`9f11cc26`](https://github.com/Dicklesworthstone/franken_lean/commit/9f11cc26ddbf82c911bee326cd2e9f54de50f91c), [`5583c65f`](https://github.com/Dicklesworthstone/franken_lean/commit/5583c65febe88583d6ae2dcb544a39c960342d57), [`b8256034`](https://github.com/Dicklesworthstone/franken_lean/commit/b82560341b9096f36df280a570a2608e6972d645), [`a4807ece`](https://github.com/Dicklesworthstone/franken_lean/commit/a4807ece6042d676d4d43f62f569c34a841062ae), [`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3).
 
 ---
 
