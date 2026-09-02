@@ -21,7 +21,8 @@ const USAGE: &str = "Usage: fln-lsp-server-validate [--] INPUT\n\
 \n\
 Validate one exact Content-Length-framed JSON-RPC server transcript.\n\
 Use INPUT=- to read standard input. The bounded profile accepts notifications\n\
-and result/error responses; server-initiated requests are refused.\n";
+and result/error responses; server-initiated requests are refused. Known\n\
+Lantern notification payloads are validated against their structural schemas.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -134,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_server_stream_emits_schema_v2_resource_evidence() {
+    fn mixed_server_stream_emits_schema_v3_resource_evidence() {
         let mut bytes = frame(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
         bytes.extend(frame(
             r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"ok"}}"#,
@@ -147,9 +148,10 @@ mod tests {
         )
         .unwrap();
         let receipt = server_transcript::render_server_transcript_validation(evidence.stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-server-transcript/2\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-server-transcript/3\""));
         assert!(receipt.contains("\"responses\":2"));
         assert!(receipt.contains("\"notifications\":1"));
+        assert!(receipt.contains("\"logMessages\":1"));
         assert!(receipt.contains("\"metadataBytes\":"));
         assert!(receipt.contains("\"metadataByteCeiling\":33554432"));
     }
