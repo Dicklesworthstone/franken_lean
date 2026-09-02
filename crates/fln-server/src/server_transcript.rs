@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, Cursor, Read};
 
 use crate::json::{
     DecodedField, EnvelopeError, RawField, RequestIdField, VersionField, parse_envelope,
@@ -6,12 +6,20 @@ use crate::json::{
 };
 use crate::transcript::{MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_FRAMES};
 
+/// Variable decoded method/response-ID bytes retained beside the immutable wire.
+///
+/// Fixed per-frame struct overhead is separately bounded by
+/// [`MAX_TRANSCRIPT_FRAMES`]. This ceiling prevents a valid 256 MiB recording
+/// from being duplicated wholesale into decoded `String` storage.
+pub const MAX_SERVER_TRANSCRIPT_METADATA_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerResponseKind {
     Result,
     Error,
 }
 
+#[cfg(test)]
 impl ServerResponseKind {
     const fn name(self) -> &'static str {
         match self {
@@ -32,6 +40,8 @@ pub struct ServerTranscriptFrame {
     pub index: u64,
     pub role: ServerFrameRole,
     pub method: Option<String>,
+    /// Deterministic request-ID JSON: number lexemes are preserved, strings are
+    /// decoded and canonically re-escaped, and null remains null.
     pub id_json: Option<String>,
     pub body_bytes: u64,
 }
@@ -45,6 +55,8 @@ pub struct ServerTranscriptStats {
     pub notifications: u64,
     pub wire_bytes: u64,
     pub body_bytes: u64,
+    /// Decoded method and canonical response-ID string bytes retained in frames.
+    pub metadata_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,8 +193,24 @@ pub fn validate_server_frame(body: &[u8], frame: u64) -> Result<ServerTranscript
     }
 }
 
-pub fn validate_server_transcript_bytes(
+fn frame_metadata_bytes(frame: &ServerTranscriptFrame) -> Result<u64, String> {
+    frame
+        .method
+        .as_ref()
+        .map_or(Ok(0), |method| {
+            u64::try_from(method.len())
+                .map_err(|_| format!("frame {} method length does not fit u64", frame.index))
+        })?
+        .checked_add(frame.id_json.as_ref().map_or(0, |id| {
+            u64::try_from(id.len()).unwrap_or(u64::MAX)
+        }))
+        .ok_or_else(|| format!("frame {} metadata-byte accounting overflow", frame.index))
+}
+
+fn validate_server_transcript_with_limits(
     bytes: &[u8],
+    max_frames: u64,
+    max_metadata_bytes: u64,
 ) -> Result<ServerTranscriptEvidence, String> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TRANSCRIPT_BYTES {
         return Err(format!(
@@ -202,17 +230,27 @@ pub fn validate_server_transcript_bytes(
         else {
             break;
         };
-        if index > MAX_TRANSCRIPT_FRAMES {
+        if index > max_frames {
             return Err(format!(
-                "server transcript exceeds the {MAX_TRANSCRIPT_FRAMES}-frame ceiling"
+                "server transcript exceeds the {max_frames}-frame ceiling"
             ));
         }
         let frame = validate_server_frame(&body, index)?;
+        let next_metadata_bytes = stats
+            .metadata_bytes
+            .checked_add(frame_metadata_bytes(&frame)?)
+            .ok_or_else(|| "server transcript metadata-byte accounting overflow".to_string())?;
+        if next_metadata_bytes > max_metadata_bytes {
+            return Err(format!(
+                "server transcript decoded metadata exceeds the {max_metadata_bytes}-byte ceiling while reading frame {index}"
+            ));
+        }
         stats.frames = index;
         stats.body_bytes = stats
             .body_bytes
             .checked_add(frame.body_bytes)
             .ok_or_else(|| "server transcript body-byte accounting overflow".to_string())?;
+        stats.metadata_bytes = next_metadata_bytes;
         match frame.role {
             ServerFrameRole::Notification => {
                 stats.notifications = stats
@@ -250,6 +288,16 @@ pub fn validate_server_transcript_bytes(
     Ok(ServerTranscriptEvidence { stats, frames })
 }
 
+pub fn validate_server_transcript_bytes(
+    bytes: &[u8],
+) -> Result<ServerTranscriptEvidence, String> {
+    validate_server_transcript_with_limits(
+        bytes,
+        MAX_TRANSCRIPT_FRAMES,
+        MAX_SERVER_TRANSCRIPT_METADATA_BYTES,
+    )
+}
+
 pub fn validate_server_transcript_reader(
     input: &mut dyn BufRead,
 ) -> Result<ServerTranscriptEvidence, String> {
@@ -264,10 +312,11 @@ pub fn validate_server_transcript_reader(
 pub fn render_server_transcript_validation(stats: ServerTranscriptStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-server-transcript/1\",",
+            "{{\"schema\":\"fln.lsp-server-transcript/2\",",
             "\"frames\":{},\"responses\":{},\"resultResponses\":{},",
             "\"errorResponses\":{},\"notifications\":{},",
-            "\"wireBytes\":{},\"bodyBytes\":{}}}\n"
+            "\"wireBytes\":{},\"bodyBytes\":{},\"metadataBytes\":{},",
+            "\"frameCeiling\":{},\"metadataByteCeiling\":{}}}\n"
         ),
         stats.frames,
         stats.responses,
@@ -275,7 +324,10 @@ pub fn render_server_transcript_validation(stats: ServerTranscriptStats) -> Stri
         stats.error_responses,
         stats.notifications,
         stats.wire_bytes,
-        stats.body_bytes
+        stats.body_bytes,
+        stats.metadata_bytes,
+        MAX_TRANSCRIPT_FRAMES,
+        MAX_SERVER_TRANSCRIPT_METADATA_BYTES
     )
 }
 
@@ -298,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_notifications_results_errors_and_lexical_ids() {
+    fn validates_notifications_results_errors_and_canonical_ids() {
         let bytes = framed(&[
             r#"{"jsonrpc":"2.0","id":1.25e2,"result":{"capabilities":{}}}"#,
             r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"ok"}}"#,
@@ -313,9 +365,15 @@ mod tests {
         assert_eq!(evidence.frames[0].id_json.as_deref(), Some("1.25e2"));
         assert_eq!(evidence.frames[2].id_json.as_deref(), Some("\"wait\""));
         assert_eq!(evidence.stats.wire_bytes, u64::try_from(bytes.len()).unwrap());
+        assert_eq!(
+            evidence.stats.metadata_bytes,
+            u64::try_from("1.25e2".len() + "window/logMessage".len() + "\"wait\"".len())
+                .unwrap()
+        );
         let receipt = render_server_transcript_validation(evidence.stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-server-transcript/1\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-server-transcript/2\""));
         assert!(receipt.contains("\"errorResponses\":1"));
+        assert!(receipt.contains("\"metadataBytes\":"));
     }
 
     #[test]
@@ -364,6 +422,32 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("signed 32-bit"));
+    }
+
+    #[test]
+    fn metadata_ceiling_refuses_before_retaining_the_failing_frame() {
+        let bytes = framed(&[
+            r#"{"jsonrpc":"2.0","method":"ok","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"too-long","params":{}}"#,
+        ]);
+        let error = validate_server_transcript_with_limits(&bytes, 10, 3).unwrap_err();
+        assert!(error.contains("3-byte ceiling"));
+        assert!(error.contains("frame 2"));
+    }
+
+    #[test]
+    fn frame_ceiling_is_independent_of_wire_bytes() {
+        let bytes = framed(&[
+            r#"{"jsonrpc":"2.0","method":"one","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"two","params":{}}"#,
+        ]);
+        let error = validate_server_transcript_with_limits(
+            &bytes,
+            1,
+            MAX_SERVER_TRANSCRIPT_METADATA_BYTES,
+        )
+        .unwrap_err();
+        assert!(error.contains("1-frame ceiling"));
     }
 
     #[test]
