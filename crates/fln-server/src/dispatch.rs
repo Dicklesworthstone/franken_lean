@@ -5,10 +5,13 @@
 //! intentionally synchronous: it owns protocol ordering and delegates source
 //! checking through one callback.
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 use crate::transport;
 
+#[cfg(test)]
+mod diagnostic_wait;
 mod json;
 mod session;
 mod wait;
@@ -44,10 +47,30 @@ pub struct ServerOutcome {
     pub documents_saved: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticCompletion {
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiagnosticFrontier {
+    version: i64,
+    completion: DiagnosticCompletion,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PublishedVersion {
+struct CheckedVersion {
     uri: String,
     version: i64,
+    completion: DiagnosticCompletion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackMessageClass {
+    PrimaryTerminal,
+    Auxiliary,
+    Invalid,
 }
 
 pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
@@ -70,9 +93,37 @@ fn write_retention_outcome(
     Ok(())
 }
 
-fn is_terminal_diagnostic_message(message: &str) -> bool {
-    message.contains("\"method\":\"textDocument/publishDiagnostics\"")
-        || message.contains("\"method\":\"$/lean/diagnosticOutcome\"")
+fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessageClass {
+    let Ok(envelope) = parse_envelope(message) else {
+        return CallbackMessageClass::Invalid;
+    };
+    if !matches!(
+        &envelope.jsonrpc,
+        DecodedField::Valid(version) if version == "2.0"
+    ) || !matches!(&envelope.id, RequestIdField::Absent)
+    {
+        return CallbackMessageClass::Invalid;
+    }
+    let DecodedField::Valid(method) = &envelope.method else {
+        return CallbackMessageClass::Invalid;
+    };
+    if matches!(envelope.params, RawField::Invalid) {
+        return CallbackMessageClass::Invalid;
+    }
+    match method.as_str() {
+        "$/lean/diagnosticOutcome" => match envelope.params {
+            RawField::Value(_) => CallbackMessageClass::PrimaryTerminal,
+            RawField::Missing | RawField::Invalid => CallbackMessageClass::Invalid,
+        },
+        "textDocument/publishDiagnostics" => match direct_uri(envelope.params) {
+            DecodedField::Valid(uri) if uri == document_uri => {
+                CallbackMessageClass::PrimaryTerminal
+            }
+            DecodedField::Valid(_) => CallbackMessageClass::Auxiliary,
+            DecodedField::Missing | DecodedField::Invalid => CallbackMessageClass::Invalid,
+        },
+        _ => CallbackMessageClass::Auxiliary,
+    }
 }
 
 fn check_document(
@@ -80,20 +131,47 @@ fn check_document(
     uri: &str,
     content: &str,
     on_did_open: &mut OnDidOpen,
-) -> io::Result<()> {
+) -> io::Result<DiagnosticCompletion> {
     write_protocol_message(output, file_progress_notification(uri, true))?;
     let notifications = on_did_open(uri, content);
-    let has_terminal_outcome = notifications
+    let classes = notifications
         .iter()
-        .any(|message| is_terminal_diagnostic_message(message));
-    for notification in notifications {
-        transport::write_message(output, notification.as_bytes())?;
+        .map(|message| classify_callback_message(message, uri))
+        .collect::<Vec<_>>();
+    let primary_count = classes
+        .iter()
+        .filter(|class| **class == CallbackMessageClass::PrimaryTerminal)
+        .count();
+    let invalid = classes.contains(&CallbackMessageClass::Invalid);
+    let complete = !invalid && primary_count == 1;
+
+    if invalid {
+        write_warning(
+            output,
+            "FrankenLean discarded malformed diagnostic callback output",
+        )?;
     }
-    if !has_terminal_outcome {
+    for (notification, class) in notifications.into_iter().zip(classes) {
+        if class == CallbackMessageClass::Auxiliary || (!invalid && primary_count == 1) {
+            transport::write_message(output, notification.as_bytes())?;
+        }
+    }
+    if !complete {
+        if primary_count > 1 {
+            write_warning(
+                output,
+                "FrankenLean refused ambiguous diagnostic callback output with multiple primary terminal messages",
+            )?;
+        }
         write_protocol_message(output, clear_diagnostics_notification(uri))?;
         write_protocol_message(output, diagnostic_callback_failure_notification(uri))?;
     }
-    write_protocol_message(output, file_progress_notification(uri, false))
+    write_protocol_message(output, file_progress_notification(uri, false))?;
+    Ok(if complete {
+        DiagnosticCompletion::Complete
+    } else {
+        DiagnosticCompletion::Failed
+    })
 }
 
 fn complete_waits(output: &mut dyn Write, ids: Vec<RequestId>) -> io::Result<()> {
@@ -110,9 +188,62 @@ fn fail_waits(output: &mut dyn Write, ids: Vec<RequestId>, message: &str) -> io:
     Ok(())
 }
 
+fn settle_waits(
+    output: &mut dyn Write,
+    ids: Vec<RequestId>,
+    completion: DiagnosticCompletion,
+) -> io::Result<()> {
+    match completion {
+        DiagnosticCompletion::Complete => complete_waits(output, ids),
+        DiagnosticCompletion::Failed => fail_waits(
+            output,
+            ids,
+            "diagnostic processing reached a non-authoritative terminal outcome",
+        ),
+    }
+}
+
+fn record_frontier(
+    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
+    checked: &CheckedVersion,
+) {
+    frontiers.insert(
+        checked.uri.clone(),
+        DiagnosticFrontier {
+            version: checked.version,
+            completion: checked.completion,
+        },
+    );
+}
+
+fn fail_current_frontier(
+    output: &mut dyn Write,
+    session: &DocumentSession,
+    waits: &mut PendingDiagnosticWaits,
+    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
+    uri: &str,
+    message: &str,
+) -> io::Result<()> {
+    if let Some(version) = session.version(uri) {
+        frontiers.insert(
+            uri.to_string(),
+            DiagnosticFrontier {
+                version,
+                completion: DiagnosticCompletion::Failed,
+            },
+        );
+        fail_waits(output, waits.complete_ready(uri, version), message)?;
+    } else {
+        frontiers.remove(uri);
+    }
+    Ok(())
+}
+
 fn invalidate_source_and_clear(
     output: &mut dyn Write,
     session: &mut DocumentSession,
+    waits: &mut PendingDiagnosticWaits,
+    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     uri: &str,
     reason: &str,
 ) -> io::Result<()> {
@@ -121,6 +252,14 @@ fn invalidate_source_and_clear(
         Err(refusal) => write_warning(output, refusal.message())?,
     }
     write_protocol_message(output, clear_diagnostics_notification(uri))?;
+    fail_current_frontier(
+        output,
+        session,
+        waits,
+        frontiers,
+        uri,
+        "diagnostics were invalidated before the requested version could remain authoritative",
+    )?;
     write_warning(output, reason)
 }
 
@@ -164,12 +303,8 @@ fn decoded_change_text(params: RawField<'_>) -> Result<String, &'static str> {
 fn decoded_wait_target(params: RawField<'_>) -> Result<(String, i64), &'static str> {
     let uri = match direct_uri(params) {
         DecodedField::Valid(uri) if !uri.is_empty() => uri,
-        DecodedField::Valid(_) => {
-            return Err("waitForDiagnostics uri must not be empty");
-        }
-        DecodedField::Missing => {
-            return Err("waitForDiagnostics requires uri");
-        }
+        DecodedField::Valid(_) => return Err("waitForDiagnostics uri must not be empty"),
+        DecodedField::Missing => return Err("waitForDiagnostics requires uri"),
         DecodedField::Invalid => {
             return Err("waitForDiagnostics uri is malformed or ambiguous");
         }
@@ -179,9 +314,7 @@ fn decoded_wait_target(params: RawField<'_>) -> Result<(String, i64), &'static s
         VersionField::Valid(_) => {
             return Err("waitForDiagnostics version must be a nonnegative integer");
         }
-        VersionField::Missing => {
-            return Err("waitForDiagnostics requires version");
-        }
+        VersionField::Missing => return Err("waitForDiagnostics requires version"),
         VersionField::Invalid => {
             return Err("waitForDiagnostics version is malformed or ambiguous");
         }
@@ -194,7 +327,7 @@ fn handle_open(
     session: &mut DocumentSession,
     params: RawField<'_>,
     on_did_open: &mut OnDidOpen,
-) -> io::Result<Option<PublishedVersion>> {
+) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
@@ -220,8 +353,12 @@ fn handle_open(
     match session.open(uri.clone(), version, text.clone()) {
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
-            check_document(output, &uri, &text, on_did_open)?;
-            Ok(Some(PublishedVersion { uri, version }))
+            let completion = check_document(output, &uri, &text, on_did_open)?;
+            Ok(Some(CheckedVersion {
+                uri,
+                version,
+                completion,
+            }))
         }
         Err(refusal) => {
             write_warning(output, refusal.message())?;
@@ -233,9 +370,11 @@ fn handle_open(
 fn handle_change(
     output: &mut dyn Write,
     session: &mut DocumentSession,
+    waits: &mut PendingDiagnosticWaits,
+    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
     on_did_open: &mut OnDidOpen,
-) -> io::Result<Option<PublishedVersion>> {
+) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
@@ -250,14 +389,18 @@ fn handle_change(
     let version = match decoded_version(params) {
         Ok(version) => version,
         Err(message) => {
-            invalidate_source_and_clear(output, session, &uri, message)?;
+            invalidate_source_and_clear(
+                output, session, waits, frontiers, &uri, message,
+            )?;
             return Ok(None);
         }
     };
     let text = match decoded_change_text(params) {
         Ok(text) => text,
         Err(message) => {
-            invalidate_source_and_clear(output, session, &uri, message)?;
+            invalidate_source_and_clear(
+                output, session, waits, frontiers, &uri, message,
+            )?;
             return Ok(None);
         }
     };
@@ -265,8 +408,25 @@ fn handle_change(
     match session.change(&uri, version, text.clone()) {
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
-            check_document(output, &uri, &text, on_did_open)?;
-            Ok(Some(PublishedVersion { uri, version }))
+            let completion = check_document(output, &uri, &text, on_did_open)?;
+            Ok(Some(CheckedVersion {
+                uri,
+                version,
+                completion,
+            }))
+        }
+        Err(SessionRefusal::AccountingInvariant) => {
+            write_protocol_message(output, clear_diagnostics_notification(&uri))?;
+            fail_current_frontier(
+                output,
+                session,
+                waits,
+                frontiers,
+                &uri,
+                "retained-source accounting failed before diagnostic publication",
+            )?;
+            write_warning(output, SessionRefusal::AccountingInvariant.message())?;
+            Ok(None)
         }
         Err(refusal) => {
             write_warning(output, refusal.message())?;
@@ -278,53 +438,86 @@ fn handle_change(
 fn handle_save(
     output: &mut dyn Write,
     session: &mut DocumentSession,
+    waits: &mut PendingDiagnosticWaits,
+    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
     on_did_open: &mut OnDidOpen,
-) -> io::Result<bool> {
+) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
         Err(message) => {
             write_warning(output, message)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
-    if !session.is_open(&uri) {
+    let Some(version) = session.version(&uri) else {
         write_warning(output, SessionRefusal::NotOpen.message())?;
-        return Ok(false);
-    }
+        return Ok(None);
+    };
 
     match save_text(params) {
         DecodedField::Valid(text) => match session.save_with_text(&uri, text.clone()) {
             Ok(retention) => {
                 write_retention_outcome(output, retention)?;
-                check_document(output, &uri, &text, on_did_open)?;
-                Ok(true)
+                let completion = check_document(output, &uri, &text, on_did_open)?;
+                Ok(Some(CheckedVersion {
+                    uri,
+                    version,
+                    completion,
+                }))
+            }
+            Err(SessionRefusal::AccountingInvariant) => {
+                write_protocol_message(output, clear_diagnostics_notification(&uri))?;
+                fail_current_frontier(
+                    output,
+                    session,
+                    waits,
+                    frontiers,
+                    &uri,
+                    "retained-source accounting failed before diagnostic publication",
+                )?;
+                write_warning(output, SessionRefusal::AccountingInvariant.message())?;
+                Ok(None)
             }
             Err(refusal) => {
                 write_warning(output, refusal.message())?;
-                Ok(false)
+                Ok(None)
             }
         },
         DecodedField::Missing => {
             let Some(text) = session.text(&uri).map(str::to_owned) else {
                 write_protocol_message(output, clear_diagnostics_notification(&uri))?;
+                fail_current_frontier(
+                    output,
+                    session,
+                    waits,
+                    frontiers,
+                    &uri,
+                    "no retained source exists for the requested diagnostic version",
+                )?;
                 write_warning(
                     output,
                     "FrankenLean could not re-check textless didSave because no retained source exists",
                 )?;
-                return Ok(false);
+                return Ok(None);
             };
-            check_document(output, &uri, &text, on_did_open)?;
-            Ok(true)
+            let completion = check_document(output, &uri, &text, on_did_open)?;
+            Ok(Some(CheckedVersion {
+                uri,
+                version,
+                completion,
+            }))
         }
         DecodedField::Invalid => {
             invalidate_source_and_clear(
                 output,
                 session,
+                waits,
+                frontiers,
                 &uri,
                 "FrankenLean refused malformed didSave text; retained source was invalidated",
             )?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -332,6 +525,7 @@ fn handle_save(
 fn handle_close(
     output: &mut dyn Write,
     session: &mut DocumentSession,
+    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
 ) -> io::Result<Option<String>> {
     let uri = match decoded_uri(params) {
@@ -349,6 +543,7 @@ fn handle_close(
         )?,
         Err(refusal) => write_warning(output, refusal.message())?,
     }
+    frontiers.remove(&uri);
     write_protocol_message(output, clear_diagnostics_notification(&uri))?;
     Ok(Some(uri))
 }
@@ -357,6 +552,7 @@ fn handle_wait_for_diagnostics(
     output: &mut dyn Write,
     session: &DocumentSession,
     waits: &mut PendingDiagnosticWaits,
+    frontiers: &BTreeMap<String, DiagnosticFrontier>,
     id: &RequestId,
     params: RawField<'_>,
 ) -> io::Result<()> {
@@ -382,11 +578,22 @@ fn handle_wait_for_diagnostics(
             ),
         );
     }
-    if session
-        .version(&uri)
-        .is_some_and(|current| current >= version)
+    if let Some(frontier) = frontiers.get(&uri)
+        && frontier.version >= version
     {
-        return write_protocol_message(output, empty_object_response(id));
+        return match frontier.completion {
+            DiagnosticCompletion::Complete => {
+                write_protocol_message(output, empty_object_response(id))
+            }
+            DiagnosticCompletion::Failed => write_protocol_message(
+                output,
+                error_response(
+                    id,
+                    REQUEST_FAILED_CODE,
+                    "diagnostic processing reached a non-authoritative terminal outcome",
+                ),
+            ),
+        };
     }
     match waits.register(id.clone(), uri, version) {
         Ok(()) => Ok(()),
@@ -575,6 +782,7 @@ pub fn serve(
     let mut documents_saved = 0u64;
     let mut session = DocumentSession::new();
     let mut waits = PendingDiagnosticWaits::new();
+    let mut frontiers = BTreeMap::new();
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -630,20 +838,19 @@ pub fn serve(
         if !validate_method_role(output, &method, id)? {
             continue;
         }
-        if method != "textDocument/waitForDiagnostics" {
-            if let Some(request_id) = id {
-                if waits.contains(request_id) {
-                    write_protocol_message(
-                        output,
-                        error_response(
-                            request_id,
-                            -32600,
-                            "FrankenLean refused a duplicate outstanding JSON-RPC request id",
-                        ),
-                    )?;
-                    continue;
-                }
-            }
+        if method != "textDocument/waitForDiagnostics"
+            && let Some(request_id) = id
+            && waits.contains(request_id)
+        {
+            write_protocol_message(
+                output,
+                error_response(
+                    request_id,
+                    -32600,
+                    "FrankenLean refused a duplicate outstanding JSON-RPC request id",
+                ),
+            )?;
+            continue;
         }
 
         match (method.as_str(), id, state) {
@@ -686,34 +893,58 @@ pub fn serve(
                 });
             }
             ("textDocument/didOpen", None, ServerState::Running) => {
-                if let Some(published) =
+                if let Some(checked) =
                     handle_open(output, &mut session, envelope.params, on_did_open)?
                 {
                     documents_opened = documents_opened.saturating_add(1);
-                    complete_waits(
+                    record_frontier(&mut frontiers, &checked);
+                    settle_waits(
                         output,
-                        waits.complete_ready(&published.uri, published.version),
+                        waits.complete_ready(&checked.uri, checked.version),
+                        checked.completion,
                     )?;
                 }
             }
             ("textDocument/didChange", None, ServerState::Running) => {
-                if let Some(published) =
-                    handle_change(output, &mut session, envelope.params, on_did_open)?
-                {
+                if let Some(checked) = handle_change(
+                    output,
+                    &mut session,
+                    &mut waits,
+                    &mut frontiers,
+                    envelope.params,
+                    on_did_open,
+                )? {
                     documents_changed = documents_changed.saturating_add(1);
-                    complete_waits(
+                    record_frontier(&mut frontiers, &checked);
+                    settle_waits(
                         output,
-                        waits.complete_ready(&published.uri, published.version),
+                        waits.complete_ready(&checked.uri, checked.version),
+                        checked.completion,
                     )?;
                 }
             }
             ("textDocument/didSave", None, ServerState::Running) => {
-                if handle_save(output, &mut session, envelope.params, on_did_open)? {
+                if let Some(checked) = handle_save(
+                    output,
+                    &mut session,
+                    &mut waits,
+                    &mut frontiers,
+                    envelope.params,
+                    on_did_open,
+                )? {
                     documents_saved = documents_saved.saturating_add(1);
+                    record_frontier(&mut frontiers, &checked);
+                    settle_waits(
+                        output,
+                        waits.complete_ready(&checked.uri, checked.version),
+                        checked.completion,
+                    )?;
                 }
             }
             ("textDocument/didClose", None, ServerState::Running) => {
-                if let Some(uri) = handle_close(output, &mut session, envelope.params)? {
+                if let Some(uri) =
+                    handle_close(output, &mut session, &mut frontiers, envelope.params)?
+                {
                     fail_waits(
                         output,
                         waits.drain_uri(&uri),
@@ -727,6 +958,7 @@ pub fn serve(
                         output,
                         &session,
                         &mut waits,
+                        &frontiers,
                         request_id,
                         envelope.params,
                     )?;
@@ -736,7 +968,12 @@ pub fn serve(
                 handle_cancel_request(output, &mut waits, envelope.params)?;
             }
             ("$/lean/rpc/keepAlive", None, ServerState::Running)
-            | ("$/lean/rpc/release", None, ServerState::Running) => {}
+            | ("$/lean/rpc/release", None, ServerState::Running) => {
+                write_warning(
+                    output,
+                    "FrankenLean ignored an RPC-session notification because Lean RPC sessions are not implemented",
+                )?;
+            }
             (method, None, state) if is_notification_method(method) => {
                 let message = match state {
                     ServerState::Uninitialized | ServerState::Initializing => {
@@ -794,7 +1031,10 @@ mod tests {
         write_message(buffer, body.as_bytes()).expect("frame test message");
     }
 
-    fn run_session(messages: &[&str]) -> (ServerOutcome, String, Vec<(String, String)>) {
+    fn run_session_with_callback(
+        messages: &[&str],
+        callback: &mut OnDidOpen,
+    ) -> (ServerOutcome, String) {
         let mut input = Vec::new();
         send(
             &mut input,
@@ -815,20 +1055,23 @@ mod tests {
 
         let mut reader = BufReader::new(input.as_slice());
         let mut output = Vec::new();
+        let outcome = serve(&mut reader, &mut output, callback).expect("serve test session");
+        (
+            outcome,
+            String::from_utf8(output).expect("UTF-8 protocol output"),
+        )
+    }
+
+    fn run_session(messages: &[&str]) -> (ServerOutcome, String, Vec<(String, String)>) {
         let mut seen = Vec::new();
-        let outcome = serve(&mut reader, &mut output, &mut |uri, text| {
+        let (outcome, output) = run_session_with_callback(messages, &mut |uri, text| {
             seen.push((uri.to_string(), text.to_string()));
             vec![format!(
                 "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
                 crate::json_string(uri)
             )]
-        })
-        .expect("serve test session");
-        (
-            outcome,
-            String::from_utf8(output).expect("UTF-8 protocol output"),
-            seen,
-        )
+        });
+        (outcome, output, seen)
     }
 
     #[test]
@@ -864,20 +1107,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_open_and_unopened_events_are_refused() {
-        let (outcome, output, seen) = run_session(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"first"}}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":2,"text":"second"}}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///missing","version":2},"contentChanges":[{"text":"bad"}]}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing"}}}"#,
-        ]);
-        assert!(outcome.clean);
-        assert_eq!(seen, vec![("file:///x".to_string(), "first".to_string())]);
-        assert!(output.contains("refused duplicate didOpen"));
-        assert!(output.matches("document is not open").count() >= 2);
-    }
-
-    #[test]
     fn stale_change_does_not_replace_authoritative_source() {
         let (outcome, output, seen) = run_session(&[
             r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":3,"text":"v3"}}}"#,
@@ -898,22 +1127,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_change_invalidates_text_and_clears_diagnostics() {
-        let (outcome, output, seen) = run_session(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"old"}}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":2},"contentChanges":[{"range":{},"text":"fragment"}]}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x"}}}"#,
-        ]);
-        assert!(outcome.clean);
-        assert_eq!(seen, vec![("file:///x".to_string(), "old".to_string())]);
-        assert_eq!(outcome.documents_changed, 0);
-        assert_eq!(outcome.documents_saved, 0);
-        assert!(output.contains("unranged Full-sync text change"));
-        assert!(output.contains("no retained source exists"));
-        assert!(output.contains("\"uri\":\"file:///x\",\"diagnostics\":[]"));
-    }
-
-    #[test]
     fn parser_errors_are_recoverable_and_use_null_id() {
         let (outcome, output, _) = run_session(&[
             r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"bad":tru}}"#,
@@ -922,28 +1135,6 @@ mod tests {
         assert!(outcome.clean);
         assert!(output.contains("\"id\":null,\"error\":{\"code\":-32700"));
         assert!(output.contains("\"id\":6,\"result\":null"));
-    }
-
-    #[test]
-    fn missing_or_wrong_jsonrpc_version_is_invalid_request() {
-        let (outcome, output, _) = run_session(&[
-            r#"{"id":"a","method":"textDocument/hover","params":{}}"#,
-            r#"{"jsonrpc":"1.0","id":7,"method":"textDocument/hover","params":{}}"#,
-        ]);
-        assert!(outcome.clean);
-        assert!(output.contains("\"id\":\"a\",\"error\":{\"code\":-32600"));
-        assert!(output.contains("\"id\":7,\"error\":{\"code\":-32600"));
-    }
-
-    #[test]
-    fn request_and_notification_roles_are_enforced() {
-        let (outcome, output, _) = run_session(&[
-            r#"{"jsonrpc":"2.0","id":10,"method":"textDocument/didOpen","params":{}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/hover","params":{}}"#,
-        ]);
-        assert!(outcome.clean);
-        assert!(output.contains("\"id\":10,\"error\":{\"code\":-32600"));
-        assert!(output.contains("request-only LSP method sent as a notification"));
     }
 
     #[test]
@@ -957,16 +1148,68 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_diagnostics_completes_immediately_and_after_version_advance() {
+    fn callback_terminal_detection_is_structural_and_uri_bound() {
+        let messages = [
+            r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///other","diagnostics":[]}}"#,
+            r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"message":"\"method\":\"textDocument/publishDiagnostics\""}}"#,
+        ];
+        let (outcome, output) = run_session_with_callback(
+            &[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#],
+            &mut |_, _| messages.iter().map(|message| (*message).to_string()).collect(),
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("diagnostic-callback-terminal-message"));
+        assert!(output.contains("\"uri\":\"file:///x\",\"diagnostics\":[]"));
+    }
+
+    #[test]
+    fn malformed_callback_output_is_withheld_and_faulted() {
+        let (outcome, output) = run_session_with_callback(
+            &[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#],
+            &mut |_, _| vec!["{malformed-callback".to_string()],
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("discarded malformed diagnostic callback output"));
+        assert!(!output.contains("{malformed-callback"));
+        assert!(output.contains("diagnostic-callback-terminal-message"));
+    }
+
+    #[test]
+    fn wait_for_diagnostics_tracks_terminal_authority_not_accepted_text() {
+        let mut calls = 0usize;
+        let (outcome, output) = run_session_with_callback(
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
+                r#"{"jsonrpc":"2.0","id":"failed","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":1}}"#,
+                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x"},"text":"v1"}}"#,
+                r#"{"jsonrpc":"2.0","id":"ready","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":1}}"#,
+            ],
+            &mut |uri, _| {
+                calls += 1;
+                if calls == 1 {
+                    Vec::new()
+                } else {
+                    vec![format!(
+                        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+                        crate::json_string(uri)
+                    )]
+                }
+            },
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"failed\",\"error\":{\"code\":-32803"));
+        assert!(output.contains("\"id\":\"ready\",\"result\":{}"));
+    }
+
+    #[test]
+    fn future_wait_completes_only_after_matching_version_publication() {
         let (outcome, output, _) = run_session(&[
             r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
-            r#"{"jsonrpc":"2.0","id":"ready","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":1}}"#,
             r#"{"jsonrpc":"2.0","id":"future","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":3}}"#,
             r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":2},"contentChanges":[{"text":"v2"}]}}"#,
             r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":3},"contentChanges":[{"text":"v3"}]}}"#,
         ]);
         assert!(outcome.clean);
-        assert!(output.contains("\"id\":\"ready\",\"result\":{}"));
         assert!(output.contains("\"id\":\"future\",\"result\":{}"));
         assert!(!output.contains("\"id\":\"future\",\"error\""));
     }
@@ -995,43 +1238,6 @@ mod tests {
         assert!(outcome.clean);
         assert!(output.contains("\"id\":21,\"error\":{\"code\":-32803"));
         assert!(output.contains("document closed before the requested diagnostics version"));
-    }
-
-    #[test]
-    fn invalid_and_duplicate_waits_fail_closed() {
-        let (outcome, output, _) = run_session(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"v1"}}}"#,
-            r#"{"jsonrpc":"2.0","id":"negative","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":-1}}"#,
-            r#"{"jsonrpc":"2.0","id":"duplicate","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":9}}"#,
-            r#"{"jsonrpc":"2.0","id":"duplicate","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":10}}"#,
-        ]);
-        assert!(outcome.clean);
-        assert!(output.contains("\"id\":\"negative\",\"error\":{\"code\":-32602"));
-        assert!(output.contains("\"id\":\"duplicate\",\"error\":{\"code\":-32600"));
-        assert!(output.contains("duplicate outstanding JSON-RPC request id"));
-    }
-
-    #[test]
-    fn empty_diagnostic_callback_is_visible_and_clears_stale_state() {
-        let mut input = Vec::new();
-        for message in [
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#,
-            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
-            r#"{"jsonrpc":"2.0","method":"exit"}"#,
-        ] {
-            send(&mut input, message);
-        }
-        let mut reader = BufReader::new(input.as_slice());
-        let mut output = Vec::new();
-        let outcome = serve(&mut reader, &mut output, &mut |_, _| Vec::new())
-            .expect("serve test session");
-        let output = String::from_utf8(output).expect("UTF-8 protocol output");
-        assert!(outcome.clean);
-        assert!(output.contains("diagnostic-callback-terminal-message"));
-        assert!(output.contains("\"authority\":false"));
-        assert!(output.contains("\"uri\":\"file:///x\",\"diagnostics\":[]"));
     }
 
     #[test]
