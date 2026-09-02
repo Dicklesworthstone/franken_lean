@@ -11,7 +11,7 @@ pub use fln_server::{json_string, transport};
 #[path = "../json.rs"]
 mod json;
 #[path = "../transcript.rs"]
-mod transcript;
+pub mod transcript;
 
 const USAGE: &str = "Usage: fln-lsp-validate [--] INPUT\n\
 \n\
@@ -114,7 +114,8 @@ mod tests {
         let bodies = [
             r#"{"jsonrpc":"2.0","id":1.25e2,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-            r#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
         ];
         let expected_body_bytes = bodies
             .iter()
@@ -128,16 +129,16 @@ mod tests {
         assert_eq!(
             stats,
             transcript::TranscriptStats {
-                frames: 3,
+                frames: 4,
                 requests: 2,
-                notifications: 1,
+                notifications: 2,
                 body_bytes: expected_body_bytes,
             }
         );
         assert_eq!(
             transcript::render_validation(stats),
             format!(
-                "{{\"schema\":\"fln.lsp-transcript-validation/1\",\"frames\":3,\"requests\":2,\"notifications\":1,\"bodyBytes\":{expected_body_bytes}}}\n"
+                "{{\"schema\":\"fln.lsp-transcript-validation/1\",\"frames\":4,\"requests\":2,\"notifications\":2,\"bodyBytes\":{expected_body_bytes}}}\n"
             )
         );
     }
