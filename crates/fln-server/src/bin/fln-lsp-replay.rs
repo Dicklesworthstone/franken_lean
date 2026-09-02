@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_REPLAY_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 const USAGE: &str = "Usage: fln-lsp-replay [--expect PATH] [--output PATH] [--] INPUT\n\
 \n\
 Replay one exact Content-Length-framed LSP client stream through FrankenLean.\n\
@@ -24,6 +25,50 @@ struct Config {
 enum Command {
     Help,
     Replay(Config),
+}
+
+#[derive(Debug)]
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl BoundedOutput {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(1024 * 1024)),
+            max_bytes,
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("replay output length overflow"))?;
+        if next_len > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay output exceeds the {}-byte ceiling",
+                    self.max_bytes
+                ),
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -123,9 +168,9 @@ fn read_bounded(path: &Path, label: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn replay(input: &[u8]) -> Result<Vec<u8>, String> {
+fn replay_with_output_limit(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>, String> {
     let mut reader = BufReader::new(Cursor::new(input));
-    let mut actual = Vec::new();
+    let mut actual = BoundedOutput::new(max_output_bytes);
     let mut document_callback = |uri: &str, _text: &str| {
         vec![format!(
             concat!(
@@ -148,7 +193,11 @@ fn replay(input: &[u8]) -> Result<Vec<u8>, String> {
     {
         return Err("replay contains bytes after the exit notification".to_string());
     }
-    Ok(actual)
+    Ok(actual.into_bytes())
+}
+
+fn replay(input: &[u8]) -> Result<Vec<u8>, String> {
+    replay_with_output_limit(input, MAX_REPLAY_OUTPUT_BYTES)
 }
 
 fn first_difference(actual: &[u8], expected: &[u8]) -> Option<usize> {
@@ -245,8 +294,8 @@ mod tests {
         for body in [
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
-            r#"{"jsonrpc":"2.0","method":"exit"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
         ] {
             input.extend(frame(body));
         }
@@ -279,12 +328,27 @@ mod tests {
     }
 
     #[test]
+    fn bounded_output_refuses_before_mutating_the_failing_write() {
+        let mut output = BoundedOutput::new(3);
+        output.write_all(b"abc").unwrap();
+        let error = output.write_all(b"d").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(output.into_bytes(), b"abc");
+    }
+
+    #[test]
     fn clean_transcript_replays_deterministically() {
         let input = clean_session();
         let first = replay(&input).unwrap();
         let second = replay(&input).unwrap();
         assert_eq!(first, second);
         assert!(first.windows(b"FrankenLean".len()).any(|window| window == b"FrankenLean"));
+    }
+
+    #[test]
+    fn replay_output_is_bounded_independently_of_input() {
+        let error = replay_with_output_limit(&clean_session(), 1).unwrap_err();
+        assert!(error.contains("replay output exceeds the 1-byte ceiling"));
     }
 
     #[test]
