@@ -54,6 +54,7 @@ enum RequestKind {
 struct RequestRecord {
     frame: u64,
     kind: RequestKind,
+    cancelled_at: Option<u64>,
 }
 
 fn decoded_uri(field: DecodedField, label: &str) -> Result<String, String> {
@@ -158,7 +159,6 @@ fn document_event(method: &str, params: RawField<'_>) -> Result<Option<DocumentE
 struct ClientSessionValidator {
     documents: BTreeMap<String, i64>,
     requests: BTreeMap<String, RequestRecord>,
-    cancelled_requests: BTreeMap<String, u64>,
     open_uri_bytes: usize,
     request_id_bytes: usize,
     max_documents: usize,
@@ -189,6 +189,7 @@ impl ClientSessionValidator {
         )
     }
 
+    #[cfg(test)]
     fn with_limits(max_documents: usize, max_uri_bytes: usize) -> Self {
         Self::with_all_limits(
             max_documents,
@@ -207,7 +208,6 @@ impl ClientSessionValidator {
         Self {
             documents: BTreeMap::new(),
             requests: BTreeMap::new(),
-            cancelled_requests: BTreeMap::new(),
             open_uri_bytes: 0,
             request_id_bytes: 0,
             max_documents,
@@ -283,6 +283,7 @@ impl ClientSessionValidator {
                 } else {
                     RequestKind::Other
                 },
+                cancelled_at: None,
             },
         );
         Ok(())
@@ -377,19 +378,22 @@ impl ClientSessionValidator {
                 }
             }
             Some(DocumentEvent::Cancel { id }) => {
-                let Some(target) = self.requests.get(&id).copied() else {
-                    return Err(format!(
-                        "frame {frame} cancelRequest targets unknown prior canonical request ID {id}"
-                    ));
+                let target_kind = {
+                    let Some(target) = self.requests.get_mut(&id) else {
+                        return Err(format!(
+                            "frame {frame} cancelRequest targets unknown prior canonical request ID {id}"
+                        ));
+                    };
+                    if let Some(first_cancel) = target.cancelled_at {
+                        return Err(format!(
+                            "frame {frame} repeats cancellation of request ID {id}; first cancellation was frame {first_cancel}"
+                        ));
+                    }
+                    target.cancelled_at = Some(frame);
+                    target.kind
                 };
-                if let Some(first_cancel) = self.cancelled_requests.get(&id) {
-                    return Err(format!(
-                        "frame {frame} repeats cancellation of request ID {id}; first cancellation was frame {first_cancel}"
-                    ));
-                }
-                self.cancelled_requests.insert(id, frame);
                 Self::bump(&mut self.cancellations, "cancelRequest")?;
-                match target.kind {
+                match target_kind {
                     RequestKind::DiagnosticWait => Self::bump(
                         &mut self.diagnostic_wait_cancellation_targets,
                         "diagnostic-wait cancellation target",
@@ -655,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_duplicate_cancellations_are_refused() {
+    fn unknown_and_duplicate_cancellations_are_refused_without_duplicate_id_storage() {
         let unknown = session(&[r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#]);
         assert!(
             validate_client_session_bytes(&unknown)
