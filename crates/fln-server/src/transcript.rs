@@ -31,6 +31,9 @@ pub struct TranscriptStats {
     pub frames: u64,
     pub requests: u64,
     pub notifications: u64,
+    /// Complete bytes consumed from the framed wire, including headers and separators.
+    pub wire_bytes: u64,
+    /// JSON body bytes only, retained separately to expose framing overhead.
     pub body_bytes: u64,
 }
 
@@ -177,6 +180,7 @@ where
         let frame = validate_frame(&body, frame_index)?;
         visitor(&frame)?;
         stats.frames = frame_index;
+        stats.wire_bytes = input.wire_bytes;
         stats.body_bytes = stats
             .body_bytes
             .checked_add(frame.body_bytes)
@@ -221,11 +225,15 @@ pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptStats, String> {
 pub fn render_validation(stats: TranscriptStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-transcript-validation/1\",",
+            "{\"schema\":\"fln.lsp-transcript-validation/2\",",
             "\"frames\":{},\"requests\":{},\"notifications\":{},",
-            "\"bodyBytes\":{}}}\n"
+            "\"wireBytes\":{},\"bodyBytes\":{}}}\n"
         ),
-        stats.frames, stats.requests, stats.notifications, stats.body_bytes
+        stats.frames,
+        stats.requests,
+        stats.notifications,
+        stats.wire_bytes,
+        stats.body_bytes
     )
 }
 
@@ -265,12 +273,14 @@ mod tests {
         for body in bodies {
             bytes.extend(frame(body));
         }
+        let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
         assert_eq!(
             validate_bytes(&bytes).unwrap(),
             TranscriptStats {
                 frames: 4,
                 requests: 2,
                 notifications: 2,
+                wire_bytes: expected_wire_bytes,
                 body_bytes: expected_body_bytes,
             }
         );
@@ -340,6 +350,7 @@ mod tests {
     fn visitor_observes_validated_frames_in_wire_order() {
         let mut transcript = frame(r#"{"jsonrpc":"2.0","id":"a","method":"first"}"#);
         transcript.extend(frame(r#"{"jsonrpc":"2.0","method":"second"}"#));
+        let expected_wire_bytes = u64::try_from(transcript.len()).unwrap();
         let mut observed = Vec::new();
         let stats = visit_reader(
             &mut BufReader::new(Cursor::new(transcript)),
@@ -358,6 +369,7 @@ mod tests {
             ]
         );
         assert_eq!(stats.frames, 2);
+        assert_eq!(stats.wire_bytes, expected_wire_bytes);
     }
 
     #[test]
@@ -386,6 +398,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.frames, 1);
+        assert_eq!(stats.wire_bytes, one_len);
         assert_eq!(stats.body_bytes, u64::try_from(body.len()).unwrap());
     }
 }

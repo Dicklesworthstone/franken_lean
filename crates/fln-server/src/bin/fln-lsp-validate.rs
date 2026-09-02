@@ -125,6 +125,7 @@ mod tests {
         for body in bodies {
             bytes.extend(frame(body));
         }
+        let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
         let stats = transcript::validate_reader(&mut BufReader::new(Cursor::new(bytes))).unwrap();
         assert_eq!(
             stats,
@@ -132,13 +133,14 @@ mod tests {
                 frames: 4,
                 requests: 2,
                 notifications: 2,
+                wire_bytes: expected_wire_bytes,
                 body_bytes: expected_body_bytes,
             }
         );
         assert_eq!(
             transcript::render_validation(stats),
             format!(
-                "{{\"schema\":\"fln.lsp-transcript-validation/1\",\"frames\":4,\"requests\":2,\"notifications\":2,\"bodyBytes\":{expected_body_bytes}}}\n"
+                "{{\"schema\":\"fln.lsp-transcript-validation/2\",\"frames\":4,\"requests\":2,\"notifications\":2,\"wireBytes\":{expected_wire_bytes},\"bodyBytes\":{expected_body_bytes}}}\n"
             )
         );
     }
