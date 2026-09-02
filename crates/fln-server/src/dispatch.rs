@@ -20,8 +20,9 @@ use json::{
 use session::{DocumentSession, RetentionOutcome, SessionRefusal};
 use wire::{
     REQUEST_FAILED_CODE, SERVER_NOT_INITIALIZED_CODE, clear_diagnostics_notification,
-    error_response, error_response_null_id, file_progress_notification, initialize_response,
-    invalid_request_response, log_warning, null_response,
+    diagnostic_callback_failure_notification, error_response, error_response_null_id,
+    file_progress_notification, initialize_response, invalid_request_response, log_warning,
+    null_response,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,11 @@ fn write_retention_outcome(
     Ok(())
 }
 
+fn is_terminal_diagnostic_message(message: &str) -> bool {
+    message.contains("\"method\":\"textDocument/publishDiagnostics\"")
+        || message.contains("\"method\":\"$/lean/diagnosticOutcome\"")
+}
+
 fn check_document(
     output: &mut dyn Write,
     uri: &str,
@@ -67,8 +73,16 @@ fn check_document(
     on_did_open: &mut OnDidOpen,
 ) -> io::Result<()> {
     write_protocol_message(output, file_progress_notification(uri, true))?;
-    for notification in on_did_open(uri, content) {
+    let notifications = on_did_open(uri, content);
+    let has_terminal_outcome = notifications
+        .iter()
+        .any(|message| is_terminal_diagnostic_message(message));
+    for notification in notifications {
         transport::write_message(output, notification.as_bytes())?;
+    }
+    if !has_terminal_outcome {
+        write_protocol_message(output, clear_diagnostics_notification(uri))?;
+        write_protocol_message(output, diagnostic_callback_failure_notification(uri))?;
     }
     write_protocol_message(output, file_progress_notification(uri, false))
 }
@@ -746,6 +760,29 @@ mod tests {
         assert!(outcome.clean);
         assert!(output.contains("\"id\":\"rpc\",\"error\":{\"code\":-32803"));
         assert!(output.contains("Lean RPC sessions are not implemented"));
+    }
+
+    #[test]
+    fn empty_diagnostic_callback_is_visible_and_clears_stale_state() {
+        let mut input = Vec::new();
+        for message in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#,
+            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+            r#"{"jsonrpc":"2.0","method":"exit"}"#,
+        ] {
+            send(&mut input, message);
+        }
+        let mut reader = BufReader::new(input.as_slice());
+        let mut output = Vec::new();
+        let outcome = serve(&mut reader, &mut output, &mut |_, _| Vec::new())
+            .expect("serve test session");
+        let output = String::from_utf8(output).expect("UTF-8 protocol output");
+        assert!(outcome.clean);
+        assert!(output.contains("diagnostic-callback-terminal-message"));
+        assert!(output.contains("\"authority\":false"));
+        assert!(output.contains("\"uri\":\"file:///x\",\"diagnostics\":[]"));
     }
 
     #[test]
