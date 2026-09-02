@@ -16,6 +16,25 @@ pub enum TranscriptRole {
     Notification,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptParamsKind {
+    Missing,
+    Object,
+    Array,
+    Null,
+}
+
+impl TranscriptParamsKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::Null => "null",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFrame {
     pub index: u64,
@@ -23,6 +42,7 @@ pub struct TranscriptFrame {
     pub method: String,
     /// Exact JSON representation of a request ID; absent for notifications.
     pub id_json: Option<String>,
+    pub params_kind: TranscriptParamsKind,
     pub body_bytes: u64,
 }
 
@@ -53,10 +73,35 @@ enum KnownMethodRole {
     Notification,
 }
 
-fn known_method_role(method: &str) -> Option<KnownMethodRole> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownParamsContract {
+    Object,
+    OptionalEmpty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KnownMethodContract {
+    role: KnownMethodRole,
+    params: KnownParamsContract,
+}
+
+const fn request(params: KnownParamsContract) -> KnownMethodContract {
+    KnownMethodContract {
+        role: KnownMethodRole::Request,
+        params,
+    }
+}
+
+const fn notification(params: KnownParamsContract) -> KnownMethodContract {
+    KnownMethodContract {
+        role: KnownMethodRole::Notification,
+        params,
+    }
+}
+
+fn known_method_contract(method: &str) -> Option<KnownMethodContract> {
     match method {
         "initialize"
-        | "shutdown"
         | "$/lean/plainGoal"
         | "$/lean/plainTermGoal"
         | "$/lean/rpc/connect"
@@ -64,16 +109,17 @@ fn known_method_role(method: &str) -> Option<KnownMethodRole> {
         | "textDocument/completion"
         | "textDocument/definition"
         | "textDocument/hover"
-        | "textDocument/waitForDiagnostics" => Some(KnownMethodRole::Request),
+        | "textDocument/waitForDiagnostics" => Some(request(KnownParamsContract::Object)),
+        "shutdown" => Some(request(KnownParamsContract::OptionalEmpty)),
         "initialized"
-        | "exit"
         | "$/cancelRequest"
         | "$/lean/rpc/keepAlive"
         | "$/lean/rpc/release"
         | "textDocument/didOpen"
         | "textDocument/didChange"
         | "textDocument/didSave"
-        | "textDocument/didClose" => Some(KnownMethodRole::Notification),
+        | "textDocument/didClose" => Some(notification(KnownParamsContract::Object)),
+        "exit" => Some(notification(KnownParamsContract::OptionalEmpty)),
         _ => None,
     }
 }
@@ -119,22 +165,48 @@ impl ClientLifecycleValidator {
         }
     }
 
-    fn validate_role(frame: &TranscriptFrame) -> Result<(), String> {
-        match (known_method_role(&frame.method), frame.role) {
-            (Some(KnownMethodRole::Request), TranscriptRole::Notification) => Err(format!(
-                "frame {} sends request-only method {:?} as a notification",
-                frame.index, frame.method
+    fn validate_contract(frame: &TranscriptFrame) -> Result<(), String> {
+        let Some(contract) = known_method_contract(&frame.method) else {
+            return Ok(());
+        };
+        match (contract.role, frame.role) {
+            (KnownMethodRole::Request, TranscriptRole::Notification) => {
+                return Err(format!(
+                    "frame {} sends request-only method {:?} as a notification",
+                    frame.index, frame.method
+                ));
+            }
+            (KnownMethodRole::Notification, TranscriptRole::Request) => {
+                return Err(format!(
+                    "frame {} sends notification-only method {:?} as a request",
+                    frame.index, frame.method
+                ));
+            }
+            _ => {}
+        }
+        match (contract.params, frame.params_kind) {
+            (KnownParamsContract::Object, TranscriptParamsKind::Object)
+            | (
+                KnownParamsContract::OptionalEmpty,
+                TranscriptParamsKind::Missing | TranscriptParamsKind::Null,
+            ) => Ok(()),
+            (KnownParamsContract::Object, observed) => Err(format!(
+                "frame {} method {:?} requires object params, observed {}",
+                frame.index,
+                frame.method,
+                observed.name()
             )),
-            (Some(KnownMethodRole::Notification), TranscriptRole::Request) => Err(format!(
-                "frame {} sends notification-only method {:?} as a request",
-                frame.index, frame.method
+            (KnownParamsContract::OptionalEmpty, observed) => Err(format!(
+                "frame {} method {:?} permits only missing or null params, observed {}",
+                frame.index,
+                frame.method,
+                observed.name()
             )),
-            _ => Ok(()),
         }
     }
 
     fn observe(&mut self, frame: &TranscriptFrame) -> Result<(), String> {
-        Self::validate_role(frame)?;
+        Self::validate_contract(frame)?;
         match self.state {
             ClientLifecycleState::BeforeInitialize => {
                 if frame.method != "initialize" {
@@ -298,19 +370,26 @@ pub fn validate_frame(body: &[u8], frame: u64) -> Result<TranscriptFrame, String
             return Err(format!("frame {frame} has a non-string method"));
         }
     };
-    match envelope.params {
-        RawField::Missing => {}
+    let params_kind = match envelope.params {
+        RawField::Missing => TranscriptParamsKind::Missing,
+        RawField::Value(value) if value.trim_start().starts_with('{') => {
+            TranscriptParamsKind::Object
+        }
+        RawField::Value(value) if value.trim_start().starts_with('[') => {
+            TranscriptParamsKind::Array
+        }
         RawField::Value(value)
-            if matches!(value.trim_start().as_bytes().first(), Some(b'{' | b'[')) => {}
-        RawField::Value(value)
-            if value.trim() == "null" && matches!(method.as_str(), "shutdown" | "exit") => {}
+            if value.trim() == "null" && matches!(method.as_str(), "shutdown" | "exit") =>
+        {
+            TranscriptParamsKind::Null
+        }
         RawField::Value(_) => {
             return Err(format!(
                 "frame {frame} params must be an object or array when present; only shutdown/exit may use null"
             ));
         }
         RawField::Invalid => return Err(format!("frame {frame} has ambiguous params")),
-    }
+    };
     let (role, id_json) = match envelope.id {
         RequestIdField::Absent => (TranscriptRole::Notification, None),
         RequestIdField::Valid(id) => (TranscriptRole::Request, Some(id.as_json())),
@@ -325,6 +404,7 @@ pub fn validate_frame(body: &[u8], frame: u64) -> Result<TranscriptFrame, String
         role,
         method,
         id_json,
+        params_kind,
         body_bytes,
     })
 }
@@ -529,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_summary_preserves_lexical_id_and_role() {
+    fn frame_summary_preserves_lexical_id_role_and_params_kind() {
         let request = validate_frame(
             br#"{"jsonrpc":"2.0","id":1.25e2,"method":"shutdown","params":null}"#,
             7,
@@ -539,14 +619,30 @@ mod tests {
         assert_eq!(request.role, TranscriptRole::Request);
         assert_eq!(request.method, "shutdown");
         assert_eq!(request.id_json.as_deref(), Some("1.25e2"));
+        assert_eq!(request.params_kind, TranscriptParamsKind::Null);
 
         let notification = validate_frame(
-            br#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+            br#"{"jsonrpc":"2.0","method":"exit"}"#,
             8,
         )
         .unwrap();
         assert_eq!(notification.role, TranscriptRole::Notification);
         assert_eq!(notification.id_json, None);
+        assert_eq!(notification.params_kind, TranscriptParamsKind::Missing);
+
+        let object = validate_frame(
+            br#"{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}}"#,
+            9,
+        )
+        .unwrap();
+        assert_eq!(object.params_kind, TranscriptParamsKind::Object);
+
+        let array = validate_frame(
+            br#"{"jsonrpc":"2.0","id":10,"method":"extension/method","params":[]}"#,
+            10,
+        )
+        .unwrap();
+        assert_eq!(array.params_kind, TranscriptParamsKind::Array);
     }
 
     #[test]
@@ -653,10 +749,14 @@ mod tests {
         assert_eq!(stats.initialized_frame, 2);
         assert_eq!(stats.shutdown_frame, 4);
         assert_eq!(stats.exit_frame, 5);
-        assert_eq!(stats.transcript.wire_bytes, bytes.len() as u64);
-        assert!(render_client_lifecycle_validation(stats).contains(
-            "\"schema\":\"fln.lsp-client-lifecycle/1\""
-        ));
+        assert_eq!(
+            stats.transcript.wire_bytes,
+            u64::try_from(bytes.len()).unwrap()
+        );
+        assert!(
+            render_client_lifecycle_validation(stats)
+                .contains("\"schema\":\"fln.lsp-client-lifecycle/1\"")
+        );
     }
 
     #[test]
@@ -678,6 +778,52 @@ mod tests {
                 error.contains("request-only") || error.contains("notification-only"),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn client_lifecycle_rejects_known_parameter_shape_mismatches() {
+        let cases = [
+            (
+                vec![r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":[]}"#],
+                "requires object params",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized"}"#,
+                ],
+                "requires object params",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":[]}"#,
+                ],
+                "requires object params",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}"#,
+                ],
+                "permits only missing or null params",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+                    r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#,
+                ],
+                "permits only missing or null params",
+            ),
+        ];
+        for (bodies, expected) in cases {
+            let error = validate_client_lifecycle_bytes(&framed(&bodies)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
         }
     }
 
@@ -742,9 +888,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"workspace/futureNotification","params":{}}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"workspace/futureRequest","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"workspace/futureRequest","params":[]}"#,
             r#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#,
-            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit"}"#,
         ]);
         assert!(validate_client_lifecycle_bytes(&bytes).is_ok());
     }
