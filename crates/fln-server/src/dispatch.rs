@@ -68,7 +68,8 @@ struct CheckedVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallbackMessageClass {
-    PrimaryTerminal,
+    CurrentDiagnostics,
+    DiagnosticOutcome(DiagnosticCompletion),
     Auxiliary,
     Invalid,
 }
@@ -93,6 +94,16 @@ fn write_retention_outcome(
     Ok(())
 }
 
+fn canonical_outcome_authority(message: &str) -> Option<bool> {
+    let true_count = message.matches("\"authority\":true").count();
+    let false_count = message.matches("\"authority\":false").count();
+    match (true_count, false_count) {
+        (1, 0) => Some(true),
+        (0, 1) => Some(false),
+        _ => None,
+    }
+}
+
 fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessageClass {
     let Ok(envelope) = parse_envelope(message) else {
         return CallbackMessageClass::Invalid;
@@ -112,12 +123,20 @@ fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessa
     }
     match method.as_str() {
         "$/lean/diagnosticOutcome" => match envelope.params {
-            RawField::Value(_) => CallbackMessageClass::PrimaryTerminal,
+            RawField::Value(_) => match canonical_outcome_authority(message) {
+                Some(true) => {
+                    CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Complete)
+                }
+                Some(false) => {
+                    CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Failed)
+                }
+                None => CallbackMessageClass::Invalid,
+            },
             RawField::Missing | RawField::Invalid => CallbackMessageClass::Invalid,
         },
         "textDocument/publishDiagnostics" => match direct_uri(envelope.params) {
             DecodedField::Valid(uri) if uri == document_uri => {
-                CallbackMessageClass::PrimaryTerminal
+                CallbackMessageClass::CurrentDiagnostics
             }
             DecodedField::Valid(_) => CallbackMessageClass::Auxiliary,
             DecodedField::Missing | DecodedField::Invalid => CallbackMessageClass::Invalid,
@@ -138,12 +157,30 @@ fn check_document(
         .iter()
         .map(|message| classify_callback_message(message, uri))
         .collect::<Vec<_>>();
-    let primary_count = classes
+    let diagnostic_count = classes
         .iter()
-        .filter(|class| **class == CallbackMessageClass::PrimaryTerminal)
+        .filter(|class| **class == CallbackMessageClass::CurrentDiagnostics)
         .count();
+    let outcomes = classes
+        .iter()
+        .filter_map(|class| match class {
+            CallbackMessageClass::DiagnosticOutcome(completion) => Some(*completion),
+            CallbackMessageClass::CurrentDiagnostics
+            | CallbackMessageClass::Auxiliary
+            | CallbackMessageClass::Invalid => None,
+        })
+        .collect::<Vec<_>>();
     let invalid = classes.contains(&CallbackMessageClass::Invalid);
-    let complete = !invalid && primary_count == 1;
+    let ambiguous = diagnostic_count > 1 || outcomes.len() > 1;
+    let has_terminal = diagnostic_count == 1 || outcomes.len() == 1;
+    let completion = outcomes.first().copied().unwrap_or_else(|| {
+        if diagnostic_count == 1 {
+            DiagnosticCompletion::Complete
+        } else {
+            DiagnosticCompletion::Failed
+        }
+    });
+    let callback_valid = !invalid && !ambiguous && has_terminal;
 
     if invalid {
         write_warning(
@@ -151,24 +188,28 @@ fn check_document(
             "FrankenLean discarded malformed diagnostic callback output",
         )?;
     }
+    if ambiguous {
+        write_warning(
+            output,
+            "FrankenLean refused ambiguous diagnostic callback output with duplicate terminal message classes",
+        )?;
+    }
     for (notification, class) in notifications.into_iter().zip(classes) {
-        if class == CallbackMessageClass::Auxiliary || (!invalid && primary_count == 1) {
+        if callback_valid || class == CallbackMessageClass::Auxiliary {
             transport::write_message(output, notification.as_bytes())?;
         }
     }
-    if !complete {
-        if primary_count > 1 {
-            write_warning(
-                output,
-                "FrankenLean refused ambiguous diagnostic callback output with multiple primary terminal messages",
-            )?;
+    if callback_valid {
+        if diagnostic_count == 0 || completion == DiagnosticCompletion::Failed {
+            write_protocol_message(output, clear_diagnostics_notification(uri))?;
         }
+    } else {
         write_protocol_message(output, clear_diagnostics_notification(uri))?;
         write_protocol_message(output, diagnostic_callback_failure_notification(uri))?;
     }
     write_protocol_message(output, file_progress_notification(uri, false))?;
-    Ok(if complete {
-        DiagnosticCompletion::Complete
+    Ok(if callback_valid {
+        completion
     } else {
         DiagnosticCompletion::Failed
     })
@@ -1172,6 +1213,50 @@ mod tests {
         assert!(output.contains("discarded malformed diagnostic callback output"));
         assert!(!output.contains("{malformed-callback"));
         assert!(output.contains("diagnostic-callback-terminal-message"));
+    }
+
+    #[test]
+    fn canonical_complete_outcome_can_pair_with_explicit_diagnostic_clearing() {
+        let (outcome, output) = run_session_with_callback(
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#,
+                r#"{"jsonrpc":"2.0","id":"ready","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":1}}"#,
+            ],
+            &mut |uri, _| {
+                vec![
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+                        crate::json_string(uri)
+                    ),
+                    r#"{"jsonrpc":"2.0","method":"$/lean/diagnosticOutcome","params":{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":0}}"#.to_string(),
+                ]
+            },
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"ready\",\"result\":{}"));
+        assert!(!output.contains("duplicate terminal message classes"));
+    }
+
+    #[test]
+    fn non_authoritative_outcome_fails_wait_even_with_an_explicit_clear() {
+        let (outcome, output) = run_session_with_callback(
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#,
+                r#"{"jsonrpc":"2.0","id":"failed","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":1}}"#,
+            ],
+            &mut |uri, _| {
+                vec![
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+                        crate::json_string(uri)
+                    ),
+                    r#"{"jsonrpc":"2.0","method":"$/lean/diagnosticOutcome","params":{"schema":"fln.diagnostic-projection/1","outcome":"inconclusive","authority":false,"causeClass":"source-check"}}"#.to_string(),
+                ]
+            },
+        );
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"failed\",\"error\":{\"code\":-32803"));
+        assert!(output.contains("\"authority\":false"));
     }
 
     #[test]
