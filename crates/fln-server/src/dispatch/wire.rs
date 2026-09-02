@@ -1,3 +1,5 @@
+use fln_core::diag::DIAGNOSTIC_PROJECTION_SCHEMA;
+
 use crate::{LSP_POSITION_ENCODING, json_string};
 
 use super::json::RequestId;
@@ -79,9 +81,47 @@ pub(super) fn clear_diagnostics_notification(uri: &str) -> String {
     )
 }
 
+pub(super) fn diagnostic_callback_failure_notification(uri: &str) -> String {
+    format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"$/lean/diagnosticOutcome\",",
+            "\"params\":{{\"schema\":{},\"outcome\":\"internal_fault\",",
+            "\"authority\":false,\"invariant\":\"diagnostic-callback-terminal-message\",",
+            "\"uri\":{},\"detail\":{{\"text\":",
+            "\"document check returned no terminal diagnostic outcome\",",
+            "\"truncated\":false}}}}}}"
+        ),
+        json_string(DIAGNOSTIC_PROJECTION_SCHEMA),
+        json_string(uri)
+    )
+}
+
 pub(super) fn log_warning(message: &str) -> String {
     format!(
         "{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{{\"type\":2,\"message\":{}}}}}",
         json_string(message)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_advertises_the_actual_full_sync_coordinate_contract() {
+        let message = initialize_response(&RequestId::Number("17".to_string()));
+        assert!(message.contains("\"id\":17"));
+        assert!(message.contains("\"positionEncoding\":\"utf-16\""));
+        assert!(message.contains("\"change\":1"));
+        assert!(message.contains("\"includeText\":true"));
+    }
+
+    #[test]
+    fn missing_terminal_diagnostic_is_non_authoritative_and_uri_bound() {
+        let message = diagnostic_callback_failure_notification("file:///x y.lean");
+        assert!(message.contains("\"outcome\":\"internal_fault\""));
+        assert!(message.contains("\"authority\":false"));
+        assert!(message.contains("diagnostic-callback-terminal-message"));
+        assert!(message.contains("file:///x y.lean"));
+    }
 }
