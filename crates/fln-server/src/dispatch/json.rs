@@ -48,6 +48,13 @@ pub(super) enum VersionField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BooleanField {
+    Missing,
+    Valid(bool),
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EnvelopeError {
     MalformedJson,
     NotObject,
@@ -556,6 +563,23 @@ fn decoded_integer_field(object: RawField<'_>, key: &str) -> VersionField {
     }
 }
 
+fn decoded_boolean_field(object: RawField<'_>, key: &str) -> BooleanField {
+    let raw = match object {
+        RawField::Value(value) => object_field(value, key),
+        RawField::Missing => RawField::Missing,
+        RawField::Invalid => RawField::Invalid,
+    };
+    match raw {
+        RawField::Missing => BooleanField::Missing,
+        RawField::Invalid => BooleanField::Invalid,
+        RawField::Value(value) => match value.trim() {
+            "true" => BooleanField::Valid(true),
+            "false" => BooleanField::Valid(false),
+            _ => BooleanField::Invalid,
+        },
+    }
+}
+
 pub(super) fn text_document_uri(params: RawField<'_>) -> DecodedField {
     decoded_string_field(text_document_object(params), "uri")
 }
@@ -578,6 +602,10 @@ pub(super) fn direct_uri(params: RawField<'_>) -> DecodedField {
 
 pub(super) fn direct_version(params: RawField<'_>) -> VersionField {
     decoded_integer_field(params_object(params), "version")
+}
+
+pub(super) fn direct_authority(params: RawField<'_>) -> BooleanField {
+    decoded_boolean_field(params_object(params), "authority")
 }
 
 pub(super) fn direct_request_id(params: RawField<'_>) -> RequestIdField {
@@ -705,20 +733,46 @@ mod tests {
 
     #[test]
     fn direct_params_fields_are_exact_and_ambiguity_safe() {
-        let params = RawField::Value(r#"{"uri":"file:///x","version":3,"id":"wait"}"#);
+        let params = RawField::Value(
+            r#"{"uri":"file:///x","version":3,"id":"wait","authority":true}"#,
+        );
         assert_eq!(
             direct_uri(params),
             DecodedField::Valid("file:///x".to_string())
         );
         assert_eq!(direct_version(params), VersionField::Valid(3));
+        assert_eq!(direct_authority(params), BooleanField::Valid(true));
         assert_eq!(
             direct_request_id(params),
             RequestIdField::Valid(RequestId::Text("wait".to_string()))
         );
 
-        let duplicate = RawField::Value(r#"{"uri":"a","uri":"b","version":1,"id":1,"id":2}"#);
+        let duplicate = RawField::Value(
+            r#"{"uri":"a","uri":"b","version":1,"id":1,"id":2,"authority":true,"\u0061uthority":false}"#,
+        );
         assert_eq!(direct_uri(duplicate), DecodedField::Invalid);
         assert_eq!(direct_request_id(duplicate), RequestIdField::Invalid);
+        assert_eq!(direct_authority(duplicate), BooleanField::Invalid);
+    }
+
+    #[test]
+    fn direct_authority_is_a_top_level_unambiguous_boolean() {
+        assert_eq!(
+            direct_authority(RawField::Value(
+                r#"{"authority":false,"detail":{"authority":true},"message":"\"authority\":true"}"#,
+            )),
+            BooleanField::Valid(false)
+        );
+        assert_eq!(
+            direct_authority(RawField::Value(r#"{"authority":"true"}"#)),
+            BooleanField::Invalid
+        );
+        assert_eq!(
+            direct_authority(RawField::Value(r#"{"detail":{"authority":true}}"#)),
+            BooleanField::Missing
+        );
+        assert_eq!(direct_authority(RawField::Missing), BooleanField::Missing);
+        assert_eq!(direct_authority(RawField::Invalid), BooleanField::Invalid);
     }
 
     #[test]
