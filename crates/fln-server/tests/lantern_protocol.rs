@@ -177,6 +177,55 @@ fn empty_callback_cannot_masquerade_as_a_clean_diagnostic_result() {
 }
 
 #[test]
+fn callback_terminal_detection_is_structural_and_uri_bound() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Primary.lean","version":1,"text":"source"}}}"#,
+    ]);
+    let (outcome, output) = run(input, &mut |_, _| {
+        vec![
+            r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"\"method\":\"textDocument/publishDiagnostics\""}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///Other.lean","diagnostics":[]}}"#.to_string(),
+        ]
+    });
+
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("\"uri\":\"file:///Other.lean\"")
+            && message.contains("textDocument/publishDiagnostics")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"uri\":\"file:///Primary.lean\"")
+            && message.contains("\"diagnostics\":[]")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("diagnostic-callback-terminal-message")
+            && message.contains("\"authority\":false")
+    }));
+}
+
+#[test]
+fn malformed_callback_output_is_withheld_and_faulted() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Fault.lean","version":1,"text":"source"}}}"#,
+    ]);
+    let (outcome, output) = run(input, &mut |_, _| {
+        vec!["{malformed-callback".to_string()]
+    });
+
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("discarded malformed diagnostic callback output")
+    }));
+    assert!(!output
+        .iter()
+        .any(|message| message.contains("{malformed-callback")));
+    assert!(output.iter().any(|message| {
+        message.contains("diagnostic-callback-terminal-message")
+            && message.contains("\"authority\":false")
+    }));
+}
+
+#[test]
 fn request_notification_roles_and_server_state_fail_closed() {
     let mut input = Vec::new();
     for message in [
@@ -246,7 +295,71 @@ fn wait_for_diagnostics_completes_only_after_requested_publication() {
 }
 
 #[test]
-fn pending_waits_cancel_or_fail_exactly_once() {
+fn waits_follow_terminal_authority_and_can_recover_at_the_same_version() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Wait.lean","version":1,"text":"v1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"failed","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":1}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///Wait.lean"},"text":"v1"}}"#,
+        r#"{"jsonrpc":"2.0","id":"recovered","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":1}}"#,
+    ]);
+    let mut callback_count = 0usize;
+    let (outcome, output) = run(input, &mut |uri, _| {
+        callback_count += 1;
+        if callback_count == 1 {
+            Vec::new()
+        } else {
+            vec![format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+                fln_server::json_string(uri)
+            )]
+        }
+    });
+
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":\"failed\"") && message.contains("\"code\":-32803")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":\"recovered\"")
+            && message.contains("\"result\":{}")
+    }));
+}
+
+#[test]
+fn future_wait_fails_when_target_publication_is_nonauthoritative() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Wait.lean","version":1,"text":"v1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"future","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":2}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Wait.lean","version":2},"contentChanges":[{"text":"v2"}]}}"#,
+    ]);
+    let mut callback_count = 0usize;
+    let (outcome, output) = run(input, &mut |uri, _| {
+        callback_count += 1;
+        if callback_count == 1 {
+            vec![format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+                fln_server::json_string(uri)
+            )]
+        } else {
+            Vec::new()
+        }
+    });
+
+    assert!(outcome.clean);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|message| message.contains("\"id\":\"future\""))
+            .count(),
+        1
+    );
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":\"future\"") && message.contains("\"code\":-32803")
+    }));
+}
+
+#[test]
+fn pending_waits_cancel_close_or_shutdown_exactly_once() {
     let input = protocol_session(&[
         r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Wait.lean","version":1,"text":"v1"}}}"#,
         r#"{"jsonrpc":"2.0","id":"cancelled","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":9}}"#,
@@ -283,5 +396,33 @@ fn pending_waits_cancel_or_fail_exactly_once() {
         message.contains("\"id\":\"closed\"")
             && message.contains("\"code\":-32803")
             && message.contains("document closed before the requested diagnostics version")
+    }));
+}
+
+#[test]
+fn pending_wait_is_failed_once_by_shutdown() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Wait.lean","version":1,"text":"v1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown-wait","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":99}}"#,
+    ]);
+    let (outcome, output) = run(input, &mut |uri, _| {
+        vec![format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+            fln_server::json_string(uri)
+        )]
+    });
+
+    assert!(outcome.clean);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|message| message.contains("\"id\":\"shutdown-wait\""))
+            .count(),
+        1
+    );
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":\"shutdown-wait\"")
+            && message.contains("\"code\":-32803")
+            && message.contains("server shut down before the requested diagnostics version")
     }));
 }
