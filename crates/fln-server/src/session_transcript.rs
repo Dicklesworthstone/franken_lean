@@ -10,6 +10,8 @@ use crate::transcript::{self, ClientLifecycleStats};
 
 pub const MAX_SESSION_DOCUMENTS: usize = 1024;
 pub const MAX_SESSION_URI_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SESSION_REQUEST_IDS: usize = 262_144;
+pub const MAX_SESSION_REQUEST_ID_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSessionStats {
@@ -22,6 +24,10 @@ pub struct ClientSessionStats {
     pub covered_version_waits: u64,
     pub future_version_waits: u64,
     pub cancellations: u64,
+    pub diagnostic_wait_cancellation_targets: u64,
+    pub other_request_cancellation_targets: u64,
+    pub unique_request_ids: u64,
+    pub request_id_bytes: u64,
     pub peak_open_documents: u64,
     pub final_open_documents: u64,
     pub peak_open_uri_bytes: u64,
@@ -35,7 +41,19 @@ enum DocumentEvent {
     Save { uri: String },
     Close { uri: String },
     Wait { uri: String, version: i64 },
-    Cancel,
+    Cancel { id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    DiagnosticWait,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestRecord {
+    frame: u64,
+    kind: RequestKind,
 }
 
 fn decoded_uri(field: DecodedField, label: &str) -> Result<String, String> {
@@ -121,8 +139,11 @@ fn document_event(method: &str, params: RawField<'_>) -> Result<Option<DocumentE
             Ok(Some(DocumentEvent::Wait { uri, version }))
         }
         "$/cancelRequest" => match direct_request_id(params) {
-            RequestIdField::Valid(RequestId::Number(_) | RequestId::Text(_)) => {
-                Ok(Some(DocumentEvent::Cancel))
+            RequestIdField::Valid(RequestId::Number(_) | RequestId::Text(_)) as id => {
+                let RequestIdField::Valid(id) = id else {
+                    unreachable!();
+                };
+                Ok(Some(DocumentEvent::Cancel { id: id.as_json() }))
             }
             RequestIdField::Valid(RequestId::Null) => {
                 Err("$/cancelRequest id must not be null".to_string())
@@ -139,9 +160,14 @@ fn document_event(method: &str, params: RawField<'_>) -> Result<Option<DocumentE
 #[derive(Debug)]
 struct ClientSessionValidator {
     documents: BTreeMap<String, i64>,
+    requests: BTreeMap<String, RequestRecord>,
+    cancelled_requests: BTreeMap<String, u64>,
     open_uri_bytes: usize,
+    request_id_bytes: usize,
     max_documents: usize,
     max_uri_bytes: usize,
+    max_request_ids: usize,
+    max_request_id_bytes: usize,
     documents_opened: u64,
     documents_changed: u64,
     documents_saved: u64,
@@ -150,21 +176,47 @@ struct ClientSessionValidator {
     covered_version_waits: u64,
     future_version_waits: u64,
     cancellations: u64,
+    diagnostic_wait_cancellation_targets: u64,
+    other_request_cancellation_targets: u64,
     peak_open_documents: usize,
     peak_open_uri_bytes: usize,
 }
 
 impl ClientSessionValidator {
     fn new() -> Self {
-        Self::with_limits(MAX_SESSION_DOCUMENTS, MAX_SESSION_URI_BYTES)
+        Self::with_all_limits(
+            MAX_SESSION_DOCUMENTS,
+            MAX_SESSION_URI_BYTES,
+            MAX_SESSION_REQUEST_IDS,
+            MAX_SESSION_REQUEST_ID_BYTES,
+        )
     }
 
     fn with_limits(max_documents: usize, max_uri_bytes: usize) -> Self {
-        Self {
-            documents: BTreeMap::new(),
-            open_uri_bytes: 0,
+        Self::with_all_limits(
             max_documents,
             max_uri_bytes,
+            MAX_SESSION_REQUEST_IDS,
+            MAX_SESSION_REQUEST_ID_BYTES,
+        )
+    }
+
+    fn with_all_limits(
+        max_documents: usize,
+        max_uri_bytes: usize,
+        max_request_ids: usize,
+        max_request_id_bytes: usize,
+    ) -> Self {
+        Self {
+            documents: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            cancelled_requests: BTreeMap::new(),
+            open_uri_bytes: 0,
+            request_id_bytes: 0,
+            max_documents,
+            max_uri_bytes,
+            max_request_ids,
+            max_request_id_bytes,
             documents_opened: 0,
             documents_changed: 0,
             documents_saved: 0,
@@ -173,6 +225,8 @@ impl ClientSessionValidator {
             covered_version_waits: 0,
             future_version_waits: 0,
             cancellations: 0,
+            diagnostic_wait_cancellation_targets: 0,
+            other_request_cancellation_targets: 0,
             peak_open_documents: 0,
             peak_open_uri_bytes: 0,
         }
@@ -185,7 +239,66 @@ impl ClientSessionValidator {
         Ok(())
     }
 
-    fn observe(&mut self, frame: u64, method: &str, params: RawField<'_>) -> Result<(), String> {
+    fn observe_request_id(
+        &mut self,
+        frame: u64,
+        method: &str,
+        id: &RequestIdField,
+    ) -> Result<(), String> {
+        let id = match id {
+            RequestIdField::Absent => return Ok(()),
+            RequestIdField::Invalid => {
+                return Err(format!(
+                    "frame {frame} method {method:?} has an invalid or ambiguous request id"
+                ));
+            }
+            RequestIdField::Valid(id) => id.as_json(),
+        };
+        if let Some(first) = self.requests.get(&id) {
+            return Err(format!(
+                "frame {frame} request ID {id} aliases the canonical ID first used at frame {}; client-session evidence requires unique canonical IDs",
+                first.frame
+            ));
+        }
+        if self.requests.len() >= self.max_request_ids {
+            return Err(format!(
+                "frame {frame} exceeds the {}-request-ID session ceiling",
+                self.max_request_ids
+            ));
+        }
+        let next_bytes = self
+            .request_id_bytes
+            .checked_add(id.len())
+            .ok_or_else(|| format!("frame {frame} request-ID byte accounting overflow"))?;
+        if next_bytes > self.max_request_id_bytes {
+            return Err(format!(
+                "frame {frame} exceeds the {}-byte canonical request-ID ceiling",
+                self.max_request_id_bytes
+            ));
+        }
+        self.request_id_bytes = next_bytes;
+        self.requests.insert(
+            id,
+            RequestRecord {
+                frame,
+                kind: if method == "textDocument/waitForDiagnostics" {
+                    RequestKind::DiagnosticWait
+                } else {
+                    RequestKind::Other
+                },
+            },
+        );
+        Ok(())
+    }
+
+    fn observe(
+        &mut self,
+        frame: u64,
+        id: &RequestIdField,
+        method: &str,
+        params: RawField<'_>,
+    ) -> Result<(), String> {
+        self.observe_request_id(frame, method, id)?;
         let event = document_event(method, params)
             .map_err(|error| format!("frame {frame} method {method:?}: {error}"))?;
         match event {
@@ -266,7 +379,30 @@ impl ClientSessionValidator {
                     Self::bump(&mut self.future_version_waits, "future-version wait")
                 }
             }
-            Some(DocumentEvent::Cancel) => Self::bump(&mut self.cancellations, "cancelRequest"),
+            Some(DocumentEvent::Cancel { id }) => {
+                let Some(target) = self.requests.get(&id).copied() else {
+                    return Err(format!(
+                        "frame {frame} cancelRequest targets unknown prior canonical request ID {id}"
+                    ));
+                };
+                if let Some(first_cancel) = self.cancelled_requests.get(&id) {
+                    return Err(format!(
+                        "frame {frame} repeats cancellation of request ID {id}; first cancellation was frame {first_cancel}"
+                    ));
+                }
+                self.cancelled_requests.insert(id, frame);
+                Self::bump(&mut self.cancellations, "cancelRequest")?;
+                match target.kind {
+                    RequestKind::DiagnosticWait => Self::bump(
+                        &mut self.diagnostic_wait_cancellation_targets,
+                        "diagnostic-wait cancellation target",
+                    ),
+                    RequestKind::Other => Self::bump(
+                        &mut self.other_request_cancellation_targets,
+                        "other-request cancellation target",
+                    ),
+                }
+            }
         }
     }
 
@@ -281,6 +417,24 @@ impl ClientSessionValidator {
                 self.diagnostic_waits
             ));
         }
+        let classified_cancellations = self
+            .diagnostic_wait_cancellation_targets
+            .checked_add(self.other_request_cancellation_targets)
+            .ok_or_else(|| "cancellation-target classification overflow".to_string())?;
+        if classified_cancellations != self.cancellations {
+            return Err(format!(
+                "cancellation-target accounting mismatch: total {}, classified {classified_cancellations}",
+                self.cancellations
+            ));
+        }
+        let unique_request_ids = u64::try_from(self.requests.len())
+            .map_err(|_| "unique request-ID count does not fit u64".to_string())?;
+        if unique_request_ids != lifecycle.transcript.requests {
+            return Err(format!(
+                "request-ID accounting mismatch: retained {unique_request_ids}, lifecycle recorded {} requests",
+                lifecycle.transcript.requests
+            ));
+        }
         Ok(ClientSessionStats {
             lifecycle,
             documents_opened: self.documents_opened,
@@ -291,6 +445,11 @@ impl ClientSessionValidator {
             covered_version_waits: self.covered_version_waits,
             future_version_waits: self.future_version_waits,
             cancellations: self.cancellations,
+            diagnostic_wait_cancellation_targets: self.diagnostic_wait_cancellation_targets,
+            other_request_cancellation_targets: self.other_request_cancellation_targets,
+            unique_request_ids,
+            request_id_bytes: u64::try_from(self.request_id_bytes)
+                .map_err(|_| "canonical request-ID bytes do not fit u64".to_string())?,
             peak_open_documents: u64::try_from(self.peak_open_documents)
                 .map_err(|_| "peak open-document count does not fit u64".to_string())?,
             final_open_documents: u64::try_from(self.documents.len())
@@ -320,14 +479,14 @@ pub fn validate_client_session_bytes(bytes: &[u8]) -> Result<ClientSessionStats,
             EnvelopeError::MalformedJson => format!("frame {frame} contains malformed JSON"),
             EnvelopeError::NotObject => format!("frame {frame} is not a JSON-RPC object"),
         })?;
-        let method = match envelope.method {
-            DecodedField::Valid(method) => method,
+        let method = match &envelope.method {
+            DecodedField::Valid(method) => method.clone(),
             DecodedField::Missing => return Err(format!("frame {frame} is missing a method")),
             DecodedField::Invalid => {
                 return Err(format!("frame {frame} has a non-string method"));
             }
         };
-        validator.observe(frame, &method, envelope.params)?;
+        validator.observe(frame, &envelope.id, &method, envelope.params)?;
     }
     if frame != lifecycle.transcript.frames {
         return Err(format!(
@@ -359,7 +518,8 @@ pub fn validate_client_session_reader(
 pub fn render_client_session_validation(stats: ClientSessionStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-session/2\",\"finalState\":\"exited\",",
+            "{{\"schema\":\"fln.lsp-client-session/3\",\"finalState\":\"exited\",",
+            "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"frames\":{},\"requests\":{},\"notifications\":{},",
             "\"wireBytes\":{},\"bodyBytes\":{},",
             "\"initializeFrame\":{},\"initializedFrame\":{},",
@@ -368,6 +528,10 @@ pub fn render_client_session_validation(stats: ClientSessionStats) -> String {
             "\"documentsSaved\":{},\"documentsClosed\":{},",
             "\"diagnosticWaits\":{},\"coveredVersionWaits\":{},",
             "\"futureVersionWaits\":{},\"cancellations\":{},",
+            "\"diagnosticWaitCancellationTargets\":{},",
+            "\"otherRequestCancellationTargets\":{},",
+            "\"uniqueRequestIds\":{},\"requestIdBytes\":{},",
+            "\"requestIdCountCeiling\":{},\"requestIdByteCeiling\":{},",
             "\"peakOpenDocuments\":{},\"finalOpenDocuments\":{},",
             "\"peakOpenUriBytes\":{},\"finalOpenUriBytes\":{}}}\n"
         ),
@@ -388,6 +552,12 @@ pub fn render_client_session_validation(stats: ClientSessionStats) -> String {
         stats.covered_version_waits,
         stats.future_version_waits,
         stats.cancellations,
+        stats.diagnostic_wait_cancellation_targets,
+        stats.other_request_cancellation_targets,
+        stats.unique_request_ids,
+        stats.request_id_bytes,
+        MAX_SESSION_REQUEST_IDS,
+        MAX_SESSION_REQUEST_ID_BYTES,
         stats.peak_open_documents,
         stats.final_open_documents,
         stats.peak_open_uri_bytes,
@@ -445,13 +615,104 @@ mod tests {
         assert_eq!(stats.covered_version_waits, 0);
         assert_eq!(stats.future_version_waits, 1);
         assert_eq!(stats.cancellations, 1);
+        assert_eq!(stats.diagnostic_wait_cancellation_targets, 1);
+        assert_eq!(stats.other_request_cancellation_targets, 0);
+        assert_eq!(stats.unique_request_ids, 3);
         assert_eq!(stats.peak_open_documents, 1);
         assert_eq!(stats.final_open_documents, 0);
         assert_eq!(stats.final_open_uri_bytes, 0);
         let receipt = render_client_session_validation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/2\""));
-        assert!(receipt.contains("\"documentsChanged\":1"));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/3\""));
+        assert!(receipt.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
         assert!(receipt.contains("\"futureVersionWaits\":1"));
+        assert!(receipt.contains("\"diagnosticWaitCancellationTargets\":1"));
+        assert!(receipt.contains("\"requestIdCountCeiling\":262144"));
+        assert!(receipt.contains("\"requestIdByteCeiling\":33554432"));
+    }
+
+    #[test]
+    fn cancellation_targets_prior_canonical_request_identity() {
+        let escaped = framed(&[
+            r#"{"jsonrpc":"2.0","id":"\u0069nit","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"init"}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let stats = validate_client_session_bytes(&escaped).unwrap();
+        assert_eq!(stats.cancellations, 1);
+        assert_eq!(stats.other_request_cancellation_targets, 1);
+
+        let numeric_alias = framed(&[
+            r#"{"jsonrpc":"2.0","id":1.25e2,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":125}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        assert!(
+            validate_client_session_bytes(&numeric_alias)
+                .unwrap_err()
+                .contains("unknown prior canonical request ID 125")
+        );
+    }
+
+    #[test]
+    fn unknown_and_duplicate_cancellations_are_refused() {
+        let unknown = session(&[r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#]);
+        assert!(
+            validate_client_session_bytes(&unknown)
+                .unwrap_err()
+                .contains("unknown prior canonical request ID")
+        );
+
+        let duplicate = session(&[
+            r#"{"jsonrpc":"2.0","id":"wait","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,
+        ]);
+        assert!(
+            validate_client_session_bytes(&duplicate)
+                .unwrap_err()
+                .contains("repeats cancellation")
+        );
+    }
+
+    #[test]
+    fn canonical_request_ids_are_unique_and_bounded() {
+        let duplicate = framed(&[
+            r#"{"jsonrpc":"2.0","id":"\u0069nit","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"init","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        assert!(
+            validate_client_session_bytes(&duplicate)
+                .unwrap_err()
+                .contains("requires unique canonical IDs")
+        );
+
+        let mut validator = ClientSessionValidator::with_all_limits(1, 16, 1, 4);
+        validator
+            .observe(
+                1,
+                &RequestIdField::Valid(RequestId::Number("1".to_string())),
+                "initialize",
+                RawField::Value("{}"),
+            )
+            .unwrap();
+        let error = validator
+            .observe(
+                2,
+                &RequestIdField::Valid(RequestId::Text("x".to_string())),
+                "textDocument/hover",
+                RawField::Value("{}"),
+            )
+            .unwrap_err();
+        assert!(error.contains("1-request-ID session ceiling"));
+        assert_eq!(validator.requests.len(), 1);
+        assert_eq!(validator.request_id_bytes, 1);
     }
 
     #[test]
@@ -545,6 +806,7 @@ mod tests {
         let error = validator
             .observe(
                 1,
+                &RequestIdField::Absent,
                 "textDocument/didOpen",
                 RawField::Value(
                     r#"{"textDocument":{"uri":"four","version":1,"text":"source"}}"#,
@@ -558,6 +820,7 @@ mod tests {
         validator
             .observe(
                 2,
+                &RequestIdField::Absent,
                 "textDocument/didOpen",
                 RawField::Value(
                     r#"{"textDocument":{"uri":"ok","version":1,"text":"source"}}"#,
