@@ -18,7 +18,8 @@ const DEFAULT_MAX_FRAMES: u64 = transcript::MAX_TRANSCRIPT_FRAMES;
 const USAGE: &str = "Usage: fln-lsp-inspect [--max-frames N] [--] INPUT\n\
 \n\
 Inspect one exact Content-Length-framed JSON-RPC transcript as NDJSON.\n\
-Use INPUT=- to read standard input. Document params and source text are not emitted.\n";
+Use INPUT=- to read standard input. Parameter contents and source text are not\n\
+emitted; each row exposes only the validated params container kind.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
@@ -94,6 +95,15 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     }))
 }
 
+fn params_kind_name(kind: transcript::TranscriptParamsKind) -> &'static str {
+    match kind {
+        transcript::TranscriptParamsKind::Missing => "missing",
+        transcript::TranscriptParamsKind::Object => "object",
+        transcript::TranscriptParamsKind::Array => "array",
+        transcript::TranscriptParamsKind::Null => "null",
+    }
+}
+
 fn render_frame(frame: &transcript::TranscriptFrame) -> String {
     let role = match frame.role {
         transcript::TranscriptRole::Request => "request",
@@ -102,13 +112,15 @@ fn render_frame(frame: &transcript::TranscriptFrame) -> String {
     let id = frame.id_json.as_deref().unwrap_or("null");
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-frame/1\",\"index\":{},",
-            "\"role\":{},\"method\":{},\"id\":{},\"bodyBytes\":{}}}\n"
+            "{{\"schema\":\"fln.lsp-frame/2\",\"index\":{},",
+            "\"role\":{},\"method\":{},\"id\":{},",
+            "\"paramsKind\":{},\"bodyBytes\":{}}}\n"
         ),
         frame.index,
         json_string(role),
         json_string(&frame.method),
         id,
+        json_string(params_kind_name(frame.params_kind)),
         frame.body_bytes
     )
 }
@@ -197,20 +209,22 @@ mod tests {
     }
 
     #[test]
-    fn inspection_is_deterministic_and_omits_params() {
+    fn inspection_is_deterministic_and_omits_parameter_contents() {
         let body = r#"{"jsonrpc":"2.0","id":"req-1","method":"textDocument/didOpen","params":{"textDocument":{"text":"secret source"}}}"#;
         let first = inspect_reader(&mut BufReader::new(Cursor::new(frame(body))), 10).unwrap();
         let second = inspect_reader(&mut BufReader::new(Cursor::new(frame(body))), 10).unwrap();
         assert_eq!(first, second);
+        assert!(first.contains("\"schema\":\"fln.lsp-frame/2\""));
         assert!(first.contains("\"role\":\"request\""));
         assert!(first.contains("\"id\":\"req-1\""));
         assert!(first.contains("\"method\":\"textDocument/didOpen\""));
+        assert!(first.contains("\"paramsKind\":\"object\""));
         assert!(!first.contains("secret source"));
-        assert!(!first.contains("params"));
+        assert!(!first.contains("\"params\":"));
     }
 
     #[test]
-    fn notification_and_null_id_request_are_distinct() {
+    fn role_id_and_parameter_kind_remain_distinct() {
         let notification = render_frame(
             &transcript::validate_frame(
                 br#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
@@ -220,14 +234,24 @@ mod tests {
         );
         let request = render_frame(
             &transcript::validate_frame(
-                br#"{"jsonrpc":"2.0","id":null,"method":"shutdown","params":null}"#,
+                br#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#,
                 2,
             )
             .unwrap(),
         );
+        let array = render_frame(
+            &transcript::validate_frame(
+                br#"{"jsonrpc":"2.0","method":"extension/example","params":[]}"#,
+                3,
+            )
+            .unwrap(),
+        );
         assert!(notification.contains("\"role\":\"notification\""));
+        assert!(notification.contains("\"paramsKind\":\"null\""));
         assert!(request.contains("\"role\":\"request\""));
         assert!(request.contains("\"id\":null"));
+        assert!(request.contains("\"paramsKind\":\"missing\""));
+        assert!(array.contains("\"paramsKind\":\"array\""));
     }
 
     #[test]
