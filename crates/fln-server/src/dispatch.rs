@@ -1,29 +1,28 @@
-//! Minimal JSON-RPC dispatch for the LSP lifecycle and document events.
+//! Bounded JSON-RPC dispatch for the LSP lifecycle and Full document sync.
 //!
-//! This module intentionally implements only the bounded LSP surface FrankenLean
-//! currently owns. It does not depend on serde or another JSON library (doctrine
-//! D1), so the parser below is small, structural, iterative, and fail-closed.
-//!
-//! Two distinctions are load-bearing:
-//! - JSON-RPC envelope fields are read only from the root object.
-//! - LSP document fields are read from their exact `params` / `textDocument`
-//!   containers, never by searching arbitrary nested text for a matching key.
-//!
-//! Full document synchronization retains a bounded copy of the latest source so
-//! a textless `didSave` can still re-check the exact document last supplied by
-//! the client. Cache refusal is visible and never suppresses a check for source
-//! that arrived in the current notification.
+//! JSON syntax, document-session authority, and deterministic wire encoding live
+//! in dedicated submodules. The dispatcher is intentionally synchronous: it owns
+//! protocol ordering and delegates source checking through one callback.
 
-use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use crate::json_string;
 use crate::transport;
 
-const MAX_JSON_NESTING: usize = 256;
-const MAX_OPEN_DOCUMENTS: usize = 1024;
-const MAX_OPEN_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
-const REQUEST_FAILED_CODE: i32 = -32803;
+mod json;
+mod session;
+mod wire;
+
+use json::{
+    DecodedField, Envelope, EnvelopeError, RawField, RequestId, RequestIdField, VersionField,
+    content_changes_text, parse_envelope, save_text, text_document_text, text_document_uri,
+    text_document_version,
+};
+use session::{DocumentSession, RetentionOutcome, SessionRefusal};
+use wire::{
+    REQUEST_FAILED_CODE, SERVER_NOT_INITIALIZED_CODE, clear_diagnostics_notification,
+    error_response, error_response_null_id, file_progress_notification, initialize_response,
+    invalid_request_response, log_warning, null_response,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -41,611 +40,24 @@ pub struct ServerOutcome {
     pub documents_saved: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RequestId {
-    Integer(i64),
-    Text(String),
+pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
+
+fn write_protocol_message(output: &mut dyn Write, message: String) -> io::Result<()> {
+    transport::write_message(output, message.as_bytes())
 }
 
-impl RequestId {
-    fn as_json(&self) -> String {
-        match self {
-            Self::Integer(value) => value.to_string(),
-            Self::Text(value) => json_string(value),
-        }
+fn write_warning(output: &mut dyn Write, message: &str) -> io::Result<()> {
+    write_protocol_message(output, log_warning(message))
+}
+
+fn write_retention_outcome(
+    output: &mut dyn Write,
+    retention: RetentionOutcome,
+) -> io::Result<()> {
+    if let RetentionOutcome::NotRetained(refusal) = retention {
+        write_warning(output, refusal.message())?;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RequestIdField {
-    Absent,
-    Valid(RequestId),
-    Invalid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Field<'a> {
-    Missing,
-    Value(&'a str),
-    Invalid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DecodedField {
-    Missing,
-    Valid(String),
-    Invalid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VersionField {
-    Missing,
-    Valid(i64),
-    Invalid,
-}
-
-#[derive(Debug)]
-struct CachedDocument {
-    version: i64,
-    text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CacheRefusal {
-    DocumentLimit,
-    ByteLimit,
-    AccountingOverflow,
-}
-
-impl CacheRefusal {
-    const fn message(self) -> &'static str {
-        match self {
-            Self::DocumentLimit => {
-                "FrankenLean source cache is full; current source was checked but not retained"
-            }
-            Self::ByteLimit => {
-                "FrankenLean source cache byte budget is exhausted; current source was checked but not retained"
-            }
-            Self::AccountingOverflow => {
-                "FrankenLean source cache accounting overflowed; current source was checked but not retained"
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DocumentCache {
-    documents: BTreeMap<String, CachedDocument>,
-    total_bytes: usize,
-    max_documents: usize,
-    max_bytes: usize,
-}
-
-impl DocumentCache {
-    fn new() -> Self {
-        Self::with_limits(MAX_OPEN_DOCUMENTS, MAX_OPEN_DOCUMENT_BYTES)
-    }
-
-    fn with_limits(max_documents: usize, max_bytes: usize) -> Self {
-        Self {
-            documents: BTreeMap::new(),
-            total_bytes: 0,
-            max_documents,
-            max_bytes,
-        }
-    }
-
-    fn store(&mut self, uri: String, version: i64, text: String) -> Result<(), CacheRefusal> {
-        let old = self.documents.remove(&uri);
-        let old_len = old.as_ref().map_or(0, |document| document.text.len());
-        self.total_bytes = self
-            .total_bytes
-            .checked_sub(old_len)
-            .ok_or(CacheRefusal::AccountingOverflow)?;
-
-        if old.is_none() && self.documents.len() >= self.max_documents {
-            return Err(CacheRefusal::DocumentLimit);
-        }
-        let next_total = self
-            .total_bytes
-            .checked_add(text.len())
-            .ok_or(CacheRefusal::AccountingOverflow)?;
-        if next_total > self.max_bytes {
-            return Err(CacheRefusal::ByteLimit);
-        }
-        self.documents.insert(uri, CachedDocument { version, text });
-        self.total_bytes = next_total;
-        Ok(())
-    }
-
-    fn text(&self, uri: &str) -> Option<&str> {
-        self.documents.get(uri).map(|document| document.text.as_str())
-    }
-
-    fn version(&self, uri: &str) -> Option<i64> {
-        self.documents.get(uri).map(|document| document.version)
-    }
-
-    fn replace_text(&mut self, uri: String, text: String) -> Result<(), CacheRefusal> {
-        let version = self.version(&uri).unwrap_or(0);
-        self.store(uri, version, text)
-    }
-
-    fn remove(&mut self, uri: &str) -> Result<(), CacheRefusal> {
-        let Some(text) = self.documents.remove(uri) else {
-            return Ok(());
-        };
-        self.total_bytes = self
-            .total_bytes
-            .checked_sub(text.text.len())
-            .ok_or(CacheRefusal::AccountingOverflow)?;
-        Ok(())
-    }
-}
-
-fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
-    while matches!(
-        bytes.get(index).copied(),
-        Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')
-    ) {
-        index += 1;
-    }
-    index
-}
-
-fn scan_string_end(bytes: &[u8], start: usize) -> Option<usize> {
-    if bytes.get(start).copied()? != b'"' {
-        return None;
-    }
-    let mut index = start.checked_add(1)?;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'"' => return index.checked_add(1),
-            b'\\' => {
-                index = index.checked_add(2)?;
-                if index > bytes.len() {
-                    return None;
-                }
-            }
-            0x00..=0x1f => return None,
-            _ => index += 1,
-        }
-    }
-    None
-}
-
-/// Return the exclusive end of one JSON value without recursively descending.
-///
-/// This is a structural boundary scanner, not a generic JSON decoder. Root and
-/// selected object fields are validated separately. The fixed stack bounds
-/// adversarial nesting while preserving arbitrary strings and nested values.
-fn scan_value_end(json: &str, start: usize) -> Option<usize> {
-    let bytes = json.as_bytes();
-    let start = skip_ws(bytes, start);
-    match bytes.get(start).copied()? {
-        b'"' => scan_string_end(bytes, start),
-        b'{' | b'[' => {
-            let mut stack = [0u8; MAX_JSON_NESTING];
-            let mut depth = 0usize;
-            let mut index = start;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'"' => {
-                        index = scan_string_end(bytes, index)?;
-                    }
-                    opener @ (b'{' | b'[') => {
-                        if depth == MAX_JSON_NESTING {
-                            return None;
-                        }
-                        stack[depth] = opener;
-                        depth += 1;
-                        index += 1;
-                    }
-                    closer @ (b'}' | b']') => {
-                        let opener = *stack.get(depth.checked_sub(1)?)?;
-                        let expected = match opener {
-                            b'{' => b'}',
-                            b'[' => b']',
-                            _ => return None,
-                        };
-                        if closer != expected {
-                            return None;
-                        }
-                        depth -= 1;
-                        index += 1;
-                        if depth == 0 {
-                            return Some(index);
-                        }
-                    }
-                    _ => index += 1,
-                }
-            }
-            None
-        }
-        _ => {
-            let mut index = start;
-            while let Some(byte) = bytes.get(index).copied() {
-                if matches!(byte, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n') {
-                    break;
-                }
-                index += 1;
-            }
-            (index > start).then_some(index)
-        }
-    }
-}
-
-/// Read one literal ASCII key from one exact JSON object.
-///
-/// Duplicate selected keys, escaped keys, malformed separators, mismatched
-/// containers, excessive nesting, and trailing bytes all return `Invalid`.
-/// The parser deliberately scans through the closing brace even after finding a
-/// match so a duplicate cannot be hidden later in the object.
-fn object_field<'a>(json: &'a str, wanted: &str) -> Field<'a> {
-    let bytes = json.as_bytes();
-    let mut index = skip_ws(bytes, 0);
-    if bytes.get(index).copied() != Some(b'{') {
-        return Field::Invalid;
-    }
-    index += 1;
-    let mut found: Option<&str> = None;
-
-    loop {
-        index = skip_ws(bytes, index);
-        match bytes.get(index).copied() {
-            Some(b'}') => {
-                index += 1;
-                if skip_ws(bytes, index) != bytes.len() {
-                    return Field::Invalid;
-                }
-                return found.map_or(Field::Missing, Field::Value);
-            }
-            Some(b'"') => {}
-            _ => return Field::Invalid,
-        }
-
-        let key_end = match scan_string_end(bytes, index) {
-            Some(value) => value,
-            None => return Field::Invalid,
-        };
-        let key_raw = match json.get(index + 1..key_end - 1) {
-            Some(value) => value,
-            None => return Field::Invalid,
-        };
-        if key_raw.contains('\\') {
-            return Field::Invalid;
-        }
-        index = skip_ws(bytes, key_end);
-        if bytes.get(index).copied() != Some(b':') {
-            return Field::Invalid;
-        }
-        index += 1;
-        index = skip_ws(bytes, index);
-        let value_start = index;
-        let value_end = match scan_value_end(json, value_start) {
-            Some(value) => value,
-            None => return Field::Invalid,
-        };
-
-        if key_raw == wanted {
-            if found.is_some() {
-                return Field::Invalid;
-            }
-            found = json.get(value_start..value_end);
-            if found.is_none() {
-                return Field::Invalid;
-            }
-        }
-
-        index = skip_ws(bytes, value_end);
-        match bytes.get(index).copied() {
-            Some(b',') => {
-                index += 1;
-                if bytes.get(skip_ws(bytes, index)).copied() == Some(b'}') {
-                    return Field::Invalid;
-                }
-            }
-            Some(b'}') => {}
-            _ => return Field::Invalid,
-        }
-    }
-}
-
-fn decode_json_string(after_quote: &str) -> Option<String> {
-    fn hex_quad(chars: &mut std::str::Chars<'_>) -> Option<u16> {
-        let mut value = 0u16;
-        for _ in 0..4 {
-            value = value.checked_mul(16)?;
-            value = value.checked_add(u16::try_from(chars.next()?.to_digit(16)?).ok()?)?;
-        }
-        Some(value)
-    }
-
-    fn unicode_escape(chars: &mut std::str::Chars<'_>) -> Option<char> {
-        let first = hex_quad(chars)?;
-        match first {
-            0xd800..=0xdbff => {
-                if chars.next()? != '\\' || chars.next()? != 'u' {
-                    return None;
-                }
-                let second = hex_quad(chars)?;
-                if !(0xdc00..=0xdfff).contains(&second) {
-                    return None;
-                }
-                let high = u32::from(first) - 0xd800;
-                let low = u32::from(second) - 0xdc00;
-                char::from_u32(0x1_0000 + (high << 10) + low)
-            }
-            0xdc00..=0xdfff => None,
-            scalar => char::from_u32(u32::from(scalar)),
-        }
-    }
-
-    let mut result = String::new();
-    let mut chars = after_quote.chars();
-    loop {
-        match chars.next()? {
-            '"' => return Some(result),
-            '\\' => {
-                let escaped = chars.next()?;
-                result.push(match escaped {
-                    '"' => '"',
-                    '\\' => '\\',
-                    '/' => '/',
-                    'b' => '\u{0008}',
-                    'f' => '\u{000c}',
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'u' => unicode_escape(&mut chars)?,
-                    _ => return None,
-                });
-            }
-            control if control <= '\u{001f}' => return None,
-            other => result.push(other),
-        }
-    }
-}
-
-fn decode_json_string_value(value: &str) -> Option<String> {
-    let value = value.trim();
-    let after_quote = value.strip_prefix('"')?;
-    let encoded_len = scan_string_end(value.as_bytes(), 0)?;
-    if encoded_len != value.len() {
-        return None;
-    }
-    decode_json_string(after_quote)
-}
-
-fn extract_integer_value(value: &str) -> Option<i64> {
-    let value = value.trim();
-    let bytes = value.as_bytes();
-    let mut index = 0usize;
-    if bytes.first().copied() == Some(b'-') {
-        index = 1;
-    }
-    let first_digit = *bytes.get(index)?;
-    match first_digit {
-        b'0' => {
-            index += 1;
-            if bytes.get(index).is_some_and(u8::is_ascii_digit) {
-                return None;
-            }
-        }
-        b'1'..=b'9' => {
-            index += 1;
-            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-                index += 1;
-            }
-        }
-        _ => return None,
-    }
-    if index != bytes.len() {
-        return None;
-    }
-    value.parse::<i64>().ok()
-}
-
-fn decoded_integer_field(object: &str, key: &str) -> VersionField {
-    match object_field(object, key) {
-        Field::Missing => VersionField::Missing,
-        Field::Invalid => VersionField::Invalid,
-        Field::Value(value) => extract_integer_value(value)
-            .map(VersionField::Valid)
-            .unwrap_or(VersionField::Invalid),
-    }
-}
-
-fn extract_text_document_version_field(json: &str) -> VersionField {
-    let Some(text_document) = text_document_object(json) else {
-        return VersionField::Invalid;
-    };
-    decoded_integer_field(text_document, "version")
-}
-
-fn extract_request_id(json: &str) -> RequestIdField {
-    match object_field(json, "id") {
-        Field::Missing => RequestIdField::Absent,
-        Field::Invalid => RequestIdField::Invalid,
-        Field::Value(value) => {
-            if value.trim_start().starts_with('"') {
-                decode_json_string_value(value)
-                    .map(RequestId::Text)
-                    .map_or(RequestIdField::Invalid, RequestIdField::Valid)
-            } else {
-                extract_integer_value(value)
-                    .map(RequestId::Integer)
-                    .map_or(RequestIdField::Invalid, RequestIdField::Valid)
-            }
-        }
-    }
-}
-
-fn extract_top_level_string_field(json: &str, key: &str) -> Option<String> {
-    match object_field(json, key) {
-        Field::Value(value) => decode_json_string_value(value),
-        Field::Missing | Field::Invalid => None,
-    }
-}
-
-fn params_object(json: &str) -> Option<&str> {
-    match object_field(json, "params") {
-        Field::Value(value) if value.trim_start().starts_with('{') => Some(value),
-        Field::Missing | Field::Value(_) | Field::Invalid => None,
-    }
-}
-
-fn text_document_object(json: &str) -> Option<&str> {
-    let params = params_object(json)?;
-    match object_field(params, "textDocument") {
-        Field::Value(value) if value.trim_start().starts_with('{') => Some(value),
-        Field::Missing | Field::Value(_) | Field::Invalid => None,
-    }
-}
-
-fn extract_text_document_uri(json: &str) -> Option<String> {
-    let text_document = text_document_object(json)?;
-    match object_field(text_document, "uri") {
-        Field::Value(value) => decode_json_string_value(value),
-        Field::Missing | Field::Invalid => None,
-    }
-}
-
-fn decoded_string_field(object: &str, key: &str) -> DecodedField {
-    match object_field(object, key) {
-        Field::Missing => DecodedField::Missing,
-        Field::Invalid => DecodedField::Invalid,
-        Field::Value(value) => decode_json_string_value(value)
-            .map(DecodedField::Valid)
-            .unwrap_or(DecodedField::Invalid),
-    }
-}
-
-fn extract_text_document_text_field(json: &str) -> DecodedField {
-    let Some(text_document) = text_document_object(json) else {
-        return DecodedField::Invalid;
-    };
-    decoded_string_field(text_document, "text")
-}
-
-fn extract_save_text_field(json: &str) -> DecodedField {
-    let Some(params) = params_object(json) else {
-        return DecodedField::Invalid;
-    };
-    decoded_string_field(params, "text")
-}
-
-fn single_array_element(value: &str) -> Option<&str> {
-    let bytes = value.as_bytes();
-    let mut index = skip_ws(bytes, 0);
-    if bytes.get(index).copied() != Some(b'[') {
-        return None;
-    }
-    index += 1;
-    index = skip_ws(bytes, index);
-    if bytes.get(index).copied() == Some(b']') {
-        return None;
-    }
-    let start = index;
-    let end = scan_value_end(value, start)?;
-    index = skip_ws(bytes, end);
-    if bytes.get(index).copied() != Some(b']') {
-        return None;
-    }
-    index += 1;
-    if skip_ws(bytes, index) != bytes.len() {
-        return None;
-    }
-    value.get(start..end)
-}
-
-fn extract_content_changes_text_field(json: &str) -> DecodedField {
-    let Some(params) = params_object(json) else {
-        return DecodedField::Invalid;
-    };
-    let changes = match object_field(params, "contentChanges") {
-        Field::Missing => return DecodedField::Missing,
-        Field::Invalid => return DecodedField::Invalid,
-        Field::Value(value) => value,
-    };
-    let Some(change) = single_array_element(changes) else {
-        return DecodedField::Invalid;
-    };
-    decoded_string_field(change, "text")
-}
-
-fn initialize_response(id: &RequestId) -> String {
-    format!(
-        concat!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{",
-            "\"capabilities\":{{",
-            "\"textDocumentSync\":{{\"openClose\":true,\"change\":1,",
-            "\"save\":{{\"includeText\":true}}}}",
-            "}},",
-            "\"serverInfo\":{{\"name\":\"FrankenLean\",\"version\":{}}}",
-            "}}}}"
-        ),
-        id.as_json(),
-        json_string(env!("CARGO_PKG_VERSION"))
-    )
-}
-
-fn error_response(id: &RequestId, code: i32, message: &str) -> String {
-    format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{},\"message\":{}}}}}",
-        id.as_json(),
-        code,
-        json_string(message)
-    )
-}
-
-fn error_response_null_id(code: i32, message: &str) -> String {
-    format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":{}}}}}",
-        code,
-        json_string(message)
-    )
-}
-
-fn null_response(id: &RequestId) -> String {
-    format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}",
-        id.as_json()
-    )
-}
-
-fn file_progress_notification(uri: &str, processing: bool) -> String {
-    let processing_value = if processing {
-        "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"kind\":1}]"
-    } else {
-        "[]"
-    };
-    format!(
-        concat!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"$/lean/fileProgress\",",
-            "\"params\":{{\"textDocument\":{{\"uri\":{}}},",
-            "\"processing\":{}}}}}"
-        ),
-        json_string(uri),
-        processing_value
-    )
-}
-
-fn clear_diagnostics_notification(uri: &str) -> String {
-    format!(
-        concat!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",",
-            "\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}"
-        ),
-        json_string(uri)
-    )
-}
-
-fn log_warning(message: &str) -> String {
-    format!(
-        "{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{{\"type\":2,\"message\":{}}}}}",
-        json_string(message)
-    )
+    Ok(())
 }
 
 fn check_document(
@@ -654,26 +66,350 @@ fn check_document(
     content: &str,
     on_did_open: &mut OnDidOpen,
 ) -> io::Result<()> {
-    transport::write_message(output, file_progress_notification(uri, true).as_bytes())?;
+    write_protocol_message(output, file_progress_notification(uri, true))?;
     for notification in on_did_open(uri, content) {
         transport::write_message(output, notification.as_bytes())?;
     }
-    transport::write_message(output, file_progress_notification(uri, false).as_bytes())
+    write_protocol_message(output, file_progress_notification(uri, false))
 }
 
-fn invalidate_retained_source(
+fn invalidate_source_and_clear(
     output: &mut dyn Write,
-    documents: &mut DocumentCache,
+    session: &mut DocumentSession,
     uri: &str,
     reason: &str,
 ) -> io::Result<()> {
-    if let Err(refusal) = documents.remove(uri) {
-        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+    match session.invalidate_text(uri) {
+        Ok(()) | Err(SessionRefusal::NotOpen) => {}
+        Err(refusal) => write_warning(output, refusal.message())?,
     }
-    transport::write_message(output, log_warning(reason).as_bytes())
+    write_protocol_message(output, clear_diagnostics_notification(uri))?;
+    write_warning(output, reason)
 }
 
-pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
+fn decoded_uri(params: RawField<'_>) -> Result<String, &'static str> {
+    match text_document_uri(params) {
+        DecodedField::Valid(uri) if !uri.is_empty() => Ok(uri),
+        DecodedField::Valid(_) => Err("LSP textDocument.uri must not be empty"),
+        DecodedField::Missing => Err("LSP textDocument.uri is required"),
+        DecodedField::Invalid => Err("LSP textDocument.uri is malformed or ambiguous"),
+    }
+}
+
+fn decoded_version(params: RawField<'_>) -> Result<i64, &'static str> {
+    match text_document_version(params) {
+        VersionField::Valid(version) => Ok(version),
+        VersionField::Missing => Err("LSP textDocument.version is required"),
+        VersionField::Invalid => Err("LSP textDocument.version must be one unambiguous integer"),
+    }
+}
+
+fn decoded_open_text(params: RawField<'_>) -> Result<String, &'static str> {
+    match text_document_text(params) {
+        DecodedField::Valid(text) => Ok(text),
+        DecodedField::Missing => Err("LSP didOpen requires the complete document text"),
+        DecodedField::Invalid => Err("LSP didOpen text is malformed or ambiguous"),
+    }
+}
+
+fn decoded_change_text(params: RawField<'_>) -> Result<String, &'static str> {
+    match content_changes_text(params) {
+        DecodedField::Valid(text) => Ok(text),
+        DecodedField::Missing => {
+            Err("LSP didChange requires exactly one Full-sync content change")
+        }
+        DecodedField::Invalid => Err(
+            "LSP didChange requires exactly one unambiguous, unranged Full-sync text change",
+        ),
+    }
+}
+
+fn handle_open(
+    output: &mut dyn Write,
+    session: &mut DocumentSession,
+    params: RawField<'_>,
+    on_did_open: &mut OnDidOpen,
+) -> io::Result<bool> {
+    let uri = match decoded_uri(params) {
+        Ok(uri) => uri,
+        Err(message) => {
+            write_warning(output, message)?;
+            return Ok(false);
+        }
+    };
+    let version = match decoded_version(params) {
+        Ok(version) => version,
+        Err(message) => {
+            write_warning(output, message)?;
+            return Ok(false);
+        }
+    };
+    let text = match decoded_open_text(params) {
+        Ok(text) => text,
+        Err(message) => {
+            write_warning(output, message)?;
+            return Ok(false);
+        }
+    };
+
+    match session.open(uri.clone(), version, text.clone()) {
+        Ok(retention) => {
+            write_retention_outcome(output, retention)?;
+            check_document(output, &uri, &text, on_did_open)?;
+            Ok(true)
+        }
+        Err(refusal) => {
+            write_warning(output, refusal.message())?;
+            Ok(false)
+        }
+    }
+}
+
+fn handle_change(
+    output: &mut dyn Write,
+    session: &mut DocumentSession,
+    params: RawField<'_>,
+    on_did_open: &mut OnDidOpen,
+) -> io::Result<bool> {
+    let uri = match decoded_uri(params) {
+        Ok(uri) => uri,
+        Err(message) => {
+            write_warning(output, message)?;
+            return Ok(false);
+        }
+    };
+    if !session.is_open(&uri) {
+        write_warning(output, SessionRefusal::NotOpen.message())?;
+        return Ok(false);
+    }
+    let version = match decoded_version(params) {
+        Ok(version) => version,
+        Err(message) => {
+            invalidate_source_and_clear(output, session, &uri, message)?;
+            return Ok(false);
+        }
+    };
+    let text = match decoded_change_text(params) {
+        Ok(text) => text,
+        Err(message) => {
+            invalidate_source_and_clear(output, session, &uri, message)?;
+            return Ok(false);
+        }
+    };
+
+    match session.change(&uri, version, text.clone()) {
+        Ok(retention) => {
+            write_retention_outcome(output, retention)?;
+            check_document(output, &uri, &text, on_did_open)?;
+            Ok(true)
+        }
+        Err(refusal) => {
+            write_warning(output, refusal.message())?;
+            Ok(false)
+        }
+    }
+}
+
+fn handle_save(
+    output: &mut dyn Write,
+    session: &mut DocumentSession,
+    params: RawField<'_>,
+    on_did_open: &mut OnDidOpen,
+) -> io::Result<bool> {
+    let uri = match decoded_uri(params) {
+        Ok(uri) => uri,
+        Err(message) => {
+            write_warning(output, message)?;
+            return Ok(false);
+        }
+    };
+    if !session.is_open(&uri) {
+        write_warning(output, SessionRefusal::NotOpen.message())?;
+        return Ok(false);
+    }
+
+    match save_text(params) {
+        DecodedField::Valid(text) => match session.save_with_text(&uri, text.clone()) {
+            Ok(retention) => {
+                write_retention_outcome(output, retention)?;
+                check_document(output, &uri, &text, on_did_open)?;
+                Ok(true)
+            }
+            Err(refusal) => {
+                write_warning(output, refusal.message())?;
+                Ok(false)
+            }
+        },
+        DecodedField::Missing => {
+            let Some(text) = session.text(&uri).map(str::to_owned) else {
+                write_protocol_message(output, clear_diagnostics_notification(&uri))?;
+                write_warning(
+                    output,
+                    "FrankenLean could not re-check textless didSave because no retained source exists",
+                )?;
+                return Ok(false);
+            };
+            check_document(output, &uri, &text, on_did_open)?;
+            Ok(true)
+        }
+        DecodedField::Invalid => {
+            invalidate_source_and_clear(
+                output,
+                session,
+                &uri,
+                "FrankenLean refused malformed didSave text; retained source was invalidated",
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+fn handle_close(
+    output: &mut dyn Write,
+    session: &mut DocumentSession,
+    params: RawField<'_>,
+) -> io::Result<()> {
+    let uri = match decoded_uri(params) {
+        Ok(uri) => uri,
+        Err(message) => {
+            write_warning(output, message)?;
+            return Ok(());
+        }
+    };
+    match session.close(&uri) {
+        Ok(true) => {}
+        Ok(false) => write_warning(
+            output,
+            "FrankenLean received didClose for a document that was not open",
+        )?,
+        Err(refusal) => write_warning(output, refusal.message())?,
+    }
+    write_protocol_message(output, clear_diagnostics_notification(&uri))
+}
+
+fn request_id(envelope: &Envelope<'_>) -> Result<Option<&RequestId>, String> {
+    match &envelope.id {
+        RequestIdField::Absent => Ok(None),
+        RequestIdField::Valid(id) => Ok(Some(id)),
+        RequestIdField::Invalid => Err(error_response_null_id(
+            -32600,
+            "invalid or ambiguous JSON-RPC request id",
+        )),
+    }
+}
+
+fn method(envelope: &Envelope<'_>, id: Option<&RequestId>) -> Result<String, String> {
+    match &envelope.method {
+        DecodedField::Valid(method) if !method.is_empty() => Ok(method.clone()),
+        DecodedField::Valid(_) => Err(invalid_request_response(
+            id,
+            "JSON-RPC method must not be empty",
+        )),
+        DecodedField::Missing => Err(invalid_request_response(
+            id,
+            "JSON-RPC method is required",
+        )),
+        DecodedField::Invalid => Err(invalid_request_response(
+            id,
+            "JSON-RPC method must be one unambiguous string",
+        )),
+    }
+}
+
+fn validate_version(envelope: &Envelope<'_>, id: Option<&RequestId>) -> Result<(), String> {
+    match &envelope.jsonrpc {
+        DecodedField::Valid(version) if version == "2.0" => Ok(()),
+        DecodedField::Valid(_) => Err(invalid_request_response(
+            id,
+            "unsupported JSON-RPC version; expected 2.0",
+        )),
+        DecodedField::Missing => Err(invalid_request_response(
+            id,
+            "missing JSON-RPC version; expected 2.0",
+        )),
+        DecodedField::Invalid => Err(invalid_request_response(
+            id,
+            "JSON-RPC version must be one unambiguous string",
+        )),
+    }
+}
+
+fn is_notification_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialized"
+            | "exit"
+            | "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+    )
+}
+
+fn is_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "shutdown"
+            | "$/lean/plainGoal"
+            | "$/lean/plainTermGoal"
+            | "textDocument/hover"
+            | "textDocument/completion"
+            | "textDocument/definition"
+            | "$/lean/rpc/connect"
+            | "$/lean/rpc/call"
+    )
+}
+
+fn validate_method_role(
+    output: &mut dyn Write,
+    method: &str,
+    id: Option<&RequestId>,
+) -> io::Result<bool> {
+    if is_notification_method(method) && id.is_some() {
+        write_protocol_message(
+            output,
+            invalid_request_response(id, "this LSP method is a notification, not a request"),
+        )?;
+        return Ok(false);
+    }
+    if is_request_method(method) && id.is_none() {
+        write_warning(
+            output,
+            "FrankenLean ignored a request-only LSP method sent as a notification",
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn running_request(
+    output: &mut dyn Write,
+    state: ServerState,
+    id: &RequestId,
+) -> io::Result<bool> {
+    match state {
+        ServerState::Running => Ok(true),
+        ServerState::Uninitialized | ServerState::Initializing => {
+            write_protocol_message(
+                output,
+                error_response(
+                    id,
+                    SERVER_NOT_INITIALIZED_CODE,
+                    "server is not initialized",
+                ),
+            )?;
+            Ok(false)
+        }
+        ServerState::ShuttingDown => {
+            write_protocol_message(
+                output,
+                error_response(id, -32600, "server is shutting down"),
+            )?;
+            Ok(false)
+        }
+    }
+}
 
 pub fn serve(
     input: &mut dyn BufRead,
@@ -684,7 +420,7 @@ pub fn serve(
     let mut documents_opened = 0u64;
     let mut documents_changed = 0u64;
     let mut documents_saved = 0u64;
-    let mut documents = DocumentCache::new();
+    let mut session = DocumentSession::new();
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -695,39 +431,79 @@ pub fn serve(
                 documents_saved,
             });
         };
-        let text = String::from_utf8(message).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "message is not valid UTF-8")
-        })?;
-        let method = extract_top_level_string_field(&text, "method");
-        let id = match extract_request_id(&text) {
-            RequestIdField::Absent => None,
-            RequestIdField::Valid(id) => Some(id),
-            RequestIdField::Invalid => {
-                let response = error_response_null_id(-32600, "invalid JSON-RPC request id");
-                transport::write_message(output, response.as_bytes())?;
+        let text = match String::from_utf8(message) {
+            Ok(text) => text,
+            Err(_) => {
+                write_protocol_message(
+                    output,
+                    error_response_null_id(-32700, "message body is not valid UTF-8 JSON"),
+                )?;
                 continue;
             }
         };
+        let envelope = match parse_envelope(&text) {
+            Ok(envelope) => envelope,
+            Err(EnvelopeError::MalformedJson) => {
+                write_protocol_message(output, error_response_null_id(-32700, "parse error"))?;
+                continue;
+            }
+            Err(EnvelopeError::NotObject) => {
+                write_protocol_message(
+                    output,
+                    error_response_null_id(-32600, "JSON-RPC request must be an object"),
+                )?;
+                continue;
+            }
+        };
+        let id = match request_id(&envelope) {
+            Ok(id) => id,
+            Err(response) => {
+                write_protocol_message(output, response)?;
+                continue;
+            }
+        };
+        if let Err(response) = validate_version(&envelope, id) {
+            write_protocol_message(output, response)?;
+            continue;
+        }
+        let method = match method(&envelope, id) {
+            Ok(method) => method,
+            Err(response) => {
+                write_protocol_message(output, response)?;
+                continue;
+            }
+        };
+        if !validate_method_role(output, &method, id)? {
+            continue;
+        }
 
-        match (method.as_deref(), id.as_ref(), state) {
-            (Some("initialize"), Some(req_id), ServerState::Uninitialized) => {
-                transport::write_message(output, initialize_response(req_id).as_bytes())?;
+        match (method.as_str(), id, state) {
+            ("initialize", Some(request_id), ServerState::Uninitialized) => {
+                write_protocol_message(output, initialize_response(request_id))?;
                 state = ServerState::Initializing;
             }
-            (Some("initialize"), Some(req_id), _) => {
-                transport::write_message(
+            ("initialize", Some(request_id), _) => {
+                write_protocol_message(
                     output,
-                    error_response(req_id, -32600, "server already initialized").as_bytes(),
+                    error_response(request_id, -32600, "server already initialized"),
                 )?;
             }
-            (Some("initialized"), None, ServerState::Initializing) => {
+            ("initialized", None, ServerState::Initializing) => {
                 state = ServerState::Running;
             }
-            (Some("shutdown"), Some(req_id), _) => {
-                transport::write_message(output, null_response(req_id).as_bytes())?;
+            ("initialized", None, _) => {
+                write_warning(output, "FrankenLean ignored initialized outside initialization")?;
+            }
+            ("shutdown", Some(request_id), ServerState::Running) => {
+                write_protocol_message(output, null_response(request_id))?;
                 state = ServerState::ShuttingDown;
             }
-            (Some("exit"), None, _) => {
+            ("shutdown", Some(request_id), _) => {
+                if !running_request(output, state, request_id)? {
+                    continue;
+                }
+            }
+            ("exit", None, _) => {
                 return Ok(ServerOutcome {
                     clean: state == ServerState::ShuttingDown,
                     documents_opened,
@@ -735,160 +511,65 @@ pub fn serve(
                     documents_saved,
                 });
             }
-            (Some("textDocument/didOpen"), None, ServerState::Running) => {
-                if let Some(uri) = extract_text_document_uri(&text) {
-                    match (
-                        extract_text_document_version_field(&text),
-                        extract_text_document_text_field(&text),
-                    ) {
-                        (VersionField::Valid(version), DecodedField::Valid(content)) => {
-                            if let Err(refusal) =
-                                documents.store(uri.clone(), version, content.clone())
-                            {
-                                transport::write_message(
-                                    output,
-                                    log_warning(refusal.message()).as_bytes(),
-                                )?;
-                            }
-                            check_document(output, &uri, &content, on_did_open)?;
-                            documents_opened = documents_opened.saturating_add(1);
-                        }
-                        _ => {
-                            invalidate_retained_source(
-                                output,
-                                &mut documents,
-                                &uri,
-                                "FrankenLean refused didOpen without a valid integer version and full document; any retained source for this URI was invalidated",
-                            )?;
-                        }
-                    }
+            ("textDocument/didOpen", None, ServerState::Running) => {
+                if handle_open(output, &mut session, envelope.params, on_did_open)? {
+                    documents_opened = documents_opened.saturating_add(1);
                 }
             }
-            (Some("textDocument/didChange"), None, ServerState::Running) => {
-                if let Some(uri) = extract_text_document_uri(&text) {
-                    match (
-                        extract_text_document_version_field(&text),
-                        extract_content_changes_text_field(&text),
-                    ) {
-                        (VersionField::Valid(version), DecodedField::Valid(content)) => {
-                            if documents
-                                .version(&uri)
-                                .is_some_and(|current| version <= current)
-                            {
-                                transport::write_message(
-                                    output,
-                                    log_warning(
-                                        "FrankenLean refused non-monotone didChange version; latest retained source remains authoritative",
-                                    )
-                                    .as_bytes(),
-                                )?;
-                                continue;
-                            }
-                            if let Err(refusal) =
-                                documents.store(uri.clone(), version, content.clone())
-                            {
-                                transport::write_message(
-                                    output,
-                                    log_warning(refusal.message()).as_bytes(),
-                                )?;
-                            }
-                            check_document(output, &uri, &content, on_did_open)?;
-                            documents_changed = documents_changed.saturating_add(1);
-                        }
-                        _ => {
-                            invalidate_retained_source(
-                                output,
-                                &mut documents,
-                                &uri,
-                                "FrankenLean refused didChange without a valid integer version and exactly one Full-sync text change; retained source was invalidated",
-                            )?;
-                        }
-                    }
+            ("textDocument/didChange", None, ServerState::Running) => {
+                if handle_change(output, &mut session, envelope.params, on_did_open)? {
+                    documents_changed = documents_changed.saturating_add(1);
                 }
             }
-            (Some("textDocument/didSave"), None, ServerState::Running) => {
-                if let Some(uri) = extract_text_document_uri(&text) {
-                    match extract_save_text_field(&text) {
-                        DecodedField::Valid(content) => {
-                            if let Err(refusal) = documents.replace_text(uri.clone(), content.clone()) {
-                                transport::write_message(
-                                    output,
-                                    log_warning(refusal.message()).as_bytes(),
-                                )?;
-                            }
-                            check_document(output, &uri, &content, on_did_open)?;
-                            documents_saved = documents_saved.saturating_add(1);
-                        }
-                        DecodedField::Missing => {
-                            if let Some(content) = documents.text(&uri) {
-                                check_document(output, &uri, content, on_did_open)?;
-                                documents_saved = documents_saved.saturating_add(1);
-                            } else {
-                                transport::write_message(
-                                    output,
-                                    log_warning(
-                                        "FrankenLean could not re-check textless didSave because no retained source exists",
-                                    )
-                                    .as_bytes(),
-                                )?;
-                            }
-                        }
-                        DecodedField::Invalid => {
-                            invalidate_retained_source(
-                                output,
-                                &mut documents,
-                                &uri,
-                                "FrankenLean refused malformed didSave text; retained source was invalidated instead of replaying stale content",
-                            )?;
-                        }
-                    }
+            ("textDocument/didSave", None, ServerState::Running) => {
+                if handle_save(output, &mut session, envelope.params, on_did_open)? {
+                    documents_saved = documents_saved.saturating_add(1);
                 }
             }
-            (Some("textDocument/didClose"), None, ServerState::Running) => {
-                if let Some(uri) = extract_text_document_uri(&text) {
-                    if let Err(refusal) = documents.remove(&uri) {
-                        transport::write_message(output, log_warning(refusal.message()).as_bytes())?;
+            ("textDocument/didClose", None, ServerState::Running) => {
+                handle_close(output, &mut session, envelope.params)?;
+            }
+            (method, None, state) if is_notification_method(method) => {
+                let message = match state {
+                    ServerState::Uninitialized | ServerState::Initializing => {
+                        "FrankenLean ignored an LSP notification before initialization completed"
                     }
-                    transport::write_message(
+                    ServerState::ShuttingDown => {
+                        "FrankenLean ignored an LSP notification after shutdown"
+                    }
+                    ServerState::Running => "FrankenLean ignored an unsupported LSP notification",
+                };
+                write_warning(output, message)?;
+            }
+            ("$/lean/plainGoal", Some(request_id), state)
+            | ("$/lean/plainTermGoal", Some(request_id), state)
+            | ("textDocument/hover", Some(request_id), state)
+            | ("textDocument/completion", Some(request_id), state)
+            | ("textDocument/definition", Some(request_id), state) => {
+                if running_request(output, state, request_id)? {
+                    write_protocol_message(output, null_response(request_id))?;
+                }
+            }
+            ("$/lean/rpc/connect", Some(request_id), state)
+            | ("$/lean/rpc/call", Some(request_id), state) => {
+                if running_request(output, state, request_id)? {
+                    write_protocol_message(
                         output,
-                        clear_diagnostics_notification(&uri).as_bytes(),
+                        error_response(
+                            request_id,
+                            REQUEST_FAILED_CODE,
+                            "Lean RPC sessions are not implemented by this FrankenLean server",
+                        ),
                     )?;
                 }
             }
-            (Some("$/lean/plainGoal"), Some(req_id), ServerState::Running)
-            | (Some("$/lean/plainTermGoal"), Some(req_id), ServerState::Running)
-            | (Some("textDocument/hover"), Some(req_id), ServerState::Running)
-            | (Some("textDocument/completion"), Some(req_id), ServerState::Running)
-            | (Some("textDocument/definition"), Some(req_id), ServerState::Running) => {
-                transport::write_message(output, null_response(req_id).as_bytes())?;
-            }
-            (Some("$/lean/rpc/connect"), Some(req_id), ServerState::Running) => {
-                transport::write_message(
-                    output,
-                    error_response(
-                        req_id,
-                        REQUEST_FAILED_CODE,
-                        "Lean RPC sessions are not implemented by this FrankenLean server",
-                    )
-                    .as_bytes(),
-                )?;
-            }
-            (Some("$/lean/rpc/call"), Some(req_id), ServerState::Running) => {
-                transport::write_message(
-                    output,
-                    error_response(
-                        req_id,
-                        REQUEST_FAILED_CODE,
-                        "Lean RPC calls are not implemented by this FrankenLean server",
-                    )
-                    .as_bytes(),
-                )?;
-            }
-            (_, Some(req_id), _) => {
-                transport::write_message(
-                    output,
-                    error_response(req_id, -32601, "method not found").as_bytes(),
-                )?;
+            (_, Some(request_id), state) => {
+                if running_request(output, state, request_id)? {
+                    write_protocol_message(
+                        output,
+                        error_response(request_id, -32601, "method not found"),
+                    )?;
+                }
             }
             (_, None, _) => {}
         }
@@ -901,509 +582,198 @@ mod tests {
     use crate::transport::write_message;
     use std::io::BufReader;
 
-    fn send(buf: &mut Vec<u8>, body: &str) {
-        write_message(buf, body.as_bytes()).unwrap();
+    fn send(buffer: &mut Vec<u8>, body: &str) {
+        write_message(buffer, body.as_bytes()).expect("frame test message");
     }
 
-    fn run_session(extra_messages: &str) -> (ServerOutcome, String, Vec<(String, String)>) {
-        let mut input_buf = Vec::new();
+    fn run_session(messages: &[&str]) -> (ServerOutcome, String, Vec<(String, String)>) {
+        let mut input = Vec::new();
         send(
-            &mut input_buf,
+            &mut input,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
         );
         send(
-            &mut input_buf,
+            &mut input,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
         );
-        for line in extra_messages.lines() {
-            if !line.trim().is_empty() {
-                send(&mut input_buf, line.trim());
-            }
+        for message in messages {
+            send(&mut input, message);
         }
         send(
-            &mut input_buf,
+            &mut input,
             r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
         );
-        send(
-            &mut input_buf,
-            r#"{"jsonrpc":"2.0","method":"exit"}"#,
-        );
+        send(&mut input, r#"{"jsonrpc":"2.0","method":"exit"}"#);
 
-        let mut reader = BufReader::new(&input_buf[..]);
-        let mut output_buf = Vec::new();
+        let mut reader = BufReader::new(input.as_slice());
+        let mut output = Vec::new();
         let mut seen = Vec::new();
-        let outcome = serve(
-            &mut reader,
-            &mut output_buf,
-            &mut |uri, text| {
-                seen.push((uri.to_string(), text.to_string()));
-                vec![format!(
-                    "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[{{\"message\":{}}}]}}}}",
-                    json_string(uri),
-                    json_string(text)
-                )]
-            },
-        )
-        .unwrap();
+        let outcome = serve(&mut reader, &mut output, &mut |uri, text| {
+            seen.push((uri.to_string(), text.to_string()));
+            vec![format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+                crate::json_string(uri)
+            )]
+        })
+        .expect("serve test session");
         (
             outcome,
-            String::from_utf8(output_buf).unwrap(),
+            String::from_utf8(output).expect("UTF-8 protocol output"),
             seen,
         )
     }
 
-    fn lifecycle_session(extra_messages: &str) -> (ServerOutcome, String) {
-        let (outcome, output, _) = run_session(extra_messages);
-        (outcome, output)
-    }
-
     #[test]
-    fn clean_lifecycle() {
-        let (outcome, output) = lifecycle_session("");
+    fn clean_lifecycle_advertises_full_sync_and_utf16() {
+        let (outcome, output, seen) = run_session(&[]);
         assert!(outcome.clean);
-        assert_eq!(outcome.documents_opened, 0);
-        assert!(output.contains("FrankenLean"));
-    }
-
-    #[test]
-    fn request_id_parser_preserves_integer_and_string_ids() {
-        assert_eq!(
-            extract_request_id(r#"{"id":42}"#),
-            RequestIdField::Valid(RequestId::Integer(42))
-        );
-        assert_eq!(
-            extract_request_id(r#"{"id":-1}"#),
-            RequestIdField::Valid(RequestId::Integer(-1))
-        );
-        assert_eq!(
-            extract_request_id(r#"{"id":"req-\ud83e\udd16"}"#),
-            RequestIdField::Valid(RequestId::Text("req-🤖".to_string()))
-        );
-        assert_eq!(
-            extract_request_id(r#"{"method":"exit"}"#),
-            RequestIdField::Absent
-        );
-    }
-
-    #[test]
-    fn malformed_request_ids_are_distinct_from_notifications() {
-        for json in [
-            r#"{"id":1.5}"#,
-            r#"{"id":1e2}"#,
-            r#"{"id":01}"#,
-            r#"{"id":-}"#,
-            r#"{"id":null}"#,
-            r#"{"id":{}}"#,
-            r#"{"id":9223372036854775808}"#,
-            r#"{"id":"x"true}"#,
-            r#"{"id":1,"id":2}"#,
-        ] {
-            assert_eq!(
-                extract_request_id(json),
-                RequestIdField::Invalid,
-                "malformed request id was accepted or erased: {json}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_request_id_returns_invalid_request_with_null_id() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":1.5,"method":"textDocument/hover","params":{}}"#,
-        );
-        assert!(outcome.clean);
-        assert!(output.contains("\"id\":null,\"error\":{\"code\":-32600"));
-        assert!(output.contains("invalid JSON-RPC request id"));
-        assert!(!output.contains("\"id\":1,\"result\":null"));
-    }
-
-    #[test]
-    fn envelope_fields_ignore_nested_lookalikes() {
-        let json = r#"{"params":{"id":"shadow","method":"shutdown"},"id":"actual","method":"textDocument/hover"}"#;
-        assert_eq!(
-            extract_request_id(json),
-            RequestIdField::Valid(RequestId::Text("actual".to_string()))
-        );
-        assert_eq!(
-            extract_top_level_string_field(json, "method").as_deref(),
-            Some("textDocument/hover")
-        );
-    }
-
-    #[test]
-    fn structural_object_field_rejects_duplicate_and_mismatched_containers() {
-        assert_eq!(object_field(r#"{"x":1,"x":2}"#, "x"), Field::Invalid);
-        assert_eq!(object_field(r#"{"x":[1}}"#, "x"), Field::Invalid);
-        assert_eq!(object_field(r#"{"x":1,}"#, "x"), Field::Invalid);
-
-        let nested = format!(
-            "{}{}",
-            "[".repeat(MAX_JSON_NESTING + 1),
-            "]".repeat(MAX_JSON_NESTING + 1)
-        );
-        let deep = format!("{{\"x\":{nested}}}");
-        assert_eq!(object_field(&deep, "x"), Field::Invalid);
-    }
-
-    #[test]
-    fn did_open_routes_through_callback() {
-        let (outcome, output, seen) = run_session(
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
-        );
-        assert!(outcome.clean);
-        assert_eq!(outcome.documents_opened, 1);
-        assert_eq!(
-            seen,
-            vec![("file:///test.lean".to_string(), "def x := 42".to_string())]
-        );
-        assert!(output.contains("publishDiagnostics"));
-        assert_eq!(output.matches("$/lean/fileProgress").count(), 2);
-    }
-
-    #[test]
-    fn document_fields_are_bound_to_exact_params_structure() {
-        let json = r#"{"textDocument":{"uri":"file:///wrong.lean","text":"wrong"},"params":{"metadata":{"textDocument":{"uri":"file:///also-wrong.lean"}},"textDocument":{"uri":"file:///right.lean","text":"right"}}}"#;
-        assert_eq!(
-            extract_text_document_uri(json).as_deref(),
-            Some("file:///right.lean")
-        );
-        assert_eq!(
-            extract_text_document_text_field(json),
-            DecodedField::Valid("right".to_string())
-        );
-    }
-
-    #[test]
-    fn did_open_requires_integer_document_version() {
-        let (outcome, output, seen) = run_session(
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","text":"unversioned"}}}"#,
-        );
-        assert!(outcome.clean);
-        assert_eq!(outcome.documents_opened, 0);
         assert!(seen.is_empty());
-        assert!(output.contains("valid integer version and full document"));
+        assert!(output.contains("\"positionEncoding\":\"utf-16\""));
+        assert!(output.contains("\"change\":1"));
     }
 
     #[test]
-    fn did_open_ignores_method_lookalike_inside_document_text() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"\"method\":\"shutdown\""}},"method":"textDocument/didOpen"}"#,
-        );
+    fn full_document_lifecycle_rechecks_latest_source() {
+        let (outcome, output, seen) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.lean","version":1,"text":"v1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x.lean","version":2},"contentChanges":[{"text":"v2"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x.lean"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///x.lean"}}}"#,
+        ]);
         assert!(outcome.clean);
         assert_eq!(outcome.documents_opened, 1);
-        assert!(output.contains("publishDiagnostics"));
-    }
-
-    #[test]
-    fn nested_method_cannot_shutdown_server() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":14,"params":{"method":"shutdown"},"method":"textDocument/hover"}"#,
-        );
-        assert!(outcome.clean);
-        assert!(output.contains("\"id\":14,\"result\":null"));
-    }
-
-    #[test]
-    fn unknown_request_returns_method_not_found() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/unknownMethod","params":{}}"#,
-        );
-        assert!(outcome.clean);
-        assert!(output.contains("-32601"));
-    }
-
-    #[test]
-    fn string_request_id_is_preserved_in_response() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":"hover-\ud83e\udd16","method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.lean"},"position":{"line":0,"character":0}}}"#,
-        );
-        assert!(outcome.clean);
-        assert!(output.contains("\"id\":\"hover-🤖\",\"result\":null"));
-    }
-
-    #[test]
-    fn text_document_uri_decodes_json_escapes() {
-        let json = r#"{"params":{"textDocument":{"uri":"file:\/\/\/tmp\/\ud83e\udd16.lean","text":"hello"}}}"#;
-        assert_eq!(
-            extract_text_document_uri(json),
-            Some("file:///tmp/🤖.lean".to_string())
-        );
-    }
-
-    #[test]
-    fn did_change_routes_full_document_through_callback() {
-        let (outcome, output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"def x := 42"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"def y := 7"}]}}"#,
-            ]
-            .join("\n"),
-        );
-        assert!(outcome.clean);
-        assert_eq!(outcome.documents_opened, 1);
-        assert_eq!(outcome.documents_changed, 1);
-        assert_eq!(
-            seen.last(),
-            Some(&("file:///test.lean".to_string(), "def y := 7".to_string()))
-        );
-        assert_eq!(output.matches("publishDiagnostics").count(), 2);
-        assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
-    }
-
-    #[test]
-    fn did_change_refuses_non_monotone_versions_without_losing_latest_source() {
-        let (outcome, output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":3,"text":"v3"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":4},"contentChanges":[{"text":"v4"}]}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":4},"contentChanges":[{"text":"duplicate-v4"}]}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"stale-v2"}]}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
-            ]
-            .join("\n"),
-        );
-        assert!(outcome.clean);
         assert_eq!(outcome.documents_changed, 1);
         assert_eq!(outcome.documents_saved, 1);
         assert_eq!(
             seen,
             vec![
-                ("file:///test.lean".to_string(), "v3".to_string()),
-                ("file:///test.lean".to_string(), "v4".to_string()),
-                ("file:///test.lean".to_string(), "v4".to_string()),
+                ("file:///x.lean".to_string(), "v1".to_string()),
+                ("file:///x.lean".to_string(), "v2".to_string()),
+                ("file:///x.lean".to_string(), "v2".to_string()),
             ]
         );
-        assert_eq!(output.matches("non-monotone didChange version").count(), 2);
+        assert!(output.contains("\"uri\":\"file:///x.lean\",\"diagnostics\":[]"));
     }
 
     #[test]
-    fn missing_or_malformed_change_version_invalidates_retained_source() {
-        for change in [
-            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean"},"contentChanges":[{"text":"missing-version"}]}}"#,
-            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":1.5},"contentChanges":[{"text":"bad-version"}]}}"#,
-        ] {
-            let (outcome, output, seen) = run_session(
-                &[
-                    r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
-                    change,
-                    r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
-                ]
-                .join("\n"),
-            );
-            assert!(outcome.clean);
-            assert_eq!(outcome.documents_changed, 0);
-            assert_eq!(outcome.documents_saved, 0);
-            assert_eq!(seen.len(), 1);
-            assert!(output.contains("valid integer version"));
-            assert!(output.contains("no retained source exists"));
-        }
-    }
-
-    #[test]
-    fn full_sync_refuses_empty_or_multiple_content_changes() {
-        for json in [
-            r#"{"params":{"textDocument":{"uri":"file:///x.lean"},"contentChanges":[]}}"#,
-            r#"{"params":{"textDocument":{"uri":"file:///x.lean"},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
-        ] {
-            assert_eq!(
-                extract_content_changes_text_field(json),
-                DecodedField::Invalid,
-                "invalid Full-sync change array was accepted: {json}"
-            );
-        }
-    }
-
-    #[test]
-    fn escaped_text_decodes_all_json_escapes_and_surrogate_pairs() {
-        let json = r#"{"params":{"textDocument":{"text":"\ud83e\udd16 a\/b\b\f\n\r\t\\\""}}}"#;
-        assert_eq!(
-            extract_text_document_text_field(json),
-            DecodedField::Valid("🤖 a/b\u{0008}\u{000c}\n\r\t\\\"".to_string())
-        );
-    }
-
-    #[test]
-    fn escaped_text_rejects_malformed_json_strings() {
-        for value in [
-            r#""\ud83e""#,
-            r#""\udd16""#,
-            r#""\ud83e\u0041""#,
-            r#""\q""#,
-            r#""\u12xz""#,
-            "\"line\nfeed\"",
-        ] {
-            assert!(
-                decode_json_string_value(value).is_none(),
-                "malformed JSON string was accepted: {value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn did_save_with_text_routes_through_callback() {
-        let (outcome, output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"saved"}}"#,
-            ]
-            .join("\n"),
-        );
+    fn duplicate_open_and_unopened_events_are_refused() {
+        let (outcome, output, seen) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"first"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":2,"text":"second"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///missing","version":2},"contentChanges":[{"text":"bad"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing"}}}"#,
+        ]);
         assert!(outcome.clean);
+        assert_eq!(seen, vec![("file:///x".to_string(), "first".to_string())]);
+        assert!(output.contains("refused duplicate didOpen"));
+        assert!(output.matches("document is not open").count() >= 2);
+    }
+
+    #[test]
+    fn stale_change_does_not_replace_authoritative_source() {
+        let (outcome, output, seen) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":3,"text":"v3"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":3},"contentChanges":[{"text":"stale"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x"}}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_changed, 0);
         assert_eq!(outcome.documents_saved, 1);
         assert_eq!(
-            seen.last(),
-            Some(&("file:///test.lean".to_string(), "saved".to_string()))
-        );
-        assert_eq!(output.matches("$/lean/fileProgress").count(), 4);
-    }
-
-    #[test]
-    fn textless_save_rechecks_latest_cached_full_document() {
-        let (outcome, _output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"latest"}]}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":2}}}"#,
+            seen,
+            vec![
+                ("file:///x".to_string(), "v3".to_string()),
+                ("file:///x".to_string(), "v3".to_string()),
             ]
-            .join("\n"),
         );
-        assert!(outcome.clean);
-        assert_eq!(outcome.documents_saved, 1);
-        assert_eq!(
-            seen.last(),
-            Some(&("file:///test.lean".to_string(), "latest".to_string()))
-        );
+        assert!(output.contains("non-monotone didChange version"));
     }
 
     #[test]
-    fn textless_save_without_retained_source_is_visible_and_not_counted() {
-        let (outcome, output, seen) = run_session(
-            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///missing.lean"}}}"#,
-        );
+    fn malformed_change_invalidates_text_and_clears_diagnostics() {
+        let (outcome, output, seen) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"old"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":2},"contentChanges":[{"range":{},"text":"fragment"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x"}}}"#,
+        ]);
         assert!(outcome.clean);
-        assert_eq!(outcome.documents_saved, 0);
-        assert!(seen.is_empty());
-        assert!(output.contains("window/logMessage"));
-        assert!(output.contains("no retained source exists"));
-    }
-
-    #[test]
-    fn malformed_change_invalidates_cache_before_textless_save() {
-        let (outcome, output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///test.lean","version":2},"contentChanges":[{"text":"a"},{"text":"b"}]}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":2}}}"#,
-            ]
-            .join("\n"),
-        );
-        assert!(outcome.clean);
-        assert_eq!(outcome.documents_opened, 1);
+        assert_eq!(seen, vec![("file:///x".to_string(), "old".to_string())]);
         assert_eq!(outcome.documents_changed, 0);
         assert_eq!(outcome.documents_saved, 0);
-        assert_eq!(seen.len(), 1, "stale pre-change source must never be replayed");
-        assert!(output.contains("retained source was invalidated"));
+        assert!(output.contains("unranged Full-sync text change"));
         assert!(output.contains("no retained source exists"));
+        assert!(output.contains("\"uri\":\"file:///x\",\"diagnostics\":[]"));
     }
 
     #[test]
-    fn malformed_present_save_text_never_falls_back_to_cache() {
-        let (outcome, output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"old"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1},"text":"\q"}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean","version":1}}}"#,
-            ]
-            .join("\n"),
-        );
+    fn parser_errors_are_recoverable_and_use_null_id() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"bad":tru}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{}}"#,
+        ]);
         assert!(outcome.clean);
-        assert_eq!(outcome.documents_saved, 0);
-        assert_eq!(seen.len(), 1, "malformed save text must invalidate cached source");
-        assert!(output.contains("malformed didSave text"));
-        assert!(output.contains("no retained source exists"));
+        assert!(output.contains("\"id\":null,\"error\":{\"code\":-32700"));
+        assert!(output.contains("\"id\":6,\"result\":null"));
     }
 
     #[test]
-    fn did_close_evicts_source_and_clears_push_diagnostics() {
-        let (outcome, output, seen) = run_session(
-            &[
-                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.lean","languageId":"lean4","version":1,"text":"open"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
-                r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///test.lean"}}}"#,
-            ]
-            .join("\n"),
-        );
+    fn missing_or_wrong_jsonrpc_version_is_invalid_request() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"id":"a","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"1.0","id":7,"method":"textDocument/hover","params":{}}"#,
+        ]);
         assert!(outcome.clean);
-        assert_eq!(seen.len(), 1, "closed source must not be reused by didSave");
-        assert!(output.contains("\"uri\":\"file:///test.lean\",\"diagnostics\":[]"));
-        assert!(output.contains("no retained source exists"));
+        assert!(output.contains("\"id\":\"a\",\"error\":{\"code\":-32600"));
+        assert!(output.contains("\"id\":7,\"error\":{\"code\":-32600"));
     }
 
     #[test]
-    fn document_cache_bounds_new_entries_and_invalidates_stale_replacements() {
-        let mut count_limited = DocumentCache::with_limits(1, 100);
-        count_limited
-            .store("a".to_string(), 1, "one".to_string())
-            .unwrap();
-        assert_eq!(
-            count_limited.store("b".to_string(), 1, "two".to_string()),
-            Err(CacheRefusal::DocumentLimit)
-        );
-        assert_eq!(count_limited.text("a"), Some("one"));
-        assert_eq!(count_limited.text("b"), None);
-
-        let mut byte_limited = DocumentCache::with_limits(2, 5);
-        byte_limited
-            .store("a".to_string(), 1, "1234".to_string())
-            .unwrap();
-        assert_eq!(
-            byte_limited.store("b".to_string(), 1, "12".to_string()),
-            Err(CacheRefusal::ByteLimit)
-        );
-        assert_eq!(byte_limited.total_bytes, 4);
-        assert_eq!(
-            byte_limited.store("a".to_string(), 1, "123456".to_string()),
-            Err(CacheRefusal::ByteLimit)
-        );
-        assert_eq!(
-            byte_limited.text("a"),
-            None,
-            "a rejected replacement must invalidate the now-stale cached text"
-        );
-        assert_eq!(byte_limited.total_bytes, 0);
-    }
-
-    #[test]
-    fn rpc_connect_fails_closed_without_fabricating_session() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":12,"method":"$/lean/rpc/connect","params":{"uri":"file:///test.lean"}}"#,
-        );
+    fn request_and_notification_roles_are_enforced() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","id":10,"method":"textDocument/didOpen","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/hover","params":{}}"#,
+        ]);
         assert!(outcome.clean);
-        assert!(output.contains("\"id\":12,\"error\":{\"code\":-32803"));
+        assert!(output.contains("\"id\":10,\"error\":{\"code\":-32600"));
+        assert!(output.contains("request-only LSP method sent as a notification"));
+    }
+
+    #[test]
+    fn unsupported_rpc_is_a_typed_request_failure() {
+        let (outcome, output, _) = run_session(&[
+            r#"{"jsonrpc":"2.0","id":"rpc","method":"$/lean/rpc/connect","params":{}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert!(output.contains("\"id\":\"rpc\",\"error\":{\"code\":-32803"));
         assert!(output.contains("Lean RPC sessions are not implemented"));
-        assert!(!output.contains("fln-stub-0"));
     }
 
     #[test]
-    fn rpc_call_fails_closed_without_fabricating_result() {
-        let (outcome, output) = lifecycle_session(
-            r#"{"jsonrpc":"2.0","id":13,"method":"$/lean/rpc/call","params":{"sessionId":"missing"}}"#,
+    fn requests_before_initialize_are_server_not_initialized() {
+        let mut input = Vec::new();
+        send(
+            &mut input,
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{}}"#,
         );
+        send(
+            &mut input,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        );
+        send(
+            &mut input,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        );
+        send(
+            &mut input,
+            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+        );
+        send(&mut input, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+        let mut reader = BufReader::new(input.as_slice());
+        let mut output = Vec::new();
+        let outcome = serve(&mut reader, &mut output, &mut |_, _| Vec::new())
+            .expect("serve test session");
+        let output = String::from_utf8(output).expect("UTF-8 protocol output");
         assert!(outcome.clean);
-        assert!(output.contains("\"id\":13,\"error\":{\"code\":-32803"));
-        assert!(output.contains("Lean RPC calls are not implemented"));
-    }
-
-    #[test]
-    fn file_progress_notification_format() {
-        let started = file_progress_notification("file:///test.lean", true);
-        assert!(started.contains("$/lean/fileProgress"));
-        assert!(started.contains("\"kind\":1"));
-        assert!(started.contains("\"uri\":\"file:///test.lean\""));
-
-        let done = file_progress_notification("file:///test.lean", false);
-        assert!(done.contains("$/lean/fileProgress"));
-        assert!(done.contains("\"processing\":[]"));
-        assert!(done.contains("\"uri\":\"file:///test.lean\""));
+        assert!(output.contains("\"id\":5,\"error\":{\"code\":-32002"));
     }
 }
