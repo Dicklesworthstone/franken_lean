@@ -56,7 +56,7 @@ enum RequestContract {
 }
 
 impl RequestContract {
-    const fn for_method(method: &str) -> Self {
+    fn for_method(method: &str) -> Self {
         match method {
             "initialize" => Self::Initialize,
             "shutdown" => Self::Shutdown,
