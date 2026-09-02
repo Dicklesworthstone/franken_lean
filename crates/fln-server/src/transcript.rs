@@ -86,20 +86,22 @@ fn validate_envelope(body: &[u8], frame: u64) -> Result<bool, String> {
             return Err(format!("frame {frame} has a non-string jsonrpc field"));
         }
     }
-    match envelope.method {
-        DecodedField::Valid(_) => {}
+    let method = match envelope.method {
+        DecodedField::Valid(method) => method,
         DecodedField::Missing => return Err(format!("frame {frame} is missing a method")),
         DecodedField::Invalid => {
             return Err(format!("frame {frame} has a non-string method"));
         }
-    }
+    };
     match envelope.params {
         RawField::Missing => {}
         RawField::Value(value)
             if matches!(value.trim_start().as_bytes().first(), Some(b'{' | b'[')) => {}
+        RawField::Value(value)
+            if value.trim() == "null" && matches!(method.as_str(), "shutdown" | "exit") => {}
         RawField::Value(_) => {
             return Err(format!(
-                "frame {frame} params must be an object or array when present"
+                "frame {frame} params must be an object or array when present; only shutdown/exit may use null"
             ));
         }
         RawField::Invalid => return Err(format!("frame {frame} has ambiguous params")),
@@ -205,7 +207,8 @@ mod tests {
         let bodies = [
             r#"{"jsonrpc":"2.0","id":1.25e2,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-            r#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
         ];
         let expected_body_bytes = bodies
             .iter()
@@ -218,12 +221,30 @@ mod tests {
         assert_eq!(
             validate_bytes(&bytes).unwrap(),
             TranscriptStats {
-                frames: 3,
+                frames: 4,
                 requests: 2,
-                notifications: 1,
+                notifications: 2,
                 body_bytes: expected_body_bytes,
             }
         );
+    }
+
+    #[test]
+    fn optional_empty_null_params_are_lifecycle_specific() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ] {
+            validate_bytes(&frame(body)).expect("pinned lifecycle null params are valid");
+        }
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"initialized","params":null}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":false}"#,
+        ] {
+            let error = validate_bytes(&frame(body)).unwrap_err();
+            assert!(error.contains("only shutdown/exit may use null"), "{error}");
+        }
     }
 
     #[test]
