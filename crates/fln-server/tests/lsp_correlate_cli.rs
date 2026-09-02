@@ -44,16 +44,16 @@ fn server() -> Vec<u8> {
     ])
 }
 
-fn scratch(name: &str) -> PathBuf {
+fn scratch(scenario: &str, name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "franken-lean-correlate-{name}-{}",
+        "franken-lean-correlate-{scenario}-{name}-{}",
         std::process::id()
     ))
 }
 
-fn write_pair(client: &[u8], server: &[u8]) -> (PathBuf, PathBuf) {
-    let client_path = scratch("client.frames");
-    let server_path = scratch("server.frames");
+fn write_pair(scenario: &str, client: &[u8], server: &[u8]) -> (PathBuf, PathBuf) {
+    let client_path = scratch(scenario, "client.frames");
+    let server_path = scratch(scenario, "server.frames");
     let _ = fs::remove_file(&client_path);
     let _ = fs::remove_file(&server_path);
     fs::write(&client_path, client).unwrap();
@@ -80,7 +80,7 @@ fn help_and_usage_refusals_are_side_effect_free() {
 
 #[test]
 fn successful_join_emits_zero_unmatched_receipt() {
-    let (client_path, server_path) = write_pair(&client(), &server());
+    let (client_path, server_path) = write_pair("success", &client(), &server());
     let output = correlator()
         .arg(&client_path)
         .arg(&server_path)
@@ -110,7 +110,7 @@ fn missing_response_and_numeric_normalization_fail_without_receipt() {
         r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
         r#"{"jsonrpc":"2.0","id":1.25e2,"result":null}"#,
     ]);
-    let (client_path, server_path) = write_pair(&client(), &missing_server);
+    let (client_path, server_path) = write_pair("failure", &client(), &missing_server);
     let missing = correlator()
         .arg(&client_path)
         .arg(&server_path)
