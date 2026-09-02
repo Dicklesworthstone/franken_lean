@@ -64,7 +64,7 @@ The repository contains source-to-kernel and source-to-Golem paths for a growing
 
 ### Lantern / LSP server
 
-**Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, and layered transcript evidence; semantic editor and daemon architecture remain incomplete.**
+**Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, and layered client/server transcript evidence; semantic editor and daemon architecture remain incomplete.**
 
 Landed transport and syntax ground:
 
@@ -104,27 +104,33 @@ Landed bounded diagnostic synchronization:
 
 Landed transcript evidence tools:
 
-- `fln-lsp-validate`, `fln-lsp-inspect`, and `fln-lsp-replay` share one strict frame/parser model rather than maintaining independent JSON-RPC interpretations.
+- `fln-lsp-validate`, `fln-lsp-inspect`, `fln-lsp-replay`, and `fln-lsp-correlate` share the repository's strict frame/parser vocabulary rather than treating JSON-RPC bytes as loose text.
 - Syntax-only validation remains the default for negative and adversarial fixtures. Its `fln.lsp-transcript-validation/2` receipt reports complete `wireBytes` separately from JSON `bodyBytes`.
 - `fln-lsp-validate --client-lifecycle` adds a fail-closed client state machine and emits `fln.lsp-client-lifecycle/1`. The receipt binds the exact initialize, initialized, shutdown, and exit frame indices as well as aggregate frame, role, and byte counts.
-- The strict lifecycle model has one known-method contract for both role and params-container shape. Known data-bearing methods require object params; shutdown and exit permit only missing or `null` params. Unknown running-state methods remain extensible but cannot bypass initialization or terminal ordering.
-- `fln-lsp-replay --client-lifecycle` performs that validation before server execution, expected-stream comparison, stdout emission, or create-new output publication. Failed preflight is side-effect free at both output surfaces; default replay continues to support deliberately invalid client fixtures.
+- The lifecycle model has one known-method contract for both role and params-container shape. Known data-bearing methods require object params; shutdown and exit permit only missing or `null` params. Unknown running-state methods remain extensible but cannot bypass initialization or terminal ordering.
+- `fln-lsp-validate --client-session` is a strictly stronger grade. It reuses lifecycle validation, then enforces nonempty document URIs, complete `didOpen` text, duplicate-open refusal, open-document membership, monotone Full-sync changes, save/close membership, wait targets, non-null cancellation IDs, a 1,024-document ceiling, and a 4 MiB aggregate open-URI ceiling.
+- `fln.lsp-client-session/1` receipts expose document event counts, wait/cancellation counts, peak and final open-document counts, and peak/final open-URI bytes. They do not retain or disclose source text.
+- `fln-lsp-replay --client-lifecycle` and `--client-session` perform their respective validation before server execution, expected-stream comparison, stdout emission, or create-new output publication. Failed preflight is side-effect free; default replay continues to support deliberately invalid client fixtures.
 - `fln-lsp-inspect` emits `fln.lsp-frame/2` rows with index, role, method, lexical ID, `paramsKind` (`missing`, `object`, `array`, or `null`), and body size. Parameter contents and source text remain omitted.
-- Validation and replay cap the complete framed stream, not merely JSON bodies; replay output and inspection output are independently bounded.
-- External-process tests bind lifecycle success/refusal, role and parameter-shape failures, replay failure before output publication, and metadata-only inspection at installed binary boundaries.
-- [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) is the current operational and evidence contract for these tools.
+- The structural server model distinguishes notifications from result/error responses, validates exact response IDs and signed 32-bit error code/string-message objects, and refuses response params, result/error ambiguity, invalid IDs, and server-initiated requests outside the current bounded profile.
+- `fln-lsp-correlate CLIENT SERVER` requires a document-semantic client session and a structurally valid server stream, then requires unique exact lexical request IDs and exactly one matching response per client request. It rejects missing, duplicate, unsolicited, and lexically normalized response IDs.
+- `fln.lsp-client-server-correlation/1` is a zero-unmatched count/ID receipt. It reports client/server frames and wire bytes, result/error response counts, server notifications, document events, waits, cancellations, and final open-document state.
+- Validation, correlation, and replay cap complete framed streams, not merely JSON bodies; replay and inspection output are independently bounded.
+- External-process tests bind lifecycle/session success and refusal, replay failure before output publication, metadata-only inspection, server result/error structure, and exact response correlation at installed binary boundaries.
+- [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) is the operational and evidence contract for these tools.
 
 Still incomplete:
 
 - The production CLI callback still uses the compatibility `fln_server::project` entry point rather than `project_with_sources`; the projector has UTF-16/source-aware support, but exact unsaved source is not yet passed through that large CLI bridge. Current file-level engine errors are positioned at `(1, 0)`; broader source-position claims remain open until that call site is migrated.
-- Strict transcript lifecycle validation proves known method role, params-container kind, and top-level ordering. It does not yet prove the semantic contents of every params object, document open/change/version coherence, or correlation against the server response stream.
+- Client-session validation proves bounded Full-sync document membership and version coherence, but not language-specific source semantics, import state, or elaboration state.
+- Client/server correlation proves exact one-to-one response-ID accounting, not cross-stream timing, method-specific result correctness, server notification semantics, active-request lifetime, or a shared event trace.
 - `$/lean/plainGoal` / `$/lean/plainTermGoal` do not yet expose cursor-position-aware proof state.
 - Hover, completion, and definition currently return no-information `null` responses rather than semantic results.
 - Lean RPC sessions/calls are explicitly **not implemented**. `rpc/connect` and `rpc/call` return `RequestFailed`; session-only keepAlive/release notifications are visibly ignored rather than fabricating state.
 - Retained source is session-local input state, not the declaration-granular shared elaboration/import environment required by the finished Lantern design.
-- The server is synchronous and does not yet implement asupersync regions, cancellation of active elaboration, shared immutable import heaps, stable diagnostic identities, complete bidirectional replay bundles, or the full unmodified-vscode-lean4 parity matrix.
+- The server is synchronous and does not yet implement asupersync regions, cancellation of active elaboration, shared immutable import heaps, stable diagnostic identities, complete timestamped bidirectional replay bundles, or the full unmodified-vscode-lean4 parity matrix.
 
-The latest Lantern lifecycle, parameter-contract, inspection, replay, accounting, callback-authority, and wait changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that execution environment lacked a Rust toolchain and hosted Actions were unavailable.
+The latest Lantern client-session, server-stream, correlation, lifecycle, inspection, replay, accounting, callback-authority, and wait changes are **landed**. This status file does not claim they were compiled in the session that wrote it because that execution environment lacked a Rust toolchain and hosted Actions were unavailable.
 
 ### Agent-control plane
 
@@ -154,7 +160,7 @@ These subsystems contain real contract planes, data structures, bounded executio
 3. **Keep independent-checker authority boundaries intact.** The checker may veto/observe; it must never become a second admission authority.
 4. **Replace LSP no-information scaffolding with truthful semantics one method at a time.** Never fabricate sessions, goals, hover data, completions, or definitions to suppress editor errors.
 5. **Promote source retention into real declaration/elaboration state deliberately.** The bounded latest-text cache is enough to make Full-sync lifecycle semantics truthful; it is not a substitute for dependency-aware incremental elaboration, import invalidation, or cursor-position proof state.
-6. **Join client and server transcript evidence.** The strict client lifecycle receipt is useful but not a complete replay bundle. Add response-ID correlation, document-event semantic validation, cancellation observations, environment/epoch identity, final server state, and first-divergence evidence without weakening syntax-only negative fixtures.
+6. **Complete bidirectional replay evidence without overstating it.** Add a shared event clock or interleaved trace, active-request lifetime, method/result contracts, server-notification semantics, environment/epoch identity, final daemon state, first-divergence evidence, and production-callback runs. Exact ID correlation alone does not establish those facts.
 7. **Keep the JSON-RPC parser narrow but structurally correct.** Extend its typed extraction vocabulary deliberately; do not reintroduce substring routing or unbounded generic decoding.
 8. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin/artifact identity, and outcome class.
 
