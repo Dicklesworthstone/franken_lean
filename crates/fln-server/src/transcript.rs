@@ -37,6 +37,192 @@ pub struct TranscriptStats {
     pub body_bytes: u64,
 }
 
+/// Evidence that one client transcript completed the bounded LSP lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientLifecycleStats {
+    pub transcript: TranscriptStats,
+    pub initialize_frame: u64,
+    pub initialized_frame: u64,
+    pub shutdown_frame: u64,
+    pub exit_frame: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownMethodRole {
+    Request,
+    Notification,
+}
+
+fn known_method_role(method: &str) -> Option<KnownMethodRole> {
+    match method {
+        "initialize"
+        | "shutdown"
+        | "$/lean/plainGoal"
+        | "$/lean/plainTermGoal"
+        | "$/lean/rpc/connect"
+        | "$/lean/rpc/call"
+        | "textDocument/completion"
+        | "textDocument/definition"
+        | "textDocument/hover"
+        | "textDocument/waitForDiagnostics" => Some(KnownMethodRole::Request),
+        "initialized"
+        | "exit"
+        | "$/cancelRequest"
+        | "$/lean/rpc/keepAlive"
+        | "$/lean/rpc/release"
+        | "textDocument/didOpen"
+        | "textDocument/didChange"
+        | "textDocument/didSave"
+        | "textDocument/didClose" => Some(KnownMethodRole::Notification),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientLifecycleState {
+    BeforeInitialize,
+    AwaitingInitialized,
+    Running,
+    AwaitingExit,
+    Exited,
+}
+
+impl ClientLifecycleState {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::BeforeInitialize => "before-initialize",
+            Self::AwaitingInitialized => "awaiting-initialized",
+            Self::Running => "running",
+            Self::AwaitingExit => "awaiting-exit",
+            Self::Exited => "exited",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientLifecycleValidator {
+    state: ClientLifecycleState,
+    initialize_frame: Option<u64>,
+    initialized_frame: Option<u64>,
+    shutdown_frame: Option<u64>,
+    exit_frame: Option<u64>,
+}
+
+impl ClientLifecycleValidator {
+    fn new() -> Self {
+        Self {
+            state: ClientLifecycleState::BeforeInitialize,
+            initialize_frame: None,
+            initialized_frame: None,
+            shutdown_frame: None,
+            exit_frame: None,
+        }
+    }
+
+    fn validate_role(frame: &TranscriptFrame) -> Result<(), String> {
+        match (known_method_role(&frame.method), frame.role) {
+            (Some(KnownMethodRole::Request), TranscriptRole::Notification) => Err(format!(
+                "frame {} sends request-only method {:?} as a notification",
+                frame.index, frame.method
+            )),
+            (Some(KnownMethodRole::Notification), TranscriptRole::Request) => Err(format!(
+                "frame {} sends notification-only method {:?} as a request",
+                frame.index, frame.method
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn observe(&mut self, frame: &TranscriptFrame) -> Result<(), String> {
+        Self::validate_role(frame)?;
+        match self.state {
+            ClientLifecycleState::BeforeInitialize => {
+                if frame.method != "initialize" {
+                    return Err(format!(
+                        "frame {} method {:?} appears before the initialize request",
+                        frame.index, frame.method
+                    ));
+                }
+                self.initialize_frame = Some(frame.index);
+                self.state = ClientLifecycleState::AwaitingInitialized;
+            }
+            ClientLifecycleState::AwaitingInitialized => {
+                if frame.method == "$/cancelRequest" {
+                    return Ok(());
+                }
+                if frame.method != "initialized" {
+                    return Err(format!(
+                        "frame {} method {:?} appears before the initialized notification",
+                        frame.index, frame.method
+                    ));
+                }
+                self.initialized_frame = Some(frame.index);
+                self.state = ClientLifecycleState::Running;
+            }
+            ClientLifecycleState::Running => match frame.method.as_str() {
+                "initialize" | "initialized" => {
+                    return Err(format!(
+                        "frame {} repeats initialization while the client is running",
+                        frame.index
+                    ));
+                }
+                "exit" => {
+                    return Err(format!(
+                        "frame {} exits before the shutdown request",
+                        frame.index
+                    ));
+                }
+                "shutdown" => {
+                    self.shutdown_frame = Some(frame.index);
+                    self.state = ClientLifecycleState::AwaitingExit;
+                }
+                _ => {}
+            },
+            ClientLifecycleState::AwaitingExit => {
+                if frame.method != "exit" {
+                    return Err(format!(
+                        "frame {} method {:?} appears after shutdown; expected exit",
+                        frame.index, frame.method
+                    ));
+                }
+                self.exit_frame = Some(frame.index);
+                self.state = ClientLifecycleState::Exited;
+            }
+            ClientLifecycleState::Exited => {
+                return Err(format!(
+                    "frame {} method {:?} appears after the terminal exit notification",
+                    frame.index, frame.method
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, transcript: TranscriptStats) -> Result<ClientLifecycleStats, String> {
+        if self.state != ClientLifecycleState::Exited {
+            return Err(format!(
+                "transcript ended in client lifecycle state {}; expected exited",
+                self.state.name()
+            ));
+        }
+        Ok(ClientLifecycleStats {
+            transcript,
+            initialize_frame: self
+                .initialize_frame
+                .ok_or_else(|| "missing initialize-frame evidence".to_string())?,
+            initialized_frame: self
+                .initialized_frame
+                .ok_or_else(|| "missing initialized-frame evidence".to_string())?,
+            shutdown_frame: self
+                .shutdown_frame
+                .ok_or_else(|| "missing shutdown-frame evidence".to_string())?,
+            exit_frame: self
+                .exit_frame
+                .ok_or_else(|| "missing exit-frame evidence".to_string())?,
+        })
+    }
+}
+
 struct CountingBufRead<'a> {
     inner: &'a mut dyn BufRead,
     wire_bytes: u64,
@@ -222,6 +408,26 @@ pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptStats, String> {
     validate_reader(&mut BufReader::new(Cursor::new(bytes)))
 }
 
+/// Validate one complete client transcript through the LSP lifecycle.
+///
+/// This is intentionally stricter than [`validate_reader`]. Syntax-only
+/// validation remains useful for negative replay fixtures; lifecycle validation
+/// establishes that the client performed a role-correct initialize, initialized,
+/// shutdown, and exit handshake and emitted no frame after exit.
+pub fn validate_client_lifecycle_reader(
+    input: &mut dyn BufRead,
+) -> Result<ClientLifecycleStats, String> {
+    let mut lifecycle = ClientLifecycleValidator::new();
+    let transcript = visit_reader(input, MAX_TRANSCRIPT_FRAMES, |frame| {
+        lifecycle.observe(frame)
+    })?;
+    lifecycle.finish(transcript)
+}
+
+pub fn validate_client_lifecycle_bytes(bytes: &[u8]) -> Result<ClientLifecycleStats, String> {
+    validate_client_lifecycle_reader(&mut BufReader::new(Cursor::new(bytes)))
+}
+
 pub fn render_validation(stats: TranscriptStats) -> String {
     format!(
         concat!(
@@ -237,6 +443,27 @@ pub fn render_validation(stats: TranscriptStats) -> String {
     )
 }
 
+pub fn render_client_lifecycle_validation(stats: ClientLifecycleStats) -> String {
+    format!(
+        concat!(
+            "{{\"schema\":\"fln.lsp-client-lifecycle/1\",",
+            "\"finalState\":\"exited\",\"frames\":{},\"requests\":{},",
+            "\"notifications\":{},\"wireBytes\":{},\"bodyBytes\":{},",
+            "\"initializeFrame\":{},\"initializedFrame\":{},",
+            "\"shutdownFrame\":{},\"exitFrame\":{}}}\n"
+        ),
+        stats.transcript.frames,
+        stats.transcript.requests,
+        stats.transcript.notifications,
+        stats.transcript.wire_bytes,
+        stats.transcript.body_bytes,
+        stats.initialize_frame,
+        stats.initialized_frame,
+        stats.shutdown_frame,
+        stats.exit_frame
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +472,24 @@ mod tests {
         let mut framed = Vec::new();
         crate::transport::write_message(&mut framed, body.as_bytes()).unwrap();
         framed
+    }
+
+    fn framed(bodies: &[&str]) -> Vec<u8> {
+        let mut transcript = Vec::new();
+        for body in bodies {
+            transcript.extend(frame(body));
+        }
+        transcript
+    }
+
+    fn lifecycle() -> Vec<u8> {
+        framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"hover","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ])
     }
 
     fn frame_with_extension(body: &str, padding: usize) -> Vec<u8> {
@@ -269,10 +514,7 @@ mod tests {
             .iter()
             .map(|body| u64::try_from(body.len()).unwrap())
             .sum();
-        let mut bytes = Vec::new();
-        for body in bodies {
-            bytes.extend(frame(body));
-        }
+        let bytes = framed(&bodies);
         let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
         assert_eq!(
             validate_bytes(&bytes).unwrap(),
@@ -400,5 +642,110 @@ mod tests {
         assert_eq!(stats.frames, 1);
         assert_eq!(stats.wire_bytes, one_len);
         assert_eq!(stats.body_bytes, u64::try_from(body.len()).unwrap());
+    }
+
+    #[test]
+    fn client_lifecycle_receipt_binds_all_handshake_frames() {
+        let bytes = lifecycle();
+        let stats = validate_client_lifecycle_bytes(&bytes).unwrap();
+        assert_eq!(stats.transcript.frames, 5);
+        assert_eq!(stats.initialize_frame, 1);
+        assert_eq!(stats.initialized_frame, 2);
+        assert_eq!(stats.shutdown_frame, 4);
+        assert_eq!(stats.exit_frame, 5);
+        assert_eq!(stats.transcript.wire_bytes, bytes.len() as u64);
+        assert!(render_client_lifecycle_validation(stats).contains(
+            "\"schema\":\"fln.lsp-client-lifecycle/1\""
+        ));
+    }
+
+    #[test]
+    fn client_lifecycle_rejects_known_role_inversions() {
+        for bodies in [
+            vec![r#"{"jsonrpc":"2.0","method":"initialize","params":{}}"#],
+            vec![
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"initialized","params":{}}"#,
+            ],
+            vec![
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/didOpen","params":{}}"#,
+            ],
+        ] {
+            let error = validate_client_lifecycle_bytes(&framed(&bodies)).unwrap_err();
+            assert!(
+                error.contains("request-only") || error.contains("notification-only"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_lifecycle_rejects_ordering_and_incomplete_eof() {
+        let cases = [
+            (
+                vec![r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#],
+                "before the initialize request",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+                ],
+                "before the initialized notification",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+                ],
+                "exits before the shutdown request",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+                ],
+                "expected exited",
+            ),
+            (
+                vec![
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+                    r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+                    r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+                    r#"{"jsonrpc":"2.0","method":"workspace/didChangeConfiguration","params":{}}"#,
+                ],
+                "after the terminal exit notification",
+            ),
+        ];
+        for (bodies, expected) in cases {
+            let error = validate_client_lifecycle_bytes(&framed(&bodies)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn syntax_only_mode_still_accepts_negative_lifecycle_fixtures() {
+        let bytes = frame(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+        assert!(validate_bytes(&bytes).is_ok());
+        assert!(validate_client_lifecycle_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn cancellation_may_precede_initialized_but_unknown_running_methods_are_extensible() {
+        let bytes = framed(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"workspace/futureNotification","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"workspace/futureRequest","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        assert!(validate_client_lifecycle_bytes(&bytes).is_ok());
     }
 }
