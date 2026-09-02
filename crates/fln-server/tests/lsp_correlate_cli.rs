@@ -68,6 +68,8 @@ fn help_and_usage_refusals_are_side_effect_free() {
     assert!(help.stderr.is_empty());
     let stdout = String::from_utf8(help.stdout).unwrap();
     assert!(stdout.starts_with("Usage: fln-lsp-correlate"));
+    assert!(stdout.contains("Number lexemes"));
+    assert!(stdout.contains("string IDs compare by decoded value"));
     assert!(stdout.contains("not cross-stream timing"));
 
     let missing = correlator().output().unwrap();
@@ -90,6 +92,7 @@ fn successful_join_emits_zero_unmatched_receipt() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/1\""));
+    assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));
     assert!(stdout.contains("\"matchedResponses\":3"));
@@ -100,6 +103,33 @@ fn successful_join_emits_zero_unmatched_receipt() {
     assert!(stdout.contains("\"documentsOpened\":1"));
     assert!(stdout.contains("\"documentsClosed\":1"));
 
+    fs::remove_file(client_path).unwrap();
+    fs::remove_file(server_path).unwrap();
+}
+
+#[test]
+fn equivalent_string_escape_spelling_correlates_by_decoded_value() {
+    let client = framed(&[
+        r#"{"jsonrpc":"2.0","id":"\u0069nit","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+        r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+    ]);
+    let server = framed(&[
+        r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+    ]);
+    let (client_path, server_path) = write_pair("escaped-string", &client, &server);
+    let output = correlator()
+        .arg(&client_path)
+        .arg(&server_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("\"matchedResponses\":2"));
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
 }
@@ -138,7 +168,7 @@ fn missing_response_and_numeric_normalization_fail_without_receipt() {
     assert!(normalized.stdout.is_empty());
     assert!(String::from_utf8(normalized.stderr)
         .unwrap()
-        .contains("unknown exact lexical request id 125"));
+        .contains("unknown canonical request ID 125"));
 
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
