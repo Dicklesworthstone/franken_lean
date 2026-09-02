@@ -10,6 +10,22 @@ use crate::json::{DecodedField, EnvelopeError, RawField, RequestIdField};
 pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_TRANSCRIPT_FRAMES: u64 = 1_000_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptRole {
+    Request,
+    Notification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFrame {
+    pub index: u64,
+    pub role: TranscriptRole,
+    pub method: String,
+    /// Exact JSON representation of a request ID; absent for notifications.
+    pub id_json: Option<String>,
+    pub body_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptStats {
     pub frames: u64,
@@ -67,7 +83,7 @@ impl BufRead for CountingBufRead<'_> {
     }
 }
 
-fn validate_envelope(body: &[u8], frame: u64) -> Result<bool, String> {
+pub fn validate_frame(body: &[u8], frame: u64) -> Result<TranscriptFrame, String> {
     let text = std::str::from_utf8(body)
         .map_err(|_| format!("frame {frame} body is not valid UTF-8"))?;
     let envelope = crate::json::parse_envelope(text).map_err(|error| match error {
@@ -106,31 +122,46 @@ fn validate_envelope(body: &[u8], frame: u64) -> Result<bool, String> {
         }
         RawField::Invalid => return Err(format!("frame {frame} has ambiguous params")),
     }
-    match envelope.id {
-        RequestIdField::Absent => Ok(false),
-        RequestIdField::Valid(_) => Ok(true),
-        RequestIdField::Invalid => Err(format!("frame {frame} has an invalid request id")),
-    }
+    let (role, id_json) = match envelope.id {
+        RequestIdField::Absent => (TranscriptRole::Notification, None),
+        RequestIdField::Valid(id) => (TranscriptRole::Request, Some(id.as_json())),
+        RequestIdField::Invalid => {
+            return Err(format!("frame {frame} has an invalid request id"));
+        }
+    };
+    let body_bytes = u64::try_from(body.len())
+        .map_err(|_| format!("frame {frame} body length does not fit u64"))?;
+    Ok(TranscriptFrame {
+        index: frame,
+        role,
+        method,
+        id_json,
+        body_bytes,
+    })
 }
 
-fn validate_reader_with_limits(
+fn visit_reader_with_limits<F>(
     input: &mut dyn BufRead,
     max_wire_bytes: u64,
     max_frames: u64,
-) -> Result<TranscriptStats, String> {
+    mut visitor: F,
+) -> Result<TranscriptStats, String>
+where
+    F: FnMut(&TranscriptFrame) -> Result<(), String>,
+{
     let mut input = CountingBufRead::new(input);
     let mut stats = TranscriptStats::default();
     loop {
-        let frame = stats
+        let frame_index = stats
             .frames
             .checked_add(1)
             .ok_or_else(|| "frame count overflow".to_string())?;
         let Some(body) = crate::transport::read_message(&mut input)
-            .map_err(|error| format!("frame {frame} transport failure: {error}"))?
+            .map_err(|error| format!("frame {frame_index} transport failure: {error}"))?
         else {
             break;
         };
-        if frame > max_frames {
+        if frame_index > max_frames {
             return Err(format!(
                 "transcript exceeds the {max_frames}-frame ceiling"
             ));
@@ -140,31 +171,47 @@ fn validate_reader_with_limits(
         }
         if input.wire_bytes > max_wire_bytes {
             return Err(format!(
-                "transcript wire bytes exceed the {max_wire_bytes}-byte aggregate ceiling while reading frame {frame}"
+                "transcript wire bytes exceed the {max_wire_bytes}-byte aggregate ceiling while reading frame {frame_index}"
             ));
         }
-        stats.frames = frame;
+        let frame = validate_frame(&body, frame_index)?;
+        visitor(&frame)?;
+        stats.frames = frame_index;
         stats.body_bytes = stats
             .body_bytes
-            .checked_add(u64::try_from(body.len()).unwrap_or(u64::MAX))
+            .checked_add(frame.body_bytes)
             .ok_or_else(|| "transcript body-byte accounting overflow".to_string())?;
-        if validate_envelope(&body, stats.frames)? {
-            stats.requests = stats
-                .requests
-                .checked_add(1)
-                .ok_or_else(|| "request count overflow".to_string())?;
-        } else {
-            stats.notifications = stats
-                .notifications
-                .checked_add(1)
-                .ok_or_else(|| "notification count overflow".to_string())?;
+        match frame.role {
+            TranscriptRole::Request => {
+                stats.requests = stats
+                    .requests
+                    .checked_add(1)
+                    .ok_or_else(|| "request count overflow".to_string())?;
+            }
+            TranscriptRole::Notification => {
+                stats.notifications = stats
+                    .notifications
+                    .checked_add(1)
+                    .ok_or_else(|| "notification count overflow".to_string())?;
+            }
         }
     }
     Ok(stats)
 }
 
+pub fn visit_reader<F>(
+    input: &mut dyn BufRead,
+    max_frames: u64,
+    visitor: F,
+) -> Result<TranscriptStats, String>
+where
+    F: FnMut(&TranscriptFrame) -> Result<(), String>,
+{
+    visit_reader_with_limits(input, MAX_TRANSCRIPT_BYTES, max_frames, visitor)
+}
+
 pub fn validate_reader(input: &mut dyn BufRead) -> Result<TranscriptStats, String> {
-    validate_reader_with_limits(input, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_FRAMES)
+    visit_reader(input, MAX_TRANSCRIPT_FRAMES, |_| Ok(()))
 }
 
 pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptStats, String> {
@@ -230,6 +277,27 @@ mod tests {
     }
 
     #[test]
+    fn frame_summary_preserves_lexical_id_and_role() {
+        let request = validate_frame(
+            br#"{"jsonrpc":"2.0","id":1.25e2,"method":"shutdown","params":null}"#,
+            7,
+        )
+        .unwrap();
+        assert_eq!(request.index, 7);
+        assert_eq!(request.role, TranscriptRole::Request);
+        assert_eq!(request.method, "shutdown");
+        assert_eq!(request.id_json.as_deref(), Some("1.25e2"));
+
+        let notification = validate_frame(
+            br#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+            8,
+        )
+        .unwrap();
+        assert_eq!(notification.role, TranscriptRole::Notification);
+        assert_eq!(notification.id_json, None);
+    }
+
+    #[test]
     fn optional_empty_null_params_are_lifecycle_specific() {
         for body in [
             r#"{"jsonrpc":"2.0","id":1,"method":"shutdown","params":null}"#,
@@ -269,6 +337,30 @@ mod tests {
     }
 
     #[test]
+    fn visitor_observes_validated_frames_in_wire_order() {
+        let mut transcript = frame(r#"{"jsonrpc":"2.0","id":"a","method":"first"}"#);
+        transcript.extend(frame(r#"{"jsonrpc":"2.0","method":"second"}"#));
+        let mut observed = Vec::new();
+        let stats = visit_reader(
+            &mut BufReader::new(Cursor::new(transcript)),
+            10,
+            |frame| {
+                observed.push((frame.index, frame.role, frame.method.clone()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            observed,
+            vec![
+                (1, TranscriptRole::Request, "first".to_string()),
+                (2, TranscriptRole::Notification, "second".to_string()),
+            ]
+        );
+        assert_eq!(stats.frames, 2);
+    }
+
+    #[test]
     fn aggregate_limit_counts_extension_headers_and_framing() {
         let body = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
         let one = frame_with_extension(body, 64);
@@ -276,19 +368,21 @@ mod tests {
         let mut transcript = one.clone();
         transcript.extend_from_slice(&one);
 
-        let error = validate_reader_with_limits(
+        let error = visit_reader_with_limits(
             &mut BufReader::new(Cursor::new(transcript)),
             one_len + 1,
             10,
+            |_| Ok(()),
         )
         .unwrap_err();
         assert!(error.contains("wire bytes"));
         assert!(error.contains("frame 2"));
 
-        let stats = validate_reader_with_limits(
+        let stats = visit_reader_with_limits(
             &mut BufReader::new(Cursor::new(one)),
             one_len,
             10,
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(stats.frames, 1);
