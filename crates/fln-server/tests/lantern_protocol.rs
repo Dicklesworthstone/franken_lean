@@ -207,3 +207,81 @@ fn request_notification_roles_and_server_state_fail_closed() {
         message.contains("\"id\":3") && message.contains("\"code\":-32803")
     }));
 }
+
+#[test]
+fn wait_for_diagnostics_completes_only_after_requested_publication() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Wait.lean","version":1,"text":"v1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"ready","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":1}}"#,
+        r#"{"jsonrpc":"2.0","id":"future","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":3}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Wait.lean","version":2},"contentChanges":[{"text":"v2"}]}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Wait.lean","version":3},"contentChanges":[{"text":"v3"}]}}"#,
+    ]);
+    let (outcome, output) = run(input, &mut |uri, text| {
+        vec![format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[{{\"message\":{}}}]}}}}",
+            fln_server::json_string(uri),
+            fln_server::json_string(text)
+        )]
+    });
+
+    assert!(outcome.clean);
+    let ready = output
+        .iter()
+        .position(|message| message.contains("\"id\":\"ready\",\"result\":{}"))
+        .expect("ready wait response");
+    let version_three = output
+        .iter()
+        .position(|message| {
+            message.contains("textDocument/publishDiagnostics")
+                && message.contains("\"message\":\"v3\"")
+        })
+        .expect("version-three diagnostic publication");
+    let future = output
+        .iter()
+        .position(|message| message.contains("\"id\":\"future\",\"result\":{}"))
+        .expect("future wait response");
+    assert!(ready < version_three);
+    assert!(version_three < future);
+}
+
+#[test]
+fn pending_waits_cancel_or_fail_exactly_once() {
+    let input = protocol_session(&[
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Wait.lean","version":1,"text":"v1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"cancelled","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":9}}"#,
+        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"cancelled"}}"#,
+        r#"{"jsonrpc":"2.0","id":"closed","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///Wait.lean","version":9}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///Wait.lean"}}}"#,
+    ]);
+    let (outcome, output) = run(input, &mut |uri, _| {
+        vec![format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":{},\"diagnostics\":[]}}}}",
+            fln_server::json_string(uri)
+        )]
+    });
+
+    assert!(outcome.clean);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|message| message.contains("\"id\":\"cancelled\""))
+            .count(),
+        1
+    );
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":\"cancelled\"") && message.contains("\"code\":-32800")
+    }));
+    assert_eq!(
+        output
+            .iter()
+            .filter(|message| message.contains("\"id\":\"closed\""))
+            .count(),
+        1
+    );
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":\"closed\"")
+            && message.contains("\"code\":-32803")
+            && message.contains("document closed before the requested diagnostics version")
+    }));
+}
