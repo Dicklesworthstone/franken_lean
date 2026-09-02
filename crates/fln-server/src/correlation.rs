@@ -8,11 +8,58 @@ use crate::server_transcript::{
 use crate::session_transcript::{ClientSessionStats, validate_client_session_bytes};
 use crate::transcript::{self, TranscriptRole};
 
+/// Maximum unique request IDs retained on either side of one correlation join.
+pub const MAX_CORRELATED_REQUESTS: usize = 262_144;
+/// Maximum canonical request-ID bytes retained in each side's join index.
+pub const MAX_CORRELATION_ID_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorrelationStats {
     pub client: ClientSessionStats,
     pub server: ServerTranscriptStats,
     pub matched_responses: u64,
+    pub client_request_id_bytes: u64,
+    pub server_response_id_bytes: u64,
+}
+
+#[derive(Debug)]
+struct IdIndex {
+    frames: BTreeMap<String, u64>,
+    id_bytes: u64,
+}
+
+fn insert_unique_id(
+    index: &mut IdIndex,
+    id: String,
+    frame: u64,
+    side: &str,
+    max_ids: usize,
+    max_id_bytes: u64,
+) -> Result<(), String> {
+    if let Some(first) = index.frames.get(&id) {
+        return Err(format!(
+            "{side} ID {id} is repeated at frames {first} and {frame}; bidirectional correlation requires unique canonical IDs"
+        ));
+    }
+    if index.frames.len() >= max_ids {
+        return Err(format!(
+            "{side} index exceeds the {max_ids}-request-ID ceiling at frame {frame}"
+        ));
+    }
+    let id_len = u64::try_from(id.len())
+        .map_err(|_| format!("{side} frame {frame} request-ID length does not fit u64"))?;
+    let next_id_bytes = index
+        .id_bytes
+        .checked_add(id_len)
+        .ok_or_else(|| format!("{side} request-ID byte accounting overflow at frame {frame}"))?;
+    if next_id_bytes > max_id_bytes {
+        return Err(format!(
+            "{side} canonical request-ID bytes exceed the {max_id_bytes}-byte ceiling at frame {frame}"
+        ));
+    }
+    index.frames.insert(id, frame);
+    index.id_bytes = next_id_bytes;
+    Ok(())
 }
 
 /// The shared parser's deterministic request-ID identity.
@@ -20,8 +67,15 @@ pub struct CorrelationStats {
 /// JSON numbers retain their exact source lexeme, strings compare by decoded
 /// Unicode value and are re-escaped canonically, and null remains null. This is
 /// also the representation the live dispatcher emits in response IDs.
-fn client_request_ids(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {
-    let mut requests = BTreeMap::new();
+fn client_request_ids_with_limits(
+    bytes: &[u8],
+    max_ids: usize,
+    max_id_bytes: u64,
+) -> Result<IdIndex, String> {
+    let mut requests = IdIndex {
+        frames: BTreeMap::new(),
+        id_bytes: 0,
+    };
     transcript::visit_reader(
         &mut Cursor::new(bytes),
         transcript::MAX_TRANSCRIPT_FRAMES,
@@ -35,23 +89,37 @@ fn client_request_ids(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {
                     frame.index
                 )
             })?;
-            if let Some(first) = requests.insert(id.clone(), frame.index) {
-                return Err(format!(
-                    "client request ID {id} is repeated at frames {first} and {}; bidirectional correlation requires unique canonical IDs",
-                    frame.index
-                ));
-            }
-            Ok(())
+            insert_unique_id(
+                &mut requests,
+                id,
+                frame.index,
+                "client request",
+                max_ids,
+                max_id_bytes,
+            )
         },
     )?;
     Ok(requests)
 }
 
-fn server_response_ids(
+fn client_request_ids(bytes: &[u8]) -> Result<IdIndex, String> {
+    client_request_ids_with_limits(
+        bytes,
+        MAX_CORRELATED_REQUESTS,
+        MAX_CORRELATION_ID_BYTES,
+    )
+}
+
+fn server_response_ids_with_limits(
     evidence: &ServerTranscriptEvidence,
     client: &BTreeMap<String, u64>,
-) -> Result<BTreeMap<String, u64>, String> {
-    let mut responses = BTreeMap::new();
+    max_ids: usize,
+    max_id_bytes: u64,
+) -> Result<IdIndex, String> {
+    let mut responses = IdIndex {
+        frames: BTreeMap::new(),
+        id_bytes: 0,
+    };
     for frame in &evidence.frames {
         if !matches!(frame.role, ServerFrameRole::Response(_)) {
             continue;
@@ -62,20 +130,34 @@ fn server_response_ids(
                 frame.index
             )
         })?;
-        if let Some(first) = responses.insert(id.clone(), frame.index) {
-            return Err(format!(
-                "server response ID {id} is repeated at frames {first} and {}",
-                frame.index
-            ));
-        }
         if !client.contains_key(&id) {
             return Err(format!(
                 "server frame {} responds to unknown canonical request ID {id}",
                 frame.index
             ));
         }
+        insert_unique_id(
+            &mut responses,
+            id,
+            frame.index,
+            "server response",
+            max_ids,
+            max_id_bytes,
+        )?;
     }
     Ok(responses)
+}
+
+fn server_response_ids(
+    evidence: &ServerTranscriptEvidence,
+    client: &BTreeMap<String, u64>,
+) -> Result<IdIndex, String> {
+    server_response_ids_with_limits(
+        evidence,
+        client,
+        MAX_CORRELATED_REQUESTS,
+        MAX_CORRELATION_ID_BYTES,
+    )
 }
 
 pub fn correlate_transcripts(
@@ -87,18 +169,19 @@ pub fn correlate_transcripts(
     let requests = client_request_ids(client_bytes)?;
     let server = validate_server_transcript_bytes(server_bytes)
         .map_err(|error| format!("server transcript validation failed: {error}"))?;
-    let responses = server_response_ids(&server, &requests)?;
+    let responses = server_response_ids(&server, &requests.frames)?;
 
     if let Some((id, frame)) = requests
+        .frames
         .iter()
-        .filter(|(id, _)| !responses.contains_key(*id))
+        .filter(|(id, _)| !responses.frames.contains_key(*id))
         .min_by_key(|(_, frame)| **frame)
     {
         return Err(format!(
             "client request frame {frame} with canonical ID {id} has no server response"
         ));
     }
-    let matched_responses = u64::try_from(responses.len())
+    let matched_responses = u64::try_from(responses.frames.len())
         .map_err(|_| "matched response count does not fit u64".to_string())?;
     if matched_responses != server.stats.responses {
         return Err(format!(
@@ -116,13 +199,15 @@ pub fn correlate_transcripts(
         client,
         server: server.stats,
         matched_responses,
+        client_request_id_bytes: requests.id_bytes,
+        server_response_id_bytes: responses.id_bytes,
     })
 }
 
 pub fn render_correlation(stats: CorrelationStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-server-correlation/1\",",
+            "{{\"schema\":\"fln.lsp-client-server-correlation/2\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -131,6 +216,9 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "\"duplicateResponseIds\":0,\"resultResponses\":{},",
             "\"errorResponses\":{},\"serverNotifications\":{},",
             "\"clientWireBytes\":{},\"serverWireBytes\":{},",
+            "\"serverMetadataBytes\":{},",
+            "\"clientRequestIdBytes\":{},\"serverResponseIdBytes\":{},",
+            "\"requestIdCountCeiling\":{},\"requestIdByteCeiling\":{},",
             "\"documentsOpened\":{},\"documentsChanged\":{},",
             "\"documentsSaved\":{},\"documentsClosed\":{},",
             "\"diagnosticWaits\":{},\"cancellations\":{},",
@@ -146,6 +234,11 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
         stats.server.notifications,
         stats.client.lifecycle.transcript.wire_bytes,
         stats.server.wire_bytes,
+        stats.server.metadata_bytes,
+        stats.client_request_id_bytes,
+        stats.server_response_id_bytes,
+        MAX_CORRELATED_REQUESTS,
+        MAX_CORRELATION_ID_BYTES,
         stats.client.documents_opened,
         stats.client.documents_changed,
         stats.client.documents_saved,
@@ -199,12 +292,15 @@ mod tests {
         assert_eq!(stats.matched_responses, 3);
         assert_eq!(stats.server.result_responses, 3);
         assert_eq!(stats.server.notifications, 1);
+        assert_eq!(stats.client_request_id_bytes, stats.server_response_id_bytes);
         let receipt = render_correlation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/1\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/2\""));
         assert!(receipt.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
         assert!(receipt.contains("\"matchedResponses\":3"));
         assert!(receipt.contains("\"unmatchedClientRequests\":0"));
         assert!(receipt.contains("\"unsolicitedServerResponses\":0"));
+        assert!(receipt.contains("\"requestIdCountCeiling\":262144"));
+        assert!(receipt.contains("\"requestIdByteCeiling\":33554432"));
     }
 
     #[test]
@@ -293,6 +389,30 @@ mod tests {
         ]);
         let error = correlate_transcripts(&client, &server()).unwrap_err();
         assert!(error.contains("requires unique canonical IDs"));
+    }
+
+    #[test]
+    fn request_index_count_and_byte_limits_fail_before_retention() {
+        let bytes = framed(&[
+            r#"{"jsonrpc":"2.0","id":"one","method":"first","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"two","method":"second","params":{}}"#,
+        ]);
+        let count_error = client_request_ids_with_limits(&bytes, 1, 100).unwrap_err();
+        assert!(count_error.contains("1-request-ID ceiling"));
+        assert!(count_error.contains("frame 2"));
+
+        let byte_error = client_request_ids_with_limits(&bytes, 10, 4).unwrap_err();
+        assert!(byte_error.contains("4-byte ceiling"));
+        assert!(byte_error.contains("frame 1"));
+    }
+
+    #[test]
+    fn response_index_has_independent_limits() {
+        let evidence = validate_server_transcript_bytes(&server()).unwrap();
+        let requests = client_request_ids(&client()).unwrap();
+        let error = server_response_ids_with_limits(&evidence, &requests.frames, 2, 100)
+            .unwrap_err();
+        assert!(error.contains("2-request-ID ceiling"));
     }
 
     #[test]
