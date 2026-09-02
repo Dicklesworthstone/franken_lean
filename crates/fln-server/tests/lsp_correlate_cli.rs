@@ -70,6 +70,7 @@ fn help_and_usage_refusals_are_side_effect_free() {
     assert!(stdout.starts_with("Usage: fln-lsp-correlate"));
     assert!(stdout.contains("Number lexemes"));
     assert!(stdout.contains("string IDs compare by decoded value"));
+    assert!(stdout.contains("cancellation to target one prior non-null"));
     assert!(stdout.contains("not cross-stream timing"));
 
     let missing = correlator().output().unwrap();
@@ -91,8 +92,9 @@ fn successful_join_emits_zero_unmatched_resource_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/3\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/4\""));
     assert!(stdout.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
+    assert!(stdout.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
     assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));
@@ -114,6 +116,10 @@ fn successful_join_emits_zero_unmatched_resource_receipt() {
     assert!(stdout.contains("\"documentsClosed\":1"));
     assert!(stdout.contains("\"diagnosticWaits\":0"));
     assert!(stdout.contains("\"cancellations\":0"));
+    assert!(stdout.contains("\"cancellationTargetIdBytes\":0"));
+    assert!(stdout.contains("\"cancelledTargetRequestCancelledResponses\":0"));
+    assert!(stdout.contains("\"cancelledTargetResultResponses\":0"));
+    assert!(stdout.contains("\"cancelledTargetOtherErrorResponses\":0"));
 
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
@@ -149,6 +155,10 @@ fn cancelled_future_wait_is_joined_as_typed_evidence() {
     assert!(stdout.contains("\"cancellations\":1"));
     assert!(stdout.contains("\"diagnosticWaitCancellationTargets\":1"));
     assert!(stdout.contains("\"otherRequestCancellationTargets\":0"));
+    assert!(stdout.contains("\"cancellationTargetIdBytes\":6"));
+    assert!(stdout.contains("\"cancelledTargetRequestCancelledResponses\":1"));
+    assert!(stdout.contains("\"cancelledTargetResultResponses\":0"));
+    assert!(stdout.contains("\"cancelledTargetOtherErrorResponses\":0"));
     assert!(stdout.contains("\"matchedResponses\":3"));
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
