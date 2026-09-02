@@ -5,4 +5,6 @@
 //! their local `json` module; the implementation itself remains single-source at
 //! `dispatch/json.rs`.
 
+#![allow(dead_code)]
+
 include!("dispatch/json.rs");
