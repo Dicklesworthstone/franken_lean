@@ -2,7 +2,7 @@
 
 This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed. [`README.md`](README.md) is intentionally written as the finished 1.0 target, while [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded state ledger.
 
-Scope: project inception on **2026-07-21** through the September 2 cancellation-bound Lantern evidence tranche rooted at substantive commit [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64).
+Scope: project inception on **2026-07-21** through the September 2 method-bound Lantern response tranche rooted at substantive commit [`0dae67c9`](https://github.com/Dicklesworthstone/franken_lean/commit/0dae67c9c800852dbd6af7527e97a9b493a2eac4).
 
 No GitHub Release is implied by this history. Representative commits are navigation aids, not substitutes for the Beads graph, generated contracts, real-artifact receipts, or governed release evidence.
 
@@ -19,7 +19,8 @@ No GitHub Release is implied by this history. Representative commits are navigat
 | [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387) | 2026-09-02 | Modular Lantern dispatcher, diagnostic publication authority, bounded waits, and public framed transcripts. |
 | [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef) | 2026-09-02 | Strict client lifecycle, method role/params contracts, replay preflight, and metadata-only inspection. |
 | [`3cef4983`](https://github.com/Dicklesworthstone/franken_lean/commit/3cef498352964fd6512c79f5d303e3d92fc045a1) | 2026-09-02 | Document-semantic client sessions, structural server transcripts, and initial bidirectional ID correlation. |
-| [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64) | 2026-09-02 | Cancellation-bound request identity, joined wait/cancellation evidence, response classification, and bounded ID retention. |
+| [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64) | 2026-09-02 | Cancellation-bound request identity, wait/cancellation evidence, response classification, and bounded ID retention. |
+| [`0dae67c9`](https://github.com/Dicklesworthstone/franken_lean/commit/0dae67c9c800852dbd6af7527e97a9b493a2eac4) | 2026-09-02 | Method-bound response validation and exhaustive reconciliation with server result/error totals. |
 
 ---
 
@@ -31,8 +32,8 @@ Landed:
 - repository-wide agent instructions and a Beads dependency graph;
 - the plan §21 native-Rust crate map and pinned nightly;
 - the closed dependency universe and structural dependency checks;
-- `SUITE.lock` as the compatibility epoch/closure authority;
-- fail-closed evidence harnesses and the Oracle-Only Law: the pinned Lean Reference is fixture/oracle material, never a FrankenLean runtime component.
+- `SUITE.lock` as the compatibility epoch and closure authority;
+- fail-closed evidence harnesses and the Oracle-Only Law: the pinned Lean Reference is fixture and oracle material, never a FrankenLean runtime component.
 
 Representative commits: [`45e3bd2a`](https://github.com/Dicklesworthstone/franken_lean/commit/45e3bd2a79a0ea9cbcbb81ecaaa6ec296ca86e79), [`3df0543d`](https://github.com/Dicklesworthstone/franken_lean/commit/3df0543d9537b0a930e7e72ba9b779bfa0e49ad5), `6c1f089c`, `0803079f`.
 
@@ -44,7 +45,7 @@ Landed:
 - `KERNEL_CONTRACT.md` as an executable judgment specification;
 - Crucible K1 bootstrap and admission authority boundaries;
 - mechanically generated ABI and `.olean` contracts;
-- Tribunal/parity-ledger bootstrap;
+- Tribunal and parity-ledger bootstrap;
 - owned bignum ground and kernel literal acceleration;
 - early mutation campaigns around conversion, recursors, quotients, proof irrelevance, and binders.
 
@@ -55,7 +56,7 @@ Representative commits: [`7ed677c2`](https://github.com/Dicklesworthstone/franke
 Landed:
 
 - `lean_object` compatibility heap, tri-state RC, membrane, and ownership shadows;
-- compacted-region mmap/relocation substrate used by artifact loading;
+- compacted-region mmap and relocation substrate used by artifact loading;
 - persistent environment snapshots and bounded declaration admission;
 - stack-safe term/level destruction and deterministic traversal/encoding;
 - split `.olean` companion decoding and the beginnings of byte-compatible reconstruction.
@@ -66,8 +67,8 @@ Representative commits: `5d6cb2b2`, [`1eca4667`](https://github.com/Dicklesworth
 
 Landed:
 
-- lossless syntax/source substrate with byte, scalar, and UTF-16 projections;
-- solver-independent CNF/proof contracts, owned SAT checking, and reflected `bv_decide` publication;
+- lossless syntax and source substrate with byte, scalar, and UTF-16 projections;
+- solver-independent CNF and proof contracts, owned SAT checking, and reflected `bv_decide` publication;
 - exact mutant-to-killer-test evidence joins;
 - kernel LOC covenant and named unsafe-boundary enforcement;
 - resource, cancellation, and inconclusive outcomes that cannot collapse into ordinary rejection;
@@ -79,10 +80,10 @@ Representative commits: [`e20cded9`](https://github.com/Dicklesworthstone/franke
 
 Landed:
 
-- the first source-text → kernel-accepted declaration seam;
-- pin-generated façade stubs over the bounded elaborator surface;
+- the first source-text to kernel-accepted declaration seam;
+- pin-generated facade stubs over the bounded elaborator surface;
 - FIR/FLBC and the Golem interpreter substrate;
-- governed ABI values, inline caches, heartbeat/check-system behavior, and bounded IO/task slices;
+- governed ABI values, inline caches, heartbeat and check-system behavior, and bounded IO/task slices;
 - independent checker admission for axioms, definitions, theorems, opaques, mutual blocks, inference, defeq, and selected inductive/recursor forms;
 - owned deterministic libm baseline and additional ABI effects.
 
@@ -92,7 +93,7 @@ Representative commits: [`7c48295c`](https://github.com/Dicklesworthstone/franke
 
 Landed:
 
-- `fln run`, `fln flbc run`, `fln check-olean`, bounded inspect/diff, and related artifact commands;
+- `fln run`, `fln flbc run`, `fln check-olean`, bounded inspect and diff, and related artifact commands;
 - Golem execution for a growing closed Nat/Bool/String subset;
 - bounded source-module imports, definitions, and module-graph execution;
 - checker reconstruction of enumeration units, field-bearing inductives, quotients, and direct recursive families;
@@ -109,7 +110,7 @@ Landed:
 - corrected `Init.HEq` hygienic recursor reconstruction;
 - corrected the direct-recursive `Init.Nat` model and forged-recursion refusal cells;
 - a real-artifact Nat council test and explicit non-vacuous runner derived from `SUITE.lock`;
-- `AGENT_FRONTIER_PROTOCOL.md` with immutable Git/artifact anchors, semantic ownership, typed first-failure frontiers, negative evidence, and one-variable experiments;
+- `AGENT_FRONTIER_PROTOCOL.md` with immutable Git and artifact anchors, semantic ownership, typed first-failure frontiers, negative evidence, and one-variable experiments;
 - executable frontier auditing, deterministic Beads selection, and concrete dependency-cycle witnesses.
 
 The full `fln-51y8` sequential `Init.Prelude` council remains open. A bounded Nat cell is not evidence that the complete Prelude frontier passed.
@@ -120,10 +121,10 @@ Representative commits: [`2ad0eb21`](https://github.com/Dicklesworthstone/franke
 
 Landed:
 
-- bounded Content-Length framing, header/resource ceilings, strict Content-Type handling, and failure-atomic writes;
+- bounded Content-Length framing, header and resource ceilings, strict Content-Type handling, and failure-atomic writes;
 - complete structural JSON validation for the supported JSON-RPC surface;
 - decoded string escapes and surrogate pairs;
-- root-only envelope routing and deterministic integer/string/null request IDs;
+- root-only envelope routing and deterministic integer, string, and null request IDs;
 - lifecycle handling for initialize, initialized, shutdown, and exit;
 - Full-sync `didOpen`, `didChange`, `didSave`, and `didClose`;
 - independent open-document, source-byte, and URI-key authority;
@@ -139,7 +140,7 @@ Landed:
 - modular JSON, wire, document-session, and wait implementations;
 - structural callback validation and current-document URI binding;
 - separate accepted-document and diagnostic-publication frontiers;
-- exact complete/authority/`diagnosticCount:0` accounting;
+- exact complete, authority, and `diagnosticCount:0` accounting;
 - non-authoritative outcomes that clear stale diagnostics and cannot release waits;
 - bounded `waitForDiagnostics`, exact cancellation, and deterministic close/shutdown completion;
 - complete-wire versus body-byte transcript receipts;
@@ -158,7 +159,7 @@ Landed:
 - metadata-only frame inspection;
 - structural server transcript validation for notifications and result/error responses;
 - known server notification payload checks;
-- canonical request-ID correlation: exact number lexemes, decoded string identity, and deterministic re-escaping;
+- canonical request-ID correlation using exact number lexemes, decoded string identity, and deterministic re-escaping;
 - bounded client request, server response, decoded metadata, and correlation indexes;
 - exact one-to-one response joins with no missing, duplicate, or unsolicited responses.
 
@@ -166,47 +167,65 @@ Representative commits: [`025c4c86`](https://github.com/Dicklesworthstone/franke
 
 ## 11. Cancellation-bound session and response evidence — 2026-09-02
 
-This tranche closes a specific evidentiary gap: a syntactically valid cancellation was previously counted without proving what it targeted, and the bidirectional join did not disclose how the target eventually responded.
+Landed:
+
+- `fln.lsp-client-session/3` with globally unique canonical request IDs and explicit count and byte limits;
+- prior-request authority for every non-null cancellation target;
+- duplicate cancellation refusal and diagnostic-wait versus other-request classification;
+- covered-versus-future diagnostic-wait counts;
+- cancellation state stored on the existing bounded request record rather than another copied-ID map;
+- independent join-side reconstruction of request and cancellation indexes;
+- `fln.lsp-client-server-correlation/4` response classification for every cancelled target as `RequestCancelled`, normal result, or another valid error;
+- installed-binary evidence for canonical aliases, numeric-lexeme non-equivalence, cancellation refusal, and joined cancellation outcomes.
+
+A result after cancellation is disclosed rather than rejected because cancellation is advisory and separate recordings do not establish event order.
+
+Representative commits: [`94717cd2`](https://github.com/Dicklesworthstone/franken_lean/commit/94717cd2592885594342b08b809947d3c4dc1cd1), [`71e3fcaf`](https://github.com/Dicklesworthstone/franken_lean/commit/71e3fcaf7a98938fe4908ef05f25c1405a17882f), [`73cdb40d`](https://github.com/Dicklesworthstone/franken_lean/commit/73cdb40d47b4d79a2d9acbd91a47623fba88c076), [`b09f7ea1`](https://github.com/Dicklesworthstone/franken_lean/commit/b09f7ea1ac2e760fb7241f76c7855d74d682d587), [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64).
+
+## 12. Method-bound response evidence — 2026-09-02
+
+This tranche closes a different evidentiary gap: a server stream could previously contain exactly one response for every canonical client ID while returning behavior inconsistent with the live bounded dispatcher.
 
 ### Landed
 
-- `fln.lsp-client-session/3` requires every client request ID to be globally unique under `number-lexeme-string-value-v1`.
-- The strict session retains at most 262,144 canonical request IDs and 32 MiB of canonical ID bytes.
-- Every `$/cancelRequest` target must identify an earlier non-null request under the same canonical identity policy.
-- Duplicate cancellation of one target fails closed.
-- Cancellation targets are classified as diagnostic waits or other requests.
-- Diagnostic waits are separately classified as already-covered or future-version targets.
-- Cancellation state is stored on the existing bounded request record; the session does not keep a second map of copied target strings.
-- Correlation independently rebuilds request and cancellation indexes and requires count, byte, and prior-request facts to agree with client-session evidence.
-- `fln.lsp-client-server-correlation/4` classifies every cancelled target's response as:
-  - JSON-RPC `RequestCancelled` (`-32800`);
-  - a normal result;
-  - another valid error.
-- The three response classes must account for every cancellation target. A result is disclosed rather than rejected because cancellation is advisory and separate streams contain no shared event clock.
-- Installed-binary tests cover successful cancellation-bound receipts, unknown and duplicate targets, side-effect-free replay refusal, canonical string aliases, numeric-lexeme non-equivalence, joined RequestCancelled evidence, and zero-valued classes for uncancelled sessions.
+- Each independently rebuilt client request entry now carries one fixed-size method contract beside its already bounded canonical ID.
+- Correlation schema advances to `fln.lsp-client-server-correlation/5` and names `fln.lsp-method-response/1`.
+- The join validates the current outer response behavior:
+  - `initialize` requires an object result;
+  - `shutdown` requires `null`;
+  - diagnostic waits permit an object result, `RequestCancelled`, or `RequestFailed`;
+  - plain goals, term goals, hover, completion, and definition require the current no-information `null` result;
+  - unsupported Lean RPC requires `RequestFailed`;
+  - unknown methods require `MethodNotFound`.
+- Every matched response belongs to exactly one method class.
+- Method-derived result counts reconcile with validated server result responses.
+- Method-derived error counts reconcile with validated server error responses.
+- The receipt reports each method class and zero method-contract violations.
+- A stale positive CLI fixture that expected `MethodNotFound` for hover was corrected to the live dispatcher's `null` response.
+- A new installed-binary negative cell proves that the same wrong hover response now fails without a success receipt.
+- Static review caught and corrected an invalid `const fn` string-method classifier before documentation closeout; method classification is runtime-only.
 
 ### Representative commits
 
-- [`94717cd2`](https://github.com/Dicklesworthstone/franken_lean/commit/94717cd2592885594342b08b809947d3c4dc1cd1) — corrected canonical cancellation-ID binding.
-- [`71e3fcaf`](https://github.com/Dicklesworthstone/franken_lean/commit/71e3fcaf7a98938fe4908ef05f25c1405a17882f) — installed client-session cancellation authority.
-- [`73cdb40d`](https://github.com/Dicklesworthstone/franken_lean/commit/73cdb40d47b4d79a2d9acbd91a47623fba88c076) — cancelled-target response classification.
-- [`b09f7ea1`](https://github.com/Dicklesworthstone/franken_lean/commit/b09f7ea1ac2e760fb7241f76c7855d74d682d587) — installed correlation schema-v4 boundary.
-- [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64) — eliminated duplicate cancellation-ID retention.
+- [`9c498a51`](https://github.com/Dicklesworthstone/franken_lean/commit/9c498a514593d25b000ffe8032d12235e95f346a) — method-bound response classification and schema v5.
+- [`643af6c1`](https://github.com/Dicklesworthstone/franken_lean/commit/643af6c1ceaab860ff3129c502bed3d4dfa9e9ff) — installed help contract.
+- [`e61181d5`](https://github.com/Dicklesworthstone/franken_lean/commit/e61181d5479641d26e1408d29198c0c75cfdb7f4) — installed positive and mismatch evidence.
+- [`0dae67c9`](https://github.com/Dicklesworthstone/franken_lean/commit/0dae67c9c800852dbd6af7527e97a9b493a2eac4) — compile-level runtime-only classifier correction.
 
 ### Evidence boundary
 
 The repository owns focused unit and installed-binary tests for this tranche. The editing environment did not contain `cargo` or `rustc`, and hosted Actions were intentionally not used, so this changelog does not claim a same-session green Rust run.
 
-The tranche does **not** establish cross-stream timing, active-computation cancellation, arbitrary method-specific result semantics, source-aware production projection, cursor-aware goals, Lean RPC, shared import heaps, full unmodified-editor parity, or the complete pinned Prelude council.
+Method-response schema v1 is intentionally an outer contract. It does not yet prove every initialize capability, the exact inner successful diagnostic-wait object, useful editor semantics, cross-stream timing, active-work cancellation, source-aware production projection, Lean RPC, shared import state, full unmodified-editor parity, or the complete pinned Prelude council.
 
 ---
 
 ## Notes for agents
 
-- The README is the 1.0 target-state specification; use [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for current evidence claims.
+- Use [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for current evidence claims; the README is the 1.0 target-state specification.
 - The tracker of record is [`.beads/issues.jsonl`](.beads/issues.jsonl); Beads IDs are not GitHub Issues.
 - The Reference is an oracle and fixture source only.
 - Generated contracts such as `KERNEL_CONTRACT.md`, `ABI_CONTRACT.md`, and `OLEAN_CONTRACT.md` are compatibility authorities; do not hand-copy their facts into implementation code.
 - A green synthetic fixture is not a pinned-artifact claim. Sequential compatibility work reports `last proven -> first non-success -> typed class`.
-- Request-ID, cancellation, and response correlation are protocol facts, not proof of method-result semantics or event timing.
-- Full semantic Lantern/RPC, mathlib-scale closure, and release-grade distribution remain active program work even though substantial bounded slices are live.
+- ID equality, cancellation classification, and method-bound outer response shape are protocol facts, not proof of inner semantic payloads or event timing.
+- Full semantic Lantern and RPC, mathlib-scale closure, and release-grade distribution remain active program work even though substantial bounded slices are live.
