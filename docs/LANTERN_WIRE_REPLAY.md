@@ -10,9 +10,23 @@ fln-lsp-replay [--client-lifecycle | --client-session] [--expect PATH] [--output
 fln-lsp-correlate [--] CLIENT SERVER
 ```
 
-`INPUT`, `CLIENT`, and `SERVER` are exact framed byte streams, including headers, separators, and bodies. The tools do not sort or regenerate the supplied stream before validation or replay. Decoded string request IDs are re-escaped canonically only when an identity key or receipt field is constructed.
+`INPUT`, `CLIENT`, and `SERVER` are exact framed byte streams, including headers, separators, and bodies. The tools do not sort, normalize, or regenerate the supplied stream before validation or replay. Decoded string request IDs are re-escaped canonically only when an identity key or receipt field is constructed.
 
-## Request-ID identity policy
+## Evidence ladder
+
+The tools deliberately expose different grades. A stronger grade adds claims; it does not retroactively change the meaning of a weaker receipt.
+
+| Grade | Command | Receipt | Additional authority |
+|---|---|---|---|
+| Framing and JSON shape | `fln-lsp-validate INPUT` | `fln.lsp-transcript-validation/2` | Complete framed bytes, valid UTF-8 JSON-RPC objects, roles, and wire/body accounting. |
+| Client lifecycle | `fln-lsp-validate --client-lifecycle INPUT` | `fln.lsp-client-lifecycle/1` | Initialize/initialized/shutdown/exit order plus known request/notification roles and parameter-container contracts. |
+| Client session | `fln-lsp-validate --client-session INPUT` | `fln.lsp-client-session/3` | Full-sync document state, monotone versions, wait classes, canonical request IDs, cancellation targets, and bounded retained metadata. |
+| Server structure | `fln-lsp-server-validate INPUT` | `fln.lsp-server-transcript/3` | Response shape, known notification schemas, result/error counts, and bounded decoded server metadata. |
+| Bidirectional join | `fln-lsp-correlate CLIENT SERVER` | `fln.lsp-client-server-correlation/5` | One-to-one canonical response IDs, cancellation-response classes, and the current method-to-response contract. |
+
+Default replay intentionally accepts any syntax-valid client stream so malformed lifecycle and document behavior can remain executable negative fixtures. Strict replay preflights add lifecycle or session authority before any server execution or output publication.
+
+## Request-ID identity
 
 Every strict session and correlation receipt names:
 
@@ -20,195 +34,89 @@ Every strict session and correlation receipt names:
 number-lexeme-string-value-v1
 ```
 
-The policy is intentionally explicit:
+The policy is:
 
 - JSON number IDs retain their exact source lexeme. `1.25e2` and `125` are different identities.
-- JSON string IDs compare by decoded Unicode value. `"init"` and `"\u0069nit"` are the same identity and are rendered with deterministic JSON escaping.
-- `null` remains `null`. It is accepted as a request-shaped ID for compatibility but cannot be a cancellation target.
+- JSON string IDs compare by decoded Unicode value. `"init"` and `"\u0069nit"` are the same identity and render with deterministic JSON escaping.
+- `null` remains `null`. It may identify a request-shaped message for compatibility but cannot be a cancellation target.
 
-Strict client-session evidence requires request IDs to be globally unique within the recorded client stream. JSON-RPC permits reuse after a response has completed, but a client-only stream has no server-response clock with which to prove that completion. Global uniqueness is therefore the conservative, timing-independent evidence rule.
+Strict client-session evidence requires request IDs to be globally unique within the client recording. JSON-RPC permits reuse after a response completes, but a client-only stream has no server-response clock with which to prove that completion. Global uniqueness is therefore the conservative timing-independent evidence rule.
 
-## Three client validation grades
-
-The grades are deliberately separate. A stronger grade never changes the meaning of a weaker one.
-
-### 1. Syntax-only validation
+## Syntax-only validation
 
 ```text
 fln-lsp-validate INPUT
 ```
 
-The default mode proves:
+This proves:
 
 - bounded Content-Length framing;
 - complete UTF-8 JSON syntax;
-- a JSON-RPC 2.0 object envelope;
+- JSON-RPC 2.0 object envelopes;
 - deterministic request-ID decoding;
 - generic parameter-container validity;
 - aggregate frame, role, wire-byte, and body-byte accounting.
 
-It does **not** require a complete lifecycle. This is intentional: malformed-order, role-inverted, and document-invalid streams remain useful inputs for replay and refusal tests.
+It does not require a complete lifecycle. Its receipt reports `wireBytes`, including headers and separators, separately from JSON `bodyBytes`.
 
-Its receipt is:
-
-```json
-{
-  "schema": "fln.lsp-transcript-validation/2",
-  "frames": 4,
-  "requests": 2,
-  "notifications": 2,
-  "wireBytes": 293,
-  "bodyBytes": 205
-}
-```
-
-`wireBytes` includes headers, CRLF separators, extension headers, and JSON bodies. `bodyBytes` includes JSON bodies only.
-
-### 2. Client-lifecycle validation
+## Client lifecycle validation
 
 ```text
 fln-lsp-validate --client-lifecycle INPUT
 ```
 
-This adds a fail-closed client lifecycle. It requires:
+This additionally requires:
 
-- request-shaped `initialize` as the first frame;
+- request-shaped `initialize` as frame one;
 - `initialized` before ordinary running traffic;
 - exactly one running-state `shutdown` request;
 - `exit` immediately after shutdown;
 - no frame after exit and EOF in the terminal state;
-- IDs on every known request-only method and no IDs on known notification-only methods;
-- object params for known data-bearing methods;
-- only missing or `null` params for `shutdown` and `exit`.
+- IDs on known request-only methods and no IDs on known notification-only methods;
+- object parameters for known data-bearing methods;
+- only missing or `null` parameters for `shutdown` and `exit`.
 
 Unknown methods remain admissible while running so future extensions do not require weakening the validator. They cannot bypass initialization or terminal ordering.
 
-The lifecycle receipt binds every handshake frame:
-
-```json
-{
-  "schema": "fln.lsp-client-lifecycle/1",
-  "finalState": "exited",
-  "frames": 5,
-  "requests": 3,
-  "notifications": 2,
-  "wireBytes": 394,
-  "bodyBytes": 284,
-  "initializeFrame": 1,
-  "initializedFrame": 2,
-  "shutdownFrame": 4,
-  "exitFrame": 5
-}
-```
-
-This grade still does not interpret document-session contents or cancellation targets.
-
-### 3. Client-session validation
+## Client-session validation
 
 ```text
 fln-lsp-validate --client-session INPUT
 ```
 
-This first requires the complete lifecycle above, then performs a bounded semantic pass over the client document and request session. It validates:
+This first requires the complete lifecycle, then validates the client document and request session:
 
-- nonempty `textDocument.uri` values;
-- one integer version and complete text on `didOpen`;
-- no duplicate open for the same URI;
-- `didChange` only for an open document;
-- strictly increasing change versions;
+- nonempty document URIs;
+- one integer version and complete source text on `didOpen`;
+- no duplicate open for one URI;
+- changes, saves, closes, and diagnostic waits only for open documents;
+- strictly increasing `didChange` versions;
 - exactly one unambiguous, unranged Full-sync content change;
-- `didSave` and `didClose` only for open documents;
 - optional save text as one valid string;
-- `waitForDiagnostics` only for an open document and a nonnegative target version;
-- whether each diagnostic wait targets the currently covered version or a future version;
-- canonical global uniqueness for every client request ID;
-- each `$/cancelRequest` target is a prior, non-null client request;
-- no request is cancelled more than once;
-- whether each cancellation targets a diagnostic wait or another request class;
-- at most 1,024 simultaneously open documents;
-- at most 4 MiB of aggregate open-document URI keys;
-- at most 262,144 canonical request IDs and 32 MiB of retained canonical request-ID bytes.
+- nonnegative diagnostic-wait target versions;
+- covered-versus-future wait classification;
+- globally unique canonical request IDs;
+- cancellation targets bound to prior non-null requests;
+- no duplicate cancellation of one target;
+- diagnostic-wait-versus-other-request cancellation classification.
 
-Cancellation state is stored on the already bounded request record. The validator does not retain a second copy of each cancellation target ID.
+Cancellation state is stored on the existing request record rather than in another copied-ID map.
 
-The validator does not retain source text after each event. It buffers the complete input under the existing 256 MiB transcript ceiling so the lifecycle and semantic passes inspect identical bytes.
-
-A successful session receipt is `fln.lsp-client-session/3` and exposes behavior, identity, and resource state:
-
-```json
-{
-  "schema": "fln.lsp-client-session/3",
-  "finalState": "exited",
-  "idPolicy": "number-lexeme-string-value-v1",
-  "frames": 10,
-  "requests": 3,
-  "notifications": 7,
-  "wireBytes": 1042,
-  "bodyBytes": 812,
-  "initializeFrame": 1,
-  "initializedFrame": 2,
-  "shutdownFrame": 9,
-  "exitFrame": 10,
-  "documentsOpened": 1,
-  "documentsChanged": 1,
-  "documentsSaved": 1,
-  "documentsClosed": 1,
-  "diagnosticWaits": 1,
-  "coveredVersionWaits": 0,
-  "futureVersionWaits": 1,
-  "cancellations": 1,
-  "diagnosticWaitCancellationTargets": 1,
-  "otherRequestCancellationTargets": 0,
-  "uniqueRequestIds": 3,
-  "requestIdBytes": 24,
-  "requestIdCountCeiling": 262144,
-  "requestIdByteCeiling": 33554432,
-  "peakOpenDocuments": 1,
-  "finalOpenDocuments": 0,
-  "peakOpenUriBytes": 14,
-  "finalOpenUriBytes": 0
-}
-```
-
-Open documents are permitted at shutdown because LSP does not require a close notification for every document. The receipt exposes the final count and URI bytes rather than silently pretending cleanup occurred.
-
-## Metadata-only inspection
-
-`fln-lsp-inspect` emits one deterministic `fln.lsp-frame/2` NDJSON row per syntactically valid client frame. Rows contain:
-
-- wire index;
-- request or notification role;
-- decoded method;
-- canonical request-ID JSON, or `null` for a notification;
-- `paramsKind` as `missing`, `object`, `array`, or `null`;
-- JSON body byte count.
-
-Parameter contents, document text, and source text are never emitted. Inspection buffers its independently bounded output and publishes nothing if a later frame is malformed or the selected frame ceiling is exceeded.
-
-## Replay preflight grades
-
-Default replay preserves adversarial testing:
+The principal client-session limits are:
 
 ```text
-fln-lsp-replay INPUT
+complete client stream:        256 MiB
+simultaneously open documents: 1,024
+aggregate open URI keys:       4 MiB
+canonical request IDs:         262,144
+canonical request-ID bytes:    32 MiB
 ```
 
-A syntactically valid stream may be replayed even when its role, lifecycle, document state, request-ID reuse, or cancellation behavior is deliberately wrong. Lantern itself determines the refusal bytes.
+`fln.lsp-client-session/3` reports all enforced behavioral and resource quantities, including covered/future waits, cancellation target classes, unique request IDs, request-ID bytes, peak/final open documents, and peak/final URI bytes. It never emits source text.
 
-The strict preflights are:
+Open documents are permitted at shutdown because LSP does not require a close notification for every document. The receipt discloses final state instead of pretending cleanup occurred.
 
-```text
-fln-lsp-replay --client-lifecycle INPUT
-fln-lsp-replay --client-session INPUT
-```
-
-Both run before server execution, expected-stream comparison, stdout emission, or named output publication. `--client-session` is strictly stronger and includes document membership, Full-sync, version, wait-target, request-ID, cancellation-target, and resource validation.
-
-A failed preflight therefore emits no partial server stream and creates no `--output` artifact.
-
-When `--expect PATH` is present, the complete generated server stream is compared byte-for-byte with the expected stream. A mismatch reports the first differing byte offset and both lengths. `--output PATH` uses create-new semantics and never replaces an existing path. Without `--output`, server bytes go to stdout and human refusals remain on stderr.
-
-## Structural server-stream validation
+## Server transcript validation
 
 ```text
 fln-lsp-server-validate INPUT
@@ -220,111 +128,139 @@ The bounded server profile accepts:
 - responses with a canonical ID, no method or params, and exactly one `result` or object-valued `error` field;
 - error objects with one signed 32-bit integer `code` and one string `message`.
 
-Known Lantern notifications receive stronger payload validation:
+Known Lantern notifications receive stronger validation:
 
 - `textDocument/publishDiagnostics`: nonempty URI, diagnostics array, optional integer-or-null version;
 - `$/lean/fileProgress`: nonempty `textDocument.uri` and processing array;
 - `window/logMessage`: MessageType integer 1 through 4 and nonempty message;
-- `$/lean/diagnosticOutcome`: the pinned projection schema plus the complete/authority/diagnostic-count covenant.
+- `$/lean/diagnosticOutcome`: the current projection schema plus the complete/authority/diagnostic-count covenant.
 
-The server receipt is `fln.lsp-server-transcript/3`. It separates result responses, error responses, diagnostic publications, diagnostic outcomes, file-progress rows, log messages, and unknown notifications, and reports complete wire bytes, body bytes, decoded metadata bytes, the one-million-frame ceiling, and the 32 MiB decoded-metadata ceiling.
+`fln.lsp-server-transcript/3` separates result responses, error responses, diagnostic publications, diagnostic outcomes, file-progress notifications, log messages, and unknown notifications. It reports complete wire bytes, body bytes, decoded method/ID metadata bytes, the one-million-frame ceiling, and the 32 MiB decoded-metadata ceiling.
 
-Malformed or duplicate result/error fields, result-plus-error responses, scalar error payloads, response params, notification result/error fields, invalid IDs, and malformed known notification payloads are refused. Server-initiated requests remain outside this bounded profile because the current correlator has no client-response stream with which to close that direction.
+Malformed or duplicate result/error fields, result-plus-error responses, scalar error payloads, response params, notification result/error fields, invalid IDs, malformed known notification payloads, and server-initiated requests are refused. Server-initiated requests remain outside this bounded profile because the current evidence bundle has no client-response stream with which to close that direction.
 
-## Client/server correlation
+## Method-bound bidirectional correlation
 
 ```text
 fln-lsp-correlate CLIENT SERVER
 ```
 
-The client must pass `--client-session` semantics. The server must pass the structural server profile above. The join then requires:
+The client must pass `--client-session`. The server must pass the structural server profile. The join requires:
 
-- every client request has one globally unique canonical ID;
-- every server response has one unique canonical ID;
-- every client request ID has exactly one server result or error response;
-- no server response refers to an unknown client request;
-- client-session request-ID count and byte accounting agree with the independently rebuilt join index;
-- each cancellation target still resolves to an earlier client request in the independent join pass;
-- validated client request and server response counts equal the join count.
+- one globally unique canonical ID for every client request;
+- one unique canonical ID for every server response;
+- exactly one result or error response for every client request;
+- no response for an unknown request;
+- agreement between client-session and independently rebuilt request-ID count/byte accounting;
+- independent confirmation that each cancellation target names an earlier client request;
+- agreement between joined response totals and server result/error totals.
 
-Both client-request and server-response indexes are separately bounded to 262,144 IDs and 32 MiB of canonical ID bytes. The cancellation-target subset is independently bounded by the same ceilings and reported separately.
+Client-request, server-response, and cancellation-target indexes are independently bounded to 262,144 IDs and 32 MiB of canonical ID bytes.
 
-A successful `fln.lsp-client-server-correlation/4` receipt names its input schemas and includes zero-unmatched response accounting, document/session counts, covered versus future waits, cancellation target classes, and the eventual server-response class for every cancelled target:
+Correlation schema v5 adds:
 
-- `cancelledTargetRequestCancelledResponses`: error code `-32800`;
+```text
+methodResponseSchema = fln.lsp-method-response/1
+```
+
+For the current bounded dispatcher, each joined response must satisfy this outer contract:
+
+| Client request | Accepted server response |
+|---|---|
+| `initialize` | object-valued result |
+| `shutdown` | `result: null` |
+| `textDocument/waitForDiagnostics` | object-valued result, `RequestCancelled` (`-32800`), or `RequestFailed` (`-32803`) |
+| `$/lean/plainGoal`, `$/lean/plainTermGoal`, hover, completion, definition | current no-information `result: null` |
+| `$/lean/rpc/connect`, `$/lean/rpc/call` | `RequestFailed` (`-32803`) because RPC sessions are not implemented |
+| any other request method | `MethodNotFound` (`-32601`) |
+
+The receipt exposes exhaustive counters for each row and requires:
+
+```text
+method result classes == validated server result responses
+method error classes  == validated server error responses
+all method classes    == matched responses
+method contract violations == 0
+```
+
+This prevents a transcript with the right IDs but the wrong dispatcher behavior from becoming successful evidence. For example, a hover response carrying `MethodNotFound` is rejected because the current server deliberately returns `null` for that no-information method.
+
+The current method contract is intentionally an **outer** contract. It proves that initialize returns an object, not that every capability inside that object is correct. It proves that a successful diagnostic wait returns an object, not yet the exact inner object schema. Semantic editor methods currently return `null`; accepting that result is evidence of present behavior, not proof that useful hover, completion, definition, or goal semantics exist.
+
+## Cancellation-bound response classification
+
+The correlator also classifies the eventual response for each cancelled target:
+
+- `cancelledTargetRequestCancelledResponses`: error `-32800`;
 - `cancelledTargetResultResponses`: a normal result;
-- `cancelledTargetOtherErrorResponses`: any other valid JSON-RPC error.
+- `cancelledTargetOtherErrorResponses`: another valid error.
 
-These three counts must sum to the cancellation-target count. A normal result after a cancellation request is disclosed rather than rejected because cancellation is advisory and separately recorded streams cannot establish whether the response raced with the cancellation.
+These counts must cover every cancellation target. A result after cancellation is disclosed rather than rejected because cancellation is advisory and independently recorded streams do not reveal whether completion raced with cancellation.
 
-The join proves identity, shape, classification, and count correlation only. Two independently recorded streams have no shared event clock, so it does **not** claim that a particular response occurred before or after a particular client notification. It also does not yet prove that an arbitrary result payload is semantically correct for its request method.
+Method-bound response validation and cancellation classification are complementary. The former checks whether the response is legal for the request method; the latter reports how cancelled requests ultimately resolved.
 
-## What successful replay and correlation prove
+## Inspection and replay
 
-For the supplied bytes and current build, successful default replay proves that:
+`fln-lsp-inspect` emits one deterministic `fln.lsp-frame/2` NDJSON row per syntax-valid client frame. Rows contain index, role, method, canonical ID JSON, `paramsKind`, and body size. Parameter contents and source text are omitted.
 
-- the stream obeyed Lantern framing strongly enough to reach the dispatcher;
-- the dispatcher reached clean shutdown then exit;
-- no bytes followed accepted exit;
-- replay output remained within its independent ceiling;
-- byte comparison and create-new output behavior were deterministic.
+```text
+fln-lsp-replay INPUT
+fln-lsp-replay --client-lifecycle INPUT
+fln-lsp-replay --client-session INPUT
+```
 
-Lifecycle and session preflights add their respective client-side claims before any replay side effect. Server validation adds response and known-notification shape. Correlation adds canonical one-to-one request/response accounting and cancellation-response classification over separately validated streams.
+Strict preflight occurs before dispatcher execution, expected-stream comparison, stdout emission, or create-new output publication. Failed preflight therefore produces no partial server stream and creates no named output artifact.
 
-Aggregate client, server, input, and expected streams are each bounded to 256 MiB. Replay output and inspection output have independent 256 MiB ceilings. Client document state, canonical request IDs, server decoded metadata, join indexes, and cancellation-target indexes have independent explicit limits.
+With `--expect PATH`, the generated server stream is compared byte-for-byte with the expected stream and reports the first differing byte plus both lengths. `--output PATH` uses create-new semantics and never replaces an existing path.
 
-## Deliberate evidence boundary
+## Evidence boundary
 
-These are protocol evidence tools, not substitutes for the complete Lantern or Lean semantic oracle.
+These tools prove bounded protocol facts about supplied recordings. They do not establish:
 
-The standalone replay callback emits deterministic empty diagnostic sets for accepted document events. Successful replay or correlation therefore does **not** prove:
-
-- source parsing or elaboration;
-- kernel admission;
+- source parsing, elaboration, or kernel admission;
 - trustworthy parser/elaborator source spans;
-- goal, hover, completion, or definition semantics;
-- Lean RPC semantics;
+- inner initialize capability correctness beyond the currently checked outer object;
+- useful goal, hover, completion, or definition semantics;
+- Lean RPC sessions;
 - shared import heaps or dependency invalidation;
 - cancellation of active computation;
 - crash isolation;
-- arbitrary method-specific result correctness;
-- cross-stream timing;
+- cross-stream timing or response-after-cancellation order;
+- complete document-to-progress-to-publication causality;
 - unmodified `vscode-lean4` compatibility.
 
-A release or gate claim must use the production Lantern callback and the required no-mock editor/session scenarios. These tools are useful for shrinking protocol failures, preserving exact framing regressions, proving failure isolation, and separating client, server, identity, cancellation, and later semantic divergence.
+The standalone replay callback emits deterministic empty diagnostics for accepted document events. Release or gate claims must use the production callback and the required no-mock editor/session scenarios.
 
 ## Agent workflow
 
 1. Preserve client and server streams exactly as observed.
-2. Use syntax-only validation when invalid lifecycle or document behavior is itself the test subject.
-3. Use `--client-lifecycle` for top-level protocol ordering and role claims.
+2. Use syntax-only validation when invalid lifecycle or document behavior is the test subject.
+3. Use `--client-lifecycle` for top-level ordering and method-role claims.
 4. Use `--client-session` for positive Full-sync document, request-ID, wait, and cancellation evidence.
-5. Validate the server recording independently before interpreting a correlation failure.
-6. Use the inspector to locate role, method, ID, and parameter-container mistakes without disclosing document contents.
+5. Validate the server stream independently before interpreting a join failure.
+6. Use the inspector to locate role, method, ID, and parameter-container mistakes without disclosing source.
 7. Replay positive sessions with `--client-session --expect` and an unused `--output` path.
-8. Correlate the exact client and server recordings when claiming response completeness or cancelled-target response classes.
+8. Correlate exact client and server recordings when claiming response completeness, method-bound behavior, or cancellation-response classes.
 9. Record executable identity, Git tree, transcript identities, exit status, first divergence, and output identity in the enclosing evidence bundle.
 10. Reduce failures only in disposable copies by deleting complete frames; never edit body bytes and Content-Length independently.
-11. Keep semantic and telemetry evidence separate. Byte equality, canonical ID joins, and response classifications are semantic protocol facts; host, duration, and path details are telemetry.
+11. Keep semantic facts and telemetry separate. Byte equality, canonical joins, method classes, and response classes are protocol facts; host, duration, and filesystem paths are telemetry.
 
-## Verification surface
+## Focused verification surface
 
-Repository-owned unit and external-process tests cover:
+Repository-owned unit and installed-binary tests cover:
 
-- deterministic argument parsing and end-of-options behavior;
+- deterministic arguments and end-of-options handling;
 - syntax-only fixture compatibility;
-- lifecycle ordering and known role/params contracts;
-- document open/change/save/close coherence;
-- monotone versions and Full-sync refusal;
-- covered and future diagnostic-wait targets;
-- canonical request-ID aliases, global uniqueness, and count/byte limits;
-- prior-request cancellation targets, duplicate cancellation refusal, and target classes;
-- document-count and URI-key resource boundaries;
+- lifecycle ordering and role/params contracts;
+- Full-sync document membership and monotone versions;
+- covered and future diagnostic waits;
+- canonical request-ID aliases, uniqueness, and resource limits;
+- prior-request cancellation targets and duplicate cancellation refusal;
 - strict replay refusal before output publication;
-- structural server notifications, result responses, and error responses;
-- known server-notification payload refusal;
-- duplicate, missing, unsolicited, and numerically normalized response refusal;
-- cancelled-target result, RequestCancelled, and other-error classification;
+- known server notification schemas;
+- missing, duplicate, unsolicited, and numerically normalized response refusal;
+- all current request-to-response classes and representative mismatches;
+- cancelled-target result, `RequestCancelled`, and other-error classification;
 - metadata-only inspection;
 - exact replay repeatability and first-divergence reporting;
-- deterministic fragment-width and truncated-body transport behavior.
+- deterministic transport behavior for fragmented and truncated frames.
