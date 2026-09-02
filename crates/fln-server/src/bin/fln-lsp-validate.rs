@@ -118,7 +118,6 @@ fn validate_path(config: &Config) -> Result<String, String> {
         return Err(format!(
             "{} is {} bytes; the transcript ceiling is {}",
             config.input.display(),
-            metadata.len(),
             transcript::MAX_TRANSCRIPT_BYTES
         ));
     }
@@ -331,11 +330,14 @@ mod tests {
             ValidationMode::ClientSession,
         )
         .unwrap();
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/1\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/2\""));
         assert!(receipt.contains("\"documentsOpened\":1"));
         assert!(receipt.contains("\"documentsChanged\":1"));
         assert!(receipt.contains("\"documentsSaved\":1"));
         assert!(receipt.contains("\"documentsClosed\":1"));
+        assert!(receipt.contains("\"diagnosticWaits\":0"));
+        assert!(receipt.contains("\"coveredVersionWaits\":0"));
+        assert!(receipt.contains("\"futureVersionWaits\":0"));
         assert!(receipt.contains("\"finalOpenDocuments\":0"));
     }
 
