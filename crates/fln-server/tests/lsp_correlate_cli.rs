@@ -81,7 +81,7 @@ fn help_and_usage_refusals_are_side_effect_free() {
 }
 
 #[test]
-fn successful_join_emits_zero_unmatched_receipt() {
+fn successful_join_emits_zero_unmatched_resource_receipt() {
     let (client_path, server_path) = write_pair("success", &client(), &server());
     let output = correlator()
         .arg(&client_path)
@@ -91,7 +91,7 @@ fn successful_join_emits_zero_unmatched_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/1\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/2\""));
     assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));
@@ -100,6 +100,13 @@ fn successful_join_emits_zero_unmatched_receipt() {
     assert!(stdout.contains("\"unsolicitedServerResponses\":0"));
     assert!(stdout.contains("\"resultResponses\":2"));
     assert!(stdout.contains("\"errorResponses\":1"));
+    assert!(stdout.contains("\"clientWireBytes\":"));
+    assert!(stdout.contains("\"serverWireBytes\":"));
+    assert!(stdout.contains("\"serverMetadataBytes\":"));
+    assert!(stdout.contains("\"clientRequestIdBytes\":"));
+    assert!(stdout.contains("\"serverResponseIdBytes\":"));
+    assert!(stdout.contains("\"requestIdCountCeiling\":262144"));
+    assert!(stdout.contains("\"requestIdByteCeiling\":33554432"));
     assert!(stdout.contains("\"documentsOpened\":1"));
     assert!(stdout.contains("\"documentsClosed\":1"));
 
