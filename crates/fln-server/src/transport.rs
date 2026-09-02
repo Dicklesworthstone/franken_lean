@@ -117,6 +117,31 @@ fn parse_content_length(value: &[u8]) -> io::Result<usize> {
     })
 }
 
+fn content_type_parameter_value(value: &[u8]) -> io::Result<&[u8]> {
+    let starts_quoted = value.first().copied() == Some(b'"');
+    let ends_quoted = value.last().copied() == Some(b'"');
+    if starts_quoted != ends_quoted {
+        return Err(invalid_data("malformed quoted LSP Content-Type parameter"));
+    }
+    if !starts_quoted {
+        if value.is_empty() || value.iter().any(|byte| !is_header_name_byte(*byte)) {
+            return Err(invalid_data("malformed LSP Content-Type parameter value"));
+        }
+        return Ok(value);
+    }
+    if value.len() < 3 {
+        return Err(invalid_data("empty quoted LSP Content-Type parameter"));
+    }
+    let inner = &value[1..value.len() - 1];
+    if inner
+        .iter()
+        .any(|byte| !is_header_name_byte(*byte) || matches!(*byte, b'"' | b'\\'))
+    {
+        return Err(invalid_data("malformed quoted LSP Content-Type parameter"));
+    }
+    Ok(inner)
+}
+
 fn validate_content_type(value: &[u8]) -> io::Result<()> {
     let mut parts = value.split(|byte| *byte == b';');
     let media_type = trim_optional_whitespace(parts.next().unwrap_or_default());
@@ -134,8 +159,10 @@ fn validate_content_type(value: &[u8]) -> io::Result<()> {
             return Err(invalid_data("malformed LSP Content-Type parameter"));
         };
         let name = trim_optional_whitespace(&parameter[..equals]);
-        let parameter_value = trim_optional_whitespace(&parameter[equals + 1..]);
-        if name.is_empty() || parameter_value.is_empty() {
+        let parameter_value = content_type_parameter_value(trim_optional_whitespace(
+            &parameter[equals + 1..],
+        ))?;
+        if name.is_empty() {
             return Err(invalid_data("malformed LSP Content-Type parameter"));
         }
         if !name.eq_ignore_ascii_case(b"charset") {
@@ -316,6 +343,8 @@ mod tests {
             "application/vscode-jsonrpc",
             "APPLICATION/VSCODE-JSONRPC; CHARSET=UTF-8",
             "application/vscode-jsonrpc;charset=utf8",
+            "application/vscode-jsonrpc; charset=\"utf-8\"",
+            "application/vscode-jsonrpc; charset = \"UTF8\"",
         ] {
             let raw = format!("Content-Length: 2\r\nContent-Type: {value}\r\n\r\n{{}}");
             assert_eq!(read(raw.as_bytes()).unwrap().unwrap(), b"{}", "value={value:?}");
@@ -328,6 +357,10 @@ mod tests {
             "application/vscode-jsonrpc; boundary=x",
             "application/vscode-jsonrpc; charset",
             "application/vscode-jsonrpc;",
+            "application/vscode-jsonrpc; charset=\"utf-8",
+            "application/vscode-jsonrpc; charset=utf-8\"",
+            "application/vscode-jsonrpc; charset=\"\"",
+            "application/vscode-jsonrpc; charset=\"utf\\-8\"",
         ] {
             let raw = format!("Content-Length: 2\r\nContent-Type: {value}\r\n\r\n{{}}");
             let error = read(raw.as_bytes()).unwrap_err();
