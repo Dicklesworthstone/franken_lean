@@ -25,8 +25,9 @@ const MAX_TRANSCRIPT_BYTES: u64 = transcript::MAX_TRANSCRIPT_BYTES;
 const USAGE: &str = "Usage: fln-lsp-correlate [--] CLIENT SERVER\n\
 \n\
 Join one strict document-semantic client transcript to one server transcript.\n\
-Every unique exact lexical client request ID must have exactly one result/error\n\
-response, and the server may not emit unsolicited or duplicate responses.\n\
+Every unique canonical request ID must have exactly one result/error response,\n\
+and the server may not emit unsolicited or duplicate responses. Number lexemes\n\
+remain exact; string IDs compare by decoded value and canonical JSON escaping.\n\
 This proves ID/accounting correlation, not cross-stream timing.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
