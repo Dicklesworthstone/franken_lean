@@ -19,6 +19,8 @@ pub struct ClientSessionStats {
     pub documents_saved: u64,
     pub documents_closed: u64,
     pub diagnostic_waits: u64,
+    pub covered_version_waits: u64,
+    pub future_version_waits: u64,
     pub cancellations: u64,
     pub peak_open_documents: u64,
     pub final_open_documents: u64,
@@ -145,6 +147,8 @@ struct ClientSessionValidator {
     documents_saved: u64,
     documents_closed: u64,
     diagnostic_waits: u64,
+    covered_version_waits: u64,
+    future_version_waits: u64,
     cancellations: u64,
     peak_open_documents: usize,
     peak_open_uri_bytes: usize,
@@ -166,6 +170,8 @@ impl ClientSessionValidator {
             documents_saved: 0,
             documents_closed: 0,
             diagnostic_waits: 0,
+            covered_version_waits: 0,
+            future_version_waits: 0,
             cancellations: 0,
             peak_open_documents: 0,
             peak_open_uri_bytes: 0,
@@ -247,19 +253,34 @@ impl ClientSessionValidator {
                     .ok_or_else(|| format!("frame {frame} document URI accounting underflow"))?;
                 Self::bump(&mut self.documents_closed, "didClose")
             }
-            Some(DocumentEvent::Wait { uri, version: _ }) => {
-                if !self.documents.contains_key(&uri) {
+            Some(DocumentEvent::Wait { uri, version }) => {
+                let Some(current) = self.documents.get(&uri).copied() else {
                     return Err(format!(
                         "frame {frame} waitForDiagnostics targets unopened document {uri:?}"
                     ));
+                };
+                Self::bump(&mut self.diagnostic_waits, "waitForDiagnostics")?;
+                if version <= current {
+                    Self::bump(&mut self.covered_version_waits, "covered-version wait")
+                } else {
+                    Self::bump(&mut self.future_version_waits, "future-version wait")
                 }
-                Self::bump(&mut self.diagnostic_waits, "waitForDiagnostics")
             }
             Some(DocumentEvent::Cancel) => Self::bump(&mut self.cancellations, "cancelRequest"),
         }
     }
 
     fn finish(self, lifecycle: ClientLifecycleStats) -> Result<ClientSessionStats, String> {
+        let classified_waits = self
+            .covered_version_waits
+            .checked_add(self.future_version_waits)
+            .ok_or_else(|| "diagnostic-wait classification overflow".to_string())?;
+        if classified_waits != self.diagnostic_waits {
+            return Err(format!(
+                "diagnostic-wait accounting mismatch: total {}, classified {classified_waits}",
+                self.diagnostic_waits
+            ));
+        }
         Ok(ClientSessionStats {
             lifecycle,
             documents_opened: self.documents_opened,
@@ -267,6 +288,8 @@ impl ClientSessionValidator {
             documents_saved: self.documents_saved,
             documents_closed: self.documents_closed,
             diagnostic_waits: self.diagnostic_waits,
+            covered_version_waits: self.covered_version_waits,
+            future_version_waits: self.future_version_waits,
             cancellations: self.cancellations,
             peak_open_documents: u64::try_from(self.peak_open_documents)
                 .map_err(|_| "peak open-document count does not fit u64".to_string())?,
@@ -336,14 +359,15 @@ pub fn validate_client_session_reader(
 pub fn render_client_session_validation(stats: ClientSessionStats) -> String {
     format!(
         concat!(
-            "{{\"schema\":\"fln.lsp-client-session/1\",\"finalState\":\"exited\",",
+            "{{\"schema\":\"fln.lsp-client-session/2\",\"finalState\":\"exited\",",
             "\"frames\":{},\"requests\":{},\"notifications\":{},",
             "\"wireBytes\":{},\"bodyBytes\":{},",
             "\"initializeFrame\":{},\"initializedFrame\":{},",
             "\"shutdownFrame\":{},\"exitFrame\":{},",
             "\"documentsOpened\":{},\"documentsChanged\":{},",
             "\"documentsSaved\":{},\"documentsClosed\":{},",
-            "\"diagnosticWaits\":{},\"cancellations\":{},",
+            "\"diagnosticWaits\":{},\"coveredVersionWaits\":{},",
+            "\"futureVersionWaits\":{},\"cancellations\":{},",
             "\"peakOpenDocuments\":{},\"finalOpenDocuments\":{},",
             "\"peakOpenUriBytes\":{},\"finalOpenUriBytes\":{}}}\n"
         ),
@@ -361,6 +385,8 @@ pub fn render_client_session_validation(stats: ClientSessionStats) -> String {
         stats.documents_saved,
         stats.documents_closed,
         stats.diagnostic_waits,
+        stats.covered_version_waits,
+        stats.future_version_waits,
         stats.cancellations,
         stats.peak_open_documents,
         stats.final_open_documents,
@@ -416,13 +442,16 @@ mod tests {
         assert_eq!(stats.documents_saved, 1);
         assert_eq!(stats.documents_closed, 1);
         assert_eq!(stats.diagnostic_waits, 1);
+        assert_eq!(stats.covered_version_waits, 0);
+        assert_eq!(stats.future_version_waits, 1);
         assert_eq!(stats.cancellations, 1);
         assert_eq!(stats.peak_open_documents, 1);
         assert_eq!(stats.final_open_documents, 0);
         assert_eq!(stats.final_open_uri_bytes, 0);
         let receipt = render_client_session_validation(stats);
-        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/1\""));
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/2\""));
         assert!(receipt.contains("\"documentsChanged\":1"));
+        assert!(receipt.contains("\"futureVersionWaits\":1"));
     }
 
     #[test]
@@ -491,12 +520,16 @@ mod tests {
     }
 
     #[test]
-    fn wait_requires_an_open_document_but_may_target_a_future_version() {
+    fn wait_requires_an_open_document_and_classifies_target_version() {
         let valid = session(&[
-            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1,"text":"a"}}}"#,
-            r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":99}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":3,"text":"a"}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":2}}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":99}}"#,
         ]);
-        assert!(validate_client_session_bytes(&valid).is_ok());
+        let stats = validate_client_session_bytes(&valid).unwrap();
+        assert_eq!(stats.diagnostic_waits, 2);
+        assert_eq!(stats.covered_version_waits, 1);
+        assert_eq!(stats.future_version_waits, 1);
 
         let invalid = session(&[r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":1}}"#]);
         assert!(
