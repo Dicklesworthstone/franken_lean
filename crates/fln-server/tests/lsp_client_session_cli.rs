@@ -78,12 +78,14 @@ fn validator_emits_document_semantic_session_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-session/1\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-session/2\""));
     assert!(stdout.contains("\"documentsOpened\":1"));
     assert!(stdout.contains("\"documentsChanged\":1"));
     assert!(stdout.contains("\"documentsSaved\":1"));
     assert!(stdout.contains("\"documentsClosed\":1"));
     assert!(stdout.contains("\"diagnosticWaits\":1"));
+    assert!(stdout.contains("\"coveredVersionWaits\":0"));
+    assert!(stdout.contains("\"futureVersionWaits\":1"));
     assert!(stdout.contains("\"cancellations\":1"));
     assert!(stdout.contains("\"finalOpenDocuments\":0"));
 }
