@@ -91,7 +91,8 @@ fn successful_join_emits_zero_unmatched_resource_receipt() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/2\""));
+    assert!(stdout.contains("\"schema\":\"fln.lsp-client-server-correlation/3\""));
+    assert!(stdout.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
     assert!(stdout.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
     assert!(stdout.contains("\"clientRequests\":3"));
     assert!(stdout.contains("\"serverResponses\":3"));
@@ -103,13 +104,52 @@ fn successful_join_emits_zero_unmatched_resource_receipt() {
     assert!(stdout.contains("\"clientWireBytes\":"));
     assert!(stdout.contains("\"serverWireBytes\":"));
     assert!(stdout.contains("\"serverMetadataBytes\":"));
+    assert!(stdout.contains("\"clientSessionRequestIdBytes\":"));
     assert!(stdout.contains("\"clientRequestIdBytes\":"));
     assert!(stdout.contains("\"serverResponseIdBytes\":"));
+    assert!(stdout.contains("\"clientUniqueRequestIds\":3"));
     assert!(stdout.contains("\"requestIdCountCeiling\":262144"));
     assert!(stdout.contains("\"requestIdByteCeiling\":33554432"));
     assert!(stdout.contains("\"documentsOpened\":1"));
     assert!(stdout.contains("\"documentsClosed\":1"));
+    assert!(stdout.contains("\"diagnosticWaits\":0"));
+    assert!(stdout.contains("\"cancellations\":0"));
 
+    fs::remove_file(client_path).unwrap();
+    fs::remove_file(server_path).unwrap();
+}
+
+#[test]
+fn cancelled_future_wait_is_joined_as_typed_evidence() {
+    let client = framed(&[
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A.lean","version":1,"text":"def a := 1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"wait","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A.lean","version":9}}"#,
+        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A.lean"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+        r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+    ]);
+    let server = framed(&[
+        r#"{"jsonrpc":"2.0","id":"init","result":{"capabilities":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":"wait","error":{"code":-32800,"message":"request cancelled"}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+    ]);
+    let (client_path, server_path) = write_pair("cancelled-wait", &client, &server);
+    let output = correlator()
+        .arg(&client_path)
+        .arg(&server_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"futureVersionWaits\":1"));
+    assert!(stdout.contains("\"cancellations\":1"));
+    assert!(stdout.contains("\"diagnosticWaitCancellationTargets\":1"));
+    assert!(stdout.contains("\"otherRequestCancellationTargets\":0"));
+    assert!(stdout.contains("\"matchedResponses\":3"));
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
 }
