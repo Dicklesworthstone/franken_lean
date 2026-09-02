@@ -1,372 +1,212 @@
 # Changelog
 
-This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed; the [`README.md`](README.md) intentionally describes the finished 1.0 target state, and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded status companion.
+This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed. [`README.md`](README.md) is intentionally written as the finished 1.0 target, while [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded state ledger.
 
-Scope: project inception on **2026-07-21** through the September 2 strict Lantern client-transcript tranche at **[`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef)**. This changelog refresh follows that implementation snapshot.
+Scope: project inception on **2026-07-21** through the September 2 cancellation-bound Lantern evidence tranche rooted at substantive commit [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64).
 
-No GitHub Releases were published when this file was refreshed on **2026-09-02**. Do not infer or invent a `v0.x` release from commit activity.
-
-Primary sources:
-
-- git history on `main` through the snapshot above;
-- the Beads tracker in [`.beads/issues.jsonl`](.beads/issues.jsonl);
-- the governing plan and generated contracts;
-- repository-owned tests, evidence receipts, and current-state documentation.
-
-Representative commits are examples, not substitutes for the tracker/evidence graph.
+No GitHub Release is implied by this history. Representative commits are navigation aids, not substitutes for the Beads graph, generated contracts, real-artifact receipts, or governed release evidence.
 
 ---
 
-## Version timeline
+## Timeline
 
 | Milestone | Date | Summary |
 |---|---|---|
 | [`45e3bd2a`](https://github.com/Dicklesworthstone/franken_lean/commit/45e3bd2a79a0ea9cbcbb81ecaaa6ec296ca86e79) | 2026-07-21 | Project, comprehensive plan, README, AGENTS, license, and initial Beads graph. |
-| [`3df0543d`](https://github.com/Dicklesworthstone/franken_lean/commit/3df0543d9537b0a930e7e72ba9b779bfa0e49ad5) | 2026-07-22 | §21 Rust workspace, pinned nightly, structural dependency gate. |
-| [`9a8860ab`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8860aba1bf88cf68d4c01785126e8dca6d9435) | 2026-08-19 | Bounded native `lean` personality, checker/olean reconstruction, Golem source execution. |
-| [`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32) | 2026-09-01 | Evidence-graded checker frontier, executable agent-control tools, structurally hardened stateful Lantern document synchronization. |
-| [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387) | 2026-09-02 | Modular Lantern dispatcher, structural callback authority, bounded versioned diagnostic waits, and public framed protocol transcripts. |
-| [`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3) | 2026-09-02 | Exact zero-diagnostic authority accounting, full-wire transcript receipts, and bounded open-document URI metadata. |
-| [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef) | 2026-09-02 | Strict client lifecycle receipts, known method role/parameter contracts, replay preflight, and metadata-only frame inspection. |
+| [`3df0543d`](https://github.com/Dicklesworthstone/franken_lean/commit/3df0543d9537b0a930e7e72ba9b779bfa0e49ad5) | 2026-07-22 | Plan §21 Rust workspace, pinned nightly, and structural dependency gate. |
+| [`9a8860ab`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8860aba1bf88cf68d4c01785126e8dca6d9435) | 2026-08-19 | Bounded native `lean` personality, checker/olean reconstruction, and Golem source execution. |
+| [`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32) | 2026-09-01 | Evidence-graded checker frontier, executable agent-control plane, and stateful Full-sync Lantern groundwork. |
+| [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387) | 2026-09-02 | Modular Lantern dispatcher, diagnostic publication authority, bounded waits, and public framed transcripts. |
+| [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef) | 2026-09-02 | Strict client lifecycle, method role/params contracts, replay preflight, and metadata-only inspection. |
+| [`3cef4983`](https://github.com/Dicklesworthstone/franken_lean/commit/3cef498352964fd6512c79f5d303e3d92fc045a1) | 2026-09-02 | Document-semantic client sessions, structural server transcripts, and initial bidirectional ID correlation. |
+| [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64) | 2026-09-02 | Cancellation-bound request identity, joined wait/cancellation evidence, response classification, and bounded ID retention. |
 
 ---
 
-## 1) Inception, crate map, and G0 constitution — 2026-07-21 → 2026-07-22
+## 1. Foundation and constitution — 2026-07-21 → 2026-07-22
 
-The repository began as a system design and immediately converted the design into enforceable structure.
+Landed:
+
+- the comprehensive architecture and execution plan;
+- repository-wide agent instructions and a Beads dependency graph;
+- the plan §21 native-Rust crate map and pinned nightly;
+- the closed dependency universe and structural dependency checks;
+- `SUITE.lock` as the compatibility epoch/closure authority;
+- fail-closed evidence harnesses and the Oracle-Only Law: the pinned Lean Reference is fixture/oracle material, never a FrankenLean runtime component.
+
+Representative commits: [`45e3bd2a`](https://github.com/Dicklesworthstone/franken_lean/commit/45e3bd2a79a0ea9cbcbb81ecaaa6ec296ca86e79), [`3df0543d`](https://github.com/Dicklesworthstone/franken_lean/commit/3df0543d9537b0a930e7e72ba9b779bfa0e49ad5), `6c1f089c`, `0803079f`.
+
+## 2. Core terms, Crucible, generated contracts, and Tribunal — 2026-07-22 → 2026-07-25
+
+Landed:
+
+- names, universes, expressions, options, positions, and bounded outcome types in `fln-core`;
+- `KERNEL_CONTRACT.md` as an executable judgment specification;
+- Crucible K1 bootstrap and admission authority boundaries;
+- mechanically generated ABI and `.olean` contracts;
+- Tribunal/parity-ledger bootstrap;
+- owned bignum ground and kernel literal acceleration;
+- early mutation campaigns around conversion, recursors, quotients, proof irrelevance, and binders.
+
+Representative commits: [`7ed677c2`](https://github.com/Dicklesworthstone/franken_lean/commit/7ed677c294339e4ce15bca65d90a653493a035a8), [`8ece0b70`](https://github.com/Dicklesworthstone/franken_lean/commit/8ece0b7086d8dbdadd4a9fe7dc3e5ec35c0e5727), [`0f21aede`](https://github.com/Dicklesworthstone/franken_lean/commit/0f21aede1109f76719d579994858498721a90591), `06ba84b2`.
+
+## 3. Marrow ABI twin, `.olean` plane, and Grimoire — 2026-07-22 → 2026-07-26
+
+Landed:
+
+- `lean_object` compatibility heap, tri-state RC, membrane, and ownership shadows;
+- compacted-region mmap/relocation substrate used by artifact loading;
+- persistent environment snapshots and bounded declaration admission;
+- stack-safe term/level destruction and deterministic traversal/encoding;
+- split `.olean` companion decoding and the beginnings of byte-compatible reconstruction.
+
+Representative commits: `5d6cb2b2`, [`1eca4667`](https://github.com/Dicklesworthstone/franken_lean/commit/1eca4667804e0ad717d2c1703040d6f22d1bb083), `94348b02`, [`156f9ee7`](https://github.com/Dicklesworthstone/franken_lean/commit/156f9ee792812295e44dd0d53540b2a17e0c1ea2).
+
+## 4. Vellum, Verdict, and evidence hardening — 2026-07-24 → 2026-08-02
+
+Landed:
+
+- lossless syntax/source substrate with byte, scalar, and UTF-16 projections;
+- solver-independent CNF/proof contracts, owned SAT checking, and reflected `bv_decide` publication;
+- exact mutant-to-killer-test evidence joins;
+- kernel LOC covenant and named unsafe-boundary enforcement;
+- resource, cancellation, and inconclusive outcomes that cannot collapse into ordinary rejection;
+- public-surface census and drift machinery.
+
+Representative commits: [`e20cded9`](https://github.com/Dicklesworthstone/franken_lean/commit/e20cded9428b85005d67dd5d13978706818a452b), [`b823faf1`](https://github.com/Dicklesworthstone/franken_lean/commit/b823faf160cf7987ea1ff8e7fa6dae3e01ee5944), `26eaaafb`, `cd195a90`, `2f9112f7`, `5a4cfd35`.
+
+## 5. Elaborator seed, Golem, independent checker, and owned numerics — 2026-07-31 → 2026-08-09
+
+Landed:
+
+- the first source-text → kernel-accepted declaration seam;
+- pin-generated façade stubs over the bounded elaborator surface;
+- FIR/FLBC and the Golem interpreter substrate;
+- governed ABI values, inline caches, heartbeat/check-system behavior, and bounded IO/task slices;
+- independent checker admission for axioms, definitions, theorems, opaques, mutual blocks, inference, defeq, and selected inductive/recursor forms;
+- owned deterministic libm baseline and additional ABI effects.
+
+Representative commits: [`7c48295c`](https://github.com/Dicklesworthstone/franken_lean/commit/7c48295c0c58bf78862032ecf7445cdae80be26b), `be81a269`, `286d1f04`, `ea3bbbf6`, [`654edb49`](https://github.com/Dicklesworthstone/franken_lean/commit/654edb49c474f2af123e3a744c569f6d050fb8ed).
+
+## 6. Native CLI, source execution, artifact reconstruction, and trust surfaces — 2026-08-10 → 2026-08-23
+
+Landed:
+
+- `fln run`, `fln flbc run`, `fln check-olean`, bounded inspect/diff, and related artifact commands;
+- Golem execution for a growing closed Nat/Bool/String subset;
+- bounded source-module imports, definitions, and module-graph execution;
+- checker reconstruction of enumeration units, field-bearing inductives, quotients, and direct recursive families;
+- standalone checkable `.olean` snapshots;
+- bounded native `lean` personality including imports and `#check`;
+- `why-trusts`, `audit --tcb`, suite identity, hash-chained run receipts, and durable create-new artifact publication.
+
+Representative commits: `0833f781`, [`32820239`](https://github.com/Dicklesworthstone/franken_lean/commit/328202398fc669d7db5d4eb5730aa692129838d0), `1af9d5b1`, [`f4960d71`](https://github.com/Dicklesworthstone/franken_lean/commit/f4960d713858b770c25f40c60fff41e83a219b83), [`aa0849b0`](https://github.com/Dicklesworthstone/franken_lean/commit/aa0849b01a4dc19f7b9096c45fa6173093d26d9d), `ef78cef4`.
+
+## 7. Pinned Prelude frontier and executable agent control — 2026-08-29 → 2026-09-01
+
+Landed:
+
+- corrected `Init.HEq` hygienic recursor reconstruction;
+- corrected the direct-recursive `Init.Nat` model and forged-recursion refusal cells;
+- a real-artifact Nat council test and explicit non-vacuous runner derived from `SUITE.lock`;
+- `AGENT_FRONTIER_PROTOCOL.md` with immutable Git/artifact anchors, semantic ownership, typed first-failure frontiers, negative evidence, and one-variable experiments;
+- executable frontier auditing, deterministic Beads selection, and concrete dependency-cycle witnesses.
+
+The full `fln-51y8` sequential `Init.Prelude` council remains open. A bounded Nat cell is not evidence that the complete Prelude frontier passed.
+
+Representative commits: [`2ad0eb21`](https://github.com/Dicklesworthstone/franken_lean/commit/2ad0eb21cc16b132407de07158ff39e81c69db2b), [`72502cc3`](https://github.com/Dicklesworthstone/franken_lean/commit/72502cc31f6e9f67c350033e663eef5ef0de63d3), [`f72025e3`](https://github.com/Dicklesworthstone/franken_lean/commit/f72025e381d9d103a6c5845c8b6b1ef9ba51fb0b), [`fcbe18f2`](https://github.com/Dicklesworthstone/franken_lean/commit/fcbe18f257c957084e6372b631541aff0e845d93), [`69c07154`](https://github.com/Dicklesworthstone/franken_lean/commit/69c07154acc175fbb58f16e8e2db7d345327418f).
+
+## 8. Lantern transport and Full-sync document authority — 2026-09-01
+
+Landed:
+
+- bounded Content-Length framing, header/resource ceilings, strict Content-Type handling, and failure-atomic writes;
+- complete structural JSON validation for the supported JSON-RPC surface;
+- decoded string escapes and surrogate pairs;
+- root-only envelope routing and deterministic integer/string/null request IDs;
+- lifecycle handling for initialize, initialized, shutdown, and exit;
+- Full-sync `didOpen`, `didChange`, `didSave`, and `didClose`;
+- independent open-document, source-byte, and URI-key authority;
+- monotone document versions, stale-source invalidation, textless-save replay, and diagnostic clearing on close;
+- explicit refusal of fabricated Lean RPC sessions.
+
+Representative commits: `fced6257`, `81d33852`, `9e50fdef`, `637176fd`, `2114cd59`, `60ebc07a`, `f2af73ff`.
+
+## 9. Diagnostic publication, waits, and resource receipts — 2026-09-02
+
+Landed:
+
+- modular JSON, wire, document-session, and wait implementations;
+- structural callback validation and current-document URI binding;
+- separate accepted-document and diagnostic-publication frontiers;
+- exact complete/authority/`diagnosticCount:0` accounting;
+- non-authoritative outcomes that clear stale diagnostics and cannot release waits;
+- bounded `waitForDiagnostics`, exact cancellation, and deterministic close/shutdown completion;
+- complete-wire versus body-byte transcript receipts;
+- independent open-document URI metadata limits;
+- public framed-stdio regression transcripts.
+
+Representative commits: [`57a268bc`](https://github.com/Dicklesworthstone/franken_lean/commit/57a268bcd1a5656b3bf4d983a7630eb709bc819f), [`32713f48`](https://github.com/Dicklesworthstone/franken_lean/commit/32713f480a77e94d8331ba064841bf72ca20377a), [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387), `9a8f2362`, `5583c65f`, `a4807ece`.
+
+## 10. Strict client, server, replay, and correlation evidence — 2026-09-02
+
+Landed:
+
+- syntax-only, lifecycle, and document-semantic client validation grades;
+- known method role and parameter-container contracts;
+- side-effect-free strict replay preflight;
+- metadata-only frame inspection;
+- structural server transcript validation for notifications and result/error responses;
+- known server notification payload checks;
+- canonical request-ID correlation: exact number lexemes, decoded string identity, and deterministic re-escaping;
+- bounded client request, server response, decoded metadata, and correlation indexes;
+- exact one-to-one response joins with no missing, duplicate, or unsolicited responses.
+
+Representative commits: [`025c4c86`](https://github.com/Dicklesworthstone/franken_lean/commit/025c4c86018484177a1ba1e02c908373bfd29fa3), [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef), `a1a4fa8f`, `c633fb62`, `53e2f14d`, `691b6d6b`, `f797d305`, `4c10c660`, `a17ae30e`.
+
+## 11. Cancellation-bound session and response evidence — 2026-09-02
+
+This tranche closes a specific evidentiary gap: a syntactically valid cancellation was previously counted without proving what it targeted, and the bidirectional join did not disclose how the target eventually responded.
 
 ### Landed
 
-- Comprehensive design plan, agent conventions, and project license.
-- Beads dependency graph projecting the execution plan.
-- Rust workspace with the plan §21 crate map, pinned nightly, and structural dependency checks.
-- Authoritative `SUITE.lock` and dependency-closure audit.
-- Fail-closed evidence harness and the pinned Lean Reference retained strictly as Tribunal/oracle material.
+- `fln.lsp-client-session/3` requires every client request ID to be globally unique under `number-lexeme-string-value-v1`.
+- The strict session retains at most 262,144 canonical request IDs and 32 MiB of canonical ID bytes.
+- Every `$/cancelRequest` target must identify an earlier non-null request under the same canonical identity policy.
+- Duplicate cancellation of one target fails closed.
+- Cancellation targets are classified as diagnostic waits or other requests.
+- Diagnostic waits are separately classified as already-covered or future-version targets.
+- Cancellation state is stored on the existing bounded request record; the session does not keep a second map of copied target strings.
+- Correlation independently rebuilds request and cancellation indexes and requires count, byte, and prior-request facts to agree with client-session evidence.
+- `fln.lsp-client-server-correlation/4` classifies every cancelled target's response as:
+  - JSON-RPC `RequestCancelled` (`-32800`);
+  - a normal result;
+  - another valid error.
+- The three response classes must account for every cancellation target. A result is disclosed rather than rejected because cancellation is advisory and separate streams contain no shared event clock.
+- Installed-binary tests cover successful cancellation-bound receipts, unknown and duplicate targets, side-effect-free replay refusal, canonical string aliases, numeric-lexeme non-equivalence, joined RequestCancelled evidence, and zero-valued classes for uncancelled sessions.
 
 ### Representative commits
 
-- [`45e3bd2a`](https://github.com/Dicklesworthstone/franken_lean/commit/45e3bd2a79a0ea9cbcbb81ecaaa6ec296ca86e79) — initial system design and repository.
-- [`3df0543d`](https://github.com/Dicklesworthstone/franken_lean/commit/3df0543d9537b0a930e7e72ba9b779bfa0e49ad5) — §21 workspace scaffold.
-- [`6c1f089c`](https://github.com/Dicklesworthstone/franken_lean/commit/6c1f089c) — `SUITE.lock` closure audit.
-- [`0803079f`](https://github.com/Dicklesworthstone/franken_lean/commit/0803079f) — evidence harness.
+- [`94717cd2`](https://github.com/Dicklesworthstone/franken_lean/commit/94717cd2592885594342b08b809947d3c4dc1cd1) — corrected canonical cancellation-ID binding.
+- [`71e3fcaf`](https://github.com/Dicklesworthstone/franken_lean/commit/71e3fcaf7a98938fe4908ef05f25c1405a17882f) — installed client-session cancellation authority.
+- [`73cdb40d`](https://github.com/Dicklesworthstone/franken_lean/commit/73cdb40d47b4d79a2d9acbd91a47623fba88c076) — cancelled-target response classification.
+- [`b09f7ea1`](https://github.com/Dicklesworthstone/franken_lean/commit/b09f7ea1ac2e760fb7241f76c7855d74d682d587) — installed correlation schema-v4 boundary.
+- [`88d9970f`](https://github.com/Dicklesworthstone/franken_lean/commit/88d9970f9c8491f2a454516da8e01071a2f0db64) — eliminated duplicate cancellation-ID retention.
 
----
+### Evidence boundary
 
-## 2) Crucible kernel, generated contracts, and Tribunal bootstrap — 2026-07-22 → 2026-07-25
+The repository owns focused unit and installed-binary tests for this tranche. The editing environment did not contain `cargo` or `rustc`, and hosted Actions were intentionally not used, so this changelog does not claim a same-session green Rust run.
 
-### Landed
-
-- `fln-core` term plane: names, universes, expressions, options, and positions.
-- `KERNEL_CONTRACT.md` as an executable/CI-checked judgment specification.
-- Crucible K1 bootstrap and soundness cells around proof irrelevance and admission authority.
-- Generated ABI and `.olean` contracts rather than hand-transcribed layouts.
-- Tribunal/parity-ledger bootstrap.
-- Owned bignum ground and kernel literal acceleration.
-- Early kernel mutation campaign around recursors, conversion, quotient initialization, and binder handling.
-
-### Representative commits
-
-- [`7ed677c2`](https://github.com/Dicklesworthstone/franken_lean/commit/7ed677c294339e4ce15bca65d90a653493a035a8) — core Lean term-plane types.
-- [`8ece0b70`](https://github.com/Dicklesworthstone/franken_lean/commit/8ece0b7086d8dbdadd4a9fe7dc3e5ec35c0e5727) — Crucible bootstrap.
-- [`0f21aede`](https://github.com/Dicklesworthstone/franken_lean/commit/0f21aede1109f76719d579994858498721a90591) — generated ABI/olean contracts.
-- [`06ba84b2`](https://github.com/Dicklesworthstone/franken_lean/commit/06ba84b2) — Tribunal bootstrap.
-
----
-
-## 3) Marrow ABI twin, `.olean` codec, and Grimoire environment — 2026-07-22 → 2026-07-26
-
-### Landed
-
-- Marrow `lean_object` compatibility heap, tri-state RC, membrane, and ownership shadows.
-- Compacted-region mmap/relocation substrate used by the `.olean` reader.
-- Grimoire persistent environment with structural identities, snapshots, and bounded admission surfaces.
-- Stack-safe term/level drops and canonical traversal/encoding paths.
-
-### Representative commits
-
-- [`5d6cb2b2`](https://github.com/Dicklesworthstone/franken_lean/commit/5d6cb2b2) — Marrow object/RC core.
-- [`1eca4667`](https://github.com/Dicklesworthstone/franken_lean/commit/1eca4667804e0ad717d2c1703040d6f22d1bb083) — compacted-region loading.
-- [`94348b02`](https://github.com/Dicklesworthstone/franken_lean/commit/94348b02) — shared region engine beneath `.olean` loading.
-- [`156f9ee7`](https://github.com/Dicklesworthstone/franken_lean/commit/156f9ee792812295e44dd0d53540b2a17e0c1ea2) — Grimoire environment.
-
----
-
-## 4) Vellum syntax/parser substrate and Verdict SAT — 2026-07-24 → 2026-07-25
-
-### Landed
-
-- Vellum naming contract and SourceInfo with byte/scalar/UTF-16 projections.
-- Lossless green-tree/source preservation laws.
-- Solver-independent Verdict CNF/proof contract, owned checker, and certificate goldens.
-- Kernel-checked reflected `bv_decide` publication over the opaque kernel capability.
-- Nested-inductive auxiliary translation work.
-
-### Representative commits
-
-- [`e20cded9`](https://github.com/Dicklesworthstone/franken_lean/commit/e20cded9428b85005d67dd5d13978706818a452b) — SourceInfo and lossless syntax ground.
-- [`b823faf1`](https://github.com/Dicklesworthstone/franken_lean/commit/b823faf160cf7987ea1ff8e7fa6dae3e01ee5944) — Verdict contract plane.
-- [`26eaaafb`](https://github.com/Dicklesworthstone/franken_lean/commit/26eaaafb) — kernel-checked `bv_decide` integration.
-
----
-
-## 5) Evidence-join and safety hardening — 2026-07-25 → 2026-08-02
-
-This wave made claims harder to overstate rather than merely increasing test counts.
-
-### Landed
-
-- Mandated-mutant rows joined to their named killer tests and retention/cadence evidence.
-- Kernel LOC covenant disclosure tied to the enforcing walk.
-- D3 SAFETY-note enforcement and named unsafe-boundary governance.
-- Evidence rows moved from file-level ambiguity toward exact producer/test identities.
-- Resource/cancellation/inconclusive outcomes prevented from collapsing into ordinary rejection.
-- Public-surface census and drift machinery across CLI/Lake/LSP-facing contracts.
-
-### Representative commits
-
-- [`cd195a90`](https://github.com/Dicklesworthstone/franken_lean/commit/cd195a90) — mandated-mutant evidence joins.
-- [`2f9112f7`](https://github.com/Dicklesworthstone/franken_lean/commit/2f9112f7) — kernel LOC disclosure.
-- [`5a4cfd35`](https://github.com/Dicklesworthstone/franken_lean/commit/5a4cfd35) — D3 SAFETY notes/enforcement.
-
----
-
-## 6) Elaborator seed and Golem VM — 2026-07-31 → 2026-08-01
-
-### Landed
-
-- First source-text → kernel-accepted declaration seam.
-- Pin-generated façade stubs over the bounded elaborator surface.
-- FIR/FLBC and Golem interpreter substrate.
-- Governed ABI value state, inline caches, heartbeat/checkSystem semantics, and early IO/task slices.
-- G0-3 parity comparator defining the intended execution verdict.
-
-### Representative commits
-
-- [`7c48295c`](https://github.com/Dicklesworthstone/franken_lean/commit/7c48295c0c58bf78862032ecf7445cdae80be26b) — first source-to-kernel elaboration seam.
-- [`be81a269`](https://github.com/Dicklesworthstone/franken_lean/commit/be81a269aa672171df4b3f14472934a1cd783953) — retained FIR/FLBC prototype.
-- [`286d1f04`](https://github.com/Dicklesworthstone/franken_lean/commit/286d1f04) — Golem parity comparator.
-
----
-
-## 7) Independent checker, owned libm, and ABI effects — 2026-08-03 → 2026-08-09
-
-### Landed
-
-- Independent checker admission ground for axioms, definitions/theorems/opaques, mutual blocks, quarantines, inference, defeq, and related KR slices.
-- Owned deterministic libm baseline and full-range numerical work.
-- Additional Marrow IO/task ABI rows and observable runtime behavior.
-- Stronger separation between checker observation/veto and the one kernel admission authority.
-
-### Representative commits
-
-- [`ea3bbbf6`](https://github.com/Dicklesworthstone/franken_lean/commit/ea3bbbf6) — declaration-admission verdict surface.
-- [`654edb49`](https://github.com/Dicklesworthstone/franken_lean/commit/654edb49c474f2af123e3a744c569f6d050fb8ed) — owned libm baseline.
-- [`dcb65dcf`](https://github.com/Dicklesworthstone/franken_lean/commit/dcb65dcf) — additional IO exports.
-
----
-
-## 8) Native CLI, source execution, and `.olean` reconstruction — 2026-08-10 → 2026-08-19
-
-### Landed
-
-- `fln run`, `fln flbc run`, `fln check-olean`, bounded olean inspection/diff, and related artifact surfaces.
-- Golem execution for a growing closed Nat/Bool/String subset.
-- Source-module import/definition partitioning and bounded module-graph execution.
-- Independent checker reconstruction of enumeration units, field-bearing inductives, quotient authority units, and related declaration blocks.
-- Standalone checkable olean snapshots.
-- Iterative stack-safe substitution/WHNF/defeq/runtime-projection paths.
-- Bounded native `lean` personality including imports and `#check`.
-
-### Representative commits
-
-- [`0833f781`](https://github.com/Dicklesworthstone/franken_lean/commit/0833f781) — bounded `fln run`.
-- [`32820239`](https://github.com/Dicklesworthstone/franken_lean/commit/328202398fc669d7db5d4eb5730aa692129838d0) — `fln check-olean`.
-- [`1af9d5b1`](https://github.com/Dicklesworthstone/franken_lean/commit/1af9d5b1) — checked `String.append` through Golem.
-- [`f4960d71`](https://github.com/Dicklesworthstone/franken_lean/commit/f4960d713858b770c25f40c60fff41e83a219b83) — quotient initializer admission.
-- [`aa0849b0`](https://github.com/Dicklesworthstone/franken_lean/commit/aa0849b01a4dc19f7b9096c45fa6173093d26d9d) — standalone olean snapshots.
-
----
-
-## 9) Repository hygiene — 2026-08-19
-
-A small janitor wave cleaned repository scratch state. Historical commit subjects should not be treated as stronger evidence than their actual diffs; authoritative planning/contracts remained at their governed paths.
-
-- [`9a8860ab`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8860aba1bf88cf68d4c01785126e8dca6d9435) — janitor cleanup.
-
----
-
-## 10) Trust surfaces on the native CLI — 2026-08-23
-
-### Landed
-
-- `fln why-trusts` bounded trust closure over decoded artifacts.
-- `fln audit --tcb` inventory views.
-- compile-time suite identity reporting.
-- hash-chained `check-olean --receipts` run receipts.
-- durable-publication parent-path repair shared by emitted artifact paths.
-
-These receipts attest runs; they are not proof certificates.
-
-### Representative commit
-
-- `ef78cef4` — trust surfaces: `why-trusts`, TCB audit, identity, and check receipts.
-
----
-
-## 11) Checker frontier, executable agent control, and Lantern hardening — 2026-08-29 → 2026-09-01
-
-This wave focused on three connected problems: make pinned-artifact checker progress falsifiable, make multi-agent repository state legible, and make the bounded LSP server truthful rather than cosmetically compatible.
-
-### Independent checker / pinned Prelude
-
-- Corrected the `Init.HEq` recursor reconstruction so the reflexive premise applies the motive to the type, the outer hygienic value, and `HEq.refl`, while preserving the distinct rebound heterogeneous value.
-- Corrected the synthetic direct-recursive `Init.Nat` successor-minor de Bruijn indices and strengthened forged-recursion refusal cells.
-- Added a real-artifact Nat council regression that decodes `Nat`, `Nat.zero`, `Nat.succ`, and `Nat.rec` from the pinned `Init.Prelude.olean` companion chain and submits that exact block through the ordinary K1 + independent-checker facade.
-- Made that real-artifact cell explicit/ignored and non-vacuous: an explicit run cannot pass merely because the Reference pin is absent.
-- Added a repository-local pinned Nat runner derived from `SUITE.lock`.
-
-**Evidence boundary:** the repository owns the real-artifact reproducer, but this changelog does not promote `fln-51y8` to full Prelude completion. The complete sequential council frontier remains a separate obligation.
-
-Representative commits: [`2ad0eb21`](https://github.com/Dicklesworthstone/franken_lean/commit/2ad0eb21cc16b132407de07158ff39e81c69db2b), [`72502cc3`](https://github.com/Dicklesworthstone/franken_lean/commit/72502cc31f6e9f67c350033e663eef5ef0de63d3), [`f72025e3`](https://github.com/Dicklesworthstone/franken_lean/commit/f72025e381d9d103a6c5845c8b6b1ef9ba51fb0b), [`5ae1b2b4`](https://github.com/Dicklesworthstone/franken_lean/commit/5ae1b2b41153b226fe1a141b82a088c828053127).
-
-### Agent-control plane
-
-- Added [`AGENT_FRONTIER_PROTOCOL.md`](AGENT_FRONTIER_PROTOCOL.md): immutable Git/artifact anchors, semantic ownership, typed first-failure frontiers, negative evidence, one-variable experiments, and evidence envelopes.
-- Added read-only frontier capsule auditing and deterministic Git-anchor recording.
-- Added deterministic Beads frontier selection using priority, transitive/direct unlocks, context reuse, isolation, evidence cost, collision risk, trusted-surface breadth, and irreducible uncertainty.
-- Selector strict mode distinguishes an observational ranking from promotion-authoritative selection when artifact/toolchain/oracle facts are unknown.
-- Blocking dependency cycles are graph corruption, not an empty ready set; cycle refusal returns a deterministic concrete witness.
-
-Representative commits: [`fcbe18f2`](https://github.com/Dicklesworthstone/franken_lean/commit/fcbe18f257c957084e6372b631541aff0e845d93), [`7d66a05e`](https://github.com/Dicklesworthstone/franken_lean/commit/7d66a05e2a02a0e6457eafeeabbe6ffb3352fb11), [`69c07154`](https://github.com/Dicklesworthstone/franken_lean/commit/69c07154acc175fbb58f16e8e2db7d345327418f), [`3d7c8300`](https://github.com/Dicklesworthstone/franken_lean/commit/3d7c83002edb71934834cbcd11a079709b4ca2ef).
-
-### Lantern / LSP bounded server
-
-- Replaced permissive JSON string handling with fail-closed escape decoding, UTF-16 surrogate-pair reconstruction, malformed-escape/raw-control refusal, and decoded URI/method/source handling.
-- Preserved integer and string JSON-RPC request IDs and gave malformed request IDs a distinct `-32600`/`id:null` outcome instead of silently turning them into notifications.
-- Bound JSON-RPC envelope routing to the root object so nested `params.method`/`params.id` cannot hijack routing.
-- Replaced fabricated Lean RPC session IDs/null-call success with explicit LSP `RequestFailed` (`-32803`) while the RPC subsystem is absent.
-- Replaced broad document-field substring search with exact structural reads from `params.textDocument`, `params.text`, and the one-element Full-sync `params.contentChanges` array.
-- Added a bounded session-local latest-source cache (1,024 documents / 256 MiB retained source) so textless saves can re-check the latest valid full document without claiming an unbounded persistent elaboration heap.
-- Bound retained source to monotone client document versions. Duplicate/regressing changes cannot overwrite or re-diagnose older source on top of a newer snapshot.
-- Malformed/incomplete open/change/save transitions invalidate retained source rather than allowing later textless saves to replay stale content.
-- `didClose` evicts retained source and clears push diagnostics for the URI.
-
-**Still not claimed:** cursor-aware proof goals, semantic hover/completion/definition, Lean RPC sessions, declaration-granular import/elaboration state, or the finished shared-heap parallel Lantern architecture.
-
-Representative commits: [`fced6257`](https://github.com/Dicklesworthstone/franken_lean/commit/fced62579ac344aaf008c7fb38f39b2485df463e), [`81d33852`](https://github.com/Dicklesworthstone/franken_lean/commit/81d338529b12dd05a91ae675cb87f94cb2abb4c8), [`9e50fdef`](https://github.com/Dicklesworthstone/franken_lean/commit/9e50fdef012caf7bd2a1f95dda575a353e51631c), [`637176fd`](https://github.com/Dicklesworthstone/franken_lean/commit/637176fd357ce610354aa14695f4841b68e72f68), [`2114cd59`](https://github.com/Dicklesworthstone/franken_lean/commit/2114cd59f7f5385782a4b56667fa60b09f4c30b1), [`60ebc07a`](https://github.com/Dicklesworthstone/franken_lean/commit/60ebc07a8c13286a6e3df293e6db99fe4e0eb073), [`f2af73ff`](https://github.com/Dicklesworthstone/franken_lean/commit/f2af73ff7faf69e10bde112ed4b1b391d57fd55b).
-
----
-
-## 12) Lantern modularization and diagnostic authority — 2026-09-02
-
-This continuation replaced overlapping protocol implementations with one typed control path, then separated accepted document state from the authority to claim that diagnostics for that state were actually emitted.
-
-### Structural protocol and session architecture
-
-- Split strict JSON parsing, deterministic wire construction, document-session state, and pending diagnostic waits into dedicated modules and made them authoritative from the live dispatcher.
-- Validated complete JSON before dispatch, preserving syntactically valid JSON number lexemes, decoded strings, and `null` request IDs without narrowing.
-- Hardened Content-Type parsing to accept the specified UTF-8 token and quoted forms while rejecting malformed quotes, escapes, duplicate parameters, unsupported charset values, and non-token inputs.
-- Made retained-source accounting recovery conservative: affected text is invalidated, unaffected text survives when an exact in-budget total can be rebuilt, and impossible reconstruction discards all cached text while preserving open/version authority.
-- Added deterministic unit round-trips for every emitted JSON-RPC wire shape through the same strict parser used for inbound traffic.
-
-### Diagnostic publication authority
-
-- Stopped treating arbitrary callback bytes or method-looking substrings as terminal diagnostics.
-- Callback messages must be valid JSON-RPC 2.0 notifications. `publishDiagnostics` counts for the current check only when `params.uri` exactly matches the checked document; wrong-URI publications remain auxiliary.
-- Missing, malformed, response-shaped, or duplicate terminal output is withheld as authority, followed by explicit diagnostic clearing and a schema-bound non-authoritative fault.
-- Canonical `$/lean/diagnosticOutcome` authority grades the publication frontier: `authority:true` completes it, while `authority:false` preserves the detailed outcome, clears editor diagnostics, and fails dependent waits.
-- The expected empty-diagnostic publication plus one canonical outcome is treated as one coherent terminal result rather than as duplicate success.
-
-### Bounded diagnostic waiting
-
-- Implemented `textDocument/waitForDiagnostics` for the pinned Lean `{ uri, version }` shape and `{}` success result.
-- Separated the accepted document/version frontier from the terminal diagnostic-publication frontier. A source change alone cannot satisfy a wait.
-- Future-version waits complete in registration order only after an authoritative terminal publication for at least the target version.
-- Non-authoritative processing, source invalidation, accounting failure, document close, or server shutdown resolves affected waits with typed failure rather than leaving them hanging or claiming success.
-- Added bounded pending-wait storage: at most 4,096 waits and 4 MiB of retained request-ID/URI metadata, with duplicate outstanding-ID refusal.
-- Added exact `$/cancelRequest` handling for pending diagnostic waits and visible no-session handling for Lean RPC keepAlive/release notifications.
-
-### Public evidence cells
-
-- Added exported framed-stdio transcripts for lifecycle order, Full-sync open/change/save/close, malformed JSON and invalid UTF-8 recovery, structural callback spoof rejection, malformed callback withholding, authoritative and non-authoritative wait outcomes, same-version recovery, future-version completion/failure, cancellation, close, shutdown, and unsupported RPC.
-
-**Evidence boundary:** these changes are landed with repository-owned unit and public transcript tests. The editing environment did not contain `cargo`/`rustc`, so this changelog does not claim those tests were executed in the same session. The live CLI callback still uses the compatibility source-blind projector; source-aware unsaved-text projection remains explicitly open.
-
-Representative commits: [`57a268bc`](https://github.com/Dicklesworthstone/franken_lean/commit/57a268bcd1a5656b3bf4d983a7630eb709bc819f), [`be2ffcf9`](https://github.com/Dicklesworthstone/franken_lean/commit/be2ffcf91ed60eb7a8fbd3605e101fdbe5d2ba54), [`32713f48`](https://github.com/Dicklesworthstone/franken_lean/commit/32713f480a77e94d8331ba064841bf72ca20377a), [`6ba4ef42`](https://github.com/Dicklesworthstone/franken_lean/commit/6ba4ef42310c9f3d12be0b5d2460c96716dd991c), [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387).
-
----
-
-## 13) Diagnostic accounting, transcript receipts, and URI resource bounds — 2026-09-02
-
-This tranche tightened three places where the implementation enforced a policy but did not yet expose or fully bind the corresponding authority fact.
-
-### Exact diagnostic accounting
-
-- A canonical zero-diagnostic completion now requires the current projection schema, `outcome:"complete"`, `authority:true`, and exact unsigned `diagnosticCount:0` as one structural tuple.
-- Missing, nonzero, negative, fractional, string, overflowing, or duplicate decoded counts are withheld rather than releasing `waitForDiagnostics` as a false clean result.
-- `inconclusive` and `internal_fault` outcomes must remain `authority:false` and may not carry the complete-only count field.
-- Exported framed-stdio tests prove malformed accounting clears editor diagnostics, emits a non-authoritative callback fault, and resolves the wait with `RequestFailed`.
-
-### Reproducible transcript resource evidence
-
-- The shared transcript reader already bounded complete Content-Length wire bytes, including extension headers and framing, while separately counting JSON body bytes.
-- `TranscriptStats` now publishes both facts, and the validation receipt advances to `fln.lsp-transcript-validation/2` with `wireBytes` and `bodyBytes`.
-- Library, validator-binary, empty-stdin, and extension-header tests bind the receipt to the exact complete framed byte length rather than an inferred body-only approximation.
-
-### Open-document metadata budget
-
-- Added a separate 4 MiB aggregate budget for retained open-document URI keys alongside the existing 1,024-document and 256 MiB source limits.
-- URI capacity is checked before source retention changes, so a rejected giant URI cannot consume source bytes, lifecycle slots, or checker work.
-- Close and invariant recovery rebuild/release source and URI accounting independently while preserving open/version authority.
-- A public framed-stdio test sends an over-budget URI and then a normal document in the same session, proving the refusal is isolated and the ordinary document still reaches diagnostics.
-
-**Evidence boundary:** the code and tests are landed, but this session had no Rust toolchain and GitHub Actions were unavailable. This changelog therefore records implementation and executable test ownership, not same-session execution evidence. `franken_lean-v2p` remains open because cursor semantics, source-aware live projection, Lean RPC, shared import state, asynchronous cancellation, and full editor parity are not complete.
-
-Representative commits: [`9a8f2362`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8f2362992d781da04419471475f3a02851d71c), [`9f11cc26`](https://github.com/Dicklesworthstone/franken_lean/commit/9f11cc26ddbf82c911bee326cd2e9f54de50f91c), [`5583c65f`](https://github.com/Dicklesworthstone/franken_lean/commit/5583c65febe88583d6ae2dcb544a39c960342d57), [`b8256034`](https://github.com/Dicklesworthstone/franken_lean/commit/b82560341b9096f36df280a570a2608e6972d645), [`a4807ece`](https://github.com/Dicklesworthstone/franken_lean/commit/a4807ece6042d676d4d43f62f569c34a841062ae), [`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3).
-
----
-
-## 14) Strict client lifecycle and parameter-shape evidence — 2026-09-02
-
-This tranche turned transcript syntax validity, protocol-valid client lifecycle, replayability, and metadata inspection into distinct evidence products instead of allowing one weak “valid transcript” label to cover all four.
-
-### Layered validation
-
-- Kept `fln-lsp-validate` syntax-only by default so negative lifecycle fixtures remain usable.
-- Added `--client-lifecycle`, which requires initialize first, initialized before running traffic, shutdown while running, exit immediately after shutdown, no post-exit frames, and EOF in the exited state.
-- Added a single known-method contract that binds request/notification role and params-container shape together. Known data-bearing methods require object params; shutdown and exit permit only missing or `null` params.
-- Unknown methods remain extensible during the running state but cannot bypass initialization or terminal ordering.
-- Added `fln.lsp-client-lifecycle/1` receipts with aggregate frame/role/wire/body counts and exact initialize, initialized, shutdown, and exit frame indices.
-
-### Replay preflight
-
-- Added `fln-lsp-replay --client-lifecycle` using the same strict model.
-- Lifecycle refusal occurs before server execution, expected-stream comparison, stdout bytes, or create-new output publication.
-- Default replay remains available for deliberately role-invalid or out-of-order client fixtures whose server refusal behavior is the subject of the test.
-- External-process tests prove clean strict replay, duplicate-option refusal, role and parameter-shape rejection, and the absence of a partial output artifact after failed preflight.
-
-### Metadata-only inspection
-
-- Extended validated frames with `paramsKind` as `missing`, `object`, `array`, or `null`.
-- Advanced inspector rows to `fln.lsp-frame/2`, exposing that category alongside frame index, role, method, lexical ID, and body size.
-- Parameter contents and source text remain omitted, and a public binary test carries an explicit secret source marker to prove it does not appear in inspection output.
-
-### Operational contract
-
-- Rewrote [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) around the three shared tools and their distinct claims.
-- The contract now tells agents when syntax-only validation is required, when lifecycle validation is promotion-relevant, and why strict replay preflight must precede output publication.
-
-**Evidence boundary:** the code and repository-owned unit/external-process tests are landed. The editing environment did not provide `cargo`/`rustc`, so no same-session green Rust claim is made. Strict client lifecycle currently proves top-level role, parameter-container category, and ordering, not the semantic contents of every params object, document open/change coherence, response-ID correlation, or complete bidirectional replay evidence.
-
-Representative commits: [`025c4c86`](https://github.com/Dicklesworthstone/franken_lean/commit/025c4c86018484177a1ba1e02c908373bfd29fa3), [`3e28ddb3`](https://github.com/Dicklesworthstone/franken_lean/commit/3e28ddb33a6087259a6672e897ec7cddcd484640), [`b256978d`](https://github.com/Dicklesworthstone/franken_lean/commit/b256978d14d2b3528531b15a1c38acc83a06e345), [`c33cb173`](https://github.com/Dicklesworthstone/franken_lean/commit/c33cb173d7cae593d489813aed527fe6ef72c280), [`13d79e4a`](https://github.com/Dicklesworthstone/franken_lean/commit/13d79e4a1da450e4baf8f83c603a3cc1ee9f6d27), [`1f379b1d`](https://github.com/Dicklesworthstone/franken_lean/commit/1f379b1d0261398b6d231994b2f6f743c20e255e), [`3c1311a8`](https://github.com/Dicklesworthstone/franken_lean/commit/3c1311a80f62b41053e0ea12921bee61180e2da5), [`f80f959e`](https://github.com/Dicklesworthstone/franken_lean/commit/f80f959e600dd06c5224d604365ceab0727939cd), [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef), [`732f70c3`](https://github.com/Dicklesworthstone/franken_lean/commit/732f70c3337212694343c2b5f428a2cbb6dce596).
+The tranche does **not** establish cross-stream timing, active-computation cancellation, arbitrary method-specific result semantics, source-aware production projection, cursor-aware goals, Lean RPC, shared import heaps, full unmodified-editor parity, or the complete pinned Prelude council.
 
 ---
 
 ## Notes for agents
 
-- The README is the 1.0 target-state specification; use [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for present implementation/evidence claims.
+- The README is the 1.0 target-state specification; use [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for current evidence claims.
 - The tracker of record is [`.beads/issues.jsonl`](.beads/issues.jsonl); Beads IDs are not GitHub Issues.
-- The Oracle-Only Law remains absolute: the pinned Lean Reference is differential evidence/fixture input, never a FrankenLean runtime component.
+- The Reference is an oracle and fixture source only.
 - Generated contracts such as `KERNEL_CONTRACT.md`, `ABI_CONTRACT.md`, and `OLEAN_CONTRACT.md` are compatibility authorities; do not hand-copy their facts into implementation code.
-- A green synthetic fixture is not a pinned-artifact claim. Long sequential compatibility work reports `last proven -> first non-success -> typed class`.
-- Full semantic Lantern/LSP/RPC, mathlib-scale end-to-end closure, and release-grade distribution remain active program work even though substantial bounded slices are live.
+- A green synthetic fixture is not a pinned-artifact claim. Sequential compatibility work reports `last proven -> first non-success -> typed class`.
+- Request-ID, cancellation, and response correlation are protocol facts, not proof of method-result semantics or event timing.
+- Full semantic Lantern/RPC, mathlib-scale closure, and release-grade distribution remain active program work even though substantial bounded slices are live.
