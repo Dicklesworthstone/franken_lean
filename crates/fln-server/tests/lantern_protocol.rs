@@ -103,39 +103,47 @@ fn full_sync_transcript_is_ordered_versioned_and_cleanly_closed() {
 }
 
 #[test]
-fn malformed_json_and_invalid_utf8_recover_before_the_next_request() {
-    let mut input = protocol_session(&[
+fn malformed_json_recovers_before_the_next_request() {
+    let input = protocol_session(&[
         r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"bad":tru}}"#,
         r#"{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{}}"#,
     ]);
-    let shutdown = protocol_session(&[]);
-    let shutdown_frames = decode_frames(&shutdown);
-    assert!(shutdown_frames.is_empty(), "input frames are not output frames");
+    let (outcome, output) = run(input, &mut |_, _| Vec::new());
+    assert!(outcome.clean);
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":null") && message.contains("\"code\":-32700")
+    }));
+    assert!(output.iter().any(|message| {
+        message.contains("\"id\":6") && message.contains("\"result\":null")
+    }));
+}
 
-    let mut prefix = Vec::new();
+#[test]
+fn invalid_utf8_recovers_before_the_next_request() {
+    let mut input = Vec::new();
     framed_json(
-        &mut prefix,
+        &mut input,
         r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
     );
     framed_json(
-        &mut prefix,
+        &mut input,
         r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
     );
-    frame(&mut prefix, &[0xff, 0xfe]);
+    frame(&mut input, &[0xff, 0xfe]);
     framed_json(
-        &mut prefix,
+        &mut input,
         r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/hover","params":{}}"#,
     );
     framed_json(
-        &mut prefix,
+        &mut input,
         r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
     );
     framed_json(
-        &mut prefix,
+        &mut input,
         r#"{"jsonrpc":"2.0","method":"exit"}"#,
     );
 
-    let (outcome, output) = run(prefix, &mut |_, _| Vec::new());
+    let (outcome, output) = run(input, &mut |_, _| Vec::new());
     assert!(outcome.clean);
     assert!(output.iter().any(|message| {
         message.contains("\"id\":null")
@@ -144,15 +152,6 @@ fn malformed_json_and_invalid_utf8_recover_before_the_next_request() {
     }));
     assert!(output.iter().any(|message| {
         message.contains("\"id\":7") && message.contains("\"result\":null")
-    }));
-
-    let (outcome, output) = run(input.split_off(0), &mut |_, _| Vec::new());
-    assert!(outcome.clean);
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":null") && message.contains("\"code\":-32700")
-    }));
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":6") && message.contains("\"result\":null")
     }));
 }
 
