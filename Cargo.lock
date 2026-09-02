@@ -23,6 +23,10 @@ dependencies = [
 [[package]]
 name = "fln-anvil"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-env",
+]
 
 [[package]]
 name = "fln-bench"
@@ -88,6 +92,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-doc"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-elab"
@@ -119,6 +126,9 @@ dependencies = [
 [[package]]
 name = "fln-hound"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-kernel"
@@ -132,10 +142,17 @@ dependencies = [
 [[package]]
 name = "fln-lake"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-ledger"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-hash",
+]
 
 [[package]]
 name = "fln-libm"
@@ -144,6 +161,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-mcp"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-olean"
@@ -191,6 +211,9 @@ dependencies = [
 [[package]]
 name = "fln-trace"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-tui"

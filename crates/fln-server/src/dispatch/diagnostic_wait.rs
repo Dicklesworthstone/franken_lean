@@ -246,6 +246,16 @@ mod tests {
             waits.register("file:///y".to_string(), 11, id("other")),
             Err(WaitRefusal::Capacity)
         );
+        assert!(
+            WaitRefusal::DuplicateRequestId
+                .message()
+                .contains("already pending")
+        );
+        assert!(
+            WaitRefusal::Capacity
+                .message()
+                .contains("bounded pending-wait limit")
+        );
     }
 
     #[test]
@@ -257,9 +267,7 @@ mod tests {
         waits
             .register("file:///x".to_string(), 3, id("x-b"))
             .unwrap();
-        waits
-            .register("file:///y".to_string(), 1, id("y"))
-            .unwrap();
+        waits.register("file:///y".to_string(), 1, id("y")).unwrap();
 
         assert_eq!(waits.cancel(&id("x-a")), Some(id("x-a")));
         assert_eq!(waits.cancel(&id("missing")), None);

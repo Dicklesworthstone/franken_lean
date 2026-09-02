@@ -118,10 +118,7 @@ mod tests {
 
     fn assert_valid_envelope(message: &str) {
         let envelope = parse_envelope(message).expect("wire encoder must emit valid JSON");
-        assert_eq!(
-            envelope.jsonrpc,
-            DecodedField::Valid("2.0".to_string())
-        );
+        assert_eq!(envelope.jsonrpc, DecodedField::Valid("2.0".to_string()));
     }
 
     #[test]
@@ -155,11 +152,14 @@ mod tests {
             assert_valid_envelope(&message);
         }
 
-        let response = parse_envelope(&null_response(&number)).expect("valid response");
+        let null_number = null_response(&number);
+        let response = parse_envelope(&null_number).expect("valid response");
         assert_eq!(response.id, RequestIdField::Valid(number.clone()));
-        let response = parse_envelope(&empty_object_response(&number)).expect("valid response");
+        let empty_number = empty_object_response(&number);
+        let response = parse_envelope(&empty_number).expect("valid response");
         assert_eq!(response.id, RequestIdField::Valid(number));
-        let response = parse_envelope(&null_response(&text)).expect("valid response");
+        let null_text = null_response(&text);
+        let response = parse_envelope(&null_text).expect("valid response");
         assert_eq!(response.id, RequestIdField::Valid(text));
     }
 

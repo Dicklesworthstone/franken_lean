@@ -18,10 +18,10 @@ mod wait;
 mod wire;
 
 use json::{
-    BooleanField, DecodedField, Envelope, EnvelopeError, RawField, RequestId, RequestIdField,
-    VersionField, content_changes_text, direct_authority, direct_request_id, direct_uri,
-    direct_version, parse_envelope, save_text, text_document_text, text_document_uri,
-    text_document_version,
+    BooleanField, DecodedField, DiagnosticCount, Envelope, EnvelopeError, RawField, RequestId,
+    RequestIdField, VersionField, content_changes_text, diagnostic_count, direct_authority,
+    direct_request_id, direct_uri, direct_version, parse_envelope, save_text, text_document_text,
+    text_document_uri, text_document_version,
 };
 use session::{DocumentSession, RetentionOutcome, SessionRefusal};
 use wait::{PendingDiagnosticWaits, WaitRefusal};
@@ -75,7 +75,7 @@ enum CallbackMessageClass {
     Invalid,
 }
 
-pub type OnDidOpen = dyn FnMut(&str, &str) -> Vec<String>;
+pub type OnDidOpen<'a> = dyn FnMut(&str, &str) -> Vec<String> + 'a;
 
 fn write_protocol_message(output: &mut dyn Write, message: String) -> io::Result<()> {
     transport::write_message(output, message.as_bytes())
@@ -85,10 +85,7 @@ fn write_warning(output: &mut dyn Write, message: &str) -> io::Result<()> {
     write_protocol_message(output, log_warning(message))
 }
 
-fn write_retention_outcome(
-    output: &mut dyn Write,
-    retention: RetentionOutcome,
-) -> io::Result<()> {
+fn write_retention_outcome(output: &mut dyn Write, retention: RetentionOutcome) -> io::Result<()> {
     if let RetentionOutcome::NotRetained(refusal) = retention {
         write_warning(output, refusal.message())?;
     }
@@ -114,13 +111,27 @@ fn classify_callback_message(message: &str, document_uri: &str) -> CallbackMessa
     }
     match method.as_str() {
         "$/lean/diagnosticOutcome" => match direct_authority(envelope.params) {
-            BooleanField::Valid(true) => {
+            // Canonical zero-diagnostic success is a four-part covenant: schema,
+            // outcome:"complete", authority:true, AND an exact unsigned-zero
+            // diagnosticCount. A complete outcome missing that count, or carrying
+            // any non-zero/non-integer/quoted/overflowing/duplicated count, is not
+            // authoritative and is withheld.
+            BooleanField::Valid(true)
+                if diagnostic_count(envelope.params) == DiagnosticCount::ExactZero =>
+            {
                 CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Complete)
             }
-            BooleanField::Valid(false) => {
+            // A non-authoritative inconclusive/internal_fault terminal must OMIT
+            // the complete-only count. Its details stay visible (it is a valid,
+            // failing terminal), but it can never satisfy a diagnostic wait.
+            BooleanField::Valid(false)
+                if diagnostic_count(envelope.params) == DiagnosticCount::Absent =>
+            {
                 CallbackMessageClass::DiagnosticOutcome(DiagnosticCompletion::Failed)
             }
-            BooleanField::Missing | BooleanField::Invalid => CallbackMessageClass::Invalid,
+            BooleanField::Valid(_) | BooleanField::Missing | BooleanField::Invalid => {
+                CallbackMessageClass::Invalid
+            }
         },
         "textDocument/publishDiagnostics" => match direct_uri(envelope.params) {
             DecodedField::Valid(uri) if uri == document_uri => {
@@ -137,7 +148,7 @@ fn check_document(
     output: &mut dyn Write,
     uri: &str,
     content: &str,
-    on_did_open: &mut OnDidOpen,
+    on_did_open: &mut OnDidOpen<'_>,
 ) -> io::Result<DiagnosticCompletion> {
     write_protocol_message(output, file_progress_notification(uri, true))?;
     let notifications = on_did_open(uri, content);
@@ -161,7 +172,7 @@ fn check_document(
     let invalid = classes.contains(&CallbackMessageClass::Invalid);
     let ambiguous = diagnostic_count > 1 || outcomes.len() > 1;
     let has_terminal = diagnostic_count == 1 || outcomes.len() == 1;
-    let completion = outcomes.first().copied().unwrap_or_else(|| {
+    let completion = outcomes.first().copied().unwrap_or({
         if diagnostic_count == 1 {
             DiagnosticCompletion::Complete
         } else {
@@ -232,10 +243,7 @@ fn settle_waits(
     }
 }
 
-fn record_frontier(
-    frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
-    checked: &CheckedVersion,
-) {
+fn record_frontier(frontiers: &mut BTreeMap<String, DiagnosticFrontier>, checked: &CheckedVersion) {
     frontiers.insert(
         checked.uri.clone(),
         DiagnosticFrontier {
@@ -320,12 +328,10 @@ fn decoded_open_text(params: RawField<'_>) -> Result<String, &'static str> {
 fn decoded_change_text(params: RawField<'_>) -> Result<String, &'static str> {
     match content_changes_text(params) {
         DecodedField::Valid(text) => Ok(text),
-        DecodedField::Missing => {
-            Err("LSP didChange requires exactly one Full-sync content change")
+        DecodedField::Missing => Err("LSP didChange requires exactly one Full-sync content change"),
+        DecodedField::Invalid => {
+            Err("LSP didChange requires exactly one unambiguous, unranged Full-sync text change")
         }
-        DecodedField::Invalid => Err(
-            "LSP didChange requires exactly one unambiguous, unranged Full-sync text change",
-        ),
     }
 }
 
@@ -355,7 +361,7 @@ fn handle_open(
     output: &mut dyn Write,
     session: &mut DocumentSession,
     params: RawField<'_>,
-    on_did_open: &mut OnDidOpen,
+    on_did_open: &mut OnDidOpen<'_>,
 ) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
@@ -402,7 +408,7 @@ fn handle_change(
     waits: &mut PendingDiagnosticWaits,
     frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
-    on_did_open: &mut OnDidOpen,
+    on_did_open: &mut OnDidOpen<'_>,
 ) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
@@ -418,18 +424,14 @@ fn handle_change(
     let version = match decoded_version(params) {
         Ok(version) => version,
         Err(message) => {
-            invalidate_source_and_clear(
-                output, session, waits, frontiers, &uri, message,
-            )?;
+            invalidate_source_and_clear(output, session, waits, frontiers, &uri, message)?;
             return Ok(None);
         }
     };
     let text = match decoded_change_text(params) {
         Ok(text) => text,
         Err(message) => {
-            invalidate_source_and_clear(
-                output, session, waits, frontiers, &uri, message,
-            )?;
+            invalidate_source_and_clear(output, session, waits, frontiers, &uri, message)?;
             return Ok(None);
         }
     };
@@ -470,7 +472,7 @@ fn handle_save(
     waits: &mut PendingDiagnosticWaits,
     frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
-    on_did_open: &mut OnDidOpen,
+    on_did_open: &mut OnDidOpen<'_>,
 ) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
@@ -672,7 +674,7 @@ fn handle_cancel_request(
     Ok(())
 }
 
-fn request_id(envelope: &Envelope<'_>) -> Result<Option<&RequestId>, String> {
+fn request_id<'a>(envelope: &'a Envelope<'_>) -> Result<Option<&'a RequestId>, String> {
     match &envelope.id {
         RequestIdField::Absent => Ok(None),
         RequestIdField::Valid(id) => Ok(Some(id)),
@@ -690,10 +692,7 @@ fn method(envelope: &Envelope<'_>, id: Option<&RequestId>) -> Result<String, Str
             id,
             "JSON-RPC method must not be empty",
         )),
-        DecodedField::Missing => Err(invalid_request_response(
-            id,
-            "JSON-RPC method is required",
-        )),
+        DecodedField::Missing => Err(invalid_request_response(id, "JSON-RPC method is required")),
         DecodedField::Invalid => Err(invalid_request_response(
             id,
             "JSON-RPC method must be one unambiguous string",
@@ -772,21 +771,13 @@ fn validate_method_role(
     Ok(true)
 }
 
-fn running_request(
-    output: &mut dyn Write,
-    state: ServerState,
-    id: &RequestId,
-) -> io::Result<bool> {
+fn running_request(output: &mut dyn Write, state: ServerState, id: &RequestId) -> io::Result<bool> {
     match state {
         ServerState::Running => Ok(true),
         ServerState::Uninitialized | ServerState::Initializing => {
             write_protocol_message(
                 output,
-                error_response(
-                    id,
-                    SERVER_NOT_INITIALIZED_CODE,
-                    "server is not initialized",
-                ),
+                error_response(id, SERVER_NOT_INITIALIZED_CODE, "server is not initialized"),
             )?;
             Ok(false)
         }
@@ -803,7 +794,7 @@ fn running_request(
 pub fn serve(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
-    on_did_open: &mut OnDidOpen,
+    on_did_open: &mut OnDidOpen<'_>,
 ) -> io::Result<ServerOutcome> {
     let mut state = ServerState::Uninitialized;
     let mut documents_opened = 0u64;
@@ -897,7 +888,10 @@ pub fn serve(
                 state = ServerState::Running;
             }
             ("initialized", None, _) => {
-                write_warning(output, "FrankenLean ignored initialized outside initialization")?;
+                write_warning(
+                    output,
+                    "FrankenLean ignored initialized outside initialization",
+                )?;
             }
             ("shutdown", Some(request_id), ServerState::Running) => {
                 fail_waits(
@@ -1062,7 +1056,7 @@ mod tests {
 
     fn run_session_with_callback(
         messages: &[&str],
-        callback: &mut OnDidOpen,
+        callback: &mut OnDidOpen<'_>,
     ) -> (ServerOutcome, String) {
         let mut input = Vec::new();
         send(
@@ -1183,8 +1177,15 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"message":"\"method\":\"textDocument/publishDiagnostics\""}}"#,
         ];
         let (outcome, output) = run_session_with_callback(
-            &[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#],
-            &mut |_, _| messages.iter().map(|message| (*message).to_string()).collect(),
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#,
+            ],
+            &mut |_, _| {
+                messages
+                    .iter()
+                    .map(|message| (*message).to_string())
+                    .collect()
+            },
         );
         assert!(outcome.clean);
         assert!(output.contains("diagnostic-callback-terminal-message"));
@@ -1194,7 +1195,9 @@ mod tests {
     #[test]
     fn malformed_callback_output_is_withheld_and_faulted() {
         let (outcome, output) = run_session_with_callback(
-            &[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#],
+            &[
+                r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"source"}}}"#,
+            ],
             &mut |_, _| vec!["{malformed-callback".to_string()],
         );
         assert!(outcome.clean);
@@ -1335,8 +1338,8 @@ mod tests {
         send(&mut input, r#"{"jsonrpc":"2.0","method":"exit"}"#);
         let mut reader = BufReader::new(input.as_slice());
         let mut output = Vec::new();
-        let outcome = serve(&mut reader, &mut output, &mut |_, _| Vec::new())
-            .expect("serve test session");
+        let outcome =
+            serve(&mut reader, &mut output, &mut |_, _| Vec::new()).expect("serve test session");
         let output = String::from_utf8(output).expect("UTF-8 protocol output");
         assert!(outcome.clean);
         assert!(output.contains("\"id\":5,\"error\":{\"code\":-32002"));

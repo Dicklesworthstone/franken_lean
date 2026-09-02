@@ -345,8 +345,8 @@ impl BufRead for CountingBufRead<'_> {
 }
 
 pub fn validate_frame(body: &[u8], frame: u64) -> Result<TranscriptFrame, String> {
-    let text = std::str::from_utf8(body)
-        .map_err(|_| format!("frame {frame} body is not valid UTF-8"))?;
+    let text =
+        std::str::from_utf8(body).map_err(|_| format!("frame {frame} body is not valid UTF-8"))?;
     let envelope = crate::json::parse_envelope(text).map_err(|error| match error {
         EnvelopeError::MalformedJson => format!("frame {frame} contains malformed JSON"),
         EnvelopeError::NotObject => format!("frame {frame} is not a JSON-RPC object"),
@@ -431,9 +431,7 @@ where
             break;
         };
         if frame_index > max_frames {
-            return Err(format!(
-                "transcript exceeds the {max_frames}-frame ceiling"
-            ));
+            return Err(format!("transcript exceeds the {max_frames}-frame ceiling"));
         }
         if input.overflowed {
             return Err("transcript wire-byte accounting overflow".to_string());
@@ -515,11 +513,7 @@ pub fn render_validation(stats: TranscriptStats) -> String {
             "\"frames\":{},\"requests\":{},\"notifications\":{},",
             "\"wireBytes\":{},\"bodyBytes\":{}}}\n"
         ),
-        stats.frames,
-        stats.requests,
-        stats.notifications,
-        stats.wire_bytes,
-        stats.body_bytes
+        stats.frames, stats.requests, stats.notifications, stats.wire_bytes, stats.body_bytes
     )
 }
 
@@ -621,11 +615,7 @@ mod tests {
         assert_eq!(request.id_json.as_deref(), Some("1.25e2"));
         assert_eq!(request.params_kind, TranscriptParamsKind::Null);
 
-        let notification = validate_frame(
-            br#"{"jsonrpc":"2.0","method":"exit"}"#,
-            8,
-        )
-        .unwrap();
+        let notification = validate_frame(br#"{"jsonrpc":"2.0","method":"exit"}"#, 8).unwrap();
         assert_eq!(notification.role, TranscriptRole::Notification);
         assert_eq!(notification.id_json, None);
         assert_eq!(notification.params_kind, TranscriptParamsKind::Missing);
@@ -690,14 +680,10 @@ mod tests {
         transcript.extend(frame(r#"{"jsonrpc":"2.0","method":"second"}"#));
         let expected_wire_bytes = u64::try_from(transcript.len()).unwrap();
         let mut observed = Vec::new();
-        let stats = visit_reader(
-            &mut BufReader::new(Cursor::new(transcript)),
-            10,
-            |frame| {
-                observed.push((frame.index, frame.role, frame.method.clone()));
-                Ok(())
-            },
-        )
+        let stats = visit_reader(&mut BufReader::new(Cursor::new(transcript)), 10, |frame| {
+            observed.push((frame.index, frame.role, frame.method.clone()));
+            Ok(())
+        })
         .unwrap();
         assert_eq!(
             observed,
@@ -728,13 +714,11 @@ mod tests {
         assert!(error.contains("wire bytes"));
         assert!(error.contains("frame 2"));
 
-        let stats = visit_reader_with_limits(
-            &mut BufReader::new(Cursor::new(one)),
-            one_len,
-            10,
-            |_| Ok(()),
-        )
-        .unwrap();
+        let stats =
+            visit_reader_with_limits(&mut BufReader::new(Cursor::new(one)), one_len, 10, |_| {
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(stats.frames, 1);
         assert_eq!(stats.wire_bytes, one_len);
         assert_eq!(stats.body_bytes, u64::try_from(body.len()).unwrap());

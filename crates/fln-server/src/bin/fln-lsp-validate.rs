@@ -119,6 +119,7 @@ fn validate_path(config: &Config) -> Result<String, String> {
         return Err(format!(
             "{} is {} bytes; the transcript ceiling is {}",
             config.input.display(),
+            metadata.len(),
             transcript::MAX_TRANSCRIPT_BYTES
         ));
     }
@@ -207,7 +208,7 @@ mod tests {
         let expected_body_bytes = bodies
             .iter()
             .map(|body| u64::try_from(body.len()).unwrap())
-            .sum();
+            .sum::<u64>();
         let bytes = framed(&bodies);
         let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
         let receipt = validate_reader(
@@ -254,20 +255,14 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_args(
-                ["fln-lsp-validate", "--client-lifecycle", "-"]
-                    .map(OsString::from)
-            ),
+            parse_args(["fln-lsp-validate", "--client-lifecycle", "-"].map(OsString::from)),
             Ok(Command::Validate(Config {
                 input: PathBuf::from("-"),
                 mode: ValidationMode::ClientLifecycle,
             }))
         );
         assert_eq!(
-            parse_args(
-                ["fln-lsp-validate", "--client-session", "-"]
-                    .map(OsString::from)
-            ),
+            parse_args(["fln-lsp-validate", "--client-session", "-"].map(OsString::from)),
             Ok(Command::Validate(Config {
                 input: PathBuf::from("-"),
                 mode: ValidationMode::ClientSession,
@@ -378,8 +373,8 @@ mod tests {
                 Vec::new(),
                 frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
             ] {
-                let error = validate_reader(&mut BufReader::new(Cursor::new(bytes)), mode)
-                    .unwrap_err();
+                let error =
+                    validate_reader(&mut BufReader::new(Cursor::new(bytes)), mode).unwrap_err();
                 assert!(error.contains("expected exited"), "{error}");
             }
         }

@@ -366,13 +366,11 @@ pub(super) fn parse_envelope(json: &str) -> Result<Envelope<'_>, EnvelopeError> 
     } else {
         loop {
             let key_start = index;
-            let key_end =
-                scan_string_end(bytes, key_start).ok_or(EnvelopeError::MalformedJson)?;
+            let key_end = scan_string_end(bytes, key_start).ok_or(EnvelopeError::MalformedJson)?;
             let key_value = json
                 .get(key_start..key_end)
                 .ok_or(EnvelopeError::MalformedJson)?;
-            let key =
-                decode_json_string_value(key_value).ok_or(EnvelopeError::MalformedJson)?;
+            let key = decode_json_string_value(key_value).ok_or(EnvelopeError::MalformedJson)?;
             index = skip_ws(bytes, key_end);
             if bytes.get(index).copied() != Some(b':') {
                 return Err(EnvelopeError::MalformedJson);
@@ -550,9 +548,7 @@ fn decoded_integer_field(object: RawField<'_>, key: &str) -> VersionField {
             match scan_number_end(bytes, 0) {
                 Some(end)
                     if end == bytes.len()
-                        && !value
-                            .bytes()
-                            .any(|byte| matches!(byte, b'.' | b'e' | b'E')) =>
+                        && !value.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) =>
                 {
                     value
                         .parse::<i64>()
@@ -622,12 +618,37 @@ pub(super) fn direct_authority(params: RawField<'_>) -> BooleanField {
             DecodedField::Valid(outcome),
             BooleanField::Valid(authority),
         ) if schema == DIAGNOSTIC_PROJECTION_SCHEMA => match (outcome.as_str(), authority) {
-            ("complete", true)
-            | ("inconclusive", false)
-            | ("internal_fault", false) => BooleanField::Valid(authority),
+            ("complete", true) | ("inconclusive", false) | ("internal_fault", false) => {
+                BooleanField::Valid(authority)
+            }
             _ => BooleanField::Invalid,
         },
         _ => BooleanField::Invalid,
+    }
+}
+
+/// State of the `diagnosticCount` field for the canonical outcome covenant.
+///
+/// The four-part canonical-success covenant requires an authoritative `complete`
+/// outcome to carry an exact unsigned-zero `diagnosticCount`, while a
+/// non-authoritative `inconclusive`/`internal_fault` outcome must omit the
+/// complete-only count entirely. `Other` covers a present-but-non-zero,
+/// non-integer, quoted, overflowing, or duplicated field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiagnosticCount {
+    Absent,
+    ExactZero,
+    Other,
+}
+
+pub(super) fn diagnostic_count(params: RawField<'_>) -> DiagnosticCount {
+    match params_object(params) {
+        RawField::Value(value) => match object_field(value, "diagnosticCount") {
+            RawField::Missing => DiagnosticCount::Absent,
+            RawField::Value(token) if token.trim() == "0" => DiagnosticCount::ExactZero,
+            RawField::Value(_) | RawField::Invalid => DiagnosticCount::Other,
+        },
+        RawField::Missing | RawField::Invalid => DiagnosticCount::Other,
     }
 }
 
@@ -725,7 +746,10 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"x","params":{"a" 1}}"#,
             r#"{"jsonrpc":"2.0","method":"x"} trailing"#,
         ] {
-            assert!(parse_envelope(json).is_err(), "accepted malformed JSON: {json}");
+            assert!(
+                parse_envelope(json).is_err(),
+                "accepted malformed JSON: {json}"
+            );
         }
     }
 
@@ -747,7 +771,10 @@ mod tests {
             text_document_uri(envelope.params),
             DecodedField::Valid("file:///right".to_string())
         );
-        assert_eq!(text_document_version(envelope.params), VersionField::Valid(3));
+        assert_eq!(
+            text_document_version(envelope.params),
+            VersionField::Valid(3)
+        );
         assert_eq!(
             text_document_text(envelope.params),
             DecodedField::Valid("ok".to_string())

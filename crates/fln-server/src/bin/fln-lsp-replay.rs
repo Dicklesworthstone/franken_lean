@@ -10,6 +10,7 @@ pub use fln_server::{json_string, transport};
 
 #[path = "../json.rs"]
 mod json;
+#[allow(dead_code)]
 #[path = "../session_transcript.rs"]
 mod session_transcript;
 #[path = "../transcript.rs"]
@@ -76,10 +77,7 @@ impl Write for BoundedOutput {
         if next_len > self.max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "replay output exceeds the {}-byte ceiling",
-                    self.max_bytes
-                ),
+                format!("replay output exceeds the {}-byte ceiling", self.max_bytes),
             ));
         }
         self.bytes.extend_from_slice(buffer);
@@ -380,8 +378,7 @@ mod tests {
         );
         assert_eq!(
             parse_args(
-                ["fln-lsp-replay", "--client-lifecycle", "input.frames"]
-                    .map(OsString::from)
+                ["fln-lsp-replay", "--client-lifecycle", "input.frames"].map(OsString::from)
             ),
             Ok(Command::Replay(Config {
                 input: PathBuf::from("input.frames"),
@@ -391,10 +388,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_args(
-                ["fln-lsp-replay", "--client-session", "input.frames"]
-                    .map(OsString::from)
-            ),
+            parse_args(["fln-lsp-replay", "--client-session", "input.frames"].map(OsString::from)),
             Ok(Command::Replay(Config {
                 input: PathBuf::from("input.frames"),
                 expect: None,
@@ -502,9 +496,7 @@ mod tests {
         assert!(replay(&unclean).unwrap_err().contains("shutdown/exit"));
 
         let mut trailing = clean_session();
-        trailing.extend(frame(
-            r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#,
-        ));
+        trailing.extend(frame(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#));
         assert!(replay(&trailing).unwrap_err().contains("after the exit"));
     }
 

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{BufReader, Cursor};
 
 use fln_server::dispatch::serve;
@@ -62,7 +64,10 @@ fn incoherent_outcome_tuples_are_withheld_and_faulted() {
         assert!(output.contains("discarded malformed diagnostic callback output"));
         assert!(output.contains("diagnostic-callback-terminal-message"));
         assert!(output.contains("\"id\":\"wait\",\"error\":{\"code\":-32803"));
-        assert!(!output.contains("-marker"), "forwarded invalid callback: {callback}");
+        assert!(
+            !output.contains("-marker"),
+            "forwarded invalid callback: {callback}"
+        );
     }
 }
 
@@ -82,7 +87,7 @@ fn nested_decoys_cannot_promote_a_non_authoritative_outcome() {
 #[test]
 fn nested_decoys_cannot_demote_an_authoritative_complete_outcome() {
     let messages = run_with_callback(
-        r#"{"jsonrpc":"2.0","method":"$/lean/diagnosticOutcome","params":{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"detail":{"schema":"wrong","outcome":"internal_fault","authority":false},"message":"\"authority\":false"}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","method":"$/lean/diagnosticOutcome","params":{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":0,"detail":{"schema":"wrong","outcome":"internal_fault","authority":false},"message":"\"authority\":false"}}"#.to_string(),
     );
     let output = joined(&messages);
 

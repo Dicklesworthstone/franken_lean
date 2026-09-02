@@ -6,10 +6,14 @@
 //! `dispatch/json.rs`.
 
 #![allow(dead_code)]
+// `include!` splices `dispatch/json.rs` (which ends in a `#[cfg(test)] mod tests`)
+// above the façade functions below, so the parser's own items legitimately follow
+// a test module whenever this façade is compiled as a test target.
+#![allow(clippy::items_after_test_module)]
 
 include!("dispatch/json.rs");
 
-pub(super) fn object_member(object: RawField<'_>, key: &str) -> RawField<'_> {
+pub(super) fn object_member<'a>(object: RawField<'a>, key: &str) -> RawField<'a> {
     match object_value(object) {
         RawField::Value(value) => object_field(value, key),
         RawField::Missing => RawField::Missing,

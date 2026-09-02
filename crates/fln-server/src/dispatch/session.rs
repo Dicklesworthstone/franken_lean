@@ -57,7 +57,9 @@ impl SessionRefusal {
             Self::DocumentMetadataLimit => {
                 "FrankenLean refused didOpen because the bounded open-document URI budget was reached"
             }
-            Self::NotOpen => "FrankenLean refused the document event because the document is not open",
+            Self::NotOpen => {
+                "FrankenLean refused the document event because the document is not open"
+            }
             Self::NonMonotone => {
                 "FrankenLean refused non-monotone didChange version; the latest accepted version remains authoritative"
             }
@@ -87,12 +89,9 @@ impl DocumentSession {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn with_limits(max_documents: usize, max_retained_bytes: usize) -> Self {
-        Self::with_resource_limits(
-            max_documents,
-            max_retained_bytes,
-            MAX_RETAINED_URI_BYTES,
-        )
+        Self::with_resource_limits(max_documents, max_retained_bytes, MAX_RETAINED_URI_BYTES)
     }
 
     fn with_resource_limits(

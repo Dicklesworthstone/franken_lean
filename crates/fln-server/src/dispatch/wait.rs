@@ -32,12 +32,8 @@ pub(super) enum WaitRefusal {
 impl WaitRefusal {
     pub(super) const fn message(self) -> &'static str {
         match self {
-            Self::DuplicateId => {
-                "FrankenLean refused a duplicate outstanding JSON-RPC request id"
-            }
-            Self::Capacity => {
-                "FrankenLean pending diagnostic-wait capacity is exhausted"
-            }
+            Self::DuplicateId => "FrankenLean refused a duplicate outstanding JSON-RPC request id",
+            Self::Capacity => "FrankenLean pending diagnostic-wait capacity is exhausted",
         }
     }
 }
@@ -150,15 +146,9 @@ mod tests {
     #[test]
     fn ready_waits_complete_in_registration_order() {
         let mut waits = PendingDiagnosticWaits::new();
-        waits
-            .register(id("a"), "file:///x".to_string(), 2)
-            .unwrap();
-        waits
-            .register(id("b"), "file:///y".to_string(), 1)
-            .unwrap();
-        waits
-            .register(id("c"), "file:///x".to_string(), 3)
-            .unwrap();
+        waits.register(id("a"), "file:///x".to_string(), 2).unwrap();
+        waits.register(id("b"), "file:///y".to_string(), 1).unwrap();
+        waits.register(id("c"), "file:///x".to_string(), 3).unwrap();
 
         assert_eq!(waits.complete_ready("file:///x", 2), vec![id("a")]);
         assert_eq!(waits.complete_ready("file:///x", 3), vec![id("c")]);
@@ -168,9 +158,7 @@ mod tests {
     #[test]
     fn duplicate_ids_and_count_capacity_are_typed_refusals() {
         let mut waits = PendingDiagnosticWaits::with_limits(1, 100);
-        waits
-            .register(id("a"), "file:///x".to_string(), 2)
-            .unwrap();
+        waits.register(id("a"), "file:///x".to_string(), 2).unwrap();
         assert!(waits.contains(&id("a")));
         assert_eq!(
             waits.register(id("a"), "file:///y".to_string(), 3),
@@ -185,29 +173,22 @@ mod tests {
     #[test]
     fn aggregate_retained_bytes_are_bounded_without_mutable_accounting() {
         let mut waits = PendingDiagnosticWaits::with_limits(4, 12);
-        waits
-            .register(id("a"), "file:///x".to_string(), 2)
-            .unwrap();
-        assert_eq!(waits.retained_bytes(), Some(9));
+        waits.register(id("a"), "file:///x".to_string(), 2).unwrap();
+        // Accounting is request-id bytes + uri bytes: id "a" (1) + "file:///x" (9) = 10.
+        assert_eq!(waits.retained_bytes(), Some(10));
         assert_eq!(
             waits.register(id("bbbb"), "file:///y".to_string(), 3),
             Err(WaitRefusal::Capacity)
         );
-        assert_eq!(waits.retained_bytes(), Some(9));
+        assert_eq!(waits.retained_bytes(), Some(10));
     }
 
     #[test]
     fn cancellation_and_drains_remove_exact_waits() {
         let mut waits = PendingDiagnosticWaits::new();
-        waits
-            .register(id("a"), "file:///x".to_string(), 2)
-            .unwrap();
-        waits
-            .register(id("b"), "file:///x".to_string(), 3)
-            .unwrap();
-        waits
-            .register(id("c"), "file:///y".to_string(), 4)
-            .unwrap();
+        waits.register(id("a"), "file:///x".to_string(), 2).unwrap();
+        waits.register(id("b"), "file:///x".to_string(), 3).unwrap();
+        waits.register(id("c"), "file:///y".to_string(), 4).unwrap();
 
         assert_eq!(waits.cancel(&id("b")), Some(id("b")));
         assert_eq!(waits.cancel(&id("missing")), None);

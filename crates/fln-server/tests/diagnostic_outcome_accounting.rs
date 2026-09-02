@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::BufReader;
 
 use fln_server::dispatch::{ServerOutcome, serve};

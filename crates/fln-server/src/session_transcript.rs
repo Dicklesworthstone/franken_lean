@@ -88,9 +88,7 @@ fn document_event(method: &str, params: RawField<'_>) -> Result<Option<DocumentE
                     return Err("didOpen requires complete textDocument.text".to_string());
                 }
                 DecodedField::Invalid => {
-                    return Err(
-                        "didOpen textDocument.text is malformed or ambiguous".to_string(),
-                    );
+                    return Err("didOpen textDocument.text is malformed or ambiguous".to_string());
                 }
             }
             Ok(Some(DocumentEvent::Open { uri, version }))
@@ -133,9 +131,7 @@ fn document_event(method: &str, params: RawField<'_>) -> Result<Option<DocumentE
             let uri = decoded_uri(direct_uri(params), "waitForDiagnostics uri")?;
             let version = decoded_version(direct_version(params), "waitForDiagnostics version")?;
             if version < 0 {
-                return Err(
-                    "waitForDiagnostics version must be a nonnegative integer".to_string(),
-                );
+                return Err("waitForDiagnostics version must be a nonnegative integer".to_string());
             }
             Ok(Some(DocumentEvent::Wait { uri, version }))
         }
@@ -660,7 +656,8 @@ mod tests {
 
     #[test]
     fn unknown_and_duplicate_cancellations_are_refused_without_duplicate_id_storage() {
-        let unknown = session(&[r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#]);
+        let unknown =
+            session(&[r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#]);
         assert!(
             validate_client_session_bytes(&unknown)
                 .unwrap_err()
@@ -727,7 +724,9 @@ mod tests {
                 "duplicates already-open",
             ),
             (
-                session(&[r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///A","version":2},"contentChanges":[{"text":"b"}]}}"#]),
+                session(&[
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///A","version":2},"contentChanges":[{"text":"b"}]}}"#,
+                ]),
                 "targets unopened document",
             ),
             (
@@ -738,11 +737,15 @@ mod tests {
                 "is not newer",
             ),
             (
-                session(&[r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///A"}}}"#]),
+                session(&[
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///A"}}}"#,
+                ]),
                 "targets unopened document",
             ),
             (
-                session(&[r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A"}}}"#]),
+                session(&[
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A"}}}"#,
+                ]),
                 "targets unopened document",
             ),
         ];
@@ -756,11 +759,15 @@ mod tests {
     fn refuses_malformed_document_payloads_after_lifecycle_validation() {
         let cases = [
             (
-                session(&[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1}}}"#]),
+                session(&[
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1}}}"#,
+                ]),
                 "requires complete textDocument.text",
             ),
             (
-                session(&[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"","version":1,"text":"a"}}}"#]),
+                session(&[
+                    r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"","version":1,"text":"a"}}}"#,
+                ]),
                 "must not be empty",
             ),
             (
@@ -793,7 +800,9 @@ mod tests {
         assert_eq!(stats.covered_version_waits, 1);
         assert_eq!(stats.future_version_waits, 1);
 
-        let invalid = session(&[r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":1}}"#]);
+        let invalid = session(&[
+            r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A","version":1}}"#,
+        ]);
         assert!(
             validate_client_session_bytes(&invalid)
                 .unwrap_err()
@@ -809,9 +818,7 @@ mod tests {
                 1,
                 &RequestIdField::Absent,
                 "textDocument/didOpen",
-                RawField::Value(
-                    r#"{"textDocument":{"uri":"four","version":1,"text":"source"}}"#,
-                ),
+                RawField::Value(r#"{"textDocument":{"uri":"four","version":1,"text":"source"}}"#),
             )
             .unwrap_err();
         assert!(error.contains("3-byte open-document URI ceiling"));
@@ -823,9 +830,7 @@ mod tests {
                 2,
                 &RequestIdField::Absent,
                 "textDocument/didOpen",
-                RawField::Value(
-                    r#"{"textDocument":{"uri":"ok","version":1,"text":"source"}}"#,
-                ),
+                RawField::Value(r#"{"textDocument":{"uri":"ok","version":1,"text":"source"}}"#),
             )
             .unwrap();
         assert_eq!(validator.documents.len(), 1);
@@ -834,7 +839,9 @@ mod tests {
 
     #[test]
     fn shutdown_may_leave_documents_open_but_receipt_discloses_them() {
-        let bytes = session(&[r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1,"text":"a"}}}"#]);
+        let bytes = session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1,"text":"a"}}}"#,
+        ]);
         let stats = validate_client_session_bytes(&bytes).unwrap();
         assert_eq!(stats.final_open_documents, 1);
         assert_eq!(stats.final_open_uri_bytes, 9);
