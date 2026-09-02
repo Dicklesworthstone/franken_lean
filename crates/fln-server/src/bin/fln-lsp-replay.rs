@@ -10,25 +10,35 @@ pub use fln_server::{json_string, transport};
 
 #[path = "../json.rs"]
 mod json;
+#[path = "../session_transcript.rs"]
+mod session_transcript;
 #[path = "../transcript.rs"]
 pub mod transcript;
 
 const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_REPLAY_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-const USAGE: &str = "Usage: fln-lsp-replay [--client-lifecycle] [--expect PATH] [--output PATH] [--] INPUT\n\
+const USAGE: &str = "Usage: fln-lsp-replay [--client-lifecycle | --client-session] [--expect PATH] [--output PATH] [--] INPUT\n\
 \n\
 Replay one exact Content-Length-framed LSP client stream through FrankenLean.\n\
---client-lifecycle validates known method roles and a complete client handshake\n\
-before server execution, comparison, or output publication.\n\
+--client-lifecycle validates known method roles and a complete client handshake.\n\
+--client-session additionally validates Full-sync document/version semantics.\n\
+Both strict modes run before server execution, comparison, or output publication.\n\
 --expect compares the complete server stream byte-for-byte.\n\
 --output writes the actual server stream with create-new semantics.\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientPreflight {
+    None,
+    Lifecycle,
+    Session,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
     input: PathBuf,
     expect: Option<PathBuf>,
     output: Option<PathBuf>,
-    client_lifecycle: bool,
+    preflight: ClientPreflight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +97,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     let mut expect = None;
     let mut output = None;
     let mut input = None;
-    let mut client_lifecycle = false;
+    let mut preflight = ClientPreflight::None;
+    let mut strict_mode_seen = false;
     let mut options = true;
 
     while let Some(argument) = arguments.next() {
@@ -96,7 +107,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
             continue;
         }
         if options && matches!(argument.to_str(), Some("-h" | "--help")) {
-            if client_lifecycle
+            if strict_mode_seen
                 || expect.is_some()
                 || output.is_some()
                 || input.is_some()
@@ -106,11 +117,24 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
             }
             return Ok(Command::Help);
         }
-        if options && argument == "--client-lifecycle" {
-            if client_lifecycle {
-                return Err("--client-lifecycle may be supplied at most once".to_string());
+        if options
+            && matches!(
+                argument.to_str(),
+                Some("--client-lifecycle" | "--client-session")
+            )
+        {
+            if strict_mode_seen {
+                return Err(
+                    "--client-lifecycle and --client-session are mutually exclusive and may be supplied at most once"
+                        .to_string(),
+                );
             }
-            client_lifecycle = true;
+            strict_mode_seen = true;
+            preflight = if argument == "--client-session" {
+                ClientPreflight::Session
+            } else {
+                ClientPreflight::Lifecycle
+            };
             continue;
         }
         if options && argument == "--expect" {
@@ -159,7 +183,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
         input,
         expect,
         output,
-        client_lifecycle,
+        preflight,
     }))
 }
 
@@ -192,13 +216,16 @@ fn read_bounded(path: &Path, label: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn validate_client_transcript(input: &[u8], client_lifecycle: bool) -> Result<(), String> {
-    if !client_lifecycle {
-        return Ok(());
+fn validate_client_transcript(input: &[u8], preflight: ClientPreflight) -> Result<(), String> {
+    match preflight {
+        ClientPreflight::None => Ok(()),
+        ClientPreflight::Lifecycle => transcript::validate_client_lifecycle_bytes(input)
+            .map(|_| ())
+            .map_err(|error| format!("client lifecycle validation failed: {error}")),
+        ClientPreflight::Session => session_transcript::validate_client_session_bytes(input)
+            .map(|_| ())
+            .map_err(|error| format!("client session validation failed: {error}")),
     }
-    transcript::validate_client_lifecycle_bytes(input)
-        .map(|_| ())
-        .map_err(|error| format!("client lifecycle validation failed: {error}"))
 }
 
 fn replay_with_output_limit(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>, String> {
@@ -272,7 +299,7 @@ fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<(), String> {
 
 fn execute(config: &Config) -> Result<(), String> {
     let input = read_bounded(&config.input, "input transcript")?;
-    validate_client_transcript(&input, config.client_lifecycle)?;
+    validate_client_transcript(&input, config.preflight)?;
     let actual = replay(&input)?;
     let mismatch = if let Some(expected_path) = config.expect.as_deref() {
         let expected = read_bounded(expected_path, "expected transcript")?;
@@ -323,17 +350,21 @@ mod tests {
         framed
     }
 
-    fn clean_session() -> Vec<u8> {
+    fn framed(bodies: &[&str]) -> Vec<u8> {
         let mut input = Vec::new();
-        for body in [
+        for body in bodies {
+            input.extend(frame(body));
+        }
+        input
+    }
+
+    fn clean_session() -> Vec<u8> {
+        framed(&[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
             r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
-        ] {
-            input.extend(frame(body));
-        }
-        input
+        ])
     }
 
     #[test]
@@ -344,7 +375,7 @@ mod tests {
                 input: PathBuf::from("--client.frames"),
                 expect: None,
                 output: None,
-                client_lifecycle: false,
+                preflight: ClientPreflight::None,
             }))
         );
         assert_eq!(
@@ -356,7 +387,19 @@ mod tests {
                 input: PathBuf::from("input.frames"),
                 expect: None,
                 output: None,
-                client_lifecycle: true,
+                preflight: ClientPreflight::Lifecycle,
+            }))
+        );
+        assert_eq!(
+            parse_args(
+                ["fln-lsp-replay", "--client-session", "input.frames"]
+                    .map(OsString::from)
+            ),
+            Ok(Command::Replay(Config {
+                input: PathBuf::from("input.frames"),
+                expect: None,
+                output: None,
+                preflight: ClientPreflight::Session,
             }))
         );
         for arguments in [
@@ -368,6 +411,18 @@ mod tests {
                 "fln-lsp-replay",
                 "--client-lifecycle",
                 "--client-lifecycle",
+                "c",
+            ],
+            vec![
+                "fln-lsp-replay",
+                "--client-session",
+                "--client-session",
+                "c",
+            ],
+            vec![
+                "fln-lsp-replay",
+                "--client-lifecycle",
+                "--client-session",
                 "c",
             ],
             vec!["fln-lsp-replay", "--unknown", "c"],
@@ -395,25 +450,41 @@ mod tests {
         let first = replay(&input).unwrap();
         let second = replay(&input).unwrap();
         assert_eq!(first, second);
-        assert!(first.windows(b"FrankenLean".len()).any(|window| window == b"FrankenLean"));
-        assert!(validate_client_transcript(&input, true).is_ok());
+        assert!(
+            first
+                .windows(b"FrankenLean".len())
+                .any(|window| window == b"FrankenLean")
+        );
+        assert!(validate_client_transcript(&input, ClientPreflight::Lifecycle).is_ok());
+        assert!(validate_client_transcript(&input, ClientPreflight::Session).is_ok());
     }
 
     #[test]
-    fn strict_preflight_rejects_role_inversion_but_default_replay_remains_available() {
-        let mut input = Vec::new();
-        for body in [
+    fn lifecycle_preflight_rejects_role_inversion_but_default_replay_remains_available() {
+        let input = framed(&[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
             r#"{"jsonrpc":"2.0","id":"bad-open","method":"textDocument/didOpen","params":{}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
             r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
-        ] {
-            input.extend(frame(body));
-        }
+        ]);
         assert!(replay(&input).is_ok());
-        let error = validate_client_transcript(&input, true).unwrap_err();
+        let error = validate_client_transcript(&input, ClientPreflight::Lifecycle).unwrap_err();
         assert!(error.contains("notification-only method"), "{error}");
+    }
+
+    #[test]
+    fn session_preflight_rejects_document_state_that_lifecycle_mode_allows() {
+        let input = framed(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///A","version":2},"contentChanges":[{"text":"source"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        assert!(validate_client_transcript(&input, ClientPreflight::Lifecycle).is_ok());
+        let error = validate_client_transcript(&input, ClientPreflight::Session).unwrap_err();
+        assert!(error.contains("targets unopened document"), "{error}");
     }
 
     #[test]
