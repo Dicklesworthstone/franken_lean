@@ -11,19 +11,50 @@
 
 use std::io::{self, BufRead, Write};
 
-/// Maximum message size the transport will accept or emit (64 MiB). This is a
-/// transport-level safety ceiling, not a semantic limit.
-const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum bytes accepted before the blank line terminating one header block.
-const MAX_HEADER_BYTES: usize = 16 * 1024;
-/// Maximum number of non-empty header fields accepted for one message.
-const MAX_HEADER_FIELDS: usize = 64;
+/// Resource ceilings for one framed LSP message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportLimits {
+    pub max_message_bytes: usize,
+    pub max_header_bytes: usize,
+    pub max_header_fields: usize,
+}
+
+impl TransportLimits {
+    /// FrankenLean's normal stdio LSP limits.
+    pub const LSP_DEFAULT: Self = Self {
+        max_message_bytes: 64 * 1024 * 1024,
+        max_header_bytes: 16 * 1024,
+        max_header_fields: 64,
+    };
+
+    pub const fn new(
+        max_message_bytes: usize,
+        max_header_bytes: usize,
+        max_header_fields: usize,
+    ) -> Self {
+        Self {
+            max_message_bytes,
+            max_header_bytes,
+            max_header_fields,
+        }
+    }
+}
+
+impl Default for TransportLimits {
+    fn default() -> Self {
+        Self::LSP_DEFAULT
+    }
+}
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn read_header_line(input: &mut dyn BufRead, byte_budget: usize) -> io::Result<Option<Vec<u8>>> {
+fn read_header_line(
+    input: &mut dyn BufRead,
+    byte_budget: usize,
+    max_header_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
         let (consumed, terminated) = {
@@ -47,7 +78,7 @@ fn read_header_line(input: &mut dyn BufRead, byte_budget: usize) -> io::Result<O
                 .ok_or_else(|| invalid_data("LSP header length overflow"))?;
             if next_len > byte_budget {
                 return Err(invalid_data(format!(
-                    "LSP header block exceeds {MAX_HEADER_BYTES} bytes"
+                    "LSP header block exceeds {max_header_bytes} bytes"
                 )));
             }
             line.extend_from_slice(&available[..consumed]);
@@ -187,21 +218,25 @@ fn validate_content_type(value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Read one Content-Length-framed LSP message from `input`.
+/// Read one Content-Length-framed LSP message with caller-selected ceilings.
 ///
 /// Returns `Ok(None)` only on clean EOF before a new header block begins.
 /// Partial, ambiguous, oversized, or malformed header blocks fail closed.
-pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
+pub fn read_message_with_limits(
+    input: &mut dyn BufRead,
+    limits: TransportLimits,
+) -> io::Result<Option<Vec<u8>>> {
     let mut content_length: Option<usize> = None;
     let mut content_type_seen = false;
     let mut header_bytes = 0usize;
     let mut header_fields = 0usize;
 
     loop {
-        let remaining = MAX_HEADER_BYTES
+        let remaining = limits
+            .max_header_bytes
             .checked_sub(header_bytes)
             .ok_or_else(|| invalid_data("LSP header byte accounting overflow"))?;
-        let Some(line) = read_header_line(input, remaining)? else {
+        let Some(line) = read_header_line(input, remaining, limits.max_header_bytes)? else {
             if header_bytes == 0 {
                 return Ok(None);
             }
@@ -220,9 +255,10 @@ pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
         header_fields = header_fields
             .checked_add(1)
             .ok_or_else(|| invalid_data("LSP header field accounting overflow"))?;
-        if header_fields > MAX_HEADER_FIELDS {
+        if header_fields > limits.max_header_fields {
             return Err(invalid_data(format!(
-                "LSP header block exceeds {MAX_HEADER_FIELDS} fields"
+                "LSP header block exceeds {} fields",
+                limits.max_header_fields
             )));
         }
         if !line.is_ascii()
@@ -257,13 +293,13 @@ pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
             validate_content_type(value)?;
             content_type_seen = true;
         }
-        // Syntactically valid extension headers are ignored for forward compatibility.
     }
 
     let length = content_length.ok_or_else(|| invalid_data("missing Content-Length header"))?;
-    if length > MAX_MESSAGE_BYTES {
+    if length > limits.max_message_bytes {
         return Err(invalid_data(format!(
-            "Content-Length {length} exceeds transport ceiling {MAX_MESSAGE_BYTES}"
+            "Content-Length {length} exceeds transport ceiling {}",
+            limits.max_message_bytes
         )));
     }
     let mut body = vec![0u8; length];
@@ -271,15 +307,24 @@ pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-fn write_message_with_limit(
+/// Read one Content-Length-framed LSP message using FrankenLean's defaults.
+pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
+    read_message_with_limits(input, TransportLimits::LSP_DEFAULT)
+}
+
+/// Write one Content-Length-framed LSP message with caller-selected ceilings.
+///
+/// Oversized messages are refused before any framing bytes are written.
+pub fn write_message_with_limits(
     output: &mut dyn Write,
     body: &[u8],
-    max_message_bytes: usize,
+    limits: TransportLimits,
 ) -> io::Result<()> {
-    if body.len() > max_message_bytes {
+    if body.len() > limits.max_message_bytes {
         return Err(invalid_data(format!(
-            "message length {} exceeds transport ceiling {max_message_bytes}",
-            body.len()
+            "message length {} exceeds transport ceiling {}",
+            body.len(),
+            limits.max_message_bytes
         )));
     }
     write!(output, "Content-Length: {}\r\n\r\n", body.len())?;
@@ -287,11 +332,9 @@ fn write_message_with_limit(
     output.flush()
 }
 
-/// Write one Content-Length-framed LSP message to `output`.
-///
-/// Oversized messages are refused before any framing bytes are written.
+/// Write one Content-Length-framed LSP message using FrankenLean's defaults.
 pub fn write_message(output: &mut dyn Write, body: &[u8]) -> io::Result<()> {
-    write_message_with_limit(output, body, MAX_MESSAGE_BYTES)
+    write_message_with_limits(output, body, TransportLimits::LSP_DEFAULT)
 }
 
 #[cfg(test)]
@@ -427,17 +470,43 @@ mod tests {
     }
 
     #[test]
-    fn message_size_ceiling_is_checked_before_allocation() {
-        let raw = format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE_BYTES + 1);
-        let error = read(raw.as_bytes()).unwrap_err();
+    fn custom_limits_are_enforced_before_body_allocation_or_output() {
+        let limits = TransportLimits::new(2, 64, 2);
+        let mut input = BufReader::new(b"Content-Length: 3\r\n\r\nabc".as_slice());
+        let error = read_message_with_limits(&mut input, limits).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("transport ceiling"));
+        assert!(error.to_string().contains("transport ceiling 2"));
+
+        let mut output = Vec::new();
+        let error = write_message_with_limits(&mut output, b"abc", limits).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn custom_header_byte_and_field_limits_are_enforced() {
+        let mut input = BufReader::new(b"Content-Length: 0\r\n\r\n".as_slice());
+        let error = read_message_with_limits(&mut input, TransportLimits::new(8, 8, 8))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 8 bytes"));
+
+        let mut input = BufReader::new(b"X-One: yes\r\nContent-Length: 0\r\n\r\n".as_slice());
+        let error = read_message_with_limits(&mut input, TransportLimits::new(8, 128, 1))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 1 fields"));
     }
 
     #[test]
     fn writer_refuses_oversized_message_before_writing() {
         let mut output = Vec::new();
-        let error = write_message_with_limit(&mut output, b"abc", 2).unwrap_err();
+        let error = write_message_with_limits(
+            &mut output,
+            b"abc",
+            TransportLimits::new(2, 1, 1),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("transport ceiling"));
         assert!(output.is_empty());
@@ -445,8 +514,9 @@ mod tests {
 
     #[test]
     fn header_byte_and_field_budgets_fail_closed() {
+        let limits = TransportLimits::LSP_DEFAULT;
         let mut oversized = b"X-Test: ".to_vec();
-        oversized.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES));
+        oversized.extend(std::iter::repeat_n(b'a', limits.max_header_bytes));
         oversized.extend_from_slice(b"\r\n\r\n");
         assert_eq!(
             read(&oversized).unwrap_err().kind(),
@@ -454,7 +524,7 @@ mod tests {
         );
 
         let mut too_many = Vec::new();
-        for index in 0..MAX_HEADER_FIELDS {
+        for index in 0..limits.max_header_fields {
             too_many.extend_from_slice(format!("X-{index}: ok\r\n").as_bytes());
         }
         too_many.extend_from_slice(b"Content-Length: 0\r\n\r\n");
