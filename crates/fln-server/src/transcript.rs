@@ -1,7 +1,12 @@
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{self, BufRead, BufReader, Cursor, Read};
 
 use crate::json::{DecodedField, EnvelopeError, RawField, RequestIdField};
 
+/// Maximum aggregate bytes consumed from one complete framed transcript.
+///
+/// This covers extension headers, Content-Length framing, separators, and JSON
+/// bodies. Counting bodies alone would let many legal per-frame headers evade
+/// the aggregate resource ceiling.
 pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_TRANSCRIPT_FRAMES: u64 = 1_000_000;
 
@@ -11,6 +16,55 @@ pub struct TranscriptStats {
     pub requests: u64,
     pub notifications: u64,
     pub body_bytes: u64,
+}
+
+struct CountingBufRead<'a> {
+    inner: &'a mut dyn BufRead,
+    wire_bytes: u64,
+    overflowed: bool,
+}
+
+impl<'a> CountingBufRead<'a> {
+    fn new(inner: &'a mut dyn BufRead) -> Self {
+        Self {
+            inner,
+            wire_bytes: 0,
+            overflowed: false,
+        }
+    }
+
+    fn record(&mut self, amount: usize) {
+        let Ok(amount) = u64::try_from(amount) else {
+            self.overflowed = true;
+            self.wire_bytes = u64::MAX;
+            return;
+        };
+        let Some(next) = self.wire_bytes.checked_add(amount) else {
+            self.overflowed = true;
+            self.wire_bytes = u64::MAX;
+            return;
+        };
+        self.wire_bytes = next;
+    }
+}
+
+impl Read for CountingBufRead<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let amount = self.inner.read(buffer)?;
+        self.record(amount);
+        Ok(amount)
+    }
+}
+
+impl BufRead for CountingBufRead<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+        self.record(amount);
+    }
 }
 
 fn validate_envelope(body: &[u8], frame: u64) -> Result<bool, String> {
@@ -57,32 +111,41 @@ fn validate_envelope(body: &[u8], frame: u64) -> Result<bool, String> {
     }
 }
 
-pub fn validate_reader(input: &mut dyn BufRead) -> Result<TranscriptStats, String> {
+fn validate_reader_with_limits(
+    input: &mut dyn BufRead,
+    max_wire_bytes: u64,
+    max_frames: u64,
+) -> Result<TranscriptStats, String> {
+    let mut input = CountingBufRead::new(input);
     let mut stats = TranscriptStats::default();
     loop {
-        let Some(body) = crate::transport::read_message(input)
-            .map_err(|error| format!("frame {} transport failure: {error}", stats.frames + 1))?
-        else {
-            break;
-        };
-        stats.frames = stats
+        let frame = stats
             .frames
             .checked_add(1)
             .ok_or_else(|| "frame count overflow".to_string())?;
-        if stats.frames > MAX_TRANSCRIPT_FRAMES {
+        let Some(body) = crate::transport::read_message(&mut input)
+            .map_err(|error| format!("frame {frame} transport failure: {error}"))?
+        else {
+            break;
+        };
+        if frame > max_frames {
             return Err(format!(
-                "transcript exceeds the {MAX_TRANSCRIPT_FRAMES}-frame ceiling"
+                "transcript exceeds the {max_frames}-frame ceiling"
             ));
         }
+        if input.overflowed {
+            return Err("transcript wire-byte accounting overflow".to_string());
+        }
+        if input.wire_bytes > max_wire_bytes {
+            return Err(format!(
+                "transcript wire bytes exceed the {max_wire_bytes}-byte aggregate ceiling while reading frame {frame}"
+            ));
+        }
+        stats.frames = frame;
         stats.body_bytes = stats
             .body_bytes
             .checked_add(u64::try_from(body.len()).unwrap_or(u64::MAX))
-            .ok_or_else(|| "transcript byte accounting overflow".to_string())?;
-        if stats.body_bytes > MAX_TRANSCRIPT_BYTES {
-            return Err(format!(
-                "transcript bodies exceed the {MAX_TRANSCRIPT_BYTES}-byte aggregate ceiling"
-            ));
-        }
+            .ok_or_else(|| "transcript body-byte accounting overflow".to_string())?;
         if validate_envelope(&body, stats.frames)? {
             stats.requests = stats
                 .requests
@@ -96,6 +159,10 @@ pub fn validate_reader(input: &mut dyn BufRead) -> Result<TranscriptStats, Strin
         }
     }
     Ok(stats)
+}
+
+pub fn validate_reader(input: &mut dyn BufRead) -> Result<TranscriptStats, String> {
+    validate_reader_with_limits(input, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_FRAMES)
 }
 
 pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptStats, String> {
@@ -121,6 +188,16 @@ mod tests {
         let mut framed = Vec::new();
         crate::transport::write_message(&mut framed, body.as_bytes()).unwrap();
         framed
+    }
+
+    fn frame_with_extension(body: &str, padding: usize) -> Vec<u8> {
+        format!(
+            "X-Padding: {}\r\nContent-Length: {}\r\n\r\n{}",
+            "x".repeat(padding),
+            body.len(),
+            body
+        )
+        .into_bytes()
     }
 
     #[test]
@@ -168,5 +245,32 @@ mod tests {
             assert!(error.contains("frame 1"));
             assert!(error.contains(reason), "{error}");
         }
+    }
+
+    #[test]
+    fn aggregate_limit_counts_extension_headers_and_framing() {
+        let body = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
+        let one = frame_with_extension(body, 64);
+        let one_len = u64::try_from(one.len()).unwrap();
+        let mut transcript = one.clone();
+        transcript.extend_from_slice(&one);
+
+        let error = validate_reader_with_limits(
+            &mut BufReader::new(Cursor::new(transcript)),
+            one_len + 1,
+            10,
+        )
+        .unwrap_err();
+        assert!(error.contains("wire bytes"));
+        assert!(error.contains("frame 2"));
+
+        let stats = validate_reader_with_limits(
+            &mut BufReader::new(Cursor::new(one)),
+            one_len,
+            10,
+        )
+        .unwrap();
+        assert_eq!(stats.frames, 1);
+        assert_eq!(stats.body_bytes, u64::try_from(body.len()).unwrap());
     }
 }
