@@ -6,14 +6,15 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-pub use fln_server::json_string;
+pub use fln_server::{json_string, transport};
 
 #[path = "../json.rs"]
 mod json;
+#[path = "../transcript.rs"]
+pub mod transcript;
 
-const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-const DEFAULT_MAX_FRAMES: u64 = 1_000_000;
+const DEFAULT_MAX_FRAMES: u64 = transcript::MAX_TRANSCRIPT_FRAMES;
 const USAGE: &str = "Usage: fln-lsp-inspect [--max-frames N] [--] INPUT\n\
 \n\
 Inspect one exact Content-Length-framed JSON-RPC transcript as NDJSON.\n\
@@ -93,81 +94,29 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     }))
 }
 
-fn inspect_body(body: &[u8], index: u64) -> Result<String, String> {
-    let text = std::str::from_utf8(body)
-        .map_err(|_| format!("frame {index} body is not valid UTF-8"))?;
-    let envelope = json::parse_envelope(text).map_err(|error| match error {
-        json::EnvelopeError::MalformedJson => format!("frame {index} contains malformed JSON"),
-        json::EnvelopeError::NotObject => format!("frame {index} is not a JSON-RPC object"),
-    })?;
-    match envelope.jsonrpc {
-        json::DecodedField::Valid(version) if version == "2.0" => {}
-        json::DecodedField::Missing => {
-            return Err(format!("frame {index} is missing jsonrpc=2.0"));
-        }
-        json::DecodedField::Valid(version) => {
-            return Err(format!(
-                "frame {index} has unsupported JSON-RPC version {version:?}"
-            ));
-        }
-        json::DecodedField::Invalid => {
-            return Err(format!("frame {index} has a non-string jsonrpc field"));
-        }
-    }
-    let method = match envelope.method {
-        json::DecodedField::Valid(method) => method,
-        json::DecodedField::Missing => return Err(format!("frame {index} is missing a method")),
-        json::DecodedField::Invalid => {
-            return Err(format!("frame {index} has a non-string method"));
-        }
+fn render_frame(frame: &transcript::TranscriptFrame) -> String {
+    let role = match frame.role {
+        transcript::TranscriptRole::Request => "request",
+        transcript::TranscriptRole::Notification => "notification",
     };
-    let (role, id) = match envelope.id {
-        json::RequestIdField::Absent => ("notification", "null".to_string()),
-        json::RequestIdField::Valid(id) => ("request", id.as_json()),
-        json::RequestIdField::Invalid => {
-            return Err(format!("frame {index} has an invalid request id"));
-        }
-    };
-    Ok(format!(
+    let id = frame.id_json.as_deref().unwrap_or("null");
+    format!(
         concat!(
             "{{\"schema\":\"fln.lsp-frame/1\",\"index\":{},",
             "\"role\":{},\"method\":{},\"id\":{},\"bodyBytes\":{}}}\n"
         ),
-        index,
+        frame.index,
         json_string(role),
-        json_string(&method),
+        json_string(&frame.method),
         id,
-        body.len()
-    ))
+        frame.body_bytes
+    )
 }
 
 fn inspect_reader(input: &mut dyn BufRead, max_frames: u64) -> Result<String, String> {
     let mut output = String::new();
-    let mut frames = 0u64;
-    let mut body_bytes = 0u64;
-    loop {
-        let Some(body) = fln_server::transport::read_message(input)
-            .map_err(|error| format!("frame {} transport failure: {error}", frames + 1))?
-        else {
-            break;
-        };
-        frames = frames
-            .checked_add(1)
-            .ok_or_else(|| "frame count overflow".to_string())?;
-        if frames > max_frames {
-            return Err(format!(
-                "transcript exceeds the selected {max_frames}-frame ceiling"
-            ));
-        }
-        body_bytes = body_bytes
-            .checked_add(u64::try_from(body.len()).unwrap_or(u64::MAX))
-            .ok_or_else(|| "input byte accounting overflow".to_string())?;
-        if body_bytes > MAX_INPUT_BYTES {
-            return Err(format!(
-                "transcript bodies exceed the {MAX_INPUT_BYTES}-byte aggregate ceiling"
-            ));
-        }
-        let row = inspect_body(&body, frames)?;
+    transcript::visit_reader(input, max_frames, |frame| {
+        let row = render_frame(frame);
         let next_len = output
             .len()
             .checked_add(row.len())
@@ -178,7 +127,8 @@ fn inspect_reader(input: &mut dyn BufRead, max_frames: u64) -> Result<String, St
             ));
         }
         output.push_str(&row);
-    }
+        Ok(())
+    })?;
     Ok(output)
 }
 
@@ -189,11 +139,12 @@ fn inspect_path(config: &Config) -> Result<String, String> {
     }
     let metadata = std::fs::metadata(&config.input)
         .map_err(|error| format!("could not inspect {}: {error}", config.input.display()))?;
-    if metadata.len() > MAX_INPUT_BYTES {
+    if metadata.len() > transcript::MAX_TRANSCRIPT_BYTES {
         return Err(format!(
-            "{} is {} bytes; the input ceiling is {MAX_INPUT_BYTES}",
+            "{} is {} bytes; the input ceiling is {}",
             config.input.display(),
-            metadata.len()
+            metadata.len(),
+            transcript::MAX_TRANSCRIPT_BYTES
         ));
     }
     let file = File::open(&config.input)
@@ -260,16 +211,20 @@ mod tests {
 
     #[test]
     fn notification_and_null_id_request_are_distinct() {
-        let notification = inspect_body(
-            br#"{"jsonrpc":"2.0","method":"initialized"}"#,
-            1,
-        )
-        .unwrap();
-        let request = inspect_body(
-            br#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#,
-            2,
-        )
-        .unwrap();
+        let notification = render_frame(
+            &transcript::validate_frame(
+                br#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+                1,
+            )
+            .unwrap(),
+        );
+        let request = render_frame(
+            &transcript::validate_frame(
+                br#"{"jsonrpc":"2.0","id":null,"method":"shutdown","params":null}"#,
+                2,
+            )
+            .unwrap(),
+        );
         assert!(notification.contains("\"role\":\"notification\""));
         assert!(request.contains("\"role\":\"request\""));
         assert!(request.contains("\"id\":null"));
@@ -292,6 +247,18 @@ mod tests {
                 .unwrap_err()
                 .contains("1-frame ceiling")
         );
+    }
+
+    #[test]
+    fn invalid_scalar_params_follow_shared_validation() {
+        let error = inspect_reader(
+            &mut BufReader::new(Cursor::new(frame(
+                r#"{"jsonrpc":"2.0","method":"initialized","params":null}"#,
+            ))),
+            10,
+        )
+        .unwrap_err();
+        assert!(error.contains("only shutdown/exit may use null"));
     }
 
     #[test]
