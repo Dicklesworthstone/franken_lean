@@ -1,3 +1,5 @@
+use fln_core::diag::DIAGNOSTIC_PROJECTION_SCHEMA;
+
 use crate::json_string;
 
 const MAX_JSON_NESTING: usize = 256;
@@ -604,8 +606,29 @@ pub(super) fn direct_version(params: RawField<'_>) -> VersionField {
     decoded_integer_field(params_object(params), "version")
 }
 
+/// Validate the canonical diagnostic-outcome tuple and return its authority.
+///
+/// This intentionally does more than read a boolean: the schema, outcome kind,
+/// and authority bit are one typed contract. Unknown schemas, missing fields,
+/// duplicate decoded keys, and contradictory outcome/authority pairs are invalid.
 pub(super) fn direct_authority(params: RawField<'_>) -> BooleanField {
-    decoded_boolean_field(params_object(params), "authority")
+    let params = params_object(params);
+    let schema = decoded_string_field(params, "schema");
+    let outcome = decoded_string_field(params, "outcome");
+    let authority = decoded_boolean_field(params, "authority");
+    match (schema, outcome, authority) {
+        (
+            DecodedField::Valid(schema),
+            DecodedField::Valid(outcome),
+            BooleanField::Valid(authority),
+        ) if schema == DIAGNOSTIC_PROJECTION_SCHEMA => match (outcome.as_str(), authority) {
+            ("complete", true)
+            | ("inconclusive", false)
+            | ("internal_fault", false) => BooleanField::Valid(authority),
+            _ => BooleanField::Invalid,
+        },
+        _ => BooleanField::Invalid,
+    }
 }
 
 pub(super) fn direct_request_id(params: RawField<'_>) -> RequestIdField {
@@ -734,7 +757,7 @@ mod tests {
     #[test]
     fn direct_params_fields_are_exact_and_ambiguity_safe() {
         let params = RawField::Value(
-            r#"{"uri":"file:///x","version":3,"id":"wait","authority":true}"#,
+            r#"{"uri":"file:///x","version":3,"id":"wait","schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true}"#,
         );
         assert_eq!(
             direct_uri(params),
@@ -748,7 +771,7 @@ mod tests {
         );
 
         let duplicate = RawField::Value(
-            r#"{"uri":"a","uri":"b","version":1,"id":1,"id":2,"authority":true,"\u0061uthority":false}"#,
+            r#"{"uri":"a","uri":"b","version":1,"id":1,"id":2,"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"\u0061uthority":false}"#,
         );
         assert_eq!(direct_uri(duplicate), DecodedField::Invalid);
         assert_eq!(direct_request_id(duplicate), RequestIdField::Invalid);
@@ -756,22 +779,41 @@ mod tests {
     }
 
     #[test]
-    fn direct_authority_is_a_top_level_unambiguous_boolean() {
-        assert_eq!(
-            direct_authority(RawField::Value(
-                r#"{"authority":false,"detail":{"authority":true},"message":"\"authority\":true"}"#,
-            )),
-            BooleanField::Valid(false)
-        );
-        assert_eq!(
-            direct_authority(RawField::Value(r#"{"authority":"true"}"#)),
-            BooleanField::Invalid
-        );
-        assert_eq!(
-            direct_authority(RawField::Value(r#"{"detail":{"authority":true}}"#)),
-            BooleanField::Missing
-        );
-        assert_eq!(direct_authority(RawField::Missing), BooleanField::Missing);
+    fn diagnostic_outcome_tuple_is_structural_and_coherent() {
+        for (params, expected) in [
+            (
+                r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true}"#,
+                BooleanField::Valid(true),
+            ),
+            (
+                r#"{"schema":"fln.diagnostic-projection/1","outcome":"inconclusive","authority":false,"detail":{"authority":true,"outcome":"complete"}}"#,
+                BooleanField::Valid(false),
+            ),
+            (
+                r#"{"schema":"fln.diagnostic-projection/1","outcome":"internal_fault","authority":false,"message":"\"authority\":true"}"#,
+                BooleanField::Valid(false),
+            ),
+        ] {
+            assert_eq!(direct_authority(RawField::Value(params)), expected);
+        }
+
+        for params in [
+            r#"{"schema":"wrong","outcome":"complete","authority":true}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"inconclusive","authority":true}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":false}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"future","authority":true}"#,
+            r#"{"outcome":"complete","authority":true}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","authority":true}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":"true"}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"\u0061uthority":false}"#,
+        ] {
+            assert_eq!(
+                direct_authority(RawField::Value(params)),
+                BooleanField::Invalid,
+                "accepted incoherent diagnostic outcome: {params}"
+            );
+        }
+        assert_eq!(direct_authority(RawField::Missing), BooleanField::Invalid);
         assert_eq!(direct_authority(RawField::Invalid), BooleanField::Invalid);
     }
 
