@@ -10,6 +10,7 @@ struct OutcomeFields {
     schema: Option<String>,
     outcome: Option<String>,
     authority: Option<bool>,
+    diagnostic_count: Option<u64>,
 }
 
 fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
@@ -156,6 +157,17 @@ fn decode_json_string(value: &str) -> Option<String> {
     }
 }
 
+fn decode_json_u64(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn set_once<T>(slot: &mut Option<T>, value: T) -> Option<()> {
     if slot.is_some() {
         return None;
@@ -199,6 +211,9 @@ fn parse_fields(value: &str) -> Option<OutcomeFields> {
                     };
                     set_once(&mut fields.authority, authority)?;
                 }
+                "diagnosticCount" => {
+                    set_once(&mut fields.diagnostic_count, decode_json_u64(raw_value)?)?;
+                }
                 _ => {}
             }
             index = skip_ws(bytes, value_end);
@@ -230,9 +245,15 @@ pub(super) fn diagnostic_outcome_completion(
     if fields.schema.as_deref()? != DIAGNOSTIC_PROJECTION_SCHEMA {
         return None;
     }
-    match (fields.outcome.as_deref()?, fields.authority?) {
-        ("complete", true) => Some(DiagnosticCompletion::Complete),
-        ("inconclusive" | "internal_fault", false) => Some(DiagnosticCompletion::Failed),
+    match (
+        fields.outcome.as_deref()?,
+        fields.authority?,
+        fields.diagnostic_count,
+    ) {
+        ("complete", true, Some(0)) => Some(DiagnosticCompletion::Complete),
+        ("inconclusive" | "internal_fault", false, None) => {
+            Some(DiagnosticCompletion::Failed)
+        }
         _ => None,
     }
 }
@@ -253,18 +274,43 @@ mod tests {
         );
         for outcome in ["inconclusive", "internal_fault"] {
             let value = format!(
-                "{{\"schema\":\"fln.diagnostic-projection/1\",\"outcome\":\"{outcome}\",\"authority\":false,\"detail\":{{\"authority\":true}}}}"
+                "{{\"schema\":\"fln.diagnostic-projection/1\",\"outcome\":\"{outcome}\",\"authority\":false,\"detail\":{{\"authority\":true,\"diagnosticCount\":99}}}}"
             );
             assert_eq!(parse(&value), Some(DiagnosticCompletion::Failed));
         }
     }
 
     #[test]
+    fn complete_authority_requires_exact_zero_diagnostic_accounting() {
+        for value in [
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":1}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":-0}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":0.0}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":"0"}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":18446744073709551616}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"diagnosticCount":0,"\u0064iagnosticCount":0}"#,
+        ] {
+            assert_eq!(parse(value), None, "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn non_authoritative_outcomes_cannot_carry_complete_only_accounting() {
+        for outcome in ["inconclusive", "internal_fault"] {
+            let value = format!(
+                "{{\"schema\":\"fln.diagnostic-projection/1\",\"outcome\":\"{outcome}\",\"authority\":false,\"diagnosticCount\":0}}"
+            );
+            assert_eq!(parse(&value), None);
+        }
+    }
+
+    #[test]
     fn nested_or_textual_authority_cannot_spoof_the_top_level_grade() {
         for value in [
-            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","detail":{"authority":true}}"#,
-            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","detail":"authority:true"}"#,
-            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":"true"}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","diagnosticCount":0,"detail":{"authority":true}}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","diagnosticCount":0,"detail":"authority:true"}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":"true","diagnosticCount":0}"#,
         ] {
             assert_eq!(parse(value), None);
         }
@@ -273,11 +319,11 @@ mod tests {
     #[test]
     fn duplicate_decoded_keys_and_inconsistent_claims_are_refused() {
         for value in [
-            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"\u0061uthority":false}"#,
-            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":false}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":true,"\u0061uthority":false,"diagnosticCount":0}"#,
+            r#"{"schema":"fln.diagnostic-projection/1","outcome":"complete","authority":false,"diagnosticCount":0}"#,
             r#"{"schema":"fln.diagnostic-projection/1","outcome":"internal_fault","authority":true}"#,
-            r#"{"schema":"other","outcome":"complete","authority":true}"#,
-            r#"{"outcome":"complete","authority":true}"#,
+            r#"{"schema":"other","outcome":"complete","authority":true,"diagnosticCount":0}"#,
+            r#"{"outcome":"complete","authority":true,"diagnosticCount":0}"#,
         ] {
             assert_eq!(parse(value), None);
         }
