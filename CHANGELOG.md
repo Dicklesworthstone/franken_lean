@@ -2,9 +2,9 @@
 
 This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed; the [`README.md`](README.md) intentionally describes the finished 1.0 target state, and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded status companion.
 
-Scope: project inception on **2026-07-21** through the September 1 implementation/status snapshot at **[`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32)**. This changelog refresh itself follows that snapshot.
+Scope: project inception on **2026-07-21** through the September 2 Lantern authority tranche at **[`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387)**. This changelog refresh follows that implementation snapshot.
 
-No GitHub Releases were published when this file was refreshed on **2026-09-01**. Do not infer or invent a `v0.x` release from commit activity.
+No GitHub Releases were published when this file was refreshed on **2026-09-02**. Do not infer or invent a `v0.x` release from commit activity.
 
 Primary sources:
 
@@ -25,6 +25,7 @@ Representative commits are examples, not substitutes for the tracker/evidence gr
 | [`3df0543d`](https://github.com/Dicklesworthstone/franken_lean/commit/3df0543d9537b0a930e7e72ba9b779bfa0e49ad5) | 2026-07-22 | §21 Rust workspace, pinned nightly, structural dependency gate. |
 | [`9a8860ab`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8860aba1bf88cf68d4c01785126e8dca6d9435) | 2026-08-19 | Bounded native `lean` personality, checker/olean reconstruction, Golem source execution. |
 | [`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32) | 2026-09-01 | Evidence-graded checker frontier, executable agent-control tools, structurally hardened stateful Lantern document synchronization. |
+| [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387) | 2026-09-02 | Modular Lantern dispatcher, structural callback authority, bounded versioned diagnostic waits, and public framed protocol transcripts. |
 
 ---
 
@@ -251,6 +252,45 @@ Representative commits: [`fcbe18f2`](https://github.com/Dicklesworthstone/franke
 **Still not claimed:** cursor-aware proof goals, semantic hover/completion/definition, Lean RPC sessions, declaration-granular import/elaboration state, or the finished shared-heap parallel Lantern architecture.
 
 Representative commits: [`fced6257`](https://github.com/Dicklesworthstone/franken_lean/commit/fced62579ac344aaf008c7fb38f39b2485df463e), [`81d33852`](https://github.com/Dicklesworthstone/franken_lean/commit/81d338529b12dd05a91ae675cb87f94cb2abb4c8), [`9e50fdef`](https://github.com/Dicklesworthstone/franken_lean/commit/9e50fdef012caf7bd2a1f95dda575a353e51631c), [`637176fd`](https://github.com/Dicklesworthstone/franken_lean/commit/637176fd357ce610354aa14695f4841b68e72f68), [`2114cd59`](https://github.com/Dicklesworthstone/franken_lean/commit/2114cd59f7f5385782a4b56667fa60b09f4c30b1), [`60ebc07a`](https://github.com/Dicklesworthstone/franken_lean/commit/60ebc07a8c13286a6e3df293e6db99fe4e0eb073), [`f2af73ff`](https://github.com/Dicklesworthstone/franken_lean/commit/f2af73ff7faf69e10bde112ed4b1b391d57fd55b).
+
+---
+
+## 12) Lantern modularization and diagnostic authority — 2026-09-02
+
+This continuation replaced overlapping protocol implementations with one typed control path, then separated accepted document state from the authority to claim that diagnostics for that state were actually emitted.
+
+### Structural protocol and session architecture
+
+- Split strict JSON parsing, deterministic wire construction, document-session state, and pending diagnostic waits into dedicated modules and made them authoritative from the live dispatcher.
+- Validated complete JSON before dispatch, preserving syntactically valid JSON number lexemes, decoded strings, and `null` request IDs without narrowing.
+- Hardened Content-Type parsing to accept the specified UTF-8 token and quoted forms while rejecting malformed quotes, escapes, duplicate parameters, unsupported charset values, and non-token inputs.
+- Made retained-source accounting recovery conservative: affected text is invalidated, unaffected text survives when an exact in-budget total can be rebuilt, and impossible reconstruction discards all cached text while preserving open/version authority.
+- Added deterministic unit round-trips for every emitted JSON-RPC wire shape through the same strict parser used for inbound traffic.
+
+### Diagnostic publication authority
+
+- Stopped treating arbitrary callback bytes or method-looking substrings as terminal diagnostics.
+- Callback messages must be valid JSON-RPC 2.0 notifications. `publishDiagnostics` counts for the current check only when `params.uri` exactly matches the checked document; wrong-URI publications remain auxiliary.
+- Missing, malformed, response-shaped, or duplicate terminal output is withheld as authority, followed by explicit diagnostic clearing and a schema-bound non-authoritative fault.
+- Canonical `$/lean/diagnosticOutcome` authority now grades the publication frontier: `authority:true` completes it, while `authority:false` preserves the detailed outcome, clears editor diagnostics, and fails dependent waits.
+- The expected empty-diagnostic publication plus one canonical outcome is treated as one coherent terminal result rather than as duplicate success.
+
+### Bounded diagnostic waiting
+
+- Implemented `textDocument/waitForDiagnostics` for the pinned Lean `{ uri, version }` shape and `{}` success result.
+- Separated the accepted document/version frontier from the terminal diagnostic-publication frontier. A source change alone cannot satisfy a wait.
+- Future-version waits complete in registration order only after an authoritative terminal publication for at least the target version.
+- Non-authoritative processing, source invalidation, accounting failure, document close, or server shutdown resolves affected waits with typed failure rather than leaving them hanging or claiming success.
+- Added bounded pending-wait storage: at most 4,096 waits and 4 MiB of retained request-ID/URI metadata, with duplicate outstanding-ID refusal.
+- Added exact `$/cancelRequest` handling for pending diagnostic waits and visible no-session handling for Lean RPC keepAlive/release notifications.
+
+### Public evidence cells
+
+- Added exported framed-stdio transcripts for lifecycle order, Full-sync open/change/save/close, malformed JSON and invalid UTF-8 recovery, structural callback spoof rejection, malformed callback withholding, authoritative and non-authoritative wait outcomes, same-version recovery, future-version completion/failure, cancellation, close, shutdown, and unsupported RPC.
+
+**Evidence boundary:** these changes are landed with repository-owned unit and public transcript tests. The editing environment did not contain `cargo`/`rustc`, so this changelog does not claim those tests were executed in the same session. The live CLI callback still uses the compatibility source-blind projector; source-aware unsaved-text projection remains explicitly open.
+
+Representative commits: [`57a268bc`](https://github.com/Dicklesworthstone/franken_lean/commit/57a268bcd1a5656b3bf4d983a7630eb709bc819f), [`be2ffcf9`](https://github.com/Dicklesworthstone/franken_lean/commit/be2ffcf91ed60eb7a8fbd3605e101fdbe5d2ba54), [`32713f48`](https://github.com/Dicklesworthstone/franken_lean/commit/32713f480a77e94d8331ba064841bf72ca20377a), [`6ba4ef42`](https://github.com/Dicklesworthstone/franken_lean/commit/6ba4ef42310c9f3d12be0b5d2460c96716dd991c), [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387).
 
 ---
 
