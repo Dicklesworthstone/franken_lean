@@ -2,7 +2,7 @@
 
 This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed; the [`README.md`](README.md) intentionally describes the finished 1.0 target state, and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded status companion.
 
-Scope: project inception on **2026-07-21** through the September 2 Lantern resource/evidence tranche at **[`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3)**. This changelog refresh follows that implementation snapshot.
+Scope: project inception on **2026-07-21** through the September 2 strict Lantern client-transcript tranche at **[`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef)**. This changelog refresh follows that implementation snapshot.
 
 No GitHub Releases were published when this file was refreshed on **2026-09-02**. Do not infer or invent a `v0.x` release from commit activity.
 
@@ -27,6 +27,7 @@ Representative commits are examples, not substitutes for the tracker/evidence gr
 | [`ea891c23`](https://github.com/Dicklesworthstone/franken_lean/commit/ea891c23fb4c44ac4d5020715d9c0121fdc90c32) | 2026-09-01 | Evidence-graded checker frontier, executable agent-control tools, structurally hardened stateful Lantern document synchronization. |
 | [`ab417cc9`](https://github.com/Dicklesworthstone/franken_lean/commit/ab417cc985dec40518d3e4318626c3a9bf4f0387) | 2026-09-02 | Modular Lantern dispatcher, structural callback authority, bounded versioned diagnostic waits, and public framed protocol transcripts. |
 | [`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3) | 2026-09-02 | Exact zero-diagnostic authority accounting, full-wire transcript receipts, and bounded open-document URI metadata. |
+| [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef) | 2026-09-02 | Strict client lifecycle receipts, known method role/parameter contracts, replay preflight, and metadata-only frame inspection. |
 
 ---
 
@@ -322,6 +323,42 @@ This tranche tightened three places where the implementation enforced a policy b
 **Evidence boundary:** the code and tests are landed, but this session had no Rust toolchain and GitHub Actions were unavailable. This changelog therefore records implementation and executable test ownership, not same-session execution evidence. `franken_lean-v2p` remains open because cursor semantics, source-aware live projection, Lean RPC, shared import state, asynchronous cancellation, and full editor parity are not complete.
 
 Representative commits: [`9a8f2362`](https://github.com/Dicklesworthstone/franken_lean/commit/9a8f2362992d781da04419471475f3a02851d71c), [`9f11cc26`](https://github.com/Dicklesworthstone/franken_lean/commit/9f11cc26ddbf82c911bee326cd2e9f54de50f91c), [`5583c65f`](https://github.com/Dicklesworthstone/franken_lean/commit/5583c65febe88583d6ae2dcb544a39c960342d57), [`b8256034`](https://github.com/Dicklesworthstone/franken_lean/commit/b82560341b9096f36df280a570a2608e6972d645), [`a4807ece`](https://github.com/Dicklesworthstone/franken_lean/commit/a4807ece6042d676d4d43f62f569c34a841062ae), [`af668aa6`](https://github.com/Dicklesworthstone/franken_lean/commit/af668aa65e2cf04ddbbf4903401bd6514ab88dc3).
+
+---
+
+## 14) Strict client lifecycle and parameter-shape evidence — 2026-09-02
+
+This tranche turned transcript syntax validity, protocol-valid client lifecycle, replayability, and metadata inspection into distinct evidence products instead of allowing one weak “valid transcript” label to cover all four.
+
+### Layered validation
+
+- Kept `fln-lsp-validate` syntax-only by default so negative lifecycle fixtures remain usable.
+- Added `--client-lifecycle`, which requires initialize first, initialized before running traffic, shutdown while running, exit immediately after shutdown, no post-exit frames, and EOF in the exited state.
+- Added a single known-method contract that binds request/notification role and params-container shape together. Known data-bearing methods require object params; shutdown and exit permit only missing or `null` params.
+- Unknown methods remain extensible during the running state but cannot bypass initialization or terminal ordering.
+- Added `fln.lsp-client-lifecycle/1` receipts with aggregate frame/role/wire/body counts and exact initialize, initialized, shutdown, and exit frame indices.
+
+### Replay preflight
+
+- Added `fln-lsp-replay --client-lifecycle` using the same strict model.
+- Lifecycle refusal occurs before server execution, expected-stream comparison, stdout bytes, or create-new output publication.
+- Default replay remains available for deliberately role-invalid or out-of-order client fixtures whose server refusal behavior is the subject of the test.
+- External-process tests prove clean strict replay, duplicate-option refusal, role and parameter-shape rejection, and the absence of a partial output artifact after failed preflight.
+
+### Metadata-only inspection
+
+- Extended validated frames with `paramsKind` as `missing`, `object`, `array`, or `null`.
+- Advanced inspector rows to `fln.lsp-frame/2`, exposing that category alongside frame index, role, method, lexical ID, and body size.
+- Parameter contents and source text remain omitted, and a public binary test carries an explicit secret source marker to prove it does not appear in inspection output.
+
+### Operational contract
+
+- Rewrote [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) around the three shared tools and their distinct claims.
+- The contract now tells agents when syntax-only validation is required, when lifecycle validation is promotion-relevant, and why strict replay preflight must precede output publication.
+
+**Evidence boundary:** the code and repository-owned unit/external-process tests are landed. The editing environment did not provide `cargo`/`rustc`, so no same-session green Rust claim is made. Strict client lifecycle currently proves top-level role, parameter-container category, and ordering, not the semantic contents of every params object, document open/change coherence, response-ID correlation, or complete bidirectional replay evidence.
+
+Representative commits: [`025c4c86`](https://github.com/Dicklesworthstone/franken_lean/commit/025c4c86018484177a1ba1e02c908373bfd29fa3), [`3e28ddb3`](https://github.com/Dicklesworthstone/franken_lean/commit/3e28ddb33a6087259a6672e897ec7cddcd484640), [`b256978d`](https://github.com/Dicklesworthstone/franken_lean/commit/b256978d14d2b3528531b15a1c38acc83a06e345), [`c33cb173`](https://github.com/Dicklesworthstone/franken_lean/commit/c33cb173d7cae593d489813aed527fe6ef72c280), [`13d79e4a`](https://github.com/Dicklesworthstone/franken_lean/commit/13d79e4a1da450e4baf8f83c603a3cc1ee9f6d27), [`1f379b1d`](https://github.com/Dicklesworthstone/franken_lean/commit/1f379b1d0261398b6d231994b2f6f743c20e255e), [`3c1311a8`](https://github.com/Dicklesworthstone/franken_lean/commit/3c1311a80f62b41053e0ea12921bee61180e2da5), [`f80f959e`](https://github.com/Dicklesworthstone/franken_lean/commit/f80f959e600dd06c5224d604365ceab0727939cd), [`c150fa9e`](https://github.com/Dicklesworthstone/franken_lean/commit/c150fa9e9c690f13303161bd3ab96b718ba125ef), [`732f70c3`](https://github.com/Dicklesworthstone/franken_lean/commit/732f70c3337212694343c2b5f428a2cbb6dce596).
 
 ---
 
