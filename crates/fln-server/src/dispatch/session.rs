@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 pub(super) const MAX_OPEN_DOCUMENTS: usize = 1024;
 pub(super) const MAX_RETAINED_SOURCE_BYTES: usize = 256 * 1024 * 1024;
+pub(super) const MAX_RETAINED_URI_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 struct OpenDocument {
@@ -38,6 +39,7 @@ pub(super) enum RetentionOutcome {
 pub(super) enum SessionRefusal {
     DuplicateOpen,
     DocumentLimit,
+    DocumentMetadataLimit,
     NotOpen,
     NonMonotone,
     AccountingInvariant,
@@ -52,12 +54,15 @@ impl SessionRefusal {
             Self::DocumentLimit => {
                 "FrankenLean refused didOpen because the bounded open-document limit was reached"
             }
+            Self::DocumentMetadataLimit => {
+                "FrankenLean refused didOpen because the bounded open-document URI budget was reached"
+            }
             Self::NotOpen => "FrankenLean refused the document event because the document is not open",
             Self::NonMonotone => {
                 "FrankenLean refused non-monotone didChange version; the latest accepted version remains authoritative"
             }
             Self::AccountingInvariant => {
-                "FrankenLean retained-source accounting invariant failed; affected text was invalidated and accounting was rebuilt"
+                "FrankenLean document-session accounting invariant failed; affected text was invalidated and accounting was rebuilt"
             }
         }
     }
@@ -67,21 +72,41 @@ impl SessionRefusal {
 pub(super) struct DocumentSession {
     documents: BTreeMap<String, OpenDocument>,
     retained_bytes: usize,
+    retained_uri_bytes: usize,
     max_documents: usize,
     max_retained_bytes: usize,
+    max_retained_uri_bytes: usize,
 }
 
 impl DocumentSession {
     pub(super) fn new() -> Self {
-        Self::with_limits(MAX_OPEN_DOCUMENTS, MAX_RETAINED_SOURCE_BYTES)
+        Self::with_resource_limits(
+            MAX_OPEN_DOCUMENTS,
+            MAX_RETAINED_SOURCE_BYTES,
+            MAX_RETAINED_URI_BYTES,
+        )
     }
 
     pub(super) fn with_limits(max_documents: usize, max_retained_bytes: usize) -> Self {
+        Self::with_resource_limits(
+            max_documents,
+            max_retained_bytes,
+            MAX_RETAINED_URI_BYTES,
+        )
+    }
+
+    fn with_resource_limits(
+        max_documents: usize,
+        max_retained_bytes: usize,
+        max_retained_uri_bytes: usize,
+    ) -> Self {
         Self {
             documents: BTreeMap::new(),
             retained_bytes: 0,
+            retained_uri_bytes: 0,
             max_documents,
             max_retained_bytes,
+            max_retained_uri_bytes,
         }
     }
 
@@ -138,6 +163,19 @@ impl DocumentSession {
         }
     }
 
+    fn rebuild_retained_uri_bytes(&mut self) {
+        self.retained_uri_bytes = self
+            .documents
+            .keys()
+            .try_fold(0usize, |total, uri| total.checked_add(uri.len()))
+            .unwrap_or(usize::MAX);
+    }
+
+    fn rebuild_accounting(&mut self) {
+        self.rebuild_retained_bytes();
+        self.rebuild_retained_uri_bytes();
+    }
+
     pub(super) fn open(
         &mut self,
         uri: String,
@@ -150,8 +188,16 @@ impl DocumentSession {
         if self.documents.len() >= self.max_documents {
             return Err(SessionRefusal::DocumentLimit);
         }
+        let next_uri_bytes = self
+            .retained_uri_bytes
+            .checked_add(uri.len())
+            .ok_or(SessionRefusal::DocumentMetadataLimit)?;
+        if next_uri_bytes > self.max_retained_uri_bytes {
+            return Err(SessionRefusal::DocumentMetadataLimit);
+        }
         let (text, retention) =
             Self::retain_text(&mut self.retained_bytes, self.max_retained_bytes, text);
+        self.retained_uri_bytes = next_uri_bytes;
         self.documents.insert(uri, OpenDocument { version, text });
         Ok(retention)
     }
@@ -169,7 +215,7 @@ impl DocumentSession {
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
             document.text = None;
             self.documents.insert(uri.to_string(), document);
-            self.rebuild_retained_bytes();
+            self.rebuild_accounting();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -213,7 +259,7 @@ impl DocumentSession {
         let old_len = document.text.take().as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
             self.documents.insert(uri.to_string(), document);
-            self.rebuild_retained_bytes();
+            self.rebuild_accounting();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
@@ -227,10 +273,15 @@ impl DocumentSession {
         };
         let old_len = document.text.as_ref().map_or(0, String::len);
         let Some(retained_bytes) = self.retained_bytes.checked_sub(old_len) else {
-            self.rebuild_retained_bytes();
+            self.rebuild_accounting();
+            return Err(SessionRefusal::AccountingInvariant);
+        };
+        let Some(retained_uri_bytes) = self.retained_uri_bytes.checked_sub(uri.len()) else {
+            self.rebuild_accounting();
             return Err(SessionRefusal::AccountingInvariant);
         };
         self.retained_bytes = retained_bytes;
+        self.retained_uri_bytes = retained_uri_bytes;
         Ok(true)
     }
 }
@@ -262,6 +313,33 @@ mod tests {
     }
 
     #[test]
+    fn uri_pressure_is_bounded_before_source_budget_changes() {
+        let mut session = DocumentSession::with_resource_limits(2, 4, 10);
+        assert_eq!(
+            session.open("1234567890".to_string(), 1, "x".to_string()),
+            Ok(RetentionOutcome::Retained)
+        );
+        assert_eq!(session.retained_uri_bytes, 10);
+        assert_eq!(session.retained_bytes, 1);
+
+        assert_eq!(
+            session.open("z".to_string(), 1, "yyy".to_string()),
+            Err(SessionRefusal::DocumentMetadataLimit)
+        );
+        assert!(!session.is_open("z"));
+        assert_eq!(session.retained_uri_bytes, 10);
+        assert_eq!(session.retained_bytes, 1);
+
+        assert_eq!(session.close("1234567890"), Ok(true));
+        assert_eq!(session.retained_uri_bytes, 0);
+        assert_eq!(session.retained_bytes, 0);
+        assert_eq!(
+            session.open("z".to_string(), 1, "yyy".to_string()),
+            Ok(RetentionOutcome::Retained)
+        );
+    }
+
+    #[test]
     fn invalidating_text_preserves_lifecycle_state() {
         let mut session = DocumentSession::new();
         session
@@ -271,6 +349,7 @@ mod tests {
         assert!(session.is_open("file:///x"));
         assert_eq!(session.version("file:///x"), Some(7));
         assert_eq!(session.text("file:///x"), None);
+        assert_eq!(session.retained_uri_bytes, "file:///x".len());
     }
 
     #[test]
@@ -298,6 +377,7 @@ mod tests {
         assert_eq!(session.close("file:///x"), Ok(true));
         assert!(!session.is_open("file:///x"));
         assert_eq!(session.retained_bytes, 0);
+        assert_eq!(session.retained_uri_bytes, 0);
         assert_eq!(session.close("file:///x"), Ok(false));
     }
 
@@ -312,6 +392,7 @@ mod tests {
             .unwrap();
 
         session.retained_bytes = 0;
+        session.retained_uri_bytes = 0;
         assert_eq!(
             session.change("file:///a", 2, "new".to_string()),
             Err(SessionRefusal::AccountingInvariant)
@@ -323,6 +404,10 @@ mod tests {
         assert_eq!(session.text("file:///a"), None);
         assert_eq!(session.text("file:///b"), Some("beta"));
         assert_eq!(session.retained_bytes, 4);
+        assert_eq!(
+            session.retained_uri_bytes,
+            "file:///a".len() + "file:///b".len()
+        );
 
         assert_eq!(
             session.change("file:///a", 2, "new".to_string()),
@@ -334,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn impossible_rebuild_fails_closed_by_discarding_every_text() {
+    fn impossible_source_rebuild_discards_text_but_preserves_uri_authority() {
         let mut session = DocumentSession::with_limits(3, 8);
         session.documents.insert(
             "file:///a".to_string(),
@@ -351,11 +436,16 @@ mod tests {
             },
         );
         session.retained_bytes = 0;
-        session.rebuild_retained_bytes();
+        session.retained_uri_bytes = 0;
+        session.rebuild_accounting();
         assert_eq!(session.retained_bytes, 0);
         assert_eq!(session.text("file:///a"), None);
         assert_eq!(session.text("file:///b"), None);
         assert_eq!(session.version("file:///a"), Some(1));
         assert_eq!(session.version("file:///b"), Some(2));
+        assert_eq!(
+            session.retained_uri_bytes,
+            "file:///a".len() + "file:///b".len()
+        );
     }
 }
