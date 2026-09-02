@@ -15,6 +15,11 @@ pub struct CorrelationStats {
     pub matched_responses: u64,
 }
 
+/// The shared parser's deterministic request-ID identity.
+///
+/// JSON numbers retain their exact source lexeme, strings compare by decoded
+/// Unicode value and are re-escaped canonically, and null remains null. This is
+/// also the representation the live dispatcher emits in response IDs.
 fn client_request_ids(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {
     let mut requests = BTreeMap::new();
     transcript::visit_reader(
@@ -26,13 +31,13 @@ fn client_request_ids(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {
             }
             let id = frame.id_json.clone().ok_or_else(|| {
                 format!(
-                    "client frame {} is request-shaped without a retained lexical id",
+                    "client frame {} is request-shaped without a retained request-ID key",
                     frame.index
                 )
             })?;
             if let Some(first) = requests.insert(id.clone(), frame.index) {
                 return Err(format!(
-                    "client request id {id} is repeated at frames {first} and {}; bidirectional correlation requires unique lexical IDs",
+                    "client request ID {id} is repeated at frames {first} and {}; bidirectional correlation requires unique canonical IDs",
                     frame.index
                 ));
             }
@@ -53,19 +58,19 @@ fn server_response_ids(
         }
         let id = frame.id_json.clone().ok_or_else(|| {
             format!(
-                "server frame {} is response-shaped without a retained lexical id",
+                "server frame {} is response-shaped without a retained request-ID key",
                 frame.index
             )
         })?;
         if let Some(first) = responses.insert(id.clone(), frame.index) {
             return Err(format!(
-                "server response id {id} is repeated at frames {first} and {}",
+                "server response ID {id} is repeated at frames {first} and {}",
                 frame.index
             ));
         }
         if !client.contains_key(&id) {
             return Err(format!(
-                "server frame {} responds to unknown exact lexical request id {id}",
+                "server frame {} responds to unknown canonical request ID {id}",
                 frame.index
             ));
         }
@@ -90,7 +95,7 @@ pub fn correlate_transcripts(
         .min_by_key(|(_, frame)| **frame)
     {
         return Err(format!(
-            "client request frame {frame} with exact lexical id {id} has no server response"
+            "client request frame {frame} with canonical ID {id} has no server response"
         ));
     }
     let matched_responses = u64::try_from(responses.len())
@@ -118,6 +123,7 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
     format!(
         concat!(
             "{{\"schema\":\"fln.lsp-client-server-correlation/1\",",
+            "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
             "\"matchedResponses\":{},\"unmatchedClientRequests\":0,",
@@ -188,13 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn correlates_unique_exact_ids_and_renders_zero_unmatched_evidence() {
+    fn correlates_unique_canonical_ids_and_renders_zero_unmatched_evidence() {
         let stats = correlate_transcripts(&client(), &server()).unwrap();
         assert_eq!(stats.matched_responses, 3);
         assert_eq!(stats.server.result_responses, 3);
         assert_eq!(stats.server.notifications, 1);
         let receipt = render_correlation(stats);
         assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/1\""));
+        assert!(receipt.contains("\"idPolicy\":\"number-lexeme-string-value-v1\""));
         assert!(receipt.contains("\"matchedResponses\":3"));
         assert!(receipt.contains("\"unmatchedClientRequests\":0"));
         assert!(receipt.contains("\"unsolicitedServerResponses\":0"));
@@ -220,7 +227,7 @@ mod tests {
         assert!(
             correlate_transcripts(&client(), &unsolicited)
                 .unwrap_err()
-                .contains("unknown exact lexical request id")
+                .contains("unknown canonical request ID")
         );
 
         let duplicate = framed(&[
@@ -232,19 +239,47 @@ mod tests {
         assert!(
             correlate_transcripts(&client(), &duplicate)
                 .unwrap_err()
-                .contains("server response id 1.25e2 is repeated")
+                .contains("server response ID 1.25e2 is repeated")
         );
     }
 
     #[test]
-    fn exact_lexical_numeric_identity_is_not_normalized() {
+    fn numeric_lexemes_are_not_normalized() {
         let normalized = framed(&[
             r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
             r#"{"jsonrpc":"2.0","id":125,"result":null}"#,
             r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
         ]);
         let error = correlate_transcripts(&client(), &normalized).unwrap_err();
-        assert!(error.contains("unknown exact lexical request id 125"));
+        assert!(error.contains("unknown canonical request ID 125"));
+    }
+
+    #[test]
+    fn equivalent_string_escapes_share_one_canonical_identity() {
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"\u0069nit","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let server = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+        ]);
+        assert!(correlate_transcripts(&client, &server).is_ok());
+    }
+
+    #[test]
+    fn aliasing_string_spellings_are_duplicate_semantic_ids() {
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"\u0069nit","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"init","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let error = correlate_transcripts(&client, &server()).unwrap_err();
+        assert!(error.contains("requires unique canonical IDs"));
     }
 
     #[test]
@@ -257,7 +292,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
         ]);
         let error = correlate_transcripts(&client, &server()).unwrap_err();
-        assert!(error.contains("bidirectional correlation requires unique lexical IDs"));
+        assert!(error.contains("requires unique canonical IDs"));
     }
 
     #[test]
