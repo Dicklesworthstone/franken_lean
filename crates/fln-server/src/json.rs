@@ -9,6 +9,34 @@
 
 include!("dispatch/json.rs");
 
+pub(super) fn object_member(object: RawField<'_>, key: &str) -> RawField<'_> {
+    match object_value(object) {
+        RawField::Value(value) => object_field(value, key),
+        RawField::Missing => RawField::Missing,
+        RawField::Invalid => RawField::Invalid,
+    }
+}
+
+pub(super) fn object_string_member(object: RawField<'_>, key: &str) -> DecodedField {
+    decoded_string(object_member(object, key))
+}
+
+pub(super) fn object_integer_member(object: RawField<'_>, key: &str) -> VersionField {
+    match object_member(object, key) {
+        RawField::Missing => VersionField::Missing,
+        RawField::Invalid => VersionField::Invalid,
+        RawField::Value(value) => value
+            .trim()
+            .parse::<i64>()
+            .map(VersionField::Valid)
+            .unwrap_or(VersionField::Invalid),
+    }
+}
+
+pub(super) fn object_boolean_member(object: RawField<'_>, key: &str) -> BooleanField {
+    decoded_boolean_field(object_value(object), key)
+}
+
 pub(super) fn response_result(json: &str) -> RawField<'_> {
     object_field(json, "result")
 }
