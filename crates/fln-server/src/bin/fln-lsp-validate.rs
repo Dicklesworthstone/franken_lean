@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,21 +13,37 @@ mod json;
 #[path = "../transcript.rs"]
 pub mod transcript;
 
-const USAGE: &str = "Usage: fln-lsp-validate [--] INPUT\n\
+const USAGE: &str = "Usage: fln-lsp-validate [--client-lifecycle] [--] INPUT\n\
 \n\
 Validate one exact Content-Length-framed JSON-RPC client transcript.\n\
-Use INPUT=- to read standard input.\n";
+Use INPUT=- to read standard input.\n\
+By default only framing and JSON-RPC shape are validated, which preserves\n\
+negative replay fixtures. --client-lifecycle additionally requires known\n\
+method roles and a complete initialize/initialized/shutdown/exit handshake.\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationMode {
+    Syntax,
+    ClientLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Config {
+    input: PathBuf,
+    mode: ValidationMode,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
-    Validate(PathBuf),
+    Validate(Config),
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     let _program = arguments.next();
     let mut options = true;
+    let mut lifecycle = false;
     let mut input = None;
     while let Some(argument) = arguments.next() {
         if options && argument == "--" {
@@ -35,10 +51,17 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
             continue;
         }
         if options && matches!(argument.to_str(), Some("-h" | "--help")) {
-            if input.is_some() || arguments.next().is_some() {
+            if lifecycle || input.is_some() || arguments.next().is_some() {
                 return Err("--help cannot be combined with validation arguments".to_string());
             }
             return Ok(Command::Help);
+        }
+        if options && argument == "--client-lifecycle" {
+            if lifecycle {
+                return Err("--client-lifecycle may be supplied at most once".to_string());
+            }
+            lifecycle = true;
+            continue;
         }
         if options && argument.to_string_lossy().starts_with('-') && argument != "-" {
             return Err(format!("unknown option: {}", argument.to_string_lossy()));
@@ -47,29 +70,44 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
             return Err("exactly one transcript is required".to_string());
         }
     }
-    input
-        .map(Command::Validate)
-        .ok_or_else(|| "missing input transcript".to_string())
+    Ok(Command::Validate(Config {
+        input: input.ok_or_else(|| "missing input transcript".to_string())?,
+        mode: if lifecycle {
+            ValidationMode::ClientLifecycle
+        } else {
+            ValidationMode::Syntax
+        },
+    }))
 }
 
-fn validate_path(path: &Path) -> Result<transcript::TranscriptStats, String> {
-    if path == Path::new("-") {
-        let stdin = io::stdin();
-        return transcript::validate_reader(&mut BufReader::new(stdin.lock()));
+fn validate_reader(input: &mut dyn BufRead, mode: ValidationMode) -> Result<String, String> {
+    match mode {
+        ValidationMode::Syntax => {
+            transcript::validate_reader(input).map(transcript::render_validation)
+        }
+        ValidationMode::ClientLifecycle => transcript::validate_client_lifecycle_reader(input)
+            .map(transcript::render_client_lifecycle_validation),
     }
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+}
+
+fn validate_path(config: &Config) -> Result<String, String> {
+    if config.input == Path::new("-") {
+        let stdin = io::stdin();
+        return validate_reader(&mut BufReader::new(stdin.lock()), config.mode);
+    }
+    let metadata = std::fs::metadata(&config.input)
+        .map_err(|error| format!("could not inspect {}: {error}", config.input.display()))?;
     if metadata.len() > transcript::MAX_TRANSCRIPT_BYTES {
         return Err(format!(
             "{} is {} bytes; the transcript ceiling is {}",
-            path.display(),
+            config.input.display(),
             metadata.len(),
             transcript::MAX_TRANSCRIPT_BYTES
         ));
     }
-    let file = File::open(path)
-        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    transcript::validate_reader(&mut BufReader::new(file))
+    let file = File::open(&config.input)
+        .map_err(|error| format!("could not open {}: {error}", config.input.display()))?;
+    validate_reader(&mut BufReader::new(file), config.mode)
 }
 
 fn main() -> ExitCode {
@@ -85,9 +123,9 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Command::Validate(path) => match validate_path(&path) {
-            Ok(stats) => {
-                print!("{}", transcript::render_validation(stats));
+        Command::Validate(config) => match validate_path(&config) {
+            Ok(receipt) => {
+                print!("{receipt}");
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -109,6 +147,19 @@ mod tests {
         framed
     }
 
+    fn lifecycle() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1.25e2,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ] {
+            bytes.extend(frame(body));
+        }
+        bytes
+    }
+
     #[test]
     fn validates_requests_and_notifications_without_normalizing_ids() {
         let bodies = [
@@ -126,19 +177,13 @@ mod tests {
             bytes.extend(frame(body));
         }
         let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
-        let stats = transcript::validate_reader(&mut BufReader::new(Cursor::new(bytes))).unwrap();
+        let receipt = validate_reader(
+            &mut BufReader::new(Cursor::new(bytes)),
+            ValidationMode::Syntax,
+        )
+        .unwrap();
         assert_eq!(
-            stats,
-            transcript::TranscriptStats {
-                frames: 4,
-                requests: 2,
-                notifications: 2,
-                wire_bytes: expected_wire_bytes,
-                body_bytes: expected_body_bytes,
-            }
-        );
-        assert_eq!(
-            transcript::render_validation(stats),
+            receipt,
             format!(
                 "{{\"schema\":\"fln.lsp-transcript-validation/2\",\"frames\":4,\"requests\":2,\"notifications\":2,\"wireBytes\":{expected_wire_bytes},\"bodyBytes\":{expected_body_bytes}}}\n"
             )
@@ -167,14 +212,76 @@ mod tests {
     }
 
     #[test]
-    fn argument_parser_honors_stdin_and_end_of_options() {
+    fn argument_parser_honors_modes_stdin_and_end_of_options() {
         assert_eq!(
             parse_args(["fln-lsp-validate", "-"].map(OsString::from)),
-            Ok(Command::Validate(PathBuf::from("-")))
+            Ok(Command::Validate(Config {
+                input: PathBuf::from("-"),
+                mode: ValidationMode::Syntax,
+            }))
         );
         assert_eq!(
-            parse_args(["fln-lsp-validate", "--", "--recording"].map(OsString::from)),
-            Ok(Command::Validate(PathBuf::from("--recording")))
+            parse_args(
+                ["fln-lsp-validate", "--client-lifecycle", "-"]
+                    .map(OsString::from)
+            ),
+            Ok(Command::Validate(Config {
+                input: PathBuf::from("-"),
+                mode: ValidationMode::ClientLifecycle,
+            }))
         );
+        assert_eq!(
+            parse_args(["fln-lsp-validate", "--", "--client-lifecycle"].map(OsString::from)),
+            Ok(Command::Validate(Config {
+                input: PathBuf::from("--client-lifecycle"),
+                mode: ValidationMode::Syntax,
+            }))
+        );
+        assert!(
+            parse_args(
+                [
+                    "fln-lsp-validate",
+                    "--client-lifecycle",
+                    "--client-lifecycle",
+                    "-",
+                ]
+                .map(OsString::from)
+            )
+            .unwrap_err()
+            .contains("at most once")
+        );
+    }
+
+    #[test]
+    fn lifecycle_mode_emits_handshake_bound_receipt() {
+        let bytes = lifecycle();
+        let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
+        let receipt = validate_reader(
+            &mut BufReader::new(Cursor::new(bytes)),
+            ValidationMode::ClientLifecycle,
+        )
+        .unwrap();
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-lifecycle/1\""));
+        assert!(receipt.contains("\"finalState\":\"exited\""));
+        assert!(receipt.contains(&format!("\"wireBytes\":{expected_wire_bytes}")));
+        assert!(receipt.contains("\"initializeFrame\":1"));
+        assert!(receipt.contains("\"initializedFrame\":2"));
+        assert!(receipt.contains("\"shutdownFrame\":3"));
+        assert!(receipt.contains("\"exitFrame\":4"));
+    }
+
+    #[test]
+    fn lifecycle_mode_rejects_empty_or_incomplete_transcripts() {
+        for bytes in [
+            Vec::new(),
+            frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
+        ] {
+            let error = validate_reader(
+                &mut BufReader::new(Cursor::new(bytes)),
+                ValidationMode::ClientLifecycle,
+            )
+            .unwrap_err();
+            assert!(error.contains("expected exited"), "{error}");
+        }
     }
 }
