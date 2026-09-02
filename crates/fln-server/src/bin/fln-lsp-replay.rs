@@ -6,11 +6,20 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+pub use fln_server::{json_string, transport};
+
+#[path = "../json.rs"]
+mod json;
+#[path = "../transcript.rs"]
+pub mod transcript;
+
 const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_REPLAY_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-const USAGE: &str = "Usage: fln-lsp-replay [--expect PATH] [--output PATH] [--] INPUT\n\
+const USAGE: &str = "Usage: fln-lsp-replay [--client-lifecycle] [--expect PATH] [--output PATH] [--] INPUT\n\
 \n\
 Replay one exact Content-Length-framed LSP client stream through FrankenLean.\n\
+--client-lifecycle validates known method roles and a complete client handshake\n\
+before server execution, comparison, or output publication.\n\
 --expect compares the complete server stream byte-for-byte.\n\
 --output writes the actual server stream with create-new semantics.\n";
 
@@ -19,6 +28,7 @@ struct Config {
     input: PathBuf,
     expect: Option<PathBuf>,
     output: Option<PathBuf>,
+    client_lifecycle: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +87,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     let mut expect = None;
     let mut output = None;
     let mut input = None;
+    let mut client_lifecycle = false;
     let mut options = true;
 
     while let Some(argument) = arguments.next() {
@@ -85,10 +96,22 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
             continue;
         }
         if options && matches!(argument.to_str(), Some("-h" | "--help")) {
-            if expect.is_some() || output.is_some() || input.is_some() || arguments.next().is_some() {
+            if client_lifecycle
+                || expect.is_some()
+                || output.is_some()
+                || input.is_some()
+                || arguments.next().is_some()
+            {
                 return Err("--help cannot be combined with replay arguments".to_string());
             }
             return Ok(Command::Help);
+        }
+        if options && argument == "--client-lifecycle" {
+            if client_lifecycle {
+                return Err("--client-lifecycle may be supplied at most once".to_string());
+            }
+            client_lifecycle = true;
+            continue;
         }
         if options && argument == "--expect" {
             if expect.is_some() {
@@ -136,6 +159,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
         input,
         expect,
         output,
+        client_lifecycle,
     }))
 }
 
@@ -166,6 +190,15 @@ fn read_bounded(path: &Path, label: &str) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(bytes)
+}
+
+fn validate_client_transcript(input: &[u8], client_lifecycle: bool) -> Result<(), String> {
+    if !client_lifecycle {
+        return Ok(());
+    }
+    transcript::validate_client_lifecycle_bytes(input)
+        .map(|_| ())
+        .map_err(|error| format!("client lifecycle validation failed: {error}"))
 }
 
 fn replay_with_output_limit(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>, String> {
@@ -239,6 +272,7 @@ fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<(), String> {
 
 fn execute(config: &Config) -> Result<(), String> {
     let input = read_bounded(&config.input, "input transcript")?;
+    validate_client_transcript(&input, config.client_lifecycle)?;
     let actual = replay(&input)?;
     let mismatch = if let Some(expected_path) = config.expect.as_deref() {
         let expected = read_bounded(expected_path, "expected transcript")?;
@@ -310,6 +344,19 @@ mod tests {
                 input: PathBuf::from("--client.frames"),
                 expect: None,
                 output: None,
+                client_lifecycle: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(
+                ["fln-lsp-replay", "--client-lifecycle", "input.frames"]
+                    .map(OsString::from)
+            ),
+            Ok(Command::Replay(Config {
+                input: PathBuf::from("input.frames"),
+                expect: None,
+                output: None,
+                client_lifecycle: true,
             }))
         );
         for arguments in [
@@ -317,6 +364,12 @@ mod tests {
             vec!["fln-lsp-replay", "--expect"],
             vec!["fln-lsp-replay", "--expect", "a", "--expect", "b", "c"],
             vec!["fln-lsp-replay", "--output", "a", "--output", "b", "c"],
+            vec![
+                "fln-lsp-replay",
+                "--client-lifecycle",
+                "--client-lifecycle",
+                "c",
+            ],
             vec!["fln-lsp-replay", "--unknown", "c"],
             vec!["fln-lsp-replay", "a", "b"],
         ] {
@@ -343,6 +396,24 @@ mod tests {
         let second = replay(&input).unwrap();
         assert_eq!(first, second);
         assert!(first.windows(b"FrankenLean".len()).any(|window| window == b"FrankenLean"));
+        assert!(validate_client_transcript(&input, true).is_ok());
+    }
+
+    #[test]
+    fn strict_preflight_rejects_role_inversion_but_default_replay_remains_available() {
+        let mut input = Vec::new();
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"bad-open","method":"textDocument/didOpen","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ] {
+            input.extend(frame(body));
+        }
+        assert!(replay(&input).is_ok());
+        let error = validate_client_transcript(&input, true).unwrap_err();
+        assert!(error.contains("notification-only method"), "{error}");
     }
 
     #[test]
