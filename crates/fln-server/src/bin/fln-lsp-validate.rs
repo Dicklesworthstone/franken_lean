@@ -10,21 +10,26 @@ pub use fln_server::{json_string, transport};
 
 #[path = "../json.rs"]
 mod json;
+#[path = "../session_transcript.rs"]
+mod session_transcript;
 #[path = "../transcript.rs"]
 pub mod transcript;
 
-const USAGE: &str = "Usage: fln-lsp-validate [--client-lifecycle] [--] INPUT\n\
+const USAGE: &str = "Usage: fln-lsp-validate [--client-lifecycle | --client-session] [--] INPUT\n\
 \n\
 Validate one exact Content-Length-framed JSON-RPC client transcript.\n\
 Use INPUT=- to read standard input.\n\
 By default only framing and JSON-RPC shape are validated, which preserves\n\
 negative replay fixtures. --client-lifecycle additionally requires known\n\
-method roles and a complete initialize/initialized/shutdown/exit handshake.\n";
+method roles and a complete initialize/initialized/shutdown/exit handshake.\n\
+--client-session also validates Full-sync document membership, required text,\n\
+monotone versions, wait targets, cancellation IDs, and bounded URI state.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidationMode {
     Syntax,
     ClientLifecycle,
+    ClientSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +48,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     let mut arguments = arguments.into_iter();
     let _program = arguments.next();
     let mut options = true;
-    let mut lifecycle = false;
+    let mut mode = ValidationMode::Syntax;
+    let mut strict_mode_seen = false;
     let mut input = None;
     while let Some(argument) = arguments.next() {
         if options && argument == "--" {
@@ -51,16 +57,29 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
             continue;
         }
         if options && matches!(argument.to_str(), Some("-h" | "--help")) {
-            if lifecycle || input.is_some() || arguments.next().is_some() {
+            if strict_mode_seen || input.is_some() || arguments.next().is_some() {
                 return Err("--help cannot be combined with validation arguments".to_string());
             }
             return Ok(Command::Help);
         }
-        if options && argument == "--client-lifecycle" {
-            if lifecycle {
-                return Err("--client-lifecycle may be supplied at most once".to_string());
+        if options
+            && matches!(
+                argument.to_str(),
+                Some("--client-lifecycle" | "--client-session")
+            )
+        {
+            if strict_mode_seen {
+                return Err(
+                    "--client-lifecycle and --client-session are mutually exclusive and may be supplied at most once"
+                        .to_string(),
+                );
             }
-            lifecycle = true;
+            strict_mode_seen = true;
+            mode = if argument == "--client-session" {
+                ValidationMode::ClientSession
+            } else {
+                ValidationMode::ClientLifecycle
+            };
             continue;
         }
         if options && argument.to_string_lossy().starts_with('-') && argument != "-" {
@@ -72,11 +91,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     }
     Ok(Command::Validate(Config {
         input: input.ok_or_else(|| "missing input transcript".to_string())?,
-        mode: if lifecycle {
-            ValidationMode::ClientLifecycle
-        } else {
-            ValidationMode::Syntax
-        },
+        mode,
     }))
 }
 
@@ -87,6 +102,8 @@ fn validate_reader(input: &mut dyn BufRead, mode: ValidationMode) -> Result<Stri
         }
         ValidationMode::ClientLifecycle => transcript::validate_client_lifecycle_reader(input)
             .map(transcript::render_client_lifecycle_validation),
+        ValidationMode::ClientSession => session_transcript::validate_client_session_reader(input)
+            .map(session_transcript::render_client_session_validation),
     }
 }
 
@@ -147,17 +164,34 @@ mod tests {
         framed
     }
 
-    fn lifecycle() -> Vec<u8> {
+    fn framed(bodies: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for body in [
+        for body in bodies {
+            bytes.extend(frame(body));
+        }
+        bytes
+    }
+
+    fn lifecycle() -> Vec<u8> {
+        framed(&[
             r#"{"jsonrpc":"2.0","id":1.25e2,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
             r#"{"jsonrpc":"2.0","id":null,"method":"shutdown","params":null}"#,
             r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
-        ] {
-            bytes.extend(frame(body));
-        }
-        bytes
+        ])
+    }
+
+    fn client_session() -> Vec<u8> {
+        framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A.lean","version":1,"text":"def a := 1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///A.lean","version":2},"contentChanges":[{"text":"def a := 2"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///A.lean"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A.lean"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ])
     }
 
     #[test]
@@ -172,10 +206,7 @@ mod tests {
             .iter()
             .map(|body| u64::try_from(body.len()).unwrap())
             .sum();
-        let mut bytes = Vec::new();
-        for body in bodies {
-            bytes.extend(frame(body));
-        }
+        let bytes = framed(&bodies);
         let expected_wire_bytes = u64::try_from(bytes.len()).unwrap();
         let receipt = validate_reader(
             &mut BufReader::new(Cursor::new(bytes)),
@@ -231,25 +262,48 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_args(["fln-lsp-validate", "--", "--client-lifecycle"].map(OsString::from)),
+            parse_args(
+                ["fln-lsp-validate", "--client-session", "-"]
+                    .map(OsString::from)
+            ),
             Ok(Command::Validate(Config {
-                input: PathBuf::from("--client-lifecycle"),
+                input: PathBuf::from("-"),
+                mode: ValidationMode::ClientSession,
+            }))
+        );
+        assert_eq!(
+            parse_args(["fln-lsp-validate", "--", "--client-session"].map(OsString::from)),
+            Ok(Command::Validate(Config {
+                input: PathBuf::from("--client-session"),
                 mode: ValidationMode::Syntax,
             }))
         );
-        assert!(
-            parse_args(
-                [
-                    "fln-lsp-validate",
-                    "--client-lifecycle",
-                    "--client-lifecycle",
-                    "-",
-                ]
-                .map(OsString::from)
-            )
-            .unwrap_err()
-            .contains("at most once")
-        );
+        for arguments in [
+            [
+                "fln-lsp-validate",
+                "--client-lifecycle",
+                "--client-lifecycle",
+                "-",
+            ],
+            [
+                "fln-lsp-validate",
+                "--client-session",
+                "--client-session",
+                "-",
+            ],
+            [
+                "fln-lsp-validate",
+                "--client-lifecycle",
+                "--client-session",
+                "-",
+            ],
+        ] {
+            assert!(
+                parse_args(arguments.map(OsString::from))
+                    .unwrap_err()
+                    .contains("mutually exclusive")
+            );
+        }
     }
 
     #[test]
@@ -271,17 +325,34 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_mode_rejects_empty_or_incomplete_transcripts() {
-        for bytes in [
-            Vec::new(),
-            frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
+    fn session_mode_emits_document_semantic_receipt() {
+        let receipt = validate_reader(
+            &mut BufReader::new(Cursor::new(client_session())),
+            ValidationMode::ClientSession,
+        )
+        .unwrap();
+        assert!(receipt.contains("\"schema\":\"fln.lsp-client-session/1\""));
+        assert!(receipt.contains("\"documentsOpened\":1"));
+        assert!(receipt.contains("\"documentsChanged\":1"));
+        assert!(receipt.contains("\"documentsSaved\":1"));
+        assert!(receipt.contains("\"documentsClosed\":1"));
+        assert!(receipt.contains("\"finalOpenDocuments\":0"));
+    }
+
+    #[test]
+    fn strict_modes_reject_empty_or_incomplete_transcripts() {
+        for mode in [
+            ValidationMode::ClientLifecycle,
+            ValidationMode::ClientSession,
         ] {
-            let error = validate_reader(
-                &mut BufReader::new(Cursor::new(bytes)),
-                ValidationMode::ClientLifecycle,
-            )
-            .unwrap_err();
-            assert!(error.contains("expected exited"), "{error}");
+            for bytes in [
+                Vec::new(),
+                frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
+            ] {
+                let error = validate_reader(&mut BufReader::new(Cursor::new(bytes)), mode)
+                    .unwrap_err();
+                assert!(error.contains("expected exited"), "{error}");
+            }
         }
     }
 }
