@@ -105,11 +105,21 @@ pub(super) fn log_warning(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::json::{DecodedField, RequestIdField, parse_envelope};
     use super::*;
+
+    fn assert_valid_envelope(message: &str) {
+        let envelope = parse_envelope(message).expect("wire encoder must emit valid JSON");
+        assert_eq!(
+            envelope.jsonrpc,
+            DecodedField::Valid("2.0".to_string())
+        );
+    }
 
     #[test]
     fn initialize_advertises_the_actual_full_sync_coordinate_contract() {
         let message = initialize_response(&RequestId::Number("17".to_string()));
+        assert_valid_envelope(&message);
         assert!(message.contains("\"id\":17"));
         assert!(message.contains("\"positionEncoding\":\"utf-16\""));
         assert!(message.contains("\"change\":1"));
@@ -117,8 +127,34 @@ mod tests {
     }
 
     #[test]
+    fn every_wire_shape_round_trips_through_the_strict_envelope_parser() {
+        let number = RequestId::Number("-1.25e+2".to_string());
+        let text = RequestId::Text("request-🤖".to_string());
+        let messages = [
+            error_response(&number, -32601, "unknown \"method\""),
+            error_response_null_id(-32700, "parse error"),
+            invalid_request_response(Some(&text), "invalid request"),
+            null_response(&text),
+            file_progress_notification("file:///tmp/a b.lean", true),
+            file_progress_notification("file:///tmp/a b.lean", false),
+            clear_diagnostics_notification("file:///tmp/a b.lean"),
+            diagnostic_callback_failure_notification("file:///tmp/a b.lean"),
+            log_warning("warning with \n and 🤖"),
+        ];
+        for message in messages {
+            assert_valid_envelope(&message);
+        }
+
+        let response = parse_envelope(&null_response(&number)).expect("valid response");
+        assert_eq!(response.id, RequestIdField::Valid(number));
+        let response = parse_envelope(&null_response(&text)).expect("valid response");
+        assert_eq!(response.id, RequestIdField::Valid(text));
+    }
+
+    #[test]
     fn missing_terminal_diagnostic_is_non_authoritative_and_uri_bound() {
         let message = diagnostic_callback_failure_notification("file:///x y.lean");
+        assert_valid_envelope(&message);
         assert!(message.contains("\"outcome\":\"internal_fault\""));
         assert!(message.contains("\"authority\":false"));
         assert!(message.contains("diagnostic-callback-terminal-message"));
