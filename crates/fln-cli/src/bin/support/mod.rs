@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{BufReader, BufWriter, Write};
 
 use fln_core::diag::{
@@ -7,7 +9,7 @@ use fln_core::diag::{
     StructuredInternalFault,
 };
 use fln_core::outcome::BoundedText;
-use fln_core::pos::Position;
+use fln_core::pos::{FileMap, Position, RawPos};
 
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
@@ -138,15 +140,45 @@ fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
                 evidence: None,
             })
         }
-        Err(error) => lsp_error_snapshot(uri, &error.to_string()),
+        Err(error) => lsp_execution_error_snapshot(uri, source, &error),
     }
 }
 
+fn lsp_execution_error_snapshot(
+    uri: &str,
+    source: &[u8],
+    error: &fln::EngineExecutionError,
+) -> ProjectionSnapshot {
+    match error
+        .primary_source_offset()
+        .and_then(|offset| source_position_at(source, offset.0))
+    {
+        Some(position) => lsp_positioned_error_snapshot(uri, &error.to_string(), position),
+        None => lsp_error_snapshot(uri, &error.to_string()),
+    }
+}
+
+fn source_position_at(source: &[u8], offset: usize) -> Option<Position> {
+    let text = std::str::from_utf8(source).ok()?;
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return None;
+    }
+    Some(FileMap::of_string(text).to_position(RawPos::new(offset)))
+}
+
 fn lsp_error_snapshot(uri: &str, message: &str) -> ProjectionSnapshot {
+    lsp_positioned_error_snapshot(uri, message, Position { line: 1, column: 0 })
+}
+
+fn lsp_positioned_error_snapshot(
+    uri: &str,
+    message: &str,
+    pos: Position,
+) -> ProjectionSnapshot {
     ProjectionSnapshot::Complete {
         diagnostics: vec![StructuredDiagnostic {
             file_name: BoundedText::new(uri.to_owned()),
-            pos: Position { line: 1, column: 0 },
+            pos,
             end_pos: None,
             severity: Severity::Error,
             error_name: None,
