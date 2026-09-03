@@ -12,6 +12,8 @@ from .common import (
     DECODER,
     HEX40,
     HandoffError,
+    MAX_ACTIVE_PATH_CLAIMS,
+    MAX_ACTIVE_SEAM_CLAIMS,
     MAX_CAPSULE_COMMENT_BYTES,
     MAX_CAPSULES,
     MAX_NEGATIVE_EVIDENCE,
@@ -108,7 +110,10 @@ def semantic_seams(value: Any, label: str) -> list[str]:
             raise HandoffError(f"{label}[{index}] exceeds the 512-byte ceiling")
         if any(character in seam for character in ("\x00", "\n", "\r", "\t")):
             raise HandoffError(f"{label}[{index}] contains a forbidden control character")
-        normalized.append(" ".join(seam.split()))
+        parts = [" ".join(part.split()) for part in seam.split("/")]
+        if any(not part for part in parts):
+            raise HandoffError(f"{label}[{index}] has an empty hierarchy segment")
+        normalized.append(" / ".join(parts))
     if len(set(normalized)) != len(normalized):
         raise HandoffError(f"{label} contains duplicate normalized seams")
     return sorted(normalized)
@@ -381,7 +386,9 @@ def capsule_records(
     records: list[dict[str, Any]] = []
     missing: list[str] = []
     by_path: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    by_seam: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    by_seam: dict[tuple[str, ...], list[tuple[str, str]]] = defaultdict(list)
+    path_claim_count = 0
+    seam_claim_count = 0
     for row in rows:
         issue_id = row.get("id")
         status = row.get("status")
@@ -401,11 +408,23 @@ def capsule_records(
         if record["freshness"] in {"current", "reusable"}:
             owner = str(record.get("owner", ""))
             for path in record["tracked_blobs"]:
+                path_claim_count += 1
+                if path_claim_count > MAX_ACTIVE_PATH_CLAIMS:
+                    raise HandoffError(
+                        f"active tracked-blob claims exceed the {MAX_ACTIVE_PATH_CLAIMS}-claim ceiling"
+                    )
                 by_path[path].append((issue_id, owner))
             for seam in record["semantic_seams"]:
-                by_seam[seam].append((issue_id, owner))
+                seam_claim_count += 1
+                if seam_claim_count > MAX_ACTIVE_SEAM_CLAIMS:
+                    raise HandoffError(
+                        f"active semantic-seam claims exceed the {MAX_ACTIVE_SEAM_CLAIMS}-claim ceiling"
+                    )
+                by_seam[tuple(seam.split(" / "))].append((issue_id, owner))
 
-    def conflicts(source: dict[str, list[tuple[str, str]]], key: str) -> list[dict[str, Any]]:
+    def exact_conflicts(
+        source: dict[str, list[tuple[str, str]]], key: str
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for identity, claimants in sorted(source.items()):
             unique = sorted(set(claimants))
@@ -420,10 +439,33 @@ def capsule_records(
                 )
         return result
 
+    seam_conflicts: dict[tuple[str, ...], set[tuple[str, str]]] = defaultdict(set)
+    for seam, claimants in by_seam.items():
+        unique = set(claimants)
+        if len(unique) > 1:
+            seam_conflicts[seam].update(unique)
+        for width in range(1, len(seam)):
+            prefix = seam[:width]
+            prefix_claimants = set(by_seam.get(prefix, ()))
+            if prefix_claimants and prefix_claimants != unique:
+                combined = prefix_claimants | unique
+                if len(combined) > 1:
+                    seam_conflicts[prefix].update(combined)
+    rendered_seam_conflicts = [
+        {
+            "seam": " / ".join(seam),
+            "claimants": [
+                {"bead": bead, "owner": owner}
+                for bead, owner in sorted(claimants)
+            ],
+        }
+        for seam, claimants in sorted(seam_conflicts.items())
+    ]
+
     records.sort(key=lambda record: (record["freshness"], record["bead"]))
     return (
         records,
         sorted(missing),
-        conflicts(by_path, "path"),
-        conflicts(by_seam, "seam"),
+        exact_conflicts(by_path, "path"),
+        rendered_seam_conflicts,
     )
