@@ -194,7 +194,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn parsed_event<'a>(body: &'a [u8], event: u64) -> Result<(Direction, &'a str), String> {
+fn parsed_event(body: &[u8], event: u64) -> Result<(Direction, &str), String> {
     let text = std::str::from_utf8(body)
         .map_err(|_| format!("event {event} outer body is not valid UTF-8"))?;
     let envelope = parse_envelope(text).map_err(|error| match error {
