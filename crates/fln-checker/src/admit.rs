@@ -6070,10 +6070,34 @@ fn admit_class_block(
         });
     };
     let recursor_levels = recursor.declaration().level_parameters();
-    let Some(motive_universe) = recursor_levels.first() else {
-        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
-            name: recursor_name,
-        });
+    // Two eliminator shapes reach here, and the level telescope is what tells
+    // them apart. LARGE elimination prepends a fresh motive universe to the
+    // family's own (`Foo.rec.{v, u}`) and the motive lands in `Sort v`. SMALL
+    // elimination — a `Prop`-valued family whose constructor carries data, so
+    // the pin permits eliminating only back into `Prop` — carries NO motive
+    // universe at all (`Nonempty.rec.{u}`) and fixes the motive's result at
+    // `Sort 0`. Treating the family's own first universe as a motive universe
+    // is what made the small-elimination shape read as a malformed recursor.
+    //
+    // Which of the two a declaration claims is then pinned by the structural
+    // compare below, because the motive domain is part of the expected
+    // recursor: a declaration claiming one shape and stating the other fails.
+    // What is NOT re-derived here is whether the pin was *entitled* to the
+    // shape it claims (that a family is `Prop`-valued and non-subsingleton, so
+    // large elimination is unavailable) — the same standing this route already
+    // takes for large elimination, where eligibility is likewise not recomputed.
+    let small_elimination = recursor_levels == family_universes;
+    let motive_universe = if small_elimination {
+        None
+    } else {
+        match recursor_levels.first() {
+            Some(universe) => Some(universe),
+            None => {
+                return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                    name: recursor_name,
+                });
+            }
+        }
     };
     let recursor_reject = |stage: &'static str| {
         if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
@@ -6086,14 +6110,16 @@ fn admit_class_block(
     if recursor.declaration().safety() != ConstantSafety::Safe {
         return recursor_reject("safety");
     }
-    if recursor_levels.len() != family_universes.len() + 1 {
-        return recursor_reject("level-count");
-    }
-    if recursor_levels.get(1..) != Some(family_universes) {
-        return recursor_reject("family-level");
-    }
-    if family_universes.contains(motive_universe) {
-        return recursor_reject("motive-level-collides");
+    if let Some(motive_universe) = motive_universe {
+        if recursor_levels.len() != family_universes.len() + 1 {
+            return recursor_reject("level-count");
+        }
+        if recursor_levels.get(1..) != Some(family_universes) {
+            return recursor_reject("family-level");
+        }
+        if family_universes.contains(motive_universe) {
+            return recursor_reject("motive-level-collides");
+        }
     }
     if recursor_metadata.mutual() != std::slice::from_ref(name) {
         return recursor_reject("mutual");
@@ -6165,7 +6191,12 @@ fn admit_class_block(
     let Some(d_under_params) = d_application_at(&mut builder, parameter_count) else {
         return defer("motive-domain-depth");
     };
-    let motive_sort = builder.sort_parameter(motive_universe);
+    // Large elimination lands in the fresh motive universe; small elimination
+    // lands in `Prop` (`Sort 0`), which is exactly why it needs no universe.
+    let motive_sort = match motive_universe {
+        Some(universe) => builder.sort_parameter(universe),
+        None => builder.sort_zero(),
+    };
     let motive_domain = builder.forall("t", BinderStyle::Default, d_under_params, motive_sort);
     imported_units += 4;
 
