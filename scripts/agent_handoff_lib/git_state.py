@@ -52,7 +52,7 @@ def blob_bytes(
     repo: Path, commit: str, path: str, limit: int, label: str
 ) -> bytes:
     entry = tree_entry(repo, commit, path)
-    if entry is None or entry["kind"] != "blob":
+    if entry is None or entry["kind"] != "blob" or entry["mode"] == "120000":
         raise HandoffError(f"{label} is not a regular tracked blob at {commit}: {path}")
     try:
         size = int(git(repo, "cat-file", "-s", entry["blob"]).stdout.strip())
@@ -84,6 +84,31 @@ def blob_bytes(
     return process.stdout
 
 
+def worktree_blob_bytes(
+    repo: Path,
+    commit: str,
+    path: str,
+    limit: int,
+    label: str,
+) -> bytes:
+    anchored = blob_bytes(repo, commit, path, limit, label)
+    candidate = repo / path
+    if not candidate.is_file() or candidate.is_symlink():
+        raise HandoffError(f"{label} must be a regular working-tree file: {path}")
+    try:
+        with candidate.open("rb") as handle:
+            current = handle.read(limit + 1)
+    except OSError as exc:
+        raise HandoffError(f"cannot read current {label} {path}: {exc}") from exc
+    if len(current) > limit:
+        raise HandoffError(f"current {label} exceeds the {limit}-byte ceiling: {path}")
+    if current != anchored:
+        raise HandoffError(
+            f"current {label} differs from the anchored HEAD blob: {path}"
+        )
+    return current
+
+
 def control_file_records(repo: Path, commit: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for path in CONTROL_PATHS:
@@ -95,7 +120,7 @@ def control_file_records(repo: Path, commit: str) -> list[dict[str, Any]]:
     return records
 
 
-def recent_commits(repo: Path, limit: int) -> list[dict[str, Any]]:
+def recent_commits(repo: Path, commit: str, limit: int) -> list[dict[str, Any]]:
     if not 1 <= limit <= MAX_RECENT_COMMITS:
         raise HandoffError(f"--recent must be in [1, {MAX_RECENT_COMMITS}]")
     raw = git(
@@ -104,6 +129,7 @@ def recent_commits(repo: Path, limit: int) -> list[dict[str, Any]]:
         "-z",
         f"-n{limit}",
         "--format=%H%x00%T%x00%cI%x00%s%x00%b",
+        commit,
     ).stdout
     fields = raw.split("\x00")
     if fields and fields[-1] == "":
@@ -112,8 +138,8 @@ def recent_commits(repo: Path, limit: int) -> list[dict[str, Any]]:
         raise HandoffError("git log emitted a malformed NUL-delimited record set")
     records: list[dict[str, Any]] = []
     for offset in range(0, len(fields), 5):
-        commit, tree, committed_at, subject, body = fields[offset : offset + 5]
-        if not HEX40.fullmatch(commit) or not HEX40.fullmatch(tree):
+        item_commit, tree, committed_at, subject, body = fields[offset : offset + 5]
+        if not HEX40.fullmatch(item_commit) or not HEX40.fullmatch(tree):
             raise HandoffError("git log emitted a malformed commit or tree identity")
         beads: list[str] = []
         for line in body.splitlines():
@@ -126,7 +152,7 @@ def recent_commits(repo: Path, limit: int) -> list[dict[str, Any]]:
                 )
         records.append(
             {
-                "commit": commit,
+                "commit": item_commit,
                 "tree": tree,
                 "committed_at": committed_at,
                 "subject": subject,
@@ -153,6 +179,8 @@ def evidence_frontiers(repo: Path, commit: str) -> list[dict[str, Any]]:
             raise HandoffError(
                 f"frontier evidence exceeds the {MAX_EVIDENCE_FILES}-file ceiling"
             )
+        if not HEX40.fullmatch(sha):
+            raise HandoffError(f"git returned a malformed frontier blob for {path}")
         if size_text == "-":
             size = None
         else:

@@ -7,16 +7,21 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-SCHEMA = "fln.agent-handoff/1"
-VERIFY_SCHEMA = "fln.agent-handoff-verification/1"
+SCHEMA = "fln.agent-handoff/2"
+VERIFY_SCHEMA = "fln.agent-handoff-verification/2"
 CAPSULE_SCHEMA = "fln.agent-frontier/1"
 MAX_ISSUES_BYTES = 64 * 1024 * 1024
+MAX_OVERLAY_BYTES = 4 * 1024 * 1024
+MAX_SELECTOR_BYTES = 2 * 1024 * 1024
 MAX_CAPSULE_COMMENT_BYTES = 2 * 1024 * 1024
 MAX_CAPSULES = 4096
 MAX_TRACKED_BLOBS = 256
+MAX_SEMANTIC_SEAMS = 256
+MAX_NEGATIVE_EVIDENCE = 128
 MAX_RECENT_COMMITS = 64
 MAX_READY_CANDIDATES = 100
 MAX_EVIDENCE_FILES = 512
@@ -70,6 +75,10 @@ def canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def die(reason: str, code: int = 2, *, schema: str = SCHEMA) -> int:
     sys.stderr.buffer.write(
         canonical_json({"schema": schema, "outcome": "refused", "reason": reason})
@@ -117,6 +126,53 @@ def safe_relative_path(value: Any, label: str) -> str:
     return path.as_posix()
 
 
+def require_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise HandoffError(f"{label} must be a non-empty string")
+    if "\x00" in value:
+        raise HandoffError(f"{label} must not contain NUL")
+    return value
+
+
+def require_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise HandoffError(f"{label} must be boolean")
+    return value
+
+
+def require_int(value: Any, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise HandoffError(f"{label} must be an integer in [{minimum}, {maximum}]")
+    return value
+
+
+def require_optional_string(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    return require_string(value, label)
+
+
+def require_string_list(
+    value: Any,
+    label: str,
+    *,
+    maximum: int,
+    allow_empty: bool = True,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise HandoffError(f"{label} must be an array")
+    if len(value) > maximum:
+        raise HandoffError(f"{label} exceeds the {maximum}-item ceiling")
+    if not allow_empty and not value:
+        raise HandoffError(f"{label} must not be empty")
+    result: list[str] = []
+    for index, item in enumerate(value):
+        result.append(require_string(item, f"{label}[{index}]"))
+    if len(set(result)) != len(result):
+        raise HandoffError(f"{label} must not contain duplicates")
+    return result
+
+
 def git(
     repo: Path, *arguments: str, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
@@ -151,25 +207,23 @@ def repository_root(candidate: Path) -> Path:
     return root
 
 
-def require_string(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise HandoffError(f"{label} must be a non-empty string")
-    return value
-
-
-def issue_rows(path: Path) -> tuple[list[dict[str, Any]], str]:
-    raw = bounded_read(path, MAX_ISSUES_BYTES, "Beads issue store")
+def issue_rows_bytes(raw: bytes, label: str = "Beads issue store") -> tuple[list[dict[str, Any]], str]:
     rows: list[dict[str, Any]] = []
     for line_number, raw_line in enumerate(raw.splitlines(), 1):
         if not raw_line.strip():
             continue
-        value = load_json_bytes(raw_line, f"Beads line {line_number}")
+        value = load_json_bytes(raw_line, f"{label} line {line_number}")
         if not isinstance(value, dict):
-            raise HandoffError(f"Beads line {line_number} must be an object")
+            raise HandoffError(f"{label} line {line_number} must be an object")
         rows.append(value)
     if not rows:
-        raise HandoffError("Beads issue store contains no issue rows")
-    return rows, hashlib.sha256(raw).hexdigest()
+        raise HandoffError(f"{label} contains no issue rows")
+    return rows, sha256_hex(raw)
+
+
+def issue_rows(path: Path) -> tuple[list[dict[str, Any]], str]:
+    raw = bounded_read(path, MAX_ISSUES_BYTES, "Beads issue store")
+    return issue_rows_bytes(raw)
 
 
 def environment_facts() -> dict[str, Any]:
@@ -197,13 +251,45 @@ def environment_facts() -> dict[str, Any]:
 
 
 def write_no_clobber(path: Path, payload: bytes) -> None:
-    if not path.parent.is_dir():
-        raise HandoffError(f"output parent directory does not exist: {path.parent}")
+    parent = path.parent
+    if not parent.is_dir():
+        raise HandoffError(f"output parent directory does not exist: {parent}")
+    temporary: Path | None = None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.handoff-", dir=parent
+        )
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except OSError as exc:
+            raise HandoffError(f"refusing to replace output path {path}: {exc}") from exc
+        try:
+            directory_descriptor = os.open(parent, os.O_RDONLY)
+        except OSError:
+            directory_descriptor = None
+        if directory_descriptor is not None:
+            try:
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError:
+                    pass
+            finally:
+                os.close(directory_descriptor)
+    except HandoffError:
+        raise
     except OSError as exc:
-        raise HandoffError(f"refusing to replace output path {path}: {exc}") from exc
-    with os.fdopen(descriptor, "wb", closefd=True) as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+        raise HandoffError(f"cannot publish output path {path}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass

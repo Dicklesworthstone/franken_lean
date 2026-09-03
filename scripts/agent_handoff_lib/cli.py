@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--include-environment", action="store_true")
     snapshot.add_argument("--output", type=Path)
     verify = subparsers.add_parser("verify")
-    verify.add_argument("capsule", help="Capsule path, or '-' for stdin")
+    verify.add_argument("capsule", help="Snapshot path, or '-' for stdin")
     verify.add_argument("--repo", type=Path, default=Path("."))
     verify.add_argument("--current", action="store_true")
     return root
