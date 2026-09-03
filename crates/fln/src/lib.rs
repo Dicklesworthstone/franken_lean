@@ -3044,6 +3044,7 @@ impl Engine {
                 .map_err(|error| EngineExecutionError::BatchCommand {
                     index: command_index,
                     error: Box::new(EngineExecutionError::Frontend(error)),
+                    at: Some(original_offset),
                 })?;
             if parsed.kind() == fln_parse::SourceCommandKind::Check {
                 let checked = match engine.check_parsed_source_command(
@@ -3063,6 +3064,7 @@ impl Engine {
                         return Err(EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error),
+                            at: Some(original_offset),
                         });
                     }
                 };
@@ -3082,6 +3084,7 @@ impl Engine {
                         .map_err(|error| EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error),
+                            at: Some(original_offset),
                         })?;
                     fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
                         .map_err(DefinitionFrontendError::Elaborate)
@@ -3089,6 +3092,7 @@ impl Engine {
                         .map_err(|error| EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error),
+                            at: Some(original_offset),
                         })?
                 }
                 fln_parse::SourceCommandKind::Definition => {
@@ -3098,6 +3102,7 @@ impl Engine {
                         .map_err(|error| EngineExecutionError::BatchCommand {
                             index: command_index,
                             error: Box::new(error),
+                            at: Some(original_offset),
                         })?
                 }
                 fln_parse::SourceCommandKind::Check => {
@@ -3116,6 +3121,7 @@ impl Engine {
                     return Err(EngineExecutionError::BatchCommand {
                         index: command_index,
                         error: Box::new(error),
+                        at: Some(original_offset),
                     });
                 }
             };
@@ -3184,6 +3190,7 @@ impl Engine {
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: terminal_index,
                 error: Box::new(EngineExecutionError::Frontend(error)),
+                at: Some(terminal_offset),
             })?;
         if terminal.kind() != fln_parse::SourceCommandKind::Check {
             return Err(EngineExecutionError::TerminalCheckRequired);
@@ -3195,6 +3202,7 @@ impl Engine {
                 .map_err(|error| EngineExecutionError::BatchCommand {
                     index,
                     error: Box::new(EngineExecutionError::Frontend(error)),
+                    at: Some(*original_offset),
                 })?;
             if parsed.kind() != fln_parse::SourceCommandKind::Definition {
                 return Err(EngineExecutionError::TerminalCheckDefinitionPrefix { index });
@@ -3218,6 +3226,7 @@ impl Engine {
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: terminal_index,
                 error: Box::new(error),
+                at: Some(terminal_offset),
             })?;
         Ok(match checked {
             Outcome::Complete(check) => Outcome::Complete(TerminalSourceCheck {
@@ -3299,6 +3308,7 @@ impl Engine {
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: terminal_index,
                         error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(terminal_offset),
                     })?;
                 if terminal.kind() != fln_parse::SourceCommandKind::Check {
                     return Err(EngineExecutionError::TerminalCheckRequired);
@@ -3317,6 +3327,7 @@ impl Engine {
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index,
                         error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(*original_offset),
                     })?;
                 if parsed.kind() != fln_parse::SourceCommandKind::Definition {
                     return Err(EngineExecutionError::TerminalCheckModuleDefinitionPrefix {
@@ -3363,6 +3374,7 @@ impl Engine {
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: query_index,
                 error: Box::new(error),
+                at: None,
             })?;
         Ok(match checked {
             Outcome::Complete(check) => {
@@ -3550,6 +3562,7 @@ impl Engine {
                         error: Box::new(EngineExecutionError::Frontend(
                             NatDefinitionFrontendError::Parse(error),
                         )),
+                        at: None,
                     }
                 })?;
             let requested = commands.len().checked_add(partitioned.len()).ok_or(
@@ -3593,6 +3606,7 @@ impl Engine {
                     error: Box::new(EngineExecutionError::Frontend(
                         DefinitionFrontendError::Parse(error),
                     )),
+                    at: None,
                 }
             })?;
             if !partitioned.imports.is_empty() {
@@ -4070,6 +4084,7 @@ impl Engine {
                     return Err(EngineExecutionError::BatchCommand {
                         index,
                         error: Box::new(error),
+                        at: None,
                     });
                 }
             };
@@ -6176,6 +6191,11 @@ pub enum EngineExecutionError {
     BatchCommand {
         index: usize,
         error: Box<EngineExecutionError>,
+        /// Byte offset (file coordinates) of the command that failed, when the
+        /// caller knew it. Locates an elaboration or kernel refusal — which carry
+        /// no source position of their own — to the command's line; a parse
+        /// refusal keeps its own token-precise offset in preference.
+        at: Option<fln_parse::BytePos>,
     },
     StandaloneCheckRequired,
     TerminalCheckRequired,
@@ -6223,7 +6243,11 @@ impl EngineExecutionError {
     /// position exists for those.
     pub fn primary_source_offset(&self) -> Option<fln_parse::BytePos> {
         match self {
-            Self::BatchCommand { error, .. } => error.primary_source_offset(),
+            // Prefer the inner error's own token-precise offset (a parse refusal
+            // has one) and fall back to the command-level offset the loop
+            // attached — the only position an elaboration or kernel refusal can
+            // offer.
+            Self::BatchCommand { error, at, .. } => error.primary_source_offset().or(*at),
             Self::Frontend(error) => error.primary_offset(),
             _ => None,
         }
@@ -6317,7 +6341,7 @@ impl fmt::Display for EngineExecutionError {
                 formatter,
                 "could not reserve {requested} entries for {resource}"
             ),
-            Self::BatchCommand { index, error } => {
+            Self::BatchCommand { index, error, .. } => {
                 write!(
                     formatter,
                     "definition batch command {index} failed: {error}"
@@ -6394,6 +6418,7 @@ impl From<EngineAdmissionError> for EngineExecutionError {
             EngineAdmissionError::BatchDeclaration { index, error } => Self::BatchCommand {
                 index,
                 error: Box::new(Self::from(*error)),
+                at: None,
             },
             EngineAdmissionError::UnsupportedDeclaration { kind } => {
                 Self::UnsupportedDeclaration { kind }
@@ -9730,6 +9755,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 1,
                 error,
+                ..
             } if matches!(*error, EngineExecutionError::KernelRejected { .. })
         ));
         assert_eq!(engine.logical_root(&options), base_root);
@@ -9903,6 +9929,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 1,
                 error,
+                ..
             } if matches!(*error, EngineExecutionError::StandaloneCheckRequired)
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10008,6 +10035,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 1,
                 error,
+                ..
             } if matches!(*error, EngineExecutionError::Frontend(_))
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10155,6 +10183,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 0,
                 error,
+                ..
             } if matches!(*error, EngineExecutionError::Frontend(_))
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10171,6 +10200,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 3,
                 error,
+                ..
             } if matches!(*error, EngineExecutionError::Frontend(_))
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10329,7 +10359,7 @@ mod tests {
                     test_limits(),
                 )
                 .expect_err("a refused query exposes no completed dependency engine"),
-            EngineExecutionError::BatchCommand { index: 1, error }
+            EngineExecutionError::BatchCommand { index: 1, error, .. }
                 if matches!(*error, EngineExecutionError::Frontend(_))
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10344,7 +10374,7 @@ mod tests {
             engine
                 .check_terminal_source_modules(&empty_graph, &main, &options, constrained)
                 .expect_err("an independent-checker non-answer vetoes an imported query"),
-            EngineExecutionError::BatchCommand { index: 0, error }
+            EngineExecutionError::BatchCommand { index: 0, error, .. }
                 if matches!(*error, EngineExecutionError::CouncilHalted { .. })
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10465,6 +10495,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 0,
                 error,
+                ..
             } if matches!(*error, EngineExecutionError::Frontend(_))
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -10562,7 +10593,7 @@ mod tests {
                     test_limits(),
                 )
                 .expect_err("a dependency check cannot observe its later definition"),
-            EngineExecutionError::BatchCommand { index: 0, error }
+            EngineExecutionError::BatchCommand { index: 0, error, .. }
                 if matches!(*error, EngineExecutionError::Frontend(_))
         ));
         assert_eq!(engine.logical_root(&options), before);
@@ -12027,6 +12058,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 1,
                 error,
+                ..
             } if matches!(
                 error.as_ref(),
                 EngineExecutionError::UnsupportedDeclaration { kind: "axiom" }
@@ -12556,6 +12588,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 1,
                 error,
+                ..
             } if matches!(
                 error.as_ref(),
                 EngineExecutionError::Frontend(NatDefinitionFrontendError::Parse(
@@ -12635,6 +12668,7 @@ mod tests {
             EngineExecutionError::BatchCommand {
                 index: 1,
                 error,
+                ..
             } if matches!(
                 error.as_ref(),
                 EngineExecutionError::KernelRejected {

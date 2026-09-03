@@ -13392,6 +13392,7 @@ mod tests {
             error: Box::new(fln::EngineExecutionError::CouncilHalted {
                 summary: "independent checker did not answer".to_owned(),
             }),
+            at: None,
         };
         assert_eq!(
             execution_error_disposition(&inconclusive),
@@ -13403,6 +13404,7 @@ mod tests {
             error: Box::new(fln::EngineExecutionError::CheckerBridge {
                 detail: "projection mismatch".to_owned(),
             }),
+            at: None,
         };
         assert_eq!(
             execution_error_disposition(&internal),
@@ -13428,6 +13430,7 @@ mod tests {
                     requested: usize::MAX,
                 },
             )),
+            at: None,
         };
         assert_eq!(
             execution_error_disposition(&lowering_budget),

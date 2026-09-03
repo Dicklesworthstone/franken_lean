@@ -67,9 +67,11 @@ fn real_fln_server_executes_full_document_lifecycle() {
             && message.contains("\"positionEncoding\":\"utf-16\"")
             && message.contains("\"change\":1")
     }));
-    assert!(messages.iter().any(|message| {
-        message.contains("\"id\":99") && message.contains("\"result\":null")
-    }));
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("\"id\":99") && message.contains("\"result\":null")
+        })
+    );
 
     let progress_started = messages
         .iter()
@@ -201,5 +203,53 @@ fn syntax_error_reports_a_real_utf16_source_position() {
     assert!(
         !diagnostic.contains(r#""line":1,"character":21}"#),
         "diagnostic kept the raw codepoint column; source-aware UTF-16 conversion did not run: {diagnostic}"
+    );
+}
+
+// A kernel rejection — the common "type error" in the bounded source subset —
+// carries no source position of its own, so before route (a) it landed at the
+// file head. The command loop now attaches the failing command's byte offset to
+// `EngineExecutionError::BatchCommand`, and `primary_source_offset` falls back to
+// it, so the diagnostic lands on the command's line.
+//
+// Document:
+//   line 1 (0-based 0): `def ok : Nat := 1`   — valid
+//   line 2 (0-based 1): `def bad : Nat := "str"` — a `String` body under a `Nat`
+//                        declaration; the kernel rejects it (DefinitionTypeMismatch).
+// The failing command starts at byte 18 (the start of line 2), so the diagnostic
+// must publish at line 1, not the hardcoded file-head line 0.
+#[test]
+fn kernel_rejection_reports_the_command_line_not_the_file_head() {
+    let uri = "file:///tmp/KernelReject.lean";
+    let (status, messages, stderr) = run_fln_session(&[
+        r#"{"jsonrpc":"2.0","id":"init-1","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/KernelReject.lean","languageId":"lean4","version":1,"text":"def ok : Nat := 1\ndef bad : Nat := \"str\""}}}"#,
+        r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ]);
+
+    assert!(status.success(), "stderr: {stderr}");
+    let diagnostic = messages
+        .iter()
+        .find(|message| {
+            message.contains("publishDiagnostics")
+                && message.contains(uri)
+                && message.contains("diagnostics\":[{")
+        })
+        .unwrap_or_else(|| panic!("no nonempty publishDiagnostics for {uri}: {messages:#?}"));
+
+    // Sanity: this really is the kernel type-mismatch rejection, not a parse error.
+    assert!(
+        diagnostic.contains("does not match") || diagnostic.contains("DefinitionTypeMismatch"),
+        "expected a kernel type-mismatch rejection, got: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(r#""start":{"line":1,"character":0}"#),
+        "expected the kernel rejection at line 1 (the failing command), got: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains(r#""start":{"line":0,"character":0}"#),
+        "kernel rejection regressed to the hardcoded file-head position: {diagnostic}"
     );
 }
