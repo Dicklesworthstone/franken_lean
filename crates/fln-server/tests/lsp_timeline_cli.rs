@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -167,20 +166,21 @@ fn cancellation_after_response_fails_without_a_receipt() {
 }
 
 #[test]
-fn option_terminator_allows_a_dash_prefixed_path() {
-    let mut arguments = vec![OsString::from("--")];
-    let path = write_timeline("dash-path", &timeline(&valid_events()));
-    let dash_path = path.with_file_name(format!(
-        "--{}",
-        path.file_name().unwrap().to_string_lossy()
-    ));
-    fs::rename(&path, &dash_path).unwrap();
-    arguments.push(dash_path.clone().into_os_string());
-    let output = timeline_binary().args(arguments).output().unwrap();
+fn option_terminator_allows_a_real_dash_prefixed_path() {
+    let directory = scratch("dash-path-directory").with_extension("");
+    fs::create_dir(&directory).unwrap();
+    let relative = PathBuf::from("--session.timeline");
+    fs::write(directory.join(&relative), timeline(&valid_events())).unwrap();
+
+    let output = timeline_binary()
+        .current_dir(&directory)
+        .args(["--", "--session.timeline"])
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fs::remove_file(dash_path).unwrap();
+    fs::remove_dir_all(directory).unwrap();
 }
