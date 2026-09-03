@@ -2060,7 +2060,10 @@ fn init_heq_entries() -> Vec<ConstantEntry> {
         ),
     );
     let refl_alpha_a = Expr::app(refl_at(bv(2)), bv(1));
-    let minor_domain = Expr::app(Expr::app(bv(0), bv(1)), refl_alpha_a);
+    // The refl minor proves `HEq α a α a`, so the motive is applied to three
+    // arguments — β := α (bv 2), b := a (bv 1), major := `HEq.refl α a` — exactly
+    // as the pinned `HEq.rec` states it: `motive α a (HEq.refl α a)`.
+    let minor_domain = Expr::app(Expr::app(Expr::app(bv(0), bv(2)), bv(1)), refl_alpha_a);
     let result = Expr::app(Expr::app(Expr::app(bv(4), bv(2)), bv(1)), bv(0));
     let rec_type = primary_pi(
         "α",
@@ -2168,7 +2171,7 @@ fn init_heq_entries() -> Vec<ConstantEntry> {
 }
 
 #[test]
-fn kr600_803_init_heq_block_defers_typed_on_preamble_sort_arguments() {
+fn kr600_803_init_heq_block_is_reconstructed() {
     let entries = init_heq_entries();
     let verdict = admit_inductive(
         &ConstantEnvironment::empty(),
@@ -2176,24 +2179,16 @@ fn kr600_803_init_heq_block_defers_typed_on_preamble_sort_arguments() {
         AdmissionBudget::unlimited(),
         EnvironmentBudget::unlimited(),
     );
-    // The route recognizes the block and verifies the inductive type,
-    // reflector, and eliminator shapes; the member preamble's sort inference
-    // then defers on `HEq α a β b`'s sort-typed arguments instead of admitting
-    // half-verified. When the preamble inference extends to those
-    // applications, this test graduates to the admitted contract.
-    assert!(
-        !verdict.is_admitted(),
-        "unexpected admission before preamble sort-argument support: {verdict:?}"
-    );
-    assert!(
-        matches!(
-            verdict,
-            fln_checker::admit::InductiveVerdict::Deferred(
-                fln_checker::admit::InductiveSupportLimit::MemberPreamble { .. }
-            )
-        ),
-        "expected the typed member-preamble deferral, got: {verdict:?}"
-    );
+    // The heterogeneous-equality block admits end to end: the inductive type,
+    // reflector, and eliminator all reconstruct against the pin. The eliminator's
+    // refl minor instantiates the motive at the diagonal — `motive α a (HEq.refl
+    // α a)`, three arguments — which the earlier two-argument reconstruction got
+    // wrong; the real pinned `Init.HEq` council run now clears this member too.
+    assert!(verdict.is_admitted(), "exact Init.HEq block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 3);
 }
 #[test]
 fn kr600_803_init_heq_refuses_a_forged_reflector_field_count() {

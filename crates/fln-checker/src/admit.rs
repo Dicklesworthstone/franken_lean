@@ -8184,10 +8184,17 @@ fn heq_recursor_type(
     let refl_alpha = b.apply(refl_const, refl_alpha_index);
     let refl_a_index = b.bvar(1);
     let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+    // The refl case proves `HEq α a α a`, so the motive is instantiated at its
+    // β-index := α, its b-index := a, and its major := `HEq.refl α a`: three
+    // arguments (`motive α a (HEq.refl α a)`), exactly as the pinned eliminator
+    // states. A two-argument `motive a (HEq.refl α a)` omits the leading β := α
+    // and never meets the real bytes.
     let motive_var = b.bvar(0);
+    let minor_beta = b.bvar(2);
+    let motive_beta = b.apply(motive_var, minor_beta);
     let minor_a = b.bvar(1);
-    let motive_a = b.apply(motive_var, minor_a);
-    let minor_type = b.apply(motive_a, refl_alpha_a);
+    let motive_beta_a = b.apply(motive_beta, minor_a);
+    let minor_type = b.apply(motive_beta_a, refl_alpha_a);
     // Result, scope: α(6), a(5), motive(4), minor(3), β(2), b(1), h(0).
     let motive_result = b.bvar(4);
     let result_beta = b.bvar(2);
@@ -8231,10 +8238,14 @@ fn heq_rule_rhs(
     let refl_alpha = b.apply(refl_const, refl_alpha_index);
     let refl_a_index = b.bvar(1);
     let refl_alpha_a = b.apply(refl_alpha, refl_a_index);
+    // The minor's type mirrors the eliminator's: `motive α a (HEq.refl α a)`,
+    // the motive instantiated at β := α, b := a, major := `HEq.refl α a`.
     let motive_var = b.bvar(0);
+    let minor_beta = b.bvar(2);
+    let motive_beta = b.apply(motive_var, minor_beta);
     let minor_a = b.bvar(1);
-    let motive_a = b.apply(motive_var, minor_a);
-    let minor_type = b.apply(motive_a, refl_alpha_a);
+    let motive_beta_a = b.apply(motive_beta, minor_a);
+    let minor_type = b.apply(motive_beta_a, refl_alpha_a);
     // The iota contraction for refl is the minor premise itself.
     let result = b.bvar(0);
     let m_1 = b.lambda("m_1", BinderStyle::Default, minor_type, result);
