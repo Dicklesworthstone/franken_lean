@@ -61,7 +61,7 @@ use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, Verdict};
 use fln_kernel::{Declaration, check};
 use fln_parse::{
-    NatDefinitionParseError, ParsedDefinition, ParsedNatDefinition, parse_definition,
+    BytePos, NatDefinitionParseError, ParsedDefinition, ParsedNatDefinition, parse_definition,
     parse_nat_definition,
 };
 use fln_syntax::tree::Syntax;
@@ -114,6 +114,23 @@ impl std::error::Error for NatDefinitionElabError {}
 pub enum NatDefinitionFrontendError {
     Parse(NatDefinitionParseError),
     Elaborate(NatDefinitionElabError),
+}
+
+impl NatDefinitionFrontendError {
+    /// The primary source byte offset this refusal points at, or `None` when no
+    /// user-facing position is available.
+    ///
+    /// Parse refusals delegate to [`NatDefinitionParseError::primary_offset`].
+    /// Elaboration refusals return `None`: [`NatDefinitionElabError`] does not
+    /// yet capture the offending token's position (the `Syntax` node carries it,
+    /// but the error type discards it), so a type error cannot be located in the
+    /// source until that variant is extended.
+    pub fn primary_offset(&self) -> Option<BytePos> {
+        match self {
+            Self::Parse(error) => error.primary_offset(),
+            Self::Elaborate(_) => None,
+        }
+    }
 }
 
 /// Compatibility name for the wider bounded source door.

@@ -6211,6 +6211,25 @@ pub enum EngineExecutionError {
     Codec(CodecError),
 }
 
+impl EngineExecutionError {
+    /// The primary source byte offset this failure points at, or `None`.
+    ///
+    /// A per-command failure is unwrapped from [`EngineExecutionError::BatchCommand`],
+    /// and a frontend refusal delegates to
+    /// [`NatDefinitionFrontendError::primary_offset`], so a parse error yields the
+    /// offending byte (already in the source file's coordinate system), while an
+    /// elaboration refusal, a kernel rejection, an inconclusive/fault non-answer,
+    /// or a structural planning fault yields `None` — no user-facing source
+    /// position exists for those.
+    pub fn primary_source_offset(&self) -> Option<fln_parse::BytePos> {
+        match self {
+            Self::BatchCommand { error, .. } => error.primary_source_offset(),
+            Self::Frontend(error) => error.primary_offset(),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for EngineExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

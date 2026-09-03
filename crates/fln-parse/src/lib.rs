@@ -177,6 +177,24 @@ impl NatDefinitionParseError {
             Self::Build(error) => Self::Build(error),
         }
     }
+
+    /// The primary source byte offset this refusal points at, in whatever
+    /// coordinate system the error currently carries (already rebased into the
+    /// original file by [`with_original_offset`](Self::with_original_offset) or
+    /// [`rebase_from_normalized_slice`](Self::rebase_from_normalized_slice) at
+    /// the point a caller reports it).
+    ///
+    /// Returns `None` for [`NatDefinitionParseError::Build`], an internal syntax
+    /// construction fault that carries no user-facing parser position. A
+    /// [`Lexical`](Self::Lexical) refusal reports the first diagnostic's offset.
+    pub fn primary_offset(&self) -> Option<BytePos> {
+        match self {
+            Self::Source(SourceError::NotUtf8 { at }) => Some(*at),
+            Self::Lexical { diagnostics } => diagnostics.first().map(|diagnostic| diagnostic.at),
+            Self::OutsideSeedGrammar { at, .. } => Some(*at),
+            Self::Build(_) => None,
+        }
+    }
 }
 
 impl From<BuildError> for NatDefinitionParseError {

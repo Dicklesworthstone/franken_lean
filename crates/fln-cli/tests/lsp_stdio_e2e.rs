@@ -154,3 +154,52 @@ fn fln_serve_lsp_rejects_trailing_arguments_before_transport_startup() {
         "fln: serve-lsp does not accept arguments\n"
     );
 }
+
+// A syntax error must publish a diagnostic at the real source position, in LSP
+// UTF-16 columns — not the file-head fallback the compatibility `project` entry
+// produced. This exercises the full CLI bridge: the parser's byte offset is
+// rebased into the file, converted to a Lean line/codepoint column, and the
+// exact unsaved document is passed to `project_with_sources` so the codepoint
+// column becomes a UTF-16 code unit.
+//
+// The document is:
+//   line 1 (0-based 0): `def ok : Nat := 1`   — valid, so a good command does
+//                                                not suppress a later error
+//   line 2 (0-based 1): `def s : String := "🤖"@more`
+// The offending `@` sits after `def s : String := "🤖"`. Its codepoint column is
+// 21 (`def s : String := "` = 19, `🤖` = 1 codepoint, `"` = 1); its UTF-16 column
+// is 22 because `🤖` is two UTF-16 code units. Asserting 22 (not 21) proves the
+// source-aware conversion actually ran — a regression to `project` would leave
+// the raw codepoint column 21, and the pre-fix code hardcoded line 0 column 0.
+#[test]
+fn syntax_error_reports_a_real_utf16_source_position() {
+    let uri = "file:///tmp/PositionedError.lean";
+    let (status, messages, stderr) = run_fln_session(&[
+        r#"{"jsonrpc":"2.0","id":"init-1","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/PositionedError.lean","languageId":"lean4","version":1,"text":"def ok : Nat := 1\ndef s : String := \"🤖\"@more"}}}"#,
+        r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ]);
+
+    assert!(status.success(), "stderr: {stderr}");
+    let diagnostic = messages
+        .iter()
+        .find(|message| message.contains("publishDiagnostics") && message.contains(uri))
+        .unwrap_or_else(|| panic!("no publishDiagnostics for {uri}: {messages:#?}"));
+
+    assert!(
+        diagnostic.contains(r#""start":{"line":1,"character":22}"#),
+        "expected the diagnostic at line 1 (0-based) UTF-16 character 22, got: {diagnostic}"
+    );
+    // The pre-fix behaviour: a file-head fallback at line 0, column 0.
+    assert!(
+        !diagnostic.contains(r#""start":{"line":0,"character":0}"#),
+        "diagnostic regressed to the hardcoded file-head position: {diagnostic}"
+    );
+    // The unconverted codepoint column would be 21; UTF-16 conversion makes it 22.
+    assert!(
+        !diagnostic.contains(r#""line":1,"character":21}"#),
+        "diagnostic kept the raw codepoint column; source-aware UTF-16 conversion did not run: {diagnostic}"
+    );
+}

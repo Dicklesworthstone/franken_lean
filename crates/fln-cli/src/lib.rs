@@ -10794,7 +10794,13 @@ fn serve_lsp() -> MultiplexerOutput {
 
     let mut on_did_open = move |uri: &str, text: &str| -> Vec<String> {
         let snapshot = lsp_source_snapshot(uri, text.as_bytes());
-        let mut messages = match fln_server::project(lsp_request, &snapshot) {
+        // Pass the exact unsaved document as the projection source so diagnostic
+        // columns (Lean codepoint columns) are converted to the LSP UTF-16 code
+        // units the editor expects. The compatibility `project` entry supplies no
+        // source and silently leaves non-ASCII columns wrong.
+        let sources = [fln_server::LspSource::new(uri, text)];
+        let mut messages = match fln_server::project_with_sources(lsp_request, &snapshot, &sources)
+        {
             Ok(projection) => projection.messages,
             Err(_refusal) => Vec::new(),
         };
@@ -10898,22 +10904,68 @@ fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
                 evidence: None,
             })
         }
-        Err(error) => lsp_error_snapshot(uri, &error.to_string()),
+        Err(error) => lsp_execution_error_snapshot(uri, source, &error),
     }
 }
 
-/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at
-/// the start of the file. Position (1, 0) is the Lean convention for
-/// file-level errors. The `uri` is used as `file_name` so that the
-/// projection generates a `publishDiagnostics` for the right document.
+/// Build a `ProjectionSnapshot` for a source-execution failure, placing the
+/// diagnostic at the real parse position when the error carries a recoverable
+/// source offset, and falling back to the file-level `(1, 0)` position for
+/// elaboration, kernel, or structural failures that carry none. Parse offsets
+/// are already rebased into the file's coordinate system by the frontend, so a
+/// syntax error at line 3 column 5 lands there instead of at the file head.
+fn lsp_execution_error_snapshot(
+    uri: &str,
+    source: &[u8],
+    error: &fln::EngineExecutionError,
+) -> ProjectionSnapshot {
+    match error
+        .primary_source_offset()
+        .and_then(|offset| source_position_at(source, offset.0))
+    {
+        Some(position) => lsp_positioned_error_snapshot(uri, &error.to_string(), position),
+        None => lsp_error_snapshot(uri, &error.to_string()),
+    }
+}
+
+/// Convert a byte offset in the UTF-8 document into a Lean 1-based-line,
+/// 0-based-codepoint-column position, or `None` when the source is not valid
+/// UTF-8, or the offset is out of range or not on a character boundary — in
+/// which case a codepoint column cannot be trusted and the caller falls back to
+/// the file-level position.
+fn source_position_at(source: &[u8], offset: usize) -> Option<fln_core::pos::Position> {
+    let text = std::str::from_utf8(source).ok()?;
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return None;
+    }
+    Some(fln_core::pos::FileMap::of_string(text).to_position(fln_core::pos::RawPos::new(offset)))
+}
+
+/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at the
+/// start of the file. Position (1, 0) is the Lean convention for file-level
+/// errors that carry no recoverable source position. The `uri` is used as
+/// `file_name` so that the projection generates a `publishDiagnostics` for the
+/// right document.
 fn lsp_error_snapshot(uri: &str, message: &str) -> ProjectionSnapshot {
+    lsp_positioned_error_snapshot(uri, message, fln_core::pos::Position { line: 1, column: 0 })
+}
+
+/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at an
+/// explicit Lean position (1-based line, 0-based codepoint column). The column
+/// is converted to LSP UTF-16 code units by the projector once the document
+/// source is supplied to `project_with_sources`.
+fn lsp_positioned_error_snapshot(
+    uri: &str,
+    message: &str,
+    pos: fln_core::pos::Position,
+) -> ProjectionSnapshot {
     // Strip the `file://` prefix if present, because `complete_messages`
     // in fln-server re-adds `file://` when building the notification URI.
     let file_name = uri.strip_prefix("file://").unwrap_or(uri);
     ProjectionSnapshot::Complete {
         diagnostics: vec![StructuredDiagnostic {
             file_name: BoundedText::new(file_name.to_owned()),
-            pos: fln_core::pos::Position { line: 1, column: 0 },
+            pos,
             end_pos: None,
             severity: Severity::Error,
             error_name: None,
