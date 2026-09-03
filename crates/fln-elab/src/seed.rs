@@ -426,8 +426,6 @@ pub fn nat_dec_lt_seed_declaration() -> Declaration {
     nat_binary_to_bool_seed_declaration("decLt")
 }
 
-
-
 /// Construct the exact `String.append : String -> String -> String` candidate
 /// recognized by the bounded compiler bridge.
 pub fn string_append_seed_declaration() -> Declaration {

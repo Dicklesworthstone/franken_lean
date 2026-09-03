@@ -60,9 +60,11 @@ fn every_small_fragment_width_round_trips_one_frame() {
             Some(body.as_slice()),
             "fragment width {width}"
         );
-        assert!(fln_server::transport::read_message(&mut input)
-            .unwrap()
-            .is_none());
+        assert!(
+            fln_server::transport::read_message(&mut input)
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -84,9 +86,11 @@ fn fragmented_concatenated_frames_remain_separate() {
                 "fragment width {width}"
             );
         }
-        assert!(fln_server::transport::read_message(&mut input)
-            .unwrap()
-            .is_none());
+        assert!(
+            fln_server::transport::read_message(&mut input)
+                .unwrap()
+                .is_none()
+        );
     }
 }
 

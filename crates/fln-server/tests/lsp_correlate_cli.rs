@@ -77,9 +77,11 @@ fn help_and_usage_refusals_are_side_effect_free() {
     let missing = correlator().output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
     assert!(missing.stdout.is_empty());
-    assert!(String::from_utf8(missing.stderr)
-        .unwrap()
-        .contains("exactly two transcripts are required"));
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains("exactly two transcripts are required")
+    );
 }
 
 #[test]
@@ -219,9 +221,11 @@ fn equivalent_string_escape_spelling_correlates_by_decoded_value() {
         .unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert!(String::from_utf8(output.stdout)
-        .unwrap()
-        .contains("\"matchedResponses\":2"));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("\"matchedResponses\":2")
+    );
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();
 }
@@ -240,9 +244,11 @@ fn missing_response_and_numeric_normalization_fail_without_receipt() {
         .unwrap();
     assert_eq!(missing.status.code(), Some(1));
     assert!(missing.stdout.is_empty());
-    assert!(String::from_utf8(missing.stderr)
-        .unwrap()
-        .contains("has no server response"));
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains("has no server response")
+    );
     fs::remove_file(&server_path).unwrap();
 
     let normalized_server = framed(&[
@@ -258,9 +264,11 @@ fn missing_response_and_numeric_normalization_fail_without_receipt() {
         .unwrap();
     assert_eq!(normalized.status.code(), Some(1));
     assert!(normalized.stdout.is_empty());
-    assert!(String::from_utf8(normalized.stderr)
-        .unwrap()
-        .contains("unknown canonical request ID 125"));
+    assert!(
+        String::from_utf8(normalized.stderr)
+            .unwrap()
+            .contains("unknown canonical request ID 125")
+    );
 
     fs::remove_file(client_path).unwrap();
     fs::remove_file(server_path).unwrap();

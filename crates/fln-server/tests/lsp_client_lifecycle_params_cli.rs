@@ -67,9 +67,11 @@ fn syntax_only_mode_preserves_parameter_shape_negative_fixtures() {
     let syntax = run_validator(&["-"], &input);
     assert!(syntax.status.success());
     assert!(syntax.stderr.is_empty());
-    assert!(String::from_utf8(syntax.stdout)
-        .unwrap()
-        .contains("\"schema\":\"fln.lsp-transcript-validation/2\""));
+    assert!(
+        String::from_utf8(syntax.stdout)
+            .unwrap()
+            .contains("\"schema\":\"fln.lsp-transcript-validation/2\"")
+    );
 
     let lifecycle = run_validator(&["--client-lifecycle", "-"], &input);
     assert_eq!(lifecycle.status.code(), Some(1));

@@ -226,18 +226,12 @@ mod tests {
     #[test]
     fn role_id_and_parameter_kind_remain_distinct() {
         let notification = render_frame(
-            &transcript::validate_frame(
-                br#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
-                1,
-            )
-            .unwrap(),
+            &transcript::validate_frame(br#"{"jsonrpc":"2.0","method":"exit","params":null}"#, 1)
+                .unwrap(),
         );
         let request = render_frame(
-            &transcript::validate_frame(
-                br#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#,
-                2,
-            )
-            .unwrap(),
+            &transcript::validate_frame(br#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#, 2)
+                .unwrap(),
         );
         let array = render_frame(
             &transcript::validate_frame(
@@ -289,8 +283,7 @@ mod tests {
     fn argument_parser_honors_end_of_options_and_rejects_duplicates() {
         assert_eq!(
             parse_args(
-                ["fln-lsp-inspect", "--max-frames", "12", "--", "--capture"]
-                    .map(OsString::from)
+                ["fln-lsp-inspect", "--max-frames", "12", "--", "--capture"].map(OsString::from)
             ),
             Ok(Command::Inspect(Config {
                 input: PathBuf::from("--capture"),

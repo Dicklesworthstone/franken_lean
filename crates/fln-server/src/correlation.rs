@@ -286,11 +286,7 @@ fn client_request_ids_with_limits(
 }
 
 fn client_request_ids(bytes: &[u8]) -> Result<IdIndex, String> {
-    client_request_ids_with_limits(
-        bytes,
-        MAX_CORRELATED_REQUESTS,
-        MAX_CORRELATION_ID_BYTES,
-    )
+    client_request_ids_with_limits(bytes, MAX_CORRELATED_REQUESTS, MAX_CORRELATION_ID_BYTES)
 }
 
 fn client_cancellation_targets_with_limits(
@@ -327,9 +323,7 @@ fn client_cancellation_targets_with_limits(
             continue;
         }
         let id = match direct_request_id(envelope.params) {
-            RequestIdField::Valid(id @ (RequestId::Number(_) | RequestId::Text(_))) => {
-                id.as_json()
-            }
+            RequestIdField::Valid(id @ (RequestId::Number(_) | RequestId::Text(_))) => id.as_json(),
             RequestIdField::Valid(RequestId::Null) => {
                 return Err(format!(
                     "client frame {frame} cancelRequest target must not be null"
@@ -493,19 +487,17 @@ fn classify_method_response(
         (RequestContract::Shutdown, ResponseShape::Result(value)) => {
             mismatch(result_kind(value).to_string(), "the null shutdown result")
         }
-        (RequestContract::Shutdown, ResponseShape::Error(code)) => mismatch(
-            format!("error code {code}"),
-            "the null shutdown result",
-        ),
+        (RequestContract::Shutdown, ResponseShape::Error(code)) => {
+            mismatch(format!("error code {code}"), "the null shutdown result")
+        }
         (RequestContract::DiagnosticWait, ResponseShape::Result(value))
             if value.trim_start().starts_with('{') =>
         {
             Ok(MethodResponseClass::DiagnosticWaitResult)
         }
-        (
-            RequestContract::DiagnosticWait,
-            ResponseShape::Error(REQUEST_CANCELLED_CODE),
-        ) => Ok(MethodResponseClass::DiagnosticWaitCancelledError),
+        (RequestContract::DiagnosticWait, ResponseShape::Error(REQUEST_CANCELLED_CODE)) => {
+            Ok(MethodResponseClass::DiagnosticWaitCancelledError)
+        }
         (RequestContract::DiagnosticWait, ResponseShape::Error(REQUEST_FAILED_CODE)) => {
             Ok(MethodResponseClass::DiagnosticWaitFailedError)
         }
@@ -776,8 +768,7 @@ pub fn correlate_transcripts(
             server.stats.error_responses
         ));
     }
-    let cancellation_responses =
-        classify_cancelled_target_responses(server_bytes, &cancellations)?;
+    let cancellation_responses = classify_cancelled_target_responses(server_bytes, &cancellations)?;
     Ok(CorrelationStats {
         client,
         server: server.stats,
@@ -928,7 +919,10 @@ mod tests {
         assert_eq!(stats.server.result_responses, 3);
         assert_eq!(stats.server.notifications, 1);
         assert_eq!(stats.client_request_id_bytes, stats.client.request_id_bytes);
-        assert_eq!(stats.client_request_id_bytes, stats.server_response_id_bytes);
+        assert_eq!(
+            stats.client_request_id_bytes,
+            stats.server_response_id_bytes
+        );
         assert_eq!(stats.method_contract_responses, 3);
         assert_eq!(stats.initialize_results, 1);
         assert_eq!(stats.shutdown_results, 1);
@@ -1000,10 +994,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":"wait","error":{"code":-32800,"message":"request cancelled"}}"#,
                 (1, 0, 0),
             ),
-            (
-                r#"{"jsonrpc":"2.0","id":"wait","result":{}}"#,
-                (0, 1, 0),
-            ),
+            (r#"{"jsonrpc":"2.0","id":"wait","result":{}}"#, (0, 1, 0)),
             (
                 r#"{"jsonrpc":"2.0","id":"wait","error":{"code":-32803,"message":"request failed"}}"#,
                 (0, 0, 1),
@@ -1246,8 +1237,8 @@ mod tests {
     fn response_index_has_independent_limits() {
         let evidence = validate_server_transcript_bytes(&server()).unwrap();
         let requests = client_request_ids(&client()).unwrap();
-        let error = server_response_ids_with_limits(&evidence, &requests.frames, 2, 100)
-            .unwrap_err();
+        let error =
+            server_response_ids_with_limits(&evidence, &requests.frames, 2, 100).unwrap_err();
         assert!(error.contains("2-request-ID ceiling"));
     }
 

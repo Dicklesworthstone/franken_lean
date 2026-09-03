@@ -167,7 +167,9 @@ impl<'a> Parser<'a> {
         self.expect(b'"')?;
         let mut output = String::new();
         loop {
-            let byte = self.next().ok_or_else(|| self.error("unterminated string"))?;
+            let byte = self
+                .next()
+                .ok_or_else(|| self.error("unterminated string"))?;
             match byte {
                 b'"' => return Ok(output),
                 b'\\' => self.escape(&mut output)?,
@@ -214,9 +216,7 @@ impl<'a> Parser<'a> {
                     if !(0xdc00..=0xdfff).contains(&second) {
                         return Err(self.error("high surrogate followed by non-low surrogate"));
                     }
-                    0x1_0000
-                        + ((u32::from(first) - 0xd800) << 10)
-                        + (u32::from(second) - 0xdc00)
+                    0x1_0000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00)
                 } else if (0xdc00..=0xdfff).contains(&first) {
                     return Err(self.error("unpaired low surrogate"));
                 } else {
@@ -469,9 +469,7 @@ fn nonempty_string_array(
     }
     for (index, value) in values.iter().enumerate() {
         if !matches!(value.as_str(), Some(text) if !text.trim().is_empty()) {
-            problems.push(format!(
-                "{path}.{key}[{index}] must be a non-empty string"
-            ));
+            problems.push(format!("{path}.{key}[{index}] must be a non-empty string"));
         }
     }
 }
@@ -486,11 +484,7 @@ fn is_sha256(value: &str) -> bool {
         .is_some_and(|digest| is_hex(digest, 64))
 }
 
-fn validate_capsule(
-    capsule: &Json,
-    issue_id: &str,
-    issue_status: &str,
-) -> Result<(), Vec<String>> {
+fn validate_capsule(capsule: &Json, issue_id: &str, issue_status: &str) -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
     let Some(root) = capsule.as_object() else {
         return Err(vec!["capsule root must be an object".to_owned()]);
@@ -536,9 +530,9 @@ fn validate_capsule(
                     }
                 }
             }
-            _ => problems.push(
-                "capsule.anchor.tracked_blobs must be a non-empty object".to_owned(),
-            ),
+            _ => {
+                problems.push("capsule.anchor.tracked_blobs must be a non-empty object".to_owned())
+            }
         }
     }
 
@@ -555,20 +549,13 @@ fn validate_capsule(
         for key in ["actual_fingerprint", "expected_fingerprint"] {
             match string_field(frontier, key) {
                 Some(value) if is_sha256(value) => {}
-                _ => problems.push(format!(
-                    "capsule.frontier.{key} must be sha256:<64 hex>"
-                )),
+                _ => problems.push(format!("capsule.frontier.{key} must be sha256:<64 hex>")),
             }
         }
     }
 
     if let Some(hypothesis) = object_field(root, "hypothesis", "capsule", &mut problems) {
-        require_nonempty_string(
-            hypothesis,
-            "statement",
-            "capsule.hypothesis",
-            &mut problems,
-        );
+        require_nonempty_string(hypothesis, "statement", "capsule.hypothesis", &mut problems);
         require_nonempty_string(
             hypothesis,
             "smallest_experiment",
@@ -586,22 +573,12 @@ fn validate_capsule(
     if let Some(last_green) = object_field(root, "last_green", "capsule", &mut problems) {
         match string_field(last_green, "commit") {
             Some(value) if is_hex(value, 40) => {}
-            _ => problems.push(
-                "capsule.last_green.commit must be a 40-hex commit id".to_owned(),
-            ),
+            _ => problems.push("capsule.last_green.commit must be a 40-hex commit id".to_owned()),
         }
-        nonempty_string_array(
-            last_green,
-            "commands",
-            "capsule.last_green",
-            &mut problems,
-        );
-        if let Some(receipts) = array_field(
-            last_green,
-            "receipts",
-            "capsule.last_green",
-            &mut problems,
-        ) {
+        nonempty_string_array(last_green, "commands", "capsule.last_green", &mut problems);
+        if let Some(receipts) =
+            array_field(last_green, "receipts", "capsule.last_green", &mut problems)
+        {
             for (index, receipt) in receipts.iter().enumerate() {
                 if !matches!(receipt.as_str(), Some(value) if !value.trim().is_empty()) {
                     problems.push(format!(
@@ -610,12 +587,7 @@ fn validate_capsule(
                 }
             }
         }
-        require_nonempty_string(
-            last_green,
-            "scope",
-            "capsule.last_green",
-            &mut problems,
-        );
+        require_nonempty_string(last_green, "scope", "capsule.last_green", &mut problems);
     }
 
     if let Some(rows) = array_field(root, "negative_evidence", "capsule", &mut problems) {
@@ -647,12 +619,9 @@ fn validate_capsule(
 
     if let Some(closure) = object_field(root, "closure", "capsule", &mut problems) {
         nonempty_string_array(closure, "criteria", "capsule.closure", &mut problems);
-        if let Some(missing) = array_field(
-            closure,
-            "still_missing",
-            "capsule.closure",
-            &mut problems,
-        ) {
+        if let Some(missing) =
+            array_field(closure, "still_missing", "capsule.closure", &mut problems)
+        {
             for (index, item) in missing.iter().enumerate() {
                 if !matches!(item.as_str(), Some(value) if !value.trim().is_empty()) {
                     problems.push(format!(
@@ -966,8 +935,7 @@ mod tests {
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const TREE: &str = "89abcdef0123456789abcdef0123456789abcdef";
-    const DIGEST: &str =
-        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn capsule(bead: &str, state: &str, missing: &str) -> String {
         format!(

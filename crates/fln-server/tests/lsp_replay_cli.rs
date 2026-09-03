@@ -76,11 +76,7 @@ fn duplicate_singleton_options_are_refused_before_io() {
     for arguments in [
         vec!["--expect", "a", "--expect", "b", "input"],
         vec!["--output", "a", "--output", "b", "input"],
-        vec![
-            "--client-lifecycle",
-            "--client-lifecycle",
-            "input",
-        ],
+        vec!["--client-lifecycle", "--client-lifecycle", "input"],
     ] {
         let output = replay().args(arguments).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
@@ -105,10 +101,12 @@ fn lifecycle_preflight_accepts_a_clean_client_stream() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     assert!(output.stdout.starts_with(b"Content-Length: "));
-    assert!(output
-        .stdout
-        .windows(b"FrankenLean".len())
-        .any(|window| window == b"FrankenLean"));
+    assert!(
+        output
+            .stdout
+            .windows(b"FrankenLean".len())
+            .any(|window| window == b"FrankenLean")
+    );
 }
 
 #[test]

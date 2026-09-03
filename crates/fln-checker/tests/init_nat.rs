@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
 
-use fln_checker::admit::{
-    AdmissionBudget, InductiveRejection, InductiveVerdict, admit_inductive,
-};
+use fln_checker::admit::{AdmissionBudget, InductiveRejection, InductiveVerdict, admit_inductive};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
     ConstructorDeclaration, EnvironmentBudget, InductiveDeclaration, RecursorDeclaration,
     RecursorRule,
 };
-use fln_checker::wire::{DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name};
+use fln_checker::wire::{
+    DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name,
+};
 use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
@@ -57,10 +57,7 @@ fn zero() -> Expr {
 }
 
 fn succ(value: Expr) -> Expr {
-    Expr::app(
-        Expr::const_(qualified(&["Nat", "succ"]), Vec::new()),
-        value,
-    )
+    Expr::app(Expr::const_(qualified(&["Nat", "succ"]), Vec::new()), value)
 }
 
 fn nat_entries(recursive: bool, recursive_rule_call: bool) -> Vec<ConstantEntry> {
@@ -75,12 +72,7 @@ fn nat_entries(recursive: bool, recursive_rule_call: bool) -> Vec<ConstantEntry>
     let zero_type = nat();
     let succ_type = pi("n", BinderInfo::Default, nat(), nat());
 
-    let motive_type = pi(
-        "t",
-        BinderInfo::Default,
-        nat(),
-        Expr::sort(u.clone()),
-    );
+    let motive_type = pi("t", BinderInfo::Default, nat(), Expr::sort(u.clone()));
     let zero_minor = Expr::app(bvar(0), zero());
     let succ_minor = pi(
         "n",
@@ -105,12 +97,7 @@ fn nat_entries(recursive: bool, recursive_rule_call: bool) -> Vec<ConstantEntry>
                 "succ",
                 BinderInfo::Default,
                 succ_minor.clone(),
-                pi(
-                    "t",
-                    BinderInfo::Default,
-                    nat(),
-                    Expr::app(bvar(3), bvar(0)),
-                ),
+                pi("t", BinderInfo::Default, nat(), Expr::app(bvar(3), bvar(0))),
             ),
         ),
     );
@@ -153,12 +140,7 @@ fn nat_entries(recursive: bool, recursive_rule_call: bool) -> Vec<ConstantEntry>
             Expr::lam(
                 name("succ"),
                 succ_minor,
-                Expr::lam(
-                    name("n"),
-                    nat(),
-                    succ_body,
-                    BinderInfo::Default,
-                ),
+                Expr::lam(name("n"), nat(), succ_body, BinderInfo::Default),
                 BinderInfo::Default,
             ),
             BinderInfo::Default,

@@ -51,9 +51,11 @@ fn canonical_complete(count: &str) -> String {
 fn assert_failed_accounting(message: &str) {
     let (outcome, frames) = run(message);
     assert!(outcome.clean);
-    assert!(frames.iter().any(|frame| {
-        frame.contains("\"id\":\"wait\"") && frame.contains("\"code\":-32803")
-    }));
+    assert!(
+        frames.iter().any(|frame| {
+            frame.contains("\"id\":\"wait\"") && frame.contains("\"code\":-32803")
+        })
+    );
     assert!(frames.iter().any(|frame| {
         frame.contains("diagnostic-callback-terminal-message")
             && frame.contains("\"authority\":false")
@@ -75,12 +77,16 @@ fn zero_count_complete_outcome_releases_wait() {
     let (outcome, frames) = run(&message);
     assert!(outcome.clean);
     assert!(frames.iter().any(|frame| frame == &message));
-    assert!(frames.iter().any(|frame| {
-        frame.contains("\"id\":\"wait\"") && frame.contains("\"result\":{}")
-    }));
-    assert!(!frames
-        .iter()
-        .any(|frame| frame.contains("diagnostic-callback-terminal-message")));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| { frame.contains("\"id\":\"wait\"") && frame.contains("\"result\":{}") })
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains("diagnostic-callback-terminal-message"))
+    );
 }
 
 #[test]

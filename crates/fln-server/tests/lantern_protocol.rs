@@ -99,9 +99,11 @@ fn full_sync_transcript_is_ordered_versioned_and_cleanly_closed() {
             && message.contains("\"uri\":\"file:///Main.lean\"")
             && message.contains("\"diagnostics\":[]")
     }));
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":99") && message.contains("\"result\":null")
-    }));
+    assert!(
+        output.iter().any(|message| {
+            message.contains("\"id\":99") && message.contains("\"result\":null")
+        })
+    );
 }
 
 #[test]
@@ -112,12 +114,16 @@ fn malformed_json_recovers_before_the_next_request() {
     ]);
     let (outcome, output) = run(input, &mut |_, _| Vec::new());
     assert!(outcome.clean);
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":null") && message.contains("\"code\":-32700")
-    }));
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":6") && message.contains("\"result\":null")
-    }));
+    assert!(
+        output.iter().any(|message| {
+            message.contains("\"id\":null") && message.contains("\"code\":-32700")
+        })
+    );
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("\"id\":6") && message.contains("\"result\":null") })
+    );
 }
 
 #[test]
@@ -140,10 +146,7 @@ fn invalid_utf8_recovers_before_the_next_request() {
         &mut input,
         r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
     );
-    framed_json(
-        &mut input,
-        r#"{"jsonrpc":"2.0","method":"exit"}"#,
-    );
+    framed_json(&mut input, r#"{"jsonrpc":"2.0","method":"exit"}"#);
 
     let (outcome, output) = run(input, &mut |_, _| Vec::new());
     assert!(outcome.clean);
@@ -152,9 +155,11 @@ fn invalid_utf8_recovers_before_the_next_request() {
             && message.contains("\"code\":-32700")
             && message.contains("not valid UTF-8")
     }));
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":7") && message.contains("\"result\":null")
-    }));
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("\"id\":7") && message.contains("\"result\":null") })
+    );
 }
 
 #[test]
@@ -210,17 +215,19 @@ fn malformed_callback_output_is_withheld_and_faulted() {
     let input = protocol_session(&[
         r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///Fault.lean","version":1,"text":"source"}}}"#,
     ]);
-    let (outcome, output) = run(input, &mut |_, _| {
-        vec!["{malformed-callback".to_string()]
-    });
+    let (outcome, output) = run(input, &mut |_, _| vec!["{malformed-callback".to_string()]);
 
     assert!(outcome.clean);
-    assert!(output.iter().any(|message| {
-        message.contains("discarded malformed diagnostic callback output")
-    }));
-    assert!(!output
-        .iter()
-        .any(|message| message.contains("{malformed-callback")));
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("discarded malformed diagnostic callback output") })
+    );
+    assert!(
+        !output
+            .iter()
+            .any(|message| message.contains("{malformed-callback"))
+    );
     assert!(output.iter().any(|message| {
         message.contains("diagnostic-callback-terminal-message")
             && message.contains("\"authority\":false")
@@ -245,18 +252,26 @@ fn request_notification_roles_and_server_state_fail_closed() {
 
     let (outcome, output) = run(input, &mut |_, _| Vec::new());
     assert!(outcome.clean);
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":1") && message.contains("\"code\":-32002")
-    }));
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":2") && message.contains("\"code\":-32600")
-    }));
-    assert!(output.iter().any(|message| {
-        message.contains("request-only LSP method sent as a notification")
-    }));
-    assert!(output.iter().any(|message| {
-        message.contains("\"id\":3") && message.contains("\"code\":-32803")
-    }));
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("\"id\":1") && message.contains("\"code\":-32002") })
+    );
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("\"id\":2") && message.contains("\"code\":-32600") })
+    );
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("request-only LSP method sent as a notification") })
+    );
+    assert!(
+        output
+            .iter()
+            .any(|message| { message.contains("\"id\":3") && message.contains("\"code\":-32803") })
+    );
 }
 
 #[test]
@@ -322,8 +337,7 @@ fn waits_follow_terminal_authority_and_can_recover_at_the_same_version() {
         message.contains("\"id\":\"failed\"") && message.contains("\"code\":-32803")
     }));
     assert!(output.iter().any(|message| {
-        message.contains("\"id\":\"recovered\"")
-            && message.contains("\"result\":{}")
+        message.contains("\"id\":\"recovered\"") && message.contains("\"result\":{}")
     }));
 }
 

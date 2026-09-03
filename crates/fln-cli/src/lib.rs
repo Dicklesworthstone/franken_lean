@@ -10838,10 +10838,9 @@ fn serve_lsp() -> MultiplexerOutput {
                 )
             }
         }
-        Err(error) => MultiplexerOutput::failure(
-            format!("fln serve-lsp: transport error: {error}\n"),
-            1,
-        ),
+        Err(error) => {
+            MultiplexerOutput::failure(format!("fln serve-lsp: transport error: {error}\n"), 1)
+        }
     }
 }
 
@@ -10856,9 +10855,8 @@ fn serve_lsp() -> MultiplexerOutput {
 /// correct document.
 fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
     let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
-    let engine = match fln::Engine::with_source_seed(
-        fln::EngineAdmissionLimits::new(kernel_budget),
-    ) {
+    let engine = match fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel_budget))
+    {
         Ok(fln::Outcome::Complete(engine)) => engine,
         Ok(fln::Outcome::Inconclusive(inconclusive)) => {
             return ProjectionSnapshot::Inconclusive(StructuredInconclusive {

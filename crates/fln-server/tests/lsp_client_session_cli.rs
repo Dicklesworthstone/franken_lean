@@ -21,17 +21,17 @@ fn frame(body: &str) -> Vec<u8> {
 
 fn transcript(events: &[&str]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    for body in std::iter::once(
-        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
-    )
-    .chain(std::iter::once(
-        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-    ))
-    .chain(events.iter().copied())
-    .chain([
-        r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
-        r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
-    ]) {
+    for body in
+        std::iter::once(r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#)
+            .chain(std::iter::once(
+                r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            ))
+            .chain(events.iter().copied())
+            .chain([
+                r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+                r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+            ])
+    {
         bytes.extend(frame(body));
     }
     bytes
@@ -55,10 +55,7 @@ fn run_stdin(command: &mut Command, input: &[u8]) -> std::process::Output {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "franken-lean-{name}-{}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("franken-lean-{name}-{}", std::process::id()))
 }
 
 #[test]
@@ -71,10 +68,7 @@ fn validator_emits_cancellation_bound_session_receipt() {
         r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,
         r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A.lean"}}}"#,
     ]);
-    let output = run_stdin(
-        validator().args(["--client-session", "-"]),
-        &input,
-    );
+    let output = run_stdin(validator().args(["--client-session", "-"]), &input);
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -103,56 +97,51 @@ fn lifecycle_and_session_modes_have_deliberately_different_authority() {
         r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///Missing.lean","version":2},"contentChanges":[{"text":"source"}]}}"#,
     ]);
 
-    let lifecycle = run_stdin(
-        validator().args(["--client-lifecycle", "-"]),
-        &input,
-    );
+    let lifecycle = run_stdin(validator().args(["--client-lifecycle", "-"]), &input);
     assert!(lifecycle.status.success());
     assert!(lifecycle.stderr.is_empty());
-    assert!(String::from_utf8(lifecycle.stdout)
-        .unwrap()
-        .contains("fln.lsp-client-lifecycle/1"));
-
-    let session = run_stdin(
-        validator().args(["--client-session", "-"]),
-        &input,
+    assert!(
+        String::from_utf8(lifecycle.stdout)
+            .unwrap()
+            .contains("fln.lsp-client-lifecycle/1")
     );
+
+    let session = run_stdin(validator().args(["--client-session", "-"]), &input);
     assert_eq!(session.status.code(), Some(1));
     assert!(session.stdout.is_empty());
-    assert!(String::from_utf8(session.stderr)
-        .unwrap()
-        .contains("didChange targets unopened document"));
+    assert!(
+        String::from_utf8(session.stderr)
+            .unwrap()
+            .contains("didChange targets unopened document")
+    );
 }
 
 #[test]
 fn cancellation_target_errors_are_visible_and_receipt_free() {
-    let unknown = transcript(&[
-        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#,
-    ]);
-    let output = run_stdin(
-        validator().args(["--client-session", "-"]),
-        &unknown,
-    );
+    let unknown =
+        transcript(&[r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#]);
+    let output = run_stdin(validator().args(["--client-session", "-"]), &unknown);
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("unknown prior canonical request ID"));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unknown prior canonical request ID")
+    );
 
     let duplicate = transcript(&[
         r#"{"jsonrpc":"2.0","id":"request","method":"textDocument/hover","params":{}}"#,
         r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"request"}}"#,
         r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"request"}}"#,
     ]);
-    let output = run_stdin(
-        validator().args(["--client-session", "-"]),
-        &duplicate,
-    );
+    let output = run_stdin(validator().args(["--client-session", "-"]), &duplicate);
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("repeats cancellation"));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("repeats cancellation")
+    );
 }
 
 #[test]
@@ -163,9 +152,7 @@ fn replay_session_preflight_fails_before_output_publication() {
     let _ = fs::remove_file(&output_path);
     fs::write(
         &input_path,
-        transcript(&[
-            r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#,
-        ]),
+        transcript(&[r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"missing"}}"#]),
     )
     .unwrap();
 

@@ -8,18 +8,18 @@ use std::process::ExitCode;
 
 pub use fln_server::{json_string, transport};
 
+#[path = "../correlation.rs"]
+mod correlation;
 #[path = "../json.rs"]
 mod json;
-#[allow(dead_code)]
-#[path = "../session_transcript.rs"]
-mod session_transcript;
 #[allow(dead_code, unused_imports)]
 #[path = "../server_transcript.rs"]
 mod server_transcript;
+#[allow(dead_code)]
+#[path = "../session_transcript.rs"]
+mod session_transcript;
 #[path = "../transcript.rs"]
 pub mod transcript;
-#[path = "../correlation.rs"]
-mod correlation;
 
 const MAX_TRANSCRIPT_BYTES: u64 = transcript::MAX_TRANSCRIPT_BYTES;
 const USAGE: &str = "Usage: fln-lsp-correlate [--] CLIENT SERVER\n\
@@ -149,10 +149,7 @@ mod tests {
     #[test]
     fn parser_is_exact_and_honors_end_of_options() {
         assert_eq!(
-            parse_args(
-                ["fln-lsp-correlate", "client.frames", "server.frames"]
-                    .map(OsString::from)
-            ),
+            parse_args(["fln-lsp-correlate", "client.frames", "server.frames"].map(OsString::from)),
             Ok(Command::Correlate(Config {
                 client: PathBuf::from("client.frames"),
                 server: PathBuf::from("server.frames"),

@@ -50,21 +50,24 @@ fn real_fln_server_executes_full_document_lifecycle() {
     ]);
 
     assert!(status.success(), "stderr: {stderr}");
-    assert!(stderr.is_empty(), "successful protocol output leaked to stderr: {stderr}");
+    assert!(
+        stderr.is_empty(),
+        "successful protocol output leaked to stderr: {stderr}"
+    );
     assert!(messages.iter().any(|message| {
         message.contains("\"id\":\"init-1\"")
             && message.contains("\"positionEncoding\":\"utf-16\"")
             && message.contains("\"change\":1")
     }));
-    assert!(messages.iter().any(|message| {
-        message.contains("\"id\":99") && message.contains("\"result\":null")
-    }));
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("\"id\":99") && message.contains("\"result\":null")
+        })
+    );
 
     let progress_started = messages
         .iter()
-        .filter(|message| {
-            message.contains("$/lean/fileProgress") && message.contains("\"kind\":1")
-        })
+        .filter(|message| message.contains("$/lean/fileProgress") && message.contains("\"kind\":1"))
         .count();
     let progress_finished = messages
         .iter()

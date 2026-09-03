@@ -344,7 +344,10 @@ impl fmt::Display for CacheSyncOutcome {
                 fetched,
                 cached,
                 missing,
-            } => write!(f, "partial: {fetched} fetched, {cached} cached, {missing} missing"),
+            } => write!(
+                f,
+                "partial: {fetched} fetched, {cached} cached, {missing} missing"
+            ),
             Self::Unavailable { reason } => write!(f, "unavailable: {reason}"),
         }
     }

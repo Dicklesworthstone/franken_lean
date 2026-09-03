@@ -54,10 +54,7 @@ pub enum CapsuleError {
     /// Unsupported capsule version.
     UnsupportedVersion(u8),
     /// Payload exceeds the verification budget.
-    PayloadTooLarge {
-        observed: u64,
-        limit: u64,
-    },
+    PayloadTooLarge { observed: u64, limit: u64 },
     /// Axiom fingerprint does not match the verifier's expected set.
     AxiomMismatch,
     /// Truncated or malformed capsule.

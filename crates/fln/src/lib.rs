@@ -5058,11 +5058,7 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             ValueType::Bool,
             Some("Nat.beq"),
         ),
-        "Nat.decLe" | "Nat.decLt" => (
-            vec![ValueType::Nat, ValueType::Nat],
-            ValueType::Bool,
-            None,
-        ),
+        "Nat.decLe" | "Nat.decLt" => (vec![ValueType::Nat, ValueType::Nat], ValueType::Bool, None),
         "String.append" => (
             vec![ValueType::String, ValueType::String],
             ValueType::String,
@@ -12670,7 +12666,10 @@ mod tests {
                 };
                 assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
                 let scalar = returned.value.unbox();
-                assert!(scalar == 0 || scalar == 1, "Bool must be 0 or 1, got {scalar}");
+                assert!(
+                    scalar == 0 || scalar == 1,
+                    "Bool must be 0 or 1, got {scalar}"
+                );
                 scalar
             })
             .collect();

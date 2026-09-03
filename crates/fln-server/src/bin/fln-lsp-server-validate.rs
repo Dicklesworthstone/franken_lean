@@ -126,10 +126,7 @@ mod tests {
             Ok(Command::Validate(PathBuf::from("-")))
         );
         assert_eq!(
-            parse_args(
-                ["fln-lsp-server-validate", "--", "--server.frames"]
-                    .map(OsString::from)
-            ),
+            parse_args(["fln-lsp-server-validate", "--", "--server.frames"].map(OsString::from)),
             Ok(Command::Validate(PathBuf::from("--server.frames")))
         );
     }
@@ -143,9 +140,9 @@ mod tests {
         bytes.extend(frame(
             r#"{"jsonrpc":"2.0","id":"x","error":{"code":-32601,"message":"method not found"}}"#,
         ));
-        let evidence = server_transcript::validate_server_transcript_reader(
-            &mut BufReader::new(Cursor::new(bytes)),
-        )
+        let evidence = server_transcript::validate_server_transcript_reader(&mut BufReader::new(
+            Cursor::new(bytes),
+        ))
         .unwrap();
         let receipt = server_transcript::render_server_transcript_validation(evidence.stats);
         assert!(receipt.contains("\"schema\":\"fln.lsp-server-transcript/3\""));

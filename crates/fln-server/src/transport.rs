@@ -82,7 +82,10 @@ fn read_header_line(
                 )));
             }
             line.extend_from_slice(&available[..consumed]);
-            (consumed, available.get(consumed - 1).copied() == Some(b'\n'))
+            (
+                consumed,
+                available.get(consumed - 1).copied() == Some(b'\n'),
+            )
         };
         input.consume(consumed);
         if terminated {
@@ -190,9 +193,8 @@ fn validate_content_type(value: &[u8]) -> io::Result<()> {
             return Err(invalid_data("malformed LSP Content-Type parameter"));
         };
         let name = trim_optional_whitespace(&parameter[..equals]);
-        let parameter_value = content_type_parameter_value(trim_optional_whitespace(
-            &parameter[equals + 1..],
-        ))?;
+        let parameter_value =
+            content_type_parameter_value(trim_optional_whitespace(&parameter[equals + 1..]))?;
         if name.is_empty() {
             return Err(invalid_data("malformed LSP Content-Type parameter"));
         }
@@ -390,7 +392,11 @@ mod tests {
             "application/vscode-jsonrpc; charset = \"UTF8\"",
         ] {
             let raw = format!("Content-Length: 2\r\nContent-Type: {value}\r\n\r\n{{}}");
-            assert_eq!(read(raw.as_bytes()).unwrap().unwrap(), b"{}", "value={value:?}");
+            assert_eq!(
+                read(raw.as_bytes()).unwrap().unwrap(),
+                b"{}",
+                "value={value:?}"
+            );
         }
 
         for value in [
@@ -486,14 +492,14 @@ mod tests {
     #[test]
     fn custom_header_byte_and_field_limits_are_enforced() {
         let mut input = BufReader::new(b"Content-Length: 0\r\n\r\n".as_slice());
-        let error = read_message_with_limits(&mut input, TransportLimits::new(8, 8, 8))
-            .unwrap_err();
+        let error =
+            read_message_with_limits(&mut input, TransportLimits::new(8, 8, 8)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeds 8 bytes"));
 
         let mut input = BufReader::new(b"X-One: yes\r\nContent-Length: 0\r\n\r\n".as_slice());
-        let error = read_message_with_limits(&mut input, TransportLimits::new(8, 128, 1))
-            .unwrap_err();
+        let error =
+            read_message_with_limits(&mut input, TransportLimits::new(8, 128, 1)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeds 1 fields"));
     }
@@ -501,12 +507,8 @@ mod tests {
     #[test]
     fn writer_refuses_oversized_message_before_writing() {
         let mut output = Vec::new();
-        let error = write_message_with_limits(
-            &mut output,
-            b"abc",
-            TransportLimits::new(2, 1, 1),
-        )
-        .unwrap_err();
+        let error = write_message_with_limits(&mut output, b"abc", TransportLimits::new(2, 1, 1))
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("transport ceiling"));
         assert!(output.is_empty());

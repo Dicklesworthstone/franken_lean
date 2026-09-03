@@ -27,8 +27,7 @@ fn reference_lib() -> Option<PathBuf> {
         return path.is_dir().then_some(path);
     }
     let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home)
-        .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
+    let path = PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
     path.is_dir().then_some(path)
 }
 

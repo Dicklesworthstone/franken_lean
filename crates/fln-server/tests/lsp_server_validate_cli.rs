@@ -44,9 +44,11 @@ fn help_and_missing_input_are_side_effect_free() {
     let missing = validator().output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
     assert!(missing.stdout.is_empty());
-    assert!(String::from_utf8(missing.stderr)
-        .unwrap()
-        .contains("missing server transcript"));
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains("missing server transcript")
+    );
 }
 
 #[test]

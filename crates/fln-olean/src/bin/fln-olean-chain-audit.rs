@@ -200,8 +200,8 @@ fn audit(args: &Args) -> Result<AuditSummary, String> {
 }
 
 fn file_len(path: &Path) -> Result<usize, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("stat {}: {error}", path.display()))?;
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
@@ -230,10 +230,25 @@ fn read_exact(path: &Path, expected: usize) -> Result<Vec<u8>, String> {
 
 fn print_human(args: &Args, summary: &AuditSummary) {
     println!("FrankenLean .olean chain audit");
-    println!("  exported: {} ({} bytes)", args.exported.display(), summary.exported_bytes);
-    println!("  server:   {} ({} bytes)", args.server.display(), summary.server_bytes);
-    println!("  private:  {} ({} bytes)", args.private.display(), summary.private_bytes);
-    println!("  total:    {} / {} bytes", summary.total_bytes, summary.max_bytes);
+    println!(
+        "  exported: {} ({} bytes)",
+        args.exported.display(),
+        summary.exported_bytes
+    );
+    println!(
+        "  server:   {} ({} bytes)",
+        args.server.display(),
+        summary.server_bytes
+    );
+    println!(
+        "  private:  {} ({} bytes)",
+        args.private.display(),
+        summary.private_bytes
+    );
+    println!(
+        "  total:    {} / {} bytes",
+        summary.total_bytes, summary.max_bytes
+    );
     println!("  constants: {}", summary.constants);
     println!("    exported:     {}", summary.exported_constants);
     println!("    private-only: {}", summary.private_only_constants);
@@ -246,7 +261,11 @@ fn print_human(args: &Args, summary: &AuditSummary) {
                 ConstantOrigin::Exported => "exported",
                 ConstantOrigin::PrivateOnly => "private-only",
             };
-            let strengthened = if row.strengthened { " strengthened" } else { "" };
+            let strengthened = if row.strengthened {
+                " strengthened"
+            } else {
+                ""
+            };
             println!(
                 "    {:>6} {:<12} {:<11} {}{}",
                 row.position, row.kind, origin, row.name, strengthened

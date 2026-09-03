@@ -3,10 +3,10 @@ use std::io::{BufRead, Cursor, Read};
 use fln_core::diag::DIAGNOSTIC_PROJECTION_SCHEMA;
 
 use crate::json::{
-    BooleanField, DecodedField, EnvelopeError, RawField, RequestIdField, VersionField,
-    direct_uri, object_boolean_member, object_integer_member, object_member,
-    object_string_member, parse_envelope, response_error, response_error_code,
-    response_error_message, response_result, text_document_uri,
+    BooleanField, DecodedField, EnvelopeError, RawField, RequestIdField, VersionField, direct_uri,
+    object_boolean_member, object_integer_member, object_member, object_string_member,
+    parse_envelope, response_error, response_error_code, response_error_message, response_result,
+    text_document_uri,
 };
 use crate::transcript::{MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_FRAMES};
 
@@ -77,7 +77,9 @@ pub struct ServerTranscriptEvidence {
 fn notification_params_are_supported(params: RawField<'_>) -> bool {
     match params {
         RawField::Missing => true,
-        RawField::Value(value) => matches!(value.trim_start().as_bytes().first(), Some(b'{' | b'[')),
+        RawField::Value(value) => {
+            matches!(value.trim_start().as_bytes().first(), Some(b'{' | b'['))
+        }
         RawField::Invalid => false,
     }
 }
@@ -112,12 +114,7 @@ fn required_nonempty_string(
     }
 }
 
-fn required_array(
-    params: RawField<'_>,
-    key: &str,
-    frame: u64,
-    method: &str,
-) -> Result<(), String> {
+fn required_array(params: RawField<'_>, key: &str, frame: u64, method: &str) -> Result<(), String> {
     match object_member(params, key) {
         RawField::Value(value) if value.trim_start().starts_with('[') => Ok(()),
         RawField::Missing => Err(notification_error(
@@ -168,11 +165,7 @@ fn validate_publish_diagnostics(params: RawField<'_>, frame: u64) -> Result<(), 
     match direct_uri(params) {
         DecodedField::Valid(uri) if !uri.is_empty() => {}
         DecodedField::Valid(_) => {
-            return Err(notification_error(
-                frame,
-                method,
-                "requires a nonempty uri",
-            ));
+            return Err(notification_error(frame, method, "requires a nonempty uri"));
         }
         DecodedField::Missing => {
             return Err(notification_error(frame, method, "requires uri"));
@@ -357,8 +350,8 @@ fn response_kind(json: &str, frame: u64) -> Result<ServerResponseKind, String> {
 }
 
 pub fn validate_server_frame(body: &[u8], frame: u64) -> Result<ServerTranscriptFrame, String> {
-    let json = std::str::from_utf8(body)
-        .map_err(|_| format!("frame {frame} body is not valid UTF-8"))?;
+    let json =
+        std::str::from_utf8(body).map_err(|_| format!("frame {frame} body is not valid UTF-8"))?;
     let envelope = parse_envelope(json).map_err(|error| match error {
         EnvelopeError::MalformedJson => format!("frame {frame} contains malformed JSON"),
         EnvelopeError::NotObject => format!("frame {frame} is not a JSON-RPC object"),
@@ -381,7 +374,9 @@ pub fn validate_server_frame(body: &[u8], frame: u64) -> Result<ServerTranscript
     match (&envelope.method, &envelope.id) {
         (DecodedField::Valid(method), RequestIdField::Absent) => {
             if method.is_empty() {
-                return Err(format!("frame {frame} notification method must not be empty"));
+                return Err(format!(
+                    "frame {frame} notification method must not be empty"
+                ));
             }
             if !matches!(response_result(json), RawField::Missing)
                 || !matches!(response_error(json), RawField::Missing)
@@ -423,12 +418,12 @@ pub fn validate_server_frame(body: &[u8], frame: u64) -> Result<ServerTranscript
         (DecodedField::Missing, RequestIdField::Absent) => Err(format!(
             "frame {frame} is neither a server notification nor a response"
         )),
-        (DecodedField::Invalid, _) => {
-            Err(format!("frame {frame} has a non-string or ambiguous method"))
-        }
-        (_, RequestIdField::Invalid) => {
-            Err(format!("frame {frame} has an invalid or ambiguous response id"))
-        }
+        (DecodedField::Invalid, _) => Err(format!(
+            "frame {frame} has a non-string or ambiguous method"
+        )),
+        (_, RequestIdField::Invalid) => Err(format!(
+            "frame {frame} has an invalid or ambiguous response id"
+        )),
     }
 }
 
@@ -564,9 +559,7 @@ fn validate_server_transcript_with_limits(
     Ok(ServerTranscriptEvidence { stats, frames })
 }
 
-pub fn validate_server_transcript_bytes(
-    bytes: &[u8],
-) -> Result<ServerTranscriptEvidence, String> {
+pub fn validate_server_transcript_bytes(bytes: &[u8]) -> Result<ServerTranscriptEvidence, String> {
     validate_server_transcript_with_limits(
         bytes,
         MAX_TRANSCRIPT_FRAMES,
@@ -649,11 +642,13 @@ mod tests {
         assert_eq!(evidence.stats.log_messages, 1);
         assert_eq!(evidence.frames[0].id_json.as_deref(), Some("1.25e2"));
         assert_eq!(evidence.frames[2].id_json.as_deref(), Some("\"wait\""));
-        assert_eq!(evidence.stats.wire_bytes, u64::try_from(bytes.len()).unwrap());
+        assert_eq!(
+            evidence.stats.wire_bytes,
+            u64::try_from(bytes.len()).unwrap()
+        );
         assert_eq!(
             evidence.stats.metadata_bytes,
-            u64::try_from("1.25e2".len() + "window/logMessage".len() + "\"wait\"".len())
-                .unwrap()
+            u64::try_from("1.25e2".len() + "window/logMessage".len() + "\"wait\"".len()).unwrap()
         );
         let receipt = render_server_transcript_validation(evidence.stats);
         assert!(receipt.contains("\"schema\":\"fln.lsp-server-transcript/3\""));
@@ -728,10 +723,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-1,"message":"bad"}}"#,
                 "both result and error",
             ),
-            (
-                r#"{"jsonrpc":"2.0","id":1}"#,
-                "exactly one result or error",
-            ),
+            (r#"{"jsonrpc":"2.0","id":1}"#, "exactly one result or error"),
             (
                 r#"{"jsonrpc":"2.0","id":1,"error":{"message":"bad"}}"#,
                 "error.code is required",
@@ -786,12 +778,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"one","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"two","params":{}}"#,
         ]);
-        let error = validate_server_transcript_with_limits(
-            &bytes,
-            1,
-            MAX_SERVER_TRANSCRIPT_METADATA_BYTES,
-        )
-        .unwrap_err();
+        let error =
+            validate_server_transcript_with_limits(&bytes, 1, MAX_SERVER_TRANSCRIPT_METADATA_BYTES)
+                .unwrap_err();
         assert!(error.contains("1-frame ceiling"));
     }
 

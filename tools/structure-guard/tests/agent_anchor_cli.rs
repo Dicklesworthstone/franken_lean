@@ -14,10 +14,8 @@ struct TempRepo {
 impl TempRepo {
     fn new() -> Self {
         let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "fln-agent-anchor-{}-{serial}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("fln-agent-anchor-{}-{serial}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create temporary repository");
         git(&path, ["init", "--quiet"]);
@@ -82,10 +80,7 @@ fn clean_and_dirty_git_identities_are_reported_without_ambiguity() {
 
     let head = git(&repo.path, ["rev-parse", "HEAD"]);
     let tree = git(&repo.path, ["rev-parse", "HEAD^{tree}"]);
-    let blob = git(
-        &repo.path,
-        ["rev-parse", "HEAD:crates/demo/src/lib.rs"],
-    );
+    let blob = git(&repo.path, ["rev-parse", "HEAD:crates/demo/src/lib.rs"]);
     let clean = anchor(&repo.path, &["--path", "crates/demo/src/lib.rs"]);
     assert!(
         clean.status.success(),
@@ -111,11 +106,7 @@ fn clean_and_dirty_git_identities_are_reported_without_ambiguity() {
 
     let dirty = anchor(
         &repo.path,
-        &[
-            "--allow-dirty",
-            "--path",
-            "./crates/demo/src/lib.rs",
-        ],
+        &["--allow-dirty", "--path", "./crates/demo/src/lib.rs"],
     );
     assert!(
         dirty.status.success(),
@@ -123,10 +114,7 @@ fn clean_and_dirty_git_identities_are_reported_without_ambiguity() {
         String::from_utf8_lossy(&dirty.stderr)
     );
     let dirty = String::from_utf8(dirty.stdout).expect("anchor output is UTF-8");
-    let worktree_blob = git(
-        &repo.path,
-        ["hash-object", "--", "crates/demo/src/lib.rs"],
-    );
+    let worktree_blob = git(&repo.path, ["hash-object", "--", "crates/demo/src/lib.rs"]);
     assert_ne!(blob, worktree_blob, "the fixture must actually be dirty");
     assert!(dirty.contains(&format!("\"head_blob\":\"{blob}\"")));
     assert!(dirty.contains(&format!("\"worktree_blob\":\"{worktree_blob}\"")));

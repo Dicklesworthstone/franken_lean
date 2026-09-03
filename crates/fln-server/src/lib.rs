@@ -258,10 +258,7 @@ fn source_lsp_position(source: &str, position: Position) -> (usize, usize) {
     if current_line == requested_line {
         return (current_line, utf16_column(final_line, position.column));
     }
-    (
-        current_line,
-        utf16_column(final_line, usize::MAX),
-    )
+    (current_line, utf16_column(final_line, usize::MAX))
 }
 
 fn resolved_lsp_position(
@@ -280,12 +277,7 @@ fn lsp_position_json(position: (usize, usize)) -> String {
     format!("{{\"line\":{line},\"character\":{character}}}")
 }
 
-fn lsp_range(
-    file_name: &str,
-    start: Position,
-    end: Position,
-    sources: &[LspSource<'_>],
-) -> String {
+fn lsp_range(file_name: &str, start: Position, end: Position, sources: &[LspSource<'_>]) -> String {
     let start = resolved_lsp_position(file_name, start, sources);
     let mut end = resolved_lsp_position(file_name, end, sources);
     if end < start {
@@ -382,12 +374,7 @@ fn lsp_diagnostic(
             "\"causeClass\":{},\"behaviorNote\":{},\"bodyTruncated\":{},\"evidence\":[{}],",
             "\"omittedRelated\":{},\"omittedEvidence\":{}}}}}"
         ),
-        lsp_range(
-            diagnostic.file_name.text(),
-            diagnostic.pos,
-            end,
-            sources
-        ),
+        lsp_range(diagnostic.file_name.text(), diagnostic.pos, end, sources),
         severity_code(diagnostic.severity),
         json_string(diagnostic.cause_class),
         json_string(&diagnostic_message(diagnostic, request.mode)),
@@ -614,10 +601,7 @@ mod tests {
             &ProjectionSnapshot::Complete {
                 diagnostics: vec![diagnostic],
             },
-            &[LspSource::new(
-                "file:///tmp/Emoji%20File.lean",
-                "a😀b",
-            )],
+            &[LspSource::new("file:///tmp/Emoji%20File.lean", "a😀b")],
         )
         .expect("the LSP projection tuple is supported");
         let message = &projection.messages[0];
@@ -638,7 +622,13 @@ mod tests {
             (1, 3)
         );
         assert_eq!(
-            source_lsp_position("a\r\n", Position { line: 1, column: 99 }),
+            source_lsp_position(
+                "a\r\n",
+                Position {
+                    line: 1,
+                    column: 99
+                }
+            ),
             (0, 1),
             "the CRLF terminator is not part of the LSP line character count"
         );

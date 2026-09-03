@@ -111,8 +111,12 @@ fn parse_args(
             Some("--path") => paths.push(next_path(&mut arguments, "--path")?),
             Some("--allow-dirty") => allow_dirty = true,
             Some("-h" | "--help") => return Err(USAGE.to_owned()),
-            Some(flag) if flag.starts_with('-') => return Err(format!("unknown option {flag:?}; {USAGE}")),
-            Some(value) => return Err(format!("unexpected positional argument {value:?}; {USAGE}")),
+            Some(flag) if flag.starts_with('-') => {
+                return Err(format!("unknown option {flag:?}; {USAGE}"));
+            }
+            Some(value) => {
+                return Err(format!("unexpected positional argument {value:?}; {USAGE}"));
+            }
             None => return Err(format!("argument is not valid UTF-8; {USAGE}")),
         }
     }
@@ -161,7 +165,10 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf, String> {
         return Err("anchor path may not be empty".to_owned());
     }
     if path.is_absolute() {
-        return Err(format!("anchor path must be repository-relative: {}", path.display()));
+        return Err(format!(
+            "anchor path must be repository-relative: {}",
+            path.display()
+        ));
     }
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -169,7 +176,10 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf, String> {
             Component::Normal(value) => normalized.push(value),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("anchor path escapes the repository: {}", path.display()));
+                return Err(format!(
+                    "anchor path escapes the repository: {}",
+                    path.display()
+                ));
             }
         }
     }
@@ -206,8 +216,8 @@ fn git_output<const N: usize>(repo: &Path, args: [&str; N]) -> Result<String, St
     if !output.status.success() {
         return Err(format_command_failure("git", repo, &args, &output.stderr));
     }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|_| "git produced non-UTF-8 output".to_owned())?;
+    let text =
+        String::from_utf8(output.stdout).map_err(|_| "git produced non-UTF-8 output".to_owned())?;
     Ok(text.trim_end_matches(['\r', '\n']).to_owned())
 }
 
@@ -341,10 +351,7 @@ mod tests {
 
     #[test]
     fn json_strings_preserve_unicode_and_escape_controls() {
-        assert_eq!(
-            json_string("a\n\"β\\\u{0007}"),
-            "\"a\\n\\\"β\\\\\\u0007\""
-        );
+        assert_eq!(json_string("a\n\"β\\\u{0007}"), "\"a\\n\\\"β\\\\\\u0007\"");
     }
 
     #[test]
