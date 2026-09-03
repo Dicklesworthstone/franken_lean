@@ -1,6 +1,6 @@
 # Lantern wire replay and transcript evidence
 
-FrankenLean exposes five bounded transcript tools over one structural JSON-RPC and Content-Length framing model:
+FrankenLean exposes six bounded transcript tools over one structural JSON-RPC and Content-Length framing model:
 
 ```text
 fln-lsp-validate [--client-lifecycle | --client-session] [--] INPUT
@@ -8,9 +8,27 @@ fln-lsp-server-validate [--] INPUT
 fln-lsp-inspect [--max-frames N] [--] INPUT
 fln-lsp-replay [--client-lifecycle | --client-session] [--expect PATH] [--output PATH] [--] INPUT
 fln-lsp-correlate [--] CLIENT SERVER
+fln-lsp-timeline [--] TIMELINE
 ```
 
 `INPUT`, `CLIENT`, and `SERVER` are exact framed byte streams, including headers, separators, and bodies. The tools do not sort, normalize, or regenerate the supplied stream before validation or replay. Decoded string request IDs are re-escaped canonically only when an identity key or receipt field is constructed.
+
+`TIMELINE` is a distinct, explicitly interleaved recording format. It is not inferred from two independently captured streams. Each outer Content-Length frame carries one typed direction plus one complete inner JSON-RPC object:
+
+```json
+{
+  "schema": "fln.lsp-interleaved-event/1",
+  "direction": "client",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": "init",
+    "method": "initialize",
+    "params": {}
+  }
+}
+```
+
+The outer stream preserves one recorder-defined event order. The inner client and server messages are reframed canonically only into bounded private projections used by the existing validators; the supplied outer bytes remain the authority for timeline byte accounting.
 
 ## Evidence ladder
 
@@ -23,6 +41,7 @@ The tools deliberately expose different grades. A stronger grade adds claims; it
 | Client session | `fln-lsp-validate --client-session INPUT` | `fln.lsp-client-session/3` | Full-sync document state, monotone versions, wait classes, canonical request IDs, cancellation targets, and bounded retained metadata. |
 | Server structure | `fln-lsp-server-validate INPUT` | `fln.lsp-server-transcript/3` | Response shape, known notification schemas, result/error counts, and bounded decoded server metadata. |
 | Bidirectional join | `fln-lsp-correlate CLIENT SERVER` | `fln.lsp-client-server-correlation/5` | One-to-one canonical response IDs, cancellation-response classes, and the current method-to-response contract. |
+| Interleaved record order | `fln-lsp-timeline TIMELINE` | `fln.lsp-interleaved-timeline/1` | All strict projected-stream claims plus request-before-response, initialize-response-before-initialized, shutdown-response-before-exit, cancellation-before-target-response, and no-event-after-exit evidence. |
 
 Default replay intentionally accepts any syntax-valid client stream so malformed lifecycle and document behavior can remain executable negative fixtures. Strict replay preflights add lifecycle or session authority before any server execution or output publication.
 
@@ -41,6 +60,8 @@ The policy is:
 - `null` remains `null`. It may identify a request-shaped message for compatibility but cannot be a cancellation target.
 
 Strict client-session evidence requires request IDs to be globally unique within the client recording. JSON-RPC permits reuse after a response completes, but a client-only stream has no server-response clock with which to prove that completion. Global uniqueness is therefore the conservative timing-independent evidence rule.
+
+The interleaved timeline currently preserves that same globally unique profile rather than introducing a second request-ID policy. Its additional order evidence therefore strengthens the existing join without changing canonical identity.
 
 ## Syntax-only validation
 
@@ -199,6 +220,55 @@ These counts must cover every cancellation target. A result after cancellation i
 
 Method-bound response validation and cancellation classification are complementary. The former checks whether the response is legal for the request method; the latter reports how cancelled requests ultimately resolved.
 
+## Interleaved event-order causality
+
+```text
+fln-lsp-timeline TIMELINE
+```
+
+A timeline is accepted only when every outer event uses exactly the registered event schema and a supported direction, and its `message` is an object-valued inner JSON-RPC message. A raw JSON-RPC frame is not silently treated as an interleaved event.
+
+The validator constructs bounded client and server projections and subjects them to the same strict session, server, correlation, cancellation, and method-response passes described above. It then uses the shared outer record order to establish facts that two independent files cannot establish:
+
+- a server response is never observed before its canonical client request;
+- each request has at most one response event;
+- the initialize response precedes the client `initialized` notification;
+- the shutdown response precedes the client `exit` notification;
+- each cancellation targets an earlier request that has not yet responded;
+- each cancelled target's eventual response occurs after the cancellation event;
+- duplicate cancellation and duplicate response events fail closed;
+- no client or server event follows the terminal `exit` event.
+
+The receipt is:
+
+```text
+fln.lsp-interleaved-timeline/1
+```
+
+and names:
+
+```text
+eventSchema     = fln.lsp-interleaved-event/1
+causalitySchema = fln.lsp-cross-stream-causality/1
+ordering         = record-order-v1
+```
+
+It publishes the lifecycle event indices, outer wire/body bytes, projected inner wire bytes, request-ID bytes, all enforced ceilings, cancellation counts, and explicit zero-violation fields. The complete `fln.lsp-client-server-correlation/5` receipt is nested rather than summarized, so downstream agents do not need to join two unbound receipts by prose.
+
+Resource ceilings are explicit and fail closed:
+
+```text
+outer timeline bytes:          256 MiB
+outer timeline events:         1,000,000
+combined projected wire bytes: 256 MiB
+canonical request IDs:         262,144
+canonical request-ID bytes:    32 MiB
+```
+
+`record-order-v1` means only that event A was recorded before event B in the supplied authoritative sequence. It does **not** assert elapsed time, simultaneous arrival, scheduler execution, transport flush completion, CPU activity, or whether cancelled work had started. A producer must separately bind how it generated the sequence before promoting the receipt to production evidence.
+
+The first timeline schema also deliberately stops short of document-check episode causality. It validates the projected client and server document facts, but does not yet prove that a particular `didOpen`/`didChange`/`didSave` caused a particular progress/publication sequence.
+
 ## Inspection and replay
 
 `fln-lsp-inspect` emits one deterministic `fln.lsp-frame/2` NDJSON row per syntax-valid client frame. Rows contain index, role, method, canonical ID JSON, `paramsKind`, and body size. Parameter contents and source text are omitted.
@@ -218,16 +288,19 @@ With `--expect PATH`, the generated server stream is compared byte-for-byte with
 These tools prove bounded protocol facts about supplied recordings. They do not establish:
 
 - source parsing, elaboration, or kernel admission;
-- trustworthy parser/elaborator source spans;
+- trustworthy elaborator or kernel source spans beyond the parser positions separately exercised by the production CLI tests;
 - inner initialize capability correctness beyond the currently checked outer object;
 - useful goal, hover, completion, or definition semantics;
 - Lean RPC sessions;
 - shared import heaps or dependency invalidation;
 - cancellation of active computation;
 - crash isolation;
-- cross-stream timing or response-after-cancellation order;
+- wall-clock timing, duration, scheduler order, or CPU-work intervals;
 - complete document-to-progress-to-publication causality;
+- that an interleaved recording was produced by the live server rather than a fixture generator;
 - unmodified `vscode-lean4` compatibility.
+
+Two independently supplied `CLIENT` and `SERVER` streams still establish no cross-stream order. Only the explicit `TIMELINE` profile makes record-order claims, and those claims remain bounded by the producer identity and ordering semantics attached to the supplied recording.
 
 The standalone replay callback emits deterministic empty diagnostics for accepted document events. Release or gate claims must use the production callback and the required no-mock editor/session scenarios.
 
@@ -241,9 +314,10 @@ The standalone replay callback emits deterministic empty diagnostics for accepte
 6. Use the inspector to locate role, method, ID, and parameter-container mistakes without disclosing source.
 7. Replay positive sessions with `--client-session --expect` and an unused `--output` path.
 8. Correlate exact client and server recordings when claiming response completeness, method-bound behavior, or cancellation-response classes.
-9. Record executable identity, Git tree, transcript identities, exit status, first divergence, and output identity in the enclosing evidence bundle.
-10. Reduce failures only in disposable copies by deleting complete frames; never edit body bytes and Content-Length independently.
-11. Keep semantic facts and telemetry separate. Byte equality, canonical joins, method classes, and response classes are protocol facts; host, duration, and filesystem paths are telemetry.
+9. Use an explicitly interleaved timeline only when the recorder can state what its event order means. Never synthesize order by zipping or timestamp-sorting independent streams.
+10. Record executable identity, Git tree, transcript or timeline identity, exit status, first divergence, producer identity, and output identity in the enclosing evidence bundle.
+11. Reduce failures only in disposable copies by deleting complete frames; never edit body bytes and Content-Length independently.
+12. Keep semantic facts and telemetry separate. Byte equality, canonical joins, method classes, response classes, and record order are protocol facts; host, duration, and filesystem paths are telemetry.
 
 ## Focused verification surface
 
@@ -261,6 +335,8 @@ Repository-owned unit and installed-binary tests cover:
 - missing, duplicate, unsolicited, and numerically normalized response refusal;
 - all current request-to-response classes and representative mismatches;
 - cancelled-target result, `RequestCancelled`, and other-error classification;
+- interleaved response-before-request, lifecycle-response ordering, cancellation ordering, and post-exit refusal;
+- nested timeline/correlation receipt accounting;
 - metadata-only inspection;
 - exact replay repeatability and first-divergence reporting;
 - deterministic transport behavior for fragmented and truncated frames.
