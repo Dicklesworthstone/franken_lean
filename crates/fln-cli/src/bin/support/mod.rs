@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::io::{BufReader, BufWriter, Write};
 
 use fln_core::diag::{
@@ -30,27 +29,6 @@ pub(super) fn write_output(output: fln_cli::MultiplexerOutput) -> std::process::
     std::process::ExitCode::from(output.exit_code)
 }
 
-pub(super) fn fln_server_command(arguments: &[OsString]) -> Option<fln_cli::MultiplexerOutput> {
-    let Some(first) = arguments.first() else {
-        return None;
-    };
-    if first != "serve-lsp" {
-        return None;
-    }
-    if arguments.len() != 1 {
-        return Some(fln_cli::MultiplexerOutput {
-            stdout: String::new(),
-            stderr: "fln: serve-lsp does not accept arguments\n".to_owned(),
-            exit_code: 2,
-        });
-    }
-    Some(serve_lsp())
-}
-
-pub(super) fn lean_server_command(arguments: &[OsString]) -> Option<fln_cli::MultiplexerOutput> {
-    matches!(arguments, [argument] if argument == "--server").then(serve_lsp)
-}
-
 fn lsp_projection_request() -> ProjectionRequest {
     ProjectionRequest {
         epoch: DiagnosticEpoch::V4_32_0,
@@ -70,13 +48,14 @@ fn project_snapshot(
     text: &str,
     snapshot: &ProjectionSnapshot,
 ) -> Vec<String> {
-    fln_server::project_with_sources(
+    match fln_server::project_with_sources(
         request,
         snapshot,
         &[fln_server::LspSource::new(uri, text)],
-    )
-    .map(|projection| projection.messages)
-    .unwrap_or_default()
+    ) {
+        Ok(projection) => projection.messages,
+        Err(_) => Vec::new(),
+    }
 }
 
 pub(super) fn serve_lsp() -> fln_cli::MultiplexerOutput {
@@ -224,19 +203,5 @@ mod tests {
         };
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].file_name.text(), uri);
-    }
-
-    #[test]
-    fn server_argument_selection_is_exact() {
-        assert!(fln_server_command(&[OsString::from("other")]).is_none());
-        let invalid = fln_server_command(&[
-            OsString::from("serve-lsp"),
-            OsString::from("unexpected"),
-        ])
-        .expect("serve-lsp owns its argument prefix");
-        assert_eq!(invalid.exit_code, 2);
-        assert!(invalid.stdout.is_empty());
-        assert!(invalid.stderr.contains("does not accept arguments"));
-        assert!(lean_server_command(&[OsString::from("--server"), OsString::from("extra")]).is_none());
     }
 }
