@@ -1,22 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::io::Write;
+mod support;
 
 fn main() -> std::process::ExitCode {
-    let output = fln_cli::run(std::env::args_os().skip(1));
-    if std::io::stdout()
-        .lock()
-        .write_all(output.stdout.as_bytes())
-        .is_err()
-    {
-        return std::process::ExitCode::from(1);
-    }
-    if std::io::stderr()
-        .lock()
-        .write_all(output.stderr.as_bytes())
-        .is_err()
-    {
-        return std::process::ExitCode::from(1);
-    }
-    std::process::ExitCode::from(output.exit_code)
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let output = support::fln_server_command(&arguments)
+        .unwrap_or_else(|| fln_cli::run(arguments));
+    support::write_output(output)
 }

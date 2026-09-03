@@ -1,24 +1,16 @@
 #![forbid(unsafe_code)]
 
-use std::io::Write;
+mod support;
 
 fn main() -> std::process::ExitCode {
-    let stdin = std::io::stdin();
-    let mut stdin = stdin.lock();
-    let output = fln_cli::run_lean_with_input(std::env::args_os().skip(1), &mut stdin);
-    if std::io::stdout()
-        .lock()
-        .write_all(output.stdout.as_bytes())
-        .is_err()
-    {
-        return std::process::ExitCode::from(1);
-    }
-    if std::io::stderr()
-        .lock()
-        .write_all(output.stderr.as_bytes())
-        .is_err()
-    {
-        return std::process::ExitCode::from(1);
-    }
-    std::process::ExitCode::from(output.exit_code)
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let output = match support::lean_server_command(&arguments) {
+        Some(output) => output,
+        None => {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            fln_cli::run_lean_with_input(arguments, &mut stdin)
+        }
+    };
+    support::write_output(output)
 }
