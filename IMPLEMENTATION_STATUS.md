@@ -179,6 +179,8 @@ This is intended to make agent work accretive: failed hypotheses and verified fr
 
 These subsystems contain real contract planes, data structures, bounded execution slices, or integration work, but the repository has not reached the README's finished-system claims. Full mathlib-compatible elaboration and tactics, the complete native `Lean.*` Mirror, full Lake and Ledger behavior, production Iron code generation and JIT, semantic LSP and RPC, complete MCP orchestration, and release-grade cross-platform distribution remain active program work.
 
+One concrete increment within this surface landed at `046ab940`: **Anvil** (`fln-anvil`) now carries a real first-order discrimination-tree lookup substrate — `flatten(&Expr)` (preorder key encoding; unknowns and an over-`u64` `Nat` collapse to a `Star` wildcard) plus an in-memory `DTree` with `insert(pattern, rule)` and `candidates(term)` wildcard-skip retrieval, deterministic and deduplicated, covered by nine unit tests (clippy `-D warnings` and fmt clean). It is the candidate index simp/aesop query at plan §12.2 (B5), but it is a **substrate, not yet consumed by a live simp tactic** (no rewrite engine imports `fln-anvil` today), and it stays an untrusted accelerator (FL-INV-06): retrieval is a sound candidate pre-filter — a superset of the true matches for the caller to confirm by unification — never an admission path.
+
 ---
 
 ## High-priority open proof obligations
