@@ -5,5 +5,6 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
 python3 scripts/test_agent_handoff.py
+python3 scripts/test_agent_handoff_hierarchy.py
 python3 scripts/agent_handoff.py snapshot --strict --recent 8 --limit 8 \
   | python3 scripts/agent_handoff.py verify --current - >/dev/null
