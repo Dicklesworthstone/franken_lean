@@ -14,9 +14,9 @@ Do not promote a row from implemented to verified merely because code or a test 
 | State | Meaning |
 |---|---|
 | **landed** | Code is committed on `main`; no claim is made that the relevant runtime test ran in the same session. |
-| **model-verified** | A focused synthetic/model test exists and has previously run, but the claim is not bound to the real pinned artifact. |
+| **model-verified** | A focused synthetic/model test exists and has run, but the claim is not bound to the real pinned artifact. |
 | **artifact-bound** | A repository-owned test or runner consumes the real pinned Reference artifact and fails closed when that artifact is absent. |
-| **observed** | A concrete run against the real pinned artifact is retained with enough identity to reproduce it. |
+| **observed** | A concrete run against the relevant real build or pinned artifact is retained with enough identity to reproduce it. |
 | **target** | Architectural or product intent, not current implementation evidence. |
 
 The evidence matrix and Beads tracker remain authoritative where they carry stronger, fresher evidence than this summary.
@@ -44,7 +44,7 @@ Recent critical-path work includes:
 
 **Status: substantial bounded implementation, still incomplete.**
 
-Landed surfaces include split-artifact parsing, declaration decoding, bounded inspection and diff tooling, reconstruction for several authority units, provenance/chain auditing, standalone checkable snapshots, and the `fln check-olean` council path.
+Landed surfaces include split-artifact parsing, declaration decoding, bounded inspection and diff tooling, reconstruction for several authority units, provenance and chain auditing, standalone checkable snapshots, and the `fln check-olean` council path.
 
 The Reference remains an oracle and fixture source only. No upstream implementation executes as a FrankenLean runtime component.
 
@@ -52,33 +52,38 @@ The Reference remains an oracle and fixture source only. No upstream implementat
 
 **Status: bounded executable vertical slices are live; general Lean elaboration and runtime parity are not complete.**
 
-The repository contains source-to-kernel and source-to-Golem paths for a growing bounded subset, including caller-named definitions, imports, `#check`, Nat/Bool/String operations, and emitted intermediate/artifact forms. This is meaningful executable ground, not full source-language compatibility.
+The repository contains source-to-kernel and source-to-Golem paths for a growing bounded subset, including caller-named definitions, imports, `#check`, Nat/Bool/String operations, and emitted intermediate and artifact forms. This is meaningful executable ground, not full source-language compatibility.
 
 ### Lantern / LSP server
 
-**Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, and layered client/server transcript evidence; semantic editor and daemon architecture remain incomplete.**
+**Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, source-aware installed entry points, and layered transcript evidence; semantic editor and daemon architecture remain incomplete.**
 
 #### Transport, parser, and wire ground
 
 Landed:
 
 - Content-Length-framed stdio with bounded header bytes, field count, and message size; strict duplicate `Content-Length` and `Content-Type` refusal; canonical CRLF framing; UTF-8-only `application/vscode-jsonrpc`; and failure-atomic bounded writes.
-- Structural JSON decoding for the supported JSON-RPC/LSP surface. Complete values are validated before dispatch, nesting is bounded, malformed strings/numbers/literals/containers and duplicate selected fields are rejected, and parse errors remain distinct from invalid requests.
+- Structural JSON decoding for the supported JSON-RPC/LSP surface. Complete values are validated before dispatch, nesting is bounded, malformed strings, numbers, literals, and containers plus duplicate selected fields are rejected, and parse errors remain distinct from invalid requests.
 - Root envelope fields cannot be impersonated by nested payload content. Document fields are read only from their exact structural containers.
 - Request-ID identity is explicit: number lexemes remain exact, strings compare by decoded Unicode value and canonical JSON escaping, and `null` remains `null`.
 - Deterministic constructors for lifecycle responses, errors, progress, warnings, diagnostic clearing, and non-authoritative callback faults.
 
-#### Live lifecycle and document authority
+#### Live lifecycle, source, and document authority
 
 Landed:
 
 - `initialize`, `initialized`, `shutdown`, and `exit`, with UTF-16 position encoding advertised and Full text synchronization selected.
-- Full-sync `didOpen`, `didChange`, `didSave`, and `didClose`. Ranged/incremental fragments, duplicate opens, unopened changes/saves, non-monotone versions, and malformed transitions fail closed.
+- Full-sync `didOpen`, `didChange`, `didSave`, and `didClose`. Ranged or incremental fragments, duplicate opens, unopened changes and saves, non-monotone versions, and malformed transitions fail closed.
 - Open-document membership and accepted versions remain authoritative independently of retained source bytes.
 - Session-local state is independently bounded to 1,024 open documents, 256 MiB of retained source, and 4 MiB of aggregate URI keys.
 - Textless saves recheck the newest retained snapshot. Missing or invalidated text is visible and cannot replay stale source.
 - Accounting recovery rebuilds source-byte and URI-key aggregates from surviving documents where possible, otherwise discards retained text while preserving open/version authority.
 - Close removes document, source, and publication state, clears push diagnostics, and resolves waits that can no longer complete.
+- Both installed entry points, `fln serve-lsp` and `lean --server`, now use one shared binary-side adapter. The adapter checks the exact unsaved source and passes that URI/text snapshot to `project_with_sources`; it does not inspect rendered JSON substrings or create a second diagnostic authority.
+- Engine diagnostics retain the exact editor URI, including already percent-encoded file URIs and non-hierarchical schemes. The installed regression forbids the old `%2520` double-encoding split.
+- Parser refusal offsets now survive the parser, elaborator facade, engine error, `FileMap`, and source-aware projector. A real installed-binary test places a second-line error after a non-BMP character and observes the correct LSP UTF-16 coordinate.
+
+**Evidence:** the source-aware installed bridge and parser-position path were compiled and exercised by the compiler-equipped session that landed `db4e3058` and `7e22255a`; the focused `fln-cli` LSP test reported 4/4 passing there.
 
 #### Diagnostic publication and wait authority
 
@@ -92,7 +97,7 @@ Landed:
 - Missing, malformed, or ambiguous terminal callback output cannot become an empty success.
 - Accepted document state and diagnostic-publication authority are separate frontiers. `textDocument/waitForDiagnostics` is satisfied only by the latter.
 - Immediate and future-version waits use one monotone publication frontier. Non-authoritative processing fails matching waits; a later authoritative save at the same version may recover the frontier.
-- Pending waits are bounded to 4,096 requests and 4 MiB of retained request-ID/URI metadata.
+- Pending waits are bounded to 4,096 requests and 4 MiB of retained request-ID and URI metadata.
 - Cancellation, close, and shutdown resolve pending waits exactly once in deterministic order.
 
 #### Client transcript evidence
@@ -101,7 +106,7 @@ Landed:
 
 - `fln-lsp-validate` exposes syntax-only, `--client-lifecycle`, and `--client-session` grades.
 - `fln.lsp-transcript-validation/2` reports complete framed `wireBytes` separately from JSON `bodyBytes` and remains usable for negative fixtures.
-- `fln.lsp-client-lifecycle/1` binds initialize/initialized/shutdown/exit positions plus known method role and parameter-container contracts.
+- `fln.lsp-client-lifecycle/1` binds initialize, initialized, shutdown, and exit positions plus known method role and parameter-container contracts.
 - `fln.lsp-client-session/3` adds Full-sync document semantics, monotone versions, covered-versus-future waits, canonical request-ID uniqueness, and cancellation-target authority.
 - Every cancellation target must name an earlier non-null request under the same canonical identity policy; duplicate cancellation of one target fails closed.
 - Client request identity is bounded to 262,144 IDs and 32 MiB of canonical ID bytes. Cancellation state is stored on the bounded request record rather than copying each ID into another map.
@@ -109,14 +114,14 @@ Landed:
 - Strict replay preflight occurs before dispatcher execution, expected-stream comparison, stdout emission, or create-new output publication. Default replay remains available for deliberately invalid fixtures.
 - `fln-lsp-inspect` emits metadata-only `fln.lsp-frame/2` rows and omits parameter and source contents.
 
-#### Server transcript and bidirectional evidence
+#### Server, correlation, and interleaved causality evidence
 
 Landed:
 
-- `fln-lsp-server-validate` validates notifications and result/error responses independently of a client recording.
+- `fln-lsp-server-validate` validates notifications and result or error responses independently of a client recording.
 - `fln.lsp-server-transcript/3` separates result responses, error responses, diagnostic publications, diagnostic outcomes, file-progress notifications, log messages, and unknown notifications.
-- Known notification payloads receive structural validation: nonempty document identities, required arrays and strings, MessageType range, optional diagnostic versions, and the diagnostic outcome/authority/count covenant.
-- Server wire bytes, body bytes, decoded method/ID bytes, frame ceiling, and decoded-metadata ceiling are explicit.
+- Known notification payloads receive structural validation: nonempty document identities, required arrays and strings, MessageType range, optional diagnostic versions, and the diagnostic outcome, authority, and count covenant.
+- Server wire bytes, body bytes, decoded method and ID bytes, frame ceiling, and decoded-metadata ceiling are explicit.
 - Server-initiated requests remain outside the current bounded profile and are refused rather than misclassified.
 - `fln-lsp-correlate CLIENT SERVER` requires a strict client session and strict server transcript, then joins every canonical client request ID to exactly one server response.
 - Correlation independently rebuilds request and cancellation indexes and requires their accounting and prior-request facts to agree with the client-session pass.
@@ -129,24 +134,29 @@ Landed:
   - plain goals, term goals, hover, completion, and definition return the current no-information `null` result;
   - unsupported Lean RPC calls return `RequestFailed`;
   - unknown methods return `MethodNotFound`.
-- Method-derived result and error counts must reconcile exactly with the server transcript's validated result/error totals, and every matched response must belong to one method contract class.
-- The receipt exposes zero method-contract violations plus separate counters for initialize, shutdown, diagnostic-wait results/errors, no-information query results, unsupported-RPC errors, and unknown-method errors.
-- Cancelled targets are also classified independently as `RequestCancelled`, normal result, or another valid error. A normal result is disclosed rather than rejected because cancellation is advisory and separate streams contain no shared event clock.
-- Installed-binary tests bind the positive schema-v5 receipt and prove that a response with the correct ID but the wrong method behavior cannot produce a success receipt. In particular, `MethodNotFound` for hover is rejected because the live bounded dispatcher currently returns `null`.
-- [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) is the operational contract for these evidence tools.
+- Method-derived result and error counts must reconcile exactly with the server transcript's validated totals, and every matched response must belong to one method contract class.
+- Cancelled targets are classified independently as `RequestCancelled`, normal result, or another valid error. Separate client and server streams disclose that result but cannot prove response order.
+- `fln-lsp-timeline TIMELINE` adds a typed interleaved profile rather than guessing order between independent files. Every outer frame carries `fln.lsp-interleaved-event/1`, one direction, and one inner JSON-RPC object.
+- The timeline rebuilds bounded client and server projections and subjects them to the existing strict session, server, correlation, cancellation, and method-response validators before making additional claims.
+- `fln.lsp-interleaved-timeline/1` names `fln.lsp-cross-stream-causality/1` and proves, under `record-order-v1`, that responses follow their requests, the initialize response precedes `initialized`, the shutdown response precedes `exit`, cancellation precedes the target response, duplicate responses and cancellations are absent, and no event follows exit.
+- The complete correlation-v5 receipt is nested inside the timeline receipt. Lifecycle event indices, outer and projected wire bytes, request-ID bytes, cancellation counts, enforced ceilings, and explicit zero-violation fields are retained.
+- Timeline resources are bounded to 256 MiB of outer bytes, one million events, 256 MiB of combined projected client/server wire, 262,144 request IDs, and 32 MiB of canonical request-ID bytes.
+- Repository-owned unit and installed-binary tests cover positive nested receipts plus response-before-request, initialized-before-response, exit-before-shutdown-response, cancellation-after-response, duplicate cancellation or response, and post-exit refusal.
+- [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) is the operational contract for all six tools.
+
+**Timeline evidence grade:** landed. The environment that authored `fln-lsp-timeline` did not contain `cargo` or `rustc`, and hosted Actions were intentionally not used, so this file does not claim the new target compiled or its tests ran in that same session.
 
 #### Still incomplete
 
-- The production CLI callback now passes the exact unsaved document through `project_with_sources`, and a parse error is reported at its real source position (byte offset → `FileMap::to_position` → LSP UTF-16 column) instead of the file head. **Landed and tested** (`syntax_error_reports_a_real_utf16_source_position`, commit `2bf3a02a`). Remaining: **elaboration/type** errors are still positioned at `(1, 0)` because `NatDefinitionElabError` is message-only — the offending `Syntax` node's `BytePos` must be threaded through the elaborator's refusal type before those can be located (a new-implementation task, not wiring).
-- Method-response schema v1 is an outer contract. It does not yet validate the complete initialize capability object or useful semantic payloads for goals, hover, completion, or definition. Successful diagnostic waits are currently classified as object-valued results rather than a deeper inner schema.
-- Client and server recordings have no shared event clock. Correlation establishes identity, shape, counts, method classes, and cancellation-response classes, not response ordering or proof that a response followed cancellation.
-- Complete document-to-progress-to-publication causality is not yet joined across both streams.
+- Parser errors have real UTF-16 positions. Most bounded-source type failures are kernel rejections rather than `NatDefinitionElabError` values, and neither path currently carries an offending source position. Those failures still land at `(1, 0)`.
+- Method-response schema v1 is an outer contract. It does not validate the complete initialize capability object or useful semantic payloads for goals, hover, completion, or definition. Successful diagnostic waits are object-valued rather than bound to a deeper inner schema.
+- Independent `CLIENT` and `SERVER` recordings still have no shared order. The new `TIMELINE` profile supplies recorder-defined event order, not wall-clock time, duration, scheduler execution, transport flush completion, or active CPU-work intervals.
+- No production recorder yet emits and identity-binds the interleaved event format. Fixture or caller-generated timelines must not be promoted to live-daemon evidence by implication.
+- Timeline schema v1 does not yet bind a particular `didOpen`, `didChange`, or `didSave` to its progress, terminal publication, diagnostic clearing, and completion episode. Complete document-to-progress-to-publication causality remains open.
 - Plain goals and term goals are not cursor-aware. Hover, completion, and definition still return no-information responses.
-- Lean RPC sessions are not implemented. RPC calls fail visibly; keepAlive/release do not fabricate a session.
-- Retained source is session-local input state, not a declaration-granular shared elaboration/import environment.
-- The server remains synchronous and does not implement asupersync regions, active elaboration cancellation, shared immutable import heaps, stable diagnostic identities, crash isolation, a timestamped bidirectional trace, or full unmodified `vscode-lean4` parity.
-
-The latest method-bound response, cancellation, session, server-stream, correlation, replay, accounting, callback-authority, and wait changes are **landed**. The environment used for this edit did not contain `cargo` or `rustc`, and hosted Actions were intentionally not used, so this status file does not claim a same-session green Rust run.
+- Lean RPC sessions are not implemented. RPC calls fail visibly; keepAlive and release do not fabricate a session.
+- Retained source is session-local input state, not a declaration-granular shared elaboration and import environment.
+- The server remains synchronous and does not implement asupersync regions, active elaboration cancellation, shared immutable import heaps, stable diagnostic identities, crash isolation, or full unmodified `vscode-lean4` parity.
 
 ### Agent-control plane
 
@@ -165,21 +175,23 @@ This is intended to make agent work accretive: failed hypotheses and verified fr
 
 **Status: mixed partial implementation.**
 
-These subsystems contain real contract planes, data structures, bounded execution slices, or integration work, but the repository has not reached the README's finished-system claims. Full mathlib-compatible elaboration and tactics, the complete native `Lean.*` Mirror, full Lake/Ledger behavior, production Iron code generation and JIT, semantic LSP/RPC, complete MCP orchestration, and release-grade cross-platform distribution remain active program work.
+These subsystems contain real contract planes, data structures, bounded execution slices, or integration work, but the repository has not reached the README's finished-system claims. Full mathlib-compatible elaboration and tactics, the complete native `Lean.*` Mirror, full Lake and Ledger behavior, production Iron code generation and JIT, semantic LSP and RPC, complete MCP orchestration, and release-grade cross-platform distribution remain active program work.
 
 ---
 
 ## High-priority open proof obligations
 
 1. **Advance `fln-51y8` with real pinned evidence.** Execute the pinned Nat council and continue the exact Prelude first-failure frontier rather than generalizing from fixtures.
-2. **Give elaboration/type errors real positions (deliberate refactor, not wiring).** Parse errors now project at their true UTF-16 position (done, `db4e3058` + shared LSP support `7e22255a`); both `fln serve-lsp` and `lean --server` share it. The remaining errors still land at the file head `(1, 0)`, and a measurement clarified *why this is bigger than it looks*: for the bounded source subset, most "type errors" are **kernel rejections** (`DefinitionTypeMismatch`, `UnknownConstant`), not `NatDefinitionElabError` refusals — e.g. `def h : Nat := "str"` is a `KernelRejected`, and `def g : Nat := zzz` is `UnknownConstant`; genuine `Frontend::Elaborate` refusals are comparatively rare. Neither the kernel verdict nor `NatDefinitionElabError` carries a source position. Two honest routes: (a) a **command-level** position — attach the command's `original_offset` (already in the `execute_source_command_stream` loop) to `EngineExecutionError::BatchCommand` via a new `at: Option<BytePos>` field and let `primary_source_offset` fall back to it (`inner.or(at)`); this locates any command error to its **line** but touches **~27 `BatchCommand` construction sites**, so it is a deliberate refactor, not a quick edit; or (b) **token-level** positions, which need real source provenance threaded through the elaborator (65 `NatDefinitionElabError` sites) and the kernel — a much larger feature. Route (a) is the pragmatic next step and is testable end-to-end (a kernel rejection on line 2 must publish at line 1, not the file head).
-3. **Keep independent-checker authority boundaries intact.** The checker may veto or observe; it must never become a second admission authority.
-4. **Deepen method-result contracts deliberately.** Bind the exact initialize capability object and exact diagnostic-wait success payload before claiming those inner semantics.
-5. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
-6. **Promote retained text into real declaration and import state deliberately.** The latest-text cache supports truthful Full-sync lifecycle semantics; it is not dependency-aware incremental elaboration.
-7. **Join client and server causality.** Add a shared event clock or interleaved trace, active-request lifetime, environment/epoch/executable identity, final daemon state, first divergence, and production-callback evidence.
-8. **Keep JSON-RPC decoding narrow but structural.** Extend typed extraction deliberately; never reintroduce substring routing or unbounded generic decoding.
-9. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin or artifact identity, and outcome class.
+2. **Give kernel, elaboration, and other command failures honest source positions.** Parse errors are done. The pragmatic next step is command-level provenance: attach each command's existing `original_offset` to the `EngineExecutionError::BatchCommand` envelope and let `primary_source_offset` fall back to it. That locates all command failures to the correct line without pretending token precision. Token-level elaborator and kernel positions remain a larger follow-on.
+3. **Compile and run the interleaved timeline target at the pinned Rust toolchain.** Exercise its unit and installed-binary tests, clippy with warnings denied, formatting, and workspace check before promoting the new profile beyond landed evidence.
+4. **Bind document-check episodes in timeline schema v2.** Join each accepted open, change, save, and close to the exact progress, publication or outcome, clear, and completion sequence, while refusing overlapping or orphaned synchronous episodes.
+5. **Add a production timeline recorder with identity.** Bind executable, Git tree, epoch, producer semantics, final daemon state, first divergence, and the exact outer stream; do not synthesize order from independent recordings.
+6. **Keep independent-checker authority boundaries intact.** The checker may veto or observe; it must never become a second admission authority.
+7. **Deepen method-result contracts deliberately.** Bind the exact initialize capability object and exact diagnostic-wait success payload before claiming those inner semantics.
+8. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
+9. **Promote retained text into real declaration and import state deliberately.** The latest-text cache supports truthful Full-sync lifecycle semantics; it is not dependency-aware incremental elaboration.
+10. **Keep JSON-RPC decoding narrow but structural.** Extend typed extraction deliberately; never reintroduce substring routing or unbounded generic decoding.
+11. **Prefer executable frontier evidence over narrative status.** New compatibility claims should name a reproducer, pin or artifact identity, and outcome class.
 
 ---
 
@@ -191,8 +203,9 @@ On a host with the pinned Rust and Reference toolchains:
 cargo fmt --all -- --check
 cargo test --locked -p fln-server --all-targets --no-fail-fast
 cargo clippy --locked -p fln-server --all-targets -- -D warnings
-cargo test --locked -p fln-cli --lib --no-fail-fast
-cargo clippy --locked -p fln-cli --lib -- -D warnings
+cargo test --locked -p fln-cli --all-targets --no-fail-fast
+cargo clippy --locked -p fln-cli --all-targets -- -D warnings
+cargo check --locked --workspace --all-targets
 cargo test --locked -p fln-checker --no-fail-fast
 cargo test --locked -p fln-conformance --test pinned_nat_council
 python3 scripts/check_pinned_nat_council.py
