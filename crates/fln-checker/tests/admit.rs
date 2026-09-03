@@ -13566,6 +13566,205 @@ fn kr600_803_class_shaped_add_block_is_reconstructed() {
     );
 }
 
+/// A two-parameter class block. The `Add` fixture above cannot see the ORDER of
+/// the parameter telescope: with one parameter, wrapping it forward and wrapping
+/// it in reverse build the same term. `Init.MonadEvalT` is the first real class
+/// carrying two, and a reversed telescope makes the reconstruction disagree with
+/// the pin at `constructor-compare`.
+///
+/// The two parameters therefore carry DIFFERENT types (`Sort (u+1)` and
+/// `Sort u`). Giving them the same type would make this test vacuous — swapping
+/// two identical binders yields an identical term, and the mutant would live.
+fn class_conv_entries() -> Vec<ConstantEntry> {
+    let conv = checker_qualified(&["Conv"]);
+    let mk = checker_qualified(&["Conv", "mk"]);
+    let rec = checker_qualified(&["Conv", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let atype = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let btype = || Expr::sort(u.clone());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let conv_of = |alpha: Expr, beta: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(primary_name("Conv"), vec![u.clone()]),
+                alpha,
+            ),
+            beta,
+        )
+    };
+    let mk_applied = |alpha: Expr, beta: Expr, field: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["Conv", "mk"]), vec![u.clone()]),
+                    alpha,
+                ),
+                beta,
+            ),
+            field,
+        )
+    };
+    // The field type `α → β`. Its de Bruijn indices depend on how deep it sits,
+    // so each site spells its own: the domain names α in the enclosing scope and
+    // the body names β one binder deeper.
+    let field_in_ctor = || primary_pi("c", BinderInfo::Default, bv(1), bv(1));
+    let field_in_minor = || primary_pi("c", BinderInfo::Default, bv(2), bv(2));
+    let field_in_rule = || primary_pi("c", BinderInfo::Default, bv(3), bv(3));
+    // Motive `Conv α β → Sort v`, under `[α, β]`.
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            conv_of(bv(1), bv(0)),
+            Expr::sort(v.clone()),
+        )
+    };
+    // Minor `∀ c : α → β, motive (mk α β c)`, under `[α, β, motive]`.
+    let minor_type = || {
+        primary_pi(
+            "c",
+            BinderInfo::Default,
+            field_in_minor(),
+            Expr::app(bv(1), mk_applied(bv(3), bv(2), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        atype(),
+        primary_pi(
+            "β",
+            BinderInfo::Implicit,
+            btype(),
+            primary_pi(
+                "motive",
+                BinderInfo::Implicit,
+                motive_type(),
+                primary_pi(
+                    "minor",
+                    BinderInfo::Default,
+                    minor_type(),
+                    primary_pi(
+                        "major",
+                        BinderInfo::Default,
+                        conv_of(bv(3), bv(2)),
+                        Expr::app(bv(2), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+    // Iota rule: `λ α β motive minor c. minor c`.
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        atype(),
+        Expr::lam(
+            primary_name("β"),
+            btype(),
+            Expr::lam(
+                primary_name("motive"),
+                motive_type(),
+                Expr::lam(
+                    primary_name("minor"),
+                    minor_type(),
+                    Expr::lam(
+                        primary_name("c"),
+                        field_in_rule(),
+                        Expr::app(bv(1), bv(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            conv.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    atype(),
+                    primary_pi("β", BinderInfo::Default, btype(), atype()),
+                )),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    0,
+                    vec![conv.clone()],
+                    vec![mk.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            mk.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    atype(),
+                    primary_pi(
+                        "β",
+                        BinderInfo::Implicit,
+                        btype(),
+                        primary_pi(
+                            "c",
+                            BinderInfo::Default,
+                            field_in_ctor(),
+                            conv_of(bv(2), bv(1)),
+                        ),
+                    ),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(conv.clone(), 0, 2, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![conv],
+                    2,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(mk, 1, decoded(&rule_rhs))],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_class_block_reconstructs_a_two_parameter_family() {
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &class_conv_entries(),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "two-parameter class block admits: {verdict:?}"
+    );
+}
+
 #[test]
 fn kr600_803_class_block_refuses_a_forged_field_count() {
     let mut entries = class_add_entries();
