@@ -137,7 +137,7 @@ Landed:
 
 #### Still incomplete
 
-- The production CLI callback still uses compatibility `fln_server::project` rather than `project_with_sources`; exact unsaved source is not yet passed through that monolithic bridge. Current file-level engine failures are predominantly positioned at `(1, 0)`.
+- The production CLI callback now passes the exact unsaved document through `project_with_sources`, and a parse error is reported at its real source position (byte offset → `FileMap::to_position` → LSP UTF-16 column) instead of the file head. **Landed and tested** (`syntax_error_reports_a_real_utf16_source_position`, commit `2bf3a02a`). Remaining: **elaboration/type** errors are still positioned at `(1, 0)` because `NatDefinitionElabError` is message-only — the offending `Syntax` node's `BytePos` must be threaded through the elaborator's refusal type before those can be located (a new-implementation task, not wiring).
 - Method-response schema v1 is an outer contract. It does not yet validate the complete initialize capability object or useful semantic payloads for goals, hover, completion, or definition. Successful diagnostic waits are currently classified as object-valued results rather than a deeper inner schema.
 - Client and server recordings have no shared event clock. Correlation establishes identity, shape, counts, method classes, and cancellation-response classes, not response ordering or proof that a response followed cancellation.
 - Complete document-to-progress-to-publication causality is not yet joined across both streams.
@@ -172,7 +172,7 @@ These subsystems contain real contract planes, data structures, bounded executio
 ## High-priority open proof obligations
 
 1. **Advance `fln-51y8` with real pinned evidence.** Execute the pinned Nat council and continue the exact Prelude first-failure frontier rather than generalizing from fixtures.
-2. **Migrate the live CLI callback to source-aware projection.** Pass exact unsaved URI/text into `project_with_sources` without duplicating or weakening dispatcher publication authority.
+2. **Give elaboration/type errors real positions.** Parse errors now project at their true UTF-16 position (obligation done, `2bf3a02a`); the remaining work is to capture the offending `Syntax` node's `BytePos` in `NatDefinitionElabError` and thread it through `NatDefinitionFrontendError::Elaborate` so type errors are located too, then reuse the same `primary_source_offset` → `FileMap::to_position` bridge.
 3. **Keep independent-checker authority boundaries intact.** The checker may veto or observe; it must never become a second admission authority.
 4. **Deepen method-result contracts deliberately.** Bind the exact initialize capability object and exact diagnostic-wait success payload before claiming those inner semantics.
 5. **Replace no-information editor scaffolding with truthful semantics one method at a time.** Never fabricate goals, hover data, completions, definitions, or RPC sessions merely to suppress client errors.
