@@ -13588,10 +13588,7 @@ fn class_conv_entries() -> Vec<ConstantEntry> {
     let bv = |index| Expr::bvar(index).expect("packs");
     let conv_of = |alpha: Expr, beta: Expr| {
         Expr::app(
-            Expr::app(
-                Expr::const_(primary_name("Conv"), vec![u.clone()]),
-                alpha,
-            ),
+            Expr::app(Expr::const_(primary_name("Conv"), vec![u.clone()]), alpha),
             beta,
         )
     };
