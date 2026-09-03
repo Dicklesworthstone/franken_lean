@@ -14,7 +14,7 @@ Do not promote a row from implemented to verified merely because code or a test 
 | State | Meaning |
 |---|---|
 | **landed** | Code is committed on `main`; no claim is made that the relevant runtime test ran in the same session. |
-| **model-verified** | A focused synthetic/model test exists and has run, but the claim is not bound to the real pinned artifact. |
+| **model-verified** | A focused synthetic or model test exists and has run, but the claim is not bound to the real pinned artifact. |
 | **artifact-bound** | A repository-owned test or runner consumes the real pinned Reference artifact and fails closed when that artifact is absent. |
 | **observed** | A concrete run against the relevant real build or pinned artifact is retained with enough identity to reproduce it. |
 | **target** | Architectural or product intent, not current implementation evidence. |
@@ -52,7 +52,7 @@ The Reference remains an oracle and fixture source only. No upstream implementat
 
 **Status: bounded executable vertical slices are live; general Lean elaboration and runtime parity are not complete.**
 
-The repository contains source-to-kernel and source-to-Golem paths for a growing bounded subset, including caller-named definitions, imports, `#check`, Nat/Bool/String operations, and emitted intermediate and artifact forms. This is meaningful executable ground, not full source-language compatibility.
+The repository contains source-to-kernel and source-to-Golem paths for a growing bounded subset, including caller-named definitions, imports, `#check`, Nat, Bool, and String operations, and emitted intermediate and artifact forms. This is meaningful executable ground, not full source-language compatibility.
 
 ### Lantern / LSP server
 
@@ -63,7 +63,7 @@ The repository contains source-to-kernel and source-to-Golem paths for a growing
 Landed:
 
 - Content-Length-framed stdio with bounded header bytes, field count, and message size; strict duplicate `Content-Length` and `Content-Type` refusal; canonical CRLF framing; UTF-8-only `application/vscode-jsonrpc`; and failure-atomic bounded writes.
-- Structural JSON decoding for the supported JSON-RPC/LSP surface. Complete values are validated before dispatch, nesting is bounded, malformed strings, numbers, literals, and containers plus duplicate selected fields are rejected, and parse errors remain distinct from invalid requests.
+- Structural JSON decoding for the supported JSON-RPC and LSP surface. Complete values are validated before dispatch, nesting is bounded, malformed strings, numbers, literals, and containers plus duplicate selected fields are rejected, and parse errors remain distinct from invalid requests.
 - Root envelope fields cannot be impersonated by nested payload content. Document fields are read only from their exact structural containers.
 - Request-ID identity is explicit: number lexemes remain exact, strings compare by decoded Unicode value and canonical JSON escaping, and `null` remains `null`.
 - Deterministic constructors for lifecycle responses, errors, progress, warnings, diagnostic clearing, and non-authoritative callback faults.
@@ -77,13 +77,13 @@ Landed:
 - Open-document membership and accepted versions remain authoritative independently of retained source bytes.
 - Session-local state is independently bounded to 1,024 open documents, 256 MiB of retained source, and 4 MiB of aggregate URI keys.
 - Textless saves recheck the newest retained snapshot. Missing or invalidated text is visible and cannot replay stale source.
-- Accounting recovery rebuilds source-byte and URI-key aggregates from surviving documents where possible, otherwise discards retained text while preserving open/version authority.
+- Accounting recovery rebuilds source-byte and URI-key aggregates from surviving documents where possible, otherwise discards retained text while preserving open and version authority.
 - Close removes document, source, and publication state, clears push diagnostics, and resolves waits that can no longer complete.
-- Both installed entry points, `fln serve-lsp` and `lean --server`, now use one shared binary-side adapter. The adapter checks the exact unsaved source and passes that URI/text snapshot to `project_with_sources`; it does not inspect rendered JSON substrings or create a second diagnostic authority.
+- Both installed entry points, `fln serve-lsp` and `lean --server`, now use one shared binary-side adapter. The adapter checks the exact unsaved source and passes that URI and text snapshot to `project_with_sources`; it does not inspect rendered JSON substrings or create a second diagnostic authority.
 - Engine diagnostics retain the exact editor URI, including already percent-encoded file URIs and non-hierarchical schemes. The installed regression forbids the old `%2520` double-encoding split.
 - Parser refusal offsets now survive the parser, elaborator facade, engine error, `FileMap`, and source-aware projector. A real installed-binary test places a second-line error after a non-BMP character and observes the correct LSP UTF-16 coordinate.
 
-**Evidence:** the source-aware installed bridge and parser-position path were compiled and exercised by the compiler-equipped session that landed `db4e3058` and `7e22255a`; the focused `fln-cli` LSP test reported 4/4 passing there.
+**Evidence:** the source-aware installed bridge and parser-position path were compiled and exercised by the compiler-equipped session that landed `db4e3058` and `7e22255a`; the focused `fln-cli` LSP test reported 4 of 4 passing there.
 
 #### Diagnostic publication and wait authority
 
@@ -140,11 +140,13 @@ Landed:
 - The timeline rebuilds bounded client and server projections and subjects them to the existing strict session, server, correlation, cancellation, and method-response validators before making additional claims.
 - `fln.lsp-interleaved-timeline/1` names `fln.lsp-cross-stream-causality/1` and proves, under `record-order-v1`, that responses follow their requests, the initialize response precedes `initialized`, the shutdown response precedes `exit`, cancellation precedes the target response, duplicate responses and cancellations are absent, and no event follows exit.
 - The complete correlation-v5 receipt is nested inside the timeline receipt. Lifecycle event indices, outer and projected wire bytes, request-ID bytes, cancellation counts, enforced ceilings, and explicit zero-violation fields are retained.
-- Timeline resources are bounded to 256 MiB of outer bytes, one million events, 256 MiB of combined projected client/server wire, 262,144 request IDs, and 32 MiB of canonical request-ID bytes.
-- Repository-owned unit and installed-binary tests cover positive nested receipts plus response-before-request, initialized-before-response, exit-before-shutdown-response, cancellation-after-response, duplicate cancellation or response, and post-exit refusal.
-- [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) is the operational contract for all six tools.
+- Timeline resources are bounded to 256 MiB of outer bytes, one million events, 256 MiB of combined projected client and server wire, 262,144 request IDs, and 32 MiB of canonical request-ID bytes.
+- Repository-owned unit and installed-binary tests cover positive nested receipts plus response-before-request, initialized-before-response, exit-before-shutdown-response, cancellation-after-response, duplicate cancellation or response, and post-exit refusal. The end-of-options regression now passes a genuinely dash-prefixed relative path rather than an absolute `/tmp` path whose first byte was `/`.
+- `scripts/build_lsp_timeline.py` constructs deterministic fixtures from `direction<TAB>raw JSON` lines without reserializing the inner message. Exact number lexemes and string escape spellings therefore survive into the validator input. It validates duplicate-free object JSON, directions, UTF-8, per-event and aggregate limits, and publishes through a complete staging inode plus no-clobber hard link.
+- Fixture construction emits `fln.lsp-timeline-fixture-build/1` with input and output hashes, explicit byte counts, `authority:false`, and `purpose:"fixture-generation"`. This receipt identifies a fixture; it is not live-recorder or production causality evidence.
+- [`docs/LANTERN_WIRE_REPLAY.md`](docs/LANTERN_WIRE_REPLAY.md) specifies all six transcript tools, and [`docs/LANTERN_TIMELINE_FIXTURES.md`](docs/LANTERN_TIMELINE_FIXTURES.md) specifies deterministic fixture construction.
 
-**Timeline evidence grade:** landed. The environment that authored `fln-lsp-timeline` did not contain `cargo` or `rustc`, and hosted Actions were intentionally not used, so this file does not claim the new target compiled or its tests ran in that same session.
+**Timeline evidence grade:** the Rust timeline target and its Rust tests are landed. The environment that authored them did not contain `cargo` or `rustc`, and hosted Actions were intentionally not used, so this file does not claim the new target compiled or its Rust tests ran in that same session. The independent Python 3.13 fixture-builder regression is **observed** at 4 of 4 passing.
 
 #### Still incomplete
 
@@ -183,7 +185,7 @@ These subsystems contain real contract planes, data structures, bounded executio
 
 1. **Advance `fln-51y8` with real pinned evidence.** Execute the pinned Nat council and continue the exact Prelude first-failure frontier rather than generalizing from fixtures.
 2. **Give kernel, elaboration, and other command failures honest source positions.** Parse errors are done. The pragmatic next step is command-level provenance: attach each command's existing `original_offset` to the `EngineExecutionError::BatchCommand` envelope and let `primary_source_offset` fall back to it. That locates all command failures to the correct line without pretending token precision. Token-level elaborator and kernel positions remain a larger follow-on.
-3. **Compile and run the interleaved timeline target at the pinned Rust toolchain.** Exercise its unit and installed-binary tests, clippy with warnings denied, formatting, and workspace check before promoting the new profile beyond landed evidence.
+3. **Compile and run the interleaved timeline target at the pinned Rust toolchain.** Exercise its unit and installed-binary tests, clippy with warnings denied, formatting, and workspace check before promoting the new Rust profile beyond landed evidence. Retain the already observed Python fixture-builder regression as a separate claim.
 4. **Bind document-check episodes in timeline schema v2.** Join each accepted open, change, save, and close to the exact progress, publication or outcome, clear, and completion sequence, while refusing overlapping or orphaned synchronous episodes.
 5. **Add a production timeline recorder with identity.** Bind executable, Git tree, epoch, producer semantics, final daemon state, first divergence, and the exact outer stream; do not synthesize order from independent recordings.
 6. **Keep independent-checker authority boundaries intact.** The checker may veto or observe; it must never become a second admission authority.
@@ -206,6 +208,7 @@ cargo clippy --locked -p fln-server --all-targets -- -D warnings
 cargo test --locked -p fln-cli --all-targets --no-fail-fast
 cargo clippy --locked -p fln-cli --all-targets -- -D warnings
 cargo check --locked --workspace --all-targets
+python3 scripts/test_build_lsp_timeline.py
 cargo test --locked -p fln-checker --no-fail-fast
 cargo test --locked -p fln-conformance --test pinned_nat_council
 python3 scripts/check_pinned_nat_council.py
