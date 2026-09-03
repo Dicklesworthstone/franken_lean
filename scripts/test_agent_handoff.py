@@ -84,6 +84,16 @@ class HandoffTests(unittest.TestCase):
   tracked.write_text("two\n"); run(["git","add","tracked.txt"],root); run(["git","commit","-m","move"],root)
   stale=json.loads(self.snap(root,"--owner","tester").stdout)["capsules"]["records"][0]; self.assertEqual(stale["freshness"],"stale"); self.assertEqual(stale["stale_paths"],["tracked.txt"])
   missing=self.repo([self.row("active",1,"in_progress")]); refused=self.snap(missing,"--require-capsules"); self.assertEqual(refused.returncode,2); self.assertIn("missing=1",json.loads(refused.stderr)["reason"])
+ def test_capsule_conflicts_block_authority_and_required_snapshot(self):
+  root=self.repo(); tracked=root/"tracked.txt"; tracked.write_text("one\n"); run(["git","add","tracked.txt"],root); run(["git","commit","-m","seam"],root)
+  commit=run(["git","rev-parse","HEAD"],root).stdout.decode().strip(); tree=run(["git","rev-parse","HEAD^{tree}"],root).stdout.decode().strip(); blob=run(["git","rev-parse","HEAD:tracked.txt"],root).stdout.decode().strip()
+  def row(bead,owner):
+   capsule={"schema":"fln.agent-frontier/1","bead":bead,"state":"in_progress","owner":owner,"anchor":{"branch":"main","commit":commit,"tree":tree,"tracked_blobs":{"tracked.txt":blob}}}
+   return self.row(bead,1,"in_progress",comments=[{"created_at":"2026-09-03T00:00:00Z","text":json.dumps(capsule)}])
+  self.rows(root,[row("alpha","owner-a"),row("beta","owner-b")]); run(["git","add",".beads/issues.jsonl"],root); run(["git","commit","-m","conflict"],root)
+  snapshot=self.snap(root,"--owner","owner-a","--selection-strict"); self.assertEqual(snapshot.returncode,0,snapshot.stderr.decode()); document=json.loads(snapshot.stdout)
+  self.assertFalse(document["authority"]["promotion_authority"]); self.assertEqual(document["capsules"]["conflicts"],[{"path":"tracked.txt","claimants":[{"bead":"alpha","owner":"owner-a"},{"bead":"beta","owner":"owner-b"}]}])
+  refused=self.snap(root,"--owner","owner-a","--selection-strict","--require-capsules"); self.assertEqual(refused.returncode,2); self.assertIn("conflicts=1",json.loads(refused.stderr)["reason"])
  def test_duplicate_ids_and_keys_fail_closed(self):
   root=self.repo(); with_open=root/".beads/issues.jsonl"
   with with_open.open("a") as f: f.write(json.dumps(self.row("high",0))+"\n")
