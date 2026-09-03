@@ -5996,7 +5996,14 @@ fn admit_class_block(
     for field_type in imported_field_types.iter().rev() {
         result = builder.forall("x", BinderStyle::Default, *field_type, result);
     }
-    for (index, (_, style)) in constructor_param_binders.iter().enumerate() {
+    // `forall` wraps inside out, so the parameters must be wrapped in REVERSE
+    // declaration order for parameter 1 to land outermost — exactly as the field
+    // loop above already does. Wrapping them forward reverses the parameter
+    // telescope, which is invisible for a one-parameter class and swaps the
+    // binders for every class carrying two or more. The result application above
+    // places parameter i at depth `k + f - i`, i.e. it assumes the standard
+    // order, so both halves have to agree.
+    for (index, (_, style)) in constructor_param_binders.iter().enumerate().rev() {
         result = builder.forall("p", *style, imported_param_types[index], result);
     }
     let Some(expected_constructor) = builder.finish(result) else {
@@ -6212,7 +6219,11 @@ fn admit_class_block(
     let mut expected = builder.forall("major", major_binder.1, major_type, body);
     expected = builder.forall("minor", minor_binder.1, minor_body, expected);
     expected = builder.forall("motive", motive_binder.1, motive_domain, expected);
-    for (index, (_, style)) in recursor_param_binders.iter().enumerate() {
+    // Reverse order, for the same reason as the constructor's parameter
+    // telescope: the minor-premise and major-premise depth arithmetic above
+    // ("parameter i sits at `f + k + 1 - i`", "the constructor application is
+    // parameters first") assumes parameter 1 is the outermost binder.
+    for (index, (_, style)) in recursor_param_binders.iter().enumerate().rev() {
         expected = builder.forall("p", *style, recursor_param_imports[index], expected);
     }
     if imported_units.saturating_mul(8) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
