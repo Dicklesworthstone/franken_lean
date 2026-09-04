@@ -2,7 +2,7 @@
 # This pin is authoritative until SUITE.lock (bead franken_lean-xwf) subsumes it;
 # the two must then agree, enforced in CI.
 [toolchain]
-channel = "nightly-2026-07-13"
+channel = "nightly-2026-08-31"
 # `miri` and `rust-src` are here because the Marrow concurrency guards need them
 # and a fresh clone otherwise has neither (bead fln-nhf5). They are components of
 # the pin, not a second pin: SUITE.lock governs the CHANNEL, which is unchanged.
