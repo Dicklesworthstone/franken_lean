@@ -112,6 +112,112 @@ class FrontierBoundaryTests(unittest.TestCase):
                                 sum(reachable[index]),
                             )
 
+    def test_duplicate_issue_fields_are_rejected_before_selection(self):
+        row = issue("task")
+        body = json.dumps(row)
+        for key, conflicting in (
+            ("id", "different"),
+            ("status", "in_progress"),
+            ("assignee", "other-agent"),
+            ("dependencies", [{
+                "issue_id": "task", "depends_on_id": "missing", "type": "blocks",
+            }]),
+        ):
+            with self.subTest(key=key):
+                path = self.write_issues([row])
+                raw = "{" + json.dumps(key) + ":" + json.dumps(conflicting) + "," + body[1:]
+                path.write_text(raw + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(fs.FrontierError, "duplicate JSON key"):
+                    fs.load_issues(path)
+
+    def test_duplicate_nested_dependency_target_is_not_last_write_wins(self):
+        task = json.dumps(issue("task", blockers=("parent",)))
+        task = task.replace(
+            '"depends_on_id": "parent"',
+            '"depends_on_id": "missing", "depends_on_id": "parent"',
+        )
+        path = self.write_issues([])
+        path.write_text(
+            json.dumps(issue("parent", status="closed")) + "\n" + task + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(fs.FrontierError, "duplicate JSON key 'depends_on_id'"):
+            fs.load_issues(path)
+
+    def test_duplicate_overlay_facts_refuse_in_both_orders_and_when_equal(self):
+        path = self.write_issues([]).with_name("overlay.json")
+        for first, last in (("false", "true"), ("true", "false"), ("true", "true")):
+            with self.subTest(first=first, last=last):
+                path.write_text(
+                    '{"task":{"first_failure_named":true,"artifacts_available":true,'
+                    '"oracle_only_compliant":true,"toolchain_available":' + first
+                    + ',"toolchain_available":' + last + '}}',
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(fs.FrontierError, "duplicate JSON key"):
+                    fs.load_overlays(path, {"task"})
+
+    def test_duplicate_overlay_rows_and_decoded_keys_are_rejected(self):
+        path = self.write_issues([]).with_name("overlay.json")
+        cases = (
+            '{"task":{"toolchain_available":false},"task":{"toolchain_available":true}}',
+            r'{"task":{"toolchain_\u0061vailable":false,"toolchain_available":true}}',
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                path.write_text(raw, encoding="utf-8")
+                with self.assertRaisesRegex(fs.FrontierError, "duplicate JSON key"):
+                    fs.load_overlays(path, {"task"})
+
+    def test_repeated_keys_in_distinct_objects_and_string_content_remain_valid(self):
+        rows = [issue("a"), issue("b")]
+        rows[0]["description"] = 'literal {"status":"closed","status":"open"}'
+        path = self.write_issues(rows)
+        original = path.read_bytes()
+        issues, digest = fs.load_issues(path)
+        facts = {
+            "first_failure_named": True,
+            "artifacts_available": True,
+            "toolchain_available": True,
+            "oracle_only_compliant": True,
+        }
+        overlay_path = path.with_name("overlay.json")
+        overlay_path.write_text(json.dumps({"a": facts, "b": facts}), encoding="utf-8")
+        overlays = fs.load_overlays(overlay_path, set(issues))
+        ranked, excluded = fs.rank(issues, overlays, owner="agent", strict=True)
+        self.assertEqual([row["id"] for row in ranked], ["a", "b"])
+        self.assertTrue(all(row["eligibility_complete"] for row in ranked))
+        self.assertTrue(all(not row["promotion_authority"] for row in ranked))
+        self.assertEqual(excluded, {})
+        self.assertEqual(issues["a"].description, rows[0]["description"])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(digest, fs.hashlib.sha256(original).hexdigest())
+
+    def test_cli_duplicate_overlay_refuses_without_an_authoritative_stdout(self):
+        path = self.write_issues([issue("task")])
+        overlay = path.with_name("overlay.json")
+        raw = (
+            '{"task":{"first_failure_named":true,"artifacts_available":true,'
+            '"oracle_only_compliant":true,"toolchain_available":false,'
+            '"toolchain_available":true}}'
+        )
+        overlay.write_text(raw, encoding="utf-8")
+        process = subprocess.run(
+            [
+                sys.executable, str(Path(fs.__file__).resolve()),
+                "--issues", str(path), "--overlay", str(overlay),
+                "--owner", "agent", "--strict",
+            ],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(process.returncode, 2, process.stdout)
+        self.assertEqual(process.stdout, "")
+        refusal = json.loads(process.stderr)
+        self.assertEqual(refusal["schema"], fs.SCHEMA)
+        self.assertEqual(refusal["outcome"], "refused")
+        self.assertIn("duplicate JSON key", refusal["reason"])
+        self.assertEqual(overlay.read_text(encoding="utf-8"), raw)
+
 
 if __name__ == "__main__":
     unittest.main()

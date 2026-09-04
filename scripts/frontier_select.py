@@ -96,6 +96,15 @@ def expect_optional_bool(value: Any, where: str) -> bool | None:
     return value
 
 
+def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise FrontierError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
 def load_issues(path: Path) -> tuple[dict[str, Issue], str]:
     try:
         raw = path.read_bytes()
@@ -107,7 +116,10 @@ def load_issues(path: Path) -> tuple[dict[str, Issue], str]:
         if not raw_line.strip():
             continue
         try:
-            row = expect_dict(json.loads(raw_line), f"line {line_number}")
+            row = expect_dict(
+                json.loads(raw_line, object_pairs_hook=reject_duplicate_pairs),
+                f"line {line_number}",
+            )
         except (UnicodeDecodeError, json.JSONDecodeError, FrontierError) as exc:
             raise FrontierError(f"invalid issue row at line {line_number}: {exc}") from exc
         issue_id = expect_string(row.get("id"), f"line {line_number}.id")
@@ -242,7 +254,10 @@ def load_overlay_snapshot(
     try:
         raw = path.read_bytes()
         root = expect_dict(
-            json.loads(raw.decode("utf-8")),
+            json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_pairs,
+            ),
             "overlay root",
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, FrontierError) as exc:
