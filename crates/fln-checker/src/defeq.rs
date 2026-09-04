@@ -1290,6 +1290,42 @@ fn spine_head_is_lambda(term: &WireExpr, root: ExprId) -> bool {
     }
 }
 
+/// Dump the surviving pair of a typed deferral under FLN_CHECKER_TRACE. The
+/// `DefEqDeferred` need references the GENERATED arenas, which are dropped
+/// before any caller-side hook could print them, so an item-126-class
+/// deferral is invisible at the surface without this dump.
+fn trace_unresolved(
+    need: &DefEqDeferred,
+    left_reference: DefEqTerm,
+    right_reference: DefEqTerm,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &[WireExpr],
+) {
+    if std::env::var_os("FLN_CHECKER_TRACE").is_none() {
+        return;
+    }
+    let sources = TermSources::new(left, right, generated);
+    eprintln!(
+        "fln-checker: defeq unresolved need left={:?} right={:?}",
+        need.left, need.right
+    );
+    if let Ok(term) = sources.source(left_reference) {
+        eprintln!(
+            "fln-checker: defeq unresolved LEFT root={} arena: {:?}",
+            left_reference.root.index(),
+            term.nodes()
+        );
+    }
+    if let Ok(term) = sources.source(right_reference) {
+        eprintln!(
+            "fln-checker: defeq unresolved RIGHT root={} arena: {:?}",
+            right_reference.root.index(),
+            term.nodes()
+        );
+    }
+}
+
 fn compare_pair(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
@@ -2721,6 +2757,7 @@ fn run_slow(
                         )? {
                             continue;
                         }
+                        trace_unresolved(&need, left_reference, right_reference, left, right, &generated);
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
@@ -2748,6 +2785,7 @@ fn run_slow(
                         cancelled,
                     )?;
                     if result.delta_reductions == 0 {
+                        trace_unresolved(&need, left_reference, right_reference, left, right, &generated);
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
@@ -2768,6 +2806,7 @@ fn run_slow(
                         cancelled,
                     )?;
                     if result.delta_reductions == 0 {
+                        trace_unresolved(&need, left_reference, right_reference, left, right, &generated);
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
