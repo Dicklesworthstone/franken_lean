@@ -1272,6 +1272,24 @@ fn defer_pair(
     })
 }
 
+/// Whether the application spine rooted at `root` is an unreduced beta-redex,
+/// i.e. its head is a lambda. The slow worklist must route such a side through
+/// normalization BEFORE congruence decomposition: decomposing first would
+/// expose the lambda HEAD to a head it can never match (a telescope local, a
+/// constant), even though weak-head-normalizing it dissolves the redex and
+/// lets the spines meet. The real pinned `Init.instTransEq_1` body deferred on
+/// exactly that exposure (fln-51y8 item 120).
+fn spine_head_is_lambda(term: &WireExpr, root: ExprId) -> bool {
+    let mut current = root;
+    loop {
+        match term.node(current) {
+            Some(ExprNode::Apply { function, .. }) => current = *function,
+            Some(ExprNode::Lambda { .. }) => return true,
+            _ => return false,
+        }
+    }
+}
+
 fn compare_pair(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
@@ -1402,16 +1420,28 @@ fn compare_pair(
                 function: right_function,
                 argument: right_argument,
             },
-        ) => Ok(PairAction::Push2(
-            (
-                child(left_reference, *left_function)?,
-                child(right_reference, *right_function)?,
-            ),
-            (
-                child(left_reference, *left_argument)?,
-                child(right_reference, *right_argument)?,
-            ),
-        )),
+        ) => {
+            if spine_head_is_lambda(left_term, left_reference.root)
+                || spine_head_is_lambda(right_term, right_reference.root)
+            {
+                return Ok(defer_pair(
+                    left_reference,
+                    right_reference,
+                    left_node,
+                    right_node,
+                ));
+            }
+            Ok(PairAction::Push2(
+                (
+                    child(left_reference, *left_function)?,
+                    child(right_reference, *right_function)?,
+                ),
+                (
+                    child(left_reference, *left_argument)?,
+                    child(right_reference, *right_argument)?,
+                ),
+            ))
+        }
         (
             ExprNode::Lambda {
                 binder_type: left_type,
