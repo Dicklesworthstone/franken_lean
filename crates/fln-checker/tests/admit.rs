@@ -13762,6 +13762,160 @@ fn kr600_803_class_block_reconstructs_a_two_parameter_family() {
     );
 }
 
+/// A `Nonempty`-shaped class block: `Prop`-valued with a data-carrying field, so
+/// the pin gives it SMALL elimination. Its recursor takes NO motive universe
+/// (`levels = [u]`, not `[v, u]`) and its motive lands in `Sort 0`. Reading the
+/// family's own universe as a motive universe made this shape fail the
+/// `level-count` gate and REJECT a well-formed pinned declaration — a false
+/// disagreement with the Reference, not a deferral.
+fn class_nonempty_entries() -> Vec<ConstantEntry> {
+    let nonempty = checker_qualified(&["Nonempty"]);
+    let intro = checker_qualified(&["Nonempty", "intro"]);
+    let rec = checker_qualified(&["Nonempty", "rec"]);
+    let u_name = checker_name("u");
+    let u = Level::param(primary_name("u"));
+    let utype = || Expr::sort(u.clone());
+    let prop = || Expr::sort(Level::zero());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let nonempty_of = |alpha: Expr| {
+        Expr::app(
+            Expr::const_(primary_name("Nonempty"), vec![u.clone()]),
+            alpha,
+        )
+    };
+    let intro_applied = |alpha: Expr, val: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(
+                    Name::from_components(["Nonempty", "intro"]),
+                    vec![u.clone()],
+                ),
+                alpha,
+            ),
+            val,
+        )
+    };
+    // Motive `Nonempty α → Prop`, under `[α]`.
+    let motive_type = || primary_pi("t", BinderInfo::Default, nonempty_of(bv(0)), prop());
+    // Minor `∀ val : α, motive (intro α val)`, under `[α, motive]`.
+    let minor_type = || {
+        primary_pi(
+            "val",
+            BinderInfo::Default,
+            bv(1),
+            Expr::app(bv(1), intro_applied(bv(2), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        utype(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "minor",
+                BinderInfo::Default,
+                minor_type(),
+                primary_pi(
+                    "major",
+                    BinderInfo::Default,
+                    nonempty_of(bv(2)),
+                    Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        ),
+    );
+    // Iota rule: `λ α motive minor val. minor val`.
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        utype(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("minor"),
+                minor_type(),
+                Expr::lam(
+                    primary_name("val"),
+                    bv(2),
+                    Expr::app(bv(1), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            nonempty.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi("α", BinderInfo::Default, utype(), prop())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![nonempty.clone()],
+                    vec![intro.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            intro.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    utype(),
+                    primary_pi("val", BinderInfo::Default, bv(0), nonempty_of(bv(1))),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(nonempty.clone(), 0, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            // Only the family universe: no motive universe is prepended.
+            ConstantDeclaration::recursor(
+                vec![u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![nonempty],
+                    1,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(intro, 1, decoded(&rule_rhs))],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_class_block_admits_a_small_elimination_recursor() {
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &class_nonempty_entries(),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "Prop-valued small-elimination class block admits: {verdict:?}"
+    );
+}
+
 #[test]
 fn kr600_803_class_block_refuses_a_forged_field_count() {
     let mut entries = class_add_entries();
