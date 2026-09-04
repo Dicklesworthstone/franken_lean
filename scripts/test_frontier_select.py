@@ -1,9 +1,13 @@
+import contextlib
+import hashlib
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import frontier_select as fs
@@ -104,7 +108,8 @@ class FrontierSelectTests(unittest.TestCase):
         ranked, excluded = fs.rank(issues, overlays, owner="agent", strict=True)
         self.assertEqual([row["id"] for row in ranked], ["a"])
         self.assertEqual(excluded["unknown_hard_filter_facts"], 1)
-        self.assertTrue(ranked[0]["promotion_authority"])
+        self.assertTrue(ranked[0]["eligibility_complete"])
+        self.assertFalse(ranked[0]["promotion_authority"])
 
     def test_false_hard_fact_refuses_candidate(self):
         path = self.write_issues([issue("a")])
@@ -240,6 +245,118 @@ class FrontierSelectTests(unittest.TestCase):
                 self.assertEqual(refusal["schema"], fs.SCHEMA)
                 self.assertEqual(refusal["outcome"], "refused")
                 self.assertIn("owner", refusal["reason"])
+
+    def write_overlay(self, issues_path, value):
+        path = issues_path.with_name("overlay.json")
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    def complete_overlay(self):
+        return {
+            "first_failure_named": True,
+            "artifacts_available": True,
+            "toolchain_available": True,
+            "oracle_only_compliant": True,
+        }
+
+    def test_complete_facts_do_not_grant_authority(self):
+        path = self.write_issues([issue("a", assignee="me")])
+        overlay_path = self.write_overlay(path, {"a": self.complete_overlay()})
+        before = (path.read_bytes(), overlay_path.read_bytes())
+        result = self.run_selector(
+            path, "--overlay", str(overlay_path), "--owner", "me", "--strict"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertFalse(document["authority"])
+        self.assertTrue(document["eligibility_complete"])
+        self.assertFalse(document["selected"]["promotion_authority"])
+        self.assertTrue(document["selected"]["eligibility_complete"])
+        self.assertTrue(document["read_only"])
+        self.assertFalse(document["live_state_verified"])
+        self.assertEqual(document["owner"], "me")
+        self.assertTrue(document["strict"])
+        self.assertEqual(document["overlay_path"], overlay_path.as_posix())
+        self.assertEqual(document["overlay_sha256"], hashlib.sha256(before[1]).hexdigest())
+        self.assertEqual((path.read_bytes(), overlay_path.read_bytes()), before)
+
+    def test_missing_overlay_differs_from_an_explicit_empty_snapshot(self):
+        path = self.write_issues([issue("a")])
+        missing = json.loads(self.run_selector(path).stdout)
+        self.assertIsNone(missing["overlay_path"])
+        self.assertIsNone(missing["overlay_sha256"])
+        self.assertIsNone(missing["owner"])
+        self.assertFalse(missing["strict"])
+        self.assertFalse(missing["eligibility_complete"])
+        overlay_path = self.write_overlay(path, {})
+        present = json.loads(self.run_selector(path, "--overlay", str(overlay_path)).stdout)
+        self.assertEqual(present["overlay_sha256"], hashlib.sha256(b"{}").hexdigest())
+        self.assertEqual(missing["candidates"], present["candidates"])
+
+    def test_main_hashes_and_parses_each_input_from_one_read(self):
+        path = self.write_issues([issue("a")])
+        overlay_path = self.write_overlay(path, {"a": self.complete_overlay()})
+        raw = {
+            path: path.read_bytes(),
+            overlay_path: (json.dumps({"a": self.complete_overlay()}, indent=2) + "\r\n").encode(),
+        }
+        reads = []
+        def read_once(source):
+            self.assertNotIn(source, reads)
+            reads.append(source)
+            return raw[source]
+        out = io.StringIO()
+        with mock.patch.object(Path, "read_bytes", read_once), mock.patch.object(
+            Path, "read_text", side_effect=AssertionError("must not reopen for parsing")
+        ), contextlib.redirect_stdout(out):
+            status = fs.main(["--issues", str(path), "--overlay", str(overlay_path), "--strict"])
+        self.assertEqual(status, 0)
+        self.assertCountEqual(reads, [path, overlay_path])
+        document = json.loads(out.getvalue())
+        self.assertEqual(document["issues_sha256"], hashlib.sha256(raw[path]).hexdigest())
+        self.assertEqual(document["overlay_sha256"], hashlib.sha256(raw[overlay_path]).hexdigest())
+        self.assertTrue(document["eligibility_complete"])
+        self.assertFalse(document["authority"])
+
+    def test_overlay_loader_keeps_dictionary_api(self):
+        path = self.write_issues([issue("a")])
+        overlay_path = self.write_overlay(path, {"a": self.complete_overlay()})
+        loaded = fs.load_overlays(overlay_path, {"a"})
+        self.assertIsInstance(loaded, dict)
+        self.assertTrue(loaded["a"].toolchain_available)
+        self.assertEqual(fs.load_overlays(None, {"a"}), {})
+
+    def test_overlay_bytes_change_digest_not_semantic_ranking(self):
+        path = self.write_issues([issue("a")])
+        value = {"a": self.complete_overlay()}
+        overlay_path = self.write_overlay(path, value)
+        first = json.loads(self.run_selector(path, "--overlay", str(overlay_path)).stdout)
+        overlay_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        second_result = self.run_selector(path, "--overlay", str(overlay_path))
+        repeated_result = self.run_selector(path, "--overlay", str(overlay_path))
+        second = json.loads(second_result.stdout)
+        self.assertNotEqual(first["overlay_sha256"], second["overlay_sha256"])
+        self.assertEqual(first["candidates"], second["candidates"])
+        self.assertEqual(second_result.stdout, repeated_result.stdout)
+
+    def test_invalid_overlay_bytes_and_fields_are_typed_refusals(self):
+        path = self.write_issues([issue("a")])
+        overlay_path = path.with_name("overlay.json")
+        cases = [
+            b"\xff", b"{", b"[]", b'{"missing": {}}',
+            b'{"a": {"unknown": true}}', b'{"a": {"toolchain_available": "true"}}',
+            b'{"a": {"context_reuse": true}}', b'{"a": {"context_reuse": 11}}',
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                overlay_path.write_bytes(raw)
+                result = self.run_selector(path, "--overlay", str(overlay_path))
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                refusal = json.loads(result.stderr)
+                self.assertEqual(refusal["outcome"], "refused")
+                self.assertEqual(refusal["schema"], fs.SCHEMA)
+                self.assertEqual(overlay_path.read_bytes(), raw)
 
     def test_input_order_does_not_change_ranking(self):
         rows = [issue("z"), issue("a"), issue("m")]

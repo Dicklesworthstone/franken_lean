@@ -230,11 +230,19 @@ def validate_block_graph_acyclic(issues: dict[str, Issue]) -> None:
 
 
 def load_overlays(path: Path | None, issue_ids: set[str]) -> dict[str, Overlay]:
+    overlays, _ = load_overlay_snapshot(path, issue_ids)
+    return overlays
+
+
+def load_overlay_snapshot(
+    path: Path | None, issue_ids: set[str]
+) -> tuple[dict[str, Overlay], str | None]:
     if path is None:
-        return {}
+        return {}, None
     try:
+        raw = path.read_bytes()
         root = expect_dict(
-            json.loads(path.read_text(encoding="utf-8")),
+            json.loads(raw.decode("utf-8")),
             "overlay root",
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, FrontierError) as exc:
@@ -283,7 +291,7 @@ def load_overlays(path: Path | None, issue_ids: set[str]) -> dict[str, Overlay]:
             }
         )
         overlays[issue_id] = Overlay(**values)
-    return overlays
+    return overlays, hashlib.sha256(raw).hexdigest()
 
 
 def unresolved(issue: Issue, issues: dict[str, Issue]) -> tuple[str, ...]:
@@ -408,7 +416,8 @@ def rank(
                 "score": total,
                 "score_components": components,
                 "unknown_hard_filter_facts": unknown_facts,
-                "promotion_authority": not unknown_facts,
+                "eligibility_complete": not unknown_facts,
+                "promotion_authority": False,
             }
         )
     candidates.sort(
@@ -455,7 +464,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         die("--limit must be positive")
     try:
         issues, digest = load_issues(args.issues)
-        overlays = load_overlays(args.overlay, set(issues))
+        overlays, overlay_digest = load_overlay_snapshot(args.overlay, set(issues))
         candidates, excluded = rank(
             issues,
             overlays,
@@ -468,7 +477,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     document = {
         "schema": SCHEMA,
         "outcome": "ranked" if selected else "no_candidate",
-        "authority": bool(selected and selected["promotion_authority"]),
+        "authority": False,
+        "eligibility_complete": bool(selected and selected["eligibility_complete"]),
+        "read_only": True,
+        "live_state_verified": False,
+        "owner": args.owner,
+        "strict": args.strict,
+        "overlay_path": args.overlay.as_posix() if args.overlay is not None else None,
+        "overlay_sha256": overlay_digest,
         "issues_path": args.issues.as_posix(),
         "issues_sha256": digest,
         "issue_count": len(issues),
