@@ -319,7 +319,10 @@ fn pure_conversion_preserves_pending_siblings_across_beta_reduction() {
     assert_eq!(progress.slow_comparisons, 9);
     assert_eq!(progress.normalizations, 4);
     assert_eq!(progress.whnf_reductions, 2);
-    assert_eq!(progress.materialized_arena_nodes, 4);
+    // Since be66b472 a lambda-headed spine normalizes BEFORE congruence, so
+    // the partially reduced spine `function (identity argument)` materializes
+    // whole (13 nodes) instead of only the two one-node redex reductions.
+    assert_eq!(progress.materialized_arena_nodes, 13);
 }
 
 #[test]
