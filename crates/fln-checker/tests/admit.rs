@@ -13916,6 +13916,228 @@ fn kr600_803_class_block_admits_a_small_elimination_recursor() {
     );
 }
 
+/// A parameterized block with TWO constructors carrying DIFFERENT field counts
+/// (`nil` none, `one` a single field) — the shape `Init.Decidable` and
+/// `Init.Option` have and the single-constructor fixtures above cannot reach.
+///
+/// It pins three things a one-constructor block leaves untested: that the
+/// eliminator tail is `motive, minor_0, minor_1, major` rather than a fixed
+/// three binders; that minor_j's own depth arithmetic counts the `j` minors
+/// declared before it; and that each iota rule names its own constructor and
+/// applies its own minor at `f + (n - 1 - j)`.
+fn class_choice_entries() -> Vec<ConstantEntry> {
+    let choice = checker_qualified(&["Choice"]);
+    let nil = checker_qualified(&["Choice", "nil"]);
+    let one = checker_qualified(&["Choice", "one"]);
+    let rec = checker_qualified(&["Choice", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let atype = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let choice_of =
+        |alpha: Expr| Expr::app(Expr::const_(primary_name("Choice"), vec![u.clone()]), alpha);
+    let nil_applied = |alpha: Expr| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Choice", "nil"]), vec![u.clone()]),
+            alpha,
+        )
+    };
+    let one_applied = |alpha: Expr, val: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Choice", "one"]), vec![u.clone()]),
+                alpha,
+            ),
+            val,
+        )
+    };
+    // Motive `Choice α → Sort v`, under `[α]`.
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            choice_of(bv(0)),
+            Expr::sort(v.clone()),
+        )
+    };
+    // minor_0 (`nil`, no fields): `motive (Choice.nil α)`, under `[α, motive]`.
+    let minor_nil_type = || Expr::app(bv(0), nil_applied(bv(1)));
+    // minor_1 (`one`, one field): `∀ val : α, motive (Choice.one α val)`, under
+    // `[α, motive, nil_case]` — note the motive is now TWO binders up, which is
+    // exactly the offset a single-constructor fixture never exercises.
+    let minor_one_type = || {
+        primary_pi(
+            "val",
+            BinderInfo::Default,
+            bv(2),
+            Expr::app(bv(2), one_applied(bv(3), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        atype(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "nil_case",
+                BinderInfo::Default,
+                minor_nil_type(),
+                primary_pi(
+                    "one_case",
+                    BinderInfo::Default,
+                    minor_one_type(),
+                    primary_pi(
+                        "major",
+                        BinderInfo::Default,
+                        choice_of(bv(3)),
+                        Expr::app(bv(3), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+    // Iota rules: `λ α motive nil_case one_case. nil_case` and
+    // `λ α motive nil_case one_case val. one_case val`.
+    let rule_nil_rhs = Expr::lam(
+        primary_name("α"),
+        atype(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("nil_case"),
+                minor_nil_type(),
+                Expr::lam(
+                    primary_name("one_case"),
+                    minor_one_type(),
+                    bv(1),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rule_one_rhs = Expr::lam(
+        primary_name("α"),
+        atype(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("nil_case"),
+                minor_nil_type(),
+                Expr::lam(
+                    primary_name("one_case"),
+                    minor_one_type(),
+                    Expr::lam(
+                        primary_name("val"),
+                        bv(3),
+                        Expr::app(bv(1), bv(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            choice.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi("α", BinderInfo::Default, atype(), atype())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![choice.clone()],
+                    vec![nil.clone(), one.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            nil.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    atype(),
+                    choice_of(bv(0)),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(choice.clone(), 0, 1, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            one.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    atype(),
+                    primary_pi("val", BinderInfo::Default, bv(0), choice_of(bv(1))),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(choice.clone(), 1, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![choice],
+                    1,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(nil, 0, decoded(&rule_nil_rhs)),
+                        RecursorRule::new(one, 1, decoded(&rule_one_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_class_block_reconstructs_two_constructors_with_unequal_fields() {
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &class_choice_entries(),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "two-constructor block admits: {verdict:?}"
+    );
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    // Inductive + both constructors + recursor, in declaration order.
+    assert_eq!(admission.members().len(), 4);
+}
+
 #[test]
 fn kr600_803_class_block_refuses_a_forged_field_count() {
     let mut entries = class_add_entries();
