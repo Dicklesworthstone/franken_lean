@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   diagnose-and-land:
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Check out the live mainline
@@ -23,6 +23,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Install the repository-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-07-13 --profile minimal --component rustfmt --component clippy
 
       - name: Add reusable structural mismatch tracing
         shell: bash
@@ -125,23 +131,30 @@ jobs:
           cargo test --locked -p fln-checker --all-targets --no-fail-fast
           cargo clippy --locked -p fln-checker --all-targets -- -D warnings
 
+      - name: Fetch and verify the exact Lean 4.32.0 release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 4 --retry-all-errors \
+            --output "$archive" \
+            https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          printf '%s  %s\n' \
+            fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 \
+            "$archive" | sha256sum --check --strict
+          tar --zstd --extract --file "$archive" --directory "$RUNNER_TEMP"
+          lean_bin="$RUNNER_TEMP/lean-4.32.0-linux/bin/lean"
+          test -x "$lean_bin"
+          test "$("$lean_bin" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          pin="$(find "$RUNNER_TEMP/lean-4.32.0-linux" -type f -path '*/Init/Prelude.olean' -print -quit)"
+          test -n "$pin"
+          printf '%s\n' "$pin" > "$RUNNER_TEMP/pinned-prelude-path"
+
       - name: Reproduce the real pinned Option frontier with trace evidence
         shell: bash
         run: |
           set -euo pipefail
-          pin=""
-          while IFS= read -r candidate; do
-            case "$candidate" in
-              */leanprover--lean4---v4.32.0/*|*/lean4/v4.32.0/*|*/v4.32.0/*)
-                pin="$candidate"
-                break
-                ;;
-            esac
-          done < <(find "$HOME/.elan" "$HOME" /data /opt -type f -path '*/Init/Prelude.olean' -print 2>/dev/null | LC_ALL=C sort -u)
-          if [[ -z "$pin" ]]; then
-            echo 'pinned Lean 4.32.0 Init/Prelude.olean was not found on the self-hosted verifier' >&2
-            exit 1
-          fi
+          pin="$(cat "$RUNNER_TEMP/pinned-prelude-path")"
           printf 'pinned_artifact=%s\n' "$pin"
           cargo build --locked -p fln-cli --bin fln
           set +e
