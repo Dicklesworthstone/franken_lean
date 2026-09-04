@@ -42,6 +42,32 @@ With an explicitly observed facts overlay, `--strict` on the selector (or `--sel
 
 A nomination is advisory even when its input hashes are exact. Refresh live Beads readiness, the recorded assignee, and semantic-seam ownership before an explicit claim; then bind experiments and receipts to the actual Git/artifact anchor. Neither this read nor a successful handoff verification performs that state transition. The detailed implemented contract and its relationship to the proposed command surface are in [Agent Frontier Protocol §10.4](../AGENT_FRONTIER_PROTOCOL.md#104-implemented-read-only-selection-contract).
 
+## Ranking and input boundaries
+
+`critical_path_descendants` counts distinct non-closed descendants reachable
+through non-closed blocking dependents. A closed intermediate cuts traversal:
+work beyond it already has that prerequisite satisfied and is not an unlock
+attributable to the candidate. Alternative live paths still count; diamond
+joins count once. Reopening a prerequisite restores the live path from the
+current tracker snapshot, without a separate graph or status authority.
+
+This is potential downstream work, not a promise that one closure makes every
+descendant ready. `direct_unlocks` is narrower: direct dependents whose only
+unresolved blocker is the candidate. Neither score overrides a hard filter.
+
+Both selector inputs reject duplicate decoded JSON keys within every object,
+including issue fields, nested dependency records, the overlay issue-ID map,
+and hard-filter facts. Escaped-equivalent spellings are the same key. Equal
+repeated values are also refused; repeated names in distinct objects and key-like
+text inside strings remain valid. The selector never chooses first-wins or
+last-wins semantics that could erase an owner, blocker, or unavailable-toolchain
+fact. Its CLI emits the existing structured refusal on stderr, exits 2, and
+emits no successful selection on stdout for such inputs.
+
+Each input is still hashed and parsed from one captured byte read. Unique keys
+and exact hashes remove ambiguity; they do not turn supplied availability facts
+into measured availability or grant live ownership or promotion authority.
+
 ## Verify a handoff
 
 ```bash
@@ -102,12 +128,14 @@ The output is a projection. With the current production selector, `tracker.selec
 scripts/check_agent_handoff.sh
 ```
 
-The check runs the hermetic regression suite, builds a strict snapshot of the current tree, and verifies that exact stream immediately through stdin. It creates no repository files and mutates neither Beads nor Git.
+The check first runs both production-selector suites, then the handoff regression suites, builds a strict snapshot of the current tree, and verifies that exact stream immediately through stdin. It mutates neither Beads nor Git.
 
 The focused unit suite covers deterministic bytes, strict dirty-tree refusal, no-clobber output, current and historical verification, anchored-versus-current tracker movement, tracker duplicate IDs and duplicate JSON keys, missing capsule enforcement, capsule reuse becoming stale when its tracked blob changes, and commit-message separator bytes that must not forge history records.
 
-Some handoff unit tests intentionally use a simplified selector fixture to exercise reconstruction and tamper refusal. Their green result is not evidence that the production selector's ownership/eligibility semantics are covered. Run the production-selector suite separately:
+Some handoff unit tests intentionally use a simplified selector fixture to exercise reconstruction and tamper refusal. Their green result is not evidence that the production selector's ownership/eligibility semantics are covered. The check therefore runs the production-selector suites explicitly before the handoff suites. To run only that focused subset:
 
 ```bash
-python3 -m unittest discover -s scripts -p 'test_frontier_select.py'
+python3 -m unittest discover -s scripts -p 'test_frontier_select*.py'
 ```
+
+The selector boundary suite covers closed prerequisites, live and reopened diamond paths, all 1,024 four-node DAG/status combinations, duplicate JSON keys, real CLI refusals, and valid-input controls. These are synthetic scheduling/input regressions, not real-corpus, kernel, live-tracker, or full handoff-integration evidence.
