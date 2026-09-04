@@ -10,12 +10,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: fln-checker-frontier-isolated-v8
+  group: fln-pempty-frontier-selfhosted-v2
   cancel-in-progress: false
 
 jobs:
   verify-and-land:
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     timeout-minutes: 120
     steps:
       - name: Check out repository history
