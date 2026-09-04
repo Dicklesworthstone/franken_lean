@@ -1998,3 +1998,45 @@ fn defeq_production_code_has_no_primary_semantic_path() {
         );
     }
 }
+
+/// The slow phase's `(Apply, Apply)` arm decomposes by congruence — unless one
+/// side is an unreduced beta-redex, whose lambda HEAD can never match the other
+/// side's spine head (a telescope local, a constant). Such a pair must route
+/// through normalization first. The real pinned `Init.instTransEq_1` body
+/// deferred on exactly this exposure (fln-51y8 item 120): the argument's
+/// inferred type `(r a) b` against the redex `((λ x. λ h. (r a) x) b) hproof`,
+/// which beta-reduces to `(r a) b`.
+#[test]
+fn a_redex_side_is_normalized_before_spine_congruence() {
+    let r = Expr::fvar(FVarId(name("r")));
+    let a = Expr::fvar(FVarId(name("a")));
+    let b = Expr::fvar(FVarId(name("b")));
+    let h_proof = Expr::fvar(FVarId(name("h_proof")));
+    let actual = decoded(&Expr::app(Expr::app(r.clone(), a.clone()), b.clone()));
+    let redex = decoded(&Expr::app(
+        Expr::app(
+            Expr::lam(
+                name("x"),
+                Expr::sort(Level::zero()),
+                Expr::lam(
+                    name("h"),
+                    Expr::sort(Level::zero()),
+                    Expr::app(Expr::app(r, a), Expr::bvar(1).expect("x under h")),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            b,
+        ),
+        h_proof,
+    ));
+    assert!(matches!(
+        def_eq(
+            &actual,
+            &redex,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Equal(..)
+    ));
+}
