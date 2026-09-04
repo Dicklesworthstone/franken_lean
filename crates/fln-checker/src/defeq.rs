@@ -2757,7 +2757,14 @@ fn run_slow(
                         )? {
                             continue;
                         }
-                        trace_unresolved(&need, left_reference, right_reference, left, right, &generated);
+                        trace_unresolved(
+                            &need,
+                            left_reference,
+                            right_reference,
+                            left,
+                            right,
+                            &generated,
+                        );
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
@@ -2785,7 +2792,14 @@ fn run_slow(
                         cancelled,
                     )?;
                     if result.delta_reductions == 0 {
-                        trace_unresolved(&need, left_reference, right_reference, left, right, &generated);
+                        trace_unresolved(
+                            &need,
+                            left_reference,
+                            right_reference,
+                            left,
+                            right,
+                            &generated,
+                        );
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
@@ -2806,7 +2820,14 @@ fn run_slow(
                         cancelled,
                     )?;
                     if result.delta_reductions == 0 {
-                        trace_unresolved(&need, left_reference, right_reference, left, right, &generated);
+                        trace_unresolved(
+                            &need,
+                            left_reference,
+                            right_reference,
+                            left,
+                            right,
+                            &generated,
+                        );
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
