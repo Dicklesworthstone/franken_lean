@@ -1,4 +1,4 @@
-name: FrankenLean frontier tools self-hosted verification
+name: FrankenLean checker frontier implementation lane
 
 on:
   push:
@@ -10,72 +10,169 @@ permissions:
   contents: write
 
 concurrency:
-  group: fln-frontier-tools-verification
+  group: fln-checker-frontier-implementation
   cancel-in-progress: false
 
 jobs:
-  verify-and-land:
+  diagnose-and-land:
     runs-on: self-hosted
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the live mainline
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Normalize the anchor recorder regression cells
+      - name: Add reusable structural mismatch tracing
         shell: bash
+        env:
+          EXPECTED_ADMIT_BLOB: 95101a7647ba5fe3ba91e46fe127e3091b81765f
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          test "$(git hash-object crates/fln-checker/src/admit.rs)" = "$EXPECTED_ADMIT_BLOB"
+          python3 -I - <<'PY'
           from pathlib import Path
-          path = Path('tools/structure-guard/src/bin/fln-agent-anchor.rs')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              "trim_end_matches(['\\r', '\\n'])",
-              "trim_end_matches(&['\\r', '\\n'][..])",
-          )
-          lines = text.splitlines()
-          matches = [i for i, line in enumerate(lines) if 'u0007' in line]
-          if len(matches) != 1:
-              raise SystemExit(f'expected one JSON oracle line, found {matches}')
-          lines[matches[0]] = r'            r#""a\n\"β\\\u0007""#'
-          text = '\n'.join(lines) + '\n'
-          text = text.replace('let anchors = vec![Anchor {', 'let anchors = [Anchor {')
-          text = text.replace('            dirty: true,\n        }];', '            dirty: true,\n        }];')
-          path.write_text(text, encoding='utf-8')
+
+          path = Path("crates/fln-checker/src/admit.rs")
+          text = path.read_text(encoding="utf-8")
+          helper_anchor = "fn compare_inductive_expression(\n"
+          helper = '''fn trace_inductive_expression_mismatch(
+              family: &WireName,
+              stage: &'static str,
+              actual: &WireExpr,
+              expected: &WireExpr,
+          ) {
+              if std::env::var_os("FLN_CHECKER_TRACE").is_none() {
+                  return;
+              }
+              eprintln!("fln-checker: inductive mismatch at {stage} for {family:?}");
+              eprintln!("fln-checker: actual levels: {:?}", actual.levels());
+              eprintln!("fln-checker: actual nodes: {:?}", actual.nodes());
+              eprintln!("fln-checker: expected levels: {:?}", expected.levels());
+              eprintln!("fln-checker: expected nodes: {:?}", expected.nodes());
+          }
+
+          '''
+          if "fn trace_inductive_expression_mismatch(" in text:
+              raise SystemExit("structural mismatch tracer already exists; anchor moved")
+          if text.count(helper_anchor) != 1:
+              raise SystemExit(f"expected one helper anchor, found {text.count(helper_anchor)}")
+          text = text.replace(helper_anchor, helper + helper_anchor)
+
+          start = text.index("fn admit_init_option(")
+          end = text.index("/// Reconstruct the named recursive `Init.List` family.", start)
+          section = text[start:end]
+          recursor_old = '''        Ok(false) => {
+                      return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                          name: recursor_name,
+                      });
+                  }
+          '''
+          recursor_new = '''        Ok(false) => {
+                      trace_inductive_expression_mismatch(
+                          name,
+                          "option-recursor-type",
+                          recursor.declaration().type_(),
+                          &expected_type,
+                      );
+                      return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                          name: recursor_name,
+                      });
+                  }
+          '''
+          if section.count(recursor_old) < 1:
+              raise SystemExit("Option recursor mismatch branch not found")
+          section = section.replace(recursor_old, recursor_new, 1)
+
+          rule_old = '''            Ok(false) => {
+                          return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                              name: recursor_name,
+                          });
+                      }
+          '''
+          rule_new = '''            Ok(false) => {
+                          trace_inductive_expression_mismatch(
+                              name,
+                              if selected_some {
+                                  "option-some-rule"
+                              } else {
+                                  "option-none-rule"
+                              },
+                              rule.rhs(),
+                              &expected_rhs,
+                          );
+                          return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                              name: recursor_name,
+                          });
+                      }
+          '''
+          if section.count(rule_old) < 1:
+              raise SystemExit("Option rule mismatch branch not found")
+          section = section.replace(rule_old, rule_new, 1)
+          text = text[:start] + section + text[end:]
+          path.write_text(text, encoding="utf-8")
           PY
           cargo fmt --all
-          git diff --check
+          git diff --check -- crates/fln-checker/src/admit.rs
 
-      - name: Verify both permanent binaries
+      - name: Verify the checker before touching public history
         shell: bash
         run: |
           set -euo pipefail
           cargo fmt --all --check
-          cargo test --manifest-path tools/structure-guard/Cargo.toml --bin fln-agent-anchor
-          cargo clippy --manifest-path tools/structure-guard/Cargo.toml --bin fln-agent-anchor -- -D warnings
-          cargo test --manifest-path crates/fln-olean/Cargo.toml --bin fln-olean-chain-audit
-          cargo clippy --manifest-path crates/fln-olean/Cargo.toml --bin fln-olean-chain-audit -- -D warnings
+          cargo test --locked -p fln-checker --test admit --no-fail-fast
+          cargo test --locked -p fln-checker --all-targets --no-fail-fast
+          cargo clippy --locked -p fln-checker --all-targets -- -D warnings
 
-      - name: Commit verified repairs and retire one-shot workflows
+      - name: Reproduce the real pinned Option frontier with trace evidence
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if ! git diff --quiet -- tools/structure-guard/src/bin/fln-agent-anchor.rs crates/fln-olean/src/bin/fln-olean-chain-audit.rs; then
-            git add tools/structure-guard/src/bin/fln-agent-anchor.rs crates/fln-olean/src/bin/fln-olean-chain-audit.rs
-            git commit -m 'fix(agent): verify frontier diagnostic binaries'
+          pin=""
+          while IFS= read -r candidate; do
+            case "$candidate" in
+              */leanprover--lean4---v4.32.0/*|*/lean4/v4.32.0/*|*/v4.32.0/*)
+                pin="$candidate"
+                break
+                ;;
+            esac
+          done < <(find "$HOME/.elan" "$HOME" /data /opt -type f -path '*/Init/Prelude.olean' -print 2>/dev/null | LC_ALL=C sort -u)
+          if [[ -z "$pin" ]]; then
+            echo 'pinned Lean 4.32.0 Init/Prelude.olean was not found on the self-hosted verifier' >&2
+            exit 1
           fi
-          rm -f .github/workflows/fln-agent-anchor-verified-fix.yml
-          rm -f .github/workflows/fln-frontier-tools-selfhosted.yml
-          git add .github/workflows
-          if ! git diff --cached --quiet; then
-            git commit -m 'chore(agent): retire frontier-tool landing scaffolding'
+          printf 'pinned_artifact=%s\n' "$pin"
+          cargo build --locked -p fln-cli --bin fln
+          set +e
+          FLN_CHECKER_TRACE=1 target/debug/fln check-olean "$pin" >"$RUNNER_TEMP/option-frontier.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/option-frontier.log"
+          if [[ "$status" -eq 0 ]]; then
+            echo 'expected the current incomplete Prelude frontier to remain nonzero during diagnosis' >&2
+            exit 1
           fi
+          grep -F 'fln-checker: inductive mismatch at option-recursor-type' "$RUNNER_TEMP/option-frontier.log"
+          grep -F 'Option' "$RUNNER_TEMP/option-frontier.log"
+
+      - name: Commit the verified diagnostic implementation directly to main and mirror master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'GPT-5.6 Pro'
+          git config user.email 'noreply@openai.com'
+          git add crates/fln-checker/src/admit.rs
+          git commit -m 'feat(checker): trace inductive structural mismatches'
           for attempt in 1 2 3 4 5; do
-            if git pull --rebase origin main && git push origin HEAD:main; then
-              exit 0
+            git fetch origin main master
+            if git rebase origin/main; then
+              cargo fmt --all --check
+              cargo test --locked -p fln-checker --all-targets --no-fail-fast
+              cargo clippy --locked -p fln-checker --all-targets -- -D warnings
+              if git push --atomic origin HEAD:refs/heads/main HEAD:refs/heads/master; then
+                exit 0
+              fi
             fi
             git rebase --abort >/dev/null 2>&1 || true
             sleep $((attempt * 3))
