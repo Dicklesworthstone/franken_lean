@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fln-checker-frontier-implementation
+  group: fln-checker-frontier-hosted-option-diagnostic
   cancel-in-progress: false
 
 jobs:
