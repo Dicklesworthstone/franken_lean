@@ -2924,7 +2924,10 @@ fn option_rule_rhs(
     if selected_some {
         let value = builder.bvar(0);
         result = builder.apply(result, value);
-        let parameter = builder.bvar(2);
+        // The `value` lambda's binder type sits under α, motive, none and some,
+        // so the family parameter is bvar 3 — confirmed against the real pinned
+        // `Init.Option.rec` iota-rule bytes (fln-51y8 item 42).
+        let parameter = builder.bvar(3);
         result = builder.lambda("value", BinderStyle::Default, parameter, result);
     }
     result = builder.lambda("some", BinderStyle::Default, some_minor, result);
@@ -3719,12 +3722,18 @@ fn admit_init_option(
         });
     };
     let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: option reject at rec-metadata for {recursor_name:?}");
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
     };
     let recursor_levels = recursor.declaration().level_parameters();
     let Some(motive_universe) = recursor_levels.first() else {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: option reject at rec-levels-empty for {recursor_name:?}");
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
@@ -3742,6 +3751,23 @@ fn admit_init_option(
         || recursor_metadata.k()
         || environment.find(&recursor_name).is_some()
     {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: option reject at recursor-gate for {recursor_name:?}");
+            eprintln!(
+                "fln-checker: option rec gate: safety={:?} levels={recursor_levels:?} \
+                 mutual_len={} parameters={} indices={} motives={} minors={} rules={} k={} \
+                 already_staged={}",
+                recursor.declaration().safety(),
+                recursor_metadata.mutual().len(),
+                recursor_metadata.num_parameters(),
+                recursor_metadata.num_indices(),
+                recursor_metadata.num_motives(),
+                recursor_metadata.num_minors(),
+                recursor_metadata.rules().len(),
+                recursor_metadata.k(),
+                environment.find(&recursor_name).is_some(),
+            );
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
@@ -3759,6 +3785,17 @@ fn admit_init_option(
     ) {
         Ok(true) => {}
         Ok(false) => {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!("fln-checker: option reject at rec-type-compare for {recursor_name:?}");
+                eprintln!(
+                    "fln-checker: option rec arena: {:?}",
+                    recursor.declaration().type_().nodes()
+                );
+                eprintln!(
+                    "fln-checker: option rec EXPECTED: {:?}",
+                    expected_type.nodes()
+                );
+            }
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -3769,6 +3806,11 @@ fn admit_init_option(
         [(none, false), (some, true)].into_iter().enumerate()
     {
         let Some(rule) = recursor_metadata.rules().get(index) else {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!(
+                    "fln-checker: option reject at rule-missing[{index}] for {recursor_name:?}"
+                );
+            }
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -3784,6 +3826,14 @@ fn admit_init_option(
             return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
         };
         if rule.constructor() != &constructor || rule.num_fields() != u32::from(selected_some) {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!(
+                    "fln-checker: option reject at rule-shape[{index}] for {recursor_name:?}: \
+                     constructor={:?} fields={}",
+                    rule.constructor(),
+                    rule.num_fields(),
+                );
+            }
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -3791,6 +3841,20 @@ fn admit_init_option(
         match compare_inductive_expression(rule.rhs(), &expected_rhs, comparison, cancelled) {
             Ok(true) => {}
             Ok(false) => {
+                if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                    eprintln!(
+                        "fln-checker: option reject at rule-rhs-compare[{index}] for \
+                         {recursor_name:?}"
+                    );
+                    eprintln!(
+                        "fln-checker: option rule rhs arena: {:?}",
+                        rule.rhs().nodes()
+                    );
+                    eprintln!(
+                        "fln-checker: option rule rhs EXPECTED: {:?}",
+                        expected_rhs.nodes()
+                    );
+                }
                 return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                     name: recursor_name,
                 });

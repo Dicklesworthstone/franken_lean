@@ -910,7 +910,7 @@ fn init_option_entries() -> Vec<ConstantEntry> {
                     some_minor_type(),
                     Expr::lam(
                         primary_name("value"),
-                        bv(2),
+                        bv(3),
                         Expr::app(bv(1), bv(0)),
                         BinderInfo::Default,
                     ),
