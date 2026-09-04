@@ -320,11 +320,11 @@ def descendant_count(
     pending = deque(reverse.get(issue_id, ()))
     while pending:
         child = pending.popleft()
-        if child in seen:
+        if child in seen or issues[child].status == "closed":
             continue
         seen.add(child)
         pending.extend(reverse.get(child, ()))
-    return sum(issues[child].status != "closed" for child in seen)
+    return len(seen)
 
 
 def score(
