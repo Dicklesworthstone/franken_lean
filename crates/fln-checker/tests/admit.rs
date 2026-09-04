@@ -1339,7 +1339,7 @@ fn init_pempty_entries() -> Vec<ConstantEntry> {
     let motive_type = primary_pi("t", BinderInfo::Default, pempty_expr(), Expr::sort(v));
     let recursor_type = primary_pi(
         "motive",
-        BinderInfo::Implicit,
+        BinderInfo::Default,
         motive_type.clone(),
         primary_pi(
             "t",

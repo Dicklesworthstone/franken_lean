@@ -2958,9 +2958,9 @@ fn empty_recursor_type_at_levels(
     result = builder.forall("t", BinderStyle::Default, major_type, result);
     // The pin binds this eliminator's motive Default on `Init.Empty` itself,
     // confirmed against real pinned bytes (`False.rec` and `Empty.recOn` rows
-    // render `Π#` for the motive); `PEmpty` currently asserts the Implicit
-    // spelling and has not yet been confirmed against real bytes, so that
-    // caller's style stays caller-chosen.
+    // render `Π#` for the motive); `PEmpty` is now confirmed the same way —
+    // the real pinned `Init.PEmpty.rec` renders `Π#` for the motive too
+    // (fln-51y8 item 45), so no caller chooses Implicit any longer.
     let root = builder.forall("motive", motive_style, motive_type, result);
     builder.finish(root)
 }
@@ -4407,7 +4407,7 @@ fn admit_init_pempty(
         name,
         motive_universe,
         std::slice::from_ref(family_universe),
-        BinderStyle::Implicit,
+        BinderStyle::Default,
     ) else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
