@@ -7,14 +7,14 @@ on:
       - .github/workflows/fln-frontier-tools-selfhosted.yml
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: fln-checker-frontier-hosted-option-diagnostic
+  group: fln-checker-frontier-hosted-option-differential
   cancel-in-progress: false
 
 jobs:
-  diagnose-and-land:
+  diagnose:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Install the repository-pinned Rust toolchain
         shell: bash
@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install nightly-2026-07-13 --profile minimal --component rustfmt --component clippy
 
-      - name: Add reusable structural mismatch tracing
+      - name: Instrument an Option route differential without changing its verdict
         shell: bash
         env:
           EXPECTED_ADMIT_BLOB: 95101a7647ba5fe3ba91e46fe127e3091b81765f
@@ -42,92 +42,65 @@ jobs:
 
           path = Path("crates/fln-checker/src/admit.rs")
           text = path.read_text(encoding="utf-8")
-          helper_anchor = "fn compare_inductive_expression(\n"
-          helper = '''fn trace_inductive_expression_mismatch(
-              family: &WireName,
-              stage: &'static str,
-              actual: &WireExpr,
-              expected: &WireExpr,
-          ) {
-              if std::env::var_os("FLN_CHECKER_TRACE").is_none() {
-                  return;
+          old = '''    if name == &checker_atom("Option")
+                  && declaration.level_parameters().len() == 1
+                  && metadata.num_parameters() == 1
+              {
+                  return admit_init_option(
+                      environment,
+                      declarations,
+                      inductive,
+                      budget,
+                      environment_budget,
+                      &mut comparison,
+                      &mut cancelled,
+                  );
               }
-              eprintln!("fln-checker: inductive mismatch at {stage} for {family:?}");
-              eprintln!("fln-checker: actual levels: {:?}", actual.levels());
-              eprintln!("fln-checker: actual nodes: {:?}", actual.nodes());
-              eprintln!("fln-checker: expected levels: {:?}", expected.levels());
-              eprintln!("fln-checker: expected nodes: {:?}", expected.nodes());
-          }
-
           '''
-          if "fn trace_inductive_expression_mismatch(" in text:
-              raise SystemExit("structural mismatch tracer already exists; anchor moved")
-          if text.count(helper_anchor) != 1:
-              raise SystemExit(f"expected one helper anchor, found {text.count(helper_anchor)}")
-          text = text.replace(helper_anchor, helper + helper_anchor)
-
-          start = text.index("fn admit_init_option(")
-          end = text.index("/// Reconstruct the named recursive `Init.List` family.", start)
-          section = text[start:end]
-          recursor_old = '''        Ok(false) => {
-                      return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
-                          name: recursor_name,
-                      });
-                  }
-          '''
-          recursor_new = '''        Ok(false) => {
-                      trace_inductive_expression_mismatch(
-                          name,
-                          "option-recursor-type",
-                          recursor.declaration().type_(),
-                          &expected_type,
+          new = '''    if name == &checker_atom("Option")
+                  && declaration.level_parameters().len() == 1
+                  && metadata.num_parameters() == 1
+              {
+                  let legacy = admit_init_option(
+                      environment,
+                      declarations,
+                      inductive,
+                      budget,
+                      environment_budget,
+                      &mut comparison,
+                      &mut cancelled,
+                  );
+                  if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                      let mut generic_comparison =
+                          StructuralComparisonControl::new(budget.conversion.quick);
+                      let generic = admit_class_block(
+                          environment,
+                          declarations,
+                          inductive,
+                          budget,
+                          environment_budget,
+                          &mut generic_comparison,
+                          &mut cancelled,
                       );
-                      return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
-                          name: recursor_name,
-                      });
+                      eprintln!(
+                          "fln-checker: Option route differential: legacy={legacy:?}; generic={generic:?}"
+                      );
                   }
+                  return legacy;
+              }
           '''
-          if section.count(recursor_old) < 1:
-              raise SystemExit("Option recursor mismatch branch not found")
-          section = section.replace(recursor_old, recursor_new, 1)
-
-          rule_old = '''            Ok(false) => {
-                          return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
-                              name: recursor_name,
-                          });
-                      }
-          '''
-          rule_new = '''            Ok(false) => {
-                          trace_inductive_expression_mismatch(
-                              name,
-                              if selected_some {
-                                  "option-some-rule"
-                              } else {
-                                  "option-none-rule"
-                              },
-                              rule.rhs(),
-                              &expected_rhs,
-                          );
-                          return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
-                              name: recursor_name,
-                          });
-                      }
-          '''
-          if section.count(rule_old) < 1:
-              raise SystemExit("Option rule mismatch branch not found")
-          section = section.replace(rule_old, rule_new, 1)
-          text = text[:start] + section + text[end:]
-          path.write_text(text, encoding="utf-8")
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one Option dispatch block, found {text.count(old)}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
           PY
           cargo fmt --all
           git diff --check -- crates/fln-checker/src/admit.rs
 
-      - name: Verify the checker before touching public history
+      - name: Verify the instrumented checker
         shell: bash
         run: |
           set -euo pipefail
           cargo fmt --all --check
-          cargo test --locked -p fln-checker --test admit --no-fail-fast
           cargo test --locked -p fln-checker --all-targets --no-fail-fast
           cargo clippy --locked -p fln-checker --all-targets -- -D warnings
 
@@ -150,44 +123,30 @@ jobs:
           test -n "$pin"
           printf '%s\n' "$pin" > "$RUNNER_TEMP/pinned-prelude-path"
 
-      - name: Reproduce the real pinned Option frontier with trace evidence
+      - name: Capture the real pinned Option route differential
         shell: bash
         run: |
           set -euo pipefail
           pin="$(cat "$RUNNER_TEMP/pinned-prelude-path")"
-          printf 'pinned_artifact=%s\n' "$pin"
           cargo build --locked -p fln-cli --bin fln
           set +e
-          FLN_CHECKER_TRACE=1 target/debug/fln check-olean "$pin" >"$RUNNER_TEMP/option-frontier.log" 2>&1
+          FLN_CHECKER_TRACE=1 target/debug/fln check-olean "$pin" >"$RUNNER_TEMP/option-route-differential.log" 2>&1
           status=$?
           set -e
-          cat "$RUNNER_TEMP/option-frontier.log"
-          if [[ "$status" -eq 0 ]]; then
-            echo 'expected the current incomplete Prelude frontier to remain nonzero during diagnosis' >&2
-            exit 1
-          fi
-          grep -F 'fln-checker: inductive mismatch at option-recursor-type' "$RUNNER_TEMP/option-frontier.log"
-          grep -F 'Option' "$RUNNER_TEMP/option-frontier.log"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/option-route-differential.status"
+          cat "$RUNNER_TEMP/option-route-differential.log"
+          test "$status" -ne 0
+          grep -F 'fln-checker: Option route differential:' "$RUNNER_TEMP/option-route-differential.log"
+          grep -F 'Option' "$RUNNER_TEMP/option-route-differential.log"
 
-      - name: Commit the verified diagnostic implementation directly to main and mirror master
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'GPT-5.6 Pro'
-          git config user.email 'noreply@openai.com'
-          git add crates/fln-checker/src/admit.rs
-          git commit -m 'feat(checker): trace inductive structural mismatches'
-          for attempt in 1 2 3 4 5; do
-            git fetch origin main master
-            if git rebase origin/main; then
-              cargo fmt --all --check
-              cargo test --locked -p fln-checker --all-targets --no-fail-fast
-              cargo clippy --locked -p fln-checker --all-targets -- -D warnings
-              if git push --atomic origin HEAD:refs/heads/main HEAD:refs/heads/master; then
-                exit 0
-              fi
-            fi
-            git rebase --abort >/dev/null 2>&1 || true
-            sleep $((attempt * 3))
-          done
-          exit 1
+      - name: Archive the real-artifact differential
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: option-route-differential-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/option-route-differential.log
+            ${{ runner.temp }}/option-route-differential.status
+            ${{ runner.temp }}/pinned-prelude-path
+          if-no-files-found: error
+          retention-days: 14
