@@ -10,7 +10,7 @@ It is a **projection**, never a second tracker. Beads remains authoritative for 
 python3 scripts/agent_handoff.py snapshot --strict > /tmp/franken-lean.handoff.json
 ```
 
-The `fln.agent-handoff/1` document contains:
+The `fln.agent-handoff/2` document contains:
 
 - the attached branch, commit, tree, and clean-tree state;
 - Git blob identities for the core control documents and selector;
@@ -28,6 +28,20 @@ No generation timestamp is included. Recent commit records use NUL-delimited Git
 
 The snapshot reuses `scripts/frontier_select.py` rather than reimplementing task ranking. The handoff independently parses the Beads bytes with duplicate-key rejection and requires both passes to agree on the exact SHA-256 digest.
 
+## Nomination is not a claim
+
+For a smaller scheduling-only read, use the same production selector that the handoff imports:
+
+```bash
+python3 scripts/frontier_select.py --owner agent-session --limit 10
+```
+
+This command always emits JSON. Supplying `--owner` only permits exact matches to recorded assignments; it does not claim open work or resolve the owner of an unassigned `in_progress` bead. Such an in-progress bead remains excluded as `unowned_in_progress`. Empty/whitespace caller identities and malformed recorded assignees fail closed.
+
+With an explicitly observed facts overlay, `--strict` on the selector (or `--selection-strict` on the handoff) excludes unknown non-Beads facts. Complete facts set the candidate's `eligibility_complete`, never its `promotion_authority`. The selector's top-level JSON also reports `read_only: true`, `live_state_verified: false`, `owner`, `strict`, and the exact issue/overlay byte digests. No overlay is represented by null overlay path/digest, not by an invented empty-file identity.
+
+A nomination is advisory even when its input hashes are exact. Refresh live Beads readiness, the recorded assignee, and semantic-seam ownership before an explicit claim; then bind experiments and receipts to the actual Git/artifact anchor. Neither this read nor a successful handoff verification performs that state transition. The detailed implemented contract and its relationship to the proposed command surface are in [Agent Frontier Protocol §10.4](../AGENT_FRONTIER_PROTOCOL.md#104-implemented-read-only-selection-contract).
+
 ## Verify a handoff
 
 ```bash
@@ -41,7 +55,7 @@ python3 scripts/agent_handoff.py snapshot --strict \
   | python3 scripts/agent_handoff.py verify --current -
 ```
 
-All verification first checks the immutable anchor: the commit must exist, its tree must match, every recorded control-file entry must match that tree, and the Beads digest is recomputed from the tracker blob stored in that anchor. This means an old handoff can still be verified as historical evidence after current Beads has moved.
+All verification first checks the immutable anchor: the commit must exist, its tree must match, every recorded control-file entry must match that tree, and the Beads digest is recomputed from the tracker blob stored in that anchor. An old handoff can be verified as historical evidence after current Beads has moved when it still matches the verifier's reconstruction contract. Verification uses the current verifier selector; a selector/schema change may therefore reject an older handoff. Regenerate after the ownership/eligibility contract change rather than relabeling an old payload as current.
 
 `--current` additionally requires:
 
@@ -78,9 +92,9 @@ The tool is standard-library-only and bounds:
 - frontier evidence files: 512;
 - emitted or verified handoff: 4 MiB.
 
-The default output is a projection. `promotion_authority` becomes true only when the snapshot is strict, the selected frontier carries strict selection authority, and no stale/invalid capsule or visible tracked-blob conflict undermines the observation.
+The output is a projection. With the current production selector, `tracker.selection_authority` and `authority.promotion_authority` remain false even for strict, clean snapshots: complete scheduling facts do not grant a lease, satisfy a bead's acceptance criteria, or prove a theorem. Inspect the selected candidate's `eligibility_complete` and `unknown_hard_filter_facts` for scheduling readiness instead.
 
-`--output` uses create-new semantics and never replaces an existing path. The complete JSON bytes are constructed before the destination is opened. A handoff is not promotion evidence until it passes verification against the intended tree.
+`--output` uses create-new semantics and never replaces an existing path. The complete JSON bytes are constructed before the destination is opened. Verification binds an observation to the intended tree; it does not replace the required acceptance, evidence, and closure gates.
 
 ## Repository check
 
@@ -91,3 +105,9 @@ scripts/check_agent_handoff.sh
 The check runs the hermetic regression suite, builds a strict snapshot of the current tree, and verifies that exact stream immediately through stdin. It creates no repository files and mutates neither Beads nor Git.
 
 The focused unit suite covers deterministic bytes, strict dirty-tree refusal, no-clobber output, current and historical verification, anchored-versus-current tracker movement, tracker duplicate IDs and duplicate JSON keys, missing capsule enforcement, capsule reuse becoming stale when its tracked blob changes, and commit-message separator bytes that must not forge history records.
+
+Some handoff unit tests intentionally use a simplified selector fixture to exercise reconstruction and tamper refusal. Their green result is not evidence that the production selector's ownership/eligibility semantics are covered. Run the production-selector suite separately:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_frontier_select.py'
+```

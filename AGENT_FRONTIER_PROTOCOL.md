@@ -1,7 +1,7 @@
 # FrankenLean Agent Frontier Protocol
 
 **Schema:** `fln.agent-frontier/1`
-**Status:** proposed constitutional design extension
+**Status:** proposed constitutional design extension; implemented read-only selection contract in §10.4
 **Purpose:** make parallel agent work schedule-independent, evidence-preserving, collision-resistant, and monotonically accretive.
 
 ---
@@ -325,11 +325,45 @@ Everything else is linked by digest. This ordering minimizes context load while 
 Human dashboards, JSONL exports, coverage views, and overlap maps are projections. They declare:
 
 - source snapshot/digest;
-- generation time;
+- observation time, or an explicit deterministic/no-wall-clock policy;
 - completeness state;
 - freshness relative to live beads and `main`.
 
 No projection silently impersonates authority.
+
+### 10.4 Implemented read-only selection contract
+
+Use the existing selector, not the proposed `fln frontier` mutation commands:
+
+```bash
+python3 scripts/frontier_select.py --issues .beads/issues.jsonl --limit 10
+python3 scripts/frontier_select.py --owner agent-session --overlay /tmp/frontier-facts.json --strict
+```
+
+The selector always emits JSON (`fln.frontier-selection/1`); there is no `--json` flag. It ranks a supplied issue projection, not a live database transaction. Exit 0 means a candidate was nominated, exit 3 means no candidate survived, and input-validation refusals emit `outcome: "refused"` on stderr with exit 2.
+
+**Ownership is a hard filter, not a scoring hint.** `--owner` is the caller's nonblank identity. An assigned issue is eligible only for that exact identity; identities are not trimmed into aliases. An `in_progress` issue with a missing, null, or empty recorded assignee is excluded as `unowned_in_progress`, even with `--owner` and complete overlay facts. Blank or non-string caller identities are refused. Unassigned open work may be nominated but remains unclaimed. Malformed recorded assignees are input errors, not ownership evidence.
+
+The overlay is a JSON object keyed by existing bead IDs. Each value may contain the numeric scoring fields implemented by the selector and the four boolean-or-null facts `first_failure_named`, `artifacts_available`, `toolchain_available`, and `oracle_only_compliant`. Unknown IDs or fields are refused. Declare facts only from actual observations: a true field is an assertion supplied by the caller, not a toolchain probe or receipt. False facts exclude the candidate; missing/null facts remain listed as unknown and are excluded in strict mode.
+
+`eligibility_complete` means the selected candidate passed the implemented filters with no unknown overlay facts. It does **not** establish live ownership, acceptance-criterion satisfaction, kernel admission, or evidence sufficient for closure. The retained `authority` and candidate `promotion_authority` fields are always false; `read_only` is true and `live_state_verified` is false. Consumers must not replace these distinctions with a single green/ready bit.
+
+Both `issues_sha256` and `overlay_sha256` identify the exact bytes parsed from one read of each input. `overlay_path` and `overlay_sha256` are null when no overlay was supplied; an explicit empty object has its own digest. The output also records `owner` and `strict`. Identical input bytes, options, and selector code produce deterministic output without a generation timestamp. These two file reads do not establish an atomic cross-file snapshot, freshness relative to live `br`, or a live lease.
+
+Compose the existing abstractions in this order:
+
+```text
+Git-addressed code + hashed issue/overlay bytes
+  -> validated advisory ranking and handoff
+  -> live Beads/dependency/semantic-seam recheck and explicit claim
+  -> one bounded experiment on an exact code/artifact anchor
+  -> scoped receipt and negative-evidence update
+  -> the existing acceptance and closure decision
+```
+
+The selector and `scripts/agent_handoff.py` supply observations for this loop; neither executes its ownership or promotion transitions. A consumer must recheck live state before acting. When that state is unavailable, report the limitation rather than treating a committed export as a lease or rewriting a partial export as the tracker. Keep learned hypotheses and receipts in the existing bead/capsule/evidence surfaces, not a parallel status store.
+
+Before trusting a consumer's green tests, distinguish a simplified selector fixture from the production selector. The focused production-selector regressions are `python3 -m unittest discover -s scripts -p 'test_frontier_select.py'`; they do not by themselves certify the handoff, Rust workspace, or pinned-artifact gates.
 
 ---
 
