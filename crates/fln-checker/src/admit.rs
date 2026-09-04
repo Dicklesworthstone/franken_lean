@@ -2340,40 +2340,54 @@ fn bool_rule_rhs(level_parameter: &WireName, selected_true: bool) -> Option<Wire
     builder.finish(root)
 }
 
-fn unit_constructor_type() -> Option<WireExpr> {
+fn prop_inductive_type() -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
-    let root = builder.constant(&checker_atom("Unit"), &[]);
+    let root = builder.sort_zero();
     builder.finish(root)
 }
 
-fn unit_recursor_type(motive_universe: &WireName) -> Option<WireExpr> {
+fn singleton_constructor_type(family: &WireName) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
-    let unit = builder.constant(&checker_atom("Unit"), &[]);
+    let root = builder.constant(family, &[]);
+    builder.finish(root)
+}
+
+fn singleton_recursor_type(
+    family: &WireName,
+    constructor: &WireName,
+    motive_universe: &WireName,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let family_const = builder.constant(family, &[]);
     let motive_sort = builder.sort_parameter(motive_universe);
-    let motive_type = builder.forall("t", BinderStyle::Default, unit, motive_sort);
-    let unit = builder.constant(&checker_child(&checker_atom("Unit"), "unit"), &[]);
+    let motive_type = builder.forall("t", BinderStyle::Default, family_const, motive_sort);
+    let constructor_const = builder.constant(constructor, &[]);
     let motive = builder.bvar(0);
-    let minor = builder.apply(motive, unit);
-    let major_type = builder.constant(&checker_atom("Unit"), &[]);
+    let minor = builder.apply(motive, constructor_const);
+    let major_type = builder.constant(family, &[]);
     let motive = builder.bvar(2);
     let major = builder.bvar(0);
     let mut result = builder.apply(motive, major);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
-    result = builder.forall("unit", BinderStyle::Default, minor, result);
+    result = builder.forall("minor", BinderStyle::Default, minor, result);
     let root = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
     builder.finish(root)
 }
 
-fn unit_rule_rhs(motive_universe: &WireName) -> Option<WireExpr> {
+fn singleton_rule_rhs(
+    family: &WireName,
+    constructor: &WireName,
+    motive_universe: &WireName,
+) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
-    let unit = builder.constant(&checker_atom("Unit"), &[]);
+    let family_const = builder.constant(family, &[]);
     let motive_sort = builder.sort_parameter(motive_universe);
-    let motive_type = builder.forall("t", BinderStyle::Default, unit, motive_sort);
-    let unit = builder.constant(&checker_child(&checker_atom("Unit"), "unit"), &[]);
+    let motive_type = builder.forall("t", BinderStyle::Default, family_const, motive_sort);
+    let constructor_const = builder.constant(constructor, &[]);
     let motive = builder.bvar(0);
-    let minor = builder.apply(motive, unit);
+    let minor = builder.apply(motive, constructor_const);
     let result = builder.bvar(0);
-    let result = builder.lambda("unit", BinderStyle::Default, minor, result);
+    let result = builder.lambda("minor", BinderStyle::Default, minor, result);
     let root = builder.lambda("motive", BinderStyle::Default, motive_type, result);
     builder.finish(root)
 }
@@ -5127,8 +5141,11 @@ fn admit_init_bool(
     InductiveVerdict::Admitted(InductiveAdmission { members })
 }
 
-/// Reconstruct the one-constructor `Init.Unit` block and its eliminator.
-fn admit_init_unit(
+/// Reconstruct a one-nullary-constructor block and its eliminator: the shape
+/// of `Init.Unit` (in `Type`) and `Init.True` (in `Prop`), which share every
+/// part of the encoding except the family's result sort.
+#[allow(clippy::too_many_arguments)]
+fn admit_init_singleton(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
     inductive: &ConstantEntry,
@@ -5136,6 +5153,7 @@ fn admit_init_unit(
     environment_budget: EnvironmentBudget,
     comparison: &mut StructuralComparisonControl,
     cancelled: &mut dyn FnMut() -> bool,
+    constructor_child: &str,
 ) -> InductiveVerdict {
     let name = inductive.name();
     let declaration = inductive.declaration();
@@ -5173,8 +5191,8 @@ fn admit_init_unit(
     if metadata.is_reflexive() {
         return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
     }
-    let unit = checker_child(name, "unit");
-    if metadata.constructors() != std::slice::from_ref(&unit)
+    let constructor_name = checker_child(name, constructor_child);
+    if metadata.constructors() != std::slice::from_ref(&constructor_name)
         || declarations.len() != 3
         || environment.find(name).is_some()
     {
@@ -5182,13 +5200,36 @@ fn admit_init_unit(
             name: name.clone(),
         });
     }
-    let Some(expected_type) = bool_inductive_type() else {
+    // The pin places this shape in `Type` (`Init.Unit`) or in `Prop`
+    // (`Init.True`); both carry the same eliminator encoding, so the family's
+    // result sort is the one degree of freedom the gate leaves open.
+    let Some(type_sort_one) = bool_inductive_type() else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
-    match compare_inductive_expression(declaration.type_(), &expected_type, comparison, cancelled) {
-        Ok(true) => {}
-        Ok(false) => return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse),
+    let type_matches = match compare_inductive_expression(
+        declaration.type_(),
+        &type_sort_one,
+        comparison,
+        cancelled,
+    ) {
+        Ok(matches) => matches,
         Err(verdict) => return verdict,
+    };
+    let prop_valued = !type_matches;
+    if prop_valued {
+        let Some(type_sort_zero) = prop_inductive_type() else {
+            return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+        };
+        match compare_inductive_expression(
+            declaration.type_(),
+            &type_sort_zero,
+            comparison,
+            cancelled,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse),
+            Err(verdict) => return verdict,
+        }
     }
     if let Err(verdict) =
         declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
@@ -5200,15 +5241,20 @@ fn admit_init_unit(
             Ok(environment) => environment,
             Err(verdict) => return verdict,
         };
-    let Some(constructor) = declarations.iter().find(|entry| entry.name() == &unit) else {
-        return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing { name: unit });
+    let Some(constructor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &constructor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing {
+            name: constructor_name,
+        });
     };
     let Some(constructor_metadata) = constructor.declaration().constructor_metadata() else {
         return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
-            name: checker_child(name, "unit"),
+            name: checker_child(name, constructor_child),
         });
     };
-    let Some(expected_type) = unit_constructor_type() else {
+    let Some(expected_type) = singleton_constructor_type(name) else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
     if constructor.declaration().safety() != ConstantSafety::Safe
@@ -5217,9 +5263,11 @@ fn admit_init_unit(
         || constructor_metadata.index() != 0
         || constructor_metadata.num_parameters() != 0
         || constructor_metadata.num_fields() != 0
-        || environment.find(&unit).is_some()
+        || environment.find(&constructor_name).is_some()
     {
-        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { name: unit });
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: constructor_name,
+        });
     }
     match compare_inductive_expression(
         constructor.declaration().type_(),
@@ -5230,19 +5278,19 @@ fn admit_init_unit(
         Ok(true) => {}
         Ok(false) => {
             return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
-                name: checker_child(name, "unit"),
+                name: checker_child(name, constructor_child),
             });
         }
         Err(verdict) => return verdict,
     }
     if let Err(verdict) = declared_type_is_a_type(
         &staged,
-        &unit,
+        &constructor_name,
         constructor.declaration(),
         &budget,
         cancelled,
     ) {
-        return map_member_preamble(&unit, verdict);
+        return map_member_preamble(&constructor_name, verdict);
     }
     staged = match stage_inductive_member(&staged, constructor, environment_budget, cancelled) {
         Ok(environment) => environment,
@@ -5258,16 +5306,25 @@ fn admit_init_unit(
         });
     };
     let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: singleton reject at rec-metadata for {recursor_name:?}");
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
     };
     let levels = recursor.declaration().level_parameters();
     let Some(motive_universe) = levels.first() else {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: singleton reject at rec-levels-empty for {recursor_name:?}");
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
     };
+    // The pin K-flags this eliminator exactly when the family is Prop-valued:
+    // the real pinned `Init.True.rec` carries `k = true`, and a `Type`-valued
+    // singleton can never be K (fln-51y8 item 61).
     if recursor.declaration().safety() != ConstantSafety::Safe
         || levels.len() != 1
         || recursor_metadata.mutual() != std::slice::from_ref(name)
@@ -5276,14 +5333,33 @@ fn admit_init_unit(
         || recursor_metadata.num_motives() != 1
         || recursor_metadata.num_minors() != 1
         || recursor_metadata.rules().len() != 1
-        || recursor_metadata.k()
+        || recursor_metadata.k() != prop_valued
         || environment.find(&recursor_name).is_some()
     {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!("fln-checker: singleton reject at recursor-gate for {recursor_name:?}");
+            eprintln!(
+                "fln-checker: singleton rec gate: safety={:?} levels={levels:?} mutual_len={} \
+                 parameters={} indices={} motives={} minors={} rules={} k={} expected_k={} \
+                 already_staged={}",
+                recursor.declaration().safety(),
+                recursor_metadata.mutual().len(),
+                recursor_metadata.num_parameters(),
+                recursor_metadata.num_indices(),
+                recursor_metadata.num_motives(),
+                recursor_metadata.num_minors(),
+                recursor_metadata.rules().len(),
+                recursor_metadata.k(),
+                prop_valued,
+                environment.find(&recursor_name).is_some(),
+            );
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
     }
-    let Some(expected_type) = unit_recursor_type(motive_universe) else {
+    let Some(expected_type) = singleton_recursor_type(name, &constructor_name, motive_universe)
+    else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
     match compare_inductive_expression(
@@ -5294,6 +5370,19 @@ fn admit_init_unit(
     ) {
         Ok(true) => {}
         Ok(false) => {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!(
+                    "fln-checker: singleton reject at rec-type-compare for {recursor_name:?}"
+                );
+                eprintln!(
+                    "fln-checker: singleton rec arena: {:?}",
+                    recursor.declaration().type_().nodes()
+                );
+                eprintln!(
+                    "fln-checker: singleton rec EXPECTED: {:?}",
+                    expected_type.nodes()
+                );
+            }
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -5305,10 +5394,18 @@ fn admit_init_unit(
             name: recursor_name,
         });
     };
-    let Some(expected_rhs) = unit_rule_rhs(motive_universe) else {
+    let Some(expected_rhs) = singleton_rule_rhs(name, &constructor_name, motive_universe) else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
-    if rule.constructor() != &unit || rule.num_fields() != 0 {
+    if rule.constructor() != &constructor_name || rule.num_fields() != 0 {
+        if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+            eprintln!(
+                "fln-checker: singleton reject at rule-shape for {recursor_name:?}: \
+                 constructor={:?} fields={}",
+                rule.constructor(),
+                rule.num_fields(),
+            );
+        }
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
@@ -5316,6 +5413,19 @@ fn admit_init_unit(
     match compare_inductive_expression(rule.rhs(), &expected_rhs, comparison, cancelled) {
         Ok(true) => {}
         Ok(false) => {
+            if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                eprintln!(
+                    "fln-checker: singleton reject at rule-rhs-compare for {recursor_name:?}"
+                );
+                eprintln!(
+                    "fln-checker: singleton rule rhs arena: {:?}",
+                    rule.rhs().nodes()
+                );
+                eprintln!(
+                    "fln-checker: singleton rule rhs EXPECTED: {:?}",
+                    expected_rhs.nodes()
+                );
+            }
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -5335,7 +5445,7 @@ fn admit_init_unit(
         return verdict;
     }
     InductiveVerdict::Admitted(InductiveAdmission {
-        members: vec![name.clone(), unit, recursor_name],
+        members: vec![name.clone(), constructor_name, recursor_name],
     })
 }
 
@@ -7415,7 +7525,7 @@ pub fn admit_inductive_with(
         && declaration.level_parameters().is_empty()
         && metadata.num_parameters() == 0
     {
-        return admit_init_unit(
+        return admit_init_singleton(
             environment,
             declarations,
             inductive,
@@ -7423,6 +7533,22 @@ pub fn admit_inductive_with(
             environment_budget,
             &mut comparison,
             &mut cancelled,
+            "unit",
+        );
+    }
+    if name == &checker_atom("True")
+        && declaration.level_parameters().is_empty()
+        && metadata.num_parameters() == 0
+    {
+        return admit_init_singleton(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+            "intro",
         );
     }
     if name == &checker_atom("PUnit")

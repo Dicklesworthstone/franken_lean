@@ -2512,6 +2512,91 @@ fn init_unit_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// `Init.True` is the Prop-valued member of the one-nullary-constructor
+/// shape: no universe parameters, `True.intro : True`, and an eliminator
+/// whose Implicit motive targets any `Sort v` (singleton-style elimination).
+fn init_true_entries() -> Vec<ConstantEntry> {
+    let true_name = checker_name("True");
+    let intro = checker_qualified(&["True", "intro"]);
+    let rec = checker_qualified(&["True", "rec"]);
+    let v_name = checker_name("v");
+    let v = Level::param(primary_name("v"));
+    let true_expr = || Expr::const_(primary_name("True"), Vec::new());
+    let intro_expr = || Expr::const_(Name::from_components(["True", "intro"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, true_expr(), Expr::sort(v.clone()));
+    let minor = || Expr::app(bv(0), intro_expr());
+    let rec_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive(),
+        primary_pi(
+            "intro",
+            BinderInfo::Default,
+            minor(),
+            primary_pi(
+                "t",
+                BinderInfo::Default,
+                true_expr(),
+                Expr::app(bv(2), bv(0)),
+            ),
+        ),
+    );
+    let rhs = Expr::lam(
+        primary_name("motive"),
+        motive(),
+        Expr::lam(primary_name("intro"), minor(), bv(0), BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            true_name.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::zero())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![true_name.clone()],
+                    vec![intro.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            intro.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&true_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(true_name.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                // The real pinned `Init.True.rec` is K-flagged: a Prop-valued
+                // singleton family is exactly where the pin marks K.
+                RecursorDeclaration::new(
+                    vec![true_name],
+                    0,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(intro, 0, decoded(&rhs))],
+                    true,
+                ),
+            ),
+        ),
+    ]
+}
+
 fn init_sum_entries() -> Vec<ConstantEntry> {
     let sum = checker_name("Sum");
     let inl = checker_qualified(&["Sum", "inl"]);
@@ -5024,6 +5109,94 @@ fn kr600_803_init_unit_constructor_recursor_and_iota_are_reconstructed() {
         EnvironmentBudget::unlimited(),
     );
     assert!(verdict.is_admitted(), "exact Init.Unit block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_true_constructor_recursor_and_iota_are_reconstructed() {
+    let entries = init_true_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.True block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_true_defers_a_family_at_a_higher_sort() {
+    let mut entries = init_true_entries();
+    entries[0] = ConstantEntry::new(
+        checker_name("True"),
+        ConstantDeclaration::inductive(
+            Vec::new(),
+            decoded(&Expr::sort(
+                Level::succ(Level::one()).expect("universe successor packs"),
+            )),
+            ConstantSafety::Safe,
+            InductiveDeclaration::new(
+                0,
+                0,
+                vec![checker_name("True")],
+                vec![checker_qualified(&["True", "intro"])],
+                0,
+                false,
+                false,
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Deferred(
+            fln_checker::admit::InductiveSupportLimit::ResultUniverse
+        )
+    ));
+}
+
+#[test]
+fn kr600_803_init_true_refuses_a_dropped_k() {
+    let mut entries = init_true_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["True", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                metadata.rules().to_vec(),
+                false,
+            ),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
+        "Prop singleton with k cleared must refuse: {verdict:?}"
+    );
 }
 
 #[test]
