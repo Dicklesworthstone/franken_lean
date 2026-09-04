@@ -7,14 +7,14 @@ on:
       - .github/workflows/fln-frontier-tools-selfhosted.yml
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: fln-checker-frontier-hosted-option-differential
+  group: fln-checker-class-structural-nonanswer-repair
   cancel-in-progress: false
 
 jobs:
-  diagnose:
+  verify-and-land:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Install the repository-pinned Rust toolchain
         shell: bash
@@ -30,123 +30,154 @@ jobs:
           set -euo pipefail
           rustup toolchain install nightly-2026-07-13 --profile minimal --component rustfmt --component clippy
 
-      - name: Instrument an Option route differential without changing its verdict
+      - name: Preserve typed structural stops and faults
         shell: bash
         env:
           EXPECTED_ADMIT_BLOB: 95101a7647ba5fe3ba91e46fe127e3091b81765f
+          EXPECTED_TEST_BLOB: aeafa1da7fa66a8332ac7291c1c1f0f68f9bd6f2
         run: |
           set -euo pipefail
           test "$(git hash-object crates/fln-checker/src/admit.rs)" = "$EXPECTED_ADMIT_BLOB"
+          test "$(git hash-object crates/fln-checker/tests/admit.rs)" = "$EXPECTED_TEST_BLOB"
           python3 -I - <<'PY'
           from pathlib import Path
 
-          path = Path("crates/fln-checker/src/admit.rs")
-          text = path.read_text(encoding="utf-8")
-          old = '''    if name == &checker_atom("Option")
-                  && declaration.level_parameters().len() == 1
-                  && metadata.num_parameters() == 1
-              {
-                  return admit_init_option(
-                      environment,
-                      declarations,
-                      inductive,
-                      budget,
-                      environment_budget,
-                      &mut comparison,
-                      &mut cancelled,
-                  );
-              }
-          '''
-          new = '''    if name == &checker_atom("Option")
-                  && declaration.level_parameters().len() == 1
-                  && metadata.num_parameters() == 1
-              {
-                  let legacy = admit_init_option(
-                      environment,
-                      declarations,
-                      inductive,
-                      budget,
-                      environment_budget,
-                      &mut comparison,
-                      &mut cancelled,
-                  );
-                  if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
-                      let mut generic_comparison =
-                          StructuralComparisonControl::new(budget.conversion.quick);
-                      let generic = admit_class_block(
-                          environment,
-                          declarations,
-                          inductive,
-                          budget,
-                          environment_budget,
-                          &mut generic_comparison,
-                          &mut cancelled,
-                      );
-                      eprintln!(
-                          "fln-checker: Option route differential: legacy={legacy:?}; generic={generic:?}"
-                      );
+          source = Path("crates/fln-checker/src/admit.rs")
+          text = source.read_text(encoding="utf-8")
+          old_constructor = '''        match compare_inductive_expression(
+                      constructor_type,
+                      &expected_constructor,
+                      comparison,
+                      cancelled,
+                  ) {
+                      Ok(true) => {}
+                      Ok(false) | Err(_) => return defer("constructor-compare"),
                   }
-                  return legacy;
+          '''
+          new_constructor = '''        match compare_inductive_expression(
+                      constructor_type,
+                      &expected_constructor,
+                      comparison,
+                      cancelled,
+                  ) {
+                      Ok(true) => {}
+                      Ok(false) => return defer("constructor-compare"),
+                      Err(verdict) => return verdict,
+                  }
+          '''
+          old_recursor = '''    match compare_inductive_expression(recursor_type, &expected_recursor, comparison, cancelled) {
+                  Ok(true) => {}
+                  Ok(false) | Err(_) => return defer("recursor-compare"),
               }
           '''
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one Option dispatch block, found {text.count(old)}")
-          path.write_text(text.replace(old, new), encoding="utf-8")
+          new_recursor = '''    match compare_inductive_expression(recursor_type, &expected_recursor, comparison, cancelled) {
+                  Ok(true) => {}
+                  Ok(false) => return defer("recursor-compare"),
+                  Err(verdict) => return verdict,
+              }
+          '''
+          if text.count(old_constructor) != 1:
+              raise SystemExit(f"constructor comparison anchor count was {text.count(old_constructor)}")
+          if text.count(old_recursor) != 1:
+              raise SystemExit(f"recursor comparison anchor count was {text.count(old_recursor)}")
+          text = text.replace(old_constructor, new_constructor).replace(old_recursor, new_recursor)
+          source.write_text(text, encoding="utf-8")
+
+          tests = Path("crates/fln-checker/tests/admit.rs")
+          test_text = tests.read_text(encoding="utf-8")
+          anchor = '''#[test]
+          fn kr600_803_class_block_reconstructs_two_constructors_with_unequal_fields() {
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &class_choice_entries(),
+                  AdmissionBudget::unlimited(),
+                  EnvironmentBudget::unlimited(),
+              );
+              assert!(
+                  verdict.is_admitted(),
+                  "two-constructor block admits: {verdict:?}"
+              );
+              let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+                  return;
+              };
+              // Inductive + both constructors + recursor, in declaration order.
+              assert_eq!(admission.members().len(), 4);
+          }
+
+          '''
+          regression = anchor + '''#[test]
+          fn kr600_803_class_block_preserves_structural_resource_stops() {
+              let budget = AdmissionBudget::new(
+                  InferenceBudget::unlimited(),
+                  WhnfBudget::unlimited(),
+                  DefEqBudget {
+                      quick: QuickDefEqBudget::new(0, u64::MAX),
+                      ..DefEqBudget::unlimited()
+                  },
+              );
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &class_choice_entries(),
+                  budget,
+                  EnvironmentBudget::unlimited(),
+              );
+              assert!(
+                  matches!(
+                      verdict,
+                      fln_checker::admit::InductiveVerdict::Inconclusive(
+                          fln_checker::admit::InductiveStop::Structural(
+                              QuickDefEqStop::Resource {
+                                  limit: QuickDefEqLimit::Comparisons,
+                                  allowed: 0,
+                                  observed: 1,
+                                  completed_comparisons: 0,
+                              }
+                          )
+                      )
+                  ),
+                  "a structural resource stop must remain inconclusive: {verdict:?}"
+              );
+          }
+
+          '''
+          if test_text.count(anchor) != 1:
+              raise SystemExit(f"positive class fixture anchor count was {test_text.count(anchor)}")
+          tests.write_text(test_text.replace(anchor, regression), encoding="utf-8")
           PY
           cargo fmt --all
-          git diff --check -- crates/fln-checker/src/admit.rs
+          git diff --check -- crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
 
-      - name: Verify the instrumented checker
+      - name: Verify focused and complete checker targets
         shell: bash
         run: |
           set -euo pipefail
           cargo fmt --all --check
+          cargo test --locked -p fln-checker --test admit kr600_803_class_block_preserves_structural_resource_stops -- --exact
+          cargo test --locked -p fln-checker --test admit --no-fail-fast
           cargo test --locked -p fln-checker --all-targets --no-fail-fast
           cargo clippy --locked -p fln-checker --all-targets -- -D warnings
 
-      - name: Fetch and verify the exact Lean 4.32.0 release artifact
+      - name: Commit directly to main and mirror master atomically
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
-          curl --fail --location --retry 4 --retry-all-errors \
-            --output "$archive" \
-            https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
-          printf '%s  %s\n' \
-            fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 \
-            "$archive" | sha256sum --check --strict
-          tar --zstd --extract --file "$archive" --directory "$RUNNER_TEMP"
-          lean_bin="$RUNNER_TEMP/lean-4.32.0-linux/bin/lean"
-          test -x "$lean_bin"
-          test "$("$lean_bin" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
-          pin="$(find "$RUNNER_TEMP/lean-4.32.0-linux" -type f -path '*/Init/Prelude.olean' -print -quit)"
-          test -n "$pin"
-          printf '%s\n' "$pin" > "$RUNNER_TEMP/pinned-prelude-path"
-
-      - name: Capture the real pinned Option route differential
-        shell: bash
-        run: |
-          set -euo pipefail
-          pin="$(cat "$RUNNER_TEMP/pinned-prelude-path")"
-          cargo build --locked -p fln-cli --bin fln
-          set +e
-          FLN_CHECKER_TRACE=1 target/debug/fln check-olean "$pin" >"$RUNNER_TEMP/option-route-differential.log" 2>&1
-          status=$?
-          set -e
-          printf '%s\n' "$status" > "$RUNNER_TEMP/option-route-differential.status"
-          cat "$RUNNER_TEMP/option-route-differential.log"
-          test "$status" -ne 0
-          grep -F 'fln-checker: Option route differential:' "$RUNNER_TEMP/option-route-differential.log"
-          grep -F 'Option' "$RUNNER_TEMP/option-route-differential.log"
-
-      - name: Archive the real-artifact differential
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: option-route-differential-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/option-route-differential.log
-            ${{ runner.temp }}/option-route-differential.status
-            ${{ runner.temp }}/pinned-prelude-path
-          if-no-files-found: error
-          retention-days: 14
+          git config user.name 'GPT-5.6 Pro'
+          git config user.email 'noreply@openai.com'
+          git add crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
+          git commit -m 'fix(checker): preserve structural nonanswers in class admission' \
+            -m 'Propagate comparison resource stops, cancellation, and structural faults through their typed verdict arms instead of collapsing them into ResultUniverse deferrals. Add a two-constructor regression that proves a zero comparison budget remains Inconclusive with the exact QuickDefEq resource stop.'
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main master
+            if git rebase origin/main; then
+              cargo fmt --all --check
+              cargo test --locked -p fln-checker --test admit --no-fail-fast
+              cargo test --locked -p fln-checker --all-targets --no-fail-fast
+              cargo clippy --locked -p fln-checker --all-targets -- -D warnings
+              if git push --atomic origin HEAD:refs/heads/main HEAD:refs/heads/master; then
+                exit 0
+              fi
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 3))
+          done
+          exit 1
