@@ -1,0 +1,476 @@
+name: FrankenLean PEmpty frontier implementation lane
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fln-pempty-frontier-selfhosted.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-checker-frontier-isolated-v8
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-07-13 --profile minimal --component rustfmt --component clippy
+
+      - name: Fetch and identify the exact Lean oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/lean-4.32.0-linux.tar.zst"
+          curl --fail --location --retry 4 --retry-all-errors \
+            --output "$archive" \
+            https://github.com/leanprover/lean4/releases/download/v4.32.0/lean-4.32.0-linux.tar.zst
+          printf '%s  %s\n' \
+            fca846f3588724a38ad19ee40292c67cb7438d7555903372e3308eef795ba516 \
+            "$archive" | sha256sum --check --strict
+          tar --zstd --extract --file "$archive" --directory "$RUNNER_TEMP"
+          lean_bin="$RUNNER_TEMP/lean-4.32.0-linux/bin/lean"
+          test -x "$lean_bin"
+          test "$("$lean_bin" --githash)" = 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+          pin="$(find "$RUNNER_TEMP/lean-4.32.0-linux" -type f -path '*/Init/Prelude.olean' -print -quit)"
+          test -n "$pin"
+          printf '%s\n' "$lean_bin" > "$RUNNER_TEMP/lean-bin-path"
+          printf '%s\n' "$pin" > "$RUNNER_TEMP/pinned-prelude-path"
+          cat > "$RUNNER_TEMP/PEmpty.lean" <<'LEAN'
+          set_option pp.universes true
+          set_option pp.explicit false
+          #print PEmpty.rec
+          #check PEmpty.rec
+          LEAN
+          "$lean_bin" "$RUNNER_TEMP/PEmpty.lean" 2>&1 | tee "$RUNNER_TEMP/pempty-reference.txt"
+
+      - name: Apply, verify, and atomically publish checker fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/fln-pempty-target"
+          git -C "$root" config user.name 'GPT-5.6 Pro'
+          git -C "$root" config user.email 'noreply@openai.com'
+
+          patch_checker() {
+            python3 -I - <<'PY'
+          from pathlib import Path
+
+          source = Path("crates/fln-checker/src/admit.rs")
+          tests = Path("crates/fln-checker/tests/admit.rs")
+          text = source.read_text(encoding="utf-8")
+          test_text = tests.read_text(encoding="utf-8")
+
+          def replace_once(section, old, new, label):
+              old_count = section.count(old)
+              new_count = section.count(new)
+              if old_count == 1 and new_count == 0:
+                  return section.replace(old, new)
+              if old_count == 0 and new_count == 1:
+                  return section
+              raise SystemExit(f"{label}: old={old_count} new={new_count}")
+
+          class_start = text.index("fn admit_class_block(")
+          class_end = text.index("fn admit_indexed_class_block(", class_start)
+          class_section = text[class_start:class_end]
+          class_section = replace_once(
+              class_section,
+              '''        match compare_inductive_expression(
+                      constructor_type,
+                      &expected_constructor,
+                      comparison,
+                      cancelled,
+                  ) {
+                      Ok(true) => {}
+                      Ok(false) | Err(_) => return defer("constructor-compare"),
+                  }
+          ''',
+              '''        match compare_inductive_expression(
+                      constructor_type,
+                      &expected_constructor,
+                      comparison,
+                      cancelled,
+                  ) {
+                      Ok(true) => {}
+                      Ok(false) => return defer("constructor-compare"),
+                      Err(verdict) => return verdict,
+                  }
+          ''',
+              "class constructor nonanswer",
+          )
+          class_section = replace_once(
+              class_section,
+              '''    match compare_inductive_expression(recursor_type, &expected_recursor, comparison, cancelled) {
+                  Ok(true) => {}
+                  Ok(false) | Err(_) => return defer("recursor-compare"),
+              }
+          ''',
+              '''    match compare_inductive_expression(recursor_type, &expected_recursor, comparison, cancelled) {
+                  Ok(true) => {}
+                  Ok(false) => return defer("recursor-compare"),
+                  Err(verdict) => return verdict,
+              }
+          ''',
+              "class recursor nonanswer",
+          )
+          text = text[:class_start] + class_section + text[class_end:]
+
+          option_start = text.index("fn option_rule_rhs(")
+          option_end = text.index("fn empty_recursor_type(", option_start)
+          option_section = text[option_start:option_end]
+          option_section = replace_once(
+              option_section,
+              '''        let value = builder.bvar(0);
+                  result = builder.apply(result, value);
+                  let parameter = builder.bvar(2);
+                  result = builder.lambda("value", BinderStyle::Default, parameter, result);
+          ''',
+              '''        let value = builder.bvar(0);
+                  result = builder.apply(result, value);
+                  // The value binder's domain sees `α, motive, none, some`.
+                  // Bound(3) is the family parameter; Bound(2) is the motive.
+                  let parameter = builder.bvar(3);
+                  result = builder.lambda("value", BinderStyle::Default, parameter, result);
+          ''',
+              "Option.some value domain",
+          )
+          text = text[:option_start] + option_section + text[option_end:]
+
+          pempty_start = text.index("fn admit_init_pempty(")
+          pempty_end = text.index("fn admit_init_or(", pempty_start)
+          pempty_section = text[pempty_start:pempty_end]
+          pempty_section = replace_once(
+              pempty_section,
+              '''        std::slice::from_ref(family_universe),
+                  BinderStyle::Implicit,
+              ) else {
+          ''',
+              '''        std::slice::from_ref(family_universe),
+                  // Empty recursors have no minor premises from which Lean can
+                  // infer a hidden motive, so the generated motive binder is
+                  // explicit. Preserve that pin-visible binder annotation.
+                  BinderStyle::Default,
+              ) else {
+          ''',
+              "PEmpty recursor motive style",
+          )
+          text = text[:pempty_start] + pempty_section + text[pempty_end:]
+          source.write_text(text, encoding="utf-8")
+
+          import_old = '''use fln_checker::wire::{
+              DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name,
+          };
+          '''
+          import_new = '''use fln_checker::wire::{
+              DecodeBudget, DecodeOutcome, ExprNode, WireExpr, WireName, decode_expr, decode_name,
+          };
+          '''
+          if import_old in test_text and import_new not in test_text:
+              test_text = test_text.replace(import_old, import_new)
+          elif test_text.count(import_new) != 1:
+              raise SystemExit("wire import is neither expected form")
+
+          structural_name = "fn kr600_803_class_block_preserves_structural_resource_stops()"
+          if structural_name not in test_text:
+              anchor = '''#[test]
+          fn kr600_803_class_block_reconstructs_two_constructors_with_unequal_fields() {
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &class_choice_entries(),
+                  AdmissionBudget::unlimited(),
+                  EnvironmentBudget::unlimited(),
+              );
+              assert!(
+                  verdict.is_admitted(),
+                  "two-constructor block admits: {verdict:?}"
+              );
+              let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+                  return;
+              };
+              // Inductive + both constructors + recursor, in declaration order.
+              assert_eq!(admission.members().len(), 4);
+          }
+
+          '''
+              addition = anchor + '''#[test]
+          fn kr600_803_class_block_preserves_structural_resource_stops() {
+              let budget = AdmissionBudget::new(
+                  InferenceBudget::unlimited(),
+                  WhnfBudget::unlimited(),
+                  DefEqBudget {
+                      quick: QuickDefEqBudget::new(0, u64::MAX),
+                      ..DefEqBudget::unlimited()
+                  },
+              );
+              let verdict = admit_inductive(
+                  &ConstantEnvironment::empty(),
+                  &class_choice_entries(),
+                  budget,
+                  EnvironmentBudget::unlimited(),
+              );
+              assert!(matches!(
+                  verdict,
+                  fln_checker::admit::InductiveVerdict::Inconclusive(
+                      fln_checker::admit::InductiveStop::Structural(
+                          QuickDefEqStop::Resource {
+                              limit: QuickDefEqLimit::Comparisons,
+                              allowed: 0,
+                              observed: 1,
+                              completed_comparisons: 0,
+                          }
+                      )
+                  )
+              ));
+          }
+
+          '''
+              if test_text.count(anchor) != 1:
+                  raise SystemExit("structural test anchor drifted")
+              test_text = test_text.replace(anchor, addition)
+
+          option_fixture_start = test_text.index("fn init_option_entries()")
+          option_fixture_end = test_text.index("fn init_list_entries()", option_fixture_start)
+          option_fixture = test_text[option_fixture_start:option_fixture_end]
+          option_fixture = replace_once(
+              option_fixture,
+              '''                    Expr::lam(
+                                  primary_name("value"),
+                                  bv(2),
+                                  Expr::app(bv(1), bv(0)),
+                                  BinderInfo::Default,
+                              ),
+          ''',
+              '''                    Expr::lam(
+                                  primary_name("value"),
+                                  bv(3),
+                                  Expr::app(bv(1), bv(0)),
+                                  BinderInfo::Default,
+                              ),
+          ''',
+              "Option fixture value domain",
+          )
+          test_text = test_text[:option_fixture_start] + option_fixture + test_text[option_fixture_end:]
+
+          option_name = "fn kr600_803_init_option_some_iota_value_domain_is_the_outer_parameter()"
+          if option_name not in test_text:
+              anchor = '''#[test]
+          fn kr600_803_init_option_fixture_pins_iota_rhs_closure() {
+              let entries = init_option_entries();
+              let metadata = entries[3]
+                  .declaration()
+                  .recursor_metadata()
+                  .expect("fixture recursor metadata");
+              for rule in metadata.rules() {
+                  let facts = match inspect(rule.rhs(), TermBudget::unlimited()) {
+                      TermOutcome::Complete(facts) => facts,
+                      other => panic!("fixture iota inspection must complete: {other:?}"),
+                  };
+                  assert_eq!(facts.external_bound_span, 0);
+              }
+          }
+
+          '''
+              addition = anchor + '''#[test]
+          fn kr600_803_init_option_some_iota_value_domain_is_the_outer_parameter() {
+              let entries = init_option_entries();
+              let rhs = entries[3]
+                  .declaration()
+                  .recursor_metadata()
+                  .expect("fixture recursor metadata")
+                  .rules()[1]
+                  .rhs();
+              let mut cursor = rhs.root();
+              for binder in ["alpha", "motive", "none", "some"] {
+                  cursor = match rhs.node(cursor) {
+                      Some(ExprNode::Lambda { body, .. }) => *body,
+                      other => panic!("missing {binder} lambda: {other:?}"),
+                  };
+              }
+              let Some(ExprNode::Lambda { binder_type, body, .. }) = rhs.node(cursor) else {
+                  panic!("missing Option.some value lambda")
+              };
+              assert!(matches!(
+                  rhs.node(*binder_type),
+                  Some(ExprNode::Bound { index }) if *index == 3
+              ));
+              let Some(ExprNode::Apply { function, argument }) = rhs.node(*body) else {
+                  panic!("Option.some iota body must apply its minor")
+              };
+              assert!(matches!(rhs.node(*function), Some(ExprNode::Bound { index }) if *index == 1));
+              assert!(matches!(rhs.node(*argument), Some(ExprNode::Bound { index }) if *index == 0));
+          }
+
+          '''
+              if test_text.count(anchor) != 1:
+                  raise SystemExit("Option regression anchor drifted")
+              test_text = test_text.replace(anchor, addition)
+
+          pempty_fixture_start = test_text.index("fn init_pempty_entries()")
+          pempty_fixture_end = test_text.index("fn init_or_entries()", pempty_fixture_start)
+          pempty_fixture = test_text[pempty_fixture_start:pempty_fixture_end]
+          pempty_fixture = replace_once(
+              pempty_fixture,
+              '''    let recursor_type = primary_pi(
+                  "motive",
+                  BinderInfo::Implicit,
+                  motive_type.clone(),
+          ''',
+              '''    let recursor_type = primary_pi(
+                  "motive",
+                  BinderInfo::Default,
+                  motive_type.clone(),
+          ''',
+              "PEmpty fixture motive style",
+          )
+          test_text = test_text[:pempty_fixture_start] + pempty_fixture + test_text[pempty_fixture_end:]
+
+          pempty_name = "fn kr600_803_init_pempty_fixture_pins_explicit_motive_binder()"
+          if pempty_name not in test_text:
+              anchor = '''#[test]
+          fn kr600_803_init_pempty_fixture_pins_eliminator_bvar_closure() {
+              let entries = init_pempty_entries();
+              let facts = match inspect(entries[1].declaration().type_(), TermBudget::unlimited()) {
+                  TermOutcome::Complete(facts) => facts,
+                  other => panic!("fixture eliminator inspection must complete: {other:?}"),
+              };
+              assert_eq!(facts.external_bound_span, 0);
+          }
+
+          '''
+              addition = anchor + '''#[test]
+          fn kr600_803_init_pempty_fixture_pins_explicit_motive_binder() {
+              let entries = init_pempty_entries();
+              let recursor = entries[1].declaration().type_();
+              assert!(matches!(
+                  recursor.node(recursor.root()),
+                  Some(ExprNode::Forall { style, .. })
+                      if *style == fln_checker::wire::BinderStyle::Default
+              ));
+          }
+
+          '''
+              if test_text.count(anchor) != 1:
+                  raise SystemExit("PEmpty regression anchor drifted")
+              test_text = test_text.replace(anchor, addition)
+
+          tests.write_text(test_text, encoding="utf-8")
+          PY
+          }
+
+          verify_frontier() {
+            local pin status log
+            pin="$(cat "$RUNNER_TEMP/pinned-prelude-path")"
+            log="$RUNNER_TEMP/pempty-frontier-${attempt}.log"
+            cargo build --locked -p fln-cli --bin fln
+            set +e
+            FLN_CHECKER_TRACE=1 "$CARGO_TARGET_DIR/debug/fln" check-olean "$pin" >"$log" 2>&1
+            status=$?
+            set -e
+            cat "$log"
+            python3 -I - "$status" "$log" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          status = int(sys.argv[1])
+          text = Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
+          if status == 0:
+              print("checker_frontier=complete")
+              raise SystemExit(0)
+          matches = [int(value) for value in re.findall(r"declaration batch item ([0-9]+)", text)]
+          if not matches:
+              raise SystemExit("nonzero checker run reported no declaration frontier")
+          frontier = matches[-1]
+          print(f"checker_frontier={frontier}")
+          if frontier <= 45:
+              raise SystemExit(f"real pinned frontier did not advance beyond PEmpty.rec: {frontier}")
+          PY
+          }
+
+          for attempt in 1 2 3 4; do
+            git -C "$root" fetch origin main master
+            base="$(git -C "$root" rev-parse refs/remotes/origin/main)"
+            mirror="$(git -C "$root" rev-parse refs/remotes/origin/master)"
+            test "$base" = "$mirror"
+            work="$RUNNER_TEMP/fln-pempty-attempt-$attempt"
+            git -C "$root" worktree add --detach "$work" "$base"
+            cd "$work"
+            printf '%s\n' "$base" > "$RUNNER_TEMP/pempty-base-${attempt}.txt"
+
+            before_source="$(git hash-object crates/fln-checker/src/admit.rs)"
+            before_tests="$(git hash-object crates/fln-checker/tests/admit.rs)"
+            patch_checker
+            rustfmt --edition 2024 crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
+            git diff --check -- crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
+            unexpected="$(git status --porcelain=v1 --untracked-files=all | grep -Ev '^.. crates/fln-checker/(src/admit.rs|tests/admit.rs)$' || true)"
+            test -z "$unexpected"
+
+            cargo test --locked -p fln-checker --test admit kr600_803_class_block_preserves_structural_resource_stops -- --exact
+            cargo test --locked -p fln-checker --test admit kr600_803_init_option_ -- --nocapture
+            cargo test --locked -p fln-checker --test admit kr600_803_init_pempty_ -- --nocapture
+            cargo test --locked -p fln-checker --all-targets --no-fail-fast
+            cargo clippy --locked -p fln-checker --all-targets -- -D warnings
+            cargo fmt --package fln-checker -- --check
+            verify_frontier
+
+            after_source="$(git hash-object crates/fln-checker/src/admit.rs)"
+            after_tests="$(git hash-object crates/fln-checker/tests/admit.rs)"
+            if test "$before_source" != "$after_source" || test "$before_tests" != "$after_tests"; then
+              git add crates/fln-checker/src/admit.rs crates/fln-checker/tests/admit.rs
+              git commit -m 'fix(checker): advance pinned Prelude through PEmpty recursor' \
+                -m 'Preserve structural comparison nonanswers, correct the Option.some iota value domain, and match the pin-visible explicit motive binder of the empty universe-polymorphic PEmpty recursor. Bind all three defects with focused regressions and require a real Lean 4.32.0 Init.Prelude frontier beyond item 45.'
+            fi
+            test -z "$(git status --porcelain=v1 --untracked-files=all)"
+            candidate="$(git rev-parse HEAD)"
+            printf '%s\n' "$candidate" > "$RUNNER_TEMP/pempty-candidate-${attempt}.txt"
+
+            git -C "$root" fetch origin main master
+            latest_main="$(git -C "$root" rev-parse refs/remotes/origin/main)"
+            latest_master="$(git -C "$root" rev-parse refs/remotes/origin/master)"
+            if test "$latest_main" != "$base" || test "$latest_master" != "$base"; then
+              printf 'lease-lost base=%s main=%s master=%s\n' "$base" "$latest_main" "$latest_master" \
+                | tee "$RUNNER_TEMP/pempty-lease-${attempt}.txt"
+              cd "$root"
+              continue
+            fi
+            if test "$candidate" = "$base"; then
+              printf 'already-public=%s\n' "$base" | tee "$RUNNER_TEMP/pempty-published.txt"
+              exit 0
+            fi
+            if git push --atomic origin "$candidate:refs/heads/main" "$candidate:refs/heads/master"; then
+              printf 'published=%s\n' "$candidate" | tee "$RUNNER_TEMP/pempty-published.txt"
+              exit 0
+            fi
+            cd "$root"
+          done
+          exit 1
+
+      - name: Archive PEmpty frontier evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pempty-frontier-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pempty-reference.txt
+            ${{ runner.temp }}/pempty-frontier-*.log
+            ${{ runner.temp }}/pempty-base-*.txt
+            ${{ runner.temp }}/pempty-candidate-*.txt
+            ${{ runner.temp }}/pempty-lease-*.txt
+            ${{ runner.temp }}/pempty-published.txt
+            ${{ runner.temp }}/pinned-prelude-path
+          if-no-files-found: warn
+          retention-days: 14
