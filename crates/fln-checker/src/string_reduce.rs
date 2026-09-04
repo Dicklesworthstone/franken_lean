@@ -6,6 +6,10 @@
 //! wire arena. Unicode scalar values, not UTF-8 bytes, are the list elements.
 //! Traversal and construction are iterative, bounded, cancellation-aware, and
 //! failure-atomic: no partially built arena is ever returned.
+//!
+//! All progress counters are checked rather than saturating. Cancellation is
+//! sampled after the source scan and before any proportional arena allocation,
+//! and again before every nonzero natural-limb allocation.
 
 use crate::wire::{
     ExprId, ExprNode, LevelId, LevelNode, NamePart, WireExpr, WireName, expression_owned_units,
@@ -159,12 +163,24 @@ impl Control {
         }
     }
 
+    fn checked_increment(&self, value: u64) -> Result<u64, Halt> {
+        value
+            .checked_add(1)
+            .ok_or_else(|| self.fault(StringExpansionFault::SizeOverflow))
+    }
+
+    fn checked_add(&self, left: u64, right: u64) -> Result<u64, Halt> {
+        left.checked_add(right)
+            .ok_or_else(|| self.fault(StringExpansionFault::SizeOverflow))
+    }
+
     fn poll(&mut self, at_byte: usize, cancelled: &mut dyn FnMut() -> bool) -> Result<(), Halt> {
-        self.polls = self.polls.saturating_add(1);
+        let polls = self.checked_increment(self.polls)?;
+        self.polls = polls;
         if cancelled() {
             return Err(Halt::Stop(StringExpansionStop::Cancelled {
                 at_byte,
-                polls: self.polls,
+                polls,
                 progress: self.progress,
             }));
         }
@@ -173,7 +189,7 @@ impl Control {
 
     fn step(&mut self, at_byte: usize, cancelled: &mut dyn FnMut() -> bool) -> Result<(), Halt> {
         self.poll(at_byte, cancelled)?;
-        let observed = self.progress.steps.saturating_add(1);
+        let observed = self.checked_increment(self.progress.steps)?;
         if observed > self.budget.max_steps {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::Steps,
@@ -193,7 +209,7 @@ impl Control {
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), Halt> {
         self.step(at_byte, cancelled)?;
-        let observed = self.progress.code_points.saturating_add(1);
+        let observed = self.checked_increment(self.progress.code_points)?;
         if observed > self.budget.max_code_points {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::CodePoints,
@@ -214,11 +230,7 @@ impl Control {
         owned_units: u64,
         at_byte: usize,
     ) -> Result<(), Halt> {
-        let observed_steps = self
-            .progress
-            .steps
-            .checked_add(emitted_steps)
-            .ok_or_else(|| self.fault(StringExpansionFault::SizeOverflow))?;
+        let observed_steps = self.checked_add(self.progress.steps, emitted_steps)?;
         if observed_steps > self.budget.max_steps {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::Steps,
@@ -257,7 +269,7 @@ impl Control {
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<LevelId, Halt> {
         self.step(at_byte, cancelled)?;
-        let observed_nodes = self.progress.arena_nodes.saturating_add(1);
+        let observed_nodes = self.checked_increment(self.progress.arena_nodes)?;
         if observed_nodes > self.budget.max_arena_nodes {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::ArenaNodes,
@@ -268,7 +280,7 @@ impl Control {
             }));
         }
         let units = level_owned_units(&node);
-        let observed_units = self.progress.owned_units.saturating_add(units);
+        let observed_units = self.checked_add(self.progress.owned_units, units)?;
         if observed_units > self.budget.max_owned_units {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::OwnedUnits,
@@ -297,7 +309,7 @@ impl Control {
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<ExprId, Halt> {
         self.step(at_byte, cancelled)?;
-        let observed_nodes = self.progress.arena_nodes.saturating_add(1);
+        let observed_nodes = self.checked_increment(self.progress.arena_nodes)?;
         if observed_nodes > self.budget.max_arena_nodes {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::ArenaNodes,
@@ -308,7 +320,7 @@ impl Control {
             }));
         }
         let units = expression_owned_units(&node);
-        let observed_units = self.progress.owned_units.saturating_add(units);
+        let observed_units = self.checked_add(self.progress.owned_units, units)?;
         if observed_units > self.budget.max_owned_units {
             return Err(Halt::Stop(StringExpansionStop::Resource {
                 limit: StringExpansionLimit::OwnedUnits,
@@ -339,17 +351,22 @@ fn two_part_name(namespace: &str, leaf: &str) -> WireName {
     ])
 }
 
-fn natural_limbs(value: u64, progress: StringExpansionProgress) -> Result<Vec<u64>, Halt> {
+fn natural_limbs(
+    value: u64,
+    at_byte: usize,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Vec<u64>, Halt> {
     if value == 0 {
         return Ok(Vec::new());
     }
+    control.poll(at_byte, cancelled)?;
     let mut limbs = Vec::new();
-    limbs.try_reserve_exact(1).map_err(|_| Halt::Fault {
-        fault: StringExpansionFault::Allocation {
+    limbs.try_reserve_exact(1).map_err(|_| {
+        control.fault(StringExpansionFault::Allocation {
             region: StringExpansionAllocation::NaturalLimb,
             requested: 1,
-        },
-        progress,
+        })
     })?;
     limbs.push(value);
     Ok(limbs)
@@ -388,7 +405,9 @@ fn expand(
     for (at_byte, character) in value.char_indices() {
         control.code_point(at_byte, cancelled)?;
         if character != '\0' {
-            nonzero_code_points = nonzero_code_points.saturating_add(1);
+            nonzero_code_points = nonzero_code_points
+                .checked_add(1)
+                .ok_or_else(|| control.fault(StringExpansionFault::SizeOverflow))?;
         }
     }
 
@@ -397,9 +416,8 @@ fn expand(
         nonzero_code_points,
         control.progress,
     )?;
-    let emitted_steps = expected_nodes;
     control.preflight(
-        emitted_steps,
+        expected_nodes,
         expected_nodes,
         expected_owned_units,
         value.len(),
@@ -409,6 +427,10 @@ fn expand(
         .checked_sub(1)
         .and_then(|nodes| usize::try_from(nodes).ok())
         .ok_or_else(|| control.fault(StringExpansionFault::SizeOverflow))?;
+
+    // This checkpoint is intentionally after all proportional size calculations
+    // and before either arena reserves memory.
+    control.poll(value.len(), cancelled)?;
     let mut nodes = Vec::new();
     nodes.try_reserve_exact(expression_nodes).map_err(|_| {
         control.fault(StringExpansionFault::Allocation {
@@ -482,10 +504,9 @@ fn expand(
 
     for (at_byte, character) in value.char_indices().rev() {
         let code = u64::from(u32::from(character));
+        let limbs_le = natural_limbs(code, at_byte, &mut control, cancelled)?;
         let literal = control.emit_expression(
-            ExprNode::NatLiteral {
-                limbs_le: natural_limbs(code, control.progress)?,
-            },
+            ExprNode::NatLiteral { limbs_le },
             at_byte,
             &mut nodes,
             cancelled,
@@ -537,9 +558,11 @@ fn expand(
         &mut nodes,
         cancelled,
     )?;
-    let actual_nodes = u64::try_from(nodes.len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(levels.len()).unwrap_or(u64::MAX));
+    let expression_count = u64::try_from(nodes.len())
+        .map_err(|_| control.fault(StringExpansionFault::SizeOverflow))?;
+    let level_count = u64::try_from(levels.len())
+        .map_err(|_| control.fault(StringExpansionFault::SizeOverflow))?;
+    let actual_nodes = control.checked_add(expression_count, level_count)?;
     if actual_nodes != expected_nodes || control.progress.owned_units != expected_owned_units {
         return Err(control.fault(StringExpansionFault::Accounting {
             expected_nodes,
@@ -570,5 +593,117 @@ pub fn expand_string_literal_with(
         Err(Halt::Fault { fault, progress }) => {
             StringExpansionOutcome::InternalFault { fault, progress }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_is_sampled_before_proportional_arena_allocation() {
+        let mut polls = 0_u64;
+        let outcome = expand_string_literal_with("a", StringExpansionBudget::unlimited(), || {
+            polls += 1;
+            polls == 2
+        });
+        assert!(matches!(
+            outcome,
+            StringExpansionOutcome::Inconclusive(StringExpansionStop::Cancelled {
+                at_byte: 1,
+                polls: 2,
+                progress: StringExpansionProgress {
+                    steps: 1,
+                    code_points: 1,
+                    generated_arenas: 0,
+                    arena_nodes: 0,
+                    owned_units: 0,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_literals_can_cancel_before_any_arena_allocation() {
+        let outcome = expand_string_literal_with("", StringExpansionBudget::unlimited(), || true);
+        assert!(matches!(
+            outcome,
+            StringExpansionOutcome::Inconclusive(StringExpansionStop::Cancelled {
+                at_byte: 0,
+                polls: 1,
+                progress: StringExpansionProgress {
+                    steps: 0,
+                    code_points: 0,
+                    generated_arenas: 0,
+                    arena_nodes: 0,
+                    owned_units: 0,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn natural_limb_allocation_has_its_own_cancellation_checkpoint() {
+        let mut control = Control::new(StringExpansionBudget::unlimited());
+        let result = natural_limbs(65, 7, &mut control, &mut || true);
+        assert!(matches!(
+            result,
+            Err(Halt::Stop(StringExpansionStop::Cancelled {
+                at_byte: 7,
+                polls: 1,
+                progress: StringExpansionProgress {
+                    steps: 0,
+                    code_points: 0,
+                    generated_arenas: 0,
+                    arena_nodes: 0,
+                    owned_units: 0,
+                },
+            }))
+        ));
+    }
+
+    #[test]
+    fn counter_overflow_is_an_internal_fault_not_saturation() {
+        let mut never = || false;
+
+        let mut poll_control = Control::new(StringExpansionBudget::unlimited());
+        poll_control.polls = u64::MAX;
+        assert!(matches!(
+            poll_control.poll(0, &mut never),
+            Err(Halt::Fault {
+                fault: StringExpansionFault::SizeOverflow,
+                ..
+            })
+        ));
+
+        let mut step_control = Control::new(StringExpansionBudget::unlimited());
+        step_control.progress.steps = u64::MAX;
+        assert!(matches!(
+            step_control.step(0, &mut never),
+            Err(Halt::Fault {
+                fault: StringExpansionFault::SizeOverflow,
+                ..
+            })
+        ));
+
+        let mut code_point_control = Control::new(StringExpansionBudget::unlimited());
+        code_point_control.progress.code_points = u64::MAX;
+        assert!(matches!(
+            code_point_control.code_point(0, &mut never),
+            Err(Halt::Fault {
+                fault: StringExpansionFault::SizeOverflow,
+                ..
+            })
+        ));
+
+        let mut node_control = Control::new(StringExpansionBudget::unlimited());
+        node_control.progress.arena_nodes = u64::MAX;
+        assert!(matches!(
+            node_control.emit_level(LevelNode::Zero, 0, &mut Vec::new(), &mut never),
+            Err(Halt::Fault {
+                fault: StringExpansionFault::SizeOverflow,
+                ..
+            })
+        ));
     }
 }
