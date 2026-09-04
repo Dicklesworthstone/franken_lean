@@ -14424,3 +14424,166 @@ fn kr600_803_class_block_refuses_a_motive_head_iota_rule() {
         "motive-headed iota rule rejects: {verdict:?}"
     );
 }
+
+/// A class block whose one field is INST-IMPLICIT: the `extends`-clause shape
+/// (`Init.Applicative.mk` binds its superclass fields inst-implicit). Before
+/// the class route kept declared field styles, both the constructor rebuild
+/// and the minor rebuild hardcoded `Default`, and a block like this deferred
+/// at `constructor-compare` no matter how well formed.
+fn class_wrap_entries() -> Vec<ConstantEntry> {
+    let wrap = checker_qualified(&["WrapInst"]);
+    let mk = checker_qualified(&["WrapInst", "mk"]);
+    let rec = checker_qualified(&["WrapInst", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let ptype = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let wrap_of = |parameter: Expr| {
+        Expr::app(
+            Expr::const_(primary_name("WrapInst"), vec![u.clone()]),
+            parameter,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    // The field type `α → α`, written under `[α]`.
+    let arrow_alpha = || primary_pi("x", BinderInfo::Default, bv(0), bv(1));
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            wrap_of(bv(0)),
+            Expr::sort(v.clone()),
+        )
+    };
+    let mk_applied = |alpha: Expr, field: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["WrapInst", "mk"]), vec![u.clone()]),
+                alpha,
+            ),
+            field,
+        )
+    };
+    // Minor: `∀e field : (α → α), motive (mk α field)` under `[α, motive]`.
+    let minor_type = || {
+        primary_pi(
+            "field",
+            BinderInfo::InstImplicit,
+            primary_pi("x", BinderInfo::Default, bv(1), bv(2)),
+            Expr::app(bv(1), mk_applied(bv(2), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        ptype(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "minor",
+                BinderInfo::Default,
+                minor_type(),
+                primary_pi(
+                    "major",
+                    BinderInfo::Default,
+                    wrap_of(bv(2)),
+                    Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        ),
+    );
+    // Iota rule: `λ α motive minor field. minor field`.
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        ptype(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("minor"),
+                minor_type(),
+                Expr::lam(
+                    primary_name("field"),
+                    arrow_alpha(),
+                    Expr::app(bv(1), bv(0)),
+                    BinderInfo::InstImplicit,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            wrap.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi("α", BinderInfo::Default, ptype(), ptype())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![wrap.clone()],
+                    vec![mk.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            mk.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Implicit,
+                    ptype(),
+                    primary_pi(
+                        "field",
+                        BinderInfo::InstImplicit,
+                        arrow_alpha(),
+                        wrap_of(bv(1)),
+                    ),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(wrap.clone(), 0, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![wrap],
+                    1,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(mk, 1, decoded(&rule_rhs))],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr600_803_class_block_reconstructs_an_inst_implicit_field() {
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &class_wrap_entries(),
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "inst-implicit-field class block admits: {verdict:?}"
+    );
+}

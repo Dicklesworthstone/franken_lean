@@ -6184,8 +6184,16 @@ fn admit_class_block(
             let argument = builder.bvar(depth as u32 - 1);
             result = builder.apply(result, argument);
         }
-        for field_type in imported_field_types.iter().rev() {
-            result = builder.forall("x", BinderStyle::Default, *field_type, result);
+        // Field binders keep their declared styles: superclass fields arrive
+        // inst-implicit (`Init.Applicative.mk`), data fields Default — the
+        // pin's encoding distinguishes them, and the structural compare sees
+        // styles.
+        for (field_type, (_, style)) in imported_field_types
+            .iter()
+            .rev()
+            .zip(constructor_field_binders.iter().rev())
+        {
+            result = builder.forall("x", *style, *field_type, result);
         }
         // `forall` wraps inside out, so the parameters must be wrapped in REVERSE
         // declaration order for parameter 1 to land outermost — exactly as the field
@@ -6440,8 +6448,14 @@ fn admit_class_block(
         }
         let motive_reference = builder.bvar((field_count + minor_index) as u32);
         let mut minor_body = builder.apply(motive_reference, minor_call);
-        for field_type in minor_field_imports.iter().rev() {
-            minor_body = builder.forall("x", BinderStyle::Default, *field_type, minor_body);
+        // As in the constructor rebuild above: the minor's field binders keep
+        // their declared styles, since the pin inst-implicit superclass fields.
+        for (field_type, (_, style)) in minor_field_imports
+            .iter()
+            .rev()
+            .zip(minor_field_binders.iter().rev())
+        {
+            minor_body = builder.forall("x", *style, *field_type, minor_body);
         }
         imported_units += 4;
         minor_bodies.push(minor_body);
