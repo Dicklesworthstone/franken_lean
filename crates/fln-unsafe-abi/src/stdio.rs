@@ -50,7 +50,10 @@ unsafe extern "C" {
     static stdin: *mut c_void;
     static stdout: *mut c_void;
     static stderr: *mut c_void;
-    fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int;
+    // C's `open` is variadic (the mode is present only with O_CREAT); the
+    // pinned nightly's `invalid_runtime_symbol_definitions` denies a fixed
+    // three-argument redeclaration of a symbol std itself imports.
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn fread(ptr: *mut c_void, size: usize, n: usize, f: *mut c_void) -> usize;

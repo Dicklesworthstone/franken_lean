@@ -764,7 +764,10 @@ unsafe extern "C" {
     fn gettid() -> c_int;
     fn getpid() -> c_int;
     fn readlink(path: *const c_char, buf: *mut c_char, bufsiz: usize) -> isize;
-    fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int;
+    // C's `open` is variadic (the mode is present only with O_CREAT); the
+    // pinned nightly's `invalid_runtime_symbol_definitions` denies a fixed
+    // three-argument redeclaration of a symbol std itself imports.
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn close(fd: c_int) -> c_int;
 }
