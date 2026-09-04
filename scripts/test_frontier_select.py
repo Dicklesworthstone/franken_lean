@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -127,12 +128,118 @@ class FrontierSelectTests(unittest.TestCase):
         )
         issues, _ = fs.load_issues(path)
         ranked, excluded = fs.rank(issues, {}, owner="me", strict=False)
-        self.assertEqual([row["id"] for row in ranked], ["mine", "unknown"])
+        self.assertEqual([row["id"] for row in ranked], ["mine"])
+        self.assertEqual(excluded["unowned_in_progress"], 1)
         self.assertEqual(excluded["owned_by_other"], 1)
         ranked, excluded = fs.rank(issues, {}, owner=None, strict=False)
         self.assertEqual(ranked, [])
         self.assertEqual(excluded["owned_by_other"], 2)
         self.assertEqual(excluded["unowned_in_progress"], 1)
+
+    def run_selector(self, path, *args):
+        return subprocess.run(
+            [sys.executable, str(Path(fs.__file__).resolve()), "--issues", str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_caller_cannot_supply_missing_recorded_ownership(self):
+        for assignee in (None, ""):
+            for owner in (None, "me", "another-agent"):
+                for strict in (False, True):
+                    with self.subTest(assignee=assignee, owner=owner, strict=strict):
+                        path = self.write_issues([
+                            issue("unknown", status="in_progress", assignee=assignee)
+                        ])
+                        issues, _ = fs.load_issues(path)
+                        overlays = {"unknown": fs.Overlay(
+                            first_failure_named=True, artifacts_available=True,
+                            toolchain_available=True, oracle_only_compliant=True,
+                        )}
+                        ranked, excluded = fs.rank(
+                            issues, overlays, owner=owner, strict=strict
+                        )
+                        self.assertEqual(ranked, [])
+                        self.assertEqual(excluded, {"unowned_in_progress": 1})
+
+    def test_blank_and_non_string_caller_identities_are_refused(self):
+        issues, _ = fs.load_issues(self.write_issues([issue("open")]))
+        for owner in ("", " ", "\t", 0, False, [], {}):
+            with self.subTest(owner=owner):
+                with self.assertRaisesRegex(fs.FrontierError, "owner"):
+                    fs.rank(issues, {}, owner=owner, strict=False)
+
+    def test_malformed_recorded_assignee_is_refused(self):
+        for assignee in (" ", "\t", 0, False, [], {}):
+            with self.subTest(assignee=assignee):
+                path = self.write_issues([
+                    issue("unknown", status="in_progress", assignee=assignee)
+                ])
+                with self.assertRaisesRegex(fs.FrontierError, "assignee"):
+                    fs.load_issues(path)
+
+    def test_owner_does_not_claim_unassigned_open_work_or_trim_identity(self):
+        path = self.write_issues([
+            issue("available"),
+            issue("assigned-open", assignee="me"),
+            issue("different-identity", status="in_progress", assignee=" me "),
+        ])
+        issues, _ = fs.load_issues(path)
+        ranked, excluded = fs.rank(issues, {}, owner="me", strict=False)
+        self.assertEqual([row["id"] for row in ranked], ["assigned-open", "available"])
+        self.assertEqual(excluded, {"owned_by_other": 1})
+        self.assertIsNone(issues["available"].assignee)
+
+    def test_json_cli_refuses_unknown_ownership_without_writing_inputs(self):
+        for assignee in (None, ""):
+            with self.subTest(assignee=assignee):
+                path = self.write_issues([
+                    issue("unknown", status="in_progress", assignee=assignee)
+                ])
+                before = path.read_bytes()
+                for args in ((), ("--owner", "me")):
+                    result = self.run_selector(path, *args)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    document = json.loads(result.stdout)
+                    self.assertEqual(document["outcome"], "no_candidate")
+                    self.assertIsNone(document["selected"])
+                    self.assertEqual(document["candidates"], [])
+                    self.assertEqual(document["excluded"], {"unowned_in_progress": 1})
+                    self.assertFalse(document["authority"])
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_json_cli_owner_controls_only_matching_recorded_work(self):
+        path = self.write_issues([
+            issue("mine", status="in_progress", assignee="me"),
+            issue("unknown", status="in_progress"),
+            issue("theirs", status="in_progress", assignee="other"),
+        ])
+        first = self.run_selector(path, "--owner", "me")
+        second = self.run_selector(path, "--owner", "me")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertEqual(first.stderr, "")
+        document = json.loads(first.stdout)
+        self.assertEqual([row["id"] for row in document["candidates"]], ["mine"])
+        self.assertEqual(document["excluded"], {
+            "owned_by_other": 1, "unowned_in_progress": 1,
+        })
+
+    def test_json_cli_blank_owner_is_a_typed_refusal(self):
+        path = self.write_issues([issue("available")])
+        for owner in ("", " ", "\t"):
+            with self.subTest(owner=owner):
+                result = self.run_selector(path, "--owner", owner)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                refusal = json.loads(result.stderr)
+                self.assertEqual(refusal["schema"], fs.SCHEMA)
+                self.assertEqual(refusal["outcome"], "refused")
+                self.assertIn("owner", refusal["reason"])
 
     def test_input_order_does_not_change_ranking(self):
         rows = [issue("z"), issue("a"), issue("m")]

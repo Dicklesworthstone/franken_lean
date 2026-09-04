@@ -346,6 +346,8 @@ def rank(
     owner: str | None,
     strict: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if owner is not None:
+        expect_string(owner, "owner")
     reverse = reverse_block_graph(issues)
     excluded: dict[str, int] = defaultdict(int)
     candidates: list[dict[str, Any]] = []
@@ -360,7 +362,7 @@ def rank(
         if issue.assignee and issue.assignee != owner:
             excluded["owned_by_other"] += 1
             continue
-        if issue.status == "in_progress" and issue.assignee is None and owner is None:
+        if issue.status == "in_progress" and issue.assignee is None:
             excluded["unowned_in_progress"] += 1
             continue
         if not issue.acceptance_criteria.strip():
@@ -433,7 +435,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlay", type=Path)
     parser.add_argument(
         "--owner",
-        help="Current agent/session owner; permits matching assigned work.",
+        help=(
+            "Caller identity for matching recorded assignments; never claims work "
+            "or resolves an unassigned in-progress issue."
+        ),
     )
     parser.add_argument(
         "--strict",
