@@ -2923,15 +2923,32 @@ impl<'a> InferenceEngine<'a> {
             }
         };
 
-        let rule = self
+        // The caller's registry is the untrusted-input surface; when it lacks
+        // the rule, KR-112's condition is derivable from the staged
+        // environment itself: a single-constructor inductive names its own
+        // constructor. `Init.Add.add` needs exactly this (fln-51y8 item 138).
+        let derived_rule;
+        let rule = match self
             .context
             .reduction()
             .projection_rules()
             .iter()
             .find(|candidate| *candidate.structure_name() == state.structure_name)
-            .ok_or(LeafHalt::Refused(InferenceRefusal::ProjectionRuleMissing {
-                structure: state.structure_name.clone(),
-            }))?;
+        {
+            Some(rule) => rule,
+            None => {
+                derived_rule = crate::whnf::derive_projection_rule(
+                    self.context.constants(),
+                    &state.structure_name,
+                )
+                .ok_or(LeafHalt::Refused(
+                    InferenceRefusal::ProjectionRuleMissing {
+                        structure: state.structure_name.clone(),
+                    },
+                ))?;
+                &derived_rule
+            }
+        };
         let parameters = rule.parameter_count();
         let constructor_name = rule.constructor_name().clone();
         if parameters > arguments.len() {

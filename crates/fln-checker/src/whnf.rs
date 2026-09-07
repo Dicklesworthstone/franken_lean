@@ -4,13 +4,15 @@
 //! implements the eager checker portion of KR-200 through KR-204 with flat arena
 //! cursors and explicit heap frames: safe-definition delta, metadata stripping,
 //! beta, let-zeta, supplied let-bound free unfolding, and explicit-constructor
-//! projection. Unsafe and partial definitions stay stuck. Recursors, native
-//! extensions, and numeric/string acceleration remain outside this layer.
+//! projection — plus recursor reduction: iota (KR-316) with the K-flagged
+//! corner (KR-317, `to_cnstr_when_K`). Unsafe and partial definitions stay
+//! stuck. Native extensions and numeric/string literal majors remain outside
+//! this layer.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use crate::environment::ConstantEnvironment;
+use crate::environment::{ConstantEnvironment, RecursorDeclaration};
 use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
     instantiate_term_parameters_from_level_roots_with,
@@ -20,9 +22,10 @@ use crate::string_reduce::{
     StringExpansionStop, expand_string_literal_with,
 };
 use crate::term::{
-    TermBudget, TermFault, TermLimit, TermOutcome, TermStop, copy_subterm_with,
+    TermBudget, TermFault, TermLimit, TermOutcome, TermStop, copy_subterm_with, inspect_with,
     substitute_bound_subterms_with,
 };
+use crate::universe::{UniverseError, level_roots_equal};
 use crate::wire::{
     ExprId, ExprNode, LevelId, LevelNode, NamePart, WireExpr, WireName, expression_owned_units,
     level_owned_units, usize_units,
@@ -170,6 +173,7 @@ pub enum WhnfPhase {
     FreeBinding { index: usize },
     Beta,
     Zeta,
+    Iota,
     RebuildApplication,
     RebuildProjection,
     Final,
@@ -237,6 +241,10 @@ pub enum WhnfStop {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhnfFault {
+    Universe {
+        at: usize,
+        error: UniverseError,
+    },
     Term {
         phase: WhnfPhase,
         fault: TermFault,
@@ -729,7 +737,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         frame: &ProjectionFrame,
         scrutinee: &Cursor,
     ) -> Result<Option<Cursor>, Halt> {
-        let (rule_index, field_index) = {
+        let (rule, rule_index, field_index) = {
             let node = self.node(&frame.projection)?;
             let ExprNode::Projection {
                 structure_name,
@@ -742,42 +750,43 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     index: frame.projection.root.index(),
                 }));
             };
-            let Some(rule_index) = self.context.projection_rules.get(structure_name).copied()
-            else {
-                return Ok(None);
-            };
-            (rule_index, *index)
+            // The caller's registry stays the untrusted-input surface; on a
+            // miss, KR-112's condition is derivable from the environment for
+            // a single-constructor inductive (`derive_projection_rule`).
+            let (rule, rule_index) =
+                match self.context.projection_rules.get(structure_name).copied() {
+                    Some(rule_index) => {
+                        let rule = self.context.source.projection_rules.get(rule_index).ok_or(
+                            Halt::Fault(WhnfFault::MissingExpression {
+                                input: 0,
+                                index: rule_index,
+                            }),
+                        )?;
+                        (rule.clone(), rule_index)
+                    }
+                    None => {
+                        let Some(rule) =
+                            derive_projection_rule(self.context.source.constants(), structure_name)
+                        else {
+                            return Ok(None);
+                        };
+                        // No registry row exists for a derived rule; the overflow
+                        // refusal's row field reports usize::MAX there.
+                        (rule, usize::MAX)
+                    }
+                };
+            (rule, rule_index, *index)
         };
 
         let (head, arguments) = self.peel_application(scrutinee)?;
-        let constructor_matches = {
-            let rule = self
-                .context
-                .source
-                .projection_rules
-                .get(rule_index)
-                .ok_or(Halt::Fault(WhnfFault::MissingExpression {
-                    input: 0,
-                    index: rule_index,
-                }))?;
-            matches!(
-                self.node(&head)?,
-                ExprNode::Constant { name, .. } if name == &rule.constructor_name
-            )
-        };
+        let constructor_matches = matches!(
+            self.node(&head)?,
+            ExprNode::Constant { name, .. } if name == &rule.constructor_name
+        );
         if !constructor_matches {
             return Ok(None);
         }
 
-        let rule = self
-            .context
-            .source
-            .projection_rules
-            .get(rule_index)
-            .ok_or(Halt::Fault(WhnfFault::MissingExpression {
-                input: 0,
-                index: rule_index,
-            }))?;
         let field = usize::try_from(field_index).map_err(|_| {
             Halt::Refusal(WhnfRefusal::ProjectionIndexOverflow {
                 rule: rule_index,
@@ -857,6 +866,649 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }))
             }
         }
+    }
+
+    /// Whether the major premise already reduces to a constructor
+    /// application — the shape the pin converts before the K corner
+    /// (`inductive.h:91-95`), which the ordinary fire path owns. Literal
+    /// majors are NOT constructor applications here: Nat/String
+    /// literal-to-constructor conversion is outside this layer for now.
+    fn major_is_constructor_application(&mut self, major: &Cursor) -> Result<bool, Halt> {
+        let (head, _) = self.peel_application(major)?;
+        match self.node(&head)? {
+            ExprNode::Constant { name, .. } => {
+                let name = name.clone();
+                Ok(self
+                    .context
+                    .source
+                    .constants()
+                    .find(&name)
+                    .is_some_and(|entry| entry.constructor_metadata().is_some()))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Weak-head-normalize a cursor inside this reduction's remaining budget,
+    /// absorbing the sub-run's measured work back into this control so the
+    /// budget accounting stays global.
+    fn whnf_subterm(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
+        let context = self.context.source;
+        let budget = WhnfBudget::new(
+            self.control
+                .budget
+                .max_steps
+                .saturating_sub(self.control.steps),
+            self.control
+                .budget
+                .max_reductions
+                .saturating_sub(self.control.reductions),
+            self.control.budget.materialization,
+        )
+        .with_string(self.remaining_string_budget());
+        match whnf_at_mode_with(
+            &cursor.arena,
+            cursor.root,
+            context,
+            budget,
+            self.delta_mode,
+            &mut *self.cancelled,
+        ) {
+            WhnfOutcome::Complete(result) => {
+                self.control.steps = self.control.steps.saturating_add(result.steps);
+                self.control.reductions = self.control.reductions.saturating_add(result.reductions);
+                self.delta_reductions = self
+                    .delta_reductions
+                    .saturating_add(result.delta_reductions);
+                self.absorb_string(result.string_progress);
+                let root = result.term.root();
+                Ok(Cursor {
+                    arena: Arc::new(result.term),
+                    root,
+                })
+            }
+            WhnfOutcome::Refused(refusal) => Err(Halt::Refusal(refusal)),
+            WhnfOutcome::Inconclusive(stop) => Err(Halt::Stop(stop)),
+            WhnfOutcome::InternalFault(fault) => Err(Halt::Fault(fault)),
+        }
+    }
+
+    /// Structural equality of two cursor roots across arenas, budgeted by the
+    /// control: the checker-local equivalent of the gate the pin runs with
+    /// `is_def_eq` in `to_cnstr_when_K`. Arenas are acyclic with
+    /// backward-only references, so the walk terminates.
+    fn structural_cursors_equal(&mut self, left: &Cursor, right: &Cursor) -> Result<bool, Halt> {
+        let mut pending = vec![(left.root, right.root)];
+        let mut seen = BTreeSet::new();
+        while let Some((left_id, right_id)) = pending.pop() {
+            if !seen.insert((left_id, right_id)) {
+                continue;
+            }
+            self.control
+                .step(left_id.index().max(right_id.index()), self.cancelled)?;
+            let left_node =
+                left.arena
+                    .node(left_id)
+                    .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                        input: 0,
+                        index: left_id.index(),
+                    }))?;
+            let right_node =
+                right
+                    .arena
+                    .node(right_id)
+                    .ok_or(Halt::Fault(WhnfFault::MissingExpression {
+                        input: 0,
+                        index: right_id.index(),
+                    }))?;
+            let mut push = |left_child: ExprId, right_child: ExprId| -> Result<(), Halt> {
+                Self::validate_child(left_id, left_child)?;
+                Self::validate_child(right_id, right_child)?;
+                pending.push((left_child, right_child));
+                Ok(())
+            };
+            match (left_node, right_node) {
+                (ExprNode::Bound { index: left }, ExprNode::Bound { index: right })
+                    if left == right => {}
+                (ExprNode::Free { name: left }, ExprNode::Free { name: right })
+                    if left == right => {}
+                (ExprNode::Sort { level: left_level }, ExprNode::Sort { level: right_level }) => {
+                    if !level_roots_equal(
+                        left.arena.levels(),
+                        *left_level,
+                        right.arena.levels(),
+                        *right_level,
+                    )
+                    .map_err(|error| {
+                        Halt::Fault(WhnfFault::Universe {
+                            at: left_id.index(),
+                            error,
+                        })
+                    })? {
+                        return Ok(false);
+                    }
+                }
+                (
+                    ExprNode::Constant {
+                        name: left_name,
+                        levels: left_levels,
+                    },
+                    ExprNode::Constant {
+                        name: right_name,
+                        levels: right_levels,
+                    },
+                ) if left_name == right_name && left_levels.len() == right_levels.len() => {
+                    for (left_level, right_level) in left_levels.iter().zip(right_levels) {
+                        if !level_roots_equal(
+                            left.arena.levels(),
+                            *left_level,
+                            right.arena.levels(),
+                            *right_level,
+                        )
+                        .map_err(|error| {
+                            Halt::Fault(WhnfFault::Universe {
+                                at: left_id.index(),
+                                error,
+                            })
+                        })? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                (
+                    ExprNode::Apply {
+                        function: left_function,
+                        argument: left_argument,
+                    },
+                    ExprNode::Apply {
+                        function: right_function,
+                        argument: right_argument,
+                    },
+                ) => {
+                    push(*left_argument, *right_argument)?;
+                    push(*left_function, *right_function)?;
+                }
+                (
+                    ExprNode::Lambda {
+                        binder_type: left_type,
+                        body: left_body,
+                        style: left_style,
+                        ..
+                    },
+                    ExprNode::Lambda {
+                        binder_type: right_type,
+                        body: right_body,
+                        style: right_style,
+                        ..
+                    },
+                )
+                | (
+                    ExprNode::Forall {
+                        binder_type: left_type,
+                        body: left_body,
+                        style: left_style,
+                        ..
+                    },
+                    ExprNode::Forall {
+                        binder_type: right_type,
+                        body: right_body,
+                        style: right_style,
+                        ..
+                    },
+                ) if left_style == right_style => {
+                    push(*left_body, *right_body)?;
+                    push(*left_type, *right_type)?;
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// KR-317 (`to_cnstr_when_K`, inductive.h:31): a K-flagged recursor
+    /// replaces a stuck major premise with the inductive's nullary
+    /// constructor so the ordinary iota rule can fire. The pin gates the
+    /// replacement on `is_def_eq` between the major's INFERRED type and the
+    /// constructed constructor's type; this layer has no term inference, so
+    /// the gate derives the major's domain from the recursor's own telescope
+    /// instantiated by the spine (the same place K1's `recursor_major_induct`
+    /// reads, tc.rs:3409) and requires the constructor's result type to match
+    /// it structurally. Fail-closed: a gate miss leaves the major stuck,
+    /// never produces a wrong reduction. This is what closes
+    /// `cast h a ≡ a` with the proof h a variable (fln-51y8 item 126).
+    #[allow(clippy::too_many_arguments)]
+    fn recursor_major_to_nullary_constructor(
+        &mut self,
+        level_parameters: &[WireName],
+        recursor_type: &WireExpr,
+        current: &Cursor,
+        levels: &[LevelId],
+        arguments: &VecDeque<Cursor>,
+        major_index: usize,
+        parameter_count: usize,
+    ) -> Result<Option<Cursor>, Halt> {
+        if self.major_is_constructor_application(&arguments[major_index])? {
+            return Ok(None);
+        }
+        // derived domain is concrete.
+        let instantiated_type = match instantiate_term_parameters_from_level_roots_with(
+            recursor_type,
+            level_parameters,
+            current.arena.levels(),
+            levels,
+            self.control.budget.materialization,
+            &mut *self.cancelled,
+        ) {
+            InstantiationOutcome::Complete(term) => term,
+            InstantiationOutcome::Refused(refusal) => {
+                return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
+                    at: current.root.index(),
+                    refusal,
+                }));
+            }
+            InstantiationOutcome::Inconclusive(stop) => {
+                return Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                    at: current.root.index(),
+                    stop,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                }));
+            }
+            InstantiationOutcome::InternalFault(fault) => {
+                return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
+                    at: current.root.index(),
+                    fault,
+                }));
+            }
+        };
+        // Walk `major_index` binders of the recursor's type; the next binder's
+        // domain is the major premise's expected type.
+        let mut root = instantiated_type.root();
+        for _ in 0..major_index {
+            self.control.step(root.index(), self.cancelled)?;
+            let Some(ExprNode::Forall { body, .. }) = instantiated_type.node(root) else {
+                return Ok(None);
+            };
+            Self::validate_child(root, *body)?;
+            root = *body;
+        }
+        self.control.step(root.index(), self.cancelled)?;
+        let Some(ExprNode::Forall { binder_type, .. }) = instantiated_type.node(root) else {
+            return Ok(None);
+        };
+        Self::validate_child(root, *binder_type)?;
+        let mut domain =
+            self.materialize_wire(&instantiated_type, *binder_type, WhnfPhase::Iota)?;
+        // Substitute the spine's earlier arguments for the dangling binders,
+        // innermost first — the same reverse-substitution discipline as
+        // infer.rs's `materialize_function_subterm`.
+        let facts = self.control.term_halt(
+            WhnfPhase::Iota,
+            inspect_with(
+                &domain,
+                self.control.budget.materialization,
+                &mut *self.cancelled,
+            ),
+        )?;
+        let needed = usize::try_from(facts.external_bound_span).unwrap_or(usize::MAX);
+        if needed > major_index {
+            return Ok(None);
+        }
+        let first = major_index - needed;
+        for replacement in arguments.range(first..major_index).rev() {
+            let domain_root = domain.root();
+            domain = self.control.term_halt(
+                WhnfPhase::Iota,
+                substitute_bound_subterms_with(
+                    &domain,
+                    domain_root,
+                    0,
+                    &replacement.arena,
+                    replacement.root,
+                    self.control.budget.materialization,
+                    &mut *self.cancelled,
+                ),
+            )?;
+        }
+        let domain = Arc::new(domain);
+        let domain_cursor = Cursor {
+            root: domain.root(),
+            arena: Arc::clone(&domain),
+        };
+        let (domain_head, domain_args) = self.peel_application(&domain_cursor)?;
+        let (inductive_name, inductive_levels) = match self.node(&domain_head)? {
+            ExprNode::Constant { name, levels } => (name.clone(), levels.clone()),
+            _ => return Ok(None),
+        };
+        let Some(inductive_entry) = self.context.source.constants().find(&inductive_name) else {
+            return Ok(None);
+        };
+        let Some(inductive_metadata) = inductive_entry.inductive_metadata() else {
+            return Ok(None);
+        };
+        let Some(constructor_name) = inductive_metadata.constructors().first().cloned() else {
+            return Ok(None);
+        };
+        let Some(constructor_entry) = self.context.source.constants().find(&constructor_name)
+        else {
+            return Ok(None);
+        };
+        let constructor_type = constructor_entry.type_().clone();
+        let constructor_levels = constructor_entry.level_parameters().to_vec();
+        // The constructor's result type with the domain's parameters applied:
+        // peel the parameter binders and substitute the domain's parameter
+        // arguments. K-flagged families are nullary, so no field binders
+        // remain at that point by construction.
+        let mut constructor_result = match instantiate_term_parameters_from_level_roots_with(
+            &constructor_type,
+            &constructor_levels,
+            domain.levels(),
+            &inductive_levels,
+            self.control.budget.materialization,
+            &mut *self.cancelled,
+        ) {
+            InstantiationOutcome::Complete(term) => term,
+            InstantiationOutcome::Refused(refusal) => {
+                return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
+                    at: current.root.index(),
+                    refusal,
+                }));
+            }
+            InstantiationOutcome::Inconclusive(stop) => {
+                return Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                    at: current.root.index(),
+                    stop,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                }));
+            }
+            InstantiationOutcome::InternalFault(fault) => {
+                return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
+                    at: current.root.index(),
+                    fault,
+                }));
+            }
+        };
+        let mut result_root = constructor_result.root();
+        for _ in 0..parameter_count {
+            self.control.step(result_root.index(), self.cancelled)?;
+            let Some(ExprNode::Forall { body, .. }) = constructor_result.node(result_root) else {
+                return Ok(None);
+            };
+            Self::validate_child(result_root, *body)?;
+            result_root = *body;
+        }
+        constructor_result =
+            self.materialize_wire(&constructor_result, result_root, WhnfPhase::Iota)?;
+        let facts = self.control.term_halt(
+            WhnfPhase::Iota,
+            inspect_with(
+                &constructor_result,
+                self.control.budget.materialization,
+                &mut *self.cancelled,
+            ),
+        )?;
+        let needed = usize::try_from(facts.external_bound_span).unwrap_or(usize::MAX);
+        if needed > parameter_count || needed > domain_args.len() {
+            return Ok(None);
+        }
+        let first = parameter_count - needed;
+        for replacement in domain_args.range(first..parameter_count).rev() {
+            let result_root = constructor_result.root();
+            constructor_result = self.control.term_halt(
+                WhnfPhase::Iota,
+                substitute_bound_subterms_with(
+                    &constructor_result,
+                    result_root,
+                    0,
+                    &replacement.arena,
+                    replacement.root,
+                    self.control.budget.materialization,
+                    &mut *self.cancelled,
+                ),
+            )?;
+        }
+        let result_cursor = Cursor {
+            root: constructor_result.root(),
+            arena: Arc::new(constructor_result),
+        };
+        // The pin's gate: the constructed constructor's type must be defeq to
+        // the major's type. Here: the reconstructed result type must match
+        // the spine-derived domain structurally.
+        if !self.structural_cursors_equal(&domain_cursor, &result_cursor)? {
+            return Ok(None);
+        }
+        // Build the nullary constructor applied to the domain's parameters.
+        let mut composer = Composer::new(
+            self.control.budget.materialization,
+            WhnfPhase::Iota,
+            self.control.steps,
+            self.control.reductions,
+            &mut *self.cancelled,
+        );
+        let domain_source = composer.source_index(&domain);
+        let mut level_ids = Vec::with_capacity(inductive_levels.len());
+        for level in &inductive_levels {
+            level_ids.push(composer.copy_level_root(domain_source, *level, 0)?);
+        }
+        let mut root = composer.push_expression(
+            ExprNode::Constant {
+                name: constructor_name,
+                levels: level_ids,
+            },
+            1,
+            0,
+        )?;
+        for (index, argument) in domain_args.iter().take(parameter_count).enumerate() {
+            let argument = composer.copy_cursor(argument, index.saturating_add(1))?;
+            root = composer.push_expression(
+                ExprNode::Apply {
+                    function: root,
+                    argument,
+                },
+                1,
+                index,
+            )?;
+        }
+        let term = composer.finish(root);
+        Ok(Some(Cursor {
+            root: term.root(),
+            arena: Arc::new(term),
+        }))
+    }
+
+    /// KR-316 (`inductive_reduce_rec`, inductive.h:76): a recursor application
+    /// fires when its major premise reduces to a constructor of the recursor's
+    /// inductive. The matching rule's right-hand side is instantiated with the
+    /// recursor's levels and applied to the spine's parameters, motives, and
+    /// minor premises (the indices are consumed by the motive, never applied
+    /// to the rule), then the constructor's fields, then the trailing
+    /// arguments. Nat/String literal majors and structure-eta coercion remain
+    /// outside this layer for now.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_recursor_reduction(
+        &mut self,
+        metadata: &RecursorDeclaration,
+        level_parameters: &[WireName],
+        current: &Cursor,
+        levels: &[LevelId],
+        arguments: &VecDeque<Cursor>,
+        major_index: usize,
+        major: &Cursor,
+        prefix: usize,
+    ) -> Result<Option<Cursor>, Halt> {
+        let reduced_major = self.whnf_subterm(major)?;
+        let (major_head, major_args) = self.peel_application(&reduced_major)?;
+        let constructor_name = match self.node(&major_head)? {
+            ExprNode::Constant { name, .. } => name.clone(),
+            _ => return Ok(None),
+        };
+        let Some(rule) = metadata
+            .rules()
+            .iter()
+            .find(|rule| rule.constructor() == &constructor_name)
+        else {
+            return Ok(None);
+        };
+        let field_count = usize::try_from(rule.num_fields()).unwrap_or(usize::MAX);
+        if field_count > major_args.len() {
+            return Ok(None);
+        }
+        if levels.len() != level_parameters.len() {
+            return Ok(None);
+        }
+        self.control
+            .reduction(current.root.index(), self.cancelled)?;
+        let instantiated_rhs = match instantiate_term_parameters_from_level_roots_with(
+            rule.rhs(),
+            level_parameters,
+            current.arena.levels(),
+            levels,
+            self.control.budget.materialization,
+            &mut *self.cancelled,
+        ) {
+            InstantiationOutcome::Complete(term) => term,
+            InstantiationOutcome::Refused(refusal) => {
+                return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
+                    at: current.root.index(),
+                    refusal,
+                }));
+            }
+            InstantiationOutcome::Inconclusive(stop) => {
+                return Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                    at: current.root.index(),
+                    stop,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                }));
+            }
+            InstantiationOutcome::InternalFault(fault) => {
+                return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
+                    at: current.root.index(),
+                    fault,
+                }));
+            }
+        };
+        let rhs = Cursor {
+            root: instantiated_rhs.root(),
+            arena: Arc::new(instantiated_rhs),
+        };
+        let mut composer = Composer::new(
+            self.control.budget.materialization,
+            WhnfPhase::Iota,
+            self.control.steps,
+            self.control.reductions,
+            &mut *self.cancelled,
+        );
+        let mut root = composer.copy_cursor(&rhs, 0)?;
+        for (index, argument) in arguments.iter().take(prefix).enumerate() {
+            let argument = composer.copy_cursor(argument, index.saturating_add(1))?;
+            root = composer.push_expression(
+                ExprNode::Apply {
+                    function: root,
+                    argument,
+                },
+                1,
+                index,
+            )?;
+        }
+        for field in major_args.iter().skip(major_args.len() - field_count) {
+            let field = composer.copy_cursor(field, 0)?;
+            root = composer.push_expression(
+                ExprNode::Apply {
+                    function: root,
+                    argument: field,
+                },
+                1,
+                0,
+            )?;
+        }
+        for extra in arguments.iter().skip(major_index.saturating_add(1)) {
+            let extra = composer.copy_cursor(extra, 0)?;
+            root = composer.push_expression(
+                ExprNode::Apply {
+                    function: root,
+                    argument: extra,
+                },
+                1,
+                0,
+            )?;
+        }
+        let term = composer.finish(root);
+        Ok(Some(Cursor {
+            root: term.root(),
+            arena: Arc::new(term),
+        }))
+    }
+
+    /// Try to reduce a recursor application sitting at a constant head with a
+    /// collected spine: the K corner first for a K-flagged recursor with a
+    /// stuck major, then the ordinary constructor fire. On a fire the whole
+    /// spine is consumed into the composed result and `arguments` is drained.
+    fn try_recursor_reduction(
+        &mut self,
+        current: &Cursor,
+        arguments: &mut VecDeque<Cursor>,
+    ) -> Result<Option<Cursor>, Halt> {
+        let (name, levels) = match self.node(current)? {
+            ExprNode::Constant { name, levels } => (name.clone(), levels.clone()),
+            _ => return Ok(None),
+        };
+        let Some(entry) = self.context.source.constants().find(&name) else {
+            return Ok(None);
+        };
+        let Some(metadata) = entry.recursor_metadata().cloned() else {
+            return Ok(None);
+        };
+        let level_parameters = entry.level_parameters().to_vec();
+        let recursor_type = entry.type_().clone();
+        let parameter_count = usize::try_from(metadata.num_parameters()).unwrap_or(usize::MAX);
+        let Some(major_index) = parameter_count
+            .checked_add(usize::try_from(metadata.num_motives()).unwrap_or(usize::MAX))
+            .and_then(|value| {
+                value.checked_add(usize::try_from(metadata.num_minors()).unwrap_or(usize::MAX))
+            })
+            .and_then(|value| {
+                value.checked_add(usize::try_from(metadata.num_indices()).unwrap_or(usize::MAX))
+            })
+        else {
+            return Ok(None);
+        };
+        if arguments.len() <= major_index {
+            return Ok(None);
+        }
+        let mut major = arguments[major_index].clone();
+        if metadata.k()
+            && let Some(replacement) = self.recursor_major_to_nullary_constructor(
+                &level_parameters,
+                &recursor_type,
+                current,
+                &levels,
+                arguments,
+                major_index,
+                parameter_count,
+            )?
+        {
+            major = replacement;
+        }
+        let prefix = parameter_count
+            .saturating_add(usize::try_from(metadata.num_motives()).unwrap_or(usize::MAX))
+            .saturating_add(usize::try_from(metadata.num_minors()).unwrap_or(usize::MAX));
+        let Some(reduced) = self.finish_recursor_reduction(
+            &metadata,
+            &level_parameters,
+            current,
+            &levels,
+            arguments,
+            major_index,
+            &major,
+            prefix,
+        )?
+        else {
+            return Ok(None);
+        };
+        arguments.clear();
+        Ok(Some(reduced))
     }
 
     fn head_action(&self, current: &Cursor) -> Result<HeadAction, Halt> {
@@ -965,6 +1617,17 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         }
                         self.delta_reductions = self.delta_reductions.saturating_add(1);
                         current = unfolded;
+                        continue;
+                    }
+                    // A constant with a collected spine that did not delta-unfold
+                    // may be a recursor: iota (KR-316) and the K corner
+                    // (KR-317) fire regardless of delta mode — a recursor has
+                    // no definition body.
+                    if !pending_arguments.is_empty()
+                        && let Some(reduced) =
+                            self.try_recursor_reduction(&current, &mut pending_arguments)?
+                    {
+                        current = reduced;
                         continue;
                     }
                 }
@@ -1568,6 +2231,30 @@ impl<'c> Composer<'c> {
     fn finish(self, root: ExprId) -> WireExpr {
         WireExpr::from_parts(self.expressions, self.levels, root)
     }
+}
+
+/// Derive a projection rule from the environment when the caller's registry
+/// does not carry one. KR-112's condition: a single-constructor inductive —
+/// the rule names the staged inductive's own constructor, so it is well-formed
+/// by construction, unlike a caller-supplied rule (which stays the
+/// untrusted-input surface and is still refused downstream when it names a
+/// non-constructor). Indexed structures derive with the inductive's parameter
+/// count: the arity walk treats the index arguments exactly as the pin's
+/// `|As| = nparams + nindices` spine does.
+pub fn derive_projection_rule(
+    constants: &ConstantEnvironment,
+    structure: &WireName,
+) -> Option<ProjectionRule> {
+    let entry = constants.find(structure)?;
+    let metadata = entry.inductive_metadata()?;
+    let [constructor] = metadata.constructors() else {
+        return None;
+    };
+    Some(ProjectionRule::new(
+        structure.clone(),
+        constructor.clone(),
+        usize::try_from(metadata.num_parameters()).ok()?,
+    ))
 }
 
 pub fn whnf(term: &WireExpr, context: &WhnfContext, budget: WhnfBudget) -> WhnfOutcome {

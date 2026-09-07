@@ -4,7 +4,8 @@ use std::process::Command;
 
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+    ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+    EnvironmentOutcome, InductiveDeclaration, RecursorDeclaration, RecursorRule, ReducibilityHint,
 };
 use fln_checker::instantiate::InstantiationRefusal;
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
@@ -1269,4 +1270,499 @@ fn whnf_production_code_has_no_primary_semantic_path() {
             "checker WHNF source shares forbidden semantic path `{forbidden}`"
         );
     }
+}
+
+// ---- KR-316/KR-317: recursor iota and the K corner -------------------------
+
+fn sort(level: Level) -> WireExpr {
+    decoded(&Expr::sort(level))
+}
+
+fn checker_qualified(components: &[&str]) -> WireName {
+    let mut name = Name::anonymous();
+    for component in components {
+        name = Name::str(name, *component);
+    }
+    match decode_name(&name.to_canonical_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => value,
+        other => panic!("primary-produced name did not decode: {other:?}"),
+    }
+}
+
+/// The two-constructor family `Two : Type` with nullary `tt`/`ff` and its
+/// eliminator: the minimal ordinary-iota shape (KR-316).
+///
+/// De Bruijn scopes are marked per line; `bv(i)` counts the i innermost
+/// binders at that point.
+fn two_family_entries() -> Vec<ConstantEntry> {
+    let two = checker_name("Two");
+    let tt = checker_qualified(&["Two", "tt"]);
+    let ff = checker_qualified(&["Two", "ff"]);
+    let rec = checker_qualified(&["Two", "rec"]);
+    let v_name = checker_name("v");
+    let v = Level::param(primary_name("v"));
+    let two_const = || Expr::const_(primary_name("Two"), Vec::new());
+    let tt_const = || Expr::const_(Name::from_components(["Two", "tt"]), Vec::new());
+    let ff_const = || Expr::const_(Name::from_components(["Two", "ff"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    // scope []: `Π (t : Two), Sort v`
+    let motive_type = || {
+        Expr::forall_e(
+            primary_name("t"),
+            two_const(),
+            Expr::sort(v.clone()),
+            BinderInfo::Default,
+        )
+    };
+    // `Πi (motive : Π (t : Two), Sort v), Π (m_tt : motive tt),
+    //  Π (m_ff : motive ff), Π (t : Two), motive t`
+    let recursor_type = Expr::forall_e(
+        primary_name("motive"),
+        motive_type(),
+        // scope [motive]
+        Expr::forall_e(
+            primary_name("m_tt"),
+            Expr::app(bv(0), tt_const()),
+            // scope [motive, m_tt]
+            Expr::forall_e(
+                primary_name("m_ff"),
+                Expr::app(bv(1), ff_const()),
+                // scope [motive, m_tt, m_ff]
+                Expr::forall_e(
+                    primary_name("t"),
+                    two_const(),
+                    // scope [motive, m_tt, m_ff, t]
+                    Expr::app(bv(3), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    // Rule telescopes `λ motive. λ m_tt. λ m_ff. <selected minor>`: at the
+    // body the scope is [motive, m_tt, m_ff], so m_tt = bv(1), m_ff = bv(0).
+    let rule_rhs = |selected_tt: bool| {
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            // scope [motive]
+            Expr::lam(
+                primary_name("m_tt"),
+                Expr::app(bv(0), tt_const()),
+                // scope [motive, m_tt]
+                Expr::lam(
+                    primary_name("m_ff"),
+                    Expr::app(bv(1), ff_const()),
+                    // scope [motive, m_tt, m_ff]
+                    bv(if selected_tt { 1 } else { 0 }),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    vec![
+        ConstantEntry::new(
+            two.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                sort(Level::one()),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![two.clone()],
+                    vec![tt.clone(), ff.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            tt.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&two_const()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(two.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            ff.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&two_const()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(two.clone(), 1, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![two],
+                    0,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(tt, 0, decoded(&rule_rhs(true))),
+                        RecursorRule::new(ff, 0, decoded(&rule_rhs(false))),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+/// The Prop-valued one-nullary-constructor family `EqS` (the `Eq` shape) with
+/// its K-flagged eliminator: `EqS.rec` with a STUCK major of a same-endpoints
+/// type must still reduce — the `to_cnstr_when_K` corner (KR-317).
+fn eqs_family_entries() -> Vec<ConstantEntry> {
+    let eqs = checker_name("EqS");
+    let refl = checker_qualified(&["EqS", "refl"]);
+    let rec = checker_qualified(&["EqS", "rec"]);
+    let v_name = checker_name("v");
+    let v = Level::param(primary_name("v"));
+    let eqs_const = || Expr::const_(primary_name("EqS"), Vec::new());
+    let refl_const = || Expr::const_(Name::from_components(["EqS", "refl"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    // scope []: `Π (α : Type), Π (a : α), Π (b : α), Prop`
+    let family_type = Expr::forall_e(
+        primary_name("α"),
+        Expr::sort(Level::one()),
+        // scope [α]
+        Expr::forall_e(
+            primary_name("a"),
+            bv(0),
+            // scope [α, a]
+            Expr::forall_e(
+                primary_name("b"),
+                bv(1),
+                Expr::sort(Level::zero()),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // scope []: `Πi (α : Type), Π (a : α), EqS α a a`
+    let refl_type = Expr::forall_e(
+        primary_name("α"),
+        Expr::sort(Level::one()),
+        // scope [α]
+        Expr::forall_e(
+            primary_name("a"),
+            bv(0),
+            // scope [α, a]
+            Expr::app(Expr::app(Expr::app(eqs_const(), bv(1)), bv(0)), bv(0)),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    // scope [α, a]: `Π (b : α), (EqS α a b) → Sort v`
+    let motive_type = || {
+        Expr::forall_e(
+            primary_name("b"),
+            bv(1),
+            // scope [α, a, b]: EqS α a b is EqS applied to bv(2), bv(1), bv(0)
+            Expr::forall_e(
+                primary_name("_h"),
+                Expr::app(Expr::app(Expr::app(eqs_const(), bv(2)), bv(1)), bv(0)),
+                Expr::sort(v.clone()),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    // scope [α, a, motive]: `motive a (refl α a)`
+    let minor_type = || {
+        Expr::app(
+            Expr::app(bv(0), bv(1)),
+            Expr::app(Expr::app(refl_const(), bv(2)), bv(1)),
+        )
+    };
+    // `Πi α. Πi a. Πi motive. Π (minor : motive a (refl α a)).
+    //  Πi (b : α). Π (h : EqS α a b). motive b`
+    let recursor_type = Expr::forall_e(
+        primary_name("α"),
+        Expr::sort(Level::one()),
+        // scope [α]
+        Expr::forall_e(
+            primary_name("a"),
+            bv(0),
+            // scope [α, a]
+            Expr::forall_e(
+                primary_name("motive"),
+                motive_type(),
+                // scope [α, a, motive]
+                Expr::forall_e(
+                    primary_name("minor"),
+                    minor_type(),
+                    // scope [α, a, motive, minor]
+                    Expr::forall_e(
+                        primary_name("b"),
+                        bv(3),
+                        // scope [α, a, motive, minor, b]
+                        Expr::forall_e(
+                            primary_name("h"),
+                            Expr::app(Expr::app(Expr::app(eqs_const(), bv(4)), bv(3)), bv(0)),
+                            // scope [α, a, motive, minor, b, h]
+                            Expr::app(bv(4), bv(1)),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Implicit,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Implicit,
+            ),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    // `λ α. λ a. λ motive. λ minor. minor`; the body is bv(0) at scope
+    // [α, a, motive, minor].
+    let rule_rhs = Expr::lam(
+        primary_name("α"),
+        Expr::sort(Level::one()),
+        // scope [α]
+        Expr::lam(
+            primary_name("a"),
+            bv(0),
+            // scope [α, a]
+            Expr::lam(
+                primary_name("motive"),
+                motive_type(),
+                // scope [α, a, motive]
+                Expr::lam(
+                    primary_name("minor"),
+                    minor_type(),
+                    bv(0),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            eqs.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&family_type),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    2,
+                    1,
+                    vec![eqs.clone()],
+                    vec![refl.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            refl.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&refl_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(eqs.clone(), 0, 2, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![eqs],
+                    2,
+                    1,
+                    1,
+                    1,
+                    vec![RecursorRule::new(refl, 0, decoded(&rule_rhs))],
+                    true,
+                ),
+            ),
+        ),
+    ]
+}
+
+fn root_constant_name(term: &WireExpr) -> Option<&WireName> {
+    match term.node(term.root()) {
+        Some(ExprNode::Constant { name, .. }) => Some(name),
+        _ => None,
+    }
+}
+
+#[test]
+fn recursor_iota_fires_on_a_constructor_major() {
+    let context = definition_context(two_family_entries());
+    let motive = constant("MotiveStub");
+    let minor_tt = constant("MinorTt");
+    let minor_ff = constant("MinorFf");
+    let tt = Expr::const_(Name::from_components(["Two", "tt"]), Vec::new());
+    let application = Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(
+                        Name::from_components(["Two", "rec"]),
+                        vec![Level::param(primary_name("v"))],
+                    ),
+                    motive,
+                ),
+                minor_tt.clone(),
+            ),
+            minor_ff,
+        ),
+        tt,
+    );
+    let outcome = whnf(&decoded(&application), &context, WhnfBudget::unlimited());
+    let WhnfOutcome::Complete(result) = outcome else {
+        panic!("iota on a constructor major must complete: {outcome:?}");
+    };
+    let expected = decoded(&minor_tt);
+    assert_eq!(
+        root_constant_name(&result.term),
+        root_constant_name(&expected),
+        "Two.rec … tt must reduce to the tt minor"
+    );
+    assert!(
+        result.reductions > 0,
+        "the iota fire is a counted reduction"
+    );
+}
+
+#[test]
+fn recursor_iota_stays_stuck_on_a_variable_major() {
+    let context = definition_context(two_family_entries());
+    let application = Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(
+                        Name::from_components(["Two", "rec"]),
+                        vec![Level::param(primary_name("v"))],
+                    ),
+                    constant("MotiveStub"),
+                ),
+                constant("MinorTt"),
+            ),
+            constant("MinorFf"),
+        ),
+        Expr::fvar(FVarId(primary_name("stuck"))),
+    );
+    let outcome = whnf(&decoded(&application), &context, WhnfBudget::unlimited());
+    let WhnfOutcome::Complete(result) = outcome else {
+        panic!("a stuck major must still complete with the term unchanged: {outcome:?}");
+    };
+    assert_eq!(result.reductions, 0, "no rule fires on a variable major");
+    assert!(
+        matches!(
+            result.term.node(result.term.root()),
+            Some(ExprNode::Apply { .. })
+        ),
+        "the stuck application is returned unreduced"
+    );
+}
+
+#[test]
+fn k_corner_reduces_a_stuck_same_endpoints_major() {
+    let context = definition_context(eqs_family_entries());
+    let alpha = constant("EqsAlpha");
+    let point = constant("EqsPoint");
+    let motive = constant("EqsMotive");
+    let minor = constant("EqsMinor");
+    // The major's endpoints COINCIDE (`point` for both `a` and `b`), so the
+    // stuck variable proof converts to the nullary constructor and iota fires.
+    let application = Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(
+                        Expr::app(
+                            Expr::const_(
+                                Name::from_components(["EqS", "rec"]),
+                                vec![Level::param(primary_name("v"))],
+                            ),
+                            alpha.clone(),
+                        ),
+                        point.clone(),
+                    ),
+                    motive,
+                ),
+                minor.clone(),
+            ),
+            point,
+        ),
+        Expr::fvar(FVarId(primary_name("h"))),
+    );
+    let outcome = whnf(&decoded(&application), &context, WhnfBudget::unlimited());
+    let WhnfOutcome::Complete(result) = outcome else {
+        panic!("the K corner must complete: {outcome:?}");
+    };
+    let expected = decoded(&minor);
+    assert_eq!(
+        root_constant_name(&result.term),
+        root_constant_name(&expected),
+        "EqS.rec with a stuck same-endpoints major must reduce to the minor"
+    );
+}
+
+#[test]
+fn k_corner_stays_stuck_when_endpoints_differ() {
+    let context = definition_context(eqs_family_entries());
+    let alpha = constant("EqsAlpha");
+    let point_a = constant("EqsPointA");
+    let point_b = constant("EqsPointB");
+    // a ≠ b: the gate must NOT fire (the pin's `is_def_eq` fails there too),
+    // so the whole application stays stuck.
+    let application = Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(
+                        Expr::app(
+                            Expr::const_(
+                                Name::from_components(["EqS", "rec"]),
+                                vec![Level::param(primary_name("v"))],
+                            ),
+                            alpha,
+                        ),
+                        point_a,
+                    ),
+                    constant("EqsMotive"),
+                ),
+                constant("EqsMinor"),
+            ),
+            point_b,
+        ),
+        Expr::fvar(FVarId(primary_name("h"))),
+    );
+    let outcome = whnf(&decoded(&application), &context, WhnfBudget::unlimited());
+    let WhnfOutcome::Complete(result) = outcome else {
+        panic!("a K-corner miss must still complete stuck: {outcome:?}");
+    };
+    assert!(
+        matches!(
+            result.term.node(result.term.root()),
+            Some(ExprNode::Apply { .. })
+        ),
+        "the application is returned unreduced when the endpoints differ"
+    );
 }
