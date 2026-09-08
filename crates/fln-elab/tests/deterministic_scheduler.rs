@@ -411,7 +411,8 @@ fn perturbation_demotes_changes_in_every_product_plane() {
 
     // Each producer hides one read of the environment. Keep counts, names and
     // types unchanged: those alone used to certify a changed definition body.
-    let mutations: [(&str, fn(&mut ElabUnitProduct)); 9] = [
+    type Mutation = (&'static str, fn(&mut ElabUnitProduct));
+    let mutations: [Mutation; 9] = [
         ("definition body", |p| {
             let ConstantInfo::Defn(d) = &mut p.admitted_decls[0] else {
                 unreachable!()

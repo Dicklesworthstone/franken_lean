@@ -209,7 +209,7 @@ mod tests {
     use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
 
     #[test]
-    fn nonempty_opaque_extension_blocks_are_typed_refusals() {
+    fn counts_without_opaque_payloads_are_typed_refusals() {
         let error = require_lossless_extension_payloads(
             &[ExtensionBlock {
                 name: "Lean.Parser.Extension".to_owned(),
