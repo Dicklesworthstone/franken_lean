@@ -125,7 +125,7 @@ fn tactic(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
     let keyword = match &tokens[start].kind {
-        TokenKind::Ident(name) => ["intro", "exact", "assumption", "apply"]
+        TokenKind::Ident(name) => ["intro", "exact", "assumption", "apply", "rfl"]
             .into_iter()
             .find(|word| name == &Name::from_components([*word]))
             .ok_or_else(|| refusal(view, tokens, start))?,
@@ -156,7 +156,7 @@ fn tactic(
             }
             args.push(null_node(names));
         }
-        "assumption" if range.end == start + 1 => {}
+        "assumption" | "rfl" if range.end == start + 1 => {}
         "exact" | "apply" if range.end > start + 1 => args.push(bounded_term(
             leaves,
             view,

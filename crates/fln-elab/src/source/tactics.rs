@@ -251,6 +251,23 @@ impl Context {
                 }
                 goal.lctx = self.txn.lctx.clone();
                 proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "rfl"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "rfl", "reflexivity tactic")?;
+                let target = self.whnf(&goal.target)?;
+                let (level, alpha, left, right) =
+                    equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
+                self.constrain(&left, &right)?;
+                let value = Expr::app(
+                    Expr::app(
+                        Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
+                        alpha,
+                    ),
+                    left,
+                );
+                self.close_proof_goal(goal, value)?;
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -328,4 +345,28 @@ impl Context {
             .extend(arguments.into_iter().rev().map(Work::Goal));
         Ok(())
     }
+}
+
+/// Decode only the ordinary homogeneous equality head; no lookalike names or
+/// Boolean comparisons count as equality propositions.
+fn equality_target(target: &Expr) -> Option<(Level, Expr, Expr, Expr)> {
+    let ExprNode::App { f, a: right } = target.node() else {
+        return None;
+    };
+    let ExprNode::App { f, a: left } = f.node() else {
+        return None;
+    };
+    let ExprNode::App { f, a: alpha } = f.node() else {
+        return None;
+    };
+    let ExprNode::Const { name, levels } = f.node() else {
+        return None;
+    };
+    if name != &Name::from_components(["Eq"]) {
+        return None;
+    }
+    let [level] = levels.as_slice() else {
+        return None;
+    };
+    Some((level.clone(), alpha.clone(), left.clone(), right.clone()))
 }

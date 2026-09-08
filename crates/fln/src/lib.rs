@@ -2834,6 +2834,29 @@ impl Engine {
         }))
     }
 
+    /// Parse, elaborate and dual-check one source definition or theorem without
+    /// attempting to compile or execute a proof. Publication remains the same
+    /// immutable K1-plus-independent-checker transition as `admit_declaration`.
+    pub fn admit_source_declaration(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationAdmission>, EngineExecutionError> {
+        let parsed = fln_parse::parse_definition(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        let declaration = fln_elab::elaborate_definition_in_with_budget(
+            parsed.syntax(),
+            self.environment(),
+            limits.kernel,
+        )
+        .map_err(DefinitionFrontendError::Elaborate)
+        .map_err(EngineExecutionError::Frontend)?;
+        self.admit_declaration(declaration, options, limits)
+            .map_err(EngineExecutionError::from)
+    }
+
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
     /// and execute one bounded Nat-valued definition command. The declaration
     /// may have explicit `Nat` parameters; its body may be a natural literal, a
@@ -9623,7 +9646,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 28);
+        assert_eq!(engine.environment().len(), 32);
         assert!(
             engine
                 .environment()
@@ -9734,7 +9757,10 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 30);
+        assert_eq!(
+            completed.engine.environment().len(),
+            engine.environment().len() + 2
+        );
     }
 
     #[test]

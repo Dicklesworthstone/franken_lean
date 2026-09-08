@@ -255,6 +255,7 @@ struct BoundedTermFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedInfix {
     Arrow,
+    Equality,
     ScalarBeq,
     NatLor,
     NatXor,
@@ -276,6 +277,7 @@ impl BoundedInfix {
     const fn symbol(self) -> &'static str {
         match self {
             Self::Arrow => "->",
+            Self::Equality => "=",
             Self::ScalarBeq => "==",
             Self::NatLor => "|||",
             Self::NatXor => "^^^",
@@ -296,7 +298,7 @@ impl BoundedInfix {
     const fn precedence(self) -> u8 {
         match self {
             Self::Arrow => 25,
-            Self::ScalarBeq => 50,
+            Self::ScalarBeq | Self::Equality => 50,
             Self::NatLor => 55,
             Self::NatXor => 58,
             Self::NatLand => 60,
@@ -313,7 +315,7 @@ impl BoundedInfix {
     }
 
     const fn is_non_associative(self) -> bool {
-        matches!(self, Self::ScalarBeq)
+        matches!(self, Self::ScalarBeq | Self::Equality)
     }
 
     fn syntax_kind(self) -> Name {
@@ -472,17 +474,17 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "def", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+", "-", "++", "*",
-        "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->", "→",
-        "fun", "λ", "=>", "↦", "theorem", "by",
+        "def", "let", "(", ")", ":", ":=", ";", "=", "==", "|||", "^^^", "&&&", "+", "-", "++",
+        "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->",
+        "→", "fun", "λ", "=>", "↦", "theorem", "by",
     ])
 }
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^",
-        "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_",
-        "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦", "theorem", "by",
+        "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "=", "==", "|||",
+        "^^^", "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop",
+        "_", "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦", "theorem", "by",
     ])
 }
 
@@ -493,6 +495,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
     match symbol.as_str() {
         "->" | "→" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Arrow),
         "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),
+        "=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equality),
         "|||" => Some(BoundedInfix::NatLor),
         "^^^" => Some(BoundedInfix::NatXor),
         "&&&" => Some(BoundedInfix::NatLand),

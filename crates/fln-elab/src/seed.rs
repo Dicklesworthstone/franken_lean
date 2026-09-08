@@ -21,6 +21,9 @@
 //! internal fault while constructing this environment is never rendered as a
 //! kernel rejection (FL-INV-07).
 
+pub mod equality;
+pub use equality::{eq_seed_declaration, rfl_seed_declaration};
+
 use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
@@ -563,7 +566,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 25] {
+pub fn source_seed_declarations() -> [Declaration; 27] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
@@ -590,6 +593,8 @@ pub fn source_seed_declarations() -> [Declaration; 25] {
         nat_dec_le_seed_declaration(),
         nat_dec_lt_seed_declaration(),
         string_dec_eq_seed_declaration(),
+        eq_seed_declaration(),
+        rfl_seed_declaration(),
     ]
 }
 
@@ -687,6 +692,8 @@ mod tests {
         assert_eq!(declarations[22], nat_dec_le_seed_declaration());
         assert_eq!(declarations[23], nat_dec_lt_seed_declaration());
         assert_eq!(declarations[24], string_dec_eq_seed_declaration());
+        assert_eq!(declarations[25], eq_seed_declaration());
+        assert_eq!(declarations[26], rfl_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"

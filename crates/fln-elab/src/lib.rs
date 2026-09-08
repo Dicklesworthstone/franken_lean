@@ -879,6 +879,12 @@ impl BoundedInfixIntrinsic {
 }
 
 fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInfixIntrinsic> {
+    if allow_string && kind == &Name::str(Name::anonymous(), "term_=_") {
+        return Some(BoundedInfixIntrinsic::Fixed {
+            spelling: "=",
+            intrinsic: Name::from_components(["Eq"]),
+        });
+    }
     if allow_string && kind == &Name::str(Name::anonymous(), "term_==_") {
         return Some(BoundedInfixIntrinsic::ScalarBeq);
     }
