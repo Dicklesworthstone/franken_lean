@@ -3,6 +3,8 @@
 //! Models defeq constraints, typing obligations, typeclass synthesis goals,
 //! and delayed assignments with deterministic, targeted wake-up on assignment.
 
+pub mod unify;
+
 use crate::mvar::{AssignmentJustification, MetavarError, MetavarStore};
 use fln_core::expr::{Expr, FVarId, MVarId};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -88,21 +90,13 @@ pub struct ConstraintQueue {
 }
 
 impl ConstraintQueue {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
-    pub fn is_empty(&self) -> bool {
-        self.constraints.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.constraints.is_empty() }
 
-    pub fn len(&self) -> usize {
-        self.constraints.len()
-    }
+    pub fn len(&self) -> usize { self.constraints.len() }
 
-    pub fn constraints(&self) -> &HashMap<ConstraintId, Constraint> {
-        &self.constraints
-    }
+    pub fn constraints(&self) -> &HashMap<ConstraintId, Constraint> { &self.constraints }
 
     /// Enqueue a constraint with an explicit observed-read signature. Use
     /// `enqueue_inferred` when the obligation's terms are the entire signature.
@@ -115,20 +109,9 @@ impl ConstraintQueue {
         let id = ConstraintId(self.next_id);
         self.next_id += 1;
         for mvar in &reads_mvars {
-            self.mvar_to_constraints
-                .entry(mvar.clone())
-                .or_default()
-                .insert(id);
+            self.mvar_to_constraints.entry(mvar.clone()).or_default().insert(id);
         }
-        self.constraints.insert(
-            id,
-            Constraint {
-                id,
-                kind,
-                reads_mvars,
-                depth,
-            },
-        );
+        self.constraints.insert(id, Constraint { id, kind, reads_mvars, depth });
         id
     }
 
@@ -147,14 +130,9 @@ impl ConstraintQueue {
     /// Update a suspended obligation's observed reads without changing its
     /// identity or scheduling priority. Missing IDs leave the queue unchanged.
     pub fn update_reads(&mut self, id: ConstraintId, reads: HashSet<MVarId>) -> bool {
-        let Some(mut constraint) = self.remove(&id) else {
-            return false;
-        };
+        let Some(mut constraint) = self.remove(&id) else { return false; };
         for mvar in &reads {
-            self.mvar_to_constraints
-                .entry(mvar.clone())
-                .or_default()
-                .insert(id);
+            self.mvar_to_constraints.entry(mvar.clone()).or_default().insert(id);
         }
         constraint.reads_mvars = reads;
         self.constraints.insert(id, constraint);
@@ -199,12 +177,9 @@ impl ConstraintQueue {
     /// Extract obligations with no unresolved inputs, in stable identity order.
     /// This does not decide them: the elaborator must still process each one.
     pub fn take_ready(&mut self) -> Vec<Constraint> {
-        let ids: BTreeSet<_> = self
-            .constraints
-            .values()
+        let ids: BTreeSet<_> = self.constraints.values()
             .filter(|constraint| constraint.reads_mvars.is_empty())
-            .map(|constraint| constraint.id)
-            .collect();
+            .map(|constraint| constraint.id).collect();
         ids.into_iter().filter_map(|id| self.remove(&id)).collect()
     }
 
@@ -216,9 +191,7 @@ impl ConstraintQueue {
                 set.remove(id);
                 set.is_empty()
             });
-            if empty {
-                self.mvar_to_constraints.remove(mvar);
-            }
+            if empty { self.mvar_to_constraints.remove(mvar); }
         }
         Some(constraint)
     }
@@ -233,27 +206,15 @@ mod tests {
     use fln_core::name::Name;
     use fln_core::options::KVMap;
 
-    fn mvar(name: &str) -> MVarId {
-        MVarId(Name::from_components([name]))
-    }
+    fn mvar(name: &str) -> MVarId { MVarId(Name::from_components([name])) }
 
     fn declare(store: &mut MetavarStore, id: &MVarId) {
-        store.declare(
-            id.clone(),
-            id.0.clone(),
-            Expr::sort(Level::one()),
-            LocalContext::new(),
-            MetavarKind::Natural,
-            0,
-            None,
-        );
+        store.declare(id.clone(), id.0.clone(), Expr::sort(Level::one()),
+            LocalContext::new(), MetavarKind::Natural, 0, None);
     }
 
     fn ground() -> ConstraintKind {
-        ConstraintKind::DefEq {
-            lhs: Expr::sort(Level::zero()),
-            rhs: Expr::sort(Level::zero()),
-        }
+        ConstraintKind::DefEq { lhs: Expr::sort(Level::zero()), rhs: Expr::sort(Level::zero()) }
     }
 
     #[test]
@@ -284,19 +245,11 @@ mod tests {
         let mut store = MetavarStore::new();
         declare(&mut store, &a);
         declare(&mut store, &b);
-        store
-            .assign(a.clone(), Expr::mvar(b.clone()), AssignmentJustification::DirectDefEq)
-            .unwrap();
+        store.assign(a.clone(), Expr::mvar(b.clone()), AssignmentJustification::DirectDefEq).unwrap();
         let mut queue = ConstraintQueue::new();
         let id = queue.enqueue(ground(), HashSet::from([a]), 0);
-        let ready = queue
-            .assign_mvar(
-                &mut store,
-                b,
-                Expr::sort(Level::zero()),
-                AssignmentJustification::DirectDefEq,
-            )
-            .unwrap();
+        let ready = queue.assign_mvar(&mut store, b, Expr::sort(Level::zero()),
+            AssignmentJustification::DirectDefEq).unwrap();
         assert_eq!(ready.iter().map(|row| row.id).collect::<Vec<_>>(), vec![id]);
         assert!(queue.is_empty());
     }
@@ -310,14 +263,8 @@ mod tests {
         queue.enqueue(ground(), HashSet::from([a.clone()]), 0);
         let before_store = store.clone();
         let before_queue = queue.clone();
-        assert!(queue
-            .assign_mvar(
-                &mut store,
-                a.clone(),
-                Expr::mdata(KVMap::new(), Expr::mvar(a)),
-                AssignmentJustification::DirectDefEq,
-            )
-            .is_err());
+        assert!(queue.assign_mvar(&mut store, a.clone(), Expr::mdata(KVMap::new(), Expr::mvar(a)),
+            AssignmentJustification::DirectDefEq).is_err());
         assert_eq!(store, before_store);
         assert_eq!(queue, before_queue);
     }
@@ -329,18 +276,11 @@ mod tests {
         let mut store = MetavarStore::new();
         declare(&mut store, &a);
         declare(&mut store, &b);
-        store
-            .assign(a.clone(), Expr::mvar(b.clone()), AssignmentJustification::DirectDefEq)
-            .unwrap();
+        store.assign(a.clone(), Expr::mvar(b.clone()), AssignmentJustification::DirectDefEq).unwrap();
         let mut queue = ConstraintQueue::new();
-        let id = queue.enqueue_inferred(
-            ConstraintKind::HasType {
-                expr: Expr::mdata(KVMap::new(), Expr::mvar(a)),
-                expected_type: Expr::sort(Level::one()),
-            },
-            &store,
-            3,
-        );
+        let id = queue.enqueue_inferred(ConstraintKind::HasType {
+            expr: Expr::mdata(KVMap::new(), Expr::mvar(a)), expected_type: Expr::sort(Level::one()),
+        }, &store, 3);
         assert_eq!(queue.constraints()[&id].reads_mvars, HashSet::from([b.clone()]));
         assert!(queue.take_ready().is_empty());
         assert_eq!(queue.wake_up_for_mvar(&b)[0].depth, 3);
@@ -352,14 +292,9 @@ mod tests {
         let mut store = MetavarStore::new();
         declare(&mut store, &target);
         let mut queue = ConstraintQueue::new();
-        let id = queue.enqueue_inferred(
-            ConstraintKind::SynthInstance {
-                class: Expr::const_(Name::from_components(["TestClass"]), Vec::new()),
-                mvar: target.clone(),
-            },
-            &store,
-            0,
-        );
+        let id = queue.enqueue_inferred(ConstraintKind::SynthInstance {
+            class: Expr::const_(Name::from_components(["TestClass"]), Vec::new()), mvar: target.clone(),
+        }, &store, 0);
         let ready = queue.take_ready();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, id);
