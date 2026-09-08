@@ -9,18 +9,18 @@ use std::process::ExitCode;
 
 pub use fln_server::{json_string, transport};
 
+#[path = "../correlation.rs"]
+mod correlation;
 #[path = "../json.rs"]
 mod json;
-#[allow(dead_code)]
-#[path = "../session_transcript.rs"]
-mod session_transcript;
 #[allow(dead_code, unused_imports)]
 #[path = "../server_transcript.rs"]
 mod server_transcript;
+#[allow(dead_code)]
+#[path = "../session_transcript.rs"]
+mod session_transcript;
 #[path = "../transcript.rs"]
 pub mod transcript;
-#[path = "../correlation.rs"]
-mod correlation;
 
 use json::{
     DecodedField, EnvelopeError, RawField, RequestId, RequestIdField, direct_request_id,
@@ -248,9 +248,7 @@ fn parsed_event(body: &[u8], event: u64) -> Result<(Direction, &str), String> {
     let message = match object_member(RawField::Value(text), "message") {
         RawField::Value(message) if message.trim_start().starts_with('{') => message,
         RawField::Value(_) => {
-            return Err(format!(
-                "event {event} message must be a JSON-RPC object"
-            ));
+            return Err(format!("event {event} message must be a JSON-RPC object"));
         }
         RawField::Missing => {
             return Err(format!("event {event} outer wrapper is missing message"));
@@ -366,9 +364,10 @@ impl TimelineValidator {
 
         match frame.role {
             TranscriptRole::Request => {
-                let id = frame.id_json.clone().ok_or_else(|| {
-                    format!("event {event} client request lost its canonical ID")
-                })?;
+                let id = frame
+                    .id_json
+                    .clone()
+                    .ok_or_else(|| format!("event {event} client request lost its canonical ID"))?;
                 if let Some(first) = self.requests.get(&id) {
                     return Err(format!(
                         "event {event} repeats canonical client request ID {id}; first request event was {}",
@@ -445,9 +444,7 @@ impl TimelineValidator {
                 }
                 "exit" => {
                     let response = self.shutdown_response_event.ok_or_else(|| {
-                        format!(
-                            "event {event} sends exit before the server shutdown response"
-                        )
+                        format!("event {event} sends exit before the server shutdown response")
                     })?;
                     if response >= event {
                         return Err(format!(
@@ -488,9 +485,7 @@ impl TimelineValidator {
             }
         };
         let request = self.requests.get_mut(&id).ok_or_else(|| {
-            format!(
-                "event {event} cancellation target {id} has no earlier client request"
-            )
+            format!("event {event} cancellation target {id} has no earlier client request")
         })?;
         if let Some(response) = request.response_event {
             return Err(format!(
@@ -849,10 +844,7 @@ mod tests {
                 "client",
                 r#"{"jsonrpc":"2.0","id":"wait","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///A.lean","version":1}}"#,
             ),
-            (
-                "server",
-                r#"{"jsonrpc":"2.0","id":"wait","result":{}}"#,
-            ),
+            ("server", r#"{"jsonrpc":"2.0","id":"wait","result":{}}"#),
             (
                 "client",
                 r#"{"jsonrpc":"2.0","id":"hover","method":"textDocument/hover","params":{}}"#,
@@ -861,10 +853,7 @@ mod tests {
                 "client",
                 r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"hover"}}"#,
             ),
-            (
-                "server",
-                r#"{"jsonrpc":"2.0","id":"hover","result":null}"#,
-            ),
+            ("server", r#"{"jsonrpc":"2.0","id":"hover","result":null}"#),
             (
                 "client",
                 r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
@@ -900,7 +889,9 @@ mod tests {
         assert!(receipt.contains("\"causalitySchema\":\"fln.lsp-cross-stream-causality/1\""));
         assert!(receipt.contains("\"cancellationsBeforeResponse\":1"));
         assert!(receipt.contains("\"responsesBeforeRequests\":0"));
-        assert!(receipt.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/5\""));
+        assert!(
+            receipt.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/5\"")
+        );
     }
 
     #[test]
@@ -933,10 +924,7 @@ mod tests {
     fn rejects_cancellation_after_response() {
         let events = valid_events();
         let mut reordered = events[..11].to_vec();
-        reordered.push((
-            "server",
-            r#"{"jsonrpc":"2.0","id":"hover","result":null}"#,
-        ));
+        reordered.push(("server", r#"{"jsonrpc":"2.0","id":"hover","result":null}"#));
         reordered.push((
             "client",
             r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"hover"}}"#,
@@ -1011,9 +999,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_args(
-                ["fln-lsp-timeline", "--", "--session.timeline"].map(OsString::from)
-            ),
+            parse_args(["fln-lsp-timeline", "--", "--session.timeline"].map(OsString::from)),
             Ok(Command::Validate(Config {
                 timeline: PathBuf::from("--session.timeline"),
             }))

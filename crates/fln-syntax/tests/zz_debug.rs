@@ -54,11 +54,8 @@ pub fn explain_one_edit(base: &str, at: usize, insert: &str) -> String {
     );
     let from = damage.reused_prefix.saturating_sub(2);
     let to = (damage.reused_prefix + damage.relexed + 3).min(incremental.events.len());
-    for index in from..to {
-        report.push_str(&format!(
-            "  [{index}] incr={:?}\n",
-            incremental.events[index]
-        ));
+    for (index, event) in incremental.events.iter().enumerate().take(to).skip(from) {
+        report.push_str(&format!("  [{index}] incr={event:?}\n"));
         if let Some(event) = full.events.get(index) {
             report.push_str(&format!("        full={event:?}\n"));
         }

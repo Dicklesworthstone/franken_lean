@@ -136,19 +136,14 @@ fn valid_interleaving_emits_cross_stream_causality_receipt() {
     assert!(stdout.contains("\"cancellationsBeforeResponse\":1"));
     assert!(stdout.contains("\"cancellationsAfterResponse\":0"));
     assert!(stdout.contains("\"cancelledTargetRequestCancelledResponses\":1"));
-    assert!(stdout.contains(
-        "\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/5\""
-    ));
+    assert!(stdout.contains("\"correlation\":{\"schema\":\"fln.lsp-client-server-correlation/5\""));
     fs::remove_file(path).unwrap();
 }
 
 #[test]
 fn cancellation_after_response_fails_without_a_receipt() {
     let mut events = valid_events();
-    events[5] = (
-        "server",
-        r#"{"jsonrpc":"2.0","id":"wait","result":{}}"#,
-    );
+    events[5] = ("server", r#"{"jsonrpc":"2.0","id":"wait","result":{}}"#);
     events[6] = (
         "client",
         r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"wait"}}"#,

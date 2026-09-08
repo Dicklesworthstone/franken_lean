@@ -100,7 +100,8 @@ pub(super) fn serve_lsp() -> fln_cli::MultiplexerOutput {
 
 fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
     let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
-    let engine = match fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel_budget)) {
+    let engine = match fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel_budget))
+    {
         Ok(fln::Outcome::Complete(engine)) => engine,
         Ok(fln::Outcome::Inconclusive(inconclusive)) => {
             return ProjectionSnapshot::Inconclusive(StructuredInconclusive {
@@ -170,11 +171,7 @@ fn lsp_error_snapshot(uri: &str, message: &str) -> ProjectionSnapshot {
     lsp_positioned_error_snapshot(uri, message, Position { line: 1, column: 0 })
 }
 
-fn lsp_positioned_error_snapshot(
-    uri: &str,
-    message: &str,
-    pos: Position,
-) -> ProjectionSnapshot {
+fn lsp_positioned_error_snapshot(uri: &str, message: &str, pos: Position) -> ProjectionSnapshot {
     ProjectionSnapshot::Complete {
         diagnostics: vec![StructuredDiagnostic {
             file_name: BoundedText::new(uri.to_owned()),
@@ -230,7 +227,8 @@ mod tests {
     #[test]
     fn engine_error_snapshot_keeps_the_exact_document_identity() {
         let uri = "vscode-notebook-cell:/workspace/notebook.ipynb#cell-1";
-        let ProjectionSnapshot::Complete { diagnostics } = lsp_error_snapshot(uri, "failure") else {
+        let ProjectionSnapshot::Complete { diagnostics } = lsp_error_snapshot(uri, "failure")
+        else {
             panic!("engine errors are authoritative source diagnostics");
         };
         assert_eq!(diagnostics.len(), 1);
