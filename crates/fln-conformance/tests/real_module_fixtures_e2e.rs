@@ -16,7 +16,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,19 +24,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use fln_conformance::module_adapter::{
-    ModuleBatchApplyPlan, ModuleBatchCommitError, ModuleBatchPlanError, ModuleBatchUsageSummary,
-    OleanModuleAdapter,
+    DecodedOleanModule, ModuleBatchApplyPlan, ModuleBatchCommitError, ModuleBatchPlanError,
+    ModuleBatchUsageSummary, OleanModuleAdapter,
 };
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{CacheAdmission, Outcome};
 use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
+use fln_env::environment::Environment;
 use fln_env::module_apply::{
     ModuleApplyLimits, ModuleApplyState, ModuleApplyTransaction, preflight_module_apply,
 };
 use fln_env::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport,
-    ModuleEpoch, ModuleId, ModuleRecord,
+    ModuleEpoch, ModuleGraph, ModuleGraphLimits, ModuleId, ModuleRecord,
 };
 use fln_env::provenance::{
     CaptureStatus, ModuleContributionRecord, ModuleProvenanceLimits, ModuleProvenanceManifest,
@@ -150,6 +151,84 @@ fn real_pinned_fixtures_decode_and_match_c3_oracle_imports() {
     }
 
     assert_eq!(total_rows, 50, "all 50 c3 oracle rows verified exactly");
+}
+
+fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>) {
+    let modules: Vec<_> = ["Init.BinderNameHint", "Init.SizeOfLemmas"]
+        .into_iter()
+        .map(|module| {
+            OleanModuleAdapter::decode_file(
+                ModuleId::new(parse_dot_name(module)),
+                workspace_root().join(format!("tribunal/fixtures/c3/{module}.olean")),
+                pinned_epoch(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut environment = Environment::new();
+    for module in &modules {
+        for contribution in &module.extension_contributions {
+            let descriptor = contribution.descriptor();
+            if environment.extension(&descriptor.name).is_none() {
+                environment = environment.register_extension(descriptor.clone()).unwrap();
+            }
+        }
+    }
+    let base = ModuleApplyState::from_parts(
+        environment,
+        ModuleGraph::new(pinned_epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .unwrap(),
+        Arc::new(
+            ModuleProvenanceManifest::new(
+                pinned_epoch(),
+                vec![],
+                ModuleProvenanceLimits::default(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    (base, modules)
+}
+
+#[test]
+fn real_modules_append_to_shared_opaque_extension_histories() {
+    let (base, modules) = real_shared_extension_modules();
+    let shared = modules[0].extension_contributions.iter().find(|first| {
+        !first.entries().is_empty() && modules[1].extension_contributions.iter().any(|second| {
+            first.descriptor() == second.descriptor() && !second.entries().is_empty()
+        })
+    }).expect("the real fixture pair must contribute to a common extension").descriptor().name.clone();
+    let mut records = Vec::new();
+    let mut preflights = Vec::new();
+    for module in &modules {
+        let missing = module.imports.iter().map(|row| row.module.clone())
+            .collect::<BTreeSet<_>>().into_iter().collect();
+        let completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Partial, PayloadTransparency::Opaque, missing,
+        );
+        records.push(module.to_contribution_record(completeness.clone()));
+        let manifest = Arc::new(ModuleProvenanceManifest::new(
+            pinned_epoch(), records.clone(), ModuleProvenanceLimits::default(),
+        ).expect("real modules must compose their extension ranges"));
+        preflights.push(preflight_module_apply(
+            OleanModuleAdapter::build_transaction(module, manifest, completeness).unwrap(),
+            &ModuleApplyLimits::default(),
+        ).unwrap());
+    }
+    let plan = ModuleBatchApplyPlan::stage(
+        &base, &preflights, modules.iter().map(|module| module.module_id.clone()).collect(),
+    ).into_complete().unwrap().expect("real module batch stages");
+    let committed = plan.commit(&base, None).into_complete().unwrap().unwrap();
+    assert_eq!(committed.applied_count, 2);
+    assert_eq!(base.graph().len(), 0);
+    let actual: Vec<_> = committed.state.environment().extension(&shared).unwrap()
+        .entries().map(|entry| entry.payload.to_vec()).collect();
+    let expected: Vec<_> = modules.iter().flat_map(|module| &module.extension_entries)
+        .filter(|payload| payload.descriptor().name == shared)
+        .map(|payload| payload.payload().to_vec()).collect();
+    assert_eq!(actual, expected);
 }
 
 #[test]
