@@ -2917,9 +2917,14 @@ impl Engine {
         command_index: usize,
     ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
         let name = fresh_generated_command_name(self.environment(), command_index)?;
-        let declaration = fln_elab::elaborate_check_in(parsed.syntax(), name, self.environment())
-            .map_err(DefinitionFrontendError::Elaborate)
-            .map_err(EngineExecutionError::Frontend)?;
+        let declaration = fln_elab::elaborate_check_in_with_budget(
+            parsed.syntax(),
+            name,
+            self.environment(),
+            limits.kernel,
+        )
+        .map_err(DefinitionFrontendError::Elaborate)
+        .map_err(EngineExecutionError::Frontend)?;
         let checked_type = match &declaration {
             Declaration::Defn(definition) => definition.base.type_.clone(),
             _ => {
@@ -3094,24 +3099,33 @@ impl Engine {
                             error: Box::new(error),
                             at: Some(original_offset),
                         })?;
-                    fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
-                        .map_err(DefinitionFrontendError::Elaborate)
-                        .map_err(EngineExecutionError::Frontend)
-                        .map_err(|error| EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        })?
+                    fln_elab::elaborate_evaluation_in_with_budget(
+                        parsed.syntax(),
+                        name,
+                        engine.environment(),
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
                 }
                 fln_parse::SourceCommandKind::Definition => {
-                    fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
-                        .map_err(DefinitionFrontendError::Elaborate)
-                        .map_err(EngineExecutionError::Frontend)
-                        .map_err(|error| EngineExecutionError::BatchCommand {
-                            index: command_index,
-                            error: Box::new(error),
-                            at: Some(original_offset),
-                        })?
+                    fln_elab::elaborate_definition_in_with_budget(
+                        parsed.syntax(),
+                        engine.environment(),
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
                 }
                 fln_parse::SourceCommandKind::Check => {
                     return Err(EngineExecutionError::UnexpectedPublication {
@@ -3539,9 +3553,13 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
-        let declaration = fln_elab::elaborate_definition_in(parsed.syntax(), self.environment())
-            .map_err(DefinitionFrontendError::Elaborate)
-            .map_err(EngineExecutionError::Frontend)?;
+        let declaration = fln_elab::elaborate_definition_in_with_budget(
+            parsed.syntax(),
+            self.environment(),
+            limits.kernel,
+        )
+        .map_err(DefinitionFrontendError::Elaborate)
+        .map_err(EngineExecutionError::Frontend)?;
         self.execute_definition(declaration, options, limits)
     }
 
@@ -4019,14 +4037,23 @@ impl Engine {
                     })?;
                     evaluation_indices.push(index);
                     let name = fresh_generated_command_name(engine.environment(), index)?;
-                    fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
-                        .map_err(DefinitionFrontendError::Elaborate)
-                        .map_err(EngineExecutionError::Frontend)?
+                    fln_elab::elaborate_evaluation_in_with_budget(
+                        parsed.syntax(),
+                        name,
+                        engine.environment(),
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
                 }
                 fln_parse::SourceCommandKind::Definition => {
-                    fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
-                        .map_err(DefinitionFrontendError::Elaborate)
-                        .map_err(EngineExecutionError::Frontend)?
+                    fln_elab::elaborate_definition_in_with_budget(
+                        parsed.syntax(),
+                        engine.environment(),
+                        limits.kernel,
+                    )
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
                 }
                 fln_parse::SourceCommandKind::Check => {
                     return Err(EngineExecutionError::StandaloneCheckRequired);
@@ -6139,8 +6166,9 @@ impl std::error::Error for EngineAdmissionError {
     }
 }
 
-/// A completed refusal before Golem execution. Non-answers live in `Outcome`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A refusal before Golem execution. Inference failures retain typed causes,
+/// including complete kernel nonanswers from speculative assignment checks.
+#[derive(Debug, Clone, PartialEq)]
 pub enum EngineExecutionError {
     EmptyBatch,
     SourceModuleLimit {

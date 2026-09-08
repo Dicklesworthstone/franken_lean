@@ -32,6 +32,8 @@ pub mod mvar;
 pub mod perturbation;
 pub mod scheduler;
 pub mod seed;
+pub mod source;
+mod source_diagnostic;
 pub mod txn;
 pub mod universe;
 
@@ -67,7 +69,7 @@ use fln_parse::{
 use fln_syntax::tree::Syntax;
 
 /// Why the first elaboration subset refused an otherwise parsed tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NatDefinitionElabError {
     UnexpectedSyntax { expected: &'static str },
     AnonymousDeclarationName,
@@ -78,6 +80,7 @@ pub enum NatDefinitionElabError {
     InvalidNaturalLiteral,
     InvalidStringLiteral,
     TooManyParameters,
+    Inference(source::SourceInferenceError),
 }
 
 impl std::fmt::Display for NatDefinitionElabError {
@@ -102,6 +105,7 @@ impl std::fmt::Display for NatDefinitionElabError {
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
             Self::InvalidStringLiteral => write!(formatter, "string literal is invalid"),
             Self::TooManyParameters => write!(formatter, "definition has too many parameters"),
+            Self::Inference(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -110,7 +114,7 @@ impl std::error::Error for NatDefinitionElabError {}
 
 /// A source-to-elaboration failure. Kernel rejections and non-answers are not
 /// collapsed into this type; they remain in [`NatDefinitionCheck::outcome`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NatDefinitionFrontendError {
     Parse(NatDefinitionParseError),
     Elaborate(NatDefinitionElabError),
@@ -480,7 +484,25 @@ pub fn elaborate_definition_in(
     syntax: &Syntax,
     environment: &Environment,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    elaborate_definition_with_types(syntax, true, Some(environment))
+    elaborate_definition_in_with_budget(syntax, environment, Budget::DEFAULT)
+}
+
+/// Elaborate with native expected-type propagation and implicit inference.
+/// Every speculative assignment uses the caller's calibrated kernel budget.
+/// The returned declaration is still an untrusted candidate, not admission.
+pub fn elaborate_definition_in_with_budget(
+    syntax: &Syntax,
+    environment: &Environment,
+    budget: Budget,
+) -> Result<Declaration, NatDefinitionElabError> {
+    match source::definition(syntax, environment, budget) {
+        Err(
+            error @ NatDefinitionElabError::Inference(
+                source::SourceInferenceError::UnknownConstant(_),
+            ),
+        ) => source_diagnostic::definition(syntax, environment, budget).ok_or(error),
+        result => result,
+    }
 }
 
 /// Elaborate one canonical bounded `Lean.Parser.Command.eval` tree.
@@ -497,39 +519,26 @@ pub fn elaborate_evaluation_in(
     generated_name: Name,
     environment: &Environment,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    if !generated_name.parent().is_anonymous()
-        || !matches!(generated_name.leaf_view(), LeafView::Num(_))
-    {
-        return Err(NatDefinitionElabError::InvalidGeneratedEvaluationName);
+    elaborate_evaluation_in_with_budget(syntax, generated_name, environment, Budget::DEFAULT)
+}
+
+/// The budgeted source-evaluation seam; it does not execute or publish the term.
+pub fn elaborate_evaluation_in_with_budget(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+    budget: Budget,
+) -> Result<Declaration, NatDefinitionElabError> {
+    match source::query(syntax, generated_name.clone(), environment, budget, true) {
+        Err(
+            error @ NatDefinitionElabError::Inference(
+                source::SourceInferenceError::UnknownConstant(_),
+            ),
+        ) => {
+            source_diagnostic::evaluation(syntax, generated_name, environment, budget).ok_or(error)
+        }
+        result => result,
     }
-    let evaluation = expect_node(
-        syntax,
-        &parser_kind(&["Command", "eval"]),
-        2,
-        "Lean.Parser.Command.eval",
-    )?;
-    let [keyword, term] = evaluation else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "Lean.Parser.Command.eval",
-        });
-    };
-    expect_atom(keyword, "#eval", "evaluation keyword")?;
-    let mut expression = elaborate_term(term, &[], &nat_const(), true, Some(environment))?;
-    let declaration_type = infer_expr_type(&expression, &[], Some(environment))
-        .filter(|type_| acceptable_inferred(type_, true))
-        .unwrap_or_else(nat_const);
-    expression = eta_expand_nondependent(expression, &declaration_type)?;
-    Ok(Declaration::Defn(DefinitionVal {
-        base: ConstantVal {
-            name: generated_name.clone(),
-            level_params: Vec::new(),
-            type_: declaration_type,
-        },
-        value: expression,
-        hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
-        all: vec![generated_name],
-    }))
 }
 
 /// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a
@@ -544,37 +553,22 @@ pub fn elaborate_check_in(
     generated_name: Name,
     environment: &Environment,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    if !generated_name.parent().is_anonymous()
-        || !matches!(generated_name.leaf_view(), LeafView::Num(_))
-    {
-        return Err(NatDefinitionElabError::InvalidGeneratedCheckName);
+    elaborate_check_in_with_budget(syntax, generated_name, environment, Budget::DEFAULT)
+}
+
+/// Infer a source query using the caller's calibrated budget, without execution.
+pub fn elaborate_check_in_with_budget(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+    budget: Budget,
+) -> Result<Declaration, NatDefinitionElabError> {
+    match source::query(syntax, generated_name, environment, budget, false) {
+        Err(NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(
+            _,
+        ))) => Err(NatDefinitionElabError::CannotInferCheckType),
+        result => result,
     }
-    let check = expect_node(
-        syntax,
-        &parser_kind(&["Command", "check"]),
-        2,
-        "Lean.Parser.Command.check",
-    )?;
-    let [keyword, term] = check else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "Lean.Parser.Command.check",
-        });
-    };
-    expect_atom(keyword, "#check", "check keyword")?;
-    let expression = elaborate_term(term, &[], &nat_const(), true, Some(environment))?;
-    let declaration_type = infer_expr_type(&expression, &[], Some(environment))
-        .ok_or(NatDefinitionElabError::CannotInferCheckType)?;
-    Ok(Declaration::Defn(DefinitionVal {
-        base: ConstantVal {
-            name: generated_name.clone(),
-            level_params: Vec::new(),
-            type_: declaration_type,
-        },
-        value: expression,
-        hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
-        all: vec![generated_name],
-    }))
 }
 
 fn elaborate_definition_with_types(
@@ -1363,7 +1357,7 @@ pub fn check_definition_source(
     budget: Budget,
 ) -> Result<DefinitionCheck, DefinitionFrontendError> {
     let parsed = parse_definition(source)?;
-    let declaration = elaborate_definition_in(parsed.syntax(), environment)?;
+    let declaration = elaborate_definition_in_with_budget(parsed.syntax(), environment, budget)?;
     let outcome = check(environment, &declaration, budget);
     Ok(DefinitionCheck {
         parsed,

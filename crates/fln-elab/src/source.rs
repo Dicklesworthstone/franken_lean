@@ -1,0 +1,837 @@
+//! Bidirectional elaboration of the native source subset.
+//!
+//! Syntax drives one private elaboration transaction. Applications insert typed
+//! implicit metavariables; argument and expected-result types generate ordinary
+//! unification equations. Only fully instantiated candidates leave this module.
+//! The caller still owns final kernel checking and declaration publication.
+
+mod levels;
+
+use super::*;
+use crate::constraint::unify::{UnificationBudget, UnificationError};
+use fln_core::expr::{FVarId, MVarId};
+use fln_core::level::{LMVarId, Level};
+use fln_core::options::KVMap;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceInferenceError {
+    UnknownConstant(Name),
+    ExpectedFunction,
+    ExpectedType,
+    UnresolvedHoles { count: usize },
+    UnresolvedUniverses,
+    InstanceSynthesisRequired,
+    ResourceLimit,
+    Scope,
+    Universe(crate::universe::UniverseInstantiationError),
+    Unification(Box<UnificationError>),
+}
+
+impl std::fmt::Display for SourceInferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownConstant(_) => {
+                write!(f, "source reference does not name a known constant")
+            }
+            Self::ExpectedFunction => write!(f, "source application requires a function type"),
+            Self::ExpectedType => write!(f, "source annotation requires a type"),
+            Self::UnresolvedHoles { count } => write!(
+                f,
+                "source elaboration left {count} unresolved metavariables"
+            ),
+            Self::UnresolvedUniverses => write!(f, "source elaboration left unresolved universes"),
+            Self::InstanceSynthesisRequired => write!(
+                f,
+                "source application requires unsupported instance synthesis"
+            ),
+            Self::ResourceLimit => write!(f, "source elaboration work limit reached"),
+            Self::Scope => write!(
+                f,
+                "source elaboration encountered an invalid expression scope"
+            ),
+            Self::Universe(error) => write!(f, "{error}"),
+            Self::Unification(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SourceInferenceError {}
+
+#[derive(Clone)]
+struct Typed {
+    value: Expr,
+    type_: Expr,
+}
+
+struct Context {
+    txn: ElabTxn,
+    kernel: Budget,
+    next: u64,
+    equations: Vec<(Expr, Expr)>,
+}
+
+fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
+    NatDefinitionElabError::Inference(reason)
+}
+
+impl Context {
+    fn new(env: &Environment, kernel: Budget) -> Self {
+        let mut txn = ElabTxn::new(env.clone(), KVMap::new(), 0);
+        txn.budget.max_heartbeats = 1_000_000;
+        Self {
+            txn,
+            kernel,
+            next: 0,
+            equations: Vec::new(),
+        }
+    }
+
+    fn tick(&mut self) -> Result<(), NatDefinitionElabError> {
+        self.txn
+            .budget
+            .check_heartbeat()
+            .map_err(|_| failure(SourceInferenceError::ResourceLimit))
+    }
+
+    fn fresh_name(&mut self) -> Result<Name, NatDefinitionElabError> {
+        self.tick()?;
+        let id = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        Ok(Name::num(Name::from_components(["_fln_source"]), id))
+    }
+
+    fn level(&mut self) -> Result<Level, NatDefinitionElabError> {
+        Ok(Level::mvar(LMVarId(self.fresh_name()?)))
+    }
+
+    fn hole(&mut self, type_: Expr) -> Result<Expr, NatDefinitionElabError> {
+        let name = self.fresh_name()?;
+        let id = MVarId(name.clone());
+        self.txn.mvars.declare(
+            id.clone(),
+            name,
+            type_,
+            self.txn.lctx.clone(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        Ok(Expr::mvar(id))
+    }
+
+    fn instantiate(&mut self, value: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        self.tick()?;
+        self.txn
+            .instantiate_expr(value)
+            .map_err(|error| failure(SourceInferenceError::Universe(error)))
+    }
+
+    fn substitute(&mut self, body: &Expr, argument: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        self.tick()?;
+        body.subst_loose(0, std::slice::from_ref(argument))
+            .map_err(|_| failure(SourceInferenceError::Scope))
+    }
+
+    fn constant(&mut self, name: &Name) -> Result<Typed, NatDefinitionElabError> {
+        let info = self
+            .txn
+            .env
+            .find(name)
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
+        let base = info.constant_val();
+        let mut levels = Vec::new();
+        for _ in &base.level_params {
+            levels.push(self.level()?);
+        }
+        let type_ = self.instantiate_params(&base.type_, &base.level_params, &levels)?;
+        Ok(Typed {
+            value: Expr::const_(name.clone(), levels),
+            type_,
+        })
+    }
+
+    fn atom(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        if let Syntax::Ident { val: name, .. } = syntax {
+            if name.is_anonymous() {
+                return Err(NatDefinitionElabError::AnonymousReferenceName);
+            }
+            if let Some(local) = self
+                .txn
+                .lctx
+                .decls()
+                .iter()
+                .rev()
+                .find(|local| &local.user_name == name)
+            {
+                return Ok(Typed {
+                    value: Expr::fvar(local.id.clone()),
+                    type_: local.type_.clone(),
+                });
+            }
+            if name == &Name::from_components(["_"]) {
+                let type_ = match expected {
+                    Some(type_) => type_.clone(),
+                    None => {
+                        let universe = self.level()?;
+                        self.hole(Expr::sort(universe))?
+                    }
+                };
+                return Ok(Typed {
+                    value: self.hole(type_.clone())?,
+                    type_,
+                });
+            }
+            if name == &Name::from_components(["Type"]) {
+                return Ok(Typed {
+                    value: Expr::sort(Level::one()),
+                    type_: Expr::sort(
+                        Level::one()
+                            .succ()
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    ),
+                });
+            }
+            if name == &Name::from_components(["Prop"]) {
+                return Ok(Typed {
+                    value: Expr::sort(Level::zero()),
+                    type_: Expr::sort(Level::one()),
+                });
+            }
+            let mut resolved = name.clone();
+            if !self.txn.env.contains(name) {
+                if name == &Name::from_components(["true"]) {
+                    resolved = Name::from_components(["Bool", "true"]);
+                }
+                if name == &Name::from_components(["false"]) {
+                    resolved = Name::from_components(["Bool", "false"]);
+                }
+            }
+            return self.constant(&resolved);
+        }
+        let value = elaborate_atom(syntax, &[], true, Some(&self.txn.env))?;
+        let type_ = match value.node() {
+            ExprNode::Lit {
+                literal: Literal::Nat(_),
+            } => nat_const(),
+            ExprNode::Lit {
+                literal: Literal::Str(_),
+            } => string_const(),
+            _ => return Err(failure(SourceInferenceError::ExpectedType)),
+        };
+        Ok(Typed { value, type_ })
+    }
+
+    fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        let mut head = self.instantiate(expr)?;
+        let mut arguments = Vec::new();
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::MData { expr, .. } => head = expr.clone(),
+                ExprNode::App { f, a } => {
+                    arguments.push(a.clone());
+                    head = f.clone();
+                }
+                ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
+                ExprNode::Lam { body, .. } if !arguments.is_empty() => {
+                    let value = arguments.pop().expect("guarded application");
+                    head = self.substitute(body, &value)?;
+                }
+                ExprNode::FVar { id } => {
+                    let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
+                    match value {
+                        Some(value) => head = value,
+                        None => break,
+                    }
+                }
+                ExprNode::Const { name, levels } => {
+                    let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
+                        self.txn.env.find(name).cloned()
+                    else {
+                        break;
+                    };
+                    if definition.safety != DefinitionSafety::Safe {
+                        break;
+                    }
+                    if definition.base.level_params.len() != levels.len() {
+                        return Err(failure(SourceInferenceError::Scope));
+                    }
+                    head = self.instantiate_params(
+                        &definition.value,
+                        &definition.base.level_params,
+                        levels,
+                    )?;
+                }
+                _ => break,
+            }
+        }
+        for argument in arguments.into_iter().rev() {
+            self.tick()?;
+            head = Expr::app(head, argument);
+        }
+        Ok(head)
+    }
+
+    /// Enough type reconstruction to generate the universe side of an implicit
+    /// type assignment. This is a constraint producer, not a trusted checker.
+    fn known_type(&mut self, expression: &Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let expression = self.instantiate(expression)?;
+        match expression.node() {
+            ExprNode::Sort { level } => Ok(Some(Expr::sort(
+                level
+                    .clone()
+                    .succ()
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+            ))),
+            ExprNode::MVar { id } => Ok(self.txn.mvars.get_decl(id).map(|decl| decl.type_.clone())),
+            ExprNode::FVar { id } => Ok(self.txn.lctx.find(id).map(|local| local.type_.clone())),
+            ExprNode::Const { name, levels } => {
+                let Some(info) = self.txn.env.find(name).cloned() else {
+                    return Ok(None);
+                };
+                let base = info.constant_val();
+                Ok(Some(self.instantiate_params(
+                    &base.type_,
+                    &base.level_params,
+                    levels,
+                )?))
+            }
+            ExprNode::Lit {
+                literal: Literal::Nat(_),
+            } => Ok(Some(nat_const())),
+            ExprNode::Lit {
+                literal: Literal::Str(_),
+            } => Ok(Some(string_const())),
+            _ => Ok(None),
+        }
+    }
+
+    fn constrain(&mut self, actual: &Expr, expected: &Expr) -> Result<(), NatDefinitionElabError> {
+        let actual = self.instantiate(actual)?;
+        let expected = self.instantiate(expected)?;
+        if !actual.has_expr_mvar()
+            && !expected.has_expr_mvar()
+            && !actual.has_level_mvar()
+            && !expected.has_level_mvar()
+        {
+            // Closed constraints are checked by the declaration's ordinary K1
+            // admission. Keeping them there preserves its original verdict.
+            return Ok(());
+        }
+        if let (Some(left), Some(right)) = (self.known_type(&actual)?, self.known_type(&expected)?)
+            && (left.has_level_mvar() || right.has_level_mvar())
+        {
+            self.equations.push((left, right));
+        }
+        self.equations.push((actual, expected));
+        self.flush(false)
+    }
+
+    fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
+        if self.equations.is_empty() {
+            return Ok(());
+        }
+        self.tick()?;
+        match self.txn.unify_many_with(
+            &self.equations,
+            UnificationBudget::new(self.kernel),
+            &|| false,
+        ) {
+            Ok(report) => {
+                assert!(
+                    report.awakened.is_empty(),
+                    "this private source transaction has no queued consumer work"
+                );
+                self.equations.clear();
+                Ok(())
+            }
+            Err(UnificationError::Deferred(_)) if !final_pass => Ok(()),
+            Err(error) => Err(failure(SourceInferenceError::Unification(Box::new(error)))),
+        }
+    }
+
+    fn insert_implicits(
+        &mut self,
+        mut term: Typed,
+        explicit_follows: bool,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            term.type_ = self.whnf(&term.type_)?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = term.type_.node()
+            else {
+                break;
+            };
+            let insert = match binder_info {
+                BinderInfo::Default => false,
+                BinderInfo::Implicit => explicit_follows || expected.is_some(),
+                BinderInfo::StrictImplicit => explicit_follows,
+                BinderInfo::InstImplicit if explicit_follows || expected.is_some() => {
+                    return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+                }
+                BinderInfo::InstImplicit => false,
+            };
+            if !insert {
+                break;
+            }
+            if !explicit_follows && let Some(expected) = expected {
+                let expected = self.whnf(expected)?;
+                if matches!(expected.node(), ExprNode::ForallE { binder_info: style, .. } if style == binder_info)
+                {
+                    break;
+                }
+            }
+            let argument = self.hole(binder_type.clone())?;
+            let body = body.clone();
+            term.value = Expr::app(term.value, argument.clone());
+            term.type_ = self.substitute(&body, &argument)?;
+        }
+        Ok(term)
+    }
+
+    fn finish_term(
+        &mut self,
+        term: Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let term = self.insert_implicits(term, false, expected)?;
+        if let Some(expected) = expected {
+            self.constrain(&term.type_, expected)?;
+        }
+        Ok(term)
+    }
+
+    fn term(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        enum Task<'a> {
+            Visit(&'a Syntax, Option<Expr>, bool),
+            Function(&'a [Syntax], Option<Expr>),
+            Argument(Typed, Expr, &'a [Syntax], Option<Expr>),
+            Apply(Typed, &'a [Syntax], Option<Expr>),
+            Infix(BoundedInfixIntrinsic, Option<Expr>),
+            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
+            LetBody(LocalContext, FVarId, Name, Typed),
+        }
+        let mut tasks = vec![Task::Visit(syntax, expected, true)];
+        let mut values: Vec<Typed> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(syntax, expected, finish) => {
+                    if let Some(inner) = parenthesized_inner(syntax)? {
+                        tasks.push(Task::Visit(inner, expected, finish));
+                        continue;
+                    }
+                    if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "let"]) {
+                            let (name, annotation, value, body) = self.let_parts(args)?;
+                            tasks.push(Task::LetValue(name, annotation.clone(), body, expected));
+                            tasks.push(Task::Visit(value, annotation, true));
+                            continue;
+                        }
+                        if kind == &parser_kind(&["Term", "app"]) {
+                            let parts = expect_node(syntax, kind, 2, "application")?;
+                            let arguments = expect_null_args(&parts[1], "application arguments")?;
+                            if arguments.is_empty() {
+                                return Err(failure(SourceInferenceError::ExpectedFunction));
+                            }
+                            tasks.push(Task::Function(arguments, expected));
+                            tasks.push(Task::Visit(&parts[0], None, false));
+                            continue;
+                        }
+                        if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
+                            let parts = expect_node(syntax, kind, 3, "scalar infix")?;
+                            expect_atom(&parts[1], intrinsic.spelling(), "scalar operator")?;
+                            tasks.push(Task::Infix(intrinsic, expected));
+                            tasks.push(Task::Visit(&parts[2], None, true));
+                            tasks.push(Task::Visit(&parts[0], None, true));
+                            continue;
+                        }
+                    }
+                    let term = self.atom(syntax, expected.as_ref())?;
+                    values.push(if finish {
+                        self.finish_term(term, expected.as_ref())?
+                    } else {
+                        term
+                    });
+                }
+                Task::Function(arguments, expected) => {
+                    let function = values.pop().expect("function task follows its visit");
+                    tasks.push(Task::Apply(function, arguments, expected));
+                }
+                Task::Apply(function, arguments, expected) => {
+                    if let Some((first, rest)) = arguments.split_first() {
+                        let function = self.insert_implicits(function, true, None)?;
+                        let ExprNode::ForallE {
+                            binder_type, body, ..
+                        } = function.type_.node()
+                        else {
+                            return Err(failure(SourceInferenceError::ExpectedFunction));
+                        };
+                        let domain = binder_type.clone();
+                        let codomain = body.clone();
+                        tasks.push(Task::Argument(function, codomain, rest, expected));
+                        tasks.push(Task::Visit(first, Some(domain), true));
+                    } else {
+                        values.push(self.finish_term(function, expected.as_ref())?);
+                    }
+                }
+                Task::Argument(function, codomain, rest, expected) => {
+                    let argument = values.pop().expect("argument task follows its visit");
+                    let type_ = self.substitute(&codomain, &argument.value)?;
+                    tasks.push(Task::Apply(
+                        Typed {
+                            value: Expr::app(function.value, argument.value),
+                            type_,
+                        },
+                        rest,
+                        expected,
+                    ));
+                }
+                Task::Infix(intrinsic, expected) => {
+                    let right = values.pop().expect("infix right visit");
+                    let left = values.pop().expect("infix left visit");
+                    self.flush(false)?;
+                    let name = match intrinsic {
+                        BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                        BoundedInfixIntrinsic::ScalarBeq => {
+                            if self.instantiate(&left.type_)? == string_const()
+                                && self.instantiate(&right.type_)? == string_const()
+                            {
+                                Name::from_components(["String", "decEq"])
+                            } else {
+                                Name::from_components(["Nat", "beq"])
+                            }
+                        }
+                    };
+                    let mut function = self.constant(&name)?;
+                    for argument in [left, right] {
+                        function = self.insert_implicits(function, true, None)?;
+                        let ExprNode::ForallE {
+                            binder_type, body, ..
+                        } = function.type_.node()
+                        else {
+                            return Err(failure(SourceInferenceError::ExpectedFunction));
+                        };
+                        let domain = binder_type.clone();
+                        let body = body.clone();
+                        self.constrain(&argument.type_, &domain)?;
+                        function.type_ = self.substitute(&body, &argument.value)?;
+                        function.value = Expr::app(function.value, argument.value);
+                    }
+                    values.push(self.finish_term(function, expected.as_ref())?);
+                }
+                Task::LetValue(name, annotation, body, expected) => {
+                    let mut value = values.pop().expect("let value visit");
+                    if let Some(annotation) = annotation {
+                        value.type_ = annotation;
+                    }
+                    let saved = self.txn.lctx.clone();
+                    let id = FVarId(self.fresh_name()?);
+                    self.txn.lctx.add_let(
+                        id.clone(),
+                        name.clone(),
+                        value.type_.clone(),
+                        value.value.clone(),
+                    );
+                    tasks.push(Task::LetBody(saved, id, name, value));
+                    tasks.push(Task::Visit(body, expected, true));
+                }
+                Task::LetBody(saved, id, name, value) => {
+                    let mut body = values.pop().expect("let body visit");
+                    body.value = self.instantiate(&body.value)?;
+                    body.type_ = self.instantiate(&body.type_)?;
+                    let abstract_body = body
+                        .value
+                        .abstract_fvar(&id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    let abstract_type = body
+                        .type_
+                        .abstract_fvar(&id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    let type_ = self.substitute(&abstract_type, &value.value)?;
+                    values.push(Typed {
+                        value: Expr::let_e(name, value.type_, value.value, abstract_body, false),
+                        type_,
+                    });
+                    self.txn.lctx = saved;
+                }
+            }
+        }
+        let [result] = values.as_slice() else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        Ok(result.clone())
+    }
+
+    fn let_parts<'a>(
+        &mut self,
+        parts: &'a [Syntax],
+    ) -> Result<(Name, Option<Expr>, &'a Syntax, &'a Syntax), NatDefinitionElabError> {
+        let [keyword, config, declaration, separator, body] = parts else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(keyword, "let", "let keyword")?;
+        let config = expect_node(
+            config,
+            &parser_kind(&["Term", "letConfig"]),
+            1,
+            "let config",
+        )?;
+        expect_empty_null(&config[0], "empty let config")?;
+        let wrapper = expect_node(
+            declaration,
+            &parser_kind(&["Term", "letDecl"]),
+            1,
+            "let declaration",
+        )?;
+        let declaration = expect_node(
+            &wrapper[0],
+            &parser_kind(&["Term", "letIdDecl"]),
+            5,
+            "let binding",
+        )?;
+        let id = expect_node(
+            &declaration[0],
+            &parser_kind(&["Term", "letId"]),
+            1,
+            "let identifier",
+        )?;
+        let Syntax::Ident { val: name, .. } = &id[0] else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        if name.is_anonymous() {
+            return Err(NatDefinitionElabError::AnonymousReferenceName);
+        }
+        expect_empty_null(&declaration[1], "empty let parameters")?;
+        let annotation = optional_scalar_type(
+            &declaration[2],
+            true,
+            "optional let type",
+            "scalar let type",
+        )?;
+        expect_atom(&declaration[3], ":=", "let assignment")?;
+        expect_atom(separator, ";", "let separator")?;
+        Ok((name.clone(), annotation, &declaration[4], body))
+    }
+
+    fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
+        self.flush(true)?;
+        let value = self.instantiate(&term.value)?;
+        let type_ = self.instantiate(&term.type_)?;
+        let mut holes = self.txn.mvars.collect_mvars(&value);
+        holes.extend(self.txn.mvars.collect_mvars(&type_));
+        if !holes.is_empty() {
+            return Err(failure(SourceInferenceError::UnresolvedHoles {
+                count: holes.len(),
+            }));
+        }
+        if value.has_level_mvar() || type_.has_level_mvar() {
+            return Err(failure(SourceInferenceError::UnresolvedUniverses));
+        }
+        Ok(Typed { value, type_ })
+    }
+}
+
+pub(super) fn definition(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let mut context = Context::new(environment, kernel);
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    for modifier in modifiers {
+        expect_empty_null(modifier, "empty declaration modifier")?;
+    }
+    let definition = expect_node(
+        &declaration[1],
+        &parser_kind(&["Command", "definition"]),
+        5,
+        "definition",
+    )?;
+    expect_atom(&definition[0], "def", "definition keyword")?;
+    let id = expect_node(
+        &definition[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    let Syntax::Ident { val: name, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    if name.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    }
+    expect_empty_null(&id[1], "absent declaration pre-parser")?;
+    let signature = expect_node(
+        &definition[2],
+        &parser_kind(&["Command", "optDeclSig"]),
+        2,
+        "definition signature",
+    )?;
+    let mut parameters = Vec::new();
+    for syntax in expect_null_args(&signature[0], "definition binders")? {
+        let parts = expect_node(
+            syntax,
+            &parser_kind(&["Term", "explicitBinder"]),
+            5,
+            "explicit binder",
+        )?;
+        expect_atom(&parts[0], "(", "binder opener")?;
+        expect_atom(&parts[4], ")", "binder closer")?;
+        expect_empty_null(&parts[3], "absent binder default")?;
+        let names = expect_null_args(&parts[1], "binder names")?;
+        if names.is_empty() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let type_parts = expect_null_args(&parts[2], "binder type")?;
+        let [colon, Syntax::Ident { val: type_name, .. }] = type_parts else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
+        expect_atom(colon, ":", "binder type ascription")?;
+        let domain = scalar_type(type_name, true)
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        for name in names {
+            let Syntax::Ident { val: name, .. } = name else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            let id = FVarId(context.fresh_name()?);
+            context.txn.lctx.add_param(
+                id.clone(),
+                name.clone(),
+                domain.clone(),
+                BinderInfo::Default,
+            );
+            parameters.push((id, name.clone(), domain.clone(), BinderInfo::Default));
+        }
+    }
+    let expected = optional_scalar_type(
+        &signature[1],
+        true,
+        "optional result type",
+        "scalar result type",
+    )?;
+    let parts = expect_node(
+        &definition[3],
+        &parser_kind(&["Command", "declValSimple"]),
+        4,
+        "definition value",
+    )?;
+    expect_atom(&parts[0], ":=", "definition assignment")?;
+    let termination = expect_node(
+        &parts[2],
+        &parser_kind(&["Termination", "suffix"]),
+        2,
+        "termination suffix",
+    )?;
+    for part in termination {
+        expect_empty_null(part, "absent termination clause")?;
+    }
+    expect_empty_null(&parts[3], "absent where clause")?;
+    expect_empty_null(&definition[4], "absent definition clauses")?;
+    let mut term = context.term(&parts[1], expected.clone())?;
+    if let Some(expected) = expected {
+        term.type_ = expected;
+    }
+    let mut term = context.finish(term)?;
+    term.value = eta_expand_nondependent(term.value, &term.type_)?;
+    for (id, name, domain, style) in parameters.into_iter().rev() {
+        term.value = term
+            .value
+            .abstract_fvar(&id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        term.type_ = term
+            .type_
+            .abstract_fvar(&id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        term.value = Expr::lam(name.clone(), domain.clone(), term.value, style);
+        term.type_ = Expr::forall_e(name, domain, term.type_, style);
+    }
+    Ok(Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: Vec::new(),
+            type_: term.type_,
+        },
+        value: term.value,
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![name.clone()],
+    }))
+}
+
+pub(super) fn query(
+    syntax: &Syntax,
+    name: Name,
+    environment: &Environment,
+    kernel: Budget,
+    evaluate: bool,
+) -> Result<Declaration, NatDefinitionElabError> {
+    if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
+        return Err(if evaluate {
+            NatDefinitionElabError::InvalidGeneratedEvaluationName
+        } else {
+            NatDefinitionElabError::InvalidGeneratedCheckName
+        });
+    }
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),
+        2,
+        if evaluate {
+            "Lean.Parser.Command.eval"
+        } else {
+            "Lean.Parser.Command.check"
+        },
+    )?;
+    expect_atom(
+        &parts[0],
+        if evaluate { "#eval" } else { "#check" },
+        "query keyword",
+    )?;
+    let mut context = Context::new(environment, kernel);
+    let term = context.term(&parts[1], None)?;
+    let mut term = context.finish(term)?;
+    if evaluate {
+        term.value = eta_expand_nondependent(term.value, &term.type_)?;
+    }
+    Ok(Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: Vec::new(),
+            type_: term.type_,
+        },
+        value: term.value,
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![name],
+    }))
+}

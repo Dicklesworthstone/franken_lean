@@ -78,7 +78,7 @@ pub enum UnificationDeferred {
 
 /// Nonanswers are not flattened into a Boolean or a kernel rejection. In
 /// particular, `AssignmentCheck` preserves the complete kernel outcome.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UnificationError {
     Deferred(UnificationDeferred),
     Cancelled,
