@@ -110,7 +110,7 @@ impl std::fmt::Display for UnificationError {
 impl std::error::Error for UnificationError {}
 
 /// Successful equation solving is not an environment publication. These
-/// awakened constraints still need their own processing; none is marked proved.
+/// awakened constraints still need processing; none is marked proved here.
 #[derive(Debug)]
 pub struct UnificationReport {
     pub expression_assignments: Vec<MVarId>,
@@ -210,6 +210,72 @@ fn facts(expr: &Expr, meter: &mut Meter<'_>) -> Result<Facts, UnificationError> 
     Ok(result)
 }
 
+fn same_levels(left: &Level, right: &Level, meter: &mut Meter<'_>) -> Result<bool, UnificationError> {
+    let mut pending = vec![(left, right)];
+    let mut seen = HashSet::new();
+    while let Some((left, right)) = pending.pop() {
+        if !seen.insert((std::ptr::from_ref(left), std::ptr::from_ref(right))) { continue; }
+        meter.node()?;
+        match (left.view(), right.view()) {
+            (LevelView::Zero, LevelView::Zero) => {}
+            (LevelView::Param(a), LevelView::Param(b)) if a == b => {}
+            (LevelView::MVar(a), LevelView::MVar(b)) if a == b => {}
+            (LevelView::Succ(a), LevelView::Succ(b)) => pending.push((a, b)),
+            (LevelView::Max(a, b), LevelView::Max(c, d))
+            | (LevelView::IMax(a, b), LevelView::IMax(c, d)) => {
+                pending.push((b, d));
+                pending.push((a, c));
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// A sufficient reflexivity test, not a negative definitional-equality verdict.
+/// Binder names/styles and metadata do not affect this equality. Pair memoization
+/// prevents exponentially shared terms from becoming exponentially many tasks.
+fn same_terms(left: &Expr, right: &Expr, meter: &mut Meter<'_>) -> Result<bool, UnificationError> {
+    let mut pending = vec![(left, right)];
+    let mut seen = HashSet::new();
+    while let Some((left, right)) = pending.pop() {
+        if !seen.insert((std::ptr::from_ref(left.node()), std::ptr::from_ref(right.node()))) { continue; }
+        meter.node()?;
+        if std::ptr::eq(left.node(), right.node()) { continue; }
+        match (left.node(), right.node()) {
+            (ExprNode::MData { expr, .. }, _) => pending.push((expr, right)),
+            (_, ExprNode::MData { expr, .. }) => pending.push((left, expr)),
+            (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
+            (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) if a == b => {}
+            (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) if a == b => {}
+            (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) if a == b => {}
+            (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
+                if !same_levels(a, b, meter)? { return Ok(false); }
+            }
+            (ExprNode::Const { name: a, levels: ua }, ExprNode::Const { name: b, levels: ub }) if a == b && ua.len() == ub.len() => {
+                for (a, b) in ua.iter().zip(ub) {
+                    if !same_levels(a, b, meter)? { return Ok(false); }
+                }
+            }
+            (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
+                pending.push((b, d)); pending.push((a, c));
+            }
+            (ExprNode::Lam { binder_type: a, body: b, .. }, ExprNode::Lam { binder_type: c, body: d, .. })
+            | (ExprNode::ForallE { binder_type: a, body: b, .. }, ExprNode::ForallE { binder_type: c, body: d, .. }) => {
+                pending.push((b, d)); pending.push((a, c));
+            }
+            (ExprNode::LetE { type_: a, value: b, body: c, .. }, ExprNode::LetE { type_: d, value: e, body: f, .. }) => {
+                pending.push((c, f)); pending.push((b, e)); pending.push((a, d));
+            }
+            (ExprNode::Proj { struct_name: a, idx: i, expr: x }, ExprNode::Proj { struct_name: b, idx: j, expr: y }) if a == b && i == j => pending.push((x, y)),
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+type Equation = (Expr, Expr, LocalContext);
+
 struct Engine<'a> {
     work: ElabTxn,
     budget: UnificationBudget,
@@ -223,6 +289,10 @@ struct Engine<'a> {
 }
 
 impl Engine<'_> {
+    fn generation(&self) -> usize {
+        self.assigned.len().saturating_add(self.assigned_levels.len())
+    }
+
     fn scan(&mut self, expr: &Expr) -> Result<Facts, UnificationError> {
         let found = facts(expr, &mut self.meter)?;
         self.reserved.extend(found.fvars.iter().cloned());
@@ -246,16 +316,14 @@ impl Engine<'_> {
             let suffix = self.next_local.to_string();
             self.next_local = self.next_local.checked_add(1).ok_or(UnificationError::ExpressionScope)?;
             let id = FVarId(Name::from_components(["_fln_unify_local", suffix.as_str()]));
-            if self.reserved.insert(id.clone()) {
-                return Ok(id);
-            }
+            if self.reserved.insert(id.clone()) { return Ok(id); }
         }
     }
 
     fn substitute(&mut self, body: &Expr, value: &Expr) -> Result<Expr, UnificationError> {
         self.scan(body)?;
         self.scan(value)?;
-        let result = body.instantiate(0, std::slice::from_ref(value))
+        let result = body.subst_loose(0, std::slice::from_ref(value))
             .map_err(|_| UnificationError::ExpressionScope)?;
         self.scan(&result)?;
         Ok(result)
@@ -271,18 +339,12 @@ impl Engine<'_> {
                 ExprNode::LetE { value, body, .. } => head = self.substitute(body, value)?,
                 ExprNode::App { f, a } => { args.push(a.clone()); head = f.clone(); }
                 ExprNode::MVar { id } => {
-                    if let Some(value) = self.work.mvars.get_assigned_expr(id) {
-                        head = value.clone();
-                    } else {
-                        break;
-                    }
+                    if let Some(value) = self.work.mvars.get_assigned_expr(id) { head = value.clone(); }
+                    else { break; }
                 }
                 ExprNode::FVar { id } => {
-                    if let Some(value) = locals.find(id).and_then(|local| local.value.as_ref()) {
-                        head = value.clone();
-                    } else {
-                        break;
-                    }
+                    if let Some(value) = locals.find(id).and_then(|local| local.value.as_ref()) { head = value.clone(); }
+                    else { break; }
                 }
                 ExprNode::Lam { body, .. } if !args.is_empty() => {
                     let argument = args.pop().expect("nonempty application spine");
@@ -300,12 +362,8 @@ impl Engine<'_> {
                                 } => Some(definition.value.clone()),
                         _ => None,
                     };
-                    if let Some(value) = definition {
-                        self.scan(&value)?;
-                        head = value;
-                    } else {
-                        break;
-                    }
+                    if let Some(value) = definition { self.scan(&value)?; head = value; }
+                    else { break; }
                 }
                 _ => break,
             }
@@ -318,15 +376,13 @@ impl Engine<'_> {
     }
 
     fn assignment_slot(&self) -> Result<(), UnificationError> {
-        if self.assigned.len().saturating_add(self.assigned_levels.len()) >= self.budget.max_assignments {
+        if self.generation() >= self.budget.max_assignments {
             Err(UnificationError::AssignmentLimit { limit: self.budget.max_assignments })
-        } else {
-            Ok(())
-        }
+        } else { Ok(()) }
     }
 
-    /// Return false only when the left side is not a flexible pattern. A
-    /// candidate is scope-checked now and type-checked after the whole batch.
+    /// A candidate is scope-checked now and type-checked after the whole batch.
+    /// Every refusal precedes assignment mutation, allowing reverse orientation.
     fn pattern(&mut self, lhs: &Expr, rhs: &Expr, locals: &LocalContext) -> Result<bool, UnificationError> {
         let mut head = lhs;
         let mut arguments = Vec::new();
@@ -350,14 +406,14 @@ impl Engine<'_> {
         let mut function_type = declaration.type_.clone();
         for argument in &arguments {
             let ExprNode::FVar { id: local_id } = argument.node() else {
-                return Ok(false);
+                return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
             };
             if !distinct.insert(local_id.clone()) || !locals.contains(local_id) {
-                return Ok(false);
+                return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
             }
             function_type = self.whnf(&function_type, locals)?;
             let ExprNode::ForallE { binder_type, body, binder_info, .. } = function_type.node() else {
-                return Ok(false);
+                return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
             };
             binders.push((local_id.clone(), binder_type.clone(), *binder_info));
             function_type = self.substitute(body, argument)?;
@@ -368,9 +424,7 @@ impl Engine<'_> {
             value = value.abstract_fvar(&local, 0).map_err(|_| UnificationError::ExpressionScope)?;
             value = Expr::lam(local.0.clone(), domain, value, style);
         }
-        if value.has_loose_bvars() {
-            return Err(UnificationError::LooseBoundVariable);
-        }
+        if value.has_loose_bvars() { return Err(UnificationError::LooseBoundVariable); }
         let free = self.scan(&value)?.fvars;
         if free.iter().any(|id| !declaration.lctx.contains(id)) {
             return Err(UnificationError::Deferred(UnificationDeferred::EscapingLocal(id.clone())));
@@ -392,10 +446,8 @@ impl Engine<'_> {
             let right = self.work.universes.instantiate_with_limit(&right, remaining).map_err(UnificationError::Universe)?;
             self.scan(&Expr::sort(left.clone()))?;
             self.scan(&Expr::sort(right.clone()))?;
+            if same_levels(&left, &right, &mut self.meter)? { continue; }
             match (left.view(), right.view()) {
-                (LevelView::Zero, LevelView::Zero) => {}
-                (LevelView::Param(a), LevelView::Param(b)) if a == b => {}
-                (LevelView::MVar(a), LevelView::MVar(b)) if a == b => {}
                 (LevelView::MVar(id), _) | (_, LevelView::MVar(id)) => {
                     let value = if matches!(left.view(), LevelView::MVar(found) if found == id) { &right } else { &left };
                     let mut todo = vec![value];
@@ -426,18 +478,62 @@ impl Engine<'_> {
         Ok(())
     }
 
+    fn compare(&mut self, equation: &Equation, pending: &mut VecDeque<Equation>) -> Result<(), UnificationError> {
+        let (left, right, locals) = equation;
+        self.meter.tick()?;
+        if same_terms(left, right, &mut self.meter)? { return Ok(()); }
+        let left = self.whnf(left, locals)?;
+        let right = self.whnf(right, locals)?;
+        if same_terms(&left, &right, &mut self.meter)? { return Ok(()); }
+        let mut reason = UnificationDeferred::UnsupportedEquation;
+        match self.pattern(&left, &right, locals) {
+            Ok(true) => return Ok(()),
+            Err(UnificationError::Deferred(found)) => reason = found,
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+        match self.pattern(&right, &left, locals) {
+            Ok(true) => return Ok(()),
+            Err(UnificationError::Deferred(found)) if reason == UnificationDeferred::UnsupportedEquation => reason = found,
+            Err(UnificationError::Deferred(_)) | Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+        match (left.node(), right.node()) {
+            (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => self.levels(a, b)?,
+            (ExprNode::Const { name: a, levels: ua }, ExprNode::Const { name: b, levels: ub }) if a == b && ua.len() == ub.len() => {
+                for (a, b) in ua.iter().zip(ub) { self.levels(a, b)?; }
+            }
+            (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
+                pending.push_front((b.clone(), d.clone(), locals.clone()));
+                pending.push_front((a.clone(), c.clone(), locals.clone()));
+            }
+            (ExprNode::Lam { binder_type: a, body: b, binder_info, .. }, ExprNode::Lam { binder_type: c, body: d, .. })
+            | (ExprNode::ForallE { binder_type: a, body: b, binder_info, .. }, ExprNode::ForallE { binder_type: c, body: d, .. }) => {
+                let fresh = self.fresh()?;
+                let argument = Expr::fvar(fresh.clone());
+                let left_body = self.substitute(b, &argument)?;
+                let right_body = self.substitute(d, &argument)?;
+                let mut body_locals = locals.clone();
+                body_locals.add_param(fresh.clone(), fresh.0, a.clone(), *binder_info);
+                pending.push_front((left_body, right_body, body_locals));
+                pending.push_front((a.clone(), c.clone(), locals.clone()));
+            }
+            (ExprNode::Proj { struct_name: a, idx: i, expr: x }, ExprNode::Proj { struct_name: b, idx: j, expr: y }) if a == b && i == j => pending.push_front((x.clone(), y.clone(), locals.clone())),
+            _ => return Err(UnificationError::Deferred(reason)),
+        }
+        Ok(())
+    }
+
     fn solve(&mut self, equations: &[(Expr, Expr)]) -> Result<(), UnificationError> {
         let mut pending = VecDeque::new();
         for (left, right) in equations {
-            if left.has_loose_bvars() || right.has_loose_bvars() {
-                return Err(UnificationError::LooseBoundVariable);
-            }
+            if left.has_loose_bvars() || right.has_loose_bvars() { return Err(UnificationError::LooseBoundVariable); }
             self.scan(left)?;
             self.scan(right)?;
             pending.push_back((left.clone(), right.clone(), self.work.lctx.clone()));
         }
-        // Reserve every pre-existing local identity before opening binders.
-        // Hash-map iteration changes neither the resulting set nor its use.
+        // Reserve all pre-existing identities before opening binders. Map
+        // iteration changes neither the resulting set nor the generated names.
         let mut roots = Vec::new();
         for declaration in self.work.mvars.decls().values() {
             roots.push(declaration.type_.clone());
@@ -454,53 +550,26 @@ impl Engine<'_> {
             roots.extend(local.value.iter().cloned());
         }
         for root in roots { self.scan(&root)?; }
-        while let Some((left, right, locals)) = pending.pop_front() {
-            self.meter.tick()?;
-            let left = self.whnf(&left, &locals)?;
-            let right = self.whnf(&right, &locals)?;
-            if std::ptr::eq(left.node(), right.node()) { continue; }
-            if matches!((left.node(), right.node()), (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) if a == b) { continue; }
-            // Try both orientations without leaking a failed orientation. The
-            // pattern path mutates only after all of its scope checks pass.
-            let first = self.pattern(&left, &right, &locals);
-            match first {
-                Ok(true) => continue,
-                Err(UnificationError::Deferred(_)) | Ok(false) => {}
-                Err(error) => return Err(error),
-            }
-            match self.pattern(&right, &left, &locals) {
-                Ok(true) => continue,
-                Err(UnificationError::Deferred(_)) | Ok(false) => {}
-                Err(error) => return Err(error),
-            }
-            match (left.node(), right.node()) {
-                (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => self.levels(a, b)?,
-                (ExprNode::Const { name: a, levels: ua }, ExprNode::Const { name: b, levels: ub }) if a == b && ua.len() == ub.len() => {
-                    for (a, b) in ua.iter().zip(ub) { self.levels(a, b)?; }
+        loop {
+            let generation = self.generation();
+            let mut postponed = VecDeque::new();
+            let mut first_reason = None;
+            while let Some(equation) = pending.pop_front() {
+                match self.compare(&equation, &mut pending) {
+                    Ok(()) => {}
+                    Err(UnificationError::Deferred(reason)) => {
+                        first_reason.get_or_insert(reason);
+                        postponed.push_back(equation);
+                    }
+                    Err(error) => return Err(error),
                 }
-                (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) if a == b => {}
-                (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) if a == b => {}
-                (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
-                    pending.push_front((b.clone(), d.clone(), locals.clone()));
-                    pending.push_front((a.clone(), c.clone(), locals));
-                }
-                (ExprNode::Lam { binder_type: a, body: b, binder_info, .. }, ExprNode::Lam { binder_type: c, body: d, .. })
-                | (ExprNode::ForallE { binder_type: a, body: b, binder_info, .. }, ExprNode::ForallE { binder_type: c, body: d, .. }) => {
-                    let fresh = self.fresh()?;
-                    let argument = Expr::fvar(fresh.clone());
-                    let left_body = self.substitute(b, &argument)?;
-                    let right_body = self.substitute(d, &argument)?;
-                    let mut body_locals = locals.clone();
-                    body_locals.add_param(fresh.clone(), fresh.0, a.clone(), *binder_info);
-                    pending.push_front((left_body, right_body, body_locals));
-                    pending.push_front((a.clone(), c.clone(), locals));
-                }
-                (ExprNode::Proj { struct_name: a, idx: i, expr: x }, ExprNode::Proj { struct_name: b, idx: j, expr: y }) if a == b && i == j => pending.push_front((x.clone(), y.clone(), locals)),
-                _ => return Err(UnificationError::Deferred(UnificationDeferred::UnsupportedEquation)),
             }
+            if postponed.is_empty() { break; }
+            if self.generation() == generation {
+                return Err(UnificationError::Deferred(first_reason.expect("a postponed equation has a reason")));
+            }
+            pending = postponed;
         }
-        // K1 checks the chosen assignment, not whether the unifier guessed a
-        // promising-looking value. Unsolved typing dependencies defer the batch.
         for id in self.assigned.clone() { self.check_assignment(&id)?; }
         Ok(())
     }
@@ -512,9 +581,7 @@ impl Engine<'_> {
         let mut type_ = self.instantiate(&declaration.type_)?;
         let mut local_ids = HashSet::new();
         for local in declaration.lctx.decls() {
-            if !local_ids.insert(local.id.clone()) {
-                return Err(UnificationError::Deferred(UnificationDeferred::InvalidLocalContext));
-            }
+            if !local_ids.insert(local.id.clone()) { return Err(UnificationError::Deferred(UnificationDeferred::InvalidLocalContext)); }
         }
         for local in declaration.lctx.decls().iter().rev() {
             self.meter.tick()?;
@@ -558,11 +625,8 @@ impl Engine<'_> {
         self.meter.tick()?;
         self.kernel_checks += 1;
         let outcome = check(&self.work.env, &candidate, self.budget.kernel);
-        if matches!(&outcome, Outcome::Complete(Verdict::Accepted { .. })) {
-            Ok(())
-        } else {
-            Err(UnificationError::AssignmentCheck { id: id.clone(), outcome: Box::new(outcome) })
-        }
+        if matches!(&outcome, Outcome::Complete(Verdict::Accepted { .. })) { Ok(()) }
+        else { Err(UnificationError::AssignmentCheck { id: id.clone(), outcome: Box::new(outcome) }) }
     }
 }
 
@@ -571,8 +635,8 @@ impl ElabTxn {
         self.unify_many_with(&[(lhs.clone(), rhs.clone())], budget, &|| false)
     }
 
-    /// Solve the entire equation batch or publish none of it. A batch permits
-    /// later equations to resolve earlier assignments' typing dependencies.
+    /// Solve the entire equation batch or publish none of it. Later equations
+    /// may unblock earlier non-pattern equations and assignment-type checks.
     pub fn unify_many_with(
         &mut self,
         equations: &[(Expr, Expr)],
@@ -580,6 +644,9 @@ impl ElabTxn {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<UnificationReport, UnificationError> {
         if cancelled() { return Err(UnificationError::Cancelled); }
+        if equations.len().saturating_add(self.mvars.len()).saturating_add(self.universes.len()) > budget.max_visited_nodes {
+            return Err(UnificationError::NodeLimit { limit: budget.max_visited_nodes });
+        }
         let remaining = if self.budget.max_heartbeats == 0 { u64::MAX } else {
             self.budget.max_heartbeats.saturating_sub(self.budget.heartbeats_consumed)
         };
@@ -599,7 +666,6 @@ impl ElabTxn {
         self.budget.heartbeats_consumed = self.budget.heartbeats_consumed
             .checked_add(engine.meter.steps).ok_or(UnificationError::HeartbeatLimit)?;
         result?;
-        // Observe cancellation once more at the publication boundary.
         if cancelled() { return Err(UnificationError::Cancelled); }
         self.mvars = engine.work.mvars;
         self.universes = engine.work.universes;
