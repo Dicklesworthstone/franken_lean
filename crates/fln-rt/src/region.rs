@@ -774,6 +774,9 @@ pub struct SubgraphCapture<'a> {
 impl<'a> SubgraphCapture<'a> {
     /// Validate object boundaries and the compactor's children-before-parent law.
     pub fn new(bytes: &'a [u8], base: u64) -> RResult<Self> {
+        if !base.is_multiple_of(8) || base.checked_add(bytes.len() as u64).is_none() {
+            return Err(RegionFault::MisalignedBase { base });
+        }
         if !bytes.len().is_multiple_of(8) {
             return Err(RegionFault::RaggedPayload { len: bytes.len() });
         }

@@ -153,6 +153,20 @@ fn opaque_subgraph_capture_preserves_bytes_sharing_and_relocation() {
 fn opaque_subgraph_capture_excludes_unreachable_objects_and_refuses_bad_roots() {
     use fln_rt::region::SubgraphCapture;
     let _g = lock();
+    let scalar_region = 1u64.to_le_bytes();
+    for base in [1, u64::MAX - 7] {
+        assert!(matches!(
+            SubgraphCapture::new(&scalar_region, base),
+            Err(RegionFault::MisalignedBase { .. })
+        ));
+    }
+    assert_eq!(
+        SubgraphCapture::new(&scalar_region, u64::MAX - 15)
+            .unwrap()
+            .capture(1, 8)
+            .unwrap(),
+        scalar_region
+    );
     let wanted = Obj::mk_string("retained payload");
     let container = Obj::mk_array(vec![Obj::mk_string("unrelated"), wanted.clone_ref()]);
     let bytes = compact(&container, BASE_A).unwrap();
