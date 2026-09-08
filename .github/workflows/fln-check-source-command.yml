@@ -1,0 +1,168 @@
+name: Check source proof command
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/land_source_check_command.py', '.github/workflows/fln-check-source-command.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-check-source-command
+  cancel-in-progress: false
+jobs:
+  source-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Prepare compiler and command integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/source-check-landing
+          git rev-parse HEAD > target/source-check-landing/input.txt
+          rustc -Vv > target/source-check-landing/compiler.txt
+          python3 -I scripts/land_source_check_command.py
+      - name: Add real source and installed command regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e crates/fln/tests/source_file_check.rs
+          test ! -e crates/fln-cli/tests/source_check.rs
+          cat > crates/fln/tests/source_file_check.rs <<'RS'
+          //! Whole-file checking, including proof reuse and failure-atomic snapshots.
+          #![forbid(unsafe_code)]
+          use fln::{Engine, EngineAdmissionLimits, SourceCheckLimits, SourceCheckError, Budget, KVMap, Name, Outcome};
+          fn limits() -> SourceCheckLimits { SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(2*1024*1024))) }
+          fn engine() -> Engine { Engine::with_source_seed(limits().admission).unwrap().into_complete().unwrap() }
+          #[test]
+          fn whole_files_admit_theorems_without_executing_proofs_or_functions() {
+              let base=engine();let opts=KVMap::new();let root=base.logical_root(&opts);
+              let first=b"def identity (x : Nat) : Nat := x\r\ntheorem eqself (x : Nat) : identity x = x := by rfl\r\n";
+              let second=b"theorem reuse (x : Nat) : identity x = x := by apply eqself\ntheorem symm (x y : Nat) (h : x = y) : y = x := by rw [h]";
+              let result=base.check_source_files(&[first,second], &opts, limits()).unwrap().into_complete().unwrap();
+              assert_eq!((result.files,result.commands,result.theorems),(2,4,3));
+              assert_eq!(result.base_logical_root,root); assert_eq!(base.logical_root(&opts),root);
+              assert_ne!(result.result_logical_root,root);
+              assert!(!base.environment().contains(&Name::from_components(["identity"])));
+              assert!(result.engine.environment().contains(&Name::from_components(["symm"])));
+          }
+          #[test]
+          fn late_failure_exposes_no_successor_and_reports_the_correct_file_offset() {
+              let base=engine();let opts=KVMap::new();let root=base.logical_root(&opts);
+              let prefix=b"theorem good (x : Nat) : x = x := by rfl\r\n";
+              let mut text=prefix.to_vec();text.extend_from_slice(b"theorem bad : 1 = 2 := by rfl");
+              let error=base.check_source_files(&[b"def prior : Nat := 0",&text],&opts,limits()).unwrap_err();
+              assert!(matches!(error,SourceCheckError::Command {file:1,command:2,offset,..} if offset==prefix.len()));
+              assert_eq!(error.disposition(),("kernel-rejection",true,1));
+              assert_eq!(base.logical_root(&opts),root);
+              assert!(!base.environment().contains(&Name::from_components(["prior"])));
+          }
+          #[test]
+          fn aggregate_limits_and_empty_or_unsupported_inputs_are_not_success() {
+              let base=engine();let opts=KVMap::new();let source=b"def first : Nat := 1";
+              let mut low=limits();low.max_bytes=source.len();
+              assert!(matches!(base.check_source_files(&[source,source],&opts,low),Err(SourceCheckError::Limit{..})));
+              low=limits();low.max_commands=1;
+              assert!(matches!(base.check_source_files(&[b"def a : Nat := 1\ndef b : Nat := 2"],&opts,low),Err(SourceCheckError::Limit{..})));
+              assert!(matches!(base.check_source_files(&[],&opts,limits()),Err(SourceCheckError::EmptyInput)));
+              for source in [b"".as_slice(), b"import Init\ndef a : Nat := 1",b"#eval 1",b"#check Nat"] {
+                  assert!(base.check_source_files(&[source],&opts,limits()).is_err());
+              }
+          }
+          #[test]
+          fn kernel_nonanswers_remain_nonanswers_not_false_proofs() {
+              let base=engine();let mut low=limits();low.admission.kernel=low.admission.kernel.narrowed(0,32);
+              let result=base.check_source_files(&[b"theorem test (P : Prop) : P -> P := by intro h; exact h"],&KVMap::new(),low).unwrap();
+              assert!(matches!(result,Outcome::Inconclusive(_)));
+          }
+          RS
+          cat > crates/fln-cli/tests/source_check.rs <<'RS'
+          //! Installed and library CLI source-proof checking. No fake compiler or checker.
+          #![forbid(unsafe_code)]
+          use std::{ffi::OsString,path::PathBuf,sync::atomic::{AtomicUsize,Ordering},process::Command};
+          static NEXT:AtomicUsize=AtomicUsize::new(0);
+          fn file(text:&str)->PathBuf {
+              let dir=std::env::temp_dir().join(format!("fln-proof-check-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+              std::fs::create_dir(&dir).unwrap();let path=dir.join("proof.lean");std::fs::write(&path,text).unwrap();path
+          }
+          fn run(args:Vec<OsString>)->fln_cli::MultiplexerOutput { fln_cli::run(args) }
+          #[test]
+          fn installed_binary_checks_a_real_source_proof_file() {
+              let path=file("def identity (x : Nat) : Nat := x\ntheorem self (x : Nat) : identity x = x := by rfl\ntheorem symm (x y : Nat) (h : x = y) : y = x := by rw [h]\n");
+              let before=std::fs::read(&path).unwrap();
+              let output=Command::new(env!("CARGO_BIN_EXE_fln")).args(["check-source","--json"]).arg(&path).output().unwrap();
+              assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+              let text=String::from_utf8(output.stdout).unwrap();
+              for required in ["\"schema\":\"fln.source-check/1\"","\"outcome\":\"complete\"","\"authority\":true","\"commands\":3","\"theorems\":2","\"executed\":false"] { assert!(text.contains(required),"{text}"); }
+              assert!(output.stderr.is_empty());assert_eq!(std::fs::read(&path).unwrap(),before);
+              assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(),1);
+          }
+          #[test]
+          fn later_files_can_use_prior_theorems_and_failure_emits_no_partial_success() {
+              let one=file("theorem self (x : Nat) : x = x := by rfl");
+              let two=file("theorem reuse (x : Nat) : x = x := by apply self");
+              let args=vec!["check-source".into(),"--json".into(),one.clone().into_os_string(),two.clone().into_os_string()];
+              let output=run(args.clone());assert_eq!(output.exit_code,0,"{}",output.stderr);
+              assert!(output.stdout.contains("\"files\":2"));
+              std::fs::write(two,"theorem bad : 1 = 2 := by rfl").unwrap();
+              let output=run(args);assert_eq!(output.exit_code,1);
+              assert!(output.stdout.is_empty());assert!(output.stderr.contains("\"outcome\":\"kernel-rejection\""));
+              assert!(!output.stderr.contains("\"outcome\":\"complete\""));
+          }
+          #[test]
+          fn byte_budget_is_aggregate_and_duplicate_options_are_refused() {
+              let path=file("def x : Nat := 1");
+              let output=run(vec!["check-source".into(),"--json".into(),"--max-bytes=20".into(),path.clone().into_os_string(),path.clone().into_os_string()]);
+              assert_eq!(output.exit_code,3);assert!(output.stdout.is_empty());assert!(output.stderr.contains("\"authority\":false"));
+              for flags in [vec!["--json","--json"],vec!["--max-bytes=20","--max-bytes=30"]] {
+                  let args=std::iter::once(OsString::from("check-source")).chain(flags.into_iter().map(OsString::from)).chain(std::iter::once(path.clone().into_os_string())).collect();
+                  assert_ne!(run(args).exit_code,0);
+              }
+          }
+          #[test]
+          fn unsupported_commands_never_execute_and_end_of_options_preserves_dash_paths() {
+              let path=file("#eval 1");
+              let output=run(vec!["check-source".into(),"--json".into(),"--".into(),path.clone().into_os_string()]);
+              assert_ne!(output.exit_code,0);assert!(output.stdout.is_empty());assert!(output.stderr.contains("\"authority\":false"));
+              let dir=path.parent().unwrap();std::fs::write(dir.join("-proof.lean"),"theorem same : 7 = 7 := by rfl").unwrap();
+              let output=Command::new(env!("CARGO_BIN_EXE_fln")).current_dir(dir).args(["check-source","--","-proof.lean"]).output().unwrap();
+              assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+          }
+          RS
+      - name: Verify native command and downstream compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 crates/fln/src/lib.rs crates/fln/src/source_check.rs crates/fln-cli/src/lib.rs crates/fln-cli/src/source_check.rs crates/fln/tests/source_file_check.rs crates/fln-cli/tests/source_check.rs
+          git add -N crates/fln/tests/source_file_check.rs crates/fln-cli/tests/source_check.rs
+          git diff --check
+          git diff > target/source-check-landing/implementation.patch
+          cargo test --locked -p fln --lib --test source_file_check --test source_equality --test source_rewriting --no-fail-fast 2>&1 | tee target/source-check-landing/engine-tests.log
+          cargo test --locked -p fln-cli --lib --test source_check --no-fail-fast 2>&1 | tee target/source-check-landing/cli-tests.log
+          cargo clippy --locked -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/source-check-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-check-landing/workspace.log
+      - name: Commit verified production command
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln/src/lib.rs|crates/fln/src/source_check.rs|crates/fln-cli/src/lib.rs|crates/fln-cli/src/source_check.rs|crates/fln/tests/source_file_check.rs|crates/fln-cli/tests/source_check.rs) ;;
+              *) echo "Unexpected changed path: $path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git add -- crates/fln/src/lib.rs crates/fln/src/source_check.rs crates/fln-cli/src/lib.rs crates/fln-cli/src/source_check.rs crates/fln/tests/source_file_check.rs crates/fln-cli/tests/source_check.rs
+          git commit -m 'feat(cli): check complete source theorem files without executing proofs'
+          git push origin HEAD:main
+          git rev-parse HEAD > target/source-check-landing/published.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: check-source-command-${{ github.sha }}
+          path: target/source-check-landing
+          retention-days: 7
