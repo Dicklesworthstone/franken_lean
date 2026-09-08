@@ -3905,10 +3905,7 @@ impl<'a> TypeChecker<'a> {
             return Ok(decided);
         }
         // KR-315 unit-like structures (pin: is_def_eq_unit_like, one-sided).
-        if self.is_def_eq_unit_like(tn, sn, depth + 1)? {
-            return Ok(true);
-        }
-        Ok(false)
+        self.is_def_eq_unit_like(tn, sn, depth + 1)
     }
 
     fn open_app_congruence(
