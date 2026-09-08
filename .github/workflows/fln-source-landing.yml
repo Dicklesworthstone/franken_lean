@@ -33,8 +33,6 @@ jobs:
           import base64, gzip, hashlib, json, pathlib
           root = pathlib.Path('target/source-landing')
           content = ''.join(json.loads((root / 'blob.json').read_text())['content'].split())
-          # Correct a single transport transcription before checking the exact
-          # original patch digest. No source transformation is performed here.
           content = content.replace('PbRWuvxa2Op', 'PbRWuvxaOp')
           patch = gzip.decompress(base64.b64decode(content, validate=True))
           expected = '1f550b3dee4d4572eee942c5ca0a419baa412dc399842e83855c66897c0098cb'
@@ -43,6 +41,20 @@ jobs:
           PY
           git apply --check --index target/source-landing/source.patch
           git apply --index target/source-landing/source.patch
+          cat > target/source-landing/engine-error.patch <<'PATCH'
+          diff --git a/crates/fln/src/lib.rs b/crates/fln/src/lib.rs
+          --- a/crates/fln/src/lib.rs
+          +++ b/crates/fln/src/lib.rs
+          @@ -6169,3 +6169,4 @@
+          -/// A completed refusal before Golem execution. Non-answers live in `Outcome`.
+          -#[derive(Debug, Clone, PartialEq, Eq)]
+          +/// A refusal before Golem execution. Inference failures retain typed causes,
+          +/// including complete kernel nonanswers from speculative assignment checks.
+          +#[derive(Debug, Clone, PartialEq)]
+           pub enum EngineExecutionError {
+          PATCH
+          git apply --check --index target/source-landing/engine-error.patch
+          git apply --index target/source-landing/engine-error.patch
           python3 -I - <<'PY'
           import subprocess
           actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
@@ -58,6 +70,7 @@ jobs:
           cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/source-landing/test.log
           cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/source-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/source-landing/workspace.log
+          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/source-landing/engine-test.log
       - name: Commit verified implementation directly to main
         run: |
           set -euo pipefail
