@@ -102,7 +102,7 @@ impl std::error::Error for MetavarError {}
 pub struct MetavarStore {
     decls: HashMap<MVarId, MetavarDecl>,
     assignments: HashMap<MVarId, MetavarAssignment>,
-    /// Maps each mvar to other mvars or entities that depend on it / read it.
+    /// Reverse edges from types, local contexts, assignment values and explicit reads.
     readers: HashMap<MVarId, HashSet<MVarId>>,
 }
 
@@ -120,9 +120,7 @@ fn expression_children(expr: &Expr) -> [Option<&Expr>; 3] {
         ExprNode::LetE {
             type_, value, body, ..
         } => [Some(type_), Some(value), Some(body)],
-        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
-            [Some(expr), None, None]
-        }
+        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
         ExprNode::BVar { .. }
         | ExprNode::FVar { .. }
         | ExprNode::MVar { .. }
@@ -173,7 +171,8 @@ impl MetavarStore {
         self.assignments.get(id).map(|a| &a.expr)
     }
 
-    /// Declare a new metavariable.
+    /// Declare a metavariable and record the unresolved dependencies of its
+    /// type and local context, including local let-values hidden by metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn declare(
         &mut self,
@@ -185,7 +184,13 @@ impl MetavarStore {
         depth: u32,
         origin: Option<Name>,
     ) -> &MetavarDecl {
-        let read_mvars = self.collect_mvars(&type_);
+        let mut read_mvars = self.collect_mvars(&type_);
+        for local in lctx.decls() {
+            read_mvars.extend(self.collect_mvars(&local.type_));
+            if let Some(value) = &local.value {
+                read_mvars.extend(self.collect_mvars(value));
+            }
+        }
         for read in read_mvars {
             self.readers.entry(read).or_default().insert(id.clone());
         }
@@ -211,7 +216,9 @@ impl MetavarStore {
         self.collect_mvars(expr).contains(id)
     }
 
-    /// Assign a metavariable with justification.
+    /// Assign a metavariable with justification and return all affected readers.
+    /// An alias `?a := ?b` records `b -> a`, so assigning `b` later wakes readers
+    /// of `a` as well. Validation precedes every mutation of either state map.
     pub fn assign(
         &mut self,
         id: MVarId,
@@ -230,10 +237,14 @@ impl MetavarStore {
         if self.assignments.contains_key(&id) {
             return Err(MetavarError::AlreadyAssigned { id });
         }
-        if self.occurs_check(&id, &val) {
+        let dependencies = self.collect_mvars(&val);
+        if dependencies.contains(&id) {
             return Err(MetavarError::OccursCheckFailed { id });
         }
         let wake_ups = self.targeted_wake_up(&id);
+        for dependency in dependencies {
+            self.readers.entry(dependency).or_default().insert(id.clone());
+        }
         self.assignments.insert(
             id,
             MetavarAssignment {
@@ -249,9 +260,22 @@ impl MetavarStore {
         self.readers.entry(read).or_default().insert(reader);
     }
 
-    /// Targeted wake-up: return the exact set of mvars that read `id`.
+    /// Return the transitive reverse-dependency closure, excluding the changed
+    /// root itself. Explicit reader cycles terminate; unrelated goals stay asleep.
+    /// The set is unordered: consumers must impose their stable scheduling order.
     pub fn targeted_wake_up(&self, id: &MVarId) -> HashSet<MVarId> {
-        self.readers.get(id).cloned().unwrap_or_default()
+        let mut affected = HashSet::new();
+        let mut pending = vec![id];
+        while let Some(current) = pending.pop() {
+            if let Some(readers) = self.readers.get(current) {
+                for reader in readers {
+                    if reader != id && affected.insert(reader.clone()) {
+                        pending.push(reader);
+                    }
+                }
+            }
+        }
+        affected
     }
 
     /// Instantiate assigned metavariables with an explicit postorder worklist.
@@ -261,6 +285,7 @@ impl MetavarStore {
     /// Node addresses are local memo keys only, never ordering or persisted
     /// identity. Input roots and assignments stay borrowed for the whole walk,
     /// so an input allocation cannot disappear and have its address reused.
+    #[allow(clippy::too_many_lines)]
     pub fn instantiate(&self, expr: &Expr) -> Expr {
         if self.assignments.is_empty() || !expr.has_expr_mvar() {
             return expr.clone();
@@ -373,9 +398,7 @@ impl MetavarStore {
         let mut visited = HashSet::new();
         let mut pending = vec![expr];
         while let Some(current) = pending.pop() {
-            if !current.has_expr_mvar()
-                || !visited.insert(std::ptr::from_ref(current.node()))
-            {
+            if !current.has_expr_mvar() || !visited.insert(std::ptr::from_ref(current.node())) {
                 continue;
             }
             match current.node() {
@@ -472,7 +495,10 @@ mod tests {
             .unwrap();
         let input = metadata(Expr::mvar(a));
         assert_eq!(store.collect_mvars(&input), HashSet::from([b.clone()]));
-        assert_eq!(store.instantiate(&input), metadata(metadata(Expr::mvar(b.clone()))));
+        assert_eq!(
+            store.instantiate(&input),
+            metadata(metadata(Expr::mvar(b.clone()))),
+        );
         let value = Expr::sort(Level::zero());
         store
             .assign(b, value.clone(), AssignmentJustification::DirectDefEq)
@@ -579,5 +605,102 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn assigning_an_alias_target_wakes_transitive_readers_only() {
+        let mut store = MetavarStore::new();
+        let a = declare(&mut store, "a");
+        let b = declare(&mut store, "b");
+        let c = declare(&mut store, "c");
+        let unrelated = declare(&mut store, "unrelated");
+        let reader = MVarId(Name::from_components(["reader"]));
+        store.declare(
+            reader.clone(),
+            reader.0.clone(),
+            metadata(Expr::mvar(a.clone())),
+            LocalContext::new(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        store
+            .assign(
+                a.clone(),
+                metadata(Expr::mvar(b.clone())),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        store
+            .assign(
+                b.clone(),
+                Expr::mvar(c.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let affected = store
+            .assign(c, Expr::sort(Level::zero()), AssignmentJustification::DirectDefEq)
+            .unwrap();
+        assert_eq!(affected, HashSet::from([a, b, reader]));
+        assert!(!affected.contains(&unrelated));
+    }
+
+    #[test]
+    fn local_types_and_let_values_participate_in_the_dependency_graph() {
+        let mut store = MetavarStore::new();
+        let type_dep = declare(&mut store, "type_dep");
+        let value_dep = declare(&mut store, "value_dep");
+        let mut lctx = LocalContext::new();
+        let x = Name::from_components(["x"]);
+        lctx.add_param(
+            FVarId(x.clone()),
+            x,
+            metadata(Expr::mvar(type_dep.clone())),
+            BinderInfo::Default,
+        );
+        let y = Name::from_components(["y"]);
+        lctx.add_let(
+            FVarId(y.clone()),
+            y,
+            Expr::sort(Level::one()),
+            metadata(Expr::mvar(value_dep.clone())),
+        );
+        let reader = MVarId(Name::from_components(["reader"]));
+        store.declare(
+            reader.clone(),
+            reader.0.clone(),
+            Expr::sort(Level::one()),
+            lctx,
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        assert_eq!(store.targeted_wake_up(&type_dep), HashSet::from([reader.clone()]));
+        assert_eq!(store.targeted_wake_up(&value_dep), HashSet::from([reader]));
+    }
+
+    #[test]
+    fn explicit_reader_cycles_terminate_without_waking_the_root() {
+        let mut store = MetavarStore::new();
+        let a = declare(&mut store, "a");
+        let b = declare(&mut store, "b");
+        store.register_reader(a.clone(), a.clone());
+        store.register_reader(a.clone(), b.clone());
+        store.register_reader(b.clone(), a.clone());
+        assert_eq!(store.targeted_wake_up(&a), HashSet::from([b]));
+    }
+
+    #[test]
+    fn child_assignment_dependencies_do_not_leak_into_a_snapshot() {
+        let mut parent = MetavarStore::new();
+        let a = declare(&mut parent, "a");
+        let b = declare(&mut parent, "b");
+        let mut child = parent.clone();
+        child
+            .assign(a.clone(), Expr::mvar(b.clone()), AssignmentJustification::DirectDefEq)
+            .unwrap();
+        assert_eq!(child.targeted_wake_up(&b), HashSet::from([a.clone()]));
+        assert!(parent.targeted_wake_up(&b).is_empty());
+        assert!(!parent.is_assigned(&a));
     }
 }
