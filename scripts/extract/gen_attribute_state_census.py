@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I -S
 """Extract the pinned attribute-state census (bead fln-attribute-state-census-h14).
 
-The Reference is data here, never a runtime component (D8): the extractor reads
+The Reference is never a runtime component (D8): the default extractor reads
 the pinned tree's Lean sources and mechanically derives every observable
 attribute registration family — core `registerBuiltinAttribute` records,
 `registerTagAttribute`, `registerSimpAttr`, `registerLabelAttr` (and the
@@ -9,7 +9,8 @@ attribute registration family — core `registerBuiltinAttribute` records,
 `registerEnvExtension` rows that back them. Unknown/custom attributes
 instantiate the parameterized OpaqueFallback row shape; nothing is guessed:
 a call site the extractor cannot classify fails generation rather than being
-dropped.
+dropped. The explicit --tag-oracle-output mode executes the pinned Reference
+only as a Tribunal fixture mine, recording its own reported producer.
 
 Determinism is the contract: byte-identical regeneration independent of
 locale, timezone, absolute path, traversal order, and scheduler. The manifest
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 VENDOR = ROOT / "vendor" / "lean4-src"
 SCAN_ROOTS = ["src/Init", "src/Lean", "src/Std"]
 OUTPUT = ROOT / "contracts" / "ATTRIBUTE_STATE_CENSUS.txt"
+TAG_ORACLE = ROOT / "crates/fln-conformance/fixtures/tag_attributes/prelude.tsv"
 SCHEMA = "fln-attribute-state-census/1"
 
 # The extraction budgets (the bead's zero/exact/one-over law: every budget is
@@ -284,6 +287,7 @@ class Row:
             ("evidence-grade", self.evidence_grade),
             ("evidence-anchor", facts["evidence_anchor"]),
         ]
+        fields.extend(sorted(self.extra.items()))
         out = []
         for key, value in fields:
             if value is None or value == "":
@@ -359,6 +363,92 @@ def strip_comments(text: str) -> str:
 
 def line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
+
+
+def tag_extension_name(raw: str, line: int) -> str:
+    """Extract the source-level declaration spelling at a tag registration.
+
+    Only named, direct TagAttribute initializers are supported. A changed
+    registration shape refuses extraction. The oracle resolves the actual
+    `decl_name%` value, which can include a private numeric prefix.
+    Comments and strings are masked while keeping offsets and line boundaries.
+    """
+    chars = list(raw)
+    i, depth, in_string = 0, 0, False
+    while i < len(raw):
+        if depth:
+            if raw.startswith("/-", i):
+                chars[i:i + 2] = [" ", " "]
+                depth += 1
+                i += 2
+                continue
+            if raw.startswith("-/", i):
+                chars[i:i + 2] = [" ", " "]
+                depth -= 1
+                i += 2
+                continue
+            if raw[i] != "\n":
+                chars[i] = " "
+        elif in_string:
+            if raw[i] == "\\" and i + 1 < len(raw):
+                chars[i] = " "
+                if raw[i + 1] != "\n":
+                    chars[i + 1] = " "
+                i += 2
+                continue
+            if raw[i] == '"':
+                in_string = False
+            if raw[i] != "\n":
+                chars[i] = " "
+        elif raw.startswith("/-", i):
+            chars[i:i + 2] = [" ", " "]
+            depth = 1
+            i += 2
+            continue
+        elif raw.startswith("--", i):
+            end = raw.find("\n", i)
+            end = len(raw) if end == -1 else end
+            chars[i:end] = " " * (end - i)
+            i = end
+            continue
+        elif raw[i] == '"':
+            chars[i] = " "
+            in_string = True
+        i += 1
+    if depth or in_string:
+        raise ValueError("unterminated comment/string while resolving tag registration")
+    lines = "".join(chars).splitlines(keepends=True)
+    prefix = "".join(lines[:line - 1]) + lines[line - 1].split("registerTagAttribute", 1)[0]
+    ident = r"[A-Za-z_][A-Za-z0-9_'.]*"
+    initializer = re.search(
+        rf"(?m)^builtin_initialize\s+({ident})\s*:\s*TagAttribute\s*←\s*\Z", prefix
+    )
+    if initializer is None:
+        raise ValueError("tag registration is not a direct named TagAttribute initializer")
+    call = []
+    for index, source_line in enumerate(lines[line - 1:]):
+        if index and source_line.strip() and not source_line[0].isspace():
+            break
+        call.append(source_line)
+    if re.search(r"\bref\s*:=", "".join(call)):
+        raise ValueError("explicit tag registration ref requires extraction support")
+    scopes: list[tuple[str, str]] = []
+    for command in re.finditer(
+        rf"(?m)^(?:public\s+)?(namespace|section|mutual|end)(?:[ \t]+({ident}))?[ \t]*$", prefix
+    ):
+        kind, name = command.group(1), command.group(2) or ""
+        if kind == "end":
+            for component in reversed(name.split(".")) if name else [""]:
+                if not scopes or (component and scopes[-1][1] != component):
+                    raise ValueError("unmatched scope while resolving tag registration")
+                scopes.pop()
+        else:
+            if kind == "namespace" and not name:
+                raise ValueError("anonymous namespace in tag registration context")
+            scopes.extend((kind, component) for component in (name.split(".") if kind == "namespace" else [name]))
+    parts = [name for kind, name in scopes if kind == "namespace"]
+    parts.append(initializer.group(1))
+    return ".".join(parts)
 
 
 def match_braces(text: str, start: int, open_ch: str = "{", close_ch: str = "}") -> int:
@@ -542,6 +632,12 @@ def extract(vendor: Path) -> tuple[list, list, int]:
                 elif row == "machinery":
                     machinery += 1
                 else:
+                    if family == "tag":
+                        try:
+                            row.extra["extension-declaration"] = tag_extension_name(raw, line)
+                        except ValueError as error:
+                            problems.append(f"{module}:{line}: {error}")
+                            continue
                     rows.append(row)
         # Local wrapper families: `let mkAttr (builtin : Bool) (name : Name)`
         # followed by literal calls `mkAttr true `builtin_x` / `mkAttr false `x`.
@@ -948,12 +1044,138 @@ def parse_builtin_record(module, line, body, epoch):
     )
 
 
+def generate_tag_oracle(rows: list[Row], output: Path) -> int:
+    """Mine the pin's actual imported tag queries, only in the Tribunal extractor.
+
+    The executable references come from the source census, not a second list.
+    The generated program retains structural Names and reports its own producer.
+    This is an additive Prelude fixture, not authentication of arbitrary artifacts.
+    """
+    pin_line = next(line for line in (ROOT / "SUITE.lock").read_text().splitlines()
+                    if line.startswith("reference "))
+    pin = dict(token.split("=", 1) for token in pin_line.split() if "=" in token)
+    lean = Path.home() / ".elan/toolchains" / f"leanprover--lean4---{pin['tag']}" / "bin/lean"
+    try:
+        version = subprocess.run([str(lean), "--githash"], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"attribute-census: Reference setup refusal: {error}", file=sys.stderr)
+        return 2
+    if version.stdout.strip() != pin["commit"]:
+        print(f"attribute-census: Reference commit mismatch: {version.stdout!r}", file=sys.stderr)
+        return 2
+    input_parts = {
+        suffix: (lean.parent.parent / "lib/lean/Init" / f"Prelude.olean{suffix}").read_bytes()
+        for suffix in ("", ".server", ".private")
+    }
+    tags = [row for row in rows if row.family == "tag"]
+    source = "-- GENERATED by gen_attribute_state_census.py --tag-oracle-output; oracle-only (D8).\nmodule\nimport Lean\n"
+    source += "".join(f"import all {module}\n" for module in sorted({
+        row.module.removeprefix("src/").removesuffix(".lean").replace("/", ".")
+        for row in tags
+    }))
+    source += r'''open Lean
+
+def hexDigit (n : Nat) : Char := Char.ofNat (if n < 10 then 48 + n else 87 + n)
+def hexText (s : String) : String := String.ofList <| s.toUTF8.toList.flatMap fun b =>
+  [hexDigit (b.toNat / 16), hexDigit (b.toNat % 16)]
+def encodeName : Name → String
+  | .anonymous => "a"
+  | .str p s => encodeName p ++ "/s" ++ hexText s
+  | .num p n => encodeName p ++ "/n" ++ toString n
+
+def attributes : List (String × TagAttribute) := [
+'''
+    source += ",\n".join(f'  ("{row.name}\\t{row.extra["extension-declaration"]}", {row.extra["extension-declaration"]})' for row in tags)
+    source += r'''
+]
+
+public unsafe def main : IO Unit := do
+  initSearchPath (← getBuildDir)
+  enableInitializersExecution
+  let env ← importModules #[{ module := `Init.Prelude }] {} (loadExts := true) (level := .private)
+  IO.println "schema fln-imported-tag-queries/1"
+  IO.println s!"oracle\t{Lean.versionString}\t{Lean.githash}"
+  IO.println "module\tInit.Prelude\tprivate"
+  let decls := env.constants.toList.toArray.map Prod.fst |>.qsort Name.quickLt
+  for (label, attr) in attributes do
+    IO.println s!"binding\t{label}\t{encodeName attr.attr.ref}"
+    let label := (label.splitOn "\t").head!
+    for decl in decls do
+      if attr.hasTag env decl then
+        IO.println s!"query\t{label}\t{encodeName decl}\ttrue"
+    let absent := `_frankenLeanAbsentTagProbe
+    IO.println s!"query\t{label}\t{encodeName absent}\t{attr.hasTag env absent}"
+'''
+    output.parent.mkdir(parents=True, exist_ok=True)
+    program = output.with_suffix(".lean")
+    program.write_text(source, encoding="utf-8")
+    oracle_env = {key: value for key, value in os.environ.items()
+                  if key not in ("LEAN_PATH", "LEAN_SRC_PATH")}
+    result = subprocess.run([str(lean), "--run", str(program)], capture_output=True,
+                            text=True, env=oracle_env)
+    candidate = output.with_suffix(output.suffix + ".candidate")
+    candidate.write_text(result.stdout, encoding="utf-8")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    producer = f"oracle\t{pin['tag'].removeprefix('v')}\t{pin['commit']}"
+    if result.returncode or producer not in result.stdout.splitlines():
+        print(f"attribute-census: oracle refused; exit={result.returncode}; retained {candidate}", file=sys.stderr)
+        return 2
+    if any((lean.parent.parent / "lib/lean/Init" / f"Prelude.olean{suffix}").read_bytes() != payload
+           for suffix, payload in input_parts.items()):
+        print("attribute-census: Reference input changed during tag query extraction", file=sys.stderr)
+        return 2
+    check_cancelled("tag-oracle-publication")
+    for suffix, payload in input_parts.items():
+        artifact = output.with_suffix(f".olean{suffix}")
+        staged = artifact.with_suffix(artifact.suffix + ".candidate")
+        staged.write_bytes(payload)
+        os.replace(staged, artifact)
+    os.replace(candidate, output)
+    print(f"attribute-census: wrote {output} ({len(tags)} tag bindings; pinned Reference queries)")
+    return 0
+
+
+def bind_tag_names(rows: list[Row]) -> None:
+    """Attach observed wire Names to matching source registrations.
+
+    Custom source-only census controls keep their rows but have no observed
+    binding; AttributeState refuses to consume such unbound tag definitions.
+    A visible declaration spelling never substitutes for a private wire Name.
+    """
+    lines = TAG_ORACLE.read_text(encoding="utf-8").splitlines()
+    epoch = extract_epoch()
+    pin = dict(token.split("=", 1) for token in epoch.split() if "=" in token)
+    if lines[:2] != ["schema fln-imported-tag-queries/1",
+                     f"oracle\t{pin['tag'].removeprefix('v')}\t{pin['commit']}"]:
+        raise SystemExit("attribute-census: imported tag oracle has a stale producer or schema")
+    bindings = {}
+    for line in lines:
+        fields = line.split("\t")
+        if fields[0] == "binding":
+            if len(fields) != 4 or fields[1] in bindings:
+                raise SystemExit("attribute-census: malformed or duplicate oracle tag binding")
+            bindings[fields[1]] = (fields[2], fields[3])
+    for row in rows:
+        if row.family != "tag":
+            continue
+        binding = bindings.get(row.name)
+        if binding is not None:
+            if binding[0] != row.extra["extension-declaration"]:
+                raise SystemExit(f"attribute-census: stale oracle declaration for {row.name}")
+            row.extra["extension-name"] = binding[1]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="verify the committed census regenerates byte-identically")
     parser.add_argument(
         "--output",
         help="write to this path instead of the committed census (the lane's non-destructive leg)",
+    )
+    parser.add_argument(
+        "--tag-oracle-output",
+        help="mine additive Prelude tag queries with the pinned Reference, retaining generated Lean source and the actual companion input bytes",
     )
     parser.add_argument(
         "--vendor-path",
@@ -964,6 +1186,8 @@ def main() -> int:
         help="publish a readiness marker after cancellation handlers are installed",
     )
     args = parser.parse_args()
+    if args.tag_oracle_output and (args.check or args.output or args.vendor_path):
+        parser.error("--tag-oracle-output requires the real pinned sources and cannot combine with census output modes")
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, _on_signal)
@@ -999,6 +1223,10 @@ def main() -> int:
         seen[row.row_id] = row.anchor
     rows.sort(key=lambda row: (row.module, row.anchor, row.name))
 
+    if args.tag_oracle_output:
+        return generate_tag_oracle(rows, Path(args.tag_oracle_output))
+    bind_tag_names(rows)
+
     epoch = extract_epoch()
     header = [
         f"schema {SCHEMA}",
@@ -1007,6 +1235,7 @@ def main() -> int:
         f"# scripts/extract/gen_attribute_state_census.py — the Reference is data,",
         f"# never a runtime component (D8). Byte-identical regeneration is the",
         f"# contract; run the generator with --check to verify.",
+        f"# Tag extension Names also bind the generated Prelude oracle's structural ref values.",
         f"#",
         f"# Row grammar: space-separated key=value, '%'-escaped. Unknown/custom",
         f"# attributes instantiate the OpaqueFallback shape at the end; nothing",

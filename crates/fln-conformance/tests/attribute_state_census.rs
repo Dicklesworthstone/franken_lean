@@ -30,6 +30,40 @@ fn census_text() -> String {
         .unwrap_or_else(|e| panic!("the attribute census must exist at {}: {e}", path.display()))
 }
 
+#[test]
+fn tag_extension_keys_follow_initializer_scopes_and_refuse_ambiguous_refs() {
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-S", "-c", r#"
+import runpy
+resolve = runpy.run_path('scripts/extract/gen_attribute_state_census.py')['tag_extension_name']
+def key(source):
+    line = next(i for i, text in enumerate(source.splitlines(), 1) if 'registerTagAttribute' in text)
+    return resolve(source, line)
+prefix = 'namespace A.B.C\nend C\nsection X\nmutual\nend\nend X\n'
+assert key(prefix + 'builtin_initialize tags : TagAttribute ← registerTagAttribute `label "description"\n') == 'A.B.tags'
+assert key('namespace A\n/- namespace Wrong /- nested -/ -/\ndef text := "namespace AlsoWrong\\nend A"\nbuiltin_initialize tags : TagAttribute ←\n  registerTagAttribute `label "description"\n') == 'A.tags'
+for source in [
+    'def tags := registerTagAttribute `label "description"\n',
+    'builtin_initialize tags : TagAttribute ← registerTagAttribute `label "description" (ref := `other)\n',
+    'end Missing\nbuiltin_initialize tags : TagAttribute ← registerTagAttribute `label "description"\n',
+]:
+    try:
+        key(source)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('ambiguous tag registration accepted: ' + source)
+print('tag registration scope controls passed')
+"#])
+        .current_dir(root()).output().expect("run checked-in extraction logic");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 const SCHEMA: &str = "fln-attribute-state-census/1";
 /// The extraction measured 145 rows at generation; a materially smaller file
 /// is a silently shrinking extraction, never a leaner census.

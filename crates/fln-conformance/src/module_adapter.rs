@@ -11,6 +11,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use fln_env::attribute::{
+    Assignment, AttributeFamily, AttributeKind, AttributeState, AttributeStatePlan, HandlerClass,
+    Payload,
+};
 use fln_env::module_apply::{ModuleApplyPreflightError, ModuleApplyTransaction};
 use fln_env::modules::{ArtifactEvidence, ModuleEpoch, ModuleId};
 use fln_env::provenance::{
@@ -18,7 +22,9 @@ use fln_env::provenance::{
 };
 use fln_hash::domain::{Digest, Domain, DomainHasher, hash};
 use fln_olean::decl::{ChainLimits, DeclError};
-use fln_olean::region::{ExtensionBlock, OleanView, RegionError, WalkBudget};
+use fln_olean::region::{
+    CapturedNameError, ExtensionBlock, OleanView, RegionError, WalkBudget, decode_captured_names,
+};
 
 mod legacy;
 
@@ -39,6 +45,20 @@ pub enum ModuleAdapterError {
     Manifest(ModuleProvenanceError),
     Preflight(ModuleApplyPreflightError),
     Io(String),
+    CapturedName(CapturedNameError),
+    UnboundAttributeCensus,
+    AttributeCensusEpochMismatch {
+        artifact: ModuleEpoch,
+        census: ModuleEpoch,
+    },
+    AttributePayloadMismatch {
+        extension: fln_core::name::Name,
+        ordinal: u64,
+    },
+    MissingAttributeTarget {
+        attribute: fln_core::name::Name,
+        target: fln_core::name::Name,
+    },
     ArtifactDigestMismatch {
         expected: Digest,
         actual: Digest,
@@ -75,6 +95,23 @@ impl fmt::Display for ModuleAdapterError {
             }
             Self::Preflight(error) => write!(formatter, "module apply preflight error: {error:?}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
+            Self::CapturedName(error) => write!(formatter, "attribute payload: {error}"),
+            Self::UnboundAttributeCensus => write!(
+                formatter,
+                "tag import requires a census with a declared epoch"
+            ),
+            Self::AttributeCensusEpochMismatch { artifact, census } => write!(
+                formatter,
+                "attribute census epoch {census:?} differs from module artifact epoch {artifact:?}"
+            ),
+            Self::AttributePayloadMismatch { extension, ordinal } => write!(
+                formatter,
+                "tag payload {extension:?} entry {ordinal} disagrees with its decoded contribution"
+            ),
+            Self::MissingAttributeTarget { attribute, target } => write!(
+                formatter,
+                "tag attribute {attribute:?} names absent module declaration {target:?}"
+            ),
             Self::ArtifactDigestMismatch { expected, actual } => write!(
                 formatter,
                 "artifact digest mismatch: expected {expected:?}, actual {actual:?}"
@@ -180,6 +217,109 @@ fn require_lossless_extension_payloads(
 ///
 /// Unknown extension state is captured losslessly, with opaque provenance.
 pub struct OleanModuleAdapter;
+
+impl DecodedOleanModule {
+    /// Interpret only census-bound tag entries and prepare their native state
+    /// update. Other schemas retain their original opaque extension payloads.
+    /// This imports stored data; it does not run an attribute's source-side
+    /// validation callback or grant declaration admission authority.
+    pub fn tag_attribute_plan(
+        &self,
+        base: &AttributeState,
+        budget: WalkBudget,
+        max_payload_bytes: usize,
+    ) -> Result<AttributeStatePlan, ModuleAdapterError> {
+        let census = base
+            .census_epoch()
+            .ok_or(ModuleAdapterError::UnboundAttributeCensus)?;
+        let artifact = &self.evidence.epoch;
+        fn epoch_tag(epoch: &ModuleEpoch) -> &str {
+            epoch.tag().strip_prefix('v').unwrap_or(epoch.tag())
+        }
+        if epoch_tag(census) != epoch_tag(artifact) || census.commit() != artifact.commit() {
+            return Err(ModuleAdapterError::AttributeCensusEpochMismatch {
+                artifact: artifact.clone(),
+                census: census.clone(),
+            });
+        }
+        let bindings: std::collections::BTreeMap<_, _> = base
+            .definitions()
+            .iter()
+            .filter(|(_, definition)| {
+                definition.family == AttributeFamily::Tag
+                    && definition.handler_class == HandlerClass::DataOnly
+            })
+            .filter_map(|(_, definition)| {
+                definition
+                    .serialized_extension
+                    .as_ref()
+                    .map(|key| (key, definition))
+            })
+            .collect();
+        let selected: Vec<_> = self
+            .extension_entries
+            .iter()
+            .filter_map(|entry| {
+                bindings
+                    .get(&entry.descriptor().name)
+                    .map(|definition| (*definition, entry))
+            })
+            .collect();
+        let payloads: Vec<_> = selected.iter().map(|(_, entry)| entry.payload()).collect();
+        for (_, entry) in &selected {
+            let expected = self
+                .extension_contributions
+                .get(entry.contribution_index())
+                .filter(|contribution| contribution.descriptor() == entry.descriptor())
+                .and_then(|contribution| {
+                    usize::try_from(entry.source_ordinal())
+                        .ok()
+                        .and_then(|ordinal| contribution.entries().get(ordinal))
+                });
+            let actual = fln_env::provenance::ExtensionEntryId::derive(
+                &self.evidence.epoch,
+                entry.descriptor(),
+                entry.payload(),
+            );
+            if expected != Some(&actual) {
+                return Err(ModuleAdapterError::AttributePayloadMismatch {
+                    extension: entry.descriptor().name.clone(),
+                    ordinal: entry.source_ordinal(),
+                });
+            }
+        }
+        let names = decode_captured_names(&payloads, budget, max_payload_bytes)
+            .map_err(ModuleAdapterError::CapturedName)?;
+        let declarations: std::collections::BTreeSet<_> = self
+            .constants
+            .iter()
+            .chain(&self.extra_constants)
+            .map(|info| info.name())
+            .collect();
+        let mut assignments = Vec::new();
+        for ((definition, entry), target) in selected.into_iter().zip(names) {
+            if !declarations.contains(&target) {
+                return Err(ModuleAdapterError::MissingAttributeTarget {
+                    attribute: definition.name.clone(),
+                    target,
+                });
+            }
+            assignments.push(Assignment {
+                attribute: definition.name.clone(),
+                target,
+                payload: Payload::Unit,
+                kind: AttributeKind::Global,
+                provenance: format!(
+                    "module-tag:{}:{}:{}",
+                    self.module_id.name().to_display_string(),
+                    definition.row_id,
+                    entry.source_ordinal()
+                ),
+            });
+        }
+        Ok(AttributeStatePlan::cut(base, assignments))
+    }
+}
 
 fn require_artifact_digest(
     evidence: &ArtifactEvidence,

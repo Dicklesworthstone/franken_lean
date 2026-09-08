@@ -17,6 +17,8 @@ a.out
 !/tribunal/fixtures/c3/*.olean
 # Pinned real-mathlib G0-1 fixtures are source evidence likewise (manifest-bound).
 !/tribunal/fixtures/mathlib/*.olean
+# The tag import regression decodes the actual generated Prelude input offline.
+!/crates/fln-conformance/fixtures/tag_attributes/prelude.olean
 *.ilean
 *.olean-next
 

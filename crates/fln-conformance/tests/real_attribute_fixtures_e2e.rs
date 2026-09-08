@@ -85,6 +85,34 @@ fn name(s: &str) -> Name {
     n
 }
 
+/// The oracle serializes components, never a display spelling that loses dots,
+/// numeric constructors, anonymous names, or UTF-8 boundaries.
+fn oracle_name(encoded: &str) -> Name {
+    let mut components = encoded.split('/');
+    assert_eq!(components.next(), Some("a"));
+    components.fold(Name::anonymous(), |parent, component| {
+        if let Some(hex) = component.strip_prefix('s') {
+            assert_eq!(hex.len() % 2, 0);
+            let bytes: Vec<u8> = hex
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).unwrap();
+                    u8::from_str_radix(pair, 16).unwrap()
+                })
+                .collect();
+            Name::str(parent, String::from_utf8(bytes).unwrap())
+        } else {
+            Name::num(
+                parent,
+                component.strip_prefix('n').unwrap().parse().unwrap(),
+            )
+        }
+    })
+}
+
 fn make_axiom(name_val: Name) -> Arc<ConstantInfo> {
     Arc::new(ConstantInfo::Axiom(AxiomVal {
         base: ConstantVal {
@@ -411,6 +439,333 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
 // ---------------------------------------------------------------------------
 // 3. Duplicate, conflict, removal, and replacement laws per family
 // ---------------------------------------------------------------------------
+
+#[test]
+fn real_imported_tag_entries_drive_native_attribute_queries() {
+    use fln_olean::decl::ChainLimits;
+    use fln_olean::region::WalkBudget;
+    let fixtures = workspace_root().join("crates/fln-conformance/fixtures/tag_attributes");
+    let read = |suffix| {
+        fs::read(fixtures.join(format!("prelude.olean{suffix}")))
+            .expect("the generated Reference fixture chain must be checked in")
+    };
+    let parts = [read(""), read(".server"), read(".private")];
+    let decoded = OleanModuleAdapter::decode_chain_bytes(
+        ModuleId::new(Name::from_components(["Init", "Prelude"])),
+        &parts[0],
+        &parts[1],
+        &parts[2],
+        ArtifactEvidence {
+            epoch: pinned_epoch(),
+            content_digest: OleanModuleAdapter::chain_content_digest(
+                &parts[0], &parts[1], &parts[2],
+            ),
+            producer: ArtifactProducer::Reference,
+            grade: ArtifactGrade::Provisional,
+        },
+        ChainLimits::new(parts.iter().map(Vec::len).sum()),
+    )
+    .unwrap();
+    let base = load_census_state();
+    let census =
+        fs::read_to_string(workspace_root().join("contracts/ATTRIBUTE_STATE_CENSUS.txt")).unwrap();
+    for (from, to) in [
+        ("tag=v4.32.0", "tag=v9.0.0"),
+        (
+            "commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35",
+            "commit=0000000000000000000000000000000000000000",
+        ),
+    ] {
+        let (foreign, _) = AttributeState::from_census(&census.replace(from, to)).unwrap();
+        assert!(
+            matches!(decoded.tag_attribute_plan(&foreign, WalkBudget::default(), 64 * 1024 * 1024),
+            Err(fln_conformance::module_adapter::ModuleAdapterError::AttributeCensusEpochMismatch { artifact, census })
+                if artifact == decoded.evidence.epoch && Some(&census) == foreign.census_epoch()),
+            "a real pinned module must not decode tags with a foreign census: {to}"
+        );
+    }
+    assert!(matches!(
+        decoded.tag_attribute_plan(&AttributeState::new(), WalkBudget::default(), usize::MAX),
+        Err(fln_conformance::module_adapter::ModuleAdapterError::UnboundAttributeCensus)
+    ));
+    let (unprefixed, _) =
+        AttributeState::from_census(&census.replace("tag=v4.32.0", "tag=4.32.0")).unwrap();
+    assert_eq!(
+        decoded
+            .tag_attribute_plan(&unprefixed, WalkBudget::default(), usize::MAX)
+            .unwrap()
+            .assignments(),
+        decoded
+            .tag_attribute_plan(&base, WalkBudget::default(), usize::MAX)
+            .unwrap()
+            .assignments()
+    );
+    let plan = decoded
+        .tag_attribute_plan(&base, WalkBudget::default(), 64 * 1024 * 1024)
+        .unwrap();
+    let targets: Vec<_> = plan
+        .assignments()
+        .iter()
+        .filter(|a| a.attribute == name("unbox"))
+        .map(|a| a.target.to_display_string())
+        .collect();
+    eprintln!("Prelude imported unbox targets: {targets:?}");
+    assert_eq!(targets.len(), 3);
+    let expected_state = plan.clone().publish(&base).unwrap();
+    let mut environment = Environment::new();
+    for contribution in &decoded.extension_contributions {
+        environment = environment
+            .register_extension(contribution.descriptor().clone())
+            .unwrap();
+    }
+    let module_base = ModuleApplyState::from_parts(
+        environment,
+        ModuleGraph::new(pinned_epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .unwrap(),
+        Arc::new(
+            ModuleProvenanceManifest::new(
+                pinned_epoch(),
+                vec![],
+                ModuleProvenanceLimits::default(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let combined_base = CombinedState::new(module_base, base.clone());
+    let missing = decoded
+        .imports
+        .iter()
+        .map(|i| i.module.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let completeness = ProvenanceCompleteness::new(
+        if missing.is_empty() {
+            CaptureStatus::Complete
+        } else {
+            CaptureStatus::Partial
+        },
+        PayloadTransparency::Opaque,
+        missing,
+    );
+    let record = decoded.to_contribution_record(completeness.clone());
+    let manifest = Arc::new(
+        ModuleProvenanceManifest::new(
+            pinned_epoch(),
+            vec![record],
+            ModuleProvenanceLimits::default(),
+        )
+        .unwrap(),
+    );
+    let transaction =
+        OleanModuleAdapter::build_transaction(&decoded, manifest, completeness).unwrap();
+    let preflight = preflight_module_apply(transaction, &ModuleApplyLimits::default()).unwrap();
+    let candidate = declaration_candidate_for(&preflight, combined_base.module_state());
+    let module_plan =
+        match prepare_module_apply(&preflight, combined_base.module_state(), &candidate) {
+            Outcome::Complete(Ok(fln_env::module_apply::ModuleApplyPlan::Prepared(plan))) => *plan,
+            other => panic!("real module preparation failed: {other:?}"),
+        };
+    let combined = PreparedCombinedModulePlan::prepare(
+        &combined_base,
+        decoded.module_id.clone(),
+        module_plan,
+        plan,
+        CombinedAuthorityAxes::conservative(),
+        CombinedUsageSummary::default(),
+    )
+    .unwrap();
+    let before = combined_base.combined_root();
+    let cancelled = combined.clone().commit(
+        &combined_base,
+        Some(&TestCancelProbe(AtomicBool::new(true))),
+    );
+    assert!(matches!(cancelled, Outcome::Inconclusive(_)));
+    assert_eq!(combined_base.combined_root(), before);
+    assert!(combined_base.attribute_state().assignments().is_empty());
+    let committed = combined
+        .commit(&combined_base, None)
+        .into_complete()
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.state.attribute_state(), &expected_state);
+    assert_eq!(
+        committed
+            .state
+            .module_state()
+            .graph()
+            .record(&decoded.module_id)
+            .unwrap()
+            .artifact,
+        decoded.evidence
+    );
+    for info in decoded.constants.iter().chain(&decoded.extra_constants) {
+        assert_eq!(
+            committed
+                .state
+                .module_state()
+                .environment()
+                .find(info.name()),
+            Some(info.as_ref())
+        );
+    }
+    let state = committed.state.attribute_state();
+    let fixture = fs::read_to_string(
+        workspace_root().join("crates/fln-conformance/fixtures/tag_attributes/prelude.tsv"),
+    )
+    .expect(
+        "regenerate the additive oracle with gen_attribute_state_census.py --tag-oracle-output",
+    );
+    let lock = fs::read_to_string(workspace_root().join("SUITE.lock")).unwrap();
+    let pin = lock
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .unwrap();
+    let field = |key: &str| {
+        pin.split_whitespace()
+            .find_map(|token| token.strip_prefix(key))
+            .unwrap()
+    };
+    let mut lines = fixture.lines();
+    assert_eq!(lines.next(), Some("schema fln-imported-tag-queries/1"));
+    assert_eq!(
+        lines.next().unwrap(),
+        format!(
+            "oracle\t{}\t{}",
+            field("tag=").trim_start_matches('v'),
+            field("commit=")
+        )
+    );
+    assert_eq!(lines.next(), Some("module\tInit.Prelude\tprivate"));
+    let mut oracle_positive = BTreeSet::new();
+    let mut bindings = BTreeSet::new();
+    let mut negatives = BTreeSet::new();
+    for line in lines {
+        let fields: Vec<_> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["binding", attribute, _declaration, extension] => {
+                let attribute = name(attribute);
+                assert!(bindings.insert(attribute.clone()));
+                assert_eq!(
+                    base.definition(&attribute).unwrap().serialized_extension,
+                    Some(oracle_name(extension))
+                );
+            }
+            ["query", attribute, target, verdict] => {
+                let attribute = name(attribute);
+                let target = oracle_name(target);
+                let expected = match *verdict {
+                    "true" => true,
+                    "false" => false,
+                    other => panic!("unknown oracle verdict {other}"),
+                };
+                assert_eq!(state.has_attr(&attribute, &target), expected, "{line}");
+                if expected {
+                    assert!(oracle_positive.insert((attribute, target)));
+                } else {
+                    assert!(negatives.insert(attribute));
+                }
+            }
+            _ => panic!("unknown oracle record {line}"),
+        }
+    }
+    let registered_tags = base
+        .definitions()
+        .iter()
+        .filter(|(_, definition)| definition.family == AttributeFamily::Tag)
+        .map(|(_, definition)| definition.name.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(!oracle_positive.is_empty());
+    assert_eq!(bindings, registered_tags);
+    assert_eq!(negatives, registered_tags);
+    assert_eq!(
+        oracle_positive,
+        state
+            .assignments()
+            .iter()
+            .map(|(_, a)| (a.attribute.clone(), a.target.clone()))
+            .collect()
+    );
+    for payload in &decoded.extension_entries {
+        let extension = committed
+            .state
+            .module_state()
+            .environment()
+            .extension(&payload.descriptor().name)
+            .unwrap();
+        assert_eq!(extension.provenance(), PayloadProvenance::Opaque);
+        assert!(!extension.supports_fine_invalidation());
+        assert_eq!(
+            extension
+                .entries()
+                .nth(payload.source_ordinal() as usize)
+                .unwrap()
+                .payload
+                .as_ref(),
+            payload.payload()
+        );
+    }
+    for target in ["Prod", "Option", "Except"] {
+        assert!(!base.has_attr(&name("unbox"), &name(target)));
+        assert!(state.has_attr(&name("unbox"), &name(target)));
+    }
+    assert!(!state.has_attr(&name("unbox"), &name("Nat")));
+    let mut missing_target = decoded.clone();
+    missing_target
+        .constants
+        .retain(|info| info.name() != &name("Prod"));
+    missing_target
+        .extra_constants
+        .retain(|info| info.name() != &name("Prod"));
+    assert!(
+        matches!(missing_target.tag_attribute_plan(&base, WalkBudget::default(), usize::MAX),
+        Err(fln_conformance::module_adapter::ModuleAdapterError::MissingAttributeTarget { attribute, target })
+            if attribute == name("unbox") && target == name("Prod"))
+    );
+    let tag_index = decoded
+        .extension_entries
+        .iter()
+        .position(|entry| entry.descriptor().name == name("Lean.IR.UnboxResult.unboxAttr"))
+        .unwrap();
+    let original = &decoded.extension_entries[tag_index];
+    let mut corrupt = decoded.clone();
+    corrupt.extension_entries[tag_index] = fln_env::module_apply::ExtensionPayload::new(
+        original.contribution_index(),
+        original.descriptor().clone(),
+        original.source_ordinal(),
+        vec![1; 8],
+    );
+    assert!(matches!(
+        corrupt.tag_attribute_plan(&base, WalkBudget::default(), usize::MAX),
+        Err(fln_conformance::module_adapter::ModuleAdapterError::AttributePayloadMismatch { .. })
+    ));
+    assert!(matches!(
+        decoded.tag_attribute_plan(&base, WalkBudget::default(), 0),
+        Err(
+            fln_conformance::module_adapter::ModuleAdapterError::CapturedName(
+                fln_olean::region::CapturedNameError::Bytes { .. }
+            )
+        )
+    ));
+    assert!(matches!(
+        decoded.tag_attribute_plan(&base, WalkBudget { max_objects: 0 }, usize::MAX),
+        Err(
+            fln_conformance::module_adapter::ModuleAdapterError::CapturedName(
+                fln_olean::region::CapturedNameError::Objects { .. }
+            )
+        )
+    ));
+    assert_eq!(
+        decoded
+            .tag_attribute_plan(&base, WalkBudget::default(), 64 * 1024 * 1024)
+            .unwrap()
+            .publish(&base)
+            .unwrap(),
+        expected_state
+    );
+}
 
 #[test]
 fn duplicate_conflict_removal_replacement_laws_per_family() {

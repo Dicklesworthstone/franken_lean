@@ -275,6 +275,26 @@ jobs:
           # It proves that the registered assertion-bearing bodies executed and did not
           # silently skip; the soundness of the assertions remains their own obligation.
 
+      - name: verify imported tag queries and real module publication
+        shell: bash
+        run: |
+          # The tag test uses checked-in bytes on every ordinary test run.
+          # Regenerate those bytes here and also execute the module target's
+          # installed-pin companion case, which fails on absent artifacts.
+          artifact_root="target/e2e/contract-drift-imported-tags-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -I -S scripts/extract/gen_attribute_state_census.py \
+            --tag-oracle-output "$artifact_root/prelude.tsv"
+          cmp crates/fln-conformance/fixtures/tag_attributes/prelude.tsv "$artifact_root/prelude.tsv"
+          cmp crates/fln-conformance/fixtures/tag_attributes/prelude.lean "$artifact_root/prelude.lean"
+          for suffix in .olean .olean.server .olean.private; do
+            cmp "crates/fln-conformance/fixtures/tag_attributes/prelude$suffix" "$artifact_root/prelude$suffix"
+          done
+          python3 -I -S scripts/extract/gen_attribute_state_census.py --check
+          cargo test --locked -p fln-conformance \
+            --test real_attribute_fixtures_e2e \
+            --test real_module_fixtures_e2e \
+            --no-fail-fast -- --include-ignored --nocapture
+
       - name: run the certificate-format independent-checker lane
         shell: bash
         run: |
