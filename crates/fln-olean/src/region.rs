@@ -1210,12 +1210,6 @@ impl<'a> OleanView<'a> {
         // Establish the complete ModuleData shape before interpreting fields.
         self.module_data(budget)?;
         self.walk(budget)?;
-        if self.has_dependency_regions() {
-            return Err(RegionError::DecodeShape {
-                offset: self.payload_offset as u64,
-                reason: "opaque capture across module-part regions is not implemented",
-            });
-        }
         let map_fault = |fault| {
             shared_fault(
                 fault,
@@ -1225,11 +1219,12 @@ impl<'a> OleanView<'a> {
             )
         };
         let region = self.read_bytes(self.payload_offset as u64, self.payload_len as u64)?;
-        let capture = fln_rt::region::SubgraphCapture::new(
-            region,
-            self.header.base_addr + self.payload_offset as u64,
-        )
-        .map_err(map_fault)?;
+        let mut regions: Vec<_> = self.dependencies.iter().map(|dependency| (
+            &dependency.bytes[dependency.payload_offset..dependency.payload_offset + dependency.payload_len],
+            dependency.base_addr + dependency.payload_offset as u64,
+        )).collect();
+        regions.push((region, self.header.base_addr + self.payload_offset as u64));
+        let capture = fln_rt::region::SubgraphCapture::from_regions(&regions).map_err(map_fault)?;
         let mut walk_budget = DecodeBudget::new(budget);
         let root = self.deref(self.root_ptr()?)?;
         let entries_index = format::MODULE_DATA_FIELDS

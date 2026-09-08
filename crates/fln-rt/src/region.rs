@@ -766,47 +766,76 @@ pub fn audit(buf: &[u8], base: u64) -> RResult<RegionReport> {
 /// An indexed, validated compacted region for lossless opaque-entry capture.
 /// The index is shared across entries; it never materializes or interprets them.
 pub struct SubgraphCapture<'a> {
-    bytes: &'a [u8],
-    base: u64,
-    objects: std::collections::BTreeMap<usize, WalkStep>,
+    regions: Vec<(&'a [u8], u64)>,
+    objects: Vec<CaptureObject>,
+    addresses: std::collections::BTreeMap<u64, usize>,
+}
+
+struct CaptureObject {
+    region: usize,
+    offset: usize,
+    step: WalkStep,
 }
 
 impl<'a> SubgraphCapture<'a> {
     /// Validate object boundaries and the compactor's children-before-parent law.
     pub fn new(bytes: &'a [u8], base: u64) -> RResult<Self> {
-        if !base.is_multiple_of(8) || base.checked_add(bytes.len() as u64).is_none() {
-            return Err(RegionFault::MisalignedBase { base });
+        Self::from_regions(&[(bytes, base)])
+    }
+
+    /// Index disjoint regions in dependency/load order. Each region may point
+    /// only to earlier objects in itself or in preceding regions. Address order
+    /// is irrelevant: canonical output follows load order and object offsets.
+    /// Every pair contains payload bytes (including the root word) and the
+    /// absolute address of those bytes, without an `.olean` envelope.
+    pub fn from_regions(regions: &[(&'a [u8], u64)]) -> RResult<Self> {
+        let mut ranges = Vec::new();
+        for &(bytes, base) in regions {
+            if !base.is_multiple_of(8) || base.checked_add(bytes.len() as u64).is_none() {
+                return Err(RegionFault::MisalignedBase { base });
+            }
+            if !bytes.len().is_multiple_of(8) {
+                return Err(RegionFault::RaggedPayload { len: bytes.len() });
+            }
+            need(bytes, 0, 8)?;
+            ranges.push((base, base + bytes.len() as u64));
         }
-        if !bytes.len().is_multiple_of(8) {
-            return Err(RegionFault::RaggedPayload { len: bytes.len() });
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(RegionFault::BuildShape { reason: "capture region address ranges overlap" });
         }
-        need(bytes, 0, 8)?;
-        let mut objects = std::collections::BTreeMap::new();
-        let mut offset = 8;
-        while offset < bytes.len() {
-            let step = walk_step(bytes, offset)?;
-            need(bytes, offset, round8(step.size))?;
-            for &field in &step.ptr_fields {
-                if let Some(child) = checked_rel(bytes, field, base, bytes.len())?
-                    && !objects.contains_key(&(child as usize))
-                {
-                    return Err(RegionFault::PtrOutOfBounds {
-                        offset: field,
-                        ptr: read_u64(bytes, field),
-                    });
+        let mut objects = Vec::new();
+        let mut addresses = std::collections::BTreeMap::new();
+        for (region, &(bytes, base)) in regions.iter().enumerate() {
+            let mut offset = 8;
+            while offset < bytes.len() {
+                let step = walk_step(bytes, offset)?;
+                need(bytes, offset, round8(step.size))?;
+                for &field in &step.ptr_fields {
+                    let pointer = read_u64(bytes, field);
+                    if is_scalar_word(pointer) {
+                        continue;
+                    }
+                    if !pointer.is_multiple_of(8) {
+                        return Err(RegionFault::MisalignedPtr { offset: field, ptr: pointer });
+                    }
+                    if !addresses.contains_key(&pointer) {
+                        return Err(RegionFault::PtrOutOfBounds { offset: field, ptr: pointer });
+                    }
                 }
+                if let Some(field) = step.limb_ptr {
+                    checked_limb_rel(bytes, field, base, offset, step.size)?;
+                }
+                let size = round8(step.size);
+                addresses.insert(base + offset as u64, objects.len());
+                objects.push(CaptureObject { region, offset, step });
+                offset += size;
             }
-            if let Some(field) = step.limb_ptr {
-                checked_limb_rel(bytes, field, base, offset, step.size)?;
-            }
-            let size = round8(step.size);
-            objects.insert(offset, step);
-            offset += size;
         }
         Ok(Self {
-            bytes,
-            base,
+            regions: regions.to_vec(),
             objects,
+            addresses,
         })
     }
 
@@ -832,18 +861,17 @@ impl<'a> SubgraphCapture<'a> {
             if is_scalar_word(pointer) {
                 continue;
             }
-            let offset = pointer.wrapping_sub(self.base);
-            let step = usize::try_from(offset)
-                .ok()
-                .and_then(|offset| self.objects.get(&offset))
+            let index = *self.addresses.get(&pointer)
                 .ok_or(RegionFault::PtrOutOfBounds {
                     offset: 0,
                     ptr: pointer,
                 })?;
-            let offset = offset as usize;
-            if !reachable.insert(offset) {
+            if !reachable.insert(index) {
                 continue;
             }
+            let object = &self.objects[index];
+            let step = &object.step;
+            let bytes = self.regions[object.region].0;
             let required = total.saturating_add(round8(step.size));
             if required > max_bytes {
                 return Err(RegionFault::CaptureBudgetExhausted {
@@ -855,20 +883,23 @@ impl<'a> SubgraphCapture<'a> {
             pending.extend(
                 step.ptr_fields
                     .iter()
-                    .map(|&field| read_u64(self.bytes, field)),
+                    .map(|&field| read_u64(bytes, field)),
             );
         }
         let mut output = Vec::with_capacity(total);
         output.extend_from_slice(&[0; 8]);
         let mut relocated = HashMap::new();
-        for offset in reachable {
-            let step = &self.objects[&offset];
+        for index in reachable {
+            let object = &self.objects[index];
+            let offset = object.offset;
+            let step = &object.step;
+            let bytes = self.regions[object.region].0;
             let new_offset = output.len();
-            output.extend_from_slice(&self.bytes[offset..offset + round8(step.size)]);
+            output.extend_from_slice(&bytes[offset..offset + round8(step.size)]);
             for &field in &step.ptr_fields {
-                let pointer = read_u64(self.bytes, field);
+                let pointer = read_u64(bytes, field);
                 if !is_scalar_word(pointer) {
-                    let child = (pointer - self.base) as usize;
+                    let child = self.addresses[&pointer];
                     // new() established strict post-order, and reachability
                     // included every child. Still refuse a broken join.
                     let target =
@@ -889,10 +920,9 @@ impl<'a> SubgraphCapture<'a> {
                     (new_offset + MPZ_FIXED) as u64,
                 );
             }
-            relocated.insert(offset, new_offset as u64);
+            relocated.insert(index, new_offset as u64);
         }
-        let root_offset = (root - self.base) as usize;
-        write_u64(&mut output, 0, relocated[&root_offset]);
+        write_u64(&mut output, 0, relocated[&self.addresses[&root]]);
         Ok(output)
     }
 }
