@@ -150,6 +150,102 @@ fn opaque_subgraph_capture_preserves_bytes_sharing_and_relocation() {
 }
 
 #[test]
+fn opaque_capture_across_three_regions_preserves_shared_graphs_in_load_order() {
+    use fln_rt::region::SubgraphCapture;
+    let _g = lock();
+    let graph = sample_graph();
+    let earlier = compact(&graph, BASE_B).unwrap();
+    let earlier_root = u64::from_le_bytes(earlier[..8].try_into().unwrap());
+    let middle_value = Obj::mk_ctor(3, vec![graph.clone_ref()], &[0xAB; 8]);
+    let mut middle = compact(&Obj::mk_ctor(3, vec![Obj::mk_nat(0)], &[0xAB; 8]), BASE_A).unwrap();
+    let middle_root = u64::from_le_bytes(middle[..8].try_into().unwrap());
+    middle[16..24].copy_from_slice(&earlier_root.to_le_bytes());
+    let later_base = BASE_A + 0x10000;
+    let mut later = compact(
+        &Obj::mk_array(vec![Obj::mk_nat(0), Obj::mk_nat(0), Obj::mk_nat(0)]),
+        later_base,
+    )
+    .unwrap();
+    let later_root = u64::from_le_bytes(later[..8].try_into().unwrap());
+    for (index, pointer) in [earlier_root, middle_root, earlier_root]
+        .into_iter()
+        .enumerate()
+    {
+        later[32 + index * 8..40 + index * 8].copy_from_slice(&pointer.to_le_bytes());
+    }
+    let index = SubgraphCapture::from_regions(&[
+        (&earlier, BASE_B),
+        (&middle, BASE_A),
+        (&later, later_base),
+    ])
+    .expect("dependencies follow load order even when addresses decrease");
+    let expected_value = Obj::mk_array(vec![graph.clone_ref(), middle_value, graph]);
+    let expected = compact(&expected_value, 0).unwrap();
+    let captured = index.capture(later_root, expected.len()).unwrap();
+    assert_eq!(
+        captured, expected,
+        "independent writer pins all categories and sharing"
+    );
+    let rebuilt = materialize(&captured, 0).unwrap();
+    assert_eq!(compact(&rebuilt, 0).unwrap(), expected);
+    assert!(matches!(
+        index.capture(later_root, expected.len() - 1),
+        Err(RegionFault::CaptureBudgetExhausted { .. })
+    ));
+    assert_eq!(index.capture(later_root, expected.len()).unwrap(), expected);
+    assert_eq!(
+        index.capture(earlier_root, earlier.len()).unwrap(),
+        compact(&sample_graph(), 0).unwrap()
+    );
+}
+
+#[test]
+fn opaque_capture_refuses_foreign_interior_forward_and_overlapping_regions() {
+    use fln_rt::region::{CaptureRegionFault, SubgraphCapture};
+    let _g = lock();
+    let earlier = compact(&Obj::mk_string("shared earlier leaf"), BASE_B).unwrap();
+    let earlier_root = u64::from_le_bytes(earlier[..8].try_into().unwrap());
+    let mut later = compact(&Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]), BASE_A).unwrap();
+    let later_root = u64::from_le_bytes(later[..8].try_into().unwrap());
+    later[16..24].copy_from_slice(&earlier_root.to_le_bytes());
+    SubgraphCapture::from_regions(&[(&earlier, BASE_B), (&later, BASE_A)]).unwrap();
+    assert!(matches!(
+        SubgraphCapture::from_regions(&[(&later, BASE_A), (&earlier, BASE_B)]),
+        Err(CaptureRegionFault {
+            region: 0,
+            fault: RegionFault::PtrOutOfBounds { .. }
+        })
+    ));
+    for pointer in [
+        BASE_B,
+        earlier_root + 8,
+        later_root,
+        BASE_A + 0x10000,
+        earlier_root + 2,
+    ] {
+        let mut corrupt = later.clone();
+        corrupt[16..24].copy_from_slice(&pointer.to_le_bytes());
+        assert!(
+            matches!(
+                SubgraphCapture::from_regions(&[(&earlier, BASE_B), (&corrupt, BASE_A)]),
+                Err(CaptureRegionFault {
+                    region: 1,
+                    fault: RegionFault::PtrOutOfBounds { .. } | RegionFault::MisalignedPtr { .. }
+                })
+            ),
+            "invalid child {pointer:#x}"
+        );
+    }
+    assert!(matches!(
+        SubgraphCapture::from_regions(&[(&earlier, BASE_B), (&later, BASE_B + 8)]),
+        Err(CaptureRegionFault {
+            region: 1,
+            fault: RegionFault::BuildShape { .. }
+        })
+    ));
+}
+
+#[test]
 fn opaque_subgraph_capture_excludes_unreachable_objects_and_refuses_bad_roots() {
     use fln_rt::region::SubgraphCapture;
     let _g = lock();

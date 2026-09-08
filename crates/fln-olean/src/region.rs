@@ -1060,12 +1060,11 @@ impl<'a> OleanView<'a> {
     /// WHAT THESE NAMES ARE, because it decides what may be built on them. The
     /// pin documents `extraConstNames` as "auxiliary declarations that are NOT
     /// in the mapping `constants`" — the code generator's own names, populated
-    /// by `getIRExtraConstNames`. They are NAMES ONLY: no `ConstantInfo` is
-    /// stored for any of them anywhere in the artifact. Across the 2,431 pinned
-    /// modules that carry a complete companion chain, 342,908 distinct names
-    /// appear here and in no module's `constants`, and every one carries a
-    /// code-generator marker component (`_boxed`, `_redArg`, `_closed_N`,
-    /// `_lam_N`, `_at_`/`spec_N`, `_hyg`, `_boxed_const_N`).
+    /// by `getIRExtraConstNames`. This field stores NAMES ONLY, never a
+    /// `ConstantInfo`. That is a per-part distinction: a name listed here can
+    /// also have a real declaration in another companion. The pinned
+    /// `Init.Data.Array.QSort.Basic` chain has eight such overlaps, including
+    /// `_private.Init.Data.Array.QSort.Basic.0.Array.qsort.sort`.
     ///
     /// So this decodes a real population the reader was dropping, and it is
     /// NOT a source of kernel dependencies: no `UnknownConstant` can be
@@ -1219,12 +1218,34 @@ impl<'a> OleanView<'a> {
             )
         };
         let region = self.read_bytes(self.payload_offset as u64, self.payload_len as u64)?;
-        let mut regions: Vec<_> = self.dependencies.iter().map(|dependency| (
-            &dependency.bytes[dependency.payload_offset..dependency.payload_offset + dependency.payload_len],
-            dependency.base_addr + dependency.payload_offset as u64,
-        )).collect();
+        let mut regions: Vec<_> = self
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                (
+                    &dependency.bytes[dependency.payload_offset
+                        ..dependency.payload_offset + dependency.payload_len],
+                    dependency.base_addr + dependency.payload_offset as u64,
+                )
+            })
+            .collect();
         regions.push((region, self.header.base_addr + self.payload_offset as u64));
-        let capture = fln_rt::region::SubgraphCapture::from_regions(&regions).map_err(map_fault)?;
+        let capture = fln_rt::region::SubgraphCapture::from_regions(&regions).map_err(|error| {
+            if let Some(dependency) = self.dependencies.get(error.region) {
+                // Dependency objects use absolute addresses in this view's
+                // diagnostic coordinate space; local objects use file offsets.
+                shared_fault(
+                    error.fault,
+                    dependency.base_addr + dependency.payload_offset as u64,
+                    dependency.base_addr,
+                    dependency
+                        .base_addr
+                        .saturating_add(dependency.bytes.len() as u64),
+                )
+            } else {
+                map_fault(error.fault)
+            }
+        })?;
         let mut walk_budget = DecodeBudget::new(budget);
         let root = self.deref(self.root_ptr()?)?;
         let entries_index = format::MODULE_DATA_FIELDS
@@ -1561,6 +1582,32 @@ mod dependency_address_dispatch_tests {
         )
         .expect("empty module encodes")
         .bytes
+    }
+
+    #[test]
+    fn companion_capture_faults_identify_the_dependency_object_address() {
+        let base = format::REGION_ALIGN as u64;
+        let mut public = empty_module(base);
+        let private = empty_module(2 * base);
+        assert!(
+            OleanView::parse_with_dependencies(&private, &[&public])
+                .unwrap()
+                .extension_payloads(WalkBudget::default(), 1024)
+                .unwrap()
+                .is_empty()
+        );
+        // The dependency is unreachable from the private ModuleData, but the
+        // capture index still validates every source object. Do not attribute
+        // its bad reference count to the same offset in the private file.
+        let object = format::OLEAN_HEADER_SIZE + 8;
+        public[object..object + 4].copy_from_slice(&1i32.to_le_bytes());
+        let error = OleanView::parse_with_dependencies(&private, &[&public])
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 1024)
+            .unwrap_err();
+        assert!(
+            matches!(error, RegionError::NonPersistentRc { offset, rc: 1 } if offset == base + object as u64)
+        );
     }
 
     #[test]
