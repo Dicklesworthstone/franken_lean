@@ -105,6 +105,12 @@ pub enum ConvertError {
     UnsupportedConstructor { family: &'static str, tag: u8 },
     /// A level or expression depth overflowed the native bound.
     NativeOverflow { family: &'static str },
+    /// Conversion work was exhausted, not a malformed input verdict.
+    NodeBudgetExhausted {
+        family: &'static str,
+        visited: usize,
+        budget: usize,
+    },
 }
 
 /// Recursion ceiling kept by `enter` if a walk family grows a frame again.
@@ -129,6 +135,14 @@ impl std::fmt::Display for ConvertError {
             Self::NativeOverflow { family } => {
                 write!(f, "{family} overflowed the native bound")
             }
+            Self::NodeBudgetExhausted {
+                family,
+                visited,
+                budget,
+            } => write!(
+                f,
+                "{family} conversion exhausted {budget} nodes after {visited} visits"
+            ),
         }
     }
 }
@@ -434,7 +448,11 @@ impl Conversion {
     fn enter(&mut self, family: &'static str) -> Result<(), ConvertError> {
         self.nodes = self.nodes.saturating_add(1);
         if self.nodes > MAX_WALK_NODES {
-            return Err(malformed(family, "conversion walk exceeded the node bound"));
+            return Err(ConvertError::NodeBudgetExhausted {
+                family,
+                visited: self.nodes,
+                budget: MAX_WALK_NODES,
+            });
         }
         if self.depth >= MAX_WALK_DEPTH {
             return Err(ConvertError::NativeOverflow { family });
@@ -637,7 +655,10 @@ impl Conversion {
         }
     }
 
-    fn project_name(&mut self, root: &Obj) -> Result<Name, ConvertError> {
+    /// Project a borrowed Compat Name, retaining structural string/numeric
+    /// components and checking stored hashes. This is data conversion only;
+    /// an imported attribute entry does not authorize declaration admission.
+    pub fn project_name(&mut self, root: &Obj) -> Result<Name, ConvertError> {
         // Iterative on the parent chain: a 400-component Name is a legal
         // native value, and the recursive form overflowed at the host-stack
         // ceiling that still bounds inject (FL-INV-07).
@@ -1214,7 +1235,9 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
         .ok_or_else(|| malformed("expr", "expr was not encoded"))
 }
 
-fn inject_name(name: &Name) -> Obj {
+/// Build a fresh Compat Name through the converter membrane. The caller owns
+/// the returned graph; no declaration authority is created by this encoding.
+pub fn inject_name(name: &Name) -> Obj {
     // Iterative on the parent chain: a 400-component Name is a legal
     // native value, and the recursive form blew the host stack the same
     // way the pre-bound projector did (FL-INV-07).

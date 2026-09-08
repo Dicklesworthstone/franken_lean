@@ -118,6 +118,74 @@ impl fmt::Display for RegionError {
 
 type RResult<T> = Result<T, RegionError>;
 
+/// Failure when interpreting captured regions as Name-valued entries.
+#[derive(Debug)]
+pub enum CapturedNameError {
+    Bytes { required: usize, limit: usize },
+    Objects { required: u64, limit: u64 },
+    Region(fln_rt::region::RegionFault),
+    Conversion(fln_rt::convert::ConvertError),
+}
+
+impl fmt::Display for CapturedNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "captured Name decode: {self:?}")
+    }
+}
+
+impl std::error::Error for CapturedNameError {}
+
+/// Decode a selected batch of standalone captured Name regions at base zero.
+/// Byte and object allowances cover the whole batch, including repeated graphs.
+/// Only the caller's known schema can justify selecting an entry as a Name.
+/// No output escapes if any entry is malformed or exceeds the allowances.
+pub fn decode_captured_names(
+    payloads: &[&[u8]],
+    budget: WalkBudget,
+    max_bytes: usize,
+) -> Result<Vec<Name>, CapturedNameError> {
+    let mut bytes = 0usize;
+    for payload in payloads {
+        bytes = bytes
+            .checked_add(payload.len())
+            .ok_or(CapturedNameError::Bytes {
+                required: usize::MAX,
+                limit: max_bytes,
+            })?;
+        if bytes > max_bytes {
+            return Err(CapturedNameError::Bytes {
+                required: bytes,
+                limit: max_bytes,
+            });
+        }
+    }
+    let mut objects = 0u64;
+    let mut names = Vec::new();
+    let mut conversion = fln_rt::convert::Conversion::new();
+    for payload in payloads {
+        let report = fln_rt::region::audit(payload, 0).map_err(CapturedNameError::Region)?;
+        objects = objects
+            .checked_add(report.objects)
+            .ok_or(CapturedNameError::Objects {
+                required: u64::MAX,
+                limit: budget.max_objects,
+            })?;
+        if objects > budget.max_objects {
+            return Err(CapturedNameError::Objects {
+                required: objects,
+                limit: budget.max_objects,
+            });
+        }
+        let value = fln_rt::region::materialize(payload, 0).map_err(CapturedNameError::Region)?;
+        names.push(
+            conversion
+                .project_name(&value)
+                .map_err(CapturedNameError::Conversion)?,
+        );
+    }
+    Ok(names)
+}
+
 /// Map a shared-engine [`fln_rt::region::RegionFault`] into this codec's
 /// [`RegionError`], shifting payload-relative offsets by `shift` (the file
 /// offset where the payload begins) so diagnostics stay file-addressed.
@@ -1558,6 +1626,66 @@ mod dependency_address_dispatch_tests {
     use crate::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn captured_name_batches_preserve_structure_and_bound_total_work() {
+        let mut deep = Name::anonymous();
+        for _ in 0..400 {
+            deep = Name::str(deep, "part");
+        }
+        let names = vec![
+            Name::anonymous(),
+            Name::str(Name::anonymous(), "a.b"),
+            Name::from_components(["a", "b"]),
+            Name::num(Name::from_components(["numeric"]), 7),
+            deep,
+        ];
+        let owned: Vec<_> = names
+            .iter()
+            .map(|name| fln_rt::region::compact(&fln_rt::convert::inject_name(name), 0).unwrap())
+            .collect();
+        let payloads: Vec<_> = owned.iter().map(Vec::as_slice).collect();
+        let bytes = owned.iter().map(Vec::len).sum();
+        let objects = payloads
+            .iter()
+            .map(|payload| fln_rt::region::audit(payload, 0).unwrap().objects)
+            .sum();
+        assert_eq!(
+            decode_captured_names(
+                &payloads,
+                WalkBudget {
+                    max_objects: objects
+                },
+                bytes
+            )
+            .unwrap(),
+            names
+        );
+        assert!(matches!(
+            decode_captured_names(
+                &payloads,
+                WalkBudget {
+                    max_objects: objects - 1
+                },
+                bytes
+            ),
+            Err(CapturedNameError::Objects { .. })
+        ));
+        assert!(matches!(
+            decode_captured_names(&payloads, WalkBudget::default(), bytes - 1),
+            Err(CapturedNameError::Bytes { .. })
+        ));
+        let mut corrupt = owned[1].clone();
+        corrupt[..8].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        assert!(matches!(
+            decode_captured_names(&[&owned[0], &corrupt], WalkBudget::default(), bytes),
+            Err(CapturedNameError::Region(_))
+        ));
+        assert_eq!(
+            decode_captured_names(&payloads, WalkBudget::default(), bytes).unwrap(),
+            names
+        );
+    }
 
     fn header(base_addr: u64) -> OleanWriteHeader<'static> {
         OleanWriteHeader {
