@@ -1,17 +1,104 @@
 #!/usr/bin/env python3
-"""Apply the reviewed equality source patch, never overwrite concurrent edits."""
-import base64, gzip, hashlib, subprocess
+"""Apply the source equality increment; refuse changed anchors before any write."""
 from pathlib import Path
-PATCH = """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"""
 ROOT = Path(__file__).resolve().parents[1]
-ALLOWED = {'crates/fln-elab/src/lib.rs','crates/fln-elab/src/seed.rs','crates/fln-elab/src/seed/equality.rs','crates/fln-elab/src/source/tactics.rs','crates/fln-elab/tests/source_equality.rs','crates/fln-parse/src/lib.rs','crates/fln-parse/src/proofs.rs','crates/fln/src/lib.rs','crates/fln/tests/source_equality.rs'}
+updates = {}
+def edit(path, old, new):
+    text = updates.get(path, (ROOT / path).read_text())
+    if text.count(old) != 1:
+        raise SystemExit(f'changed or ambiguous implementation anchor: {path}: {old[:70]}')
+    updates[path] = text.replace(old, new, 1)
+
 def main():
-    patch = gzip.decompress(base64.b64decode(PATCH))
-    if hashlib.sha256(patch).hexdigest() != 'dec9932af985e739a1950cbc7d26e779665266536f6e46cc812c92d0b0f472d8':
-        raise SystemExit('patch integrity mismatch')
-    for line in patch.decode().splitlines():
-        if line.startswith('+++ ') and (not line.startswith('+++ b/') or line[6:] not in ALLOWED):
-            raise SystemExit('unexpected patch target')
-    subprocess.run(['git','apply','--check','-'],input=patch,cwd=ROOT,check=True)
-    subprocess.run(['git','apply','-'],input=patch,cwd=ROOT,check=True)
+    edit('crates/fln-elab/src/seed.rs', 'use fln_core::expr::{BinderInfo, Expr};', 'pub mod equality;\npub use equality::{eq_seed_declaration, rfl_seed_declaration};\n\nuse fln_core::expr::{BinderInfo, Expr};')
+    edit('crates/fln-elab/src/seed.rs', 'source_seed_declarations() -> [Declaration; 25]', 'source_seed_declarations() -> [Declaration; 27]')
+    edit('crates/fln-elab/src/seed.rs', '        string_dec_eq_seed_declaration(),\n    ]', '        string_dec_eq_seed_declaration(),\n        eq_seed_declaration(),\n        rfl_seed_declaration(),\n    ]')
+    edit('crates/fln-elab/src/seed.rs', '        assert_eq!(declarations[24], string_dec_eq_seed_declaration());', '        assert_eq!(declarations[24], string_dec_eq_seed_declaration());\n        assert_eq!(declarations[25], eq_seed_declaration());\n        assert_eq!(declarations[26], rfl_seed_declaration());')
+    edit('crates/fln-elab/src/seed/equality.rs', '#[cfg(test)]', RFL_SEED + '\n#[cfg(test)]')
+    edit('crates/fln-parse/src/lib.rs', 'enum BoundedInfix {\n    Arrow,', 'enum BoundedInfix {\n    Arrow,\n    Equality,')
+    edit('crates/fln-parse/src/lib.rs', '            Self::Arrow => "->",', '            Self::Arrow => "->",\n            Self::Equality => "=",')
+    edit('crates/fln-parse/src/lib.rs', '            Self::ScalarBeq => 50,', '            Self::ScalarBeq | Self::Equality => 50,')
+    edit('crates/fln-parse/src/lib.rs', 'matches!(self, Self::ScalarBeq)', 'matches!(self, Self::ScalarBeq | Self::Equality)')
+    path = 'crates/fln-parse/src/lib.rs'
+    assert updates[path].count('\":=\", \";\", \"==\"') == 2
+    updates[path] = updates[path].replace('\":=\", \";\", \"==\"', '\":=\", \";\", \"=\", \"==\"')
+    edit(path, '        "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),', '        "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),\n        "=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equality),')
+    edit('crates/fln-elab/src/lib.rs', 'fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInfixIntrinsic> {', 'fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInfixIntrinsic> {\n    if allow_string && kind == &Name::str(Name::anonymous(), "term_=_") {\n        return Some(BoundedInfixIntrinsic::Fixed { spelling: "=", intrinsic: Name::from_components(["Eq"]) });\n    }')
+    edit('crates/fln-parse/src/proofs.rs', '["intro", "exact", "assumption", "apply"]', '["intro", "exact", "assumption", "apply", "rfl"]')
+    edit('crates/fln-parse/src/proofs.rs', '        "assumption" if range.end == start + 1 => {}', '        "assumption" | "rfl" if range.end == start + 1 => {}')
+    edit('crates/fln-elab/src/source/tactics.rs', '            } else if kind == &parser_kind(&["Tactic", "assumption"]) {', RFL_TACTIC + '            } else if kind == &parser_kind(&["Tactic", "assumption"]) {')
+    updates['crates/fln-elab/src/source/tactics.rs'] += EQ_TARGET
+    edit('crates/fln/src/lib.rs', 'assert_eq!(engine.environment().len(), 28);', 'assert_eq!(engine.environment().len(), 32);')
+    edit('crates/fln/src/lib.rs', 'assert_eq!(completed.engine.environment().len(), 30);', 'assert_eq!(completed.engine.environment().len(), engine.environment().len() + 2);')
+    anchor = '    /// Parse, elaborate, admit, publish, compile, canonically encode/decode,\n    /// and execute one bounded Nat-valued definition command.'
+    edit('crates/fln/src/lib.rs', anchor, ADMISSION + anchor)
+    for path, text in updates.items():
+        (ROOT / path).write_text(text)
+
+RFL_SEED = '''/// The ordinary polymorphic `rfl` term, with both arguments inferred.
+pub fn rfl_seed_declaration() -> Declaration {
+    let name = Name::from_components(["rfl"]);
+    let u_name = Name::from_components(["u"]);
+    let u = Level::param(u_name.clone());
+    let a = Name::from_components(["a"]);
+    let alpha = Name::from_components(["α"]);
+    let bv = |i| Expr::bvar(i).expect("fixed reflexivity telescope index");
+    let relation = Expr::app(Expr::app(Expr::app(
+        Expr::const_(Name::from_components(["Eq"]), vec![u.clone()]), bv(1)), bv(0)), bv(0));
+    let type_ = Expr::forall_e(alpha.clone(), Expr::sort(u.clone()),
+        Expr::forall_e(a.clone(), bv(0), relation, BinderInfo::Implicit), BinderInfo::Implicit);
+    let value = Expr::lam(alpha, Expr::sort(u.clone()),
+        Expr::lam(a, bv(0), Expr::app(Expr::app(
+            Expr::const_(Name::from_components(["Eq", "refl"]), vec![u]), bv(1)), bv(0)),
+            BinderInfo::Implicit), BinderInfo::Implicit);
+    Declaration::Defn(fln_env::constants::DefinitionVal {
+        base: ConstantVal { name: name.clone(), level_params: vec![u_name], type_ },
+        value, hints: fln_env::constants::ReducibilityHints::Abbrev,
+        safety: fln_env::constants::DefinitionSafety::Safe, all: vec![name],
+    })
+}
+'''
+RFL_TACTIC = '''            } else if kind == &parser_kind(&["Tactic", "rfl"]) {
+                let [keyword] = args.as_slice() else { return Err(error(TacticError::MalformedScript)); };
+                expect_atom(keyword, "rfl", "reflexivity tactic")?;
+                let target = self.whnf(&goal.target)?;
+                let (level, alpha, left, right) = equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
+                self.constrain(&left, &right)?;
+                let value = Expr::app(Expr::app(Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]), alpha), left);
+                self.close_proof_goal(goal, value)?;
+'''
+EQ_TARGET = '''
+/// Decode only the ordinary homogeneous equality head; no lookalike names or
+/// Boolean comparisons count as equality propositions.
+fn equality_target(target: &Expr) -> Option<(Level, Expr, Expr, Expr)> {
+    let ExprNode::App { f, a: right } = target.node() else { return None; };
+    let ExprNode::App { f, a: left } = f.node() else { return None; };
+    let ExprNode::App { f, a: alpha } = f.node() else { return None; };
+    let ExprNode::Const { name, levels } = f.node() else { return None; };
+    if name != &Name::from_components(["Eq"]) { return None; }
+    let [level] = levels.as_slice() else { return None; };
+    Some((level.clone(), alpha.clone(), left.clone(), right.clone()))
+}
+'''
+ADMISSION = '''    /// Parse, elaborate and dual-check one source definition or theorem without
+    /// attempting to compile or execute a proof. Publication remains the same
+    /// immutable K1-plus-independent-checker transition as `admit_declaration`.
+    pub fn admit_source_declaration(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationAdmission>, EngineExecutionError> {
+        let parsed = fln_parse::parse_definition(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        let declaration = fln_elab::elaborate_definition_in_with_budget(
+            parsed.syntax(), self.environment(), limits.kernel,
+        ).map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        self.admit_declaration(declaration, options, limits)
+            .map_err(EngineExecutionError::from)
+    }
+
+'''
 if __name__ == '__main__': main()
