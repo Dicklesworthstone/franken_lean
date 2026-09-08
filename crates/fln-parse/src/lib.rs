@@ -58,6 +58,7 @@ pub enum NatDefinitionExpectation {
     DeclarationIdentifier,
     ParameterIdentifier,
     ParameterTypeAscription,
+    LambdaArrow,
     NaturalType,
     ScalarType,
     ClosingParenthesis,
@@ -233,8 +234,15 @@ struct LetBindingTokens {
     separator: usize,
 }
 
+struct LambdaTokens {
+    keyword: usize,
+    names: std::ops::Range<usize>,
+    arrow: usize,
+}
+
 struct BoundedTermFrame {
     open: Option<usize>,
+    lambda: Option<LambdaTokens>,
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
     operators: Vec<BoundedInfixToken>,
@@ -461,6 +469,7 @@ fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "def", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+", "-", "++", "*",
         "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->", "→",
+        "fun", "λ", "=>", "↦",
     ])
 }
 
@@ -468,7 +477,7 @@ fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^",
         "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_",
-        "{", "}", "⦃", "⦄", "->", "→",
+        "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦",
     ])
 }
 
@@ -900,6 +909,46 @@ fn hygienic_lparen(lparen: Syntax) -> Syntax {
     )
 }
 
+/// Fold lambda bodies at their enclosing parenthesis or end-of-term boundary.
+/// Lambda nesting uses the same explicit heap frames as application parsing.
+fn finish_lambda_frames(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &mut Vec<BoundedTermFrame>,
+    grammar: DefinitionGrammar,
+    at: usize,
+) -> Result<(), NatDefinitionParseError> {
+    while frames.last().is_some_and(|frame| frame.lambda.is_some()) {
+        let mut frame = frames.pop().expect("guarded lambda frame");
+        let prefix = frame.lambda.take().expect("guarded lambda prefix");
+        let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
+        let names = prefix
+            .names
+            .map(|index| leaves.leaf(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let basic = Syntax::node(
+            parser_kind(&["Term", "basicFun"]),
+            vec![
+                null_node(names),
+                null_node(Vec::new()),
+                leaves.leaf(prefix.arrow)?,
+                body,
+            ],
+        );
+        let lambda = Syntax::node(
+            parser_kind(&["Term", "fun"]),
+            vec![leaves.leaf(prefix.keyword)?, basic],
+        );
+        frames
+            .last_mut()
+            .expect("lambda frame has a parent")
+            .application
+            .push((lambda, prefix.keyword));
+    }
+    Ok(())
+}
+
 fn bounded_term(
     leaves: &Leaves,
     view: &SourceView,
@@ -909,11 +958,15 @@ fn bounded_term(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut frames = vec![BoundedTermFrame {
         open: None,
+        lambda: None,
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
     }];
-    for index in range.clone() {
+    let mut cursor = range.start;
+    while cursor < range.end {
+        let index = cursor;
+        cursor += 1;
         match tokens.get(index).map(|token| &token.kind) {
             kind if is_bounded_term_atom(kind, grammar) => {
                 let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
@@ -923,15 +976,52 @@ fn bounded_term(
                     .application
                     .push((term, index));
             }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && (symbol == "fun" || symbol == "λ") =>
+            {
+                let names_start = cursor;
+                while cursor < range.end && matches!(tokens[cursor].kind, TokenKind::Ident(_)) {
+                    cursor += 1;
+                }
+                if cursor == names_start {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, cursor),
+                        expected: NatDefinitionExpectation::ParameterIdentifier,
+                    });
+                }
+                if cursor >= range.end
+                    || !matches!(&tokens[cursor].kind,
+                    TokenKind::Symbol(arrow) if arrow == "=>" || arrow == "↦")
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, cursor),
+                        expected: NatDefinitionExpectation::LambdaArrow,
+                    });
+                }
+                frames.push(BoundedTermFrame {
+                    open: None,
+                    lambda: Some(LambdaTokens {
+                        keyword: index,
+                        names: names_start..cursor,
+                        arrow: cursor,
+                    }),
+                    application: Vec::new(),
+                    operands: Vec::new(),
+                    operators: Vec::new(),
+                });
+                cursor += 1;
+            }
             Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
                 frames.push(BoundedTermFrame {
                     open: Some(index),
+                    lambda: None,
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
                 });
             }
             Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
+                finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
                 if frames.len() == 1 {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, index),
@@ -972,6 +1062,7 @@ fn bounded_term(
             }
         }
     }
+    finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, range.end)?;
     if frames.len() != 1 {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, range.end),

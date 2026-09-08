@@ -330,3 +330,58 @@ fn escaped_keywords_resolve_as_identifiers_not_as_universes_or_holes() {
         );
     }
 }
+
+#[test]
+fn lambda_binders_receive_expected_domains() {
+    let result = accepted("def identity : Nat -> Nat := fun x => x", &env());
+    let ExprNode::Lam {
+        binder_type, body, ..
+    } = result.value.node()
+    else {
+        panic!("lambda expected");
+    };
+    assert_eq!(binder_type, &nat());
+    assert_eq!(body, &b(0));
+}
+#[test]
+fn lambda_application_infers_an_unannotated_domain() {
+    let result = accepted("def answer := (fun x => x) 37", &env());
+    assert_eq!(result.base.type_, nat());
+}
+#[test]
+fn nested_lambda_binders_are_closed_capture_avoidantly() {
+    let result = accepted("def first : Nat -> Nat -> Nat := fun x y => x", &env());
+    let ExprNode::Lam { body, .. } = result.value.node() else {
+        panic!("outer lambda");
+    };
+    let ExprNode::Lam { body, .. } = body.node() else {
+        panic!("inner lambda");
+    };
+    assert_eq!(body, &b(1));
+    accepted("def inner : Nat -> Nat := fun x => (fun y => x) 0", &env());
+}
+#[test]
+fn unicode_lambdas_and_nested_calls_preserve_expected_types() {
+    accepted("def identity : Nat → Nat := λ x ↦ polyId x", &env());
+}
+#[test]
+fn higher_order_arguments_can_be_source_lambdas() {
+    let env = env();
+    let apply = accepted("def apply (f : Nat -> Nat) (x : Nat) : Nat := f x", &env);
+    let env = publish(&env, Declaration::Defn(apply));
+    accepted("def answer := apply (fun x => polyId x) 37", &env);
+}
+#[test]
+fn a_bare_unconstrained_lambda_does_not_get_a_guessed_domain() {
+    assert!(matches!(
+        check_definition_source(b"def unknown := fun x => x", &env(), budget()),
+        Err(DefinitionFrontendError::Elaborate(
+            NatDefinitionElabError::Inference(_)
+        ))
+    ));
+}
+#[test]
+fn lambda_scope_restoration_preserves_outer_bindings() {
+    accepted("def shadow (x : Nat) : Nat -> Nat := fun x => x", &env());
+    accepted("def shadow : Nat -> Nat := let x := 7; fun x => x", &env());
+}
