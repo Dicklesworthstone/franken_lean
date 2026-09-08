@@ -1,0 +1,52 @@
+name: Native elaborator functional tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-elab/**'
+      - '.github/workflows/fln-elab-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fln-elab-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  elaborator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install the configured compiler for functional testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+          git rev-parse HEAD
+      - name: Check, test, and lint the actual elaborator package
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p target/elab-functional
+          cargo check --locked -p fln-elab --all-targets 2>&1 | tee target/elab-functional/check.log
+          check_status=${PIPESTATUS[0]}
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/elab-functional/test.log
+          test_status=${PIPESTATUS[0]}
+          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/elab-functional/clippy.log
+          clippy_status=${PIPESTATUS[0]}
+          printf 'check=%s test=%s clippy=%s\n' "$check_status" "$test_status" "$clippy_status" | tee target/elab-functional/result.txt
+          test "$check_status" -eq 0 && test "$test_status" -eq 0 && test "$clippy_status" -eq 0
+      - name: Retain functional test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: elab-functional-${{ github.sha }}
+          path: target/elab-functional
+          if-no-files-found: warn
+          retention-days: 7
