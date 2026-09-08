@@ -31,12 +31,13 @@ jobs:
           rustc -Vv
           git rev-parse HEAD
       - name: Format the authored elaborator files when explicitly requested
-        if: startsWith(github.event.head_commit.message, 'style(elab): format native elaborator additions')
+        if: >-
+          startsWith(github.event.head_commit.message, 'style(elab): format native elaborator additions')
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/elab-functional
-          rustfmt --edition 2024 crates/fln-elab/src/constraint.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/mvar.rs crates/fln-elab/src/universe.rs crates/fln-elab/src/txn.rs crates/fln-elab/tests/native_unification.rs
+          rustfmt --edition 2024 crates/fln-elab/src/constraint.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/residual.rs crates/fln-elab/src/mvar.rs crates/fln-elab/src/universe.rs crates/fln-elab/src/txn.rs crates/fln-elab/tests/native_unification.rs
           git diff --check
           git diff --stat
           git diff > target/elab-functional/rustfmt.patch
@@ -63,14 +64,15 @@ jobs:
           mkdir -p target/elab-functional
           cargo check --locked --workspace --all-targets 2>&1 | tee target/elab-functional/workspace-check.log
       - name: Publish only the tested formatting, without rewriting concurrent work
-        if: always() && steps.functional.outcome == 'success' && startsWith(github.event.head_commit.message, 'style(elab): format native elaborator additions')
+        if: >-
+          always() && steps.functional.outcome == 'success' && startsWith(github.event.head_commit.message, 'style(elab): format native elaborator additions')
         shell: bash
         run: |
           set -euo pipefail
-          paths=(crates/fln-elab/src/constraint.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/mvar.rs crates/fln-elab/src/universe.rs crates/fln-elab/src/txn.rs crates/fln-elab/tests/native_unification.rs)
+          paths=(crates/fln-elab/src/constraint.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/residual.rs crates/fln-elab/src/mvar.rs crates/fln-elab/src/universe.rs crates/fln-elab/src/txn.rs crates/fln-elab/tests/native_unification.rs)
           while IFS= read -r path; do
             case "$path" in
-              crates/fln-elab/src/constraint.rs|crates/fln-elab/src/constraint/unify.rs|crates/fln-elab/src/mvar.rs|crates/fln-elab/src/universe.rs|crates/fln-elab/src/txn.rs|crates/fln-elab/tests/native_unification.rs) ;;
+              crates/fln-elab/src/constraint.rs|crates/fln-elab/src/constraint/unify.rs|crates/fln-elab/src/constraint/unify/residual.rs|crates/fln-elab/src/mvar.rs|crates/fln-elab/src/universe.rs|crates/fln-elab/src/txn.rs|crates/fln-elab/tests/native_unification.rs) ;;
               *) printf 'Unexpected changed file: %s\n' "$path" >&2; exit 1 ;;
             esac
           done < <(git diff --name-only)
