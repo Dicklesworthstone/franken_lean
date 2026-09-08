@@ -169,8 +169,12 @@ fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>
             .unwrap()
         })
         .collect();
+    (empty_base_for_modules(&modules), modules)
+}
+
+fn empty_base_for_modules(modules: &[DecodedOleanModule]) -> ModuleApplyState {
     let mut environment = Environment::new();
-    for module in &modules {
+    for module in modules {
         for contribution in &module.extension_contributions {
             let descriptor = contribution.descriptor();
             if environment.extension(&descriptor.name).is_none() {
@@ -178,7 +182,7 @@ fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>
             }
         }
     }
-    let base = ModuleApplyState::from_parts_with_options(
+    ModuleApplyState::from_parts_with_options(
         environment,
         ModuleGraph::new(pinned_epoch(), ModuleGraphLimits::default())
             .into_admitted_value()
@@ -196,8 +200,7 @@ fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>
             DataValue::OfBool(true),
         )]),
     )
-    .unwrap();
-    (base, modules)
+    .unwrap()
 }
 
 fn partial_opaque_completeness(modules: &[DecodedOleanModule]) -> Vec<ProvenanceCompleteness> {
@@ -220,6 +223,240 @@ fn partial_opaque_completeness(modules: &[DecodedOleanModule]) -> Vec<Provenance
             )
         })
         .collect()
+}
+
+#[test]
+#[ignore = "requires the installed v4.32.0 Reference library; absence is a failure when invoked"]
+fn real_private_companion_chains_commit_full_declarations_and_selected_extension_entries() {
+    use fln_olean::decl::{ChainLimits, decode_chain_constants_from_parts};
+    use fln_olean::region::{OleanView, WalkBudget};
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME or FLN_REFERENCE_LIB is required"))
+                .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
+        });
+    for module in ["Init/Data/List/ToArrayImpl", "Init/Data/Array/QSort/Basic"] {
+        let read = |suffix| {
+            fs::read(lib.join(format!("{module}.olean{suffix}")))
+                .expect("the explicitly requested real companion fixture must be installed")
+        };
+        let exported = read("");
+        let server = read(".server");
+        let private = read(".private");
+        let total = exported.len() + server.len() + private.len();
+        let decoded = OleanModuleAdapter::decode_chain_bytes(
+            ModuleId::new(parse_dot_name(&module.replace('/', "."))),
+            &exported,
+            &server,
+            &private,
+            pinned_epoch(),
+            ChainLimits::new(total),
+        )
+        .expect("the complete chain reaches the environment adapter");
+        assert_eq!(decoded.payload_bytes, total);
+        assert_ne!(
+            decoded.evidence.content_digest,
+            hash(Domain::Fixture, &exported)
+        );
+        let expected = decode_chain_constants_from_parts(
+            &exported,
+            &server,
+            &private,
+            ChainLimits::new(total),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded
+                .constants
+                .iter()
+                .map(Arc::as_ref)
+                .collect::<Vec<_>>(),
+            expected.exported().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            decoded
+                .extra_constants
+                .iter()
+                .map(Arc::as_ref)
+                .collect::<Vec<_>>(),
+            expected.private_only().collect::<Vec<_>>(),
+        );
+        assert!(!decoded.extra_constants.is_empty());
+        assert!(expected.strengthened_by_the_companion().next().is_some());
+        if module.ends_with("ToArrayImpl") {
+            let witness =
+                parse_dot_name("_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1");
+            assert!(
+                decoded
+                    .extra_constants
+                    .iter()
+                    .any(|info| info.name() == &witness
+                        && matches!(info.as_ref(), ConstantInfo::Defn(_)))
+            );
+        }
+        let exported_view = OleanView::parse(&exported).unwrap();
+        let private_view =
+            OleanView::parse_with_dependencies(&private, &[&exported, &server]).unwrap();
+        let mut ir_names = exported_view
+            .extra_const_names(WalkBudget::default())
+            .unwrap();
+        for name in private_view
+            .extra_const_names(WalkBudget::default())
+            .unwrap()
+        {
+            if !ir_names.contains(&name) {
+                ir_names.push(name);
+            }
+        }
+        assert_eq!(decoded.ir_extra_const_names, ir_names);
+        if module.ends_with("QSort/Basic") {
+            assert_eq!(
+                ir_names.len(),
+                101,
+                "neither part alone contains the full IR-name population"
+            );
+        }
+        let private_blocks = private_view
+            .extension_payloads(WalkBudget::default(), 64 * 1024 * 1024)
+            .unwrap();
+        assert!(private_blocks.iter().any(|block| !block.entries.is_empty()));
+        let base = empty_base_for_modules(std::slice::from_ref(&decoded));
+        let completeness = partial_opaque_completeness(std::slice::from_ref(&decoded));
+        let plan = ModuleBatchApplyPlan::stage_decoded(
+            &base,
+            std::slice::from_ref(&decoded),
+            &completeness,
+            ModuleProvenanceLimits::default(),
+            &ModuleApplyLimits::default(),
+            None,
+        )
+        .into_complete()
+        .unwrap()
+        .unwrap();
+        let committed = plan.commit(&base, None).into_complete().unwrap().unwrap();
+        assert_eq!(committed.applied_count, 1);
+        assert_eq!(base.graph().len(), 0);
+        let environment = committed.state.environment();
+        assert_eq!(environment.len(), expected.constants.len());
+        for info in &expected.constants {
+            assert_eq!(environment.find(info.name()), Some(info));
+            assert!(base.environment().find(info.name()).is_none());
+        }
+        for name in &ir_names {
+            // A name listed as IR-only at one level can be a real declaration
+            // at another. Only the ConstantInfo arrays authorize that value.
+            assert_eq!(
+                environment.find(name),
+                expected.constants.iter().find(|info| info.name() == name),
+                "IR metadata must never synthesize a declaration: {name:?}",
+            );
+        }
+        let overlaps: Vec<_> = ir_names
+            .iter()
+            .filter(|name| environment.find(name).is_some())
+            .map(|name| name.to_display_string())
+            .collect();
+        if module.ends_with("QSort/Basic") {
+            assert_eq!(overlaps.len(), 8);
+            assert!(
+                overlaps
+                    .iter()
+                    .any(|name| name == "_private.Init.Data.Array.QSort.Basic.0.Array.qsort.sort")
+            );
+        }
+        eprintln!("IR-name/actual-declaration overlaps for {module}: {overlaps:?}");
+        for block in private_blocks {
+            if !block.entries.is_empty() {
+                let actual: Vec<_> = environment
+                    .extension(&block.name)
+                    .unwrap()
+                    .entries()
+                    .map(|entry| entry.payload.to_vec())
+                    .collect();
+                assert_eq!(
+                    actual, block.entries,
+                    "select the private level exactly once"
+                );
+            }
+        }
+        let record = committed
+            .state
+            .manifest()
+            .record(&decoded.module_id)
+            .unwrap();
+        assert_eq!(
+            record.extra_declarations(),
+            expected
+                .private_only()
+                .map(|info| info.name().clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(record.completeness().capture(), CaptureStatus::Partial);
+        assert_eq!(
+            record.completeness().transparency(),
+            PayloadTransparency::Opaque
+        );
+        eprintln!(
+            "real chain {module}: {} exported-origin declarations, {} private-only declarations, {} IR names, {} opaque entries, {total} input bytes",
+            decoded.constants.len(),
+            decoded.extra_constants.len(),
+            ir_names.len(),
+            decoded.extension_entries.len()
+        );
+
+        // Refuse resource exhaustion before parsing, and refuse partial or
+        // reordered companions. A subsequent sufficient-budget decode recovers.
+        assert!(matches!(
+            OleanModuleAdapter::decode_chain_bytes(decoded.module_id.clone(), &exported, &server, &private, pinned_epoch(), ChainLimits::new(total - 1)),
+            Err(fln_conformance::module_adapter::ModuleAdapterError::Decl(fln_olean::decl::DeclError::ChainTooLarge { bytes, limit })) if bytes == total && limit == total - 1
+        ));
+        for (server_part, private_part) in [
+            (&server[..server.len() - 1], private.as_slice()),
+            (server.as_slice(), &private[..private.len() - 1]),
+            (private.as_slice(), server.as_slice()),
+        ] {
+            assert!(
+                OleanModuleAdapter::decode_chain_bytes(
+                    decoded.module_id.clone(),
+                    &exported,
+                    server_part,
+                    private_part,
+                    pinned_epoch(),
+                    ChainLimits::new(total)
+                )
+                .is_err()
+            );
+        }
+        let mut exhausted = ChainLimits::new(total);
+        exhausted.graph.max_objects = 0;
+        assert!(matches!(
+            OleanModuleAdapter::decode_chain_bytes(
+                decoded.module_id.clone(),
+                &exported,
+                &server,
+                &private,
+                pinned_epoch(),
+                exhausted
+            ),
+            Err(fln_conformance::module_adapter::ModuleAdapterError::Decl(
+                fln_olean::decl::DeclError::Region(
+                    fln_olean::region::RegionError::BudgetExhausted { .. }
+                )
+            ))
+        ));
+        let replay = OleanModuleAdapter::decode_chain_bytes(
+            decoded.module_id.clone(),
+            &exported,
+            &server,
+            &private,
+            pinned_epoch(),
+            ChainLimits::new(total),
+        )
+        .unwrap();
+        assert_eq!(replay.evidence, decoded.evidence);
+        assert_eq!(replay.extension_entries, decoded.extension_entries);
+    }
 }
 
 #[test]

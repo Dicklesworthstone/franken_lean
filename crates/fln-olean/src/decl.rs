@@ -1550,9 +1550,10 @@ impl Default for ChainLimits {
 /// caller wanting the population has to union them. That is what this does.
 ///
 /// SCOPE, so nothing is read into this that it does not say. These are
-/// code-generator names with no `ConstantInfo` behind them anywhere in the
-/// artifact (see [`OleanView::extra_const_names`]). Dropping them cannot
-/// produce an `UnknownConstant` and none of this is kernel-facing; it is a
+/// code-generator names with no `ConstantInfo` in this field (see
+/// [`OleanView::extra_const_names`]). A name may also occur in a companion's
+/// declaration array; only that array supplies its declaration. None of this
+/// name-list union is kernel-facing; it is a
 /// completeness property of an IR-name population, not of the declarations
 /// `franken_lean-timy` is about.
 ///

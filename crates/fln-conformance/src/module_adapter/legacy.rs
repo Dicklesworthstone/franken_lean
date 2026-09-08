@@ -26,6 +26,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_env::constants::ConstantInfo;
 use fln_env::environment::{DeclAdmission, DeclarationDeltaError, EnvError, Environment};
@@ -48,9 +49,12 @@ use fln_env::provenance::{
     ModuleProvenanceLimits, ModuleProvenanceManifest, ModuleProvenanceResource,
     ModuleProvenanceRoot, ProvenanceCompleteness,
 };
-use fln_hash::domain::{Domain, hash};
+use fln_hash::domain::{Domain, DomainHasher, hash};
 use fln_hash::root::LogicalRoot;
-use fln_olean::decl::{DeclDecoder, DeclError};
+use fln_olean::decl::{
+    ChainLimits, ConstantOrigin, DeclDecoder, DeclError, chain_extra_const_names,
+    decode_chain_constants_from_parts,
+};
 use fln_olean::region::{OleanView, RegionError, WalkBudget};
 
 /// Adapter and batch coordination error.
@@ -141,6 +145,10 @@ pub struct DecodedOleanModule {
     pub imports: Vec<DirectImport>,
     pub constants: Vec<Arc<ConstantInfo>>,
     pub extra_constants: Vec<Arc<ConstantInfo>>,
+    /// Code-generator name metadata. A name can also occur in a companion's
+    /// declaration array; only that array supplies an admissible `ConstantInfo`.
+    /// This list never creates declarations or declaration provenance.
+    pub ir_extra_const_names: Vec<Name>,
     pub extension_entries: Vec<fln_env::module_apply::ExtensionPayload>,
     pub extension_contributions: Vec<ExtensionContribution>,
     pub evidence: ArtifactEvidence,
@@ -194,7 +202,78 @@ impl OleanModuleAdapter {
         epoch: ModuleEpoch,
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
         let view = OleanView::parse(bytes)?;
-        let module_data = view.module_data(WalkBudget::default())?;
+        let budget = WalkBudget::default();
+        let mut decl_decoder = DeclDecoder::new(&view, budget);
+        let raw_constants = decl_decoder.decode_module_constants()?;
+        let evidence = ArtifactEvidence {
+            epoch,
+            content_digest: hash(Domain::Fixture, bytes),
+            producer: ArtifactProducer::Reference,
+            grade: ArtifactGrade::Verified,
+        };
+        let mut decoded = Self::decode_metadata(module_id, &view, evidence, bytes.len(), budget)?;
+        decoded.constants = raw_constants.into_iter().map(Arc::new).collect();
+        decoded.ir_extra_const_names = view.extra_const_names(budget)?;
+        Ok(decoded)
+    }
+
+    /// Decode the private-level view of a complete module-system chain.
+    pub fn decode_chain_bytes(
+        module_id: ModuleId,
+        exported: &[u8],
+        server: &[u8],
+        private: &[u8],
+        epoch: ModuleEpoch,
+        limits: ChainLimits,
+    ) -> Result<DecodedOleanModule, ModuleAdapterError> {
+        let chain = decode_chain_constants_from_parts(exported, server, private, limits)?;
+        // The chain decoder already checked the combined size before parsing.
+        let payload_bytes = exported.len() + server.len() + private.len();
+        let exported_view = OleanView::parse(exported)?;
+        let private_view = OleanView::parse_with_dependencies(private, &[exported, server])?;
+        let ir_names = chain_extra_const_names(&exported_view, &private_view, limits.graph)?;
+
+        // Bind all parts, including bytes reachable only through a companion.
+        // Length framing and fixed role order prevent concatenation ambiguity.
+        let mut digest = DomainHasher::new(Domain::Fixture);
+        digest.update(b"fln-module-chain-v1\0");
+        for part in [exported, server, private] {
+            digest.update(&(part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        let evidence = ArtifactEvidence {
+            epoch,
+            content_digest: digest.finalize(),
+            producer: ArtifactProducer::Reference,
+            grade: ArtifactGrade::Verified,
+        };
+        // Each level exports its selected extension entries. Appending the
+        // exported and server arrays would replay entries multiple times.
+        let mut decoded = Self::decode_metadata(
+            module_id,
+            &private_view,
+            evidence,
+            payload_bytes,
+            limits.graph,
+        )?;
+        for (constant, origin) in chain.constants.into_iter().zip(chain.origins) {
+            match origin {
+                ConstantOrigin::Exported => decoded.constants.push(Arc::new(constant)),
+                ConstantOrigin::PrivateOnly => decoded.extra_constants.push(Arc::new(constant)),
+            }
+        }
+        decoded.ir_extra_const_names = ir_names;
+        Ok(decoded)
+    }
+
+    fn decode_metadata(
+        module_id: ModuleId,
+        view: &OleanView<'_>,
+        evidence: ArtifactEvidence,
+        payload_bytes: usize,
+        budget: WalkBudget,
+    ) -> Result<DecodedOleanModule, ModuleAdapterError> {
+        let module_data = view.module_data(budget)?;
 
         let mut imports = Vec::with_capacity(module_data.imports.len());
         for imp in &module_data.imports {
@@ -206,16 +285,12 @@ impl OleanModuleAdapter {
             ));
         }
 
-        let mut decl_decoder = DeclDecoder::new(&view, WalkBudget::default());
-        let raw_constants = decl_decoder.decode_module_constants()?;
-        let constants = raw_constants.into_iter().map(Arc::new).collect::<Vec<_>>();
-
         let mut extension_entries = Vec::new();
         let mut extension_contributions = Vec::new();
 
         // This limit bounds expansion when many entries share large subgraphs.
         // Exhaustion remains a typed non-answer; never publish a prefix.
-        let extension_blocks = view.extension_payloads(WalkBudget::default(), 64 * 1024 * 1024)?;
+        let extension_blocks = view.extension_payloads(budget, 64 * 1024 * 1024)?;
         for ext_block in extension_blocks {
             if ext_block.entries.is_empty() {
                 continue;
@@ -229,7 +304,11 @@ impl OleanModuleAdapter {
             };
             let mut entry_ids = Vec::new();
             for (ordinal, raw_data) in ext_block.entries.into_iter().enumerate() {
-                entry_ids.push(ExtensionEntryId::derive(&epoch, &descriptor, &raw_data));
+                entry_ids.push(ExtensionEntryId::derive(
+                    &evidence.epoch,
+                    &descriptor,
+                    &raw_data,
+                ));
                 extension_entries.push(fln_env::module_apply::ExtensionPayload::new(
                     ext_idx,
                     descriptor.clone(),
@@ -244,24 +323,17 @@ impl OleanModuleAdapter {
             extension_contributions.push(contribution);
         }
 
-        let content_digest = hash(Domain::Fixture, bytes);
-        let evidence = ArtifactEvidence {
-            epoch,
-            content_digest,
-            producer: ArtifactProducer::Reference,
-            grade: ArtifactGrade::Verified,
-        };
-
         Ok(DecodedOleanModule {
             module_id,
             is_module: module_data.is_module,
             imports,
-            constants,
+            constants: Vec::new(),
             extra_constants: Vec::new(),
+            ir_extra_const_names: Vec::new(),
             extension_entries,
             extension_contributions,
             evidence,
-            payload_bytes: bytes.len(),
+            payload_bytes,
         })
     }
 

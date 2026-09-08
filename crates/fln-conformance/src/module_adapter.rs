@@ -16,7 +16,7 @@ use fln_env::modules::{ModuleEpoch, ModuleId};
 use fln_env::provenance::{
     ModuleProvenanceError, ModuleProvenanceManifest, ProvenanceCompleteness,
 };
-use fln_olean::decl::DeclError;
+use fln_olean::decl::{ChainLimits, DeclError};
 use fln_olean::region::{ExtensionBlock, OleanView, RegionError, WalkBudget};
 
 mod legacy;
@@ -177,6 +177,31 @@ impl OleanModuleAdapter {
         Ok(decoded)
     }
 
+    /// Decode a complete exported/server/private chain at private import level.
+    ///
+    /// Shared declarations use their full private bodies, and declarations
+    /// found only in the private companion become `extra_constants`. Extension
+    /// entries come from the private level, retaining references to earlier
+    /// parts; IR-only names remain metadata. No kernel checking is implied.
+    pub fn decode_chain_bytes(
+        module_id: ModuleId,
+        exported: &[u8],
+        server: &[u8],
+        private: &[u8],
+        epoch: ModuleEpoch,
+        limits: ChainLimits,
+    ) -> Result<DecodedOleanModule, ModuleAdapterError> {
+        let decoded = legacy::OleanModuleAdapter::decode_chain_bytes(
+            module_id, exported, server, private, epoch, limits,
+        )?;
+        let view = OleanView::parse_with_dependencies(private, &[exported, server])?;
+        require_lossless_extension_payloads(
+            &view.module_data(limits.graph)?.extensions,
+            &decoded.extension_contributions,
+        )?;
+        Ok(decoded)
+    }
+
     /// Decode a `.olean` artifact from a filesystem file.
     pub fn decode_file(
         module_id: ModuleId,
@@ -242,6 +267,142 @@ mod tests {
             &[],
         )
         .expect("empty extension arrays carry no environment delta");
+    }
+
+    #[test]
+    fn chain_adapter_routes_declarations_and_binds_every_part_without_promoting_ir_names() {
+        use fln_core::expr::Expr;
+        use fln_core::level::Level;
+        use fln_env::constants::{
+            AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+        };
+        let name = |label| Name::str(Name::anonymous(), label);
+        let shared_name = Name::str(name("_private"), "Shared");
+        let extra_name = name("CompanionOnly");
+        let definition = |name: Name| {
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params: vec![],
+                    type_: Expr::sort(Level::succ(Level::zero()).unwrap()),
+                },
+                value: Expr::sort(Level::zero()),
+                hints: ReducibilityHints::Opaque,
+                safety: DefinitionSafety::Safe,
+                all: vec![name],
+            })
+        };
+        let shared = definition(shared_name);
+        let extra = definition(extra_name.clone());
+        let axiom = ConstantInfo::Axiom(AxiomVal {
+            base: shared.constant_val().clone(),
+            is_unsafe: false,
+        });
+        let exported_ir = name("ExportedIR");
+        let private_ir = name("PrivateIR");
+        let encode = |constants: &[ConstantInfo], ir_names: &[Name], base| {
+            encode_module(
+                ModuleWriteInput {
+                    is_module: true,
+                    imports: &[],
+                    constants,
+                    extra_const_names: ir_names,
+                },
+                OleanWriteHeader {
+                    version: 2,
+                    flags: 1,
+                    lean_version: format::PIN_TAG,
+                    githash: format::PIN_COMMIT,
+                    base_addr: base,
+                },
+                WriteBudget::default(),
+            )
+            .unwrap()
+            .bytes
+        };
+        let parts = [
+            encode(
+                std::slice::from_ref(&axiom),
+                std::slice::from_ref(&exported_ir),
+                format::REGION_ALIGN as u64,
+            ),
+            encode(&[axiom], &[], 2 * format::REGION_ALIGN as u64),
+            encode(
+                &[shared.clone(), extra.clone()],
+                &[private_ir.clone(), extra_name.clone()],
+                3 * format::REGION_ALIGN as u64,
+            ),
+        ];
+        let total = parts.iter().map(Vec::len).sum();
+        let module = ModuleId::new(name("Chain"));
+        let epoch = ModuleEpoch::new(format::PIN_TAG, format::PIN_COMMIT);
+        let decode = |parts: &[Vec<u8>; 3], limits| {
+            OleanModuleAdapter::decode_chain_bytes(
+                module.clone(),
+                &parts[0],
+                &parts[1],
+                &parts[2],
+                epoch.clone(),
+                limits,
+            )
+        };
+        let decoded = decode(&parts, ChainLimits::new(total)).unwrap();
+        assert_eq!(decoded.constants, vec![Arc::new(shared)]);
+        assert_eq!(decoded.extra_constants, vec![Arc::new(extra)]);
+        assert_eq!(
+            decoded.ir_extra_const_names,
+            vec![exported_ir.clone(), private_ir, extra_name]
+        );
+        assert_eq!(decoded.payload_bytes, total);
+        assert!(decoded.extension_entries.is_empty());
+        let exported_only =
+            OleanModuleAdapter::decode_bytes(module.clone(), &parts[0], epoch.clone()).unwrap();
+        assert_eq!(exported_only.ir_extra_const_names, vec![exported_ir]);
+        assert!(matches!(
+            exported_only.constants[0].as_ref(),
+            ConstantInfo::Axiom(_)
+        ));
+
+        // Ignored bytes after the version string's NUL affect artifact identity
+        // without changing decoded declarations or the chain identity stamp.
+        let version_field = format::OLEAN_HEADER_FIELDS
+            .iter()
+            .find(|field| field.name == "lean_version")
+            .unwrap();
+        let padding = version_field.offset + version_field.size - 1;
+        for role in 0..parts.len() {
+            let mut changed = parts.clone();
+            assert_eq!(changed[role][padding], 0);
+            changed[role][padding] = 0xAB;
+            let changed = decode(&changed, ChainLimits::new(total)).unwrap();
+            assert_ne!(
+                changed.evidence.content_digest, decoded.evidence.content_digest,
+                "part {role} must affect the digest"
+            );
+            assert_eq!(changed.constants, decoded.constants);
+            assert_eq!(changed.extra_constants, decoded.extra_constants);
+            assert_eq!(changed.ir_extra_const_names, decoded.ir_extra_const_names);
+        }
+        assert!(matches!(
+            decode(&parts, ChainLimits::new(total - 1)),
+            Err(ModuleAdapterError::Decl(DeclError::ChainTooLarge { .. }))
+        ));
+        assert!(matches!(
+            decode(
+                &parts,
+                ChainLimits {
+                    max_bytes: total,
+                    graph: WalkBudget { max_objects: 0 }
+                }
+            ),
+            Err(ModuleAdapterError::Decl(DeclError::Region(
+                RegionError::BudgetExhausted { .. }
+            )))
+        ));
+        assert_eq!(
+            decode(&parts, ChainLimits::new(total)).unwrap().evidence,
+            decoded.evidence
+        );
     }
 
     #[test]
