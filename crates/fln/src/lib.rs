@@ -26,6 +26,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod source_check;
+pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
+
 pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
 };

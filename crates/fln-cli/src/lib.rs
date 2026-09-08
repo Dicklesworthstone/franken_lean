@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+mod source_check;
+
 use fln_core::diag::{
     DIAGNOSTIC_PROJECTION_SCHEMA, DIAGNOSTIC_SOUND_BEHAVIOR_NOTE_NAME, DiagnosticChannel,
     DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, DiagnosticPathPolicy, ExitClass,
@@ -83,6 +85,8 @@ const MERGE_SORT_COMPANION_ONLY_UNSAFE_REC_RESIDUALS: [&str; 3] = [
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln check-olean [--json] [--receipts PATH] [--max-bytes BYTES] PATH\n",
+    "  fln check-source [--json] [--max-bytes BYTES] PATH...\n",
+    "    Check import-free definitions and theorems without executing code.\n",
     "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--constants] [--max-bytes BYTES] PATH\n",
@@ -261,6 +265,11 @@ impl MultiplexerOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MultiplexerCommand {
+    SourceCheck {
+        paths: Vec<PathBuf>,
+        max_bytes: usize,
+        json: bool,
+    },
     Help,
     Version,
     CheckOlean {
@@ -1050,6 +1059,9 @@ fn parse_command(
     }
     if command == "--version" || command == "-V" || command == "version" {
         return Ok(MultiplexerCommand::Version);
+    }
+    if command == "check-source" {
+        return source_check::parse(arguments.collect());
     }
     if command == "run" {
         return parse_source_run(arguments.collect());
@@ -11008,6 +11020,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_nodes,
             json,
         }) => why_trusts(&name, &path, max_bytes, max_nodes, json),
+        Ok(MultiplexerCommand::SourceCheck {
+            paths,
+            max_bytes,
+            json,
+        }) => source_check::run(paths, max_bytes, json),
         Ok(MultiplexerCommand::SourceRun {
             paths,
             max_bytes,

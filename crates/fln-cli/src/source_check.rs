@@ -8,42 +8,85 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let mut options = true;
     let mut skip_value = false;
     for arg in &arguments {
-        if skip_value { skip_value = false; continue; }
-        if arg == "--" { options = false; continue; }
-        if !options { continue; }
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg == "--" {
+            options = false;
+            continue;
+        }
+        if !options {
+            continue;
+        }
         if arg == "--json" {
-            if json { return Err(UsageError("duplicate --json".to_owned())); }
+            if json {
+                return Err(UsageError("duplicate --json".to_owned()));
+            }
             json = true;
         }
         if arg == "--max-bytes" || arg.to_str().is_some_and(|s| s.starts_with("--max-bytes=")) {
-            if bytes { return Err(UsageError("duplicate --max-bytes".to_owned())); }
+            if bytes {
+                return Err(UsageError("duplicate --max-bytes".to_owned()));
+            }
             bytes = true;
             skip_value = arg == "--max-bytes";
         }
     }
-    let Some((paths, max_bytes, json)) = parse_path_options(arguments, "check-source", SOURCE_RUN_DEFAULT_MAX_BYTES)? else { return Ok(MultiplexerCommand::Help); };
-    Ok(MultiplexerCommand::SourceCheck { paths, max_bytes, json })
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(arguments, "check-source", SOURCE_RUN_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    Ok(MultiplexerCommand::SourceCheck {
+        paths,
+        max_bytes,
+        json,
+    })
 }
 
 fn failed(class: &str, detail: &str, authority: bool, json: bool, exit: u8) -> MultiplexerOutput {
     let detail = BoundedText::new(detail.to_owned());
     let stderr = if json {
-        format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":{},\"authority\":{},\"detail\":{},\"detailTruncated\":{}}}\n",
-            json_string(class), authority, json_string(detail.text()), detail.truncated())
+        format!(
+            "{{\"schema\":\"fln.source-check/1\",\"outcome\":{},\"authority\":{},\"detail\":{},\"detailTruncated\":{}}}\n",
+            json_string(class),
+            authority,
+            json_string(detail.text()),
+            detail.truncated()
+        )
     } else {
-        format!("fln check-source: {class}: {}{}\n", detail.text(), if detail.truncated() { " [detail truncated]" } else { "" })
+        format!(
+            "fln check-source: {class}: {}{}\n",
+            detail.text(),
+            if detail.truncated() {
+                " [detail truncated]"
+            } else {
+                ""
+            }
+        )
     };
     MultiplexerOutput::failure(stderr, exit)
 }
 
 pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> MultiplexerOutput {
-    if paths.len() > 4096 { return failed("resource", "source file count exceeds 4096", false, json, 3); }
+    if paths.len() > 4096 {
+        return failed("resource", "source file count exceeds 4096", false, json, 3);
+    }
     let mut sources = Vec::new();
     let mut total = 0;
     for path in &paths {
         let bytes = match read_bounded(path, max_bytes - total, "Lean source") {
             Ok(bytes) => bytes,
-            Err(error) => return failed(error.class(), &error.to_string(), false, json, error.exit_code()),
+            Err(error) => {
+                return failed(
+                    error.class(),
+                    &error.to_string(),
+                    false,
+                    json,
+                    error.exit_code(),
+                );
+            }
         };
         total += bytes.len();
         sources.push(bytes);
@@ -83,10 +126,22 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
             MultiplexerOutput::success(stdout)
         });
     match worker {
-        Err(error) => failed("resource", &format!("could not start source-check worker: {error}"), false, json, 3),
+        Err(error) => failed(
+            "resource",
+            &format!("could not start source-check worker: {error}"),
+            false,
+            json,
+            3,
+        ),
         Ok(worker) => match worker.join() {
             Ok(result) => result,
-            Err(_) => failed("internal-fault", "source-check worker panicked", false, json, 4),
-        }
+            Err(_) => failed(
+                "internal-fault",
+                "source-check worker panicked",
+                false,
+                json,
+                4,
+            ),
+        },
     }
 }
