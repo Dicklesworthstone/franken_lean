@@ -33,6 +33,7 @@
 use fln_core::name::Name;
 use std::collections::BTreeMap;
 
+use crate::modules::ModuleEpoch;
 use crate::pmap::{PKey, PMap};
 
 /// The census families, as an exhaustive enum (the registry's own vocabulary).
@@ -143,6 +144,9 @@ pub struct AttributeDefinition {
     pub handler_class: HandlerClass,
     pub application_time: String,
     pub anchor: String,
+    /// Serialized persistent-extension key extracted from a tag registration's
+    /// `ref`. Attribute names and extension keys are distinct identities.
+    pub serialized_extension: Option<Name>,
 }
 
 /// The payload of one assignment, lossless (opaque payloads byte-exact).
@@ -263,6 +267,7 @@ impl PKey for AttrTarget {
 /// every update rebuilds exactly the affected path.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AttributeState {
+    census_epoch: Option<ModuleEpoch>,
     definitions: PMap<Name, AttributeDefinition>,
     assignments: PMap<AttrTarget, Assignment>,
 }
@@ -296,6 +301,58 @@ impl AttributeState {
         Self::default()
     }
 
+    /// The census's declared epoch, not authentication of its producer.
+    /// Source-only synthetic registries may be unbound; serialized tag import
+    /// requires a bound epoch matching the module artifact.
+    pub fn census_epoch(&self) -> Option<&ModuleEpoch> {
+        self.census_epoch.as_ref()
+    }
+
+    fn observe_census_epoch(&mut self, value: &str) -> Result<bool, AttributeError> {
+        let mut tag = None;
+        let mut commit = None;
+        for token in value.split_whitespace() {
+            if let Some(value) = token.strip_prefix("tag=") {
+                if tag.replace(value).is_some() {
+                    return Err(AttributeError::MalformedCensus {
+                        reason: "duplicate census epoch tag".into(),
+                    });
+                }
+            } else if let Some(value) = token.strip_prefix("commit=")
+                && commit.replace(value).is_some()
+            {
+                return Err(AttributeError::MalformedCensus {
+                    reason: "duplicate census epoch commit".into(),
+                });
+            }
+        }
+        let epoch = match (tag, commit) {
+            (None, None) => return Ok(false),
+            (Some(tag), Some(commit)) => ModuleEpoch::new(tag, commit),
+            _ => {
+                return Err(AttributeError::MalformedCensus {
+                    reason: "incomplete census epoch".into(),
+                });
+            }
+        };
+        if !epoch.is_well_formed() {
+            return Err(AttributeError::MalformedCensus {
+                reason: "malformed census epoch".into(),
+            });
+        }
+        if self
+            .census_epoch
+            .as_ref()
+            .is_some_and(|previous| previous != &epoch)
+        {
+            return Err(AttributeError::MalformedCensus {
+                reason: "conflicting census epochs".into(),
+            });
+        }
+        self.census_epoch = Some(epoch);
+        Ok(true)
+    }
+
     /// Build the definition substrate from the committed census text. The
     /// parameterized OpaqueFallback row is the shape, not a registration; it
     /// is excluded from the definition map and recorded separately.
@@ -303,10 +360,21 @@ impl AttributeState {
         let mut state = Self::new();
         let mut count = 0usize;
         for (index, line) in text.lines().enumerate() {
+            if let Some(epoch) = line.strip_prefix("epoch ") {
+                if !state.observe_census_epoch(epoch)? {
+                    return Err(AttributeError::MalformedCensus {
+                        reason: "unbound census epoch header".into(),
+                    });
+                }
+                continue;
+            }
             if !line.starts_with("row=") {
                 continue;
             }
             let fields = parse_census_row(line)?;
+            if let Some(epoch) = fields.get("epoch") {
+                state.observe_census_epoch(epoch)?;
+            }
             let row_id = fields
                 .get("row")
                 .ok_or_else(|| AttributeError::MalformedCensus {
@@ -344,6 +412,62 @@ impl AttributeState {
                     reason: format!("row {row_id}: missing name"),
                 })?;
             let name = Name::str(Name::anonymous(), name_text.clone());
+            let serialized_extension = if family == AttributeFamily::Tag {
+                let extension = fields
+                    .get("extension-name")
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| AttributeError::MalformedCensus {
+                        reason: format!("row {row_id}: missing tag extension-name"),
+                    })?;
+                let malformed = || AttributeError::MalformedCensus {
+                    reason: format!("row {row_id}: invalid structural extension-name"),
+                };
+                let mut components = extension.split('/');
+                if components.next() != Some("a") {
+                    return Err(malformed());
+                }
+                let mut key = Name::anonymous();
+                for part in components {
+                    if let Some(hex) = part.strip_prefix('s') {
+                        if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            return Err(malformed());
+                        }
+                        let bytes = hex
+                            .as_bytes()
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|pair| {
+                                u8::from_str_radix(
+                                    std::str::from_utf8(pair).map_err(|_| malformed())?,
+                                    16,
+                                )
+                                .map_err(|_| malformed())
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        key = Name::str(key, String::from_utf8(bytes).map_err(|_| malformed())?);
+                    } else if let Some(number) = part.strip_prefix('n') {
+                        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+                            return Err(malformed());
+                        }
+                        key = Name::num(key, number.parse().map_err(|_| malformed())?);
+                    } else {
+                        return Err(malformed());
+                    }
+                }
+                if state
+                    .definitions
+                    .iter()
+                    .any(|(_, definition)| definition.serialized_extension.as_ref() == Some(&key))
+                {
+                    return Err(AttributeError::MalformedCensus {
+                        reason: format!("row {row_id}: duplicate tag extension-name"),
+                    });
+                }
+                Some(key)
+            } else {
+                None
+            };
             let definition = AttributeDefinition {
                 row_id,
                 name: name.clone(),
@@ -351,6 +475,7 @@ impl AttributeState {
                 handler_class,
                 application_time: fields.get("application-time").cloned().unwrap_or_default(),
                 anchor: fields.get("anchor").cloned().unwrap_or_default(),
+                serialized_extension,
             };
             state.definitions = state.definitions.insert(name, definition);
             count += 1;
@@ -424,6 +549,7 @@ impl AttributeState {
 
     fn with_assignment(&self, key: AttrTarget, assignment: Assignment) -> Self {
         Self {
+            census_epoch: self.census_epoch.clone(),
             definitions: self.definitions.clone(),
             assignments: self.assignments.insert(key, assignment),
         }
@@ -442,6 +568,7 @@ impl AttributeState {
             });
         }
         Ok(Self {
+            census_epoch: self.census_epoch.clone(),
             definitions: self.definitions.clone(),
             assignments: self.assignments.remove(&key),
         })
@@ -562,6 +689,182 @@ mod tests {
 
     fn name_of(text: &str) -> Name {
         Name::str(Name::anonymous(), text)
+    }
+
+    #[test]
+    fn census_epochs_are_consistent_preserved_and_bound_to_stale_plans() {
+        let census = census_text();
+        let (base, _) = AttributeState::from_census(&census).unwrap();
+        assert_eq!(
+            base.census_epoch(),
+            Some(&ModuleEpoch::new(
+                "v4.32.0",
+                "8c9756b28d64dab099da31a4c09229a9e6a2ef35"
+            ))
+        );
+        let (foreign, _) =
+            AttributeState::from_census(&census.replace("tag=v4.32.0", "tag=v9.0.0")).unwrap();
+        assert_ne!(base.state_digest(), foreign.state_digest());
+        assert!(matches!(
+            AttributeStatePlan::cut(&base, vec![]).publish(&foreign),
+            Err(PlanError::StalePlan { .. })
+        ));
+        for malformed in [
+            census.replacen(
+                "\nepoch leanprover/lean4 tag=v4.32.0",
+                "\nepoch leanprover/lean4 tag=v9.0.0",
+                1,
+            ),
+            format!("{census}epoch unbound\n"),
+            format!("{census}epoch leanprover/lean4 tag=v4.32.0\n"),
+            format!(
+                "{census}epoch leanprover/lean4 tag=v4.32.0 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35\n"
+            ),
+        ] {
+            let result = AttributeState::from_census(&malformed);
+            assert!(
+                matches!(result, Err(AttributeError::MalformedCensus { .. })),
+                "malformed census was accepted: {malformed}"
+            );
+        }
+        let populated = base.assign(tag_assignment("unbox", "Target")).unwrap();
+        assert_eq!(populated.census_epoch(), base.census_epoch());
+        let erased = populated
+            .erase(&name_of("unbox"), &name_of("Target"))
+            .unwrap();
+        assert_eq!(erased, base);
+    }
+
+    #[test]
+    fn imported_tag_bindings_and_all_state_fields_invalidate_stale_plans() {
+        let (base, _) = state();
+        let attr = name_of("unbox");
+        let original = base.definition(&attr).unwrap().clone();
+        let mutate: [fn(&mut AttributeDefinition); 7] = [
+            |d| d.name = name_of("another"),
+            |d| d.row_id.push_str("-changed"),
+            |d| d.family = AttributeFamily::Label,
+            |d| d.handler_class = HandlerClass::RequiresHandler,
+            |d| d.application_time.push_str("-changed"),
+            |d| d.anchor.push_str("-changed"),
+            |d| d.serialized_extension = Some(Name::from_components(["Other", "tags"])),
+        ];
+        for mutation in mutate {
+            let mut definition = original.clone();
+            mutation(&mut definition);
+            let mut changed = base.clone();
+            changed.definitions = changed.definitions.insert(attr.clone(), definition);
+            assert_ne!(base.state_digest(), changed.state_digest());
+            assert!(matches!(
+                AttributeStatePlan::cut(&base, vec![]).publish(&changed),
+                Err(PlanError::StalePlan { .. })
+            ));
+        }
+        let assignment = tag_assignment("unbox", "Target");
+        let original_state = base.assign(assignment.clone()).unwrap();
+        for changed_assignment in [
+            Assignment {
+                kind: AttributeKind::Local,
+                ..assignment.clone()
+            },
+            Assignment {
+                kind: AttributeKind::Scoped,
+                ..assignment.clone()
+            },
+            Assignment {
+                provenance: "another source".into(),
+                ..assignment.clone()
+            },
+        ] {
+            let changed = base.assign(changed_assignment).unwrap();
+            assert_ne!(original_state.state_digest(), changed.state_digest());
+            assert!(matches!(
+                AttributeStatePlan::cut(&original_state, vec![]).publish(&changed),
+                Err(PlanError::StalePlan { .. })
+            ));
+        }
+        let first = base
+            .assign(Assignment {
+                target: Name::str(Name::anonymous(), "a.b"),
+                ..assignment.clone()
+            })
+            .unwrap();
+        let second = base
+            .assign(Assignment {
+                target: Name::from_components(["a", "b"]),
+                ..assignment
+            })
+            .unwrap();
+        assert_ne!(
+            first.state_digest(),
+            second.state_digest(),
+            "display-equal structural Names are distinct"
+        );
+        assert_eq!(
+            AttributeStatePlan::cut(&base, vec![])
+                .publish(&base)
+                .unwrap(),
+            base
+        );
+    }
+
+    #[test]
+    fn a_tag_census_requires_a_unique_serialized_extension_key() {
+        let census = census_text();
+        let binding = |attribute: &str| {
+            census
+                .lines()
+                .find(|line| {
+                    line.split_whitespace()
+                        .any(|field| field == format!("name={attribute}"))
+                })
+                .unwrap()
+                .split_whitespace()
+                .find(|field| field.starts_with("extension-name="))
+                .unwrap()
+        };
+        let unbox = binding("unbox");
+        let missing = census.replace(&format!(" {unbox}"), "");
+        assert!(matches!(
+            AttributeState::from_census(&missing),
+            Err(AttributeError::MalformedCensus { .. })
+        ));
+        let duplicate = census.replace(binding("never_extract"), unbox);
+        assert!(matches!(
+            AttributeState::from_census(&duplicate),
+            Err(AttributeError::MalformedCensus { .. })
+        ));
+        for invalid in [
+            "Lean.tags",
+            "a/s0",
+            "a/szz",
+            "a/sff",
+            "a/n-1",
+            "a/n18446744073709551616",
+            "a/w0",
+        ] {
+            let malformed = census.replace(unbox, &format!("extension-name={invalid}"));
+            assert!(
+                matches!(
+                    AttributeState::from_census(&malformed),
+                    Err(AttributeError::MalformedCensus { .. })
+                ),
+                "{invalid}"
+            );
+        }
+        let (state, _) = AttributeState::from_census(&census).unwrap();
+        assert_eq!(
+            state
+                .definition(&name_of("unbox"))
+                .unwrap()
+                .serialized_extension,
+            Some(Name::from_components([
+                "Lean",
+                "IR",
+                "UnboxResult",
+                "unboxAttr"
+            ]))
+        );
     }
 
     fn tag_assignment(attribute: &str, target: &str) -> Assignment {
@@ -762,51 +1065,113 @@ impl AttributeState {
         }
     }
 
-    /// The canonical state digest (for determinism comparison across
-    /// schedules): the definitions and assignments serialized in canonical
-    /// order and hashed. Two states built from the same input closure are
-    /// byte-identical in state iff their digests agree — schedule
-    /// independence made executable.
+    /// Digest all definition and assignment fields in canonical map order.
+    /// Equal state produces equal digests; digest equality is not a proof of
+    /// exact state equality. Structural names and variable fields are framed.
     pub fn state_digest(&self) -> String {
-        let mut preimage = Vec::new();
-        for (name, definition) in self.definitions.iter() {
-            preimage.extend_from_slice(name.to_display_string().as_bytes());
-            preimage.push(0);
-            preimage.extend_from_slice(definition.row_id.as_bytes());
-            preimage.push(1);
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value);
         }
-        preimage.push(0xFF);
-        for (key, assignment) in self.assignments.iter() {
-            preimage.extend_from_slice(key.attribute.to_display_string().as_bytes());
-            preimage.push(0);
-            preimage.extend_from_slice(key.target.to_display_string().as_bytes());
-            preimage.push(1);
-            let payload_tag = match &assignment.payload {
-                Payload::Unit => 0u8,
-                Payload::SimpEntry { post, priority } => {
-                    preimage.push(if *post { 2 } else { 3 });
-                    preimage.extend_from_slice(&priority.to_le_bytes());
-                    1
+        fn name(out: &mut Vec<u8>, value: &Name) {
+            let mut cursor = value.clone();
+            loop {
+                match cursor.leaf_view() {
+                    fln_core::name::LeafView::Anonymous => {
+                        out.push(0);
+                        break;
+                    }
+                    fln_core::name::LeafView::Str(part) => {
+                        out.push(1);
+                        bytes(out, part.as_bytes());
+                    }
+                    fln_core::name::LeafView::Num(part) => {
+                        out.push(2);
+                        out.extend_from_slice(&part.to_le_bytes());
+                        out.push(u8::from(cursor.component_overflowed()));
+                    }
                 }
-                Payload::Parameter(bytes) => {
-                    preimage.extend_from_slice(bytes);
-                    4
+                cursor = cursor.parent();
+            }
+        }
+        let mut preimage = b"fln-attribute-state-v2\0".to_vec();
+        if let Some(epoch) = &self.census_epoch {
+            preimage.push(1);
+            bytes(&mut preimage, epoch.tag().as_bytes());
+            bytes(&mut preimage, epoch.commit().as_bytes());
+        } else {
+            preimage.push(0);
+        }
+        preimage.extend_from_slice(&(self.definitions.len() as u64).to_le_bytes());
+        for (key, definition) in self.definitions.iter() {
+            name(&mut preimage, key);
+            name(&mut preimage, &definition.name);
+            bytes(&mut preimage, definition.row_id.as_bytes());
+            preimage.push(match definition.family {
+                AttributeFamily::Core => 0,
+                AttributeFamily::Tag => 1,
+                AttributeFamily::Simp => 2,
+                AttributeFamily::SymSimp => 3,
+                AttributeFamily::Simproc => 4,
+                AttributeFamily::Label => 5,
+                AttributeFamily::Parametric => 6,
+                AttributeFamily::InitAttr => 7,
+                AttributeFamily::KeyedDecls => 8,
+                AttributeFamily::ParserAttr => 9,
+                AttributeFamily::EnvExtension => 10,
+                AttributeFamily::Opaque => 11,
+            });
+            preimage.push(match definition.handler_class {
+                HandlerClass::DataOnly => 0,
+                HandlerClass::RequiresHandler => 1,
+                HandlerClass::RequiresHandlerProvisional => 2,
+                HandlerClass::OpaqueHandlerRequired => 3,
+            });
+            bytes(&mut preimage, definition.application_time.as_bytes());
+            bytes(&mut preimage, definition.anchor.as_bytes());
+            if let Some(extension) = &definition.serialized_extension {
+                preimage.push(1);
+                name(&mut preimage, extension);
+            } else {
+                preimage.push(0);
+            }
+        }
+        preimage.extend_from_slice(&(self.assignments.len() as u64).to_le_bytes());
+        for (key, assignment) in self.assignments.iter() {
+            name(&mut preimage, &key.attribute);
+            name(&mut preimage, &key.target);
+            name(&mut preimage, &assignment.attribute);
+            name(&mut preimage, &assignment.target);
+            preimage.push(match assignment.kind {
+                AttributeKind::Global => 0,
+                AttributeKind::Local => 1,
+                AttributeKind::Scoped => 2,
+            });
+            bytes(&mut preimage, assignment.provenance.as_bytes());
+            match &assignment.payload {
+                Payload::Unit => preimage.push(0),
+                Payload::SimpEntry { post, priority } => {
+                    preimage.push(1);
+                    preimage.push(u8::from(*post));
+                    preimage.extend_from_slice(&priority.to_le_bytes());
+                }
+                Payload::Parameter(value) => {
+                    preimage.push(2);
+                    bytes(&mut preimage, value);
                 }
                 Payload::Keyed {
                     key,
                     implementation,
                 } => {
-                    preimage.extend_from_slice(key.to_display_string().as_bytes());
-                    preimage.extend_from_slice(implementation.to_display_string().as_bytes());
-                    5
+                    preimage.push(3);
+                    name(&mut preimage, key);
+                    name(&mut preimage, implementation);
                 }
-                Payload::Opaque(bytes) => {
-                    preimage.extend_from_slice(bytes);
-                    6
+                Payload::Opaque(value) => {
+                    preimage.push(4);
+                    bytes(&mut preimage, value);
                 }
-            };
-            preimage.push(payload_tag);
-            preimage.push(7);
+            }
         }
         fln_hash::domain::hash(fln_hash::domain::Domain::Fixture, &preimage).to_hex()
     }
@@ -874,6 +1239,7 @@ impl AttributeState {
             .try_insert_with_budget(key, assignment, expanded_weight, budget)
         {
             fln_core::outcome::Outcome::Complete(assignments) => Ok(Self {
+                census_epoch: self.census_epoch.clone(),
                 definitions: self.definitions.clone(),
                 assignments,
             }),

@@ -953,7 +953,12 @@ pub mod tests {
     }
 
     fn sample_census_state() -> AttributeState {
-        let text = "row=attr-tag-simp epoch=leanprover/lean4 name=simp family=tag handler-class=data-only application-time=afterTypeChecking anchor=test:1\nrow=attr-tag-inline epoch=leanprover/lean4 name=inline family=tag handler-class=data-only application-time=afterTypeChecking anchor=test:2\n";
+        // Deliberately artificial tag definitions for the transaction unit
+        // controls; these are not the Reference's simp/inline registrations.
+        let text = concat!(
+            "row=attr-tag-simp epoch=leanprover/lean4 name=simp family=tag handler-class=data-only application-time=afterTypeChecking anchor=test:1 extension-name=a/s74616731\n",
+            "row=attr-tag-inline epoch=leanprover/lean4 name=inline family=tag handler-class=data-only application-time=afterTypeChecking anchor=test:2 extension-name=a/s74616732\n",
+        );
         AttributeState::from_census(text).expect("valid census").0
     }
 
