@@ -34,6 +34,7 @@ jobs:
           root = pathlib.Path('target/source-landing')
           content = ''.join(json.loads((root / 'blob.json').read_text())['content'].split())
           content = content.replace('PbRWuvxa2Op', 'PbRWuvxaOp')
+          content += '=' * (-len(content) % 4)
           patch = gzip.decompress(base64.b64decode(content, validate=True))
           expected = '1f550b3dee4d4572eee942c5ca0a419baa412dc399842e83855c66897c0098cb'
           assert hashlib.sha256(patch).hexdigest() == expected, 'source patch digest mismatch'
