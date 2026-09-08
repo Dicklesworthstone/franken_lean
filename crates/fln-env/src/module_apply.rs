@@ -2069,14 +2069,13 @@ pub fn prepare_module_apply_batch_with<E: From<ModuleApplyBatchPrepareError>>(
     let mut staged = Vec::with_capacity(stage_count);
     let mut current = base.clone();
     for position in 0..stage_count {
-        let (preflight, candidate_environment) = match inputs_for(
-            position, current.environment(), current.manifest(),
-        ) {
-            Outcome::Complete(Ok(inputs)) => inputs,
-            Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
-            Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
-            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
-        };
+        let (preflight, candidate_environment) =
+            match inputs_for(position, current.environment(), current.manifest()) {
+                Outcome::Complete(Ok(inputs)) => inputs,
+                Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+                Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
+                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+            };
         match prepare_module_apply_inner(&preflight, &current, &candidate_environment, None) {
             Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
                 current = plan.candidate.clone();
@@ -2085,13 +2084,15 @@ pub fn prepare_module_apply_batch_with<E: From<ModuleApplyBatchPrepareError>>(
             Outcome::Complete(Ok(ModuleApplyPlan::Retry(_))) => {
                 return Outcome::complete(Err(ModuleApplyBatchPrepareError::AlreadyApplied {
                     position,
-                }.into()));
+                }
+                .into()));
             }
             Outcome::Complete(Err(error)) => {
                 return Outcome::complete(Err(ModuleApplyBatchPrepareError::Stage {
                     position,
                     error: Box::new(error),
-                }.into()));
+                }
+                .into()));
             }
             Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
             Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),

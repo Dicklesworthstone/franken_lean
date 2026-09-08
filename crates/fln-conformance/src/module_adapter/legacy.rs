@@ -35,9 +35,9 @@ use fln_env::extensions::{
 use fln_env::module_apply::{
     MODULE_APPLY_SCHEMA_VERSION, ModuleApplyBatchCommitError, ModuleApplyBatchPrepareError,
     ModuleApplyCandidateError, ModuleApplyLimits, ModuleApplyPreflightError, ModuleApplyReceipt,
-    ModuleApplyReplayError, ModuleApplyResource, ModuleApplyState, ModuleApplyTransaction, PreflightedModuleApply,
-    StagedModuleApplyBatch, preflight_module_apply, prepare_module_apply_batch,
-    prepare_module_apply_batch_with,
+    ModuleApplyReplayError, ModuleApplyResource, ModuleApplyState, ModuleApplyTransaction,
+    PreflightedModuleApply, StagedModuleApplyBatch, preflight_module_apply,
+    prepare_module_apply_batch, prepare_module_apply_batch_with,
 };
 use fln_env::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport,
@@ -45,7 +45,8 @@ use fln_env::modules::{
 };
 use fln_env::provenance::{
     ExtensionContribution, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
-    ModuleProvenanceLimits, ModuleProvenanceManifest, ModuleProvenanceResource, ModuleProvenanceRoot, ProvenanceCompleteness,
+    ModuleProvenanceLimits, ModuleProvenanceManifest, ModuleProvenanceResource,
+    ModuleProvenanceRoot, ProvenanceCompleteness,
 };
 use fln_hash::domain::{Domain, hash};
 use fln_hash::root::LogicalRoot;
@@ -323,78 +324,110 @@ impl ModuleBatchApplyPlan {
     ) -> Outcome<Result<Self, ModuleBatchPlanError>> {
         if modules.len() != completeness.len() {
             return Outcome::complete(Err(ModuleBatchPlanError::CompletenessCount {
-                modules: modules.len(), completeness: completeness.len(),
+                modules: modules.len(),
+                completeness: completeness.len(),
             }));
         }
-        prepare_module_apply_batch_with(
-            modules.len(), base, |position, environment, manifest| {
-                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                    return Outcome::Inconclusive(Inconclusive::cancelled(
-                        "module_adapter/before-stage-binding",
-                    ));
-                }
-                let decoded = &modules[position];
-                let contribution = match contextual_contribution(
-                    decoded, environment, completeness[position].clone(),
-                ) {
-                    Ok(record) => record,
-                    Err(error) => return Outcome::complete(Err(ModuleBatchPlanError::Extension {
-                        position, error,
-                    })),
-                };
-                let mut records = manifest.records().to_vec();
-                records.push(contribution.clone());
-                let target = match ModuleProvenanceManifest::new(
-                    decoded.evidence.epoch.clone(), records, manifest_limits,
-                ) {
-                    Ok(target) => Arc::new(target),
-                    Err(error) => return manifest_binding_failure(position, error),
-                };
-                let transaction = ModuleApplyTransaction::new(
-                    target, contribution, decoded.constants.clone(),
-                    decoded.extra_constants.clone(), decoded.extension_entries.clone(),
-                );
-                let preflight = match preflight_module_apply(transaction, apply_limits) {
-                    Ok(preflight) => preflight,
-                    Err(ModuleApplyPreflightError::LimitExceeded { resource, limit, actual }) => {
-                        let unit = match resource {
-                            ModuleApplyResource::ExtensionPayloadBytes => StructuralUnit::InputBytes,
-                            _ => StructuralUnit::ProducedNodes,
-                        };
-                        return binding_resource_exhausted(position, &resource.to_string(), unit, limit, actual);
-                    }
-                    Err(ModuleApplyPreflightError::ManifestInconsistent(error)) => {
-                        return manifest_binding_failure(position, error);
-                    }
-                    Err(error) => return Outcome::complete(Err(ModuleBatchPlanError::Preflight {
-                        position, error,
-                    })),
-                };
-                let mut candidate = environment.clone();
-                for declaration in preflight.transaction().declarations().iter()
-                    .chain(preflight.transaction().extra_declarations())
+        prepare_module_apply_batch_with(modules.len(), base, |position, environment, manifest| {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Outcome::Inconclusive(Inconclusive::cancelled(
+                    "module_adapter/before-stage-binding",
+                ));
+            }
+            let decoded = &modules[position];
+            let contribution =
+                match contextual_contribution(decoded, environment, completeness[position].clone())
                 {
-                    match candidate.try_add_decl_with_budget(
-                        (**declaration).clone(), 1, fln_env::pmap::CollisionBudget::UNBOUNDED,
-                    ) {
-                        Outcome::Complete(DeclAdmission::Admitted(next)) => candidate = next,
-                        Outcome::Complete(DeclAdmission::Rejected(error)) => {
-                            return Outcome::complete(Err(ModuleBatchPlanError::Declaration {
-                                position, error,
-                            }));
-                        }
-                        Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
-                        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Outcome::complete(Err(ModuleBatchPlanError::Extension {
+                            position,
+                            error,
+                        }));
                     }
+                };
+            let mut records = manifest.records().to_vec();
+            records.push(contribution.clone());
+            let target = match ModuleProvenanceManifest::new(
+                decoded.evidence.epoch.clone(),
+                records,
+                manifest_limits,
+            ) {
+                Ok(target) => Arc::new(target),
+                Err(error) => return manifest_binding_failure(position, error),
+            };
+            let transaction = ModuleApplyTransaction::new(
+                target,
+                contribution,
+                decoded.constants.clone(),
+                decoded.extra_constants.clone(),
+                decoded.extension_entries.clone(),
+            );
+            let preflight = match preflight_module_apply(transaction, apply_limits) {
+                Ok(preflight) => preflight,
+                Err(ModuleApplyPreflightError::LimitExceeded {
+                    resource,
+                    limit,
+                    actual,
+                }) => {
+                    let unit = match resource {
+                        ModuleApplyResource::ExtensionPayloadBytes => StructuralUnit::InputBytes,
+                        _ => StructuralUnit::ProducedNodes,
+                    };
+                    return binding_resource_exhausted(
+                        position,
+                        &resource.to_string(),
+                        ResourceReason::StructuralBudget { unit },
+                        limit,
+                        actual,
+                    );
                 }
-                Outcome::complete(Ok((preflight, candidate)))
-            },
-        ).map_complete(|result| result.map(|staged_batch| Self {
-            schema: MODULE_APPLY_SCHEMA_VERSION,
-            base_snapshot: base.clone(),
-            staged_batch,
-            modules: modules.iter().map(|module| module.module_id.clone()).collect(),
-        }))
+                Err(ModuleApplyPreflightError::ManifestInconsistent(error)) => {
+                    return manifest_binding_failure(position, error);
+                }
+                Err(error) => {
+                    return Outcome::complete(Err(ModuleBatchPlanError::Preflight {
+                        position,
+                        error,
+                    }));
+                }
+            };
+            let mut candidate = environment.clone();
+            for declaration in preflight
+                .transaction()
+                .declarations()
+                .iter()
+                .chain(preflight.transaction().extra_declarations())
+            {
+                match candidate.try_add_decl_with_budget(
+                    (**declaration).clone(),
+                    1,
+                    fln_env::pmap::CollisionBudget::UNBOUNDED,
+                ) {
+                    Outcome::Complete(DeclAdmission::Admitted(next)) => candidate = next,
+                    Outcome::Complete(DeclAdmission::Rejected(error)) => {
+                        return Outcome::complete(Err(ModuleBatchPlanError::Declaration {
+                            position,
+                            error,
+                        }));
+                    }
+                    Outcome::Inconclusive(inc) => return Outcome::Inconclusive(inc),
+                    Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                }
+            }
+            Outcome::complete(Ok((preflight, candidate)))
+        })
+        .map_complete(|result| {
+            result.map(|staged_batch| Self {
+                schema: MODULE_APPLY_SCHEMA_VERSION,
+                base_snapshot: base.clone(),
+                staged_batch,
+                modules: modules
+                    .iter()
+                    .map(|module| module.module_id.clone())
+                    .collect(),
+            })
+        })
     }
 
     /// Stage a batch of preflighted module applications over `base`.
@@ -526,12 +559,30 @@ impl ModuleBatchApplyPlan {
 /// Errors during preparation of [`ModuleBatchApplyPlan`].
 #[derive(Debug)]
 pub enum ModuleBatchPlanError {
-    CountMismatch { preflights: usize, modules: usize },
-    CompletenessCount { modules: usize, completeness: usize },
-    Manifest { position: usize, error: ModuleProvenanceError },
-    Preflight { position: usize, error: ModuleApplyPreflightError },
-    Extension { position: usize, error: ModuleApplyReplayError },
-    Declaration { position: usize, error: EnvError },
+    CountMismatch {
+        preflights: usize,
+        modules: usize,
+    },
+    CompletenessCount {
+        modules: usize,
+        completeness: usize,
+    },
+    Manifest {
+        position: usize,
+        error: ModuleProvenanceError,
+    },
+    Preflight {
+        position: usize,
+        error: ModuleApplyPreflightError,
+    },
+    Extension {
+        position: usize,
+        error: ModuleApplyReplayError,
+    },
+    Declaration {
+        position: usize,
+        error: EnvError,
+    },
     Prepare(ModuleApplyBatchPrepareError),
 }
 
@@ -554,19 +605,29 @@ fn contextual_contribution(
         let history = match histories.entry(descriptor.name.clone()) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                base.extension(&descriptor.name).ok_or_else(|| {
-                    ModuleApplyReplayError::UnknownExtension { name: descriptor.name.clone() }
-                })?.clone(),
+                base.extension(&descriptor.name)
+                    .ok_or_else(|| ModuleApplyReplayError::UnknownExtension {
+                        name: descriptor.name.clone(),
+                    })?
+                    .clone(),
             ),
         };
         if history.descriptor != *descriptor {
-            return Err(ModuleApplyReplayError::DescriptorMismatch { name: descriptor.name.clone() });
+            return Err(ModuleApplyReplayError::DescriptorMismatch {
+                name: descriptor.name.clone(),
+            });
         }
-        let start = u64::try_from(history.len()).map_err(|_| ModuleApplyReplayError::RangeStart {
-            name: descriptor.name.clone(), expected: contribution.start(), actual: u64::MAX,
-        })?;
+        let start =
+            u64::try_from(history.len()).map_err(|_| ModuleApplyReplayError::RangeStart {
+                name: descriptor.name.clone(),
+                expected: contribution.start(),
+                actual: u64::MAX,
+            })?;
         contributions.push(ExtensionContribution::new(
-            descriptor.clone(), start, history.content_digest(), contribution.entries().to_vec(),
+            descriptor.clone(),
+            start,
+            history.content_digest(),
+            contribution.entries().to_vec(),
         ));
         // Preview only placement for a later contribution to this same extension.
         // Preflight still verifies every occurrence and byte identity before replay.
@@ -575,14 +636,28 @@ fn contextual_contribution(
         }
     }
     Ok(ModuleContributionRecord::new(
-        decoded.to_module_record(), decoded.constants.iter().map(|decl| decl.name().clone()).collect(),
-        decoded.extra_constants.iter().map(|decl| decl.name().clone()).collect(),
-        contributions, completeness,
+        decoded.to_module_record(),
+        decoded
+            .constants
+            .iter()
+            .map(|decl| decl.name().clone())
+            .collect(),
+        decoded
+            .extra_constants
+            .iter()
+            .map(|decl| decl.name().clone())
+            .collect(),
+        contributions,
+        completeness,
     ))
 }
 
 fn binding_resource_exhausted<T>(
-    position: usize, resource: &str, unit: StructuralUnit, limit: u128, actual: u128,
+    position: usize,
+    resource: &str,
+    reason: ResourceReason,
+    limit: u128,
+    actual: u128,
 ) -> Outcome<T> {
     let (Ok(allowed), Ok(observed)) = (u64::try_from(limit), u64::try_from(actual)) else {
         return Outcome::InternalFault(InternalFault::new(
@@ -590,21 +665,39 @@ fn binding_resource_exhausted<T>(
             "module binding exhaustion cannot be represented by ResourceUsage",
         ));
     };
-    Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
-        reason: ResourceReason::StructuralBudget { unit }, allowed, observed,
-    }).with_progress(format!("module stage {position}: {resource}")))
+    Outcome::Inconclusive(
+        Inconclusive::resource(ResourceUsage {
+            reason,
+            allowed,
+            observed,
+        })
+        .with_progress(format!("module stage {position}: {resource}")),
+    )
 }
 
-fn manifest_binding_failure<T>(position: usize, error: ModuleProvenanceError)
-    -> Outcome<Result<T, ModuleBatchPlanError>>
-{
+fn manifest_binding_failure<T>(
+    position: usize,
+    error: ModuleProvenanceError,
+) -> Outcome<Result<T, ModuleBatchPlanError>> {
     match error {
-        ModuleProvenanceError::ResourceLimitExceeded { resource, limit, actual, .. } => {
-            let unit = match resource {
-                ModuleProvenanceResource::EncodedBytes => StructuralUnit::InputBytes,
-                _ => StructuralUnit::ProducedNodes,
+        ModuleProvenanceError::ResourceLimitExceeded {
+            resource,
+            limit,
+            actual,
+            ..
+        } => {
+            let reason = match resource {
+                ModuleProvenanceResource::NameDepth => ResourceReason::RecursionDepth {
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                },
+                ModuleProvenanceResource::EncodedBytes => ResourceReason::StructuralBudget {
+                    unit: StructuralUnit::InputBytes,
+                },
+                _ => ResourceReason::StructuralBudget {
+                    unit: StructuralUnit::ProducedNodes,
+                },
             };
-            binding_resource_exhausted(position, &format!("{resource:?}"), unit, limit, actual)
+            binding_resource_exhausted(position, &format!("{resource:?}"), reason, limit, actual)
         }
         ModuleProvenanceError::GraphAdmissionFault { what }
         | ModuleProvenanceError::InternalFault { what, .. } => {

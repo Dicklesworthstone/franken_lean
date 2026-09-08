@@ -27,13 +27,17 @@ use fln_conformance::module_adapter::{
     DecodedOleanModule, ModuleBatchApplyPlan, ModuleBatchCommitError, ModuleBatchPlanError,
     ModuleBatchUsageSummary, OleanModuleAdapter,
 };
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
-use fln_core::options::KVMap;
-use fln_core::outcome::{CacheAdmission, Outcome};
+use fln_core::options::{DataValue, KVMap};
+use fln_core::outcome::{CacheAdmission, InconclusiveCause, Outcome};
 use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
 use fln_env::environment::Environment;
+use fln_env::extensions::{ExtensionState, PayloadProvenance};
 use fln_env::module_apply::{
-    ModuleApplyLimits, ModuleApplyState, ModuleApplyTransaction, preflight_module_apply,
+    ExtensionPayload, ModuleApplyBatchPrepareError, ModuleApplyLimits, ModuleApplyPreflightError,
+    ModuleApplyPrepareError, ModuleApplyReplayError, ModuleApplyState, ModuleApplyTransaction,
+    preflight_module_apply,
 };
 use fln_env::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport,
@@ -174,7 +178,7 @@ fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>
             }
         }
     }
-    let base = ModuleApplyState::from_parts(
+    let base = ModuleApplyState::from_parts_with_options(
         environment,
         ModuleGraph::new(pinned_epoch(), ModuleGraphLimits::default())
             .into_admitted_value()
@@ -187,39 +191,406 @@ fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>
             )
             .unwrap(),
         ),
+        KVMap::from_entries(vec![(
+            parse_dot_name("pp.universes"),
+            DataValue::OfBool(true),
+        )]),
     )
     .unwrap();
     (base, modules)
 }
 
+fn partial_opaque_completeness(modules: &[DecodedOleanModule]) -> Vec<ProvenanceCompleteness> {
+    modules
+        .iter()
+        .map(|module| {
+            let missing = module
+                .imports
+                .iter()
+                .map(|row| row.module.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            // These real artifacts are not their full dependency closure. Retaining
+            // opaque bytes grants inspection, never native handler or kernel authority.
+            ProvenanceCompleteness::new(
+                CaptureStatus::Partial,
+                PayloadTransparency::Opaque,
+                missing,
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn real_modules_append_to_shared_opaque_extension_histories() {
     let (base, modules) = real_shared_extension_modules();
-    let shared = modules[0].extension_contributions.iter().find(|first| {
-        !first.entries().is_empty() && modules[1].extension_contributions.iter().any(|second| {
-            first.descriptor() == second.descriptor() && !second.entries().is_empty()
+    let shared = modules[0]
+        .extension_contributions
+        .iter()
+        .find(|first| {
+            !first.entries().is_empty()
+                && modules[1].extension_contributions.iter().any(|second| {
+                    first.descriptor() == second.descriptor() && !second.entries().is_empty()
+                })
         })
-    }).expect("the real fixture pair must contribute to a common extension").descriptor().name.clone();
-    let completeness: Vec<_> = modules.iter().map(|module| {
-        let missing = module.imports.iter().map(|row| row.module.clone())
-            .collect::<BTreeSet<_>>().into_iter().collect();
-        ProvenanceCompleteness::new(
-            CaptureStatus::Partial, PayloadTransparency::Opaque, missing,
-        )
-    }).collect();
+        .expect("the real fixture pair must contribute to a common extension")
+        .descriptor()
+        .name
+        .clone();
+    let completeness = partial_opaque_completeness(&modules);
     let plan = ModuleBatchApplyPlan::stage_decoded(
-        &base, &modules, &completeness, ModuleProvenanceLimits::default(),
-        &ModuleApplyLimits::default(), None,
-    ).into_complete().unwrap().expect("real module batch stages");
+        &base,
+        &modules,
+        &completeness,
+        ModuleProvenanceLimits::default(),
+        &ModuleApplyLimits::default(),
+        None,
+    )
+    .into_complete()
+    .unwrap()
+    .expect("real module batch stages");
     let committed = plan.commit(&base, None).into_complete().unwrap().unwrap();
     assert_eq!(committed.applied_count, 2);
     assert_eq!(base.graph().len(), 0);
-    let actual: Vec<_> = committed.state.environment().extension(&shared).unwrap()
-        .entries().map(|entry| entry.payload.to_vec()).collect();
-    let expected: Vec<_> = modules.iter().flat_map(|module| &module.extension_entries)
+    let actual: Vec<_> = committed
+        .state
+        .environment()
+        .extension(&shared)
+        .unwrap()
+        .entries()
+        .map(|entry| entry.payload.to_vec())
+        .collect();
+    let expected: Vec<_> = modules
+        .iter()
+        .flat_map(|module| &module.extension_entries)
         .filter(|payload| payload.descriptor().name == shared)
-        .map(|payload| payload.payload().to_vec()).collect();
+        .map(|payload| payload.payload().to_vec())
+        .collect();
     assert_eq!(actual, expected);
+
+    let mut histories = BTreeMap::new();
+    for module in &modules {
+        let record = committed
+            .state
+            .manifest()
+            .record(&module.module_id)
+            .unwrap();
+        assert_eq!(record.completeness().capture(), CaptureStatus::Partial);
+        assert_eq!(
+            record.completeness().transparency(),
+            PayloadTransparency::Opaque
+        );
+        for (index, contribution) in record.extension_contributions().iter().enumerate() {
+            let descriptor = contribution.descriptor();
+            let history = histories
+                .entry(descriptor.name.clone())
+                .or_insert_with(|| ExtensionState::new(descriptor.clone()));
+            assert_eq!(contribution.start(), history.len() as u64);
+            assert_eq!(contribution.base_history_digest(), history.content_digest());
+            assert_eq!(
+                contribution.entries(),
+                module.extension_contributions[index].entries()
+            );
+            for (ordinal, payload) in module
+                .extension_entries
+                .iter()
+                .filter(|payload| payload.contribution_index() == index)
+                .enumerate()
+            {
+                assert_eq!(
+                    contribution.source_ordinal(ordinal),
+                    Some(payload.source_ordinal())
+                );
+                assert_eq!(
+                    contribution.target_position(ordinal),
+                    Some(history.len() as u64)
+                );
+                *history = history.push_entry(payload.payload_arc());
+            }
+            assert_eq!(history.provenance(), PayloadProvenance::Opaque);
+        }
+    }
+    for (name, expected) in histories {
+        assert_eq!(
+            committed.state.environment().extension(&name),
+            Some(&expected)
+        );
+    }
+    assert_eq!(committed.logical_root, committed.state.logical_root());
+    assert_ne!(
+        committed.logical_root,
+        committed
+            .state
+            .environment()
+            .logical_root(&KVMap::default())
+    );
+    assert_eq!(
+        committed.final_receipt.result_logical_root(),
+        committed.logical_root
+    );
+
+    let mut sequential = base.clone();
+    for (module, completeness) in modules.iter().zip(&completeness) {
+        let plan = ModuleBatchApplyPlan::stage_decoded(
+            &sequential,
+            std::slice::from_ref(module),
+            std::slice::from_ref(completeness),
+            ModuleProvenanceLimits::default(),
+            &ModuleApplyLimits::default(),
+            None,
+        )
+        .into_complete()
+        .unwrap()
+        .unwrap();
+        sequential = plan
+            .commit(&sequential, None)
+            .into_complete()
+            .unwrap()
+            .unwrap()
+            .state;
+    }
+    assert_eq!(sequential, committed.state);
+}
+
+#[test]
+fn decoded_batch_refuses_corruption_and_preserves_stale_preflight_checks() {
+    let (base, modules) = real_shared_extension_modules();
+    let original = base.clone();
+    let completeness = partial_opaque_completeness(&modules);
+    let mut corrupt = modules.clone();
+    let payload = &corrupt[1].extension_entries[0];
+    let mut bytes = payload.payload().to_vec();
+    bytes[0] ^= 1;
+    corrupt[1].extension_entries[0] = ExtensionPayload::new(
+        payload.contribution_index(),
+        payload.descriptor().clone(),
+        payload.source_ordinal(),
+        bytes,
+    );
+    assert!(matches!(
+        ModuleBatchApplyPlan::stage_decoded(
+            &base,
+            &corrupt,
+            &completeness,
+            ModuleProvenanceLimits::default(),
+            &ModuleApplyLimits::default(),
+            None,
+        ),
+        Outcome::Complete(Err(ModuleBatchPlanError::Preflight {
+            position: 1,
+            error: ModuleApplyPreflightError::ExtensionIdentity { .. },
+        }))
+    ));
+    assert_eq!(base, original);
+
+    let mut wrong_descriptor = modules.clone();
+    let contribution = &wrong_descriptor[1].extension_contributions[0];
+    let mut descriptor = contribution.descriptor().clone();
+    descriptor.provenance = PayloadProvenance::Understood;
+    wrong_descriptor[1].extension_contributions[0] =
+        fln_env::provenance::ExtensionContribution::new(
+            descriptor,
+            contribution.start(),
+            contribution.base_history_digest(),
+            contribution.entries().to_vec(),
+        );
+    assert!(matches!(
+        ModuleBatchApplyPlan::stage_decoded(
+            &base,
+            &wrong_descriptor,
+            &completeness,
+            ModuleProvenanceLimits::default(),
+            &ModuleApplyLimits::default(),
+            None,
+        ),
+        Outcome::Complete(Err(ModuleBatchPlanError::Extension {
+            position: 1,
+            error: ModuleApplyReplayError::DescriptorMismatch { .. },
+        }))
+    ));
+    assert_eq!(base, original);
+
+    // Existing preflights still carry exact placement commitments. Passing the
+    // former empty-history records must fail even though raw decoding now has a
+    // distinct context-binding entry point.
+    let mut records = Vec::new();
+    let preflights: Vec<_> = modules
+        .iter()
+        .zip(&completeness)
+        .map(|(module, completeness)| {
+            records.push(module.to_contribution_record(completeness.clone()));
+            let manifest = Arc::new(
+                ModuleProvenanceManifest::new(
+                    pinned_epoch(),
+                    records.clone(),
+                    ModuleProvenanceLimits::default(),
+                )
+                .unwrap(),
+            );
+            preflight_module_apply(
+                OleanModuleAdapter::build_transaction(module, manifest, completeness.clone())
+                    .unwrap(),
+                &ModuleApplyLimits::default(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert!(matches!(ModuleBatchApplyPlan::stage(
+        &base, &preflights, modules.iter().map(|module| module.module_id.clone()).collect(),
+    ), Outcome::Complete(Err(ModuleBatchPlanError::Prepare(ModuleApplyBatchPrepareError::Stage {
+        position: 1, error,
+    }))) if matches!(*error, ModuleApplyPrepareError::Replay(ModuleApplyReplayError::RangeStart {
+        expected: 0, actual: 2, ..
+    }))));
+    assert_eq!(base, original);
+    let replay = ModuleBatchApplyPlan::stage_decoded(
+        &base,
+        &modules,
+        &completeness,
+        ModuleProvenanceLimits::default(),
+        &ModuleApplyLimits::default(),
+        None,
+    )
+    .into_complete()
+    .unwrap()
+    .unwrap()
+    .commit(&base, None)
+    .into_complete()
+    .unwrap()
+    .unwrap();
+    assert_eq!(replay.applied_count, 2);
+
+    let stale = ModuleBatchApplyPlan::stage_decoded(
+        &base,
+        &modules,
+        &completeness,
+        ModuleProvenanceLimits::default(),
+        &ModuleApplyLimits::default(),
+        None,
+    )
+    .into_complete()
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        stale.commit(&replay.state, None),
+        Outcome::Complete(Err(ModuleBatchCommitError::StaleBase))
+    ));
+    assert_eq!(base, original);
+}
+
+#[test]
+fn decoded_batch_cancellation_and_limits_release_no_prefix_and_recover() {
+    let (base, modules) = real_shared_extension_modules();
+    let original = base.clone();
+    let completeness = partial_opaque_completeness(&modules);
+    for checkpoint in 0..modules.len() {
+        let probe = StepCancellationProbe::new(checkpoint);
+        let stopped = ModuleBatchApplyPlan::stage_decoded(
+            &base,
+            &modules,
+            &completeness,
+            ModuleProvenanceLimits::default(),
+            &ModuleApplyLimits::default(),
+            Some(&probe),
+        );
+        assert!(matches!(stopped, Outcome::Inconclusive(ref inc)
+            if matches!(inc.cause, InconclusiveCause::Cancelled { .. })));
+        assert_eq!(base, original);
+
+        let plan = ModuleBatchApplyPlan::stage_decoded(
+            &base,
+            &modules,
+            &completeness,
+            ModuleProvenanceLimits::default(),
+            &ModuleApplyLimits::default(),
+            None,
+        )
+        .into_complete()
+        .unwrap()
+        .unwrap();
+        let stopped = plan.commit(&base, Some(&StepCancellationProbe::new(checkpoint)));
+        assert!(matches!(stopped, Outcome::Inconclusive(ref inc)
+            if matches!(inc.cause, InconclusiveCause::Cancelled { .. })));
+        assert_eq!(base, original);
+    }
+
+    let manifest_limits = ModuleProvenanceLimits {
+        max_modules: 1,
+        ..ModuleProvenanceLimits::default()
+    };
+    let stopped = ModuleBatchApplyPlan::stage_decoded(
+        &base,
+        &modules,
+        &completeness,
+        manifest_limits,
+        &ModuleApplyLimits::default(),
+        None,
+    );
+    assert!(matches!(stopped, Outcome::Inconclusive(ref inc)
+        if matches!(&inc.cause, InconclusiveCause::ResourceExhausted { usage }
+            if usage.allowed == 1 && usage.observed == 2 && usage.is_genuine_exhaustion())));
+    assert_eq!(base, original);
+
+    let bytes: u128 = modules[0]
+        .extension_entries
+        .iter()
+        .map(|entry| entry.payload().len() as u128)
+        .sum();
+    assert!(bytes > 0);
+    let tight = ModuleApplyLimits {
+        max_extension_payload_bytes: bytes - 1,
+        ..ModuleApplyLimits::default()
+    };
+    let stopped = ModuleBatchApplyPlan::stage_decoded(
+        &base,
+        &modules[..1],
+        &completeness[..1],
+        ModuleProvenanceLimits::default(),
+        &tight,
+        None,
+    );
+    assert!(matches!(stopped, Outcome::Inconclusive(ref inc)
+        if matches!(&inc.cause, InconclusiveCause::ResourceExhausted { usage }
+            if u128::from(usage.allowed) == bytes - 1 && u128::from(usage.observed) == bytes
+            && usage.reason == ResourceReason::StructuralBudget { unit: StructuralUnit::InputBytes })));
+    assert_eq!(base, original);
+    let exact = ModuleApplyLimits {
+        max_extension_payload_bytes: bytes,
+        ..ModuleApplyLimits::default()
+    };
+    ModuleBatchApplyPlan::stage_decoded(
+        &base,
+        &modules[..1],
+        &completeness[..1],
+        ModuleProvenanceLimits::default(),
+        &exact,
+        None,
+    )
+    .into_complete()
+    .unwrap()
+    .unwrap()
+    .commit(&base, None)
+    .into_complete()
+    .unwrap()
+    .unwrap();
+    let recovered = ModuleBatchApplyPlan::stage_decoded(
+        &base,
+        &modules,
+        &completeness,
+        ModuleProvenanceLimits::default(),
+        &ModuleApplyLimits::default(),
+        None,
+    )
+    .into_complete()
+    .unwrap()
+    .unwrap()
+    .commit(&base, None)
+    .into_complete()
+    .unwrap()
+    .unwrap();
+    assert_eq!(recovered.applied_count, 2);
+    assert_eq!(base, original);
 }
 
 #[test]
