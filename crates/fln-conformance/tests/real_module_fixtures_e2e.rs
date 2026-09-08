@@ -200,25 +200,16 @@ fn real_modules_append_to_shared_opaque_extension_histories() {
             first.descriptor() == second.descriptor() && !second.entries().is_empty()
         })
     }).expect("the real fixture pair must contribute to a common extension").descriptor().name.clone();
-    let mut records = Vec::new();
-    let mut preflights = Vec::new();
-    for module in &modules {
+    let completeness: Vec<_> = modules.iter().map(|module| {
         let missing = module.imports.iter().map(|row| row.module.clone())
             .collect::<BTreeSet<_>>().into_iter().collect();
-        let completeness = ProvenanceCompleteness::new(
+        ProvenanceCompleteness::new(
             CaptureStatus::Partial, PayloadTransparency::Opaque, missing,
-        );
-        records.push(module.to_contribution_record(completeness.clone()));
-        let manifest = Arc::new(ModuleProvenanceManifest::new(
-            pinned_epoch(), records.clone(), ModuleProvenanceLimits::default(),
-        ).expect("real modules must compose their extension ranges"));
-        preflights.push(preflight_module_apply(
-            OleanModuleAdapter::build_transaction(module, manifest, completeness).unwrap(),
-            &ModuleApplyLimits::default(),
-        ).unwrap());
-    }
-    let plan = ModuleBatchApplyPlan::stage(
-        &base, &preflights, modules.iter().map(|module| module.module_id.clone()).collect(),
+        )
+    }).collect();
+    let plan = ModuleBatchApplyPlan::stage_decoded(
+        &base, &modules, &completeness, ModuleProvenanceLimits::default(),
+        &ModuleApplyLimits::default(), None,
     ).into_complete().unwrap().expect("real module batch stages");
     let committed = plan.commit(&base, None).into_complete().unwrap().unwrap();
     assert_eq!(committed.applied_count, 2);

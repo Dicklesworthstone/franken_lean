@@ -2033,25 +2033,51 @@ pub fn prepare_module_apply_batch(
     base: &ModuleApplyState,
     mut candidate_for: impl FnMut(usize, &Environment) -> Result<Environment, ModuleApplyCandidateError>,
 ) -> Outcome<Result<StagedModuleApplyBatch, ModuleApplyBatchPrepareError>> {
-    if preflights.is_empty() {
-        return Outcome::complete(Err(ModuleApplyBatchPrepareError::Empty));
+    prepare_module_apply_batch_with(preflights.len(), base, |position, environment, _| {
+        Outcome::complete(
+            candidate_for(position, environment)
+                .map(|candidate| (preflights[position].clone(), candidate))
+                .map_err(|error| ModuleApplyBatchPrepareError::Candidate { position, error }),
+        )
+    })
+}
+
+/// Bind each stage's inputs against the preceding privately prepared state.
+///
+/// Decoders can use this entry point to construct extension ranges and a target
+/// manifest before preflight, once the preceding stages' actual histories are
+/// known. The callback receives only the environment and manifest needed for
+/// binding; the aggregate staged states and publication plans remain private.
+/// Returned preflights undergo the same exact replay checks as an eagerly
+/// supplied batch. No stale preflight is rebased here. Callback non-answers
+/// propagate intact and never release a successful prefix.
+pub fn prepare_module_apply_batch_with<E: From<ModuleApplyBatchPrepareError>>(
+    stage_count: usize,
+    base: &ModuleApplyState,
+    mut inputs_for: impl FnMut(
+        usize,
+        &Environment,
+        &ModuleProvenanceManifest,
+    ) -> Outcome<Result<(PreflightedModuleApply, Environment), E>>,
+) -> Outcome<Result<StagedModuleApplyBatch, E>> {
+    if stage_count == 0 {
+        return Outcome::complete(Err(ModuleApplyBatchPrepareError::Empty.into()));
     }
     if let Err(error) = base.verify() {
-        return Outcome::complete(Err(ModuleApplyBatchPrepareError::BaseState(error)));
+        return Outcome::complete(Err(ModuleApplyBatchPrepareError::BaseState(error).into()));
     }
-    let mut staged = Vec::with_capacity(preflights.len());
+    let mut staged = Vec::with_capacity(stage_count);
     let mut current = base.clone();
-    for (position, preflight) in preflights.iter().enumerate() {
-        let candidate_environment = match candidate_for(position, current.environment()) {
-            Ok(environment) => environment,
-            Err(error) => {
-                return Outcome::complete(Err(ModuleApplyBatchPrepareError::Candidate {
-                    position,
-                    error,
-                }));
-            }
+    for position in 0..stage_count {
+        let (preflight, candidate_environment) = match inputs_for(
+            position, current.environment(), current.manifest(),
+        ) {
+            Outcome::Complete(Ok(inputs)) => inputs,
+            Outcome::Complete(Err(error)) => return Outcome::complete(Err(error)),
+            Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
         };
-        match prepare_module_apply_inner(preflight, &current, &candidate_environment, None) {
+        match prepare_module_apply_inner(&preflight, &current, &candidate_environment, None) {
             Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
                 current = plan.candidate.clone();
                 staged.push(*plan);
@@ -2059,13 +2085,13 @@ pub fn prepare_module_apply_batch(
             Outcome::Complete(Ok(ModuleApplyPlan::Retry(_))) => {
                 return Outcome::complete(Err(ModuleApplyBatchPrepareError::AlreadyApplied {
                     position,
-                }));
+                }.into()));
             }
             Outcome::Complete(Err(error)) => {
                 return Outcome::complete(Err(ModuleApplyBatchPrepareError::Stage {
                     position,
                     error: Box::new(error),
-                }));
+                }.into()));
             }
             Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
             Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
