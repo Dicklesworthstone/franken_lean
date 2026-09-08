@@ -1,0 +1,73 @@
+name: Source lambda integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/land_source_lambdas.py'
+      - '.github/workflows/fln-lambda-landing.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-source-lambda-landing
+  cancel-in-progress: false
+
+jobs:
+  source-lambdas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/lambda-landing
+          rustc -Vv | tee target/lambda-landing/compiler.txt
+          git rev-parse HEAD | tee target/lambda-landing/input-commit.txt
+      - name: Apply scoped lambda implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/land_source_lambdas.py
+          rustfmt --edition 2024 crates/fln-parse/src/lib.rs crates/fln-elab/src/source.rs crates/fln-elab/tests/source_inference.rs
+          git diff --check
+          git diff > target/lambda-landing/lambdas.patch
+      - name: Check and test the actual source pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked -p fln-elab -p fln-parse -p fln --all-targets 2>&1 | tee target/lambda-landing/check.log
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/lambda-landing/source-tests.log
+          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/lambda-landing/engine-tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings 2>&1 | tee target/lambda-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/lambda-landing/workspace-check.log
+      - name: Publish tested production files only
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln-parse/src/lib.rs|crates/fln-elab/src/source.rs|crates/fln-elab/src/source/infer.rs|crates/fln-elab/src/source/levels.rs|crates/fln-elab/tests/source_inference.rs) ;;
+              *) printf 'Unexpected changed file: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git config user.name 'FrankenLean source integration'
+          git config user.email 'noreply@github.com'
+          git add -- crates/fln-parse/src/lib.rs crates/fln-elab/src/source.rs crates/fln-elab/src/source/infer.rs crates/fln-elab/src/source/levels.rs crates/fln-elab/tests/source_inference.rs
+          git commit -m 'feat(elab): elaborate source lambdas with expected types and native inference'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/lambda-landing/published-commit.txt
+      - name: Retain exact test evidence and patch
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-lambdas-${{ github.sha }}
+          path: target/lambda-landing
+          if-no-files-found: error
+          retention-days: 7
