@@ -432,5 +432,16 @@ mod tests {
         .expect("extension-free module remains decodable");
         assert!(decoded.extension_entries.is_empty());
         assert!(decoded.extension_contributions.is_empty());
+        for epoch in [
+            ModuleEpoch::new("v0.0.0", format::PIN_COMMIT),
+            ModuleEpoch::new(format::PIN_TAG, "0000000000000000000000000000000000000000"),
+        ] {
+            assert!(
+                OleanModuleAdapter::decode_bytes(
+                    decoded.module_id.clone(), &encoded.bytes, epoch,
+                ).is_err(),
+                "resolver epoch must match the artifact header",
+            );
+        }
     }
 }
