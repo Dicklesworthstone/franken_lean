@@ -1,0 +1,28 @@
+name: Native source workbench
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-workbench.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Export current implementation inputs
+        run: |
+          mkdir -p target/source-workbench
+          git archive --format=tar.gz HEAD > target/source-workbench/source.tar.gz
+          git rev-parse HEAD > target/source-workbench/commit.txt
+          sha256sum target/source-workbench/source.tar.gz > target/source-workbench/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-workbench-${{ github.sha }}
+          path: target/source-workbench
+          compression-level: 0
+          retention-days: 2
