@@ -20,9 +20,9 @@
 schema fln-suite-lock/1
 
 # ---- the Rust toolchain (exact; no or-later) ------------------------------------------
-rust-nightly nightly-2026-07-13
-rust-release 1.99.0-nightly
-rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
+rust-nightly nightly-2026-08-31
+rust-release 1.100.0-nightly
+rust-commit 90850177249efe0321573c569aec5d12b257f8d6
 target x86_64-unknown-linux-gnu
 
 # ---- the FrankenSuite (D1 closed universe), pinned at exact commits --------------------
