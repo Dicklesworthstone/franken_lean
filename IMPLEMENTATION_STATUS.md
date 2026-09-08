@@ -54,6 +54,29 @@ The Reference remains an oracle and fixture source only. No upstream implementat
 
 The repository contains source-to-kernel and source-to-Golem paths for a growing bounded subset, including caller-named definitions, imports, `#check`, Nat, Bool, and String operations, and emitted intermediate and artifact forms. This is meaningful executable ground, not full source-language compatibility.
 
+### Athanor / native unification and speculative elaboration
+
+**Status: executable native solver and queued-constraint integration; package tests and downstream compilation observed on 2026-09-08.**
+
+The prior metavariable, universe, constraint and transaction stores now have a live equation-solving consumer. `ElabTxn::unify`, `unify_many_with`, and `solve_defeq_constraints_with` are compiled into `fln-elab`; the implementation is in `crates/fln-elab/src/constraint/unify.rs` and its `residual.rs` module, with queue integration in `constraint.rs`.
+
+Implemented:
+
+- Native equation worklists with beta/zeta reduction, metadata transparency, configurable safe monomorphic definition unfolding, structural universe constraints, binder opening and distinct-local higher-order patterns. For example, `?f x = x` can synthesize a lambda; dependent argument domains are rebound capture-avoidantly.
+- Deferred equations are retried when the assignment generation advances. A batch can resolve an earlier assignment's type through a later equation, rather than stopping permanently at the first blocked pair. Shared-DAG reflexivity is memoized instead of expanded into a tree.
+- Every new expression assignment is submitted to the ordinary K1 checker at its declared type, closed over its own local context. Partial assignments additionally quantify typed residual metavariables. Their types and local contexts form one dependency graph, so residual type holes can precede locals whose types depend on them.
+- Residual context compatibility includes locals not syntactically visible in the residual's type. Unknown holes, type-dependency cycles, scope escapes and depth violations defer. Synthetic-opaque residuals remain unassigned in the live store; their validation-only representatives never escape. `UnificationReport::residual_metavariables` names the unresolved dependencies rather than presenting them as solved proofs.
+- A failed conditional typing check defers: failure under universally quantified holes need not imply failure after those holes receive concrete values. K1 resource and internal nonanswers retain their full outcomes; closed invalid assignments retain the actual kernel rejection.
+- Unification publishes only metavariable assignments, universe assignments and the constraint queue, after the whole batch succeeds and the final cancellation check passes. Failed attempts retain spent work but no speculative assignments, extracted constraints, environment changes or temporary validation declarations.
+- Queued DefEq solving validates and sorts selected IDs, deduplicates repeated selections, retains the original queue on failure, and separates solved rows from awakened obligations still requiring processing. HasType and instance-synthesis obligations are not silently counted as solved.
+- Explicit unifier step, visited-node, assignment-count and metavariable-depth limits, plus a separate caller-supplied K1 budget. This is not Reference heartbeat-parity evidence or a claim that the complete future elaborator is resource-total.
+
+**Observed verification:** Actions run `34275569958`, job `102227616119`, checked source `69e410cd3fda268d4ee445764f6f7df74e5cfade` after rustfmt and published those exact formatted code changes as `00a571d4b19a71ed05c8adb1c3306bcd862246f2`. Package check, package tests and package Clippy with warnings denied all exited zero. The tests reported **103 passed, zero failed, zero ignored**: 69 library tests, 24 native-unification integration tests, 4 scheduler tests and 6 tower-transaction tests. This includes the 35 store/transaction regressions from the preceding implementation increment, which previously lacked execution evidence. `cargo check --locked --workspace --all-targets` also exited zero. Artifact `10075828185` retains the command logs, formatting patch and published commit identity.
+
+**Verification scope:** Linux x86-64, `nightly-2026-08-31`, rustc `90850177249efe0321573c569aec5d12b257f8d6`, selected from `rust-toolchain.toml`. The existing global preflight still has a conflicting `SUITE.lock` Rust pin (`nightly-2026-07-13`); the functional run does not claim that governed pin-consistency gate passed. The full workspace test suite, full-workspace Clippy, all-workspace formatting, UBS and a new real-Prelude council run are not claimed by this package-level observation.
+
+**Still incomplete:** general source elaboration does not yet route arbitrary Lean holes, implicit arguments, tactics or instance search through this solver. The full upstream approximation ladder, general flex-flex solving, complete universe normalization/solving, polymorphic delta, full recursor/quotient/proof-irrelevance conversion and oracle-trace parity remain open. The next functional integration is expected-type propagation and source/tactic-generated constraints through these live APIs, not more standalone state containers. The independent-checker's recursive indexed-inductive frontier is a separate open task; this solver does not bypass it or constitute kernel admission.
+
 ### Lantern / LSP server
 
 **Status: usable bounded transport, Full document synchronization, synchronous diagnostic waiting, source-aware installed entry points, and layered transcript evidence; semantic editor and daemon architecture remain incomplete.**
@@ -185,6 +208,8 @@ One concrete increment within this surface landed at `046ab940`: **Anvil** (`fln
 
 ## High-priority open proof obligations
 
+The new native unifier makes **expected-type propagation and source/tactic-generated constraint solving** an executable integration frontier rather than a missing primitive. Its bounded implementation and verification scope are described above; full source compatibility and the independent checker's inductive frontier remain open.
+
 1. **Advance `fln-51y8` with real pinned evidence.** Execute the pinned Nat council and continue the exact Prelude first-failure frontier rather than generalizing from fixtures.
 2. **Give command failures token-level source positions (command-level is done).** Parse errors have token-precise positions, and command-level provenance now landed (`8eb6e859`): `EngineExecutionError::BatchCommand` carries an `at` offset the source command loops populate, and `primary_source_offset` falls back to it, so every kernel/elaboration/command failure lands on the correct line. The remaining follow-on is **token-level** precision — the offending sub-expression rather than the command — which needs real source provenance threaded through the elaborator (`NatDefinitionElabError`, 65 sites) and the kernel verdict. A secondary, smaller item: the check-terminal query path and the generic batch helper still pass `at: None` (no per-command offset in scope there), so `fln run`/terminal query failures keep the file-head fallback until those are filled with per-site offset care.
 3. **Compile and run the interleaved timeline target at the pinned Rust toolchain.** Exercise its unit and installed-binary tests, clippy with warnings denied, formatting, and workspace check before promoting the new Rust profile beyond landed evidence. Retain the already observed Python fixture-builder regression as a separate claim.
@@ -205,6 +230,9 @@ On a host with the pinned Rust and Reference toolchains:
 
 ```bash
 cargo fmt --all -- --check
+cargo check --locked -p fln-elab --all-targets
+cargo test --locked -p fln-elab --no-fail-fast
+cargo clippy --locked -p fln-elab --all-targets -- -D warnings
 cargo test --locked -p fln-server --all-targets --no-fail-fast
 cargo clippy --locked -p fln-server --all-targets -- -D warnings
 cargo test --locked -p fln-cli --all-targets --no-fail-fast
