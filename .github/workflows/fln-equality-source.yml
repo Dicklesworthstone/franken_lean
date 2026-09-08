@@ -1,0 +1,171 @@
+name: Source equality implementation
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/land_equality_source.py', '.github/workflows/fln-equality-source.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-source-equality-landing
+  cancel-in-progress: false
+jobs:
+  equality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Prepare compiler and implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/equality-landing crates/fln/tests
+          git rev-parse HEAD > target/equality-landing/input.txt
+          rustc -Vv > target/equality-landing/compiler.txt
+          python3 -I scripts/land_equality_source.py
+      - name: Add source and engine regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > crates/fln-elab/tests/source_equality.rs <<'RS'
+          //! Real source equality proofs, never a mock checker.
+          #![forbid(unsafe_code)]
+          use fln_core::{name::Name, outcome::Outcome};
+          use fln_elab::{check_definition_source, seed::source_seed_declarations};
+          use fln_env::{environment::{Environment, DeclarationBudget, DeclarationCommitted}, pmap::CollisionBudget};
+          use fln_kernel::{Declaration, capability::{admit, Published}, council::{convene, Council, CouncilOutcome}, verdict::{Budget, Verdict}};
+          fn budget() -> Budget { Budget::for_stack_bytes(2 * 1024 * 1024) }
+          fn env() -> Environment {
+              let mut env = Environment::new();
+              for declaration in source_seed_declarations() {
+                  let Outcome::Complete(admitted) = admit(&env, declaration, budget()) else { panic!("seed nonanswer"); };
+                  let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else { panic!("seed rejected"); };
+                  env = match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
+                      Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => result.environment,
+                      Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+                      other => panic!("seed publication {other:?}"),
+                  };
+              }
+              env
+          }
+          fn accepted(source: &str) -> Declaration {
+              let result=check_definition_source(source.as_bytes(), &env(), budget()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+              assert!(matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}\n{:?}",result.outcome);
+              let Declaration::Thm(proof)=&result.declaration else { panic!("actual theorem"); };
+              assert!(!proof.value.has_expr_mvar() && !proof.value.has_level_mvar() && !proof.value.has_fvar());
+              result.declaration
+          }
+          #[test]
+          fn reflexivity_works_as_a_tactic_and_an_inferred_proof_term() {
+              for source in [
+                  "theorem same (x : Nat) : x = x := by rfl",
+                  "theorem same (x : Nat) : x = x := rfl",
+                  "theorem same (x : Nat) : x = x := by exact Eq.refl x",
+                  "theorem same {A : Type} (x : A) : x = x := by rfl",
+                  "theorem same (P : Prop) (h : P) : h = h := by rfl",
+                  "theorem same : 7 = 7 := by rfl",
+                  "theorem same : \"hello\" = \"hello\" := by rfl",
+              ] { accepted(source); }
+          }
+          #[test]
+          fn rfl_uses_kernel_conversion_not_only_syntax_equality() {
+              accepted("theorem reduce (x : Nat) : x = x := let y := x; by exact Eq.refl y");
+              accepted("theorem arithmetic : 2 + 3 = 5 := by rfl");
+          }
+          #[test]
+          fn equality_premises_and_intro_are_real_proof_terms() {
+              accepted("theorem retain (x y : Nat) : x = y -> x = y := by intro h; assumption");
+              accepted("theorem retain (x y : Nat) (h : x = y) : x = y := by exact h");
+          }
+          #[test]
+          fn false_and_wrong_typed_reflexivity_never_publish_a_proof() {
+              for source in ["theorem false : 1 = 2 := by rfl", "theorem bad : 1 = \"x\" := by rfl", "theorem bad : Nat := by rfl", "theorem bad : 1 == 1 := by rfl"] {
+                  match check_definition_source(source.as_bytes(), &env(), budget()) {
+                      Err(_) => {},
+                      Ok(result) => assert!(!matches!(result.outcome, Outcome::Complete(Verdict::Accepted { .. })), "{source}"),
+                  }
+              }
+          }
+          #[test]
+          fn equality_has_its_own_precedence_and_does_not_widen_nat_only() {
+              let source=b"theorem sum (x : Nat) : x + 0 = x := by rfl\r\n";
+              let parsed=fln_parse::parse_definition(source).unwrap();
+              assert_eq!(parsed.reconstruct_original(),source);
+              assert!(fln_parse::parse_definition(b"theorem bad : 1 = 2 = 3 := by rfl").is_err());
+              assert!(fln_parse::parse_nat_definition(b"def bad : Nat := 1 = 1").is_err());
+              assert!(env().contains(&Name::from_components(["Eq", "rec"])));
+          }
+          RS
+          cat > crates/fln/tests/source_equality.rs <<'RS'
+          //! Actual source proofs admitted by both independent checker seats.
+          #![forbid(unsafe_code)]
+          use fln::{Engine, EngineAdmissionLimits};
+          use fln_core::{name::Name, options::KVMap, outcome::Outcome};
+          use fln_env::constants::ConstantInfo;
+          use fln_kernel::verdict::Budget;
+          fn limits() -> EngineAdmissionLimits { EngineAdmissionLimits::new(Budget::for_stack_bytes(2*1024*1024)) }
+          fn engine() -> Engine { Engine::with_source_seed(limits()).unwrap().into_complete().unwrap() }
+          #[test]
+          fn equality_proofs_use_the_engine_council_not_the_execution_path() {
+              let base=engine(); let options=KVMap::new();
+              let first=base.admit_source_declaration(b"theorem reflexive (x : Nat) : x = x := by rfl", &options, limits()).unwrap().into_complete().unwrap();
+              assert!(!base.environment().contains(&Name::from_components(["reflexive"])));
+              assert!(matches!(first.engine.environment().find(&Name::from_components(["reflexive"])),Some(ConstantInfo::Thm(_))));
+              let second=first.engine.admit_source_declaration(b"theorem reuse (x : Nat) : x = x := by apply reflexive", &options, limits()).unwrap().into_complete().unwrap();
+              assert!(second.engine.environment().contains(&Name::from_components(["reuse"])));
+          }
+          #[test]
+          fn arithmetic_conversion_is_independently_rechecked() {
+              engine().admit_source_declaration(b"theorem arithmetic : 2 + 3 = 5 := by rfl", &KVMap::new(), limits()).unwrap().into_complete().unwrap();
+          }
+          #[test]
+          fn failed_source_proof_returns_no_advanced_engine() {
+              let base=engine(); let options=KVMap::new(); let root=base.logical_root(&options);
+              assert!(base.admit_source_declaration(b"theorem false : 1 = 2 := by rfl", &options, limits()).is_err());
+              assert_eq!(base.logical_root(&options),root);
+              assert!(!base.environment().contains(&Name::from_components(["false"])));
+          }
+          #[test]
+          fn source_admission_preserves_resource_nonanswers() {
+              let base=engine(); let options=KVMap::new(); let mut low=limits(); low.kernel=low.kernel.narrowed(0,32);
+              let result=base.admit_source_declaration(b"theorem test (P : Prop) : P -> P := by intro h; exact h", &options, low).unwrap();
+              assert!(matches!(result,Outcome::Inconclusive(_)));
+              assert!(!base.environment().contains(&Name::from_components(["test"])));
+          }
+          RS
+      - name: Verify real source pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 crates/fln-elab/src/seed.rs crates/fln-elab/src/lib.rs crates/fln-parse/src/lib.rs crates/fln-parse/src/proofs.rs crates/fln/src/lib.rs crates/fln-elab/tests/source_equality.rs crates/fln/tests/source_equality.rs
+          git add -N crates/fln-elab/tests/source_equality.rs crates/fln/tests/source_equality.rs
+          git diff --check
+          git diff > target/equality-landing/implementation.patch
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/equality-landing/source-tests.log
+          cargo test --locked -p fln --lib --test source_equality --no-fail-fast 2>&1 | tee target/equality-landing/engine-tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/equality-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/equality-landing/workspace.log
+      - name: Commit tested implementation to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln-elab/src/lib.rs|crates/fln-elab/src/seed.rs|crates/fln-elab/src/seed/equality.rs|crates/fln-elab/src/source/tactics.rs|crates/fln-elab/tests/source_equality.rs|crates/fln-parse/src/lib.rs|crates/fln-parse/src/proofs.rs|crates/fln/src/lib.rs|crates/fln/tests/source_equality.rs) ;;
+              *) echo "Unexpected changed path: $path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git add -- crates/fln-elab/src/lib.rs crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/equality.rs crates/fln-elab/src/source/tactics.rs crates/fln-elab/tests/source_equality.rs crates/fln-parse/src/lib.rs crates/fln-parse/src/proofs.rs crates/fln/src/lib.rs crates/fln/tests/source_equality.rs
+          git commit -m 'feat(elab): check source equality and reflexivity proofs through the engine council'
+          git push origin HEAD:main
+          git rev-parse HEAD > target/equality-landing/published.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: source-equality-${{ github.sha }}
+          path: target/equality-landing
+          retention-days: 7
