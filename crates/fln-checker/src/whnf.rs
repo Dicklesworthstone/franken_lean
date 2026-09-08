@@ -296,7 +296,9 @@ pub enum WhnfOutcome {
 
 enum Halt {
     Refusal(WhnfRefusal),
-    Stop(WhnfStop),
+    // Keep progress-rich stop payloads off the successful reduction stack:
+    // every fallible arena operation otherwise reserves their full size.
+    Stop(Box<WhnfStop>),
     Fault(WhnfFault),
 }
 
@@ -304,7 +306,7 @@ fn outcome(result: Result<WhnfResult, Halt>) -> WhnfOutcome {
     match result {
         Ok(result) => WhnfOutcome::Complete(result),
         Err(Halt::Refusal(refusal)) => WhnfOutcome::Refused(refusal),
-        Err(Halt::Stop(stop)) => WhnfOutcome::Inconclusive(stop),
+        Err(Halt::Stop(stop)) => WhnfOutcome::Inconclusive(*stop),
         Err(Halt::Fault(fault)) => WhnfOutcome::InternalFault(fault),
     }
 }
@@ -329,12 +331,12 @@ impl Control {
     fn poll(&mut self, at: usize, cancelled: &mut dyn FnMut() -> bool) -> Result<(), Halt> {
         self.polls = self.polls.saturating_add(1);
         if cancelled() {
-            return Err(Halt::Stop(WhnfStop::Cancelled {
+            return Err(Halt::Stop(Box::new(WhnfStop::Cancelled {
                 at,
                 polls: self.polls,
                 completed_steps: self.steps,
                 completed_reductions: self.reductions,
-            }));
+            })));
         }
         Ok(())
     }
@@ -343,14 +345,14 @@ impl Control {
         self.poll(at, cancelled)?;
         let observed = self.steps.saturating_add(1);
         if observed > self.budget.max_steps {
-            return Err(Halt::Stop(WhnfStop::Resource {
+            return Err(Halt::Stop(Box::new(WhnfStop::Resource {
                 limit: WhnfLimit::Steps,
                 allowed: self.budget.max_steps,
                 observed,
                 at,
                 completed_steps: self.steps,
                 completed_reductions: self.reductions,
-            }));
+            })));
         }
         self.steps = observed;
         Ok(())
@@ -360,14 +362,14 @@ impl Control {
         self.poll(at, cancelled)?;
         let observed = self.reductions.saturating_add(1);
         if observed > self.budget.max_reductions {
-            return Err(Halt::Stop(WhnfStop::Resource {
+            return Err(Halt::Stop(Box::new(WhnfStop::Resource {
                 limit: WhnfLimit::Reductions,
                 allowed: self.budget.max_reductions,
                 observed,
                 at,
                 completed_steps: self.steps,
                 completed_reductions: self.reductions,
-            }));
+            })));
         }
         self.reductions = observed;
         Ok(())
@@ -376,12 +378,14 @@ impl Control {
     fn term_halt<T>(&self, phase: WhnfPhase, outcome: TermOutcome<T>) -> Result<T, Halt> {
         match outcome {
             TermOutcome::Complete(value) => Ok(value),
-            TermOutcome::Inconclusive(stop) => Err(Halt::Stop(WhnfStop::Materialization {
-                phase,
-                stop,
-                completed_steps: self.steps,
-                completed_reductions: self.reductions,
-            })),
+            TermOutcome::Inconclusive(stop) => {
+                Err(Halt::Stop(Box::new(WhnfStop::Materialization {
+                    phase,
+                    stop,
+                    completed_steps: self.steps,
+                    completed_reductions: self.reductions,
+                })))
+            }
             TermOutcome::InternalFault(fault) => Err(Halt::Fault(WhnfFault::Term { phase, fault })),
         }
     }
@@ -538,12 +542,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
             }
             StringExpansionOutcome::Inconclusive(stop) => {
                 self.absorb_string(stop.progress());
-                Err(Halt::Stop(WhnfStop::StringExpansion {
+                Err(Halt::Stop(Box::new(WhnfStop::StringExpansion {
                     at,
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
-                }))
+                })))
             }
             StringExpansionOutcome::InternalFault { fault, progress } => {
                 self.absorb_string(progress);
@@ -852,12 +856,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }))
             }
             InstantiationOutcome::Inconclusive(stop) => {
-                Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
                     at: current.root.index(),
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
-                }))
+                })))
             }
             InstantiationOutcome::InternalFault(fault) => {
                 Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
@@ -928,7 +932,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 })
             }
             WhnfOutcome::Refused(refusal) => Err(Halt::Refusal(refusal)),
-            WhnfOutcome::Inconclusive(stop) => Err(Halt::Stop(stop)),
+            WhnfOutcome::Inconclusive(stop) => Err(Halt::Stop(Box::new(stop))),
             WhnfOutcome::InternalFault(fault) => Err(Halt::Fault(fault)),
         }
     }
@@ -1107,12 +1111,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }));
             }
             InstantiationOutcome::Inconclusive(stop) => {
-                return Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                return Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
                     at: current.root.index(),
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
-                }));
+                })));
             }
             InstantiationOutcome::InternalFault(fault) => {
                 return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
@@ -1215,12 +1219,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }));
             }
             InstantiationOutcome::Inconclusive(stop) => {
-                return Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                return Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
                     at: current.root.index(),
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
-                }));
+                })));
             }
             InstantiationOutcome::InternalFault(fault) => {
                 return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
@@ -1375,12 +1379,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }));
             }
             InstantiationOutcome::Inconclusive(stop) => {
-                return Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                return Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
                     at: current.root.index(),
                     stop,
                     completed_steps: self.control.steps,
                     completed_reductions: self.control.reductions,
-                }));
+                })));
             }
             InstantiationOutcome::InternalFault(fault) => {
                 return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
@@ -2218,12 +2222,12 @@ impl<'c> Composer<'c> {
 
     fn map_halt(&self, halt: ComposeHalt) -> Halt {
         match halt {
-            ComposeHalt::Stop(stop) => Halt::Stop(WhnfStop::Materialization {
+            ComposeHalt::Stop(stop) => Halt::Stop(Box::new(WhnfStop::Materialization {
                 phase: self.phase,
                 stop,
                 completed_steps: self.outer_steps,
                 completed_reductions: self.outer_reductions,
-            }),
+            })),
             ComposeHalt::Fault(fault) => Halt::Fault(fault),
         }
     }
