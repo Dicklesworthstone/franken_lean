@@ -57,6 +57,8 @@ pub enum RegionError {
     MpzIntegrity { offset: u64 },
     /// The traversal budget was exhausted — the graph is NOT validated.
     BudgetExhausted { visited: u64, budget: u64 },
+    /// Opaque entry capture exceeded the cumulative output byte allowance.
+    PayloadBudgetExhausted { required: usize, budget: usize },
     /// The region root does not have the shape the contract requires.
     RootShape { reason: &'static str },
     /// A semantic decode (Name, Import, pair) met an unexpected shape.
@@ -98,6 +100,12 @@ impl fmt::Display for RegionError {
                 write!(
                     f,
                     "budget exhausted after {visited} objects (budget {budget})"
+                )
+            }
+            Self::PayloadBudgetExhausted { required, budget } => {
+                write!(
+                    f,
+                    "opaque payload capture requires {required} bytes (budget {budget})"
                 )
             }
             Self::RootShape { reason } => write!(f, "root shape: {reason}"),
@@ -179,6 +187,10 @@ fn shared_fault(
             offset: shift,
             reason,
         },
+        F::CaptureBudgetExhausted { required, limit } => RegionError::PayloadBudgetExhausted {
+            required,
+            budget: limit,
+        },
     }
 }
 
@@ -232,6 +244,15 @@ pub struct WalkReport {
 pub struct ExtensionBlock {
     pub name: String,
     pub entries: u64,
+}
+
+/// Exact extension-entry object graphs, with structural names preserved.
+/// Each entry is a standalone compacted region at base zero. Only pointers
+/// are relocated; no extension schema or native replay semantics are assumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueExtensionBlock {
+    pub name: Name,
+    pub entries: Vec<Vec<u8>>,
 }
 
 /// One losslessly decoded `Lean.Import` row at the pinned epoch.
@@ -1176,6 +1197,88 @@ impl<'a> OleanView<'a> {
                 reason,
             }),
         }
+    }
+
+    /// Capture each opaque extension entry as a standalone compacted region.
+    /// The byte allowance is cumulative across entries, including shared graphs
+    /// copied into separate payloads; failure exposes no partial block list.
+    pub fn extension_payloads(
+        &self,
+        budget: WalkBudget,
+        max_payload_bytes: usize,
+    ) -> RResult<Vec<OpaqueExtensionBlock>> {
+        // Establish the complete ModuleData shape before interpreting fields.
+        self.module_data(budget)?;
+        self.walk(budget)?;
+        if self.has_dependency_regions() {
+            return Err(RegionError::DecodeShape {
+                offset: self.payload_offset as u64,
+                reason: "opaque capture across module-part regions is not implemented",
+            });
+        }
+        let map_fault = |fault| {
+            shared_fault(
+                fault,
+                self.payload_offset as u64,
+                self.header.base_addr,
+                self.bytes.len() as u64,
+            )
+        };
+        let region = self.read_bytes(self.payload_offset as u64, self.payload_len as u64)?;
+        let capture = fln_rt::region::SubgraphCapture::new(
+            region,
+            self.header.base_addr + self.payload_offset as u64,
+        )
+        .map_err(map_fault)?;
+        let mut walk_budget = DecodeBudget::new(budget);
+        let root = self.deref(self.root_ptr()?)?;
+        let entries_index = format::MODULE_DATA_FIELDS
+            .iter()
+            .filter(|field| field.lean_type != "Bool")
+            .position(|field| field.name == "entries")
+            .ok_or(RegionError::RootShape {
+                reason: "ModuleData contract lacks entries",
+            })?;
+        let (array, count) = self.decode_array_view(
+            self.read_u64(root + 8 + 8 * entries_index as u64)?,
+            "entries not an array",
+            &mut walk_budget,
+        )?;
+        let mut remaining = max_payload_bytes;
+        let mut blocks = Vec::new();
+        for index in 0..count {
+            walk_budget.visit()?;
+            let pair = self.deref(self.read_u64(array + 24 + 8 * index)?)?;
+            let name = self.read_name(self.read_u64(pair + 8)?, &mut walk_budget)?;
+            let (entries, length) = self.decode_array_view(
+                self.read_u64(pair + 16)?,
+                "extension payload not an array",
+                &mut walk_budget,
+            )?;
+            let mut payloads = Vec::new();
+            for ordinal in 0..length {
+                walk_budget.visit()?;
+                let pointer = self.read_u64(entries + 24 + 8 * ordinal)?;
+                let payload = capture
+                    .capture(pointer, remaining)
+                    .map_err(|fault| match fault {
+                        fln_rt::region::RegionFault::CaptureBudgetExhausted {
+                            required, ..
+                        } => RegionError::PayloadBudgetExhausted {
+                            required: (max_payload_bytes - remaining).saturating_add(required),
+                            budget: max_payload_bytes,
+                        },
+                        other => map_fault(other),
+                    })?;
+                remaining -= payload.len();
+                payloads.push(payload);
+            }
+            blocks.push(OpaqueExtensionBlock {
+                name,
+                entries: payloads,
+            });
+        }
+        Ok(blocks)
     }
 
     /// Decode the root `ModuleData` object per the generated wire order:

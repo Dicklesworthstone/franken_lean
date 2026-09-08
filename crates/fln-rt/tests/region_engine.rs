@@ -115,6 +115,72 @@ fn scalar_root_region() {
 }
 
 #[test]
+fn opaque_subgraph_capture_preserves_bytes_sharing_and_relocation() {
+    use fln_rt::region::SubgraphCapture;
+    let _g = lock();
+    let graph = sample_graph();
+    let bytes = compact(&graph, BASE_A).expect("source region");
+    let root = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let index = SubgraphCapture::new(&bytes, BASE_A).expect("index");
+    let captured = index.capture(root, bytes.len()).expect("capture");
+    // Independent existing writer and materializer establish that all payload
+    // categories and shared edges survived, rather than checking just a digest.
+    assert_eq!(
+        captured,
+        compact(&graph, 0).expect("independent compaction")
+    );
+    let rebuilt = materialize(&captured, 0).expect("captured region is executable data");
+    assert_eq!(compact(&rebuilt, BASE_A).expect("round trip"), bytes);
+    assert!(matches!(
+        index.capture(root, captured.len() - 1),
+        Err(RegionFault::CaptureBudgetExhausted { .. })
+    ));
+    assert_eq!(index.capture(root, captured.len()).unwrap(), captured);
+
+    let mut relocated = bytes.clone();
+    relocate(&mut relocated, BASE_A, BASE_B).unwrap();
+    let relocated_root = u64::from_le_bytes(relocated[..8].try_into().unwrap());
+    assert_eq!(
+        SubgraphCapture::new(&relocated, BASE_B)
+            .unwrap()
+            .capture(relocated_root, bytes.len())
+            .unwrap(),
+        captured
+    );
+}
+
+#[test]
+fn opaque_subgraph_capture_excludes_unreachable_objects_and_refuses_bad_roots() {
+    use fln_rt::region::SubgraphCapture;
+    let _g = lock();
+    let wanted = Obj::mk_string("retained payload");
+    let container = Obj::mk_array(vec![Obj::mk_string("unrelated"), wanted.clone_ref()]);
+    let bytes = compact(&container, BASE_A).unwrap();
+    let root = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let slot = (root - BASE_A) as usize + 24 + 8;
+    let entry = u64::from_le_bytes(bytes[slot..slot + 8].try_into().unwrap());
+    let index = SubgraphCapture::new(&bytes, BASE_A).unwrap();
+    assert_eq!(
+        index.capture(entry, bytes.len()).unwrap(),
+        compact(&wanted, 0).unwrap()
+    );
+    assert_eq!(index.capture(155, 8).unwrap(), 155u64.to_le_bytes());
+    for invalid in [BASE_A, entry + 8, BASE_A + bytes.len() as u64] {
+        assert!(matches!(
+            index.capture(invalid, bytes.len()),
+            Err(RegionFault::PtrOutOfBounds { .. })
+        ));
+    }
+    // An in-range pointer into an object's body must not pass as an object root.
+    let mut corrupt = bytes.clone();
+    corrupt[slot..slot + 8].copy_from_slice(&(entry + 8).to_le_bytes());
+    assert!(matches!(
+        SubgraphCapture::new(&corrupt, BASE_A),
+        Err(RegionFault::PtrOutOfBounds { .. })
+    ));
+}
+
+#[test]
 fn corruption_fault_matrix() {
     let _g = lock();
     let bytes = compact(&sample_graph(), BASE_A).expect("compact");

@@ -501,13 +501,18 @@ impl OleanDecodeError {
         matches!(
             self,
             Self::ArtifactTooLarge { .. }
-                | Self::Region(OleanRegionError::BudgetExhausted { .. })
+                | Self::Region(
+                    OleanRegionError::BudgetExhausted { .. }
+                        | OleanRegionError::PayloadBudgetExhausted { .. }
+                )
                 | Self::Declaration(OleanDeclarationError::Budget { .. })
                 | Self::Declaration(OleanDeclarationError::Region(
                     OleanRegionError::BudgetExhausted { .. }
+                        | OleanRegionError::PayloadBudgetExhausted { .. }
                 ))
                 | Self::CompanionRegion {
-                    error: OleanRegionError::BudgetExhausted { .. },
+                    error: OleanRegionError::BudgetExhausted { .. }
+                        | OleanRegionError::PayloadBudgetExhausted { .. },
                     ..
                 }
                 | Self::CompanionDeclaration {
@@ -515,7 +520,10 @@ impl OleanDecodeError {
                     ..
                 }
                 | Self::CompanionDeclaration {
-                    error: OleanDeclarationError::Region(OleanRegionError::BudgetExhausted { .. }),
+                    error: OleanDeclarationError::Region(
+                        OleanRegionError::BudgetExhausted { .. }
+                            | OleanRegionError::PayloadBudgetExhausted { .. }
+                    ),
                     ..
                 }
         )

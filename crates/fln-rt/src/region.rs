@@ -82,6 +82,8 @@ pub enum RegionFault {
     UnsupportedCategory { tag: u8, operation: &'static str },
     /// Construction input exceeded a contract bound (ctor shape, size…).
     BuildShape { reason: &'static str },
+    /// Lossless subgraph capture exceeded its caller's byte allowance.
+    CaptureBudgetExhausted { required: usize, limit: usize },
 }
 
 impl std::fmt::Display for RegionFault {
@@ -122,6 +124,12 @@ impl std::fmt::Display for RegionFault {
                 write!(f, "category tag {tag} unsupported by {operation}")
             }
             Self::BuildShape { reason } => write!(f, "build shape: {reason}"),
+            Self::CaptureBudgetExhausted { required, limit } => {
+                write!(
+                    f,
+                    "subgraph capture requires {required} bytes, allowance is {limit}"
+                )
+            }
         }
     }
 }
@@ -753,6 +761,137 @@ pub fn audit(buf: &[u8], base: u64) -> RResult<RegionReport> {
         root: read_u64(buf, 0),
         bytes: len,
     })
+}
+
+/// An indexed, validated compacted region for lossless opaque-entry capture.
+/// The index is shared across entries; it never materializes or interprets them.
+pub struct SubgraphCapture<'a> {
+    bytes: &'a [u8],
+    base: u64,
+    objects: std::collections::BTreeMap<usize, WalkStep>,
+}
+
+impl<'a> SubgraphCapture<'a> {
+    /// Validate object boundaries and the compactor's children-before-parent law.
+    pub fn new(bytes: &'a [u8], base: u64) -> RResult<Self> {
+        if !bytes.len().is_multiple_of(8) {
+            return Err(RegionFault::RaggedPayload { len: bytes.len() });
+        }
+        need(bytes, 0, 8)?;
+        let mut objects = std::collections::BTreeMap::new();
+        let mut offset = 8;
+        while offset < bytes.len() {
+            let step = walk_step(bytes, offset)?;
+            need(bytes, offset, round8(step.size))?;
+            for &field in &step.ptr_fields {
+                if let Some(child) = checked_rel(bytes, field, base, bytes.len())?
+                    && !objects.contains_key(&(child as usize))
+                {
+                    return Err(RegionFault::PtrOutOfBounds {
+                        offset: field,
+                        ptr: read_u64(bytes, field),
+                    });
+                }
+            }
+            if let Some(field) = step.limb_ptr {
+                checked_limb_rel(bytes, field, base, offset, step.size)?;
+            }
+            let size = round8(step.size);
+            objects.insert(offset, step);
+            offset += size;
+        }
+        Ok(Self {
+            bytes,
+            base,
+            objects,
+        })
+    }
+
+    /// Copy precisely the objects reachable from `root`, retaining sharing,
+    /// object/scalar bytes and entry identity. Only addresses change: the output
+    /// is a standalone region at base zero. Padding is retained verbatim.
+    /// Unknown categories and invalid child pointers are refused by the shared
+    /// reader; an exhausted allowance never returns a partial payload.
+    pub fn capture(&self, root: u64, max_bytes: usize) -> RResult<Vec<u8>> {
+        if max_bytes < 8 {
+            return Err(RegionFault::CaptureBudgetExhausted {
+                required: 8,
+                limit: max_bytes,
+            });
+        }
+        if is_scalar_word(root) {
+            return Ok(root.to_le_bytes().to_vec());
+        }
+        let mut pending = vec![root];
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut total = 8usize;
+        while let Some(pointer) = pending.pop() {
+            if is_scalar_word(pointer) {
+                continue;
+            }
+            let offset = pointer.wrapping_sub(self.base);
+            let step = usize::try_from(offset)
+                .ok()
+                .and_then(|offset| self.objects.get(&offset))
+                .ok_or(RegionFault::PtrOutOfBounds {
+                    offset: 0,
+                    ptr: pointer,
+                })?;
+            let offset = offset as usize;
+            if !reachable.insert(offset) {
+                continue;
+            }
+            let required = total.saturating_add(round8(step.size));
+            if required > max_bytes {
+                return Err(RegionFault::CaptureBudgetExhausted {
+                    required,
+                    limit: max_bytes,
+                });
+            }
+            total = required;
+            pending.extend(
+                step.ptr_fields
+                    .iter()
+                    .map(|&field| read_u64(self.bytes, field)),
+            );
+        }
+        let mut output = Vec::with_capacity(total);
+        output.extend_from_slice(&[0; 8]);
+        let mut relocated = HashMap::new();
+        for offset in reachable {
+            let step = &self.objects[&offset];
+            let new_offset = output.len();
+            output.extend_from_slice(&self.bytes[offset..offset + round8(step.size)]);
+            for &field in &step.ptr_fields {
+                let pointer = read_u64(self.bytes, field);
+                if !is_scalar_word(pointer) {
+                    let child = (pointer - self.base) as usize;
+                    // new() established strict post-order, and reachability
+                    // included every child. Still refuse a broken join.
+                    let target =
+                        relocated
+                            .get(&child)
+                            .copied()
+                            .ok_or(RegionFault::PtrOutOfBounds {
+                                offset: field,
+                                ptr: pointer,
+                            })?;
+                    write_u64(&mut output, new_offset + field - offset, target);
+                }
+            }
+            if let Some(field) = step.limb_ptr {
+                write_u64(
+                    &mut output,
+                    new_offset + field - offset,
+                    (new_offset + MPZ_FIXED) as u64,
+                );
+            }
+            relocated.insert(offset, new_offset as u64);
+        }
+        let root_offset = (root - self.base) as usize;
+        write_u64(&mut output, 0, relocated[&root_offset]);
+        Ok(output)
+    }
 }
 
 /// Canonical relocation-invariant digest: FNV-1a over the linear object

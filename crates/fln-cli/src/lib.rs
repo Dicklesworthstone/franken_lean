@@ -2920,9 +2920,10 @@ fn olean_rebuild_failure(
 fn olean_rebuild_error_class(error: &fln::OleanRebuildError) -> (&'static str, u8) {
     match error {
         fln::OleanRebuildError::ArtifactTooLarge { .. }
-        | fln::OleanRebuildError::Region(fln::OleanRegionError::BudgetExhausted { .. }) => {
-            ("resource", 3)
-        }
+        | fln::OleanRebuildError::Region(
+            fln::OleanRegionError::BudgetExhausted { .. }
+            | fln::OleanRegionError::PayloadBudgetExhausted { .. },
+        ) => ("resource", 3),
         fln::OleanRebuildError::Region(_) => ("rebuild", 1),
     }
 }

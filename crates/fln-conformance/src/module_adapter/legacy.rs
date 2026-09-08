@@ -22,11 +22,8 @@
 //!   duplicates, and structural names are preserved lossless from pinned fixtures.
 
 use std::fmt;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 
-use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::Outcome;
 use fln_env::constants::ConstantInfo;
@@ -213,27 +210,34 @@ impl OleanModuleAdapter {
         let mut extension_entries = Vec::new();
         let mut extension_contributions = Vec::new();
 
-        for (ext_idx, ext_block) in module_data.extensions.iter().enumerate() {
+        // This limit bounds expansion when many entries share large subgraphs.
+        // Exhaustion remains a typed non-answer; never publish a prefix.
+        let extension_blocks = view.extension_payloads(WalkBudget::default(), 64 * 1024 * 1024)?;
+        for ext_block in extension_blocks {
+            if ext_block.entries.is_empty() {
+                continue;
+            }
+            let ext_idx = extension_contributions.len();
             let descriptor = ExtensionDescriptor {
-                name: Name::str(Name::anonymous(), &ext_block.name),
+                name: ext_block.name,
                 merge: MergeSemantics::AppendOrdered,
                 checkpoint: CheckpointSemantics::JournalSuffix,
-                provenance: PayloadProvenance::Understood,
+                provenance: PayloadProvenance::Opaque,
             };
-            let raw_data = ext_block.name.as_bytes();
-            let entry_id = ExtensionEntryId::derive(&epoch, &descriptor, raw_data);
-            let payload = fln_env::module_apply::ExtensionPayload::new(
-                ext_idx,
-                descriptor.clone(),
-                0,
-                raw_data.to_vec(),
-            );
-            extension_entries.push(payload);
+            let mut entry_ids = Vec::new();
+            for (ordinal, raw_data) in ext_block.entries.into_iter().enumerate() {
+                entry_ids.push(ExtensionEntryId::derive(&epoch, &descriptor, &raw_data));
+                extension_entries.push(fln_env::module_apply::ExtensionPayload::new(
+                    ext_idx,
+                    descriptor.clone(),
+                    ordinal as u64,
+                    raw_data,
+                ));
+            }
 
             let base_history =
                 fln_env::extensions::ExtensionState::new(descriptor.clone()).content_digest();
-            let contribution =
-                ExtensionContribution::new(descriptor, 0, base_history, vec![entry_id]);
+            let contribution = ExtensionContribution::new(descriptor, 0, base_history, entry_ids);
             extension_contributions.push(contribution);
         }
 
@@ -256,19 +260,6 @@ impl OleanModuleAdapter {
             evidence,
             payload_bytes: bytes.len(),
         })
-    }
-
-    /// Decode a `.olean` artifact from a filesystem file.
-    pub fn decode_file(
-        module_id: ModuleId,
-        path: impl AsRef<Path>,
-        epoch: ModuleEpoch,
-    ) -> Result<DecodedOleanModule, ModuleAdapterError> {
-        let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|err| {
-            ModuleAdapterError::Io(format!("failed to read {}: {err}", path.display()))
-        })?;
-        Self::decode_bytes(module_id, &bytes, epoch)
     }
 
     /// Build a [`ModuleApplyTransaction`] pairing decoded values with a manifest.

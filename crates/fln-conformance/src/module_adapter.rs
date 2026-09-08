@@ -1,15 +1,10 @@
 //! Fail-closed `.olean` → environment adapter boundary.
 //!
-//! The compacted-region reader currently proves the integrity and cardinality of
-//! environment-extension entry arrays, but it does not expose the opaque entry
-//! roots or a lossless serialization of their payloads. The former adapter
-//! incorrectly substituted the extension name bytes for every payload and marked
-//! those bytes as understood provenance. That silently changed module semantics.
+//! Extension entries retain their complete compacted object graphs, with only
+//! addresses relocated into standalone regions. Their schemas remain opaque.
 //!
-//! This facade preserves the existing batch-coordinator implementation and public
-//! types while refusing nonempty extension blocks until the region layer can
-//! provide lossless payload bytes. Zero-entry blocks contribute no state and are
-//! stripped rather than converted into synthetic payloads.
+//! This facade checks that every nonempty extension block has payload-bearing
+//! entries before exposing the decoded module to the batch coordinator.
 
 use std::fmt;
 use std::fs;
@@ -27,8 +22,8 @@ use fln_olean::region::{ExtensionBlock, OleanView, RegionError, WalkBudget};
 mod legacy;
 
 pub use legacy::{
-    CommittedModuleBatchResult, DecodedOleanModule, ModuleBatchApplyPlan,
-    ModuleBatchCommitError, ModuleBatchPlanError, ModuleBatchUsageSummary,
+    CommittedModuleBatchResult, DecodedOleanModule, ModuleBatchApplyPlan, ModuleBatchCommitError,
+    ModuleBatchPlanError, ModuleBatchUsageSummary,
 };
 
 /// Adapter and batch-coordination failure.
@@ -65,7 +60,9 @@ impl fmt::Display for ModuleAdapterError {
         match self {
             Self::Region(error) => write!(formatter, "olean region decode error: {error:?}"),
             Self::Decl(error) => write!(formatter, "olean decl decode error: {error:?}"),
-            Self::Manifest(error) => write!(formatter, "module provenance manifest error: {error:?}"),
+            Self::Manifest(error) => {
+                write!(formatter, "module provenance manifest error: {error:?}")
+            }
             Self::Preflight(error) => write!(formatter, "module apply preflight error: {error:?}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::MissingDependency { module, dependency } => write!(
@@ -85,7 +82,7 @@ impl fmt::Display for ModuleAdapterError {
             ),
             Self::OpaqueExtensionPayloadUnavailable { extension, entries } => write!(
                 formatter,
-                "olean extension {extension:?} contains {entries} opaque entries, but the region decoder exposes only their count; refusing to fabricate environment payload bytes"
+                "olean extension {extension:?} contains {entries} opaque entries without matching captured payloads; refusing to fabricate environment payload bytes"
             ),
         }
     }
@@ -140,8 +137,15 @@ impl From<legacy::ModuleAdapterError> for ModuleAdapterError {
 
 fn require_lossless_extension_payloads(
     extensions: &[ExtensionBlock],
+    contributions: &[fln_env::provenance::ExtensionContribution],
 ) -> Result<(), ModuleAdapterError> {
-    if let Some(extension) = extensions.iter().find(|extension| extension.entries != 0) {
+    if let Some(extension) = extensions.iter().find(|extension| {
+        extension.entries != 0
+            && !contributions.iter().any(|contribution| {
+                contribution.descriptor().name.to_display_string() == extension.name
+                    && contribution.entries().len() as u64 == extension.entries
+            })
+    }) {
         return Err(ModuleAdapterError::OpaqueExtensionPayloadUnavailable {
             extension: extension.name.clone(),
             entries: extension.entries,
@@ -152,9 +156,7 @@ fn require_lossless_extension_payloads(
 
 /// Olean module adapter converting raw `.olean` artifacts into environment inputs.
 ///
-/// Declaration and import decoding retain the existing implementation. Extension
-/// state is admitted only when it is semantically empty; nonempty opaque blocks
-/// are a typed refusal until their exact payloads are recoverable.
+/// Unknown extension state is captured losslessly, with opaque provenance.
 pub struct OleanModuleAdapter;
 
 impl OleanModuleAdapter {
@@ -166,14 +168,12 @@ impl OleanModuleAdapter {
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
         let view = OleanView::parse(bytes)?;
         let module_data = view.module_data(WalkBudget::default())?;
-        require_lossless_extension_payloads(&module_data.extensions)?;
-
-        let mut decoded = legacy::OleanModuleAdapter::decode_bytes(module_id, bytes, epoch)
+        let decoded = legacy::OleanModuleAdapter::decode_bytes(module_id, bytes, epoch)
             .map_err(ModuleAdapterError::from)?;
-        // The legacy implementation synthesized one name-byte payload even for
-        // an empty entry array. Empty arrays carry no environment delta.
-        decoded.extension_entries.clear();
-        decoded.extension_contributions.clear();
+        require_lossless_extension_payloads(
+            &module_data.extensions,
+            &decoded.extension_contributions,
+        )?;
         Ok(decoded)
     }
 
@@ -210,10 +210,13 @@ mod tests {
 
     #[test]
     fn nonempty_opaque_extension_blocks_are_typed_refusals() {
-        let error = require_lossless_extension_payloads(&[ExtensionBlock {
-            name: "Lean.Parser.Extension".to_owned(),
-            entries: 3,
-        }])
+        let error = require_lossless_extension_payloads(
+            &[ExtensionBlock {
+                name: "Lean.Parser.Extension".to_owned(),
+                entries: 3,
+            }],
+            &[],
+        )
         .expect_err("opaque payload counts are not payload bytes");
         assert!(matches!(
             &error,
@@ -225,16 +228,19 @@ mod tests {
 
     #[test]
     fn zero_entry_extension_blocks_require_no_synthetic_payload() {
-        require_lossless_extension_payloads(&[
-            ExtensionBlock {
-                name: "Empty.First".to_owned(),
-                entries: 0,
-            },
-            ExtensionBlock {
-                name: "Empty.Second".to_owned(),
-                entries: 0,
-            },
-        ])
+        require_lossless_extension_payloads(
+            &[
+                ExtensionBlock {
+                    name: "Empty.First".to_owned(),
+                    entries: 0,
+                },
+                ExtensionBlock {
+                    name: "Empty.Second".to_owned(),
+                    entries: 0,
+                },
+            ],
+            &[],
+        )
         .expect("empty extension arrays carry no environment delta");
     }
 

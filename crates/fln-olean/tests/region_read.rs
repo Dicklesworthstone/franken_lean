@@ -404,6 +404,50 @@ fn binder_name_hint_decodes_constants_and_extensions() {
 }
 
 #[test]
+fn real_extension_capture_is_lossless_relocatable_and_budgeted() {
+    for filename in [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ] {
+        let bytes = fixture(filename);
+        let view = OleanView::parse(&bytes).unwrap();
+        let blocks = view
+            .extension_payloads(WalkBudget::default(), 64 * 1024 * 1024)
+            .unwrap();
+        let count: usize = blocks.iter().map(|block| block.entries.len()).sum();
+        assert!(count > 0, "{filename} must exercise actual entries");
+        let total: usize = blocks
+            .iter()
+            .flat_map(|block| &block.entries)
+            .map(Vec::len)
+            .sum();
+        for block in &blocks {
+            for payload in &block.entries {
+                let mut moved = payload.clone();
+                fln_rt::region::relocate(&mut moved, 0, SYNTHETIC_BASE).unwrap();
+                fln_rt::region::relocate(&mut moved, SYNTHETIC_BASE, 0).unwrap();
+                assert_eq!(&moved, payload, "exact payload survives relocation");
+                assert_ne!(
+                    payload.as_slice(),
+                    block.name.to_display_string().as_bytes()
+                );
+            }
+        }
+        assert!(matches!(
+            view.extension_payloads(WalkBudget::default(), total - 1),
+            Err(RegionError::PayloadBudgetExhausted { .. })
+        ));
+        assert_eq!(
+            view.extension_payloads(WalkBudget::default(), total)
+                .unwrap(),
+            blocks,
+            "adequate-budget recovery must reproduce every byte"
+        );
+    }
+}
+
+#[test]
 fn size_of_lemmas_carries_simp_extension_payloads() {
     let bytes = fixture("Init.SizeOfLemmas.olean");
     let view = OleanView::parse(&bytes).expect("header");

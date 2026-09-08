@@ -210,15 +210,15 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
         let olean_path = root.join(rel_path);
         let bytes = fs::read(&olean_path).unwrap();
         let view = fln_olean::region::OleanView::parse(&bytes).unwrap();
-        let module_data = view
-            .module_data(fln_olean::region::WalkBudget::default())
+        let extensions = view
+            .extension_payloads(fln_olean::region::WalkBudget::default(), 64 * 1024 * 1024)
             .unwrap();
-        for ext in &module_data.extensions {
+        for ext in &extensions {
             let desc = ExtensionDescriptor {
-                name: Name::str(Name::anonymous(), &ext.name),
+                name: ext.name.clone(),
                 merge: MergeSemantics::AppendOrdered,
                 checkpoint: CheckpointSemantics::JournalSuffix,
-                provenance: PayloadProvenance::Understood,
+                provenance: PayloadProvenance::Opaque,
             };
             if base_env.extension(&desc.name).is_none() {
                 base_env = base_env.register_extension(desc).unwrap();
@@ -255,18 +255,28 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
             .into_iter()
             .collect();
 
+        let transparency =
+            if decoded.extension_entries.is_empty() {
+                PayloadTransparency::Understood
+            } else {
+                let false_completeness = ProvenanceCompleteness::new(
+                    CaptureStatus::Partial,
+                    PayloadTransparency::Understood,
+                    missing.clone(),
+                );
+                assert!(
+                    matches!(ModuleProvenanceManifest::new(
+                epoch.clone(), vec![decoded.to_contribution_record(false_completeness)],
+                ModuleProvenanceLimits::default(),
+            ), Err(fln_env::provenance::ModuleProvenanceError::PayloadTransparencyMismatch { .. })),
+                    "opaque bytes cannot be relabeled understood to pass the old fixture"
+                );
+                PayloadTransparency::Opaque
+            };
         let completeness = if missing.is_empty() {
-            ProvenanceCompleteness::new(
-                CaptureStatus::Complete,
-                PayloadTransparency::Understood,
-                vec![],
-            )
+            ProvenanceCompleteness::new(CaptureStatus::Complete, transparency, vec![])
         } else {
-            ProvenanceCompleteness::new(
-                CaptureStatus::Partial,
-                PayloadTransparency::Understood,
-                missing,
-            )
+            ProvenanceCompleteness::new(CaptureStatus::Partial, transparency, missing)
         };
 
         let contribution = decoded.to_contribution_record(completeness);
@@ -277,6 +287,31 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
                 ModuleProvenanceLimits::default(),
             )
             .unwrap(),
+        );
+
+        let mut corrupted = decoded.extension_entries.clone();
+        let original = &corrupted[0];
+        let mut changed_bytes = original.payload().to_vec();
+        changed_bytes[0] ^= 1;
+        corrupted[0] = fln_env::module_apply::ExtensionPayload::new(
+            original.contribution_index(),
+            original.descriptor().clone(),
+            original.source_ordinal(),
+            changed_bytes,
+        );
+        assert!(
+            preflight_module_apply(
+                ModuleApplyTransaction::new(
+                    manifest.clone(),
+                    contribution.clone(),
+                    decoded.constants.clone(),
+                    vec![],
+                    corrupted,
+                ),
+                &ModuleApplyLimits::default()
+            )
+            .is_err(),
+            "payload corruption must fail its original manifest before staging"
         );
 
         let transaction = ModuleApplyTransaction::new(
@@ -335,6 +370,33 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
             "resulting combined state must remain internally consistent"
         );
         assert_eq!(resulting_state.module_state().manifest().records().len(), 1);
+        assert!(
+            !decoded.extension_entries.is_empty(),
+            "real fixture must exercise opaque entries"
+        );
+        for payload in &decoded.extension_entries {
+            let extension = resulting_state
+                .module_state()
+                .environment()
+                .extension(&payload.descriptor().name)
+                .expect("applied extension");
+            assert_eq!(extension.provenance(), PayloadProvenance::Opaque);
+            assert!(!extension.supports_fine_invalidation());
+            let applied = extension
+                .entries()
+                .nth(payload.source_ordinal() as usize)
+                .expect("each decoded entry was applied in source order");
+            assert_eq!(applied.payload.as_ref(), payload.payload());
+            let contribution = &decoded.extension_contributions[payload.contribution_index()];
+            assert_eq!(
+                contribution.entries()[payload.source_ordinal() as usize],
+                fln_env::provenance::ExtensionEntryId::derive(
+                    &epoch,
+                    payload.descriptor(),
+                    &applied.payload,
+                )
+            );
+        }
     }
 }
 
