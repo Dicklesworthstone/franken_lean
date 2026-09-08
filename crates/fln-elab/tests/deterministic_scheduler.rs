@@ -403,3 +403,105 @@ fn test_perturbation_validator_detects_accurate_and_lying_summaries() {
         "Lying node must be demoted to Opaque barrier!"
     );
 }
+
+#[test]
+fn perturbation_demotes_changes_in_every_product_plane() {
+    use fln_core::pos::Position;
+    use fln_elab::perturbation::PerturbationResult;
+
+    // Each producer hides one read of the environment. Keep counts, names and
+    // types unchanged: those alone used to certify a changed definition body.
+    let mutations: [(&str, fn(&mut ElabUnitProduct)); 9] = [
+        ("definition body", |p| {
+            let ConstantInfo::Defn(d) = &mut p.admitted_decls[0] else {
+                unreachable!()
+            };
+            d.value = Expr::sort(
+                fln_core::level::Level::succ(fln_core::level::Level::zero())
+                    .expect("one successor"),
+            );
+        }),
+        ("universe parameters", |p| {
+            let ConstantInfo::Defn(d) = &mut p.admitted_decls[0] else {
+                unreachable!()
+            };
+            d.base.level_params.push(Name::from_components(["u"]));
+        }),
+        ("reducibility", |p| {
+            let ConstantInfo::Defn(d) = &mut p.admitted_decls[0] else {
+                unreachable!()
+            };
+            d.hints = ReducibilityHints::Opaque;
+        }),
+        ("diagnostic start", |p| {
+            p.messages[0].pos = Some(Position { line: 2, column: 3 });
+        }),
+        ("diagnostic end", |p| {
+            p.messages[0].end_pos = Some(Position { line: 2, column: 4 });
+        }),
+        ("diagnostic caption", |p| {
+            p.messages[0].caption = "changed".to_owned();
+        }),
+        ("InfoTree", |p| {
+            p.info_tree = Some(InfoTree::Node(
+                Info::CommandInfo {
+                    name: Name::from_components(["Other"]),
+                },
+                Vec::new(),
+            ));
+        }),
+        ("dynamic effects", |p| {
+            p.effects.record(CommandEffect::ReadsOption {
+                key: "trace.Elab".to_owned(),
+            });
+        }),
+        ("decision content", |p| {
+            p.decisions[0] = DecisionRecord::TransactionFork {
+                branch_id: 1,
+                num_alternatives: 2,
+            };
+        }),
+    ];
+
+    for (label, mutate) in mutations {
+        let mut node = DataflowNode {
+            id: CommandId(0),
+            name: None,
+            declared_names: Vec::new(),
+            referenced_names: Vec::new(),
+            declared_effects: EffectSummary::new(),
+            elab_fn: Arc::new(move |env, _budget| {
+                let mut product = ElabUnitProduct::empty();
+                product.admitted_decls.push(create_sample_def("Result"));
+                product.messages.push(Message::info("same text"));
+                product.info_tree = Some(InfoTree::Node(
+                    Info::CommandInfo {
+                        name: Name::from_components(["Result"]),
+                    },
+                    Vec::new(),
+                ));
+                product.decisions.push(DecisionRecord::TransactionFork {
+                    branch_id: 0,
+                    num_alternatives: 2,
+                });
+                if !env.is_empty() {
+                    mutate(&mut product);
+                }
+                Outcome::complete(Ok(product))
+            }),
+        };
+        let result = PerturbationValidator::validate_node_effects(
+            &mut node,
+            &Environment::new(),
+            &ElabBudget::default(),
+        );
+        assert!(
+            matches!(result, Outcome::Complete(PerturbationResult::Failed { .. })),
+            "{label} escaped perturbation validation: {result:?}"
+        );
+        assert!(
+            node.declared_effects.is_barrier(),
+            "{label} was not demoted"
+        );
+    }
+}

@@ -29,7 +29,7 @@ impl std::fmt::Display for CommandId {
 }
 
 /// The result produced by elaborating a single dataflow command node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElabUnitProduct {
     /// Declarations admitted/defined by this command.
     pub admitted_decls: Vec<ConstantInfo>,

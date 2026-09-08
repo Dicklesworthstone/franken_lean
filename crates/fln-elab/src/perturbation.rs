@@ -131,31 +131,9 @@ impl PerturbationValidator {
     }
 
     fn products_equivalent(a: &ElabUnitProduct, b: &ElabUnitProduct) -> bool {
-        // Compare admitted declarations count and names
-        if a.admitted_decls.len() != b.admitted_decls.len() {
-            return false;
-        }
-        for (da, db) in a.admitted_decls.iter().zip(&b.admitted_decls) {
-            if da.name() != db.name() || da.constant_val().type_ != db.constant_val().type_ {
-                return false;
-            }
-        }
-
-        // Compare messages
-        if a.messages.len() != b.messages.len() {
-            return false;
-        }
-        for (ma, mb) in a.messages.iter().zip(&b.messages) {
-            if ma.severity != mb.severity || ma.text != mb.text {
-                return false;
-            }
-        }
-
-        // Compare decision counts
-        if a.decisions.len() != b.decisions.len() {
-            return false;
-        }
-
-        true
+        // Structural equality includes declaration bodies and metadata, complete
+        // diagnostics, InfoTrees, effects and decision content. Deriving it on
+        // the product also makes any newly added field part of this contract.
+        a == b
     }
 }
