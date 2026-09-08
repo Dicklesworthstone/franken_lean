@@ -1,0 +1,83 @@
+name: Native source proof implementation
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/land_source_proofs.py'
+      - '.github/workflows/fln-source-proofs-landing.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-source-proofs-landing
+  cancel-in-progress: false
+jobs:
+  source-proofs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install configured compiler and apply source delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          mkdir -p target/proof-landing
+          rustc -Vv > target/proof-landing/compiler.txt
+          git rev-parse HEAD > target/proof-landing/base-commit.txt
+          python3 -I scripts/land_source_proofs.py
+          python3 -I - <<'PY'
+          import pathlib, subprocess
+          allowed = {
+            'crates/fln-parse/src/lib.rs', 'crates/fln-parse/src/proofs.rs',
+            'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/tactics.rs',
+            'crates/fln-elab/tests/source_proofs.rs', 'crates/fln/src/lib.rs',
+            'crates/fln/src/source_check.rs', 'crates/fln/tests/source_proofs.rs',
+            'crates/fln-cli/src/lib.rs', 'crates/fln-cli/src/source_check.rs',
+            'crates/fln-cli/tests/source_proofs.rs',
+          }
+          rows = subprocess.check_output(['git', 'status', '--porcelain=v1', '-z']).decode().split('\0')
+          paths = []
+          for row in filter(None, rows):
+            if row[:2] not in {' M', '??'} or row[3:] not in allowed:
+              raise SystemExit(f'unexpected changed path or operation: {row!r}')
+            paths.append(row[3:])
+          if not paths:
+            raise SystemExit('no implementation changes')
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths], check=True)
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          pathlib.Path('target/proof-landing/source.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
+          PY
+          git diff --cached --check
+      - name: Test the real parser elaborator and engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/proof-landing/workspace-check.log
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/proof-landing/source-tests.log
+          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/proof-landing/engine-tests.log
+          if test -f crates/fln/tests/source_proofs.rs; then
+            cargo test --locked -p fln --test source_proofs --no-fail-fast 2>&1 | tee target/proof-landing/engine-proof-tests.log
+          fi
+          if test -f crates/fln-cli/tests/source_proofs.rs; then
+            cargo test --locked -p fln-cli --test source_proofs --no-fail-fast 2>&1 | tee target/proof-landing/cli-proof-tests.log
+          fi
+          cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings 2>&1 | tee target/proof-landing/clippy.log
+      - name: Publish the tested production delta without force
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'FrankenLean source implementation'
+          git config user.email 'noreply@github.com'
+          git commit -m 'feat(source): publish verified native proof-checking increment'
+          git push origin HEAD:main
+          git rev-parse HEAD > target/proof-landing/published-commit.txt
+      - name: Retain exact source delta and test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-proofs-${{ github.sha }}
+          path: target/proof-landing
+          if-no-files-found: error
+          retention-days: 7
