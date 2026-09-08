@@ -7,6 +7,7 @@
 
 mod infer;
 mod levels;
+mod tactics;
 
 use super::*;
 use crate::constraint::unify::{UnificationBudget, UnificationError};
@@ -19,6 +20,7 @@ pub enum SourceInferenceError {
     UnknownConstant(Name),
     ExpectedFunction,
     ExpectedType,
+    Tactic(tactics::TacticError),
     UnresolvedHoles { count: usize },
     UnresolvedUniverses,
     InstanceSynthesisRequired,
@@ -35,6 +37,7 @@ impl std::fmt::Display for SourceInferenceError {
                 write!(f, "source reference does not name a known constant")
             }
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
+            Self::Tactic(error) => write!(f, "{error}"),
             Self::ExpectedType => write!(f, "source annotation requires a type"),
             Self::UnresolvedHoles { count } => write!(
                 f,
@@ -450,6 +453,8 @@ impl Context {
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
             Lambda(LocalContext, Vec<LocalDecl>),
+            Proof(tactics::ProofState<'a>),
+            ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, bool),
         }
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
         let mut values: Vec<Typed> = Vec::new();
@@ -462,6 +467,10 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "byTactic"]) {
+                            tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "fun"]) {
                             let parts = expect_node(syntax, kind, 2, "Lean.Parser.Term.fun")?;
                             if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "fun" || val == "λ")
@@ -579,6 +588,32 @@ impl Context {
                     } else {
                         term
                     });
+                }
+                Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                    tactics::ProofAction::Term {
+                        syntax,
+                        goal,
+                        apply,
+                    } => {
+                        let expected = if apply {
+                            None
+                        } else {
+                            Some(goal.target.clone())
+                        };
+                        self.txn.lctx = goal.lctx.clone();
+                        tasks.push(Task::ProofTerm(proof, goal, apply));
+                        tasks.push(Task::Visit(syntax, expected, true));
+                    }
+                    tactics::ProofAction::Complete(term) => values.push(term),
+                },
+                Task::ProofTerm(mut proof, goal, apply) => {
+                    let term = values.pop().expect("tactic term visit");
+                    if apply {
+                        self.apply_proof_term(&mut proof, goal, term)?;
+                    } else {
+                        self.close_proof_goal(goal, term.value)?;
+                    }
+                    tasks.push(Task::Proof(proof));
                 }
                 Task::Lambda(saved, binders) => {
                     let mut body = values.pop().expect("lambda body visit");
@@ -867,13 +902,19 @@ pub(super) fn definition(
     for modifier in modifiers {
         expect_empty_null(modifier, "empty declaration modifier")?;
     }
+    let is_theorem = matches!(&declaration[1], Syntax::Node { kind, .. }
+        if kind == &parser_kind(&["Command", "theorem"]));
     let definition = expect_node(
         &declaration[1],
-        &parser_kind(&["Command", "definition"]),
-        5,
-        "definition",
+        &parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
+        if is_theorem { 4 } else { 5 },
+        "named declaration",
     )?;
-    expect_atom(&definition[0], "def", "definition keyword")?;
+    expect_atom(
+        &definition[0],
+        if is_theorem { "theorem" } else { "def" },
+        "declaration keyword",
+    )?;
     let id = expect_node(
         &definition[1],
         &parser_kind(&["Command", "declId"]),
@@ -889,9 +930,9 @@ pub(super) fn definition(
     expect_empty_null(&id[1], "absent declaration pre-parser")?;
     let signature = expect_node(
         &definition[2],
-        &parser_kind(&["Command", "optDeclSig"]),
+        &parser_kind(&["Command", if is_theorem { "declSig" } else { "optDeclSig" }]),
         2,
-        "definition signature",
+        "declaration signature",
     )?;
     let mut parameters = Vec::new();
     for syntax in expect_null_args(&signature[0], "definition binders")? {
@@ -935,9 +976,20 @@ pub(super) fn definition(
             parameters.push((id, name.clone(), domain.clone(), style));
         }
     }
-    let expected = optional_type_syntax(&signature[1])?
-        .map(|syntax| context.type_term(syntax))
-        .transpose()?;
+    let expected = if is_theorem {
+        let parts = expect_node(
+            &signature[1],
+            &parser_kind(&["Term", "typeSpec"]),
+            2,
+            "theorem type",
+        )?;
+        expect_atom(&parts[0], ":", "theorem type colon")?;
+        Some(context.type_term(&parts[1])?)
+    } else {
+        optional_type_syntax(&signature[1])?
+            .map(|syntax| context.type_term(syntax))
+            .transpose()?
+    };
     let parts = expect_node(
         &definition[3],
         &parser_kind(&["Command", "declValSimple"]),
@@ -955,7 +1007,9 @@ pub(super) fn definition(
         expect_empty_null(part, "absent termination clause")?;
     }
     expect_empty_null(&parts[3], "absent where clause")?;
-    expect_empty_null(&definition[4], "absent definition clauses")?;
+    if !is_theorem {
+        expect_empty_null(&definition[4], "absent definition clauses")?;
+    }
     let mut term = context.term(&parts[1], expected.clone())?;
     if let Some(expected) = expected {
         term.type_ = expected;
@@ -983,17 +1037,26 @@ pub(super) fn definition(
     {
         return Err(failure(SourceInferenceError::Scope));
     }
-    Ok(Declaration::Defn(DefinitionVal {
-        base: ConstantVal {
-            name: name.clone(),
-            level_params: Vec::new(),
-            type_: term.type_,
-        },
-        value: term.value,
-        hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
-        all: vec![name.clone()],
-    }))
+    let base = ConstantVal {
+        name: name.clone(),
+        level_params: Vec::new(),
+        type_: term.type_,
+    };
+    if is_theorem {
+        Ok(Declaration::Thm(fln_env::constants::TheoremVal {
+            base,
+            value: term.value,
+            all: vec![name.clone()],
+        }))
+    } else {
+        Ok(Declaration::Defn(DefinitionVal {
+            base,
+            value: term.value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name.clone()],
+        }))
+    }
 }
 
 pub(super) fn query(

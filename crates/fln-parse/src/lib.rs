@@ -30,6 +30,8 @@ pub mod recovery;
 pub mod registry;
 pub mod state;
 
+mod proofs;
+
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
 use fln_syntax::literal::LiteralKind;
@@ -59,6 +61,8 @@ pub enum NatDefinitionExpectation {
     ParameterIdentifier,
     ParameterTypeAscription,
     LambdaArrow,
+    Tactic,
+    TheoremType,
     NaturalType,
     ScalarType,
     ClosingParenthesis,
@@ -361,6 +365,7 @@ pub type DefinitionParseError = NatDefinitionParseError;
 /// Which supported source command produced a bounded command tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCommandKind {
+    /// A named source declaration (definition or theorem); never a query.
     Definition,
     Evaluation,
     Check,
@@ -469,7 +474,7 @@ fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "def", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+", "-", "++", "*",
         "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->", "→",
-        "fun", "λ", "=>", "↦",
+        "fun", "λ", "=>", "↦", "theorem", "by",
     ])
 }
 
@@ -477,7 +482,7 @@ fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^",
         "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_",
-        "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦",
+        "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦", "theorem", "by",
     ])
 }
 
@@ -968,6 +973,17 @@ fn bounded_term(
         let index = cursor;
         cursor += 1;
         match tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
+            {
+                let (proof, end) = proofs::parse(leaves, view, tokens, index, range.end)?;
+                frames
+                    .last_mut()
+                    .expect("root term frame")
+                    .application
+                    .push((proof, index));
+                cursor = end;
+            }
             kind if is_bounded_term_atom(kind, grammar) => {
                 let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
                 frames
@@ -1127,7 +1143,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
     });
     match first {
         Some(token) => match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "def" => {
+            TokenKind::Symbol(symbol) if symbol == "def" || symbol == "theorem" => {
                 let parsed = parse_definition(source)?;
                 Ok(ParsedSourceCommand {
                     kind: SourceCommandKind::Definition,
@@ -1228,7 +1244,7 @@ fn parse_definition_with_grammar(
 
     if !matches!(
         tokens.first().map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "def"
+        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && symbol == "theorem")
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, 0),
@@ -1244,6 +1260,7 @@ fn parse_definition_with_grammar(
             expected: NatDefinitionExpectation::DeclarationIdentifier,
         });
     }
+    let is_theorem = matches!(&tokens[0].kind, TokenKind::Symbol(symbol) if symbol == "theorem");
     let mut parameter_groups = Vec::new();
     let mut cursor = 2;
     while matches!(
@@ -1316,6 +1333,12 @@ fn parse_definition_with_grammar(
     } else {
         None
     };
+    if is_theorem && explicit_result_type.is_none() {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(&view, &tokens, cursor),
+            expected: NatDefinitionExpectation::TheoremType,
+        });
+    }
     let assignment_index = cursor;
     if !matches!(
         tokens.get(assignment_index).map(|token| &token.kind),
@@ -1381,8 +1404,16 @@ fn parse_definition_with_grammar(
     } else {
         null_node(Vec::new())
     };
+    let result_type = if is_theorem {
+        let Syntax::Node { args, .. } = &result_type else {
+            unreachable!("optional type container");
+        };
+        args.first().expect("theorem type was required").clone()
+    } else {
+        result_type
+    };
     let optional_signature = Syntax::node(
-        parser_kind(&["Command", "optDeclSig"]),
+        parser_kind(&["Command", if is_theorem { "declSig" } else { "optDeclSig" }]),
         vec![null_node(parameters), result_type],
     );
     let value = bounded_value_syntax(&leaves, &view, &tokens, let_bindings, body_start, grammar)?;
@@ -1394,15 +1425,18 @@ fn parse_definition_with_grammar(
         parser_kind(&["Command", "declValSimple"]),
         vec![assignment, value, termination, null_node(Vec::new())],
     );
+    let mut definition_parts = vec![
+        definition_keyword,
+        declaration_id,
+        optional_signature,
+        declaration_value,
+    ];
+    if !is_theorem {
+        definition_parts.push(null_node(Vec::new()));
+    }
     let definition = Syntax::node(
-        parser_kind(&["Command", "definition"]),
-        vec![
-            definition_keyword,
-            declaration_id,
-            optional_signature,
-            declaration_value,
-            null_node(Vec::new()),
-        ],
+        parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
+        definition_parts,
     );
     let syntax = Syntax::node(
         parser_kind(&["Command", "declaration"]),
@@ -1456,7 +1490,11 @@ pub fn partition_definition_commands(
             Event::Token(LexedToken {
                 kind: TokenKind::Symbol(symbol),
                 extent,
-            }) if symbol == "def" || symbol == "#eval" || symbol == "#check" => {
+            }) if symbol == "def"
+                || symbol == "theorem"
+                || symbol == "#eval"
+                || symbol == "#check" =>
+            {
                 Some(view.to_original(extent.start()).0)
             }
             Event::Trivia(_) | Event::Refused { .. } | Event::Token(_) => None,
@@ -1823,7 +1861,7 @@ mod nat_definition_tests {
         assert!(empty.imports.is_empty());
         assert!(empty.commands.is_empty());
 
-        let unsupported = partition_source_module(b"theorem answer : Nat := 42")
+        let unsupported = partition_source_module(b"axiom answer : Nat")
             .expect("the header parser leaves an unsupported body to the command parser");
         assert!(unsupported.imports.is_empty());
         assert_eq!(unsupported.commands.len(), 1);
