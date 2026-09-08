@@ -263,7 +263,12 @@ impl UniverseStore {
                     let levels = levels
                         .iter()
                         .map(|level| {
-                            self.instantiate_level(level, &mut level_done, &mut remaining, max_nodes)
+                            self.instantiate_level(
+                                level,
+                                &mut level_done,
+                                &mut remaining,
+                                max_nodes,
+                            )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     Expr::const_(name.clone(), levels)
@@ -373,7 +378,10 @@ mod tests {
         store.assign(bad.clone(), Level::mvar(bad));
         store.assign(good.clone(), Level::one());
         assert_eq!(store.instantiate(&Level::mvar(good)).unwrap(), Level::one());
-        assert_eq!(store.instantiate_with_limit(&Level::zero(), 0).unwrap(), Level::zero());
+        assert_eq!(
+            store.instantiate_with_limit(&Level::zero(), 0).unwrap(),
+            Level::zero()
+        );
     }
 
     #[test]
@@ -388,7 +396,10 @@ mod tests {
             Err(UniverseInstantiationError::VisitLimit { limit: 1 }),
         );
         assert_eq!(store, before);
-        assert_eq!(store.instantiate_with_limit(&input, 8).unwrap(), Level::one().succ().unwrap());
+        assert_eq!(
+            store.instantiate_with_limit(&input, 8).unwrap(),
+            Level::one().succ().unwrap()
+        );
     }
 
     #[test]
@@ -420,7 +431,10 @@ mod tests {
         };
         let mut store = UniverseStore::new();
         store.assign(u.clone(), Level::one());
-        assert_eq!(store.instantiate_expr(&build(Level::mvar(u))).unwrap(), build(Level::one()));
+        assert_eq!(
+            store.instantiate_expr(&build(Level::mvar(u))).unwrap(),
+            build(Level::one())
+        );
     }
 
     #[test]
@@ -446,7 +460,10 @@ mod tests {
             store.instantiate_expr_with_limit(&input, 1),
             Err(UniverseInstantiationError::VisitLimit { limit: 1 }),
         );
-        assert_eq!(store.instantiate_expr_with_limit(&input, 8).unwrap(), Expr::sort(Level::one()));
+        assert_eq!(
+            store.instantiate_expr_with_limit(&input, 8).unwrap(),
+            Expr::sort(Level::one())
+        );
     }
 
     #[test]

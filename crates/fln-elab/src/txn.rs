@@ -187,7 +187,8 @@ impl ElabTxn {
     /// Compose expression and universe substitution, in that order: an assigned
     /// expression may introduce universe metavariables not present in its input.
     pub fn instantiate_expr(&self, expr: &Expr) -> Result<Expr, UniverseInstantiationError> {
-        self.universes.instantiate_expr(&self.mvars.instantiate(expr))
+        self.universes
+            .instantiate_expr(&self.mvars.instantiate(expr))
     }
 
     pub fn take_exposed_candidate(&mut self) -> Option<ExposedCandidate> {
@@ -246,7 +247,10 @@ impl ElabTxn {
         self.verify_no_state_leaks(checkpoint)?;
         let base = &checkpoint.snapshot;
         if matches!(&outcome, TxnOutcome::CommitAll)
-            && !child.decisions.records().starts_with(base.decisions.records())
+            && !child
+                .decisions
+                .records()
+                .starts_with(base.decisions.records())
         {
             return Err("child replaced the inherited decision journal");
         }
@@ -369,7 +373,9 @@ impl ElabTxn {
             || self.budget.max_rec_depth != base.budget.max_rec_depth
             || self.budget.current_rec_depth != base.budget.current_rec_depth
         {
-            return Err("leak detected: resource policy or recursion scope modified after rollback");
+            return Err(
+                "leak detected: resource policy or recursion scope modified after rollback",
+            );
         }
         Ok(())
     }
@@ -389,7 +395,11 @@ impl ElabTxn {
         if self.exposed_candidate != base.exposed_candidate {
             return Err("leak detected: exposed candidate modified after rollback");
         }
-        if !self.decisions.records().starts_with(base.decisions.records()) {
+        if !self
+            .decisions
+            .records()
+            .starts_with(base.decisions.records())
+        {
             return Err("leak detected: inherited decision journal modified after rollback");
         }
         Ok(())
@@ -462,8 +472,10 @@ mod tests {
         let mut second = txn.child_txn();
         first.budget.heartbeats_consumed = 13;
         second.budget.heartbeats_consumed = 17;
-        txn.commit_outcome(&cp, first, TxnOutcome::Rollback).unwrap();
-        txn.commit_outcome(&cp, second, TxnOutcome::Rollback).unwrap();
+        txn.commit_outcome(&cp, first, TxnOutcome::Rollback)
+            .unwrap();
+        txn.commit_outcome(&cp, second, TxnOutcome::Rollback)
+            .unwrap();
         assert_eq!(txn.budget.heartbeats_consumed, 20);
         assert_eq!(txn.decisions.len(), 2);
         txn.verify_no_state_leaks(&cp).unwrap();
@@ -476,19 +488,29 @@ mod tests {
         let rejected = txn.child_txn();
         let mut accepted = txn.child_txn();
         let key = Name::from_components(["trace", "test"]);
-        accepted.options.insert(key.clone(), DataValue::OfBool(true));
+        accepted
+            .options
+            .insert(key.clone(), DataValue::OfBool(true));
         accepted.decisions.record(DecisionRecord::TransactionFork {
             branch_id: 1,
             num_alternatives: 2,
         });
         let seed = accepted.seed;
-        txn.commit_outcome(&cp, rejected, TxnOutcome::Rollback).unwrap();
-        txn.commit_outcome(&cp, accepted, TxnOutcome::CommitAll).unwrap();
+        txn.commit_outcome(&cp, rejected, TxnOutcome::Rollback)
+            .unwrap();
+        txn.commit_outcome(&cp, accepted, TxnOutcome::CommitAll)
+            .unwrap();
         assert!(txn.options.get_bool(&key, false));
         assert_eq!(txn.seed, seed);
         assert_eq!(txn.decisions.len(), 2);
-        assert!(matches!(txn.decisions.records()[0], DecisionRecord::TransactionRollback { .. }));
-        assert!(matches!(txn.decisions.records()[1], DecisionRecord::TransactionFork { .. }));
+        assert!(matches!(
+            txn.decisions.records()[0],
+            DecisionRecord::TransactionRollback { .. }
+        ));
+        assert!(matches!(
+            txn.decisions.records()[1],
+            DecisionRecord::TransactionFork { .. }
+        ));
     }
 
     #[test]
@@ -496,9 +518,13 @@ mod tests {
         let mut txn = transaction();
         let cp = txn.checkpoint();
         let child = txn.child_txn();
-        txn.options.insert(Name::from_components(["changed"]), DataValue::OfNat(7));
+        txn.options
+            .insert(Name::from_components(["changed"]), DataValue::OfNat(7));
         let before = txn.clone();
-        assert!(txn.commit_outcome(&cp, child, TxnOutcome::CommitAll).is_err());
+        assert!(
+            txn.commit_outcome(&cp, child, TxnOutcome::CommitAll)
+                .is_err()
+        );
         assert_eq!(txn, before);
     }
 
@@ -517,7 +543,8 @@ mod tests {
                     candidate: expression.clone(),
                     obligations: vec![hole.clone()],
                 },
-            ).unwrap(),
+            )
+            .unwrap(),
             Some(expression.clone()),
         );
         assert!(!txn.mvars.is_declared(&hole));
@@ -542,15 +569,18 @@ mod tests {
         );
         let cp = txn.checkpoint();
         let mut child = txn.child_txn();
-        let ready = child.assign_mvar(
-            hole.clone(),
-            Expr::sort(Level::zero()),
-            AssignmentJustification::DirectDefEq,
-        ).unwrap();
+        let ready = child
+            .assign_mvar(
+                hole.clone(),
+                Expr::sort(Level::zero()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, waiting);
         assert!(child.constraints.is_empty());
-        txn.commit_outcome(&cp, child, TxnOutcome::Rollback).unwrap();
+        txn.commit_outcome(&cp, child, TxnOutcome::Rollback)
+            .unwrap();
         assert!(!txn.mvars.is_assigned(&hole));
         assert!(txn.constraints.constraints().contains_key(&waiting));
     }
@@ -564,9 +594,13 @@ mod tests {
             hole.clone(),
             Expr::sort(Level::mvar(u.clone())),
             AssignmentJustification::DirectDefEq,
-        ).unwrap();
+        )
+        .unwrap();
         txn.universes.assign(u, Level::one());
-        assert_eq!(txn.instantiate_expr(&Expr::mvar(hole)).unwrap(), Expr::sort(Level::one()));
+        assert_eq!(
+            txn.instantiate_expr(&Expr::mvar(hole)).unwrap(),
+            Expr::sort(Level::one())
+        );
     }
 
     #[test]

@@ -243,7 +243,10 @@ impl MetavarStore {
         }
         let wake_ups = self.targeted_wake_up(&id);
         for dependency in dependencies {
-            self.readers.entry(dependency).or_default().insert(id.clone());
+            self.readers
+                .entry(dependency)
+                .or_default()
+                .insert(id.clone());
         }
         self.assignments.insert(
             id,
@@ -639,7 +642,11 @@ mod tests {
             )
             .unwrap();
         let affected = store
-            .assign(c, Expr::sort(Level::zero()), AssignmentJustification::DirectDefEq)
+            .assign(
+                c,
+                Expr::sort(Level::zero()),
+                AssignmentJustification::DirectDefEq,
+            )
             .unwrap();
         assert_eq!(affected, HashSet::from([a, b, reader]));
         assert!(!affected.contains(&unrelated));
@@ -675,7 +682,10 @@ mod tests {
             0,
             None,
         );
-        assert_eq!(store.targeted_wake_up(&type_dep), HashSet::from([reader.clone()]));
+        assert_eq!(
+            store.targeted_wake_up(&type_dep),
+            HashSet::from([reader.clone()])
+        );
         assert_eq!(store.targeted_wake_up(&value_dep), HashSet::from([reader]));
     }
 
@@ -697,7 +707,11 @@ mod tests {
         let b = declare(&mut parent, "b");
         let mut child = parent.clone();
         child
-            .assign(a.clone(), Expr::mvar(b.clone()), AssignmentJustification::DirectDefEq)
+            .assign(
+                a.clone(),
+                Expr::mvar(b.clone()),
+                AssignmentJustification::DirectDefEq,
+            )
             .unwrap();
         assert_eq!(child.targeted_wake_up(&b), HashSet::from([a.clone()]));
         assert!(parent.targeted_wake_up(&b).is_empty());
