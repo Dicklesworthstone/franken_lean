@@ -59,6 +59,21 @@ fn pinned_epoch() -> ModuleEpoch {
     ModuleEpoch::new("v4.32.0", "8c9756b28d64dab099da31a4c09229a9e6a2ef35")
 }
 
+fn provisional_reference_evidence(content_digest: fln_hash::domain::Digest) -> ArtifactEvidence {
+    // These local bytes come from the documented Reference fixture source.
+    // This test's resolver does not authenticate the manifest: retain Provisional.
+    ArtifactEvidence {
+        epoch: pinned_epoch(),
+        content_digest,
+        producer: ArtifactProducer::Reference,
+        grade: ArtifactGrade::Provisional,
+    }
+}
+
+fn provisional_file_evidence(path: &Path) -> ArtifactEvidence {
+    provisional_reference_evidence(hash(Domain::Fixture, &fs::read(path).unwrap()))
+}
+
 fn parse_dot_name(s: &str) -> Name {
     let mut name = Name::anonymous();
     for part in s.split('.') {
@@ -106,7 +121,6 @@ fn real_pinned_fixtures_decode_and_match_c3_oracle_imports() {
     let root = workspace_root();
     let tsv_path = root.join("tribunal/fixtures/c3/IMPORTS.tsv");
     let oracle = parse_tsv_imports(&tsv_path);
-    let epoch = pinned_epoch();
 
     let fixtures = [
         ("Init.olean", "tribunal/fixtures/c3/Init.olean"),
@@ -124,8 +138,12 @@ fn real_pinned_fixtures_decode_and_match_c3_oracle_imports() {
     for (fixture_name, fixture_rel_path) in fixtures {
         let fixture_path = root.join(fixture_rel_path);
         let mod_id = ModuleId::new(parse_dot_name(fixture_name.strip_suffix(".olean").unwrap()));
-        let decoded = OleanModuleAdapter::decode_file(mod_id.clone(), &fixture_path, epoch.clone())
-            .unwrap_or_else(|e| panic!("failed to decode {}: {e:?}", fixture_path.display()));
+        let decoded = OleanModuleAdapter::decode_file(
+            mod_id.clone(),
+            &fixture_path,
+            provisional_file_evidence(&fixture_path),
+        )
+        .unwrap_or_else(|e| panic!("failed to decode {}: {e:?}", fixture_path.display()));
 
         let expected_rows = oracle
             .get(fixture_name)
@@ -152,6 +170,33 @@ fn real_pinned_fixtures_decode_and_match_c3_oracle_imports() {
         let module_rec = decoded.to_module_record();
         assert_eq!(module_rec.id, mod_id);
         assert_eq!(module_rec.direct_imports().len(), expected_rows.len());
+        assert_eq!(
+            module_rec.artifact,
+            provisional_file_evidence(&fixture_path)
+        );
+        let mut stale = decoded.evidence.clone();
+        stale.content_digest = hash(Domain::Fixture, b"stale resolver bytes");
+        assert!(matches!(
+            OleanModuleAdapter::decode_file(mod_id.clone(), &fixture_path, stale.clone()),
+            Err(fln_conformance::module_adapter::ModuleAdapterError::ArtifactDigestMismatch { expected, actual })
+                if expected == stale.content_digest && actual == decoded.evidence.content_digest
+        ));
+        stale = decoded.evidence.clone();
+        stale.epoch = ModuleEpoch::new("v0.0.0", pinned_epoch().commit());
+        assert!(matches!(
+            OleanModuleAdapter::decode_file(mod_id.clone(), &fixture_path, stale),
+            Err(
+                fln_conformance::module_adapter::ModuleAdapterError::ArtifactEpochMismatch {
+                    part: "standalone",
+                    ..
+                }
+            )
+        ));
+        let replay =
+            OleanModuleAdapter::decode_file(mod_id, &fixture_path, decoded.evidence.clone())
+                .unwrap();
+        assert_eq!(replay.evidence, decoded.evidence);
+        assert_eq!(replay.extension_entries, decoded.extension_entries);
     }
 
     assert_eq!(total_rows, 50, "all 50 c3 oracle rows verified exactly");
@@ -161,10 +206,11 @@ fn real_shared_extension_modules() -> (ModuleApplyState, Vec<DecodedOleanModule>
     let modules: Vec<_> = ["Init.BinderNameHint", "Init.SizeOfLemmas"]
         .into_iter()
         .map(|module| {
+            let path = workspace_root().join(format!("tribunal/fixtures/c3/{module}.olean"));
             OleanModuleAdapter::decode_file(
                 ModuleId::new(parse_dot_name(module)),
-                workspace_root().join(format!("tribunal/fixtures/c3/{module}.olean")),
-                pinned_epoch(),
+                &path,
+                provisional_file_evidence(&path),
             )
             .unwrap()
         })
@@ -245,16 +291,20 @@ fn real_private_companion_chains_commit_full_declarations_and_selected_extension
         let server = read(".server");
         let private = read(".private");
         let total = exported.len() + server.len() + private.len();
+        let evidence = provisional_reference_evidence(OleanModuleAdapter::chain_content_digest(
+            &exported, &server, &private,
+        ));
         let decoded = OleanModuleAdapter::decode_chain_bytes(
             ModuleId::new(parse_dot_name(&module.replace('/', "."))),
             &exported,
             &server,
             &private,
-            pinned_epoch(),
+            evidence.clone(),
             ChainLimits::new(total),
         )
         .expect("the complete chain reaches the environment adapter");
         assert_eq!(decoded.payload_bytes, total);
+        assert_eq!(decoded.evidence, evidence);
         assert_ne!(
             decoded.evidence.content_digest,
             hash(Domain::Fixture, &exported)
@@ -336,6 +386,25 @@ fn real_private_companion_chains_commit_full_declarations_and_selected_extension
         .unwrap();
         let committed = plan.commit(&base, None).into_complete().unwrap().unwrap();
         assert_eq!(committed.applied_count, 1);
+        assert_eq!(
+            committed
+                .state
+                .graph()
+                .record(&decoded.module_id)
+                .unwrap()
+                .artifact,
+            evidence
+        );
+        assert_eq!(
+            committed
+                .state
+                .manifest()
+                .record(&decoded.module_id)
+                .unwrap()
+                .module()
+                .artifact,
+            evidence
+        );
         assert_eq!(base.graph().len(), 0);
         let environment = committed.state.environment();
         assert_eq!(environment.len(), expected.constants.len());
@@ -408,7 +477,7 @@ fn real_private_companion_chains_commit_full_declarations_and_selected_extension
         // Refuse resource exhaustion before parsing, and refuse partial or
         // reordered companions. A subsequent sufficient-budget decode recovers.
         assert!(matches!(
-            OleanModuleAdapter::decode_chain_bytes(decoded.module_id.clone(), &exported, &server, &private, pinned_epoch(), ChainLimits::new(total - 1)),
+            OleanModuleAdapter::decode_chain_bytes(decoded.module_id.clone(), &exported, &server, &private, evidence.clone(), ChainLimits::new(total - 1)),
             Err(fln_conformance::module_adapter::ModuleAdapterError::Decl(fln_olean::decl::DeclError::ChainTooLarge { bytes, limit })) if bytes == total && limit == total - 1
         ));
         for (server_part, private_part) in [
@@ -422,7 +491,11 @@ fn real_private_companion_chains_commit_full_declarations_and_selected_extension
                     &exported,
                     server_part,
                     private_part,
-                    pinned_epoch(),
+                    provisional_reference_evidence(OleanModuleAdapter::chain_content_digest(
+                        &exported,
+                        server_part,
+                        private_part
+                    )),
                     ChainLimits::new(total)
                 )
                 .is_err()
@@ -436,7 +509,7 @@ fn real_private_companion_chains_commit_full_declarations_and_selected_extension
                 &exported,
                 &server,
                 &private,
-                pinned_epoch(),
+                evidence.clone(),
                 exhausted
             ),
             Err(fln_conformance::module_adapter::ModuleAdapterError::Decl(
@@ -450,7 +523,7 @@ fn real_private_companion_chains_commit_full_declarations_and_selected_extension
             &exported,
             &server,
             &private,
-            pinned_epoch(),
+            evidence.clone(),
             ChainLimits::new(total),
         )
         .unwrap();
@@ -835,7 +908,6 @@ fn real_pinned_fixtures_decode_and_match_mathlib_oracle_imports() {
     let root = workspace_root();
     let tsv_path = root.join("tribunal/fixtures/mathlib/IMPORTS.tsv");
     let oracle = parse_tsv_imports(&tsv_path);
-    let epoch = pinned_epoch();
 
     let fixtures = [
         (
@@ -868,8 +940,12 @@ fn real_pinned_fixtures_decode_and_match_mathlib_oracle_imports() {
     for (fixture_name, fixture_rel_path) in fixtures {
         let fixture_path = root.join(fixture_rel_path);
         let mod_id = ModuleId::new(parse_dot_name(fixture_name.strip_suffix(".olean").unwrap()));
-        let decoded = OleanModuleAdapter::decode_file(mod_id.clone(), &fixture_path, epoch.clone())
-            .unwrap_or_else(|e| panic!("failed to decode {}: {e:?}", fixture_path.display()));
+        let decoded = OleanModuleAdapter::decode_file(
+            mod_id.clone(),
+            &fixture_path,
+            provisional_file_evidence(&fixture_path),
+        )
+        .unwrap_or_else(|e| panic!("failed to decode {}: {e:?}", fixture_path.display()));
 
         let expected_rows = oracle
             .get(fixture_name)
@@ -1372,11 +1448,14 @@ fn schedule_independence_matrix_1_8_32_threads() {
 #[test]
 fn single_charge_accounting_across_all_planes() {
     let root = workspace_root();
-    let epoch = pinned_epoch();
     let mod_id = ModuleId::new(Name::str(Name::anonymous(), "Init.BinderNameHint"));
     let fixture_path = root.join("tribunal/fixtures/c3/Init.BinderNameHint.olean");
-    let decoded = OleanModuleAdapter::decode_file(mod_id, &fixture_path, epoch)
-        .expect("decode Init.BinderNameHint");
+    let decoded = OleanModuleAdapter::decode_file(
+        mod_id,
+        &fixture_path,
+        provisional_file_evidence(&fixture_path),
+    )
+    .expect("decode Init.BinderNameHint");
 
     let mut summary = ModuleBatchUsageSummary::default();
     summary.accumulate(&decoded);

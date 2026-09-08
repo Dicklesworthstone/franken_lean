@@ -244,8 +244,16 @@ fn pinned_module_fixtures_integrated_with_attribute_state_and_provenance() {
         let mod_stem = fixture_name.strip_suffix(".olean").unwrap();
         let mod_id = ModuleId::new(name(mod_stem));
 
-        let decoded = OleanModuleAdapter::decode_bytes(mod_id.clone(), &bytes, epoch.clone())
+        let evidence = ArtifactEvidence {
+            epoch: epoch.clone(),
+            content_digest: hash(Domain::Fixture, &bytes),
+            producer: ArtifactProducer::Reference,
+            // This local resolver has not authenticated the fixture manifest.
+            grade: ArtifactGrade::Provisional,
+        };
+        let decoded = OleanModuleAdapter::decode_bytes(mod_id.clone(), &bytes, evidence.clone())
             .unwrap_or_else(|e| panic!("failed to decode {fixture_name}: {e:?}"));
+        assert_eq!(decoded.evidence, evidence);
 
         let missing: Vec<ModuleId> = decoded
             .imports

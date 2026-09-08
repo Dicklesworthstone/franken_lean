@@ -40,16 +40,12 @@ use fln_env::module_apply::{
     PreflightedModuleApply, StagedModuleApplyBatch, preflight_module_apply,
     prepare_module_apply_batch, prepare_module_apply_batch_with,
 };
-use fln_env::modules::{
-    ArtifactEvidence, ArtifactGrade, ArtifactProducer, CancellationProbe, DirectImport,
-    ModuleEpoch, ModuleId, ModuleRecord,
-};
+use fln_env::modules::{ArtifactEvidence, CancellationProbe, DirectImport, ModuleId, ModuleRecord};
 use fln_env::provenance::{
     ExtensionContribution, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
     ModuleProvenanceLimits, ModuleProvenanceManifest, ModuleProvenanceResource,
     ModuleProvenanceRoot, ProvenanceCompleteness,
 };
-use fln_hash::domain::{Domain, DomainHasher, hash};
 use fln_hash::root::LogicalRoot;
 use fln_olean::decl::{
     ChainLimits, ConstantOrigin, DeclDecoder, DeclError, chain_extra_const_names,
@@ -199,18 +195,12 @@ impl OleanModuleAdapter {
     pub fn decode_bytes(
         module_id: ModuleId,
         bytes: &[u8],
-        epoch: ModuleEpoch,
+        evidence: ArtifactEvidence,
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
         let view = OleanView::parse(bytes)?;
         let budget = WalkBudget::default();
         let mut decl_decoder = DeclDecoder::new(&view, budget);
         let raw_constants = decl_decoder.decode_module_constants()?;
-        let evidence = ArtifactEvidence {
-            epoch,
-            content_digest: hash(Domain::Fixture, bytes),
-            producer: ArtifactProducer::Reference,
-            grade: ArtifactGrade::Verified,
-        };
         let mut decoded = Self::decode_metadata(module_id, &view, evidence, bytes.len(), budget)?;
         decoded.constants = raw_constants.into_iter().map(Arc::new).collect();
         decoded.ir_extra_const_names = view.extra_const_names(budget)?;
@@ -223,7 +213,7 @@ impl OleanModuleAdapter {
         exported: &[u8],
         server: &[u8],
         private: &[u8],
-        epoch: ModuleEpoch,
+        evidence: ArtifactEvidence,
         limits: ChainLimits,
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
         let chain = decode_chain_constants_from_parts(exported, server, private, limits)?;
@@ -233,20 +223,6 @@ impl OleanModuleAdapter {
         let private_view = OleanView::parse_with_dependencies(private, &[exported, server])?;
         let ir_names = chain_extra_const_names(&exported_view, &private_view, limits.graph)?;
 
-        // Bind all parts, including bytes reachable only through a companion.
-        // Length framing and fixed role order prevent concatenation ambiguity.
-        let mut digest = DomainHasher::new(Domain::Fixture);
-        digest.update(b"fln-module-chain-v1\0");
-        for part in [exported, server, private] {
-            digest.update(&(part.len() as u64).to_le_bytes());
-            digest.update(part);
-        }
-        let evidence = ArtifactEvidence {
-            epoch,
-            content_digest: digest.finalize(),
-            producer: ArtifactProducer::Reference,
-            grade: ArtifactGrade::Verified,
-        };
         // Each level exports its selected extension entries. Appending the
         // exported and server arrays would replay entries multiple times.
         let mut decoded = Self::decode_metadata(

@@ -12,10 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fln_env::module_apply::{ModuleApplyPreflightError, ModuleApplyTransaction};
-use fln_env::modules::{ModuleEpoch, ModuleId};
+use fln_env::modules::{ArtifactEvidence, ModuleEpoch, ModuleId};
 use fln_env::provenance::{
     ModuleProvenanceError, ModuleProvenanceManifest, ProvenanceCompleteness,
 };
+use fln_hash::domain::{Digest, Domain, DomainHasher, hash};
 use fln_olean::decl::{ChainLimits, DeclError};
 use fln_olean::region::{ExtensionBlock, OleanView, RegionError, WalkBudget};
 
@@ -38,6 +39,15 @@ pub enum ModuleAdapterError {
     Manifest(ModuleProvenanceError),
     Preflight(ModuleApplyPreflightError),
     Io(String),
+    ArtifactDigestMismatch {
+        expected: Digest,
+        actual: Digest,
+    },
+    ArtifactEpochMismatch {
+        part: &'static str,
+        expected: ModuleEpoch,
+        actual: ModuleEpoch,
+    },
     MissingDependency {
         module: ModuleId,
         dependency: ModuleId,
@@ -65,6 +75,18 @@ impl fmt::Display for ModuleAdapterError {
             }
             Self::Preflight(error) => write!(formatter, "module apply preflight error: {error:?}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
+            Self::ArtifactDigestMismatch { expected, actual } => write!(
+                formatter,
+                "artifact digest mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::ArtifactEpochMismatch {
+                part,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{part} artifact epoch mismatch: expected {expected:?}, actual {actual:?}"
+            ),
             Self::MissingDependency { module, dependency } => write!(
                 formatter,
                 "missing dependency {:?} for module {:?}",
@@ -159,16 +181,75 @@ fn require_lossless_extension_payloads(
 /// Unknown extension state is captured losslessly, with opaque provenance.
 pub struct OleanModuleAdapter;
 
+fn require_artifact_digest(
+    evidence: &ArtifactEvidence,
+    actual: Digest,
+) -> Result<(), ModuleAdapterError> {
+    if evidence.content_digest != actual {
+        return Err(ModuleAdapterError::ArtifactDigestMismatch {
+            expected: evidence.content_digest,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn require_artifact_epoch(
+    evidence: &ArtifactEvidence,
+    view: &OleanView<'_>,
+    part: &'static str,
+) -> Result<(), ModuleAdapterError> {
+    let header = &view.header;
+    // Release tags conventionally carry a leading `v`; the wire version may
+    // omit it. No other version or commit normalization is permitted.
+    let expected_version = evidence
+        .epoch
+        .tag()
+        .strip_prefix('v')
+        .unwrap_or(evidence.epoch.tag());
+    let actual_version = header
+        .lean_version
+        .strip_prefix('v')
+        .unwrap_or(&header.lean_version);
+    if expected_version != actual_version || evidence.epoch.commit() != header.githash {
+        return Err(ModuleAdapterError::ArtifactEpochMismatch {
+            part,
+            expected: evidence.epoch.clone(),
+            actual: ModuleEpoch::new(header.lean_version.as_str(), header.githash.as_str()),
+        });
+    }
+    Ok(())
+}
+
 impl OleanModuleAdapter {
+    /// Digest a complete chain in exported/server/private role order.
+    /// Length framing binds part boundaries, including otherwise ignored bytes.
+    /// This computes identity only; it does not establish producer or grade.
+    pub fn chain_content_digest(exported: &[u8], server: &[u8], private: &[u8]) -> Digest {
+        let mut digest = DomainHasher::new(Domain::Fixture);
+        digest.update(b"fln-module-chain-v1\0");
+        for part in [exported, server, private] {
+            digest.update(&(part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        digest.finalize()
+    }
+
     /// Decode a `.olean` artifact from memory bytes without fabricating extension data.
+    ///
+    /// The resolver supplies provenance. Its digest must be `hash(Domain::Fixture,
+    /// bytes)` and its epoch must match the header. Producer and grade are retained
+    /// as supplied assertions, never authenticated or promoted by decoding.
     pub fn decode_bytes(
         module_id: ModuleId,
         bytes: &[u8],
-        epoch: ModuleEpoch,
+        evidence: ArtifactEvidence,
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
+        require_artifact_digest(&evidence, hash(Domain::Fixture, bytes))?;
         let view = OleanView::parse(bytes)?;
+        require_artifact_epoch(&evidence, &view, "standalone")?;
         let module_data = view.module_data(WalkBudget::default())?;
-        let decoded = legacy::OleanModuleAdapter::decode_bytes(module_id, bytes, epoch)
+        let decoded = legacy::OleanModuleAdapter::decode_bytes(module_id, bytes, evidence)
             .map_err(ModuleAdapterError::from)?;
         require_lossless_extension_payloads(
             &module_data.extensions,
@@ -183,16 +264,47 @@ impl OleanModuleAdapter {
     /// found only in the private companion become `extra_constants`. Extension
     /// entries come from the private level, retaining references to earlier
     /// parts; IR-only names remain metadata. No kernel checking is implied.
+    /// The supplied evidence must bind [`Self::chain_content_digest`] and the
+    /// epoch of every part. Its producer and grade remain resolver assertions.
     pub fn decode_chain_bytes(
         module_id: ModuleId,
         exported: &[u8],
         server: &[u8],
         private: &[u8],
-        epoch: ModuleEpoch,
+        evidence: ArtifactEvidence,
         limits: ChainLimits,
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
+        // Refuse oversized input before hashing or parsing any part, matching
+        // the codec's byte-budget precedence. Graph work remains codec-owned.
+        let total = exported
+            .len()
+            .checked_add(server.len())
+            .and_then(|total| total.checked_add(private.len()))
+            .ok_or(DeclError::ChainTooLarge {
+                bytes: usize::MAX,
+                limit: limits.max_bytes,
+            })?;
+        if total > limits.max_bytes {
+            return Err(DeclError::ChainTooLarge {
+                bytes: total,
+                limit: limits.max_bytes,
+            }
+            .into());
+        }
+        require_artifact_digest(
+            &evidence,
+            Self::chain_content_digest(exported, server, private),
+        )?;
+        for (part, bytes, dependencies) in [
+            ("exported", exported, &[][..]),
+            ("server", server, &[exported][..]),
+            ("private", private, &[exported, server][..]),
+        ] {
+            let view = OleanView::parse_with_dependencies(bytes, dependencies)?;
+            require_artifact_epoch(&evidence, &view, part)?;
+        }
         let decoded = legacy::OleanModuleAdapter::decode_chain_bytes(
-            module_id, exported, server, private, epoch, limits,
+            module_id, exported, server, private, evidence, limits,
         )?;
         let view = OleanView::parse_with_dependencies(private, &[exported, server])?;
         require_lossless_extension_payloads(
@@ -203,16 +315,17 @@ impl OleanModuleAdapter {
     }
 
     /// Decode a `.olean` artifact from a filesystem file.
+    /// The resolver's expected digest is checked against the bytes actually read.
     pub fn decode_file(
         module_id: ModuleId,
         path: impl AsRef<Path>,
-        epoch: ModuleEpoch,
+        evidence: ArtifactEvidence,
     ) -> Result<DecodedOleanModule, ModuleAdapterError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|error| {
             ModuleAdapterError::Io(format!("failed to read {}: {error}", path.display()))
         })?;
-        Self::decode_bytes(module_id, &bytes, epoch)
+        Self::decode_bytes(module_id, &bytes, evidence)
     }
 
     /// Build a transaction from an already fail-closed decoded module.
@@ -230,8 +343,18 @@ impl OleanModuleAdapter {
 mod tests {
     use super::*;
     use fln_core::name::Name;
+    use fln_env::modules::{ArtifactGrade, ArtifactProducer};
     use fln_olean::format;
     use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
+
+    fn native_evidence(content_digest: Digest) -> ArtifactEvidence {
+        ArtifactEvidence {
+            epoch: ModuleEpoch::new(format::PIN_TAG, format::PIN_COMMIT),
+            content_digest,
+            producer: ArtifactProducer::FrankenLean,
+            grade: ArtifactGrade::Provisional,
+        }
+    }
 
     #[test]
     fn counts_without_opaque_payloads_are_typed_refusals() {
@@ -335,18 +458,24 @@ mod tests {
         ];
         let total = parts.iter().map(Vec::len).sum();
         let module = ModuleId::new(name("Chain"));
-        let epoch = ModuleEpoch::new(format::PIN_TAG, format::PIN_COMMIT);
+        let evidence_for = |parts: &[Vec<u8>; 3]| {
+            native_evidence(OleanModuleAdapter::chain_content_digest(
+                &parts[0], &parts[1], &parts[2],
+            ))
+        };
         let decode = |parts: &[Vec<u8>; 3], limits| {
             OleanModuleAdapter::decode_chain_bytes(
                 module.clone(),
                 &parts[0],
                 &parts[1],
                 &parts[2],
-                epoch.clone(),
+                evidence_for(parts),
                 limits,
             )
         };
         let decoded = decode(&parts, ChainLimits::new(total)).unwrap();
+        assert_eq!(decoded.evidence, evidence_for(&parts));
+        assert_eq!(decoded.to_module_record().artifact, evidence_for(&parts));
         assert_eq!(decoded.constants, vec![Arc::new(shared)]);
         assert_eq!(decoded.extra_constants, vec![Arc::new(extra)]);
         assert_eq!(
@@ -355,8 +484,12 @@ mod tests {
         );
         assert_eq!(decoded.payload_bytes, total);
         assert!(decoded.extension_entries.is_empty());
-        let exported_only =
-            OleanModuleAdapter::decode_bytes(module.clone(), &parts[0], epoch.clone()).unwrap();
+        let exported_only = OleanModuleAdapter::decode_bytes(
+            module.clone(),
+            &parts[0],
+            native_evidence(hash(Domain::Fixture, &parts[0])),
+        )
+        .unwrap();
         assert_eq!(exported_only.ir_extra_const_names, vec![exported_ir]);
         assert!(matches!(
             exported_only.constants[0].as_ref(),
@@ -374,6 +507,14 @@ mod tests {
             let mut changed = parts.clone();
             assert_eq!(changed[role][padding], 0);
             changed[role][padding] = 0xAB;
+            assert!(matches!(
+                OleanModuleAdapter::decode_chain_bytes(
+                    module.clone(), &changed[0], &changed[1], &changed[2],
+                    decoded.evidence.clone(), ChainLimits::new(total)
+                ),
+                Err(ModuleAdapterError::ArtifactDigestMismatch { expected, actual })
+                    if expected == decoded.evidence.content_digest && actual == evidence_for(&changed).content_digest
+            ));
             let changed = decode(&changed, ChainLimits::new(total)).unwrap();
             assert_ne!(
                 changed.evidence.content_digest, decoded.evidence.content_digest,
@@ -383,6 +524,26 @@ mod tests {
             assert_eq!(changed.extra_constants, decoded.extra_constants);
             assert_eq!(changed.ir_extra_const_names, decoded.ir_extra_const_names);
         }
+        // A freshly bound digest does not excuse a stale header in any part.
+        let commit_offset = format::OLEAN_HEADER_FIELDS
+            .iter()
+            .find(|field| field.name == "githash")
+            .unwrap()
+            .offset;
+        for (role, part_name) in ["exported", "server", "private"].into_iter().enumerate() {
+            let mut changed = parts.clone();
+            changed[role][commit_offset] = b'0';
+            assert!(matches!(
+                decode(&changed, ChainLimits::new(total)),
+                Err(ModuleAdapterError::ArtifactEpochMismatch { part, expected, actual })
+                    if part == part_name && expected == decoded.evidence.epoch && actual.commit() != expected.commit()
+            ));
+        }
+        assert_ne!(
+            OleanModuleAdapter::chain_content_digest(b"a", b"bc", b"d"),
+            OleanModuleAdapter::chain_content_digest(b"ab", b"c", b"d"),
+            "part boundaries are included in identity",
+        );
         assert!(matches!(
             decode(&parts, ChainLimits::new(total - 1)),
             Err(ModuleAdapterError::Decl(DeclError::ChainTooLarge { .. }))
@@ -427,21 +588,52 @@ mod tests {
         let decoded = OleanModuleAdapter::decode_bytes(
             ModuleId::new(Name::str(Name::anonymous(), "Empty")),
             &encoded.bytes,
-            ModuleEpoch::new(format::PIN_TAG, format::PIN_COMMIT),
+            native_evidence(hash(Domain::Fixture, &encoded.bytes)),
         )
         .expect("extension-free module remains decodable");
         assert!(decoded.extension_entries.is_empty());
         assert!(decoded.extension_contributions.is_empty());
+        assert_eq!(
+            decoded.evidence,
+            native_evidence(hash(Domain::Fixture, &encoded.bytes))
+        );
+        // These are caller-asserted grades, not proof that this native fixture
+        // is verified or oracle-produced. Decoding must preserve each assertion.
+        for grade in [
+            ArtifactGrade::Provisional,
+            ArtifactGrade::Verified,
+            ArtifactGrade::OracleFixture,
+        ] {
+            let mut evidence = decoded.evidence.clone();
+            evidence.grade = grade;
+            let replay = OleanModuleAdapter::decode_bytes(
+                decoded.module_id.clone(),
+                &encoded.bytes,
+                evidence.clone(),
+            )
+            .unwrap();
+            assert_eq!(replay.evidence, evidence);
+            assert_eq!(replay.to_module_record().artifact, evidence);
+        }
         for epoch in [
             ModuleEpoch::new("v0.0.0", format::PIN_COMMIT),
             ModuleEpoch::new(format::PIN_TAG, "0000000000000000000000000000000000000000"),
         ] {
-            assert!(
+            let mut evidence = decoded.evidence.clone();
+            evidence.epoch = epoch.clone();
+            assert!(matches!(
                 OleanModuleAdapter::decode_bytes(
-                    decoded.module_id.clone(), &encoded.bytes, epoch,
-                ).is_err(),
-                "resolver epoch must match the artifact header",
-            );
+                    decoded.module_id.clone(), &encoded.bytes, evidence,
+                ),
+                Err(ModuleAdapterError::ArtifactEpochMismatch { part: "standalone", expected, .. }) if expected == epoch
+            ));
         }
+        let mut stale = decoded.evidence.clone();
+        stale.content_digest = hash(Domain::Fixture, b"different bytes");
+        assert!(matches!(
+            OleanModuleAdapter::decode_bytes(decoded.module_id.clone(), &encoded.bytes, stale.clone()),
+            Err(ModuleAdapterError::ArtifactDigestMismatch { expected, actual })
+                if expected == stale.content_digest && actual == decoded.evidence.content_digest
+        ));
     }
 }
