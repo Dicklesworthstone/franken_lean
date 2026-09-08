@@ -53,3 +53,9 @@ redirect
 *.db-wal*
 *.vacuum-wal-cert*
 *.fsqlite-migration-state
+*.fsqlite-migration-state*
+
+# Archived WAL/SHM copies (beads.db-shm.oldfamily_*). `*.db-shm` only
+# matches names that end in `.db-shm`.
+*.db-shm.*
+*.db-wal.*

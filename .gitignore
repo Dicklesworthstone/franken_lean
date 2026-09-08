@@ -163,3 +163,6 @@ __pycache__/
 
 # br doctor per-run artifacts
 .doctor/
+
+# RCH worker scratch (artifact-publication trees, cargo caches).
+.rch-tmp/
