@@ -27,8 +27,8 @@ pub(super) fn parse(
     while end < limit {
         match &tokens[end].kind {
             TokenKind::Symbol(symbol) if symbol == "by" => return Err(refusal(view, tokens, end)),
-            TokenKind::Symbol(symbol) if symbol == "(" => depth += 1,
-            TokenKind::Symbol(symbol) if symbol == ")" => {
+            TokenKind::Symbol(symbol) if symbol == "(" || symbol == "[" => depth += 1,
+            TokenKind::Symbol(symbol) if symbol == ")" || symbol == "]" => {
                 if depth == 0 {
                     break;
                 }
@@ -93,8 +93,8 @@ pub(super) fn parse(
             start = index + 1;
         }
         match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "(" => depth += 1,
-            TokenKind::Symbol(symbol) if symbol == ")" => depth -= 1,
+            TokenKind::Symbol(symbol) if symbol == "(" || symbol == "[" => depth += 1,
+            TokenKind::Symbol(symbol) if symbol == ")" || symbol == "]" => depth -= 1,
             _ => {}
         }
     }
@@ -125,10 +125,18 @@ fn tactic(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
     let keyword = match &tokens[start].kind {
-        TokenKind::Ident(name) => ["intro", "exact", "assumption", "apply", "rfl"]
-            .into_iter()
-            .find(|word| name == &Name::from_components([*word]))
-            .ok_or_else(|| refusal(view, tokens, start))?,
+        TokenKind::Ident(name) => [
+            "intro",
+            "exact",
+            "assumption",
+            "apply",
+            "rfl",
+            "rw",
+            "rewrite",
+        ]
+        .into_iter()
+        .find(|word| name == &Name::from_components([*word]))
+        .ok_or_else(|| refusal(view, tokens, start))?,
         _ => return Err(refusal(view, tokens, start)),
     };
     // Tactic words are contextual: `def apply ...` must stay a legal identifier.
@@ -138,6 +146,9 @@ fn tactic(
         info: leaf.info(),
         val: keyword.to_string(),
     }];
+    if keyword == "rw" || keyword == "rewrite" {
+        return rewrite(leaves, view, tokens, range, args.remove(0), keyword == "rw");
+    }
     match keyword {
         "intro" => {
             let mut names = Vec::new();
@@ -167,4 +178,75 @@ fn tactic(
         _ => return Err(refusal(view, tokens, start)),
     }
     Ok(Syntax::node(parser_kind(&["Tactic", keyword]), args))
+}
+
+fn rewrite(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+    close: bool,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    if range.len() < 4 || !is(range.start + 1, "[") || !is(range.end - 1, "]") {
+        return Err(refusal(view, tokens, range.start));
+    }
+    let mut rows = Vec::new();
+    let mut start = range.start + 2;
+    let mut depth = 0_usize;
+    for at in (range.start + 2)..range.end {
+        let end = at == range.end - 1;
+        if end || (depth == 0 && is(at, ",")) {
+            if at == start {
+                if end && !rows.is_empty() {
+                    break;
+                }
+                return Err(refusal(view, tokens, at));
+            }
+            let reverse = is(start, "←") || is(start, "<-");
+            let term_start = start + usize::from(reverse);
+            let direction = if reverse {
+                null_node(vec![leaves.leaf(start)?])
+            } else {
+                null_node(Vec::new())
+            };
+            let term = bounded_term(
+                leaves,
+                view,
+                tokens,
+                term_start..at,
+                DefinitionGrammar::Scalar,
+            )?;
+            rows.push(Syntax::node(
+                parser_kind(&["Tactic", "rwRule"]),
+                vec![direction, term],
+            ));
+            if !end {
+                rows.push(leaves.leaf(at)?);
+            }
+            start = at + 1;
+        } else if is(at, "(") {
+            depth += 1;
+        } else if is(at, ")") {
+            depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| refusal(view, tokens, at))?;
+        }
+    }
+    if depth != 0 {
+        return Err(refusal(view, tokens, range.end));
+    }
+    let rules = Syntax::node(
+        parser_kind(&["Tactic", "rwRuleSeq"]),
+        vec![
+            leaves.leaf(range.start + 1)?,
+            null_node(rows),
+            leaves.leaf(range.end - 1)?,
+        ],
+    );
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
+        vec![keyword, null_node(Vec::new()), rules, null_node(Vec::new())],
+    ))
 }

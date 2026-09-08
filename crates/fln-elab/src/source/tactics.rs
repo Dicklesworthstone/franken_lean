@@ -6,6 +6,7 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+mod rewrite;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticError {
@@ -15,6 +16,8 @@ pub enum TacticError {
     NoMatchingAssumption,
     ApplyMismatch,
     MalformedScript,
+    ExpectedEquality,
+    RewriteNoMatch,
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -24,6 +27,8 @@ impl std::fmt::Display for TacticError {
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
             Self::NoMatchingAssumption => write!(f, "no local assumption matches the goal"),
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
+            Self::ExpectedEquality => write!(f, "rewrite requires an instantiated equality proof"),
+            Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
         }
     }
@@ -38,7 +43,8 @@ pub(super) struct ProofGoal {
     pub(super) lctx: LocalContext,
     introduced: Vec<LocalDecl>,
 }
-enum Work {
+enum Work<'a> {
+    Rewrite(ProofGoal, std::collections::VecDeque<RewriteRule<'a>>, bool),
     Goal(ProofGoal),
     Close(ProofGoal, Expr),
 }
@@ -48,9 +54,20 @@ pub(super) struct ProofState<'a> {
     root: Expr,
     instructions: Vec<&'a Syntax>,
     cursor: usize,
-    work: Vec<Work>,
+    work: Vec<Work<'a>>,
 }
+pub(super) struct RewriteRule<'a> {
+    pub(super) syntax: &'a Syntax,
+    pub(super) reverse: bool,
+}
+
 pub(super) enum ProofAction<'a> {
+    Rewrite {
+        goal: ProofGoal,
+        rule: RewriteRule<'a>,
+        remaining: std::collections::VecDeque<RewriteRule<'a>>,
+        close: bool,
+    },
     Term {
         syntax: &'a Syntax,
         goal: ProofGoal,
@@ -193,6 +210,21 @@ impl Context {
                 }));
             };
             let mut goal = match work {
+                Work::Rewrite(goal, mut remaining, close) => {
+                    self.txn.lctx = goal.lctx.clone();
+                    if let Some(rule) = remaining.pop_front() {
+                        return Ok(ProofAction::Rewrite {
+                            goal,
+                            rule,
+                            remaining,
+                            close,
+                        });
+                    }
+                    if close && self.rewrite_reflexivity(&goal)? {
+                        continue;
+                    }
+                    goal
+                }
                 Work::Close(goal, term) => {
                     self.close_proof_goal(goal, term)?;
                     continue;
@@ -212,7 +244,13 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "intro"]) {
+            if kind == &parser_kind(&["Tactic", "rwSeq"])
+                || kind == &parser_kind(&["Tactic", "rewriteSeq"])
+            {
+                let close = kind == &parser_kind(&["Tactic", "rwSeq"]);
+                let rules = self.rewrite_rules(args, close)?;
+                proof.work.push(Work::Rewrite(goal, rules, close));
+            } else if kind == &parser_kind(&["Tactic", "intro"]) {
                 let [keyword, names] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };

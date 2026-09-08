@@ -453,6 +453,13 @@ impl Context {
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
             Lambda(LocalContext, Vec<LocalDecl>),
+            RewriteTerm(
+                tactics::ProofState<'a>,
+                tactics::ProofGoal,
+                bool,
+                std::collections::VecDeque<tactics::RewriteRule<'a>>,
+                bool,
+            ),
             Proof(tactics::ProofState<'a>),
             ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, bool),
         }
@@ -590,6 +597,22 @@ impl Context {
                     });
                 }
                 Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                    tactics::ProofAction::Rewrite {
+                        goal,
+                        rule,
+                        remaining,
+                        close,
+                    } => {
+                        self.txn.lctx = goal.lctx.clone();
+                        tasks.push(Task::RewriteTerm(
+                            proof,
+                            goal,
+                            rule.reverse,
+                            remaining,
+                            close,
+                        ));
+                        tasks.push(Task::Visit(rule.syntax, None, true));
+                    }
                     tactics::ProofAction::Term {
                         syntax,
                         goal,
@@ -606,6 +629,11 @@ impl Context {
                     }
                     tactics::ProofAction::Complete(term) => values.push(term),
                 },
+                Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
+                    let term = values.pop().expect("rewrite rule visit");
+                    self.rewrite_proof_term(&mut proof, goal, term, reverse, remaining, close)?;
+                    tasks.push(Task::Proof(proof));
+                }
                 Task::ProofTerm(mut proof, goal, apply) => {
                     let term = values.pop().expect("tactic term visit");
                     if apply {
