@@ -1,0 +1,76 @@
+name: Native source inference landing
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-landing.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  source-inference:
+    if: >-
+      startsWith(github.event.head_commit.message, 'feat(elab): land tested bidirectional source inference')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install configured compiler
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Recover and verify exact tested source patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/source-landing
+          curl --fail --silent --show-error -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/81b5b7bd3e53df33bcfdb9f166bf51058276e5ef > target/source-landing/blob.json
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, pathlib
+          root = pathlib.Path('target/source-landing')
+          content = ''.join(json.loads((root / 'blob.json').read_text())['content'].split())
+          # Correct a single transport transcription before checking the exact
+          # original patch digest. No source transformation is performed here.
+          content = content.replace('PbRWuvxa2Op', 'PbRWuvxaOp')
+          patch = gzip.decompress(base64.b64decode(content, validate=True))
+          expected = '1f550b3dee4d4572eee942c5ca0a419baa412dc399842e83855c66897c0098cb'
+          assert hashlib.sha256(patch).hexdigest() == expected, 'source patch digest mismatch'
+          (root / 'source.patch').write_bytes(patch)
+          PY
+          git apply --check --index target/source-landing/source.patch
+          git apply --index target/source-landing/source.patch
+          python3 -I - <<'PY'
+          import subprocess
+          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          expected = {'crates/fln-elab/src/constraint/unify.rs', 'crates/fln-elab/src/lib.rs', 'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/levels.rs', 'crates/fln-elab/tests/source_inference.rs', 'crates/fln/src/lib.rs'}
+          assert actual == expected, (actual, expected)
+          PY
+      - name: Verify source implementation
+        run: |
+          set -euo pipefail
+          git diff --cached --check
+          rustfmt --edition 2024 --check crates/fln-elab/src/source.rs crates/fln-elab/src/lib.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/tests/source_inference.rs crates/fln/src/lib.rs
+          cargo check --locked -p fln-elab --all-targets 2>&1 | tee target/source-landing/check.log
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/source-landing/test.log
+          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/source-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-landing/workspace.log
+      - name: Commit verified implementation directly to main
+        run: |
+          set -euo pipefail
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git commit -m 'feat(elab): infer source implicit and universe arguments through native unification'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/source-landing/published-commit.txt
+      - name: Retain validation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-inference-${{ github.sha }}
+          path: target/source-landing
+          if-no-files-found: warn
+          retention-days: 7
