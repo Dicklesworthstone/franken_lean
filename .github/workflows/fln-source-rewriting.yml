@@ -1,0 +1,61 @@
+name: Source rewriting implementation
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/land_source_rewriting.py', '.github/workflows/fln-source-rewriting.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-source-rewriting-landing
+  cancel-in-progress: false
+jobs:
+  rewriting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Prepare compiler and source implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/rewrite-landing
+          git rev-parse HEAD > target/rewrite-landing/input.txt
+          rustc -Vv > target/rewrite-landing/compiler.txt
+          python3 -I scripts/land_source_rewriting.py
+          rustfmt --edition 2024 crates/fln-elab/src/source.rs crates/fln-parse/src/lib.rs crates/fln-parse/src/proofs.rs crates/fln/tests/source_rewriting.rs
+          git add -N crates/fln/tests/source_rewriting.rs
+          git diff --check
+          git diff > target/rewrite-landing/implementation.patch
+      - name: Test source proofs with real checkers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/rewrite-landing/source-tests.log
+          cargo test --locked -p fln --lib --test source_equality --test source_rewriting --no-fail-fast 2>&1 | tee target/rewrite-landing/engine-tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/rewrite-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/rewrite-landing/workspace.log
+      - name: Commit tested implementation to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln-elab/src/source.rs|crates/fln-elab/src/source/tactics.rs|crates/fln-elab/src/source/tactics/rewrite.rs|crates/fln-parse/src/lib.rs|crates/fln-parse/src/proofs.rs|crates/fln/tests/source_rewriting.rs) ;;
+              *) echo "Unexpected changed path: $path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git add -- crates/fln-elab/src/source.rs crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/rewrite.rs crates/fln-parse/src/lib.rs crates/fln-parse/src/proofs.rs crates/fln/tests/source_rewriting.rs
+          git commit -m 'feat(elab): prove source goal rewrites using checked Eq.rec transport'
+          git push origin HEAD:main
+          git rev-parse HEAD > target/rewrite-landing/published.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: source-rewriting-${{ github.sha }}
+          path: target/rewrite-landing
+          retention-days: 7
