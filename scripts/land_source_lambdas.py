@@ -1,213 +1,26 @@
 #!/usr/bin/env python3
-"""Apply the native source-lambda increment, refusing unexpected source drift."""
+"""Apply the tested source-lambda patch; the landing workflow rechecks before commit."""
+import base64
+import gzip
+import hashlib
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-def once(source, before, after):
-    if source.count(before) != 1:
-        raise SystemExit(f"expected exactly one source anchor: {before[:90]!r}")
-    return source.replace(before, after, 1)
+PATCH = """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"""
 
 def main():
-    parser_path = ROOT / 'crates/fln-parse/src/lib.rs'
-    source_path = ROOT / 'crates/fln-elab/src/source.rs'
-    tests_path = ROOT / 'crates/fln-elab/tests/source_inference.rs'
-    parser = parser_path.read_text()
-    source = source_path.read_text()
-    tests = tests_path.read_text()
-    if 'struct LambdaTokens {' in parser:
+    patch = gzip.decompress(base64.b64decode(PATCH))
+    if hashlib.sha256(patch).hexdigest() != '705abfb092fa8a9d9583e06a2427cf773b0a4c38db1387d688fd787fecffa15a':
+        raise SystemExit('source-lambda patch integrity mismatch')
+    allowed = {'crates/fln-parse/src/lib.rs', 'crates/fln-elab/src/source.rs', 'crates/fln-elab/tests/source_inference.rs'}
+    for line in patch.decode().splitlines():
+        if line.startswith('+++ b/') and line[6:] not in allowed:
+            raise SystemExit('unexpected patch target')
+    if 'struct LambdaTokens {' in (ROOT / 'crates/fln-parse/src/lib.rs').read_text():
         raise SystemExit('lambda increment already exists; do not replay it')
-    parser = once(parser, 'struct BoundedTermFrame {\n    open: Option<usize>,', '''struct LambdaTokens {
-    keyword: usize,
-    names: std::ops::Range<usize>,
-    arrow: usize,
-}
-
-struct BoundedTermFrame {
-    open: Option<usize>,
-    lambda: Option<LambdaTokens>,''')
-    parser = once(parser, '"⦃", "⦄", "->", "→",', '"⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦",')
-    parser = once(parser, '    ParameterTypeAscription,', '    ParameterTypeAscription,\n    LambdaArrow,')
-    start = parser.index('fn bounded_term(\n')
-    end = parser.index('\n/// Parse the first production', start)
-    term = parser[start:end]
-    term = once(term, 'open: None,', 'open: None,\n        lambda: None,')
-    term = once(term, 'open: Some(index),', 'open: Some(index),\n                    lambda: None,')
-    term = once(term, 'for index in range.clone() {', 'let mut cursor = range.start;\n    while cursor < range.end {\n        let index = cursor;\n        cursor += 1;')
-    anchor = '            Some(TokenKind::Symbol(symbol)) if symbol == "(" => {'
-    term = once(term, anchor, '''            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && (symbol == "fun" || symbol == "λ") =>
-            {
-                let names_start = cursor;
-                while cursor < range.end && matches!(tokens[cursor].kind, TokenKind::Ident(_)) {
-                    cursor += 1;
-                }
-                if cursor == names_start {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, cursor),
-                        expected: NatDefinitionExpectation::ParameterIdentifier,
-                    });
-                }
-                if cursor >= range.end || !matches!(&tokens[cursor].kind,
-                    TokenKind::Symbol(arrow) if arrow == "=>" || arrow == "↦") {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, cursor),
-                        expected: NatDefinitionExpectation::LambdaArrow,
-                    });
-                }
-                frames.push(BoundedTermFrame {
-                    open: None,
-                    lambda: Some(LambdaTokens { keyword: index, names: names_start..cursor, arrow: cursor }),
-                    application: Vec::new(), operands: Vec::new(), operators: Vec::new(),
-                });
-                cursor += 1;
-            }
-''' + anchor)
-    anchor = '            Some(TokenKind::Symbol(symbol)) if symbol == ")" => {\n'
-    term = once(term, anchor, anchor + '                finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;\n')
-    term = once(term, '    if frames.len() != 1 {', '    finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, range.end)?;\n    if frames.len() != 1 {')
-    parser = parser[:start] + term + parser[end:]
-    parser = once(parser, 'fn bounded_term(\n', '''/// Lambda bodies extend through their enclosing term frame. Nested lambda
-/// frames are folded on the heap before closing their containing parenthesis.
-/// The nodes follow Parser.Term.fun/basicFun at the pinned Reference.
-fn finish_lambda_frames(
-    leaves: &Leaves,
-    view: &SourceView,
-    tokens: &[LexedToken],
-    frames: &mut Vec<BoundedTermFrame>,
-    grammar: DefinitionGrammar,
-    at: usize,
-) -> Result<(), NatDefinitionParseError> {
-    while frames.last().is_some_and(|frame| frame.lambda.is_some()) {
-        let mut frame = frames.pop().expect("the guarded lambda frame exists");
-        let prefix = frame.lambda.take().expect("the guarded lambda has a prefix");
-        let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
-        let names = prefix.names.map(|index| leaves.leaf(index)).collect::<Result<Vec<_>, _>>()?;
-        let basic = Syntax::node(parser_kind(&["Term", "basicFun"]), vec![
-            null_node(names), null_node(Vec::new()), leaves.leaf(prefix.arrow)?, body,
-        ]);
-        let lambda = Syntax::node(parser_kind(&["Term", "fun"]), vec![leaves.leaf(prefix.keyword)?, basic]);
-        frames.last_mut().expect("a lambda frame always has a parent").application.push((lambda, prefix.keyword));
-    }
-    Ok(())
-}
-
-fn bounded_term(
-''')
-    source = once(source, '            LetBody(LocalContext, FVarId, Name, Typed),', '            LetBody(LocalContext, FVarId, Name, Typed),\n            Lambda(LocalContext, Vec<LocalDecl>),')
-    anchor = '                        if kind == &parser_kind(&["Term", "let"]) {'
-    source = once(source, anchor, '''                        if kind == &parser_kind(&["Term", "fun"]) {
-                            let parts = expect_node(syntax, kind, 2, "Lean.Parser.Term.fun")?;
-                            match &parts[0] {
-                                Syntax::Atom { val, .. } if val == "fun" || val == "λ" => {}
-                                _ => return Err(failure(SourceInferenceError::Scope)),
-                            }
-                            let basic = expect_node(&parts[1], &parser_kind(&["Term", "basicFun"]), 4, "Lean.Parser.Term.basicFun")?;
-                            let names = expect_null_args(&basic[0], "lambda binders")?;
-                            if names.is_empty() { return Err(failure(SourceInferenceError::Scope)); }
-                            expect_empty_null(&basic[1], "absent lambda result ascription")?;
-                            match &basic[2] {
-                                Syntax::Atom { val, .. } if val == "=>" || val == "↦" => {}
-                                _ => return Err(failure(SourceInferenceError::Scope)),
-                            }
-                            let saved = self.txn.lctx.clone();
-                            let mut binders = Vec::new();
-                            let mut expected_body = expected;
-                            for name in names {
-                                self.tick()?;
-                                let Syntax::Ident { val: name, .. } = name else { return Err(failure(SourceInferenceError::Scope)); };
-                                if name.is_anonymous() { return Err(NatDefinitionElabError::AnonymousReferenceName); }
-                                let (domain, codomain) = if let Some(expected) = &expected_body {
-                                    let expected = self.whnf(expected)?;
-                                    let ExprNode::ForallE { binder_type, body, binder_info: BinderInfo::Default, .. } = expected.node() else {
-                                        return Err(failure(SourceInferenceError::ExpectedFunction));
-                                    };
-                                    (binder_type.clone(), Some(body.clone()))
-                                } else {
-                                    let universe = self.level()?;
-                                    (self.hole(Expr::sort(universe))?, None)
-                                };
-                                let id = FVarId(self.fresh_name()?);
-                                expected_body = codomain.map(|body| self.substitute(&body, &Expr::fvar(id.clone()))).transpose()?;
-                                self.txn.lctx.add_param(id.clone(), name.clone(), domain, BinderInfo::Default);
-                                binders.push(self.txn.lctx.find(&id).expect("the new lambda binder is present").clone());
-                            }
-                            tasks.push(Task::Lambda(saved, binders));
-                            tasks.push(Task::Visit(&basic[3], expected_body, true));
-                            continue;
-                        }
-''' + anchor)
-    anchor = '                Task::Function(arguments, expected) => {'
-    source = once(source, anchor, '''                Task::Lambda(saved, binders) => {
-                    let mut body = values.pop().expect("lambda body visit");
-                    self.flush(false)?;
-                    body.value = self.instantiate(&body.value)?;
-                    body.type_ = self.instantiate(&body.type_)?;
-                    for local in binders.into_iter().rev() {
-                        self.tick()?;
-                        let domain = self.instantiate(&local.type_)?;
-                        body.value = body.value.abstract_fvar(&local.id, 0).map_err(|_| failure(SourceInferenceError::Scope))?;
-                        body.type_ = body.type_.abstract_fvar(&local.id, 0).map_err(|_| failure(SourceInferenceError::Scope))?;
-                        body.value = Expr::lam(local.user_name.clone(), domain.clone(), body.value, local.binder_info);
-                        body.type_ = Expr::forall_e(local.user_name, domain, body.type_, local.binder_info);
-                    }
-                    self.txn.lctx = saved;
-                    values.push(body);
-                }
-''' + anchor)
-    tests += '''
-
-#[test]
-fn lambda_binders_receive_expected_domains() {
-    let result = accepted("def identity : Nat -> Nat := fun x => x", &env());
-    let ExprNode::Lam { binder_type, body, .. } = result.value.node() else { panic!("lambda expected"); };
-    assert_eq!(binder_type, &nat());
-    assert_eq!(body, &b(0));
-}
-
-#[test]
-fn lambda_application_infers_an_unannotated_domain() {
-    let result = accepted("def answer := (fun x => x) 37", &env());
-    assert_eq!(result.base.type_, nat());
-}
-
-#[test]
-fn nested_lambda_binders_are_closed_capture_avoidantly() {
-    let result = accepted("def first : Nat -> Nat -> Nat := fun x y => x", &env());
-    let ExprNode::Lam { body, .. } = result.value.node() else { panic!("outer lambda"); };
-    let ExprNode::Lam { body, .. } = body.node() else { panic!("inner lambda"); };
-    assert_eq!(body, &b(1));
-    accepted("def inner : Nat -> Nat := fun x => (fun y => x) 0", &env());
-}
-
-#[test]
-fn unicode_lambdas_and_nested_calls_preserve_expected_types() {
-    accepted("def identity : Nat → Nat := λ x ↦ polyId x", &env());
-}
-
-#[test]
-fn higher_order_arguments_can_be_source_lambdas() {
-    let env = env();
-    let apply = accepted("def apply (f : Nat -> Nat) (x : Nat) : Nat := f x", &env);
-    let env = publish(&env, Declaration::Defn(apply));
-    accepted("def answer := apply (fun x => polyId x) 37", &env);
-}
-
-#[test]
-fn a_bare_unconstrained_lambda_does_not_get_a_guessed_domain() {
-    assert!(matches!(check_definition_source(b"def unknown := fun x => x", &env(), budget()),
-        Err(DefinitionFrontendError::Elaborate(NatDefinitionElabError::Inference(_)))));
-}
-
-#[test]
-fn lambda_scope_restoration_preserves_outer_bindings() {
-    accepted("def shadow (x : Nat) : Nat -> Nat := fun x => x", &env());
-    accepted("def shadow : Nat -> Nat := let x := 7; fun x => x", &env());
-}
-'''
-    for path, text in ((parser_path, parser), (source_path, source), (tests_path, tests)):
-        path.write_text(text)
+    subprocess.run(['git', 'apply', '--check', '-'], input=patch, cwd=ROOT, check=True)
+    subprocess.run(['git', 'apply', '-'], input=patch, cwd=ROOT, check=True)
 
 if __name__ == '__main__':
     main()
