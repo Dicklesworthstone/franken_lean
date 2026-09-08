@@ -1,25 +1,22 @@
 //! Transactional elaboration state (`ElabTxn`), five-way outcome algebra,
 //! and audited rollback for Athanor (plan §10.1).
 //!
-//! State is explicit and non-ambient. Nested elaboration uses child transactions
-//! with exactly five outcomes:
-//! 1. `CommitAll`: merge all state and products into the parent.
-//! 2. `CommitDiagnosticsOnly`: rollback term/mvar state but retain messages and InfoTree.
-//! 3. `Rollback`: complete rollback, leaving zero leaks or side-effects.
-//! 4. `ExposeCandidate`: expose candidate expression + unresolved obligations.
-//! 5. `Fork`: split into deterministic alternatives for overload or tactic search.
+//! Semantic state is explicit and non-ambient. A failed alternative cannot
+//! publish its assignments or erase work already charged to its parent.
+//! Candidate exposure preserves the context needed to interpret its holes;
+//! an exposed candidate is untrusted elaboration output, not kernel admission.
 
 use fln_core::expr::{Expr, MVarId};
 use fln_core::options::KVMap;
 use fln_env::environment::Environment;
 
-use crate::constraint::ConstraintQueue;
+use crate::constraint::{Constraint, ConstraintId, ConstraintKind, ConstraintQueue};
 use crate::decision::{DecisionLedger, DecisionRecord};
 use crate::info::InfoTreeBuilder;
 use crate::lctx::LocalContext;
 use crate::messages::MessageLog;
-use crate::mvar::MetavarStore;
-use crate::universe::UniverseStore;
+use crate::mvar::{AssignmentJustification, MetavarError, MetavarStore};
+use crate::universe::{UniverseInstantiationError, UniverseStore};
 
 /// Execution and resource limits for elaboration (heartbeats, recursion depth, steps).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +49,10 @@ impl ElabBudget {
     }
 
     pub fn check_heartbeat(&mut self) -> Result<(), &'static str> {
-        self.heartbeats_consumed = self.heartbeats_consumed.saturating_add(1);
+        self.heartbeats_consumed = self
+            .heartbeats_consumed
+            .checked_add(1)
+            .ok_or("heartbeat counter overflow")?;
         if self.max_heartbeats > 0 && self.heartbeats_consumed > self.max_heartbeats {
             Err("max heartbeats exceeded")
         } else {
@@ -77,23 +77,48 @@ impl ElabBudget {
 /// The five explicit outcomes of a child elaboration transaction (plan §10.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnOutcome {
-    /// 1. Commit all products: merge mvars, uvars, lctx, constraints, messages, info tree, and decisions.
+    /// Commit all semantic products, including options and deterministic seed.
     CommitAll,
-    /// 2. Commit diagnostics only: rollback term and context state, but keep child messages and info tree.
+    /// Roll back semantic state, retaining child messages and InfoTree.
     CommitDiagnosticsOnly,
-    /// 3. Rollback completely: discard all child state, leaving parent in its exact pre-child state.
+    /// Discard child semantic state. Work accounting and the audit event survive.
     Rollback,
-    /// 4. Expose candidate expression and unresolved obligations without full parent commit.
+    /// Retain candidate, obligations and their child context without publishing it.
     ExposeCandidate {
         candidate: Expr,
         obligations: Vec<MVarId>,
     },
-    /// 5. Fork into deterministic alternatives.
+    /// Record a fork point. `ElabTxn::fork` constructs the alternative states.
     Fork { alternatives_count: usize },
 }
 
-/// A checkpoint of parent state before spawning a child transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An untrusted candidate together with the state in which its holes and free
+/// variables have meaning. It does not contain a nested candidate history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExposedCandidate {
+    pub expression: Expr,
+    pub obligations: Vec<MVarId>,
+    pub env: Environment,
+    pub lctx: LocalContext,
+    pub mvars: MetavarStore,
+    pub universes: UniverseStore,
+    pub constraints: ConstraintQueue,
+    pub options: KVMap,
+    pub seed: u64,
+}
+
+impl ExposedCandidate {
+    /// Read the candidate under its retained assignments. Unresolved expression
+    /// metavariables remain explicit; this operation is not a proof check.
+    pub fn instantiate_expr(&self) -> Result<Expr, UniverseInstantiationError> {
+        self.universes
+            .instantiate_expr(&self.mvars.instantiate(&self.expression))
+    }
+}
+
+/// A checkpoint before spawning a child. Counts remain diagnostic summaries;
+/// private value snapshots, not caller-editable counts, drive leak detection.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TxnCheckpoint {
     pub mvar_decls_count: usize,
     pub mvar_assignments_count: usize,
@@ -104,6 +129,7 @@ pub struct TxnCheckpoint {
     pub info_tree_count: usize,
     pub decisions_count: usize,
     pub heartbeats_consumed: u64,
+    snapshot: Box<ElabTxn>,
 }
 
 /// The explicit elaboration transaction state (`ElabTxn`).
@@ -120,6 +146,8 @@ pub struct ElabTxn {
     pub decisions: DecisionLedger,
     pub seed: u64,
     pub budget: ElabBudget,
+    /// The most recent exposed candidate, consumed with `take_exposed_candidate`.
+    pub exposed_candidate: Option<ExposedCandidate>,
 }
 
 impl ElabTxn {
@@ -136,10 +164,36 @@ impl ElabTxn {
             decisions: DecisionLedger::new(),
             seed,
             budget: ElabBudget::default(),
+            exposed_candidate: None,
         }
     }
 
-    /// Create a checkpoint of current transaction state for leak checking.
+    /// Postpone an obligation using its current term/context dependencies.
+    pub fn postpone(&mut self, kind: ConstraintKind, depth: u32) -> ConstraintId {
+        self.constraints.enqueue_inferred(kind, &self.mvars, depth)
+    }
+
+    /// Assign and return the deterministically ordered obligations to retry.
+    pub fn assign_mvar(
+        &mut self,
+        id: MVarId,
+        value: Expr,
+        justification: AssignmentJustification,
+    ) -> Result<Vec<Constraint>, MetavarError> {
+        self.constraints
+            .assign_mvar(&mut self.mvars, id, value, justification)
+    }
+
+    /// Compose expression and universe substitution, in that order: an assigned
+    /// expression may introduce universe metavariables not present in its input.
+    pub fn instantiate_expr(&self, expr: &Expr) -> Result<Expr, UniverseInstantiationError> {
+        self.universes.instantiate_expr(&self.mvars.instantiate(expr))
+    }
+
+    pub fn take_exposed_candidate(&mut self) -> Option<ExposedCandidate> {
+        self.exposed_candidate.take()
+    }
+
     pub fn checkpoint(&self) -> TxnCheckpoint {
         TxnCheckpoint {
             mvar_decls_count: self.mvars.len(),
@@ -151,13 +205,12 @@ impl ElabTxn {
             info_tree_count: self.info_tree.len(),
             decisions_count: self.decisions.len(),
             heartbeats_consumed: self.budget.heartbeats_consumed,
+            snapshot: Box::new(self.clone()),
         }
     }
 
-    /// Spawn a child transaction inheriting the current state.
     pub fn child_txn(&self) -> ElabTxn {
         let mut child = self.clone();
-        // Child advances deterministic PRNG seed
         child.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         child
     }
@@ -181,18 +234,31 @@ impl ElabTxn {
         forks
     }
 
-    /// Commit or resolve a child transaction according to one of the 5 explicit outcomes.
+    /// Resolve a child against an unchanged semantic parent. Audit records and
+    /// already-spent heartbeats may grow between sibling attempts. A resource
+    /// failure still charges the reported work, but publishes no child state.
     pub fn commit_outcome(
         &mut self,
         checkpoint: &TxnCheckpoint,
         child: ElabTxn,
         outcome: TxnOutcome,
     ) -> Result<Option<Expr>, &'static str> {
-        // Accounting: propagate heartbeats spent
-        self.budget.heartbeats_consumed = child.budget.heartbeats_consumed;
-
+        self.verify_no_state_leaks(checkpoint)?;
+        let base = &checkpoint.snapshot;
+        if matches!(&outcome, TxnOutcome::CommitAll)
+            && !child.decisions.records().starts_with(base.decisions.records())
+        {
+            return Err("child replaced the inherited decision journal");
+        }
+        self.charge_child_work(&base.budget, &child.budget)?;
+        if child.budget.current_rec_depth != base.budget.current_rec_depth {
+            return Err("child left an unbalanced elaboration recursion depth");
+        }
         match outcome {
             TxnOutcome::CommitAll => {
+                for record in &child.decisions.records()[base.decisions.len()..] {
+                    self.decisions.record(record.clone());
+                }
                 self.env = child.env;
                 self.lctx = child.lctx;
                 self.mvars = child.mvars;
@@ -200,74 +266,332 @@ impl ElabTxn {
                 self.constraints = child.constraints;
                 self.messages = child.messages;
                 self.info_tree = child.info_tree;
-                self.decisions = child.decisions;
+                self.options = child.options;
+                self.seed = child.seed;
+                self.exposed_candidate = child.exposed_candidate;
                 Ok(None)
             }
             TxnOutcome::CommitDiagnosticsOnly => {
-                // Keep parent state for terms/mvars/lctx/constraints, but adopt child messages and info
                 self.messages = child.messages;
                 self.info_tree = child.info_tree;
                 self.decisions.record(DecisionRecord::TransactionRollback {
                     branch_id: 0,
                     reason: "commit_diagnostics_only".to_string(),
                 });
-                self.verify_no_term_leaks(checkpoint)?;
                 Ok(None)
             }
             TxnOutcome::Rollback => {
-                // Discard all child state; verify exact audit integrity
                 self.decisions.record(DecisionRecord::TransactionRollback {
                     branch_id: 0,
                     reason: "explicit_rollback".to_string(),
                 });
-                self.verify_no_state_leaks(checkpoint)?;
                 Ok(None)
             }
             TxnOutcome::ExposeCandidate {
                 candidate,
-                obligations: _,
+                obligations,
             } => {
-                // Return candidate expression; verify that uncommitted state is not leaked
+                self.exposed_candidate = Some(ExposedCandidate {
+                    expression: candidate.clone(),
+                    obligations,
+                    env: child.env,
+                    lctx: child.lctx,
+                    mvars: child.mvars,
+                    universes: child.universes,
+                    constraints: child.constraints,
+                    options: child.options,
+                    seed: child.seed,
+                });
                 Ok(Some(candidate))
             }
-            TxnOutcome::Fork {
-                alternatives_count: _,
-            } => {
-                // Fork points are recorded in decision ledger
+            TxnOutcome::Fork { alternatives_count } => {
+                self.decisions.record(DecisionRecord::TransactionFork {
+                    branch_id: 0,
+                    num_alternatives: alternatives_count,
+                });
                 Ok(None)
             }
         }
     }
 
-    /// Leak audit: verify that term/mvar state was not altered past checkpoint.
-    pub fn verify_no_term_leaks(&self, checkpoint: &TxnCheckpoint) -> Result<(), &'static str> {
-        if self.mvars.len() != checkpoint.mvar_decls_count {
-            return Err("leak detected: mvar decls modified after rollback");
+    fn charge_child_work(
+        &mut self,
+        base: &ElabBudget,
+        child: &ElabBudget,
+    ) -> Result<(), &'static str> {
+        if self.budget.heartbeats_consumed < base.heartbeats_consumed {
+            return Err("parent heartbeat accounting moved backwards");
         }
-        if self.mvars.assignments().len() != checkpoint.mvar_assignments_count {
-            return Err("leak detected: mvar assignments modified after rollback");
-        }
-        if self.universes.len() != checkpoint.uvar_assignments_count {
-            return Err("leak detected: uvar assignments modified after rollback");
-        }
-        if self.lctx.len() != checkpoint.lctx_count {
-            return Err("leak detected: local context modified after rollback");
+        let spent = child
+            .heartbeats_consumed
+            .checked_sub(base.heartbeats_consumed)
+            .ok_or("child heartbeat accounting moved backwards")?;
+        let total = self.budget.heartbeats_consumed.checked_add(spent);
+        self.budget.heartbeats_consumed = total.unwrap_or(u64::MAX);
+        let total = total.ok_or("heartbeat counter overflow")?;
+        if self.budget.max_heartbeats > 0 && total > self.budget.max_heartbeats {
+            return Err("max heartbeats exceeded");
         }
         Ok(())
     }
 
-    /// Leak audit: verify that ALL state was cleanly restored to checkpoint.
-    pub fn verify_no_state_leaks(&self, checkpoint: &TxnCheckpoint) -> Result<(), &'static str> {
-        self.verify_no_term_leaks(checkpoint)?;
-        if self.constraints.len() != checkpoint.constraints_count {
+    /// Compare semantic values and indexes, not merely their cardinalities.
+    pub fn verify_no_term_leaks(&self, checkpoint: &TxnCheckpoint) -> Result<(), &'static str> {
+        let base = &checkpoint.snapshot;
+        if self.mvars.decls() != base.mvars.decls() {
+            return Err("leak detected: mvar decls modified after rollback");
+        }
+        if self.mvars.assignments() != base.mvars.assignments() {
+            return Err("leak detected: mvar assignments modified after rollback");
+        }
+        if self.mvars != base.mvars {
+            return Err("leak detected: mvar dependencies modified after rollback");
+        }
+        if self.universes != base.universes {
+            return Err("leak detected: uvar assignments modified after rollback");
+        }
+        if self.lctx != base.lctx {
+            return Err("leak detected: local context modified after rollback");
+        }
+        if self.constraints != base.constraints {
             return Err("leak detected: constraints modified after rollback");
         }
-        if self.messages.len() != checkpoint.messages_count {
-            return Err("leak detected: messages modified after rollback");
+        if self.env != base.env {
+            return Err("leak detected: environment modified after rollback");
         }
-        if self.info_tree.len() != checkpoint.info_tree_count {
-            return Err("leak detected: info tree modified after rollback");
+        if self.options != base.options {
+            return Err("leak detected: options modified after rollback");
+        }
+        if self.seed != base.seed {
+            return Err("leak detected: deterministic seed modified after rollback");
+        }
+        if self.budget.max_heartbeats != base.budget.max_heartbeats
+            || self.budget.max_rec_depth != base.budget.max_rec_depth
+            || self.budget.current_rec_depth != base.budget.current_rec_depth
+        {
+            return Err("leak detected: resource policy or recursion scope modified after rollback");
         }
         Ok(())
+    }
+
+    /// Audit all rollback-sensitive products. Spent work and append-only audit
+    /// events intentionally survive rollback; inherited journal entries may not
+    /// be rewritten or removed.
+    pub fn verify_no_state_leaks(&self, checkpoint: &TxnCheckpoint) -> Result<(), &'static str> {
+        self.verify_no_term_leaks(checkpoint)?;
+        let base = &checkpoint.snapshot;
+        if self.messages != base.messages {
+            return Err("leak detected: messages modified after rollback");
+        }
+        if self.info_tree != base.info_tree {
+            return Err("leak detected: info tree modified after rollback");
+        }
+        if self.exposed_candidate != base.exposed_candidate {
+            return Err("leak detected: exposed candidate modified after rollback");
+        }
+        if !self.decisions.records().starts_with(base.decisions.records()) {
+            return Err("leak detected: inherited decision journal modified after rollback");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mvar::MetavarKind;
+    use crate::seed::bootstrap_nat_environment;
+    use fln_core::level::{LMVarId, Level};
+    use fln_core::name::Name;
+    use fln_core::options::DataValue;
+    use fln_kernel::verdict::Budget;
+
+    fn transaction() -> ElabTxn {
+        let env = bootstrap_nat_environment(Budget::for_stack_bytes(1024 * 1024)).unwrap();
+        ElabTxn::new(env, KVMap::new(), 42)
+    }
+
+    fn declare(txn: &mut ElabTxn, name: &str) -> MVarId {
+        let id = MVarId(Name::from_components([name]));
+        txn.mvars.declare(
+            id.clone(),
+            id.0.clone(),
+            Expr::sort(Level::one()),
+            LocalContext::new(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        id
+    }
+
+    #[test]
+    fn same_size_universe_replacement_is_not_a_clean_rollback() {
+        let mut txn = transaction();
+        let u = LMVarId(Name::from_components(["u"]));
+        txn.universes.assign(u.clone(), Level::zero());
+        let cp = txn.checkpoint();
+        txn.universes.assign(u, Level::one());
+        assert_eq!(txn.universes.len(), cp.uvar_assignments_count);
+        assert_eq!(
+            txn.verify_no_term_leaks(&cp),
+            Err("leak detected: uvar assignments modified after rollback"),
+        );
+    }
+
+    #[test]
+    fn changing_only_dependency_edges_is_detected() {
+        let mut txn = transaction();
+        let a = declare(&mut txn, "a");
+        let b = declare(&mut txn, "b");
+        let cp = txn.checkpoint();
+        txn.mvars.register_reader(a, b);
+        assert_eq!(txn.mvars.len(), cp.mvar_decls_count);
+        assert_eq!(
+            txn.verify_no_term_leaks(&cp),
+            Err("leak detected: mvar dependencies modified after rollback"),
+        );
+    }
+
+    #[test]
+    fn sibling_rollbacks_accumulate_work_instead_of_refunding_it() {
+        let mut txn = transaction();
+        txn.budget.heartbeats_consumed = 10;
+        let cp = txn.checkpoint();
+        let mut first = txn.child_txn();
+        let mut second = txn.child_txn();
+        first.budget.heartbeats_consumed = 13;
+        second.budget.heartbeats_consumed = 17;
+        txn.commit_outcome(&cp, first, TxnOutcome::Rollback).unwrap();
+        txn.commit_outcome(&cp, second, TxnOutcome::Rollback).unwrap();
+        assert_eq!(txn.budget.heartbeats_consumed, 20);
+        assert_eq!(txn.decisions.len(), 2);
+        txn.verify_no_state_leaks(&cp).unwrap();
+    }
+
+    #[test]
+    fn commit_all_preserves_options_seed_and_prior_rollback_events() {
+        let mut txn = transaction();
+        let cp = txn.checkpoint();
+        let rejected = txn.child_txn();
+        let mut accepted = txn.child_txn();
+        let key = Name::from_components(["trace", "test"]);
+        accepted.options.insert(key.clone(), DataValue::OfBool(true));
+        accepted.decisions.record(DecisionRecord::TransactionFork {
+            branch_id: 1,
+            num_alternatives: 2,
+        });
+        let seed = accepted.seed;
+        txn.commit_outcome(&cp, rejected, TxnOutcome::Rollback).unwrap();
+        txn.commit_outcome(&cp, accepted, TxnOutcome::CommitAll).unwrap();
+        assert!(txn.options.get_bool(&key, false));
+        assert_eq!(txn.seed, seed);
+        assert_eq!(txn.decisions.len(), 2);
+        assert!(matches!(txn.decisions.records()[0], DecisionRecord::TransactionRollback { .. }));
+        assert!(matches!(txn.decisions.records()[1], DecisionRecord::TransactionFork { .. }));
+    }
+
+    #[test]
+    fn a_stale_parent_is_not_overwritten_by_a_child_commit() {
+        let mut txn = transaction();
+        let cp = txn.checkpoint();
+        let child = txn.child_txn();
+        txn.options.insert(Name::from_components(["changed"]), DataValue::OfNat(7));
+        let before = txn.clone();
+        assert!(txn.commit_outcome(&cp, child, TxnOutcome::CommitAll).is_err());
+        assert_eq!(txn, before);
+    }
+
+    #[test]
+    fn exposed_holes_keep_their_child_context_without_publishing_it() {
+        let mut txn = transaction();
+        let cp = txn.checkpoint();
+        let mut child = txn.child_txn();
+        let hole = declare(&mut child, "child_only");
+        let expression = Expr::mvar(hole.clone());
+        assert_eq!(
+            txn.commit_outcome(
+                &cp,
+                child,
+                TxnOutcome::ExposeCandidate {
+                    candidate: expression.clone(),
+                    obligations: vec![hole.clone()],
+                },
+            ).unwrap(),
+            Some(expression.clone()),
+        );
+        assert!(!txn.mvars.is_declared(&hole));
+        let exposed = txn.take_exposed_candidate().unwrap();
+        assert_eq!(exposed.obligations, vec![hole.clone()]);
+        assert!(exposed.mvars.is_declared(&hole));
+        assert_eq!(exposed.instantiate_expr().unwrap(), expression);
+        assert!(txn.take_exposed_candidate().is_none());
+        txn.verify_no_state_leaks(&cp).unwrap();
+    }
+
+    #[test]
+    fn assignment_resumes_obligations_inside_the_child_only() {
+        let mut txn = transaction();
+        let hole = declare(&mut txn, "hole");
+        let waiting = txn.postpone(
+            ConstraintKind::HasType {
+                expr: Expr::mvar(hole.clone()),
+                expected_type: Expr::sort(Level::one()),
+            },
+            0,
+        );
+        let cp = txn.checkpoint();
+        let mut child = txn.child_txn();
+        let ready = child.assign_mvar(
+            hole.clone(),
+            Expr::sort(Level::zero()),
+            AssignmentJustification::DirectDefEq,
+        ).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, waiting);
+        assert!(child.constraints.is_empty());
+        txn.commit_outcome(&cp, child, TxnOutcome::Rollback).unwrap();
+        assert!(!txn.mvars.is_assigned(&hole));
+        assert!(txn.constraints.constraints().contains_key(&waiting));
+    }
+
+    #[test]
+    fn expression_assignment_is_expanded_before_universe_assignment() {
+        let mut txn = transaction();
+        let hole = declare(&mut txn, "hole");
+        let u = LMVarId(Name::from_components(["u"]));
+        txn.assign_mvar(
+            hole.clone(),
+            Expr::sort(Level::mvar(u.clone())),
+            AssignmentJustification::DirectDefEq,
+        ).unwrap();
+        txn.universes.assign(u, Level::one());
+        assert_eq!(txn.instantiate_expr(&Expr::mvar(hole)).unwrap(), Expr::sort(Level::one()));
+    }
+
+    #[test]
+    fn budget_exhaustion_charges_work_but_publishes_no_child_state() {
+        let mut txn = transaction();
+        txn.budget.max_heartbeats = 1;
+        let cp = txn.checkpoint();
+        let mut child = txn.child_txn();
+        let hole = declare(&mut child, "child_only");
+        child.budget.heartbeats_consumed = 2;
+        assert_eq!(
+            txn.commit_outcome(&cp, child, TxnOutcome::CommitAll),
+            Err("max heartbeats exceeded"),
+        );
+        assert_eq!(txn.budget.heartbeats_consumed, 2);
+        assert!(!txn.mvars.is_declared(&hole));
+        assert_eq!(txn.seed, 42);
+        txn.verify_no_state_leaks(&cp).unwrap();
+    }
+
+    #[test]
+    fn saturating_the_heartbeat_counter_is_not_success() {
+        let mut budget = ElabBudget::new(0, 512);
+        budget.heartbeats_consumed = u64::MAX;
+        assert_eq!(budget.check_heartbeat(), Err("heartbeat counter overflow"));
+        assert_eq!(budget.heartbeats_consumed, u64::MAX);
     }
 }
