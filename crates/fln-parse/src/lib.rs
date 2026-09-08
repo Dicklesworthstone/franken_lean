@@ -218,15 +218,16 @@ struct ExplicitBinderTokens {
     open: usize,
     names: std::ops::Range<usize>,
     colon: usize,
-    type_name: usize,
+    type_range: std::ops::Range<usize>,
     close: usize,
+    kind: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LetBindingTokens {
     keyword: usize,
     name: usize,
-    explicit_type: Option<(usize, usize)>,
+    explicit_type: Option<(usize, std::ops::Range<usize>)>,
     assignment: usize,
     value: std::ops::Range<usize>,
     separator: usize,
@@ -241,6 +242,7 @@ struct BoundedTermFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedInfix {
+    Arrow,
     ScalarBeq,
     NatLor,
     NatXor,
@@ -261,6 +263,7 @@ enum BoundedInfix {
 impl BoundedInfix {
     const fn symbol(self) -> &'static str {
         match self {
+            Self::Arrow => "->",
             Self::ScalarBeq => "==",
             Self::NatLor => "|||",
             Self::NatXor => "^^^",
@@ -280,6 +283,7 @@ impl BoundedInfix {
     }
     const fn precedence(self) -> u8 {
         match self {
+            Self::Arrow => 25,
             Self::ScalarBeq => 50,
             Self::NatLor => 55,
             Self::NatXor => 58,
@@ -293,7 +297,7 @@ impl BoundedInfix {
     }
 
     const fn is_right_associative(self) -> bool {
-        matches!(self, Self::NatPow)
+        matches!(self, Self::NatPow | Self::Arrow)
     }
 
     const fn is_non_associative(self) -> bool {
@@ -301,6 +305,9 @@ impl BoundedInfix {
     }
 
     fn syntax_kind(self) -> Name {
+        if self == Self::Arrow {
+            return parser_kind(&["Term", "arrow"]);
+        }
         Name::str(Name::anonymous(), format!("term_{}_", self.symbol()))
     }
 }
@@ -453,14 +460,15 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "def", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+", "-", "++", "*",
-        "/", "%", "<<<", ">>>", "^", "<=", "<",
+        "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->", "→",
     ])
 }
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^",
-        "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<",
+        "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_",
+        "{", "}", "⦃", "⦄", "->", "→",
     ])
 }
 
@@ -469,6 +477,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         return None;
     };
     match symbol.as_str() {
+        "->" | "→" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Arrow),
         "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),
         "|||" => Some(BoundedInfix::NatLor),
         "^^^" => Some(BoundedInfix::NatXor),
@@ -502,7 +511,8 @@ fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) ->
         kind,
         Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
     ) || (grammar == DefinitionGrammar::Scalar
-        && matches!(kind, Some(TokenKind::Literal(LiteralKind::Str))))
+        && (matches!(kind, Some(TokenKind::Literal(LiteralKind::Str)))
+            || matches!(kind, Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "Type" | "Prop" | "_"))))
 }
 
 fn bounded_term_leaf(
@@ -522,6 +532,20 @@ fn bounded_term_leaf(
             Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaf]),
         ),
         Some(TokenKind::Ident(_)) => Ok(leaf),
+        Some(TokenKind::Symbol(symbol)) if grammar == DefinitionGrammar::Scalar => {
+            match symbol.as_str() {
+                "Type" => Ok(Syntax::node(
+                    parser_kind(&["Term", "type"]),
+                    vec![leaf, null_node(Vec::new())],
+                )),
+                "Prop" => Ok(Syntax::node(parser_kind(&["Term", "prop"]), vec![leaf])),
+                "_" => Ok(Syntax::node(parser_kind(&["Term", "hole"]), vec![leaf])),
+                _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: grammar.value_expectation(),
+                }),
+            }
+        }
         _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, index),
             expected: grammar.value_expectation(),
@@ -552,11 +576,48 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
     None
 }
 
+/// Find a type's delimiter without splitting a parenthesized application or
+/// arrow. The term parser still validates every token in the selected range.
+fn type_end(tokens: &[LexedToken], from: usize, delimiter: &str) -> usize {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(from) {
+        if let TokenKind::Symbol(symbol) = &token.kind {
+            if depth == 0 && symbol == delimiter {
+                return index;
+            }
+            match symbol.as_str() {
+                "(" => depth += 1,
+                ")" if depth > 0 => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    tokens.len()
+}
+
+fn bounded_type(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if grammar == DefinitionGrammar::NatOnly
+        && (range.len() != 1
+            || !matches!(tokens.get(range.start).map(|t| &t.kind), Some(TokenKind::Ident(name)) if grammar.accepts_type(name)))
+    {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, range.start),
+            expected: grammar.type_expectation(),
+        });
+    }
+    bounded_term(leaves, view, tokens, range, grammar)
+}
+
 fn bounded_let_bindings(
     view: &SourceView,
     tokens: &[LexedToken],
     mut body_start: usize,
-    grammar: DefinitionGrammar,
 ) -> Result<(Vec<LetBindingTokens>, usize), NatDefinitionParseError> {
     let mut let_bindings = Vec::new();
     while matches!(
@@ -581,18 +642,9 @@ fn bounded_let_bindings(
         ) {
             let colon = declaration_cursor;
             declaration_cursor += 1;
-            if !matches!(
-                tokens.get(declaration_cursor).map(|token| &token.kind),
-                Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
-            ) {
-                return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(view, tokens, declaration_cursor),
-                    expected: grammar.type_expectation(),
-                });
-            }
-            let type_name = declaration_cursor;
-            declaration_cursor += 1;
-            Some((colon, type_name))
+            let start = declaration_cursor;
+            declaration_cursor = type_end(tokens, start, ":=");
+            Some((colon, start..declaration_cursor))
         } else {
             None
         };
@@ -638,9 +690,12 @@ fn bounded_value_syntax(
     for binding in let_bindings.into_iter().rev() {
         let local_value = bounded_term(leaves, view, tokens, binding.value, grammar)?;
         let explicit_type = match binding.explicit_type {
-            Some((colon, type_name)) => null_node(vec![Syntax::node(
+            Some((colon, type_range)) => null_node(vec![Syntax::node(
                 parser_kind(&["Term", "typeSpec"]),
-                vec![leaves.leaf(colon)?, leaves.leaf(type_name)?],
+                vec![
+                    leaves.leaf(colon)?,
+                    bounded_type(leaves, view, tokens, type_range, grammar)?,
+                ],
             )]),
             None => null_node(Vec::new()),
         };
@@ -694,7 +749,9 @@ fn finish_bounded_application(
     if !matches!(
         tokens.get(*first_index).map(|token| &token.kind),
         Some(TokenKind::Ident(_))
-    ) {
+    ) && !(grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if symbol == "("))
+    {
         let at = terms.get(1).map_or(*first_index, |(_, index)| *index);
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, at),
@@ -1003,8 +1060,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         Event::Trivia(_) | Event::Refused { .. } => None,
                     })
                     .collect::<Vec<_>>();
-                let (let_bindings, body_start) =
-                    bounded_let_bindings(&view, &tokens, 1, DefinitionGrammar::Scalar)?;
+                let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, 1)?;
                 let leaves = Leaves::build(view.normalized(), &tokens)?;
                 let epilogue = leaves.attachment().epilogue();
                 let value = bounded_value_syntax(
@@ -1101,9 +1157,14 @@ fn parse_definition_with_grammar(
     let mut cursor = 2;
     while matches!(
         tokens.get(cursor).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "("
+        Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃"))
     ) {
         let open = cursor;
+        let (kind, closing) = match tokens.get(cursor).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(symbol)) if symbol == "{" => ("implicitBinder", "}"),
+            Some(TokenKind::Symbol(symbol)) if symbol == "⦃" => ("strictImplicitBinder", "⦄"),
+            _ => ("explicitBinder", ")"),
+        };
         cursor += 1;
         let names_start = cursor;
         while matches!(
@@ -1129,20 +1190,12 @@ fn parse_definition_with_grammar(
         }
         let colon = cursor;
         cursor += 1;
+        let start = cursor;
+        cursor = type_end(&tokens, start, closing);
+        let type_range = start..cursor;
         if !matches!(
             tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
-        ) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor),
-                expected: grammar.type_expectation(),
-            });
-        }
-        let type_name = cursor;
-        cursor += 1;
-        if !matches!(
-            tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == ")"
+            Some(TokenKind::Symbol(symbol)) if symbol == closing
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(&view, &tokens, cursor),
@@ -1155,8 +1208,9 @@ fn parse_definition_with_grammar(
             open,
             names: names_start..colon,
             colon,
-            type_name,
+            type_range,
             close,
+            kind,
         });
     }
     let explicit_result_type = if matches!(
@@ -1165,18 +1219,9 @@ fn parse_definition_with_grammar(
     ) {
         let colon = cursor;
         cursor += 1;
-        if !matches!(
-            tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
-        ) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor),
-                expected: grammar.type_expectation(),
-            });
-        }
-        let type_name = cursor;
-        cursor += 1;
-        Some((colon, type_name))
+        let start = cursor;
+        cursor = type_end(&tokens, start, ":=");
+        Some((colon, start..cursor))
     } else {
         None
     };
@@ -1191,7 +1236,7 @@ fn parse_definition_with_grammar(
         });
     }
     let value_index = assignment_index + 1;
-    let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, value_index, grammar)?;
+    let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, value_index)?;
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
@@ -1220,24 +1265,27 @@ fn parse_definition_with_grammar(
             .names
             .map(|index| leaves.leaf(index))
             .collect::<Result<Vec<_>, _>>()?;
-        parameters.push(Syntax::node(
-            parser_kind(&["Term", "explicitBinder"]),
-            vec![
-                leaves.leaf(group.open)?,
-                null_node(names),
-                null_node(vec![
-                    leaves.leaf(group.colon)?,
-                    leaves.leaf(group.type_name)?,
-                ]),
-                null_node(Vec::new()),
-                leaves.leaf(group.close)?,
-            ],
-        ));
+        let mut children = vec![
+            leaves.leaf(group.open)?,
+            null_node(names),
+            null_node(vec![
+                leaves.leaf(group.colon)?,
+                bounded_type(&leaves, &view, &tokens, group.type_range, grammar)?,
+            ]),
+        ];
+        if group.kind == "explicitBinder" {
+            children.push(null_node(Vec::new()));
+        }
+        children.push(leaves.leaf(group.close)?);
+        parameters.push(Syntax::node(parser_kind(&["Term", group.kind]), children));
     }
-    let result_type = if let Some((colon, type_name)) = explicit_result_type {
+    let result_type = if let Some((colon, type_range)) = explicit_result_type {
         null_node(vec![Syntax::node(
             parser_kind(&["Term", "typeSpec"]),
-            vec![leaves.leaf(colon)?, leaves.leaf(type_name)?],
+            vec![
+                leaves.leaf(colon)?,
+                bounded_type(&leaves, &view, &tokens, type_range, grammar)?,
+            ],
         )])
     } else {
         null_node(Vec::new())
@@ -2402,10 +2450,13 @@ mod nat_definition_tests {
                                 if colon == ":" && ty.to_display_string() == "String"))
         ));
 
+        // Type names are syntax, not a closed scalar inventory. Their existence
+        // and kind are now decided by source inference and the ordinary kernel.
+        assert!(parse_definition(b"def named := let value : Array := 1; value").is_ok());
         assert!(matches!(
-            parse_definition(b"def bad := let value : Array := 1; value"),
+            parse_nat_definition(b"def bad := let value : Array := 1; value"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
-                expected: NatDefinitionExpectation::ScalarType,
+                expected: NatDefinitionExpectation::NaturalType,
                 ..
             })
         ));

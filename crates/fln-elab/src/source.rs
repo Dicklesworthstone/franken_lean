@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod infer;
 mod levels;
 
 use super::*;
@@ -159,6 +160,53 @@ impl Context {
         syntax: &Syntax,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        if let Syntax::Node { kind, args, .. } = syntax {
+            if kind == &parser_kind(&["Term", "hole"]) {
+                let [hole] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(hole, "_", "placeholder")?;
+                let type_ = match expected {
+                    Some(type_) => type_.clone(),
+                    None => {
+                        let level = self.level()?;
+                        self.hole(Expr::sort(level))?
+                    }
+                };
+                return Ok(Typed {
+                    value: self.hole(type_.clone())?,
+                    type_,
+                });
+            }
+            let level = if kind == &parser_kind(&["Term", "type"]) {
+                let [keyword, level] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(keyword, "Type", "type universe")?;
+                expect_empty_null(level, "absent universe level")?;
+                Some(Level::one())
+            } else if kind == &parser_kind(&["Term", "prop"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(keyword, "Prop", "proposition universe")?;
+                Some(Level::zero())
+            } else {
+                None
+            };
+            if let Some(level) = level {
+                let type_ = Expr::sort(
+                    level
+                        .clone()
+                        .succ()
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                );
+                return Ok(Typed {
+                    value: Expr::sort(level),
+                    type_,
+                });
+            }
+        }
         if let Syntax::Ident { val: name, .. } = syntax {
             if name.is_anonymous() {
                 return Err(NatDefinitionElabError::AnonymousReferenceName);
@@ -174,35 +222,6 @@ impl Context {
                 return Ok(Typed {
                     value: Expr::fvar(local.id.clone()),
                     type_: local.type_.clone(),
-                });
-            }
-            if name == &Name::from_components(["_"]) {
-                let type_ = match expected {
-                    Some(type_) => type_.clone(),
-                    None => {
-                        let universe = self.level()?;
-                        self.hole(Expr::sort(universe))?
-                    }
-                };
-                return Ok(Typed {
-                    value: self.hole(type_.clone())?,
-                    type_,
-                });
-            }
-            if name == &Name::from_components(["Type"]) {
-                return Ok(Typed {
-                    value: Expr::sort(Level::one()),
-                    type_: Expr::sort(
-                        Level::one()
-                            .succ()
-                            .map_err(|_| failure(SourceInferenceError::Scope))?,
-                    ),
-                });
-            }
-            if name == &Name::from_components(["Prop"]) {
-                return Ok(Typed {
-                    value: Expr::sort(Level::zero()),
-                    type_: Expr::sort(Level::one()),
                 });
             }
             let mut resolved = name.clone();
@@ -282,7 +301,7 @@ impl Context {
 
     /// Enough type reconstruction to generate the universe side of an implicit
     /// type assignment. This is a constraint producer, not a trusted checker.
-    fn known_type(&mut self, expression: &Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
+    fn leaf_type(&mut self, expression: &Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
         let expression = self.instantiate(expression)?;
         match expression.node() {
             ExprNode::Sort { level } => Ok(Some(Expr::sort(
@@ -426,6 +445,8 @@ impl Context {
             Argument(Typed, Expr, &'a [Syntax], Option<Expr>),
             Apply(Typed, &'a [Syntax], Option<Expr>),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
+            Arrow(Option<Expr>),
+            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
         }
@@ -442,8 +463,26 @@ impl Context {
                     if let Syntax::Node { kind, args, .. } = syntax {
                         if kind == &parser_kind(&["Term", "let"]) {
                             let (name, annotation, value, body) = self.let_parts(args)?;
-                            tasks.push(Task::LetValue(name, annotation.clone(), body, expected));
-                            tasks.push(Task::Visit(value, annotation, true));
+                            if let Some(annotation) = annotation {
+                                tasks.push(Task::LetAnnotation(name, value, body, expected));
+                                tasks.push(Task::Visit(annotation, None, true));
+                            } else {
+                                tasks.push(Task::LetValue(name, None, body, expected));
+                                tasks.push(Task::Visit(value, None, true));
+                            }
+                            continue;
+                        }
+                        if kind == &parser_kind(&["Term", "arrow"]) {
+                            let [domain, arrow, codomain] = args.as_slice() else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            if !matches!(arrow, Syntax::Atom { val, .. } if val == "->" || val == "→")
+                            {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            tasks.push(Task::Arrow(expected));
+                            tasks.push(Task::Visit(codomain, None, true));
+                            tasks.push(Task::Visit(domain, None, true));
                             continue;
                         }
                         if kind == &parser_kind(&["Term", "app"]) {
@@ -538,6 +577,39 @@ impl Context {
                     }
                     values.push(self.finish_term(function, expected.as_ref())?);
                 }
+                Task::Arrow(expected) => {
+                    let right = values.pop().expect("arrow codomain visit");
+                    let left = values.pop().expect("arrow domain visit");
+                    let u = self.sort_level(&left)?;
+                    let v = self.sort_level(&right)?;
+                    let level =
+                        Level::imax(u, v).map_err(|_| failure(SourceInferenceError::Scope))?;
+                    let body = right
+                        .value
+                        .lift_loose(0, 1)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    let term = Typed {
+                        value: Expr::forall_e(
+                            Name::anonymous(),
+                            left.value,
+                            body,
+                            BinderInfo::Default,
+                        ),
+                        type_: Expr::sort(level),
+                    };
+                    values.push(self.finish_term(term, expected.as_ref())?);
+                }
+                Task::LetAnnotation(name, value, body, expected) => {
+                    let annotation = values.pop().expect("let annotation visit");
+                    self.sort_level(&annotation)?;
+                    tasks.push(Task::LetValue(
+                        name,
+                        Some(annotation.value.clone()),
+                        body,
+                        expected,
+                    ));
+                    tasks.push(Task::Visit(value, Some(annotation.value), true));
+                }
                 Task::LetValue(name, annotation, body, expected) => {
                     let mut value = values.pop().expect("let value visit");
                     if let Some(annotation) = annotation {
@@ -584,7 +656,7 @@ impl Context {
     fn let_parts<'a>(
         &mut self,
         parts: &'a [Syntax],
-    ) -> Result<(Name, Option<Expr>, &'a Syntax, &'a Syntax), NatDefinitionElabError> {
+    ) -> Result<(Name, Option<&'a Syntax>, &'a Syntax, &'a Syntax), NatDefinitionElabError> {
         let [keyword, config, declaration, separator, body] = parts else {
             return Err(failure(SourceInferenceError::Scope));
         };
@@ -621,15 +693,24 @@ impl Context {
             return Err(NatDefinitionElabError::AnonymousReferenceName);
         }
         expect_empty_null(&declaration[1], "empty let parameters")?;
-        let annotation = optional_scalar_type(
-            &declaration[2],
-            true,
-            "optional let type",
-            "scalar let type",
-        )?;
+        let annotation = optional_type_syntax(&declaration[2])?;
         expect_atom(&declaration[3], ":=", "let assignment")?;
         expect_atom(separator, ";", "let separator")?;
         Ok((name.clone(), annotation, &declaration[4], body))
+    }
+
+    fn sort_level(&mut self, term: &Typed) -> Result<Level, NatDefinitionElabError> {
+        let type_ = self.whnf(&term.type_)?;
+        let ExprNode::Sort { level } = type_.node() else {
+            return Err(failure(SourceInferenceError::ExpectedType));
+        };
+        Ok(level.clone())
+    }
+
+    fn type_term(&mut self, syntax: &Syntax) -> Result<Expr, NatDefinitionElabError> {
+        let term = self.term(syntax, None)?;
+        self.sort_level(&term)?;
+        Ok(term.value)
     }
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
@@ -648,6 +729,24 @@ impl Context {
         }
         Ok(Typed { value, type_ })
     }
+}
+
+fn optional_type_syntax(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinitionElabError> {
+    let parts = expect_null_args(syntax, "optional type")?;
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let [annotation] = parts else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    let parts = expect_node(
+        annotation,
+        &parser_kind(&["Term", "typeSpec"]),
+        2,
+        "type ascription",
+    )?;
+    expect_atom(&parts[0], ":", "type ascription colon")?;
+    Ok(Some(&parts[1]))
 }
 
 pub(super) fn definition(
@@ -699,46 +798,49 @@ pub(super) fn definition(
     )?;
     let mut parameters = Vec::new();
     for syntax in expect_null_args(&signature[0], "definition binders")? {
-        let parts = expect_node(
-            syntax,
-            &parser_kind(&["Term", "explicitBinder"]),
-            5,
-            "explicit binder",
-        )?;
-        expect_atom(&parts[0], "(", "binder opener")?;
-        expect_atom(&parts[4], ")", "binder closer")?;
-        expect_empty_null(&parts[3], "absent binder default")?;
+        let Syntax::Node { kind, .. } = syntax else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let (style, open, close, arity) = if kind == &parser_kind(&["Term", "implicitBinder"]) {
+            (BinderInfo::Implicit, "{", "}", 4)
+        } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {
+            (BinderInfo::StrictImplicit, "⦃", "⦄", 4)
+        } else if kind == &parser_kind(&["Term", "explicitBinder"]) {
+            (BinderInfo::Default, "(", ")", 5)
+        } else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let parts = expect_node(syntax, kind, arity, "typed binder")?;
+        expect_atom(&parts[0], open, "binder opener")?;
+        expect_atom(&parts[arity - 1], close, "binder closer")?;
+        if style == BinderInfo::Default {
+            expect_empty_null(&parts[3], "absent binder default")?;
+        }
         let names = expect_null_args(&parts[1], "binder names")?;
         if names.is_empty() {
             return Err(failure(SourceInferenceError::Scope));
         }
         let type_parts = expect_null_args(&parts[2], "binder type")?;
-        let [colon, Syntax::Ident { val: type_name, .. }] = type_parts else {
+        let [colon, type_syntax] = type_parts else {
             return Err(failure(SourceInferenceError::ExpectedType));
         };
         expect_atom(colon, ":", "binder type ascription")?;
-        let domain = scalar_type(type_name, true)
-            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let domain = context.type_term(type_syntax)?;
         for name in names {
             let Syntax::Ident { val: name, .. } = name else {
                 return Err(failure(SourceInferenceError::Scope));
             };
             let id = FVarId(context.fresh_name()?);
-            context.txn.lctx.add_param(
-                id.clone(),
-                name.clone(),
-                domain.clone(),
-                BinderInfo::Default,
-            );
-            parameters.push((id, name.clone(), domain.clone(), BinderInfo::Default));
+            context
+                .txn
+                .lctx
+                .add_param(id.clone(), name.clone(), domain.clone(), style);
+            parameters.push((id, name.clone(), domain.clone(), style));
         }
     }
-    let expected = optional_scalar_type(
-        &signature[1],
-        true,
-        "optional result type",
-        "scalar result type",
-    )?;
+    let expected = optional_type_syntax(&signature[1])?
+        .map(|syntax| context.type_term(syntax))
+        .transpose()?;
     let parts = expect_node(
         &definition[3],
         &parser_kind(&["Command", "declValSimple"]),
@@ -764,6 +866,7 @@ pub(super) fn definition(
     let mut term = context.finish(term)?;
     term.value = eta_expand_nondependent(term.value, &term.type_)?;
     for (id, name, domain, style) in parameters.into_iter().rev() {
+        let domain = context.instantiate(&domain)?;
         term.value = term
             .value
             .abstract_fvar(&id, 0)
@@ -774,6 +877,14 @@ pub(super) fn definition(
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         term.value = Expr::lam(name.clone(), domain.clone(), term.value, style);
         term.type_ = Expr::forall_e(name, domain, term.type_, style);
+    }
+    let term = context.finish(term)?;
+    if term.value.has_fvar()
+        || term.type_.has_fvar()
+        || term.value.has_loose_bvars()
+        || term.type_.has_loose_bvars()
+    {
+        return Err(failure(SourceInferenceError::Scope));
     }
     Ok(Declaration::Defn(DefinitionVal {
         base: ConstantVal {

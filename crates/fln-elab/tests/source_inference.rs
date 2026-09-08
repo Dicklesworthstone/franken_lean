@@ -203,3 +203,130 @@ fn query_entry_points_use_the_same_native_inference() {
         ));
     }
 }
+
+#[test]
+fn source_defined_implicit_identity_is_usable_by_the_next_declaration() {
+    let environment = env();
+    let identity = accepted("def identity {a : Type} (x : a) : a := x", &environment);
+    assert!(matches!(
+        identity.base.type_.node(),
+        ExprNode::ForallE {
+            binder_info: BinderInfo::Implicit,
+            ..
+        }
+    ));
+    let environment = publish(&environment, Declaration::Defn(identity));
+    let answer = accepted("def answer := identity 42", &environment);
+    assert_eq!(answer.base.type_, nat());
+    assert_eq!(
+        answer.value,
+        Expr::app(
+            Expr::app(Expr::const_(n("identity"), vec![]), nat()),
+            num(42)
+        )
+    );
+}
+
+#[test]
+fn strict_implicit_source_binders_are_inserted_before_explicit_arguments() {
+    let environment = env();
+    let identity = accepted("def strict ⦃a : Type⦄ (x : a) : a := x", &environment);
+    assert!(matches!(
+        identity.base.type_.node(),
+        ExprNode::ForallE {
+            binder_info: BinderInfo::StrictImplicit,
+            ..
+        }
+    ));
+    let environment = publish(&environment, Declaration::Defn(identity));
+    assert_eq!(
+        accepted("def value := strict 17", &environment).base.type_,
+        nat()
+    );
+}
+
+#[test]
+fn source_placeholder_type_argument_is_solved_by_a_later_argument() {
+    let environment = env();
+    let identity = accepted("def explicit (a : Type) (x : a) : a := x", &environment);
+    let environment = publish(&environment, Declaration::Defn(identity));
+    let result = accepted("def inferred := explicit _ 37", &environment);
+    assert_eq!(
+        result.value,
+        Expr::app(
+            Expr::app(Expr::const_(n("explicit"), vec![]), nat()),
+            num(37)
+        )
+    );
+}
+
+#[test]
+fn dependent_function_types_and_local_let_ascriptions_are_checked() {
+    let environment = env();
+    accepted(
+        "def apply {a b : Type} (f : a -> b) (x : a) : b := f x",
+        &environment,
+    );
+    accepted(
+        "def localType (a : Type) (x : a) : a := let y : a := x; y",
+        &environment,
+    );
+    accepted(
+        "def function (f : Nat → Nat) : Nat → Nat := f",
+        &environment,
+    );
+    accepted("def proposition (p : Prop) (h : p) : p := h", &environment);
+}
+
+#[test]
+fn unresolved_holes_in_unused_parameter_domains_are_still_refused() {
+    let environment = env();
+    assert!(
+        check_definition_source(b"def wrong (x : _) : Nat := 0", &environment, budget()).is_err()
+    );
+    assert!(
+        check_definition_source(b"def wrong : Nat := polyId _", &environment, budget()).is_err()
+    );
+    assert!(
+        check_definition_source(b"def wrong (x : 1) : Nat := 0", &environment, budget()).is_err()
+    );
+}
+
+#[test]
+fn dependent_source_syntax_retains_original_bytes() {
+    let source = "def id {α : Type} (f : α → α) (x : α) : α := f x\r\n";
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    assert_eq!(
+        parsed.reconstruct_normalized().unwrap(),
+        source.replace("\r\n", "\n").as_bytes()
+    );
+}
+
+#[test]
+fn implicit_type_arguments_may_be_functions_not_just_scalar_names() {
+    let environment = env();
+    accepted(
+        "def higher (f : Nat -> Nat) : Nat -> Nat := polyId f",
+        &environment,
+    );
+    accepted(
+        "def higherCall (f : Nat -> Nat) : Nat := (polyId f) 5",
+        &environment,
+    );
+}
+
+#[test]
+fn escaped_keywords_resolve_as_identifiers_not_as_universes_or_holes() {
+    let environment = env();
+    for keyword in ["Type", "Prop", "_"] {
+        let source = format!("def «{keyword}» : Nat := 7");
+        let declaration = accepted(&source, &environment);
+        let environment = publish(&environment, Declaration::Defn(declaration));
+        let usage = format!("def result : Nat := «{keyword}»");
+        assert_eq!(
+            accepted(&usage, &environment).value,
+            Expr::const_(n(keyword), vec![])
+        );
+    }
+}
