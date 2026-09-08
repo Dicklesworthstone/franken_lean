@@ -118,6 +118,23 @@ fn exported_and_private_names(chain: &ChainBytes) -> (Vec<String>, Vec<String>) 
 /// The exact constant `franken_lean-timy` names as never decoded.
 const TIMY_WITNESS: &str = "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1";
 
+#[test]
+fn private_extension_payloads_capture_objects_from_the_companion_chain() {
+    let lib = lib_or_skip!("private_extension_payloads_capture_objects_from_the_companion_chain");
+    let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
+    let view = OleanView::parse_with_dependencies(
+        &chain.private, &[&chain.exported, &chain.server],
+    ).unwrap();
+    let blocks = view.extension_payloads(WalkBudget::default(), 64 * 1024 * 1024)
+        .expect("a complete private chain must retain its real opaque extension entries");
+    assert!(blocks.iter().any(|block| !block.entries.is_empty()));
+    for block in &blocks {
+        for payload in &block.entries {
+            fln_rt::region::audit(payload, 0).expect("captured entry is a standalone region");
+        }
+    }
+}
+
 /// A private-mangled declaration that is deliberately present in Init.Prelude's
 /// exported array as well as its companion chain.
 const HEAD_INFO_LOOP_UNSAFE_REC: &str =
