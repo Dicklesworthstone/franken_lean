@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: fln-elab-native-${{ github.ref }}
@@ -21,7 +21,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Install the configured compiler for functional testing
+        with:
+          persist-credentials: false
+      - name: Install configured compiler
         id: compiler
         shell: bash
         run: |
@@ -30,19 +32,7 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv
           git rev-parse HEAD
-      - name: Format the authored elaborator files when explicitly requested
-        if: >-
-          startsWith(github.event.head_commit.message, 'style(elab): format native elaborator additions')
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/elab-functional
-          rustfmt --edition 2024 crates/fln-elab/src/constraint.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/residual.rs crates/fln-elab/src/mvar.rs crates/fln-elab/src/universe.rs crates/fln-elab/src/txn.rs crates/fln-elab/tests/native_unification.rs
-          git diff --check
-          git diff --stat
-          git diff > target/elab-functional/rustfmt.patch
-      - name: Check, test, and lint the actual elaborator package
-        id: functional
+      - name: Check test and lint elaborator
         shell: bash
         run: |
           set +e
@@ -56,35 +46,37 @@ jobs:
           clippy_status=${PIPESTATUS[0]}
           printf 'check=%s test=%s clippy=%s\n' "$check_status" "$test_status" "$clippy_status" | tee target/elab-functional/result.txt
           test "$check_status" -eq 0 && test "$test_status" -eq 0 && test "$clippy_status" -eq 0
-      - name: Compile downstream workspace targets
+      - name: Check downstream targets
         if: always() && steps.compiler.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/elab-functional
           cargo check --locked --workspace --all-targets 2>&1 | tee target/elab-functional/workspace-check.log
-      - name: Publish only the tested formatting, without rewriting concurrent work
+      - name: Export exact offline verification inputs
         if: >-
-          always() && steps.functional.outcome == 'success' && startsWith(github.event.head_commit.message, 'style(elab): format native elaborator additions')
+          success() && startsWith(github.event.head_commit.message, 'test(elab): retain an offline source snapshot')
         shell: bash
         run: |
           set -euo pipefail
-          paths=(crates/fln-elab/src/constraint.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/residual.rs crates/fln-elab/src/mvar.rs crates/fln-elab/src/universe.rs crates/fln-elab/src/txn.rs crates/fln-elab/tests/native_unification.rs)
-          while IFS= read -r path; do
-            case "$path" in
-              crates/fln-elab/src/constraint.rs|crates/fln-elab/src/constraint/unify.rs|crates/fln-elab/src/constraint/unify/residual.rs|crates/fln-elab/src/mvar.rs|crates/fln-elab/src/universe.rs|crates/fln-elab/src/txn.rs|crates/fln-elab/tests/native_unification.rs) ;;
-              *) printf 'Unexpected changed file: %s\n' "$path" >&2; exit 1 ;;
-            esac
-          done < <(git diff --name-only)
-          if ! git diff --quiet; then
-            git config user.name 'FrankenLean formatting'
-            git config user.email 'noreply@github.com'
-            git add -- "${paths[@]}"
-            git commit -m 'style(elab): rustfmt verified native unification and transaction code'
-            git push origin HEAD:main
-          fi
-          git rev-parse HEAD | tee target/elab-functional/published-commit.txt
-      - name: Retain functional test logs
+          mkdir -p target/elab-offline
+          git archive --format=tar.gz HEAD > target/elab-offline/source.tar.gz
+          toolchain="$(rustc --print sysroot)"
+          tar -C "$toolchain" -czf target/elab-offline/compiler.tar.gz bin lib
+          git rev-parse HEAD > target/elab-offline/source-commit.txt
+          rustc -Vv > target/elab-offline/compiler.txt
+          sha256sum target/elab-offline/source.tar.gz target/elab-offline/compiler.tar.gz > target/elab-offline/SHA256SUMS
+      - name: Retain offline verification inputs
+        if: >-
+          success() && startsWith(github.event.head_commit.message, 'test(elab): retain an offline source snapshot')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: elab-offline-${{ github.sha }}
+          path: target/elab-offline
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+      - name: Retain functional logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
