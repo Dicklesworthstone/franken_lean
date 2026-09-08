@@ -2,7 +2,7 @@
 schema fln-extern-builtin-environment/1
 extractor	lean-reference-environment-walk-v2
 extern-census-sha256	4226ffe647fbb03f1224b3bc1562cb37c9d4fc7470d643722f7ba84734099899
-builtin-environment-sha256	5eef2953a2748faaa9256e906785e93916d827deede26f19ce762647ea4df559
+builtin-environment-sha256	27c97a4d1a2b9eb537c47a60e65c7504363087a4eab246d0dabe0a4962b53910
 builtin-partition-sha256	fda0fca83a69a46222475f2bdb326c2a313fb21a2dfebef8fe6cf0ba507dd496
 partition-policy-sha256	db2d3d1688cd767534521912fb8b399b2efcceb7322b2d5adceaf210480df288
 constant-count	204543
@@ -13,4 +13,4 @@ toolchain-api-count	76938
 library-code-count	117149
 user-facing-data-count	10456
 unresolved-count	0
-manifest-root	sha256:dc0d4867e37fc5d49828b6b94fdb3c6f14e313309b46f95c57b6e9177cf852b5
+manifest-root	sha256:601f19beb63fbde37443435104a1a83d7f5d2cb3794b4399bcb50d3ece269d95

@@ -7,7 +7,7 @@
 //! to `contracts/EXTERN_ROW_CONTRACT.txt` by `EXTERN_ROW_CONTRACT_ROOT`.
 
 /// The terminal `contract-root` of the canonical contract this table projects.
-pub const EXTERN_ROW_CONTRACT_ROOT: &str = "fnv1a64:ddb08efcde8a0882";
+pub const EXTERN_ROW_CONTRACT_ROOT: &str = "fnv1a64:9932dd40685b92f3";
 /// The declared anti-vacuity population of the pin's extern census.
 pub const EXTERN_ROW_COUNT: usize = 954;
 
