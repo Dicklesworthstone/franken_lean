@@ -15,6 +15,7 @@ def main():
     edit(path,'enum MultiplexerCommand {','enum MultiplexerCommand {\n    SourceCheck { paths: Vec<PathBuf>, max_bytes: usize, json: bool },')
     edit(path,'    if command == "run" {','    if command == "check-source" {\n        return source_check::parse(arguments.collect());\n    }\n    if command == "run" {')
     edit(path,'        Ok(MultiplexerCommand::SourceRun {','        Ok(MultiplexerCommand::SourceCheck { paths, max_bytes, json }) => source_check::run(paths, max_bytes, json),\n        Ok(MultiplexerCommand::SourceRun {')
-    edit(path,'const USAGE: &str = concat!(','const USAGE: &str = concat!(\n    "fln check-source [--json] [--max-bytes BYTES] PATH...\\n",\n    "  Check import-free definitions and theorems without executing code.\\n",')
+    anchor='    "  fln check-olean [--json] [--receipts PATH] [--max-bytes BYTES] PATH\\n",\n'
+    edit(path,anchor,anchor+'    "  fln check-source [--json] [--max-bytes BYTES] PATH...\\n",\n    "    Check import-free definitions and theorems without executing code.\\n",\n')
     for path,text in updates.items(): (ROOT/path).write_text(text)
 if __name__=='__main__': main()
