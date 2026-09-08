@@ -2066,7 +2066,9 @@ pub fn prepare_module_apply_batch_with<E: From<ModuleApplyBatchPrepareError>>(
     if let Err(error) = base.verify() {
         return Outcome::complete(Err(ModuleApplyBatchPrepareError::BaseState(error).into()));
     }
-    let mut staged = Vec::with_capacity(stage_count);
+    // A decoder may refuse before producing its first stage. Do not allocate
+    // from an untrusted count before that callback can return a typed stop.
+    let mut staged = Vec::new();
     let mut current = base.clone();
     for position in 0..stage_count {
         let (preflight, candidate_environment) =
@@ -5501,6 +5503,25 @@ mod tests {
             Outcome::Complete(Err(ModuleApplyBatchPrepareError::Empty)) => {}
             other => panic!("expected the empty-batch refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stage_count_does_not_allocate_before_the_input_can_stop() {
+        let base = empty_base();
+        let mut called = false;
+        let stop = Inconclusive::cancelled("before-batch-input");
+        let outcome = prepare_module_apply_batch_with::<ModuleApplyBatchPrepareError>(
+            usize::MAX,
+            &base,
+            |position, _, _| {
+                assert_eq!(position, 0);
+                called = true;
+                Outcome::Inconclusive(stop.clone())
+            },
+        );
+        assert!(called);
+        assert!(matches!(outcome, Outcome::Inconclusive(actual) if actual == stop));
+        assert!(base.graph().is_empty());
     }
 
     /// Deterministic test-local xorshift64* — the closed universe has no
