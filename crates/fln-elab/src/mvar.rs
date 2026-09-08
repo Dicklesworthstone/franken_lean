@@ -1,7 +1,7 @@
 //! Expression metavariable store (`MetavarStore`) and dependency graph for Athanor (plan §10.1).
 //!
 //! Provides explicit metavariable declarations, kinds (Natural, Synthetic, SyntheticOpaque),
-//! delayed assignments, assignment justifications, recursive instantiation, occurs-check,
+//! delayed assignments, assignment justifications, DAG-preserving instantiation, occurs-check,
 //! and targeted wake-up dependency tracking.
 
 use crate::lctx::LocalContext;
@@ -106,6 +106,32 @@ pub struct MetavarStore {
     readers: HashMap<MVarId, HashSet<MVarId>>,
 }
 
+/// Expression children, including metadata. One inventory serves substitution
+/// and dependency discovery so a container cannot be transparent to only one.
+fn expression_children(expr: &Expr) -> [Option<&Expr>; 3] {
+    match expr.node() {
+        ExprNode::App { f, a } => [Some(f), Some(a), None],
+        ExprNode::Lam {
+            binder_type, body, ..
+        }
+        | ExprNode::ForallE {
+            binder_type, body, ..
+        } => [Some(binder_type), Some(body), None],
+        ExprNode::LetE {
+            type_, value, body, ..
+        } => [Some(type_), Some(value), Some(body)],
+        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+            [Some(expr), None, None]
+        }
+        ExprNode::BVar { .. }
+        | ExprNode::FVar { .. }
+        | ExprNode::MVar { .. }
+        | ExprNode::Sort { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Lit { .. } => [None, None, None],
+    }
+}
+
 impl MetavarStore {
     pub fn new() -> Self {
         Self::default()
@@ -159,12 +185,10 @@ impl MetavarStore {
         depth: u32,
         origin: Option<Name>,
     ) -> &MetavarDecl {
-        // Collect mvars read by the type and register readership
         let read_mvars = self.collect_mvars(&type_);
         for read in read_mvars {
             self.readers.entry(read).or_default().insert(id.clone());
         }
-
         self.decls.insert(
             id.clone(),
             MetavarDecl {
@@ -181,11 +205,10 @@ impl MetavarStore {
         self.decls.get(&id).unwrap()
     }
 
-    /// Check if `id` occurs in `expr` after instantiated assignments.
+    /// Check if `id` occurs after following assigned metavariables. No expanded
+    /// expression is allocated merely to decide whether an assignment is cyclic.
     pub fn occurs_check(&self, id: &MVarId, expr: &Expr) -> bool {
-        let instantiated = self.instantiate(expr);
-        let mvars = self.collect_mvars(&instantiated);
-        mvars.contains(id)
+        self.collect_mvars(expr).contains(id)
     }
 
     /// Assign a metavariable with justification.
@@ -210,10 +233,7 @@ impl MetavarStore {
         if self.occurs_check(&id, &val) {
             return Err(MetavarError::OccursCheckFailed { id });
         }
-
-        // Compute wake-ups: all entities that read `id`
         let wake_ups = self.targeted_wake_up(&id);
-
         self.assignments.insert(
             id,
             MetavarAssignment {
@@ -221,7 +241,6 @@ impl MetavarStore {
                 justification,
             },
         );
-
         Ok(wake_ups)
     }
 
@@ -235,135 +254,330 @@ impl MetavarStore {
         self.readers.get(id).cloned().unwrap_or_default()
     }
 
-    /// Instantiate all assigned metavariables in `expr`.
+    /// Instantiate assigned metavariables with an explicit postorder worklist.
+    /// Every reachable input node is visited once, including through assignment
+    /// chains. Rebuilt shared subterms stay shared; unchanged nodes are reused.
+    ///
+    /// Node addresses are local memo keys only, never ordering or persisted
+    /// identity. Input roots and assignments stay borrowed for the whole walk,
+    /// so an input allocation cannot disappear and have its address reused.
     pub fn instantiate(&self, expr: &Expr) -> Expr {
-        if self.assignments.is_empty() || !expr.data().has_expr_mvar() {
+        if self.assignments.is_empty() || !expr.has_expr_mvar() {
             return expr.clone();
         }
-        self.instantiate_inner(expr)
-    }
-
-    fn instantiate_inner(&self, expr: &Expr) -> Expr {
-        match expr.node() {
-            ExprNode::MVar { id } => {
-                if let Some(assignment) = self.assignments.get(id) {
-                    self.instantiate_inner(&assignment.expr)
-                } else {
-                    expr.clone()
-                }
+        let mut done: HashMap<*const ExprNode, Expr> = HashMap::new();
+        let mut pending = vec![(expr, false)];
+        while let Some((current, exit)) = pending.pop() {
+            let key = std::ptr::from_ref(current.node());
+            if done.contains_key(&key) {
+                continue;
             }
-            ExprNode::App { f, a } => {
-                let new_f = self.instantiate_inner(f);
-                let new_a = self.instantiate_inner(a);
-                if &new_f == f && &new_a == a {
-                    expr.clone()
-                } else {
-                    Expr::app(new_f, new_a)
-                }
+            if !current.has_expr_mvar() {
+                done.insert(key, current.clone());
+                continue;
             }
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let new_type = self.instantiate_inner(binder_type);
-                let new_body = self.instantiate_inner(body);
-                if &new_type == binder_type && &new_body == body {
-                    expr.clone()
-                } else {
-                    Expr::lam(binder_name.clone(), new_type, new_body, *binder_info)
+            if !exit {
+                pending.push((current, true));
+                match current.node() {
+                    ExprNode::MVar { id } => {
+                        if let Some(assignment) = self.assignments.get(id) {
+                            pending.push((&assignment.expr, false));
+                        }
+                    }
+                    _ => {
+                        for child in expression_children(current).into_iter().flatten() {
+                            pending.push((child, false));
+                        }
+                    }
                 }
+                continue;
             }
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let new_type = self.instantiate_inner(binder_type);
-                let new_body = self.instantiate_inner(body);
-                if &new_type == binder_type && &new_body == body {
-                    expr.clone()
-                } else {
-                    Expr::forall_e(binder_name.clone(), new_type, new_body, *binder_info)
+            let child = |input: &Expr| {
+                done.get(&std::ptr::from_ref(input.node()))
+                    .expect("postorder substitution finishes each child first")
+                    .clone()
+            };
+            let result = if let ExprNode::MVar { id } = current.node() {
+                self.assignments
+                    .get(id)
+                    .map_or_else(|| current.clone(), |assignment| child(&assignment.expr))
+            } else if expression_children(current)
+                .into_iter()
+                .flatten()
+                .all(|input| std::ptr::eq(child(input).node(), input.node()))
+            {
+                current.clone()
+            } else {
+                match current.node() {
+                    ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+                    ExprNode::Lam {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } => Expr::lam(
+                        binder_name.clone(),
+                        child(binder_type),
+                        child(body),
+                        *binder_info,
+                    ),
+                    ExprNode::ForallE {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } => Expr::forall_e(
+                        binder_name.clone(),
+                        child(binder_type),
+                        child(body),
+                        *binder_info,
+                    ),
+                    ExprNode::LetE {
+                        decl_name,
+                        type_,
+                        value,
+                        body,
+                        non_dep,
+                    } => Expr::let_e(
+                        decl_name.clone(),
+                        child(type_),
+                        child(value),
+                        child(body),
+                        *non_dep,
+                    ),
+                    ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => Expr::proj(struct_name.clone(), *idx, child(expr)),
+                    ExprNode::BVar { .. }
+                    | ExprNode::FVar { .. }
+                    | ExprNode::MVar { .. }
+                    | ExprNode::Sort { .. }
+                    | ExprNode::Const { .. }
+                    | ExprNode::Lit { .. } => current.clone(),
                 }
-            }
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => {
-                let new_type = self.instantiate_inner(type_);
-                let new_val = self.instantiate_inner(value);
-                let new_body = self.instantiate_inner(body);
-                if &new_type == type_ && &new_val == value && &new_body == body {
-                    expr.clone()
-                } else {
-                    Expr::let_e(decl_name.clone(), new_type, new_val, new_body, *non_dep)
-                }
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr: inner,
-            } => {
-                let new_inner = self.instantiate_inner(inner);
-                if &new_inner == inner {
-                    expr.clone()
-                } else {
-                    Expr::proj(struct_name.clone(), *idx, new_inner)
-                }
-            }
-            _ => expr.clone(),
+            };
+            done.insert(key, result);
         }
+        done.remove(&std::ptr::from_ref(expr.node()))
+            .expect("postorder substitution finishes the root")
     }
 
-    /// Collect all unassigned metavariables appearing in `expr`.
+    /// Collect unassigned metavariables through every expression container and
+    /// assignment edge. Shared terms and repeated assignment references are
+    /// scanned once, without recursion or expression expansion.
     pub fn collect_mvars(&self, expr: &Expr) -> HashSet<MVarId> {
         let mut mvars = HashSet::new();
-        self.collect_mvars_into(expr, &mut mvars);
+        let mut visited = HashSet::new();
+        let mut pending = vec![expr];
+        while let Some(current) = pending.pop() {
+            if !current.has_expr_mvar()
+                || !visited.insert(std::ptr::from_ref(current.node()))
+            {
+                continue;
+            }
+            match current.node() {
+                ExprNode::MVar { id } => {
+                    if let Some(assignment) = self.assignments.get(id) {
+                        pending.push(&assignment.expr);
+                    } else {
+                        mvars.insert(id.clone());
+                    }
+                }
+                _ => pending.extend(expression_children(current).into_iter().flatten()),
+            }
+        }
         mvars
     }
+}
 
-    fn collect_mvars_into(&self, expr: &Expr, mvars: &mut HashSet<MVarId>) {
-        if !expr.data().has_expr_mvar() {
-            return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_core::expr::BinderInfo;
+    use fln_core::level::Level;
+    use fln_core::options::KVMap;
+
+    fn declare(store: &mut MetavarStore, name: &str) -> MVarId {
+        let id = MVarId(Name::from_components([name]));
+        store.declare(
+            id.clone(),
+            id.0.clone(),
+            Expr::sort(Level::one()),
+            LocalContext::new(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        id
+    }
+
+    fn metadata(expr: Expr) -> Expr {
+        Expr::mdata(KVMap::new(), expr)
+    }
+
+    #[test]
+    fn metadata_cannot_hide_a_direct_cycle_and_refusal_is_atomic() {
+        let mut store = MetavarStore::new();
+        let id = declare(&mut store, "m");
+        let before = store.clone();
+        assert_eq!(
+            store.assign(
+                id.clone(),
+                metadata(Expr::mvar(id.clone())),
+                AssignmentJustification::DirectDefEq,
+            ),
+            Err(MetavarError::OccursCheckFailed { id }),
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn metadata_cannot_hide_a_cycle_through_an_assignment() {
+        let mut store = MetavarStore::new();
+        let a = declare(&mut store, "a");
+        let b = declare(&mut store, "b");
+        store
+            .assign(
+                a.clone(),
+                metadata(Expr::mvar(b.clone())),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let before = store.clone();
+        assert_eq!(
+            store.assign(
+                b.clone(),
+                metadata(Expr::mvar(a)),
+                AssignmentJustification::DirectDefEq,
+            ),
+            Err(MetavarError::OccursCheckFailed { id: b }),
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn metadata_and_unassigned_dependencies_survive_substitution() {
+        let mut store = MetavarStore::new();
+        let a = declare(&mut store, "a");
+        let b = declare(&mut store, "b");
+        store
+            .assign(
+                a.clone(),
+                metadata(Expr::mvar(b.clone())),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let input = metadata(Expr::mvar(a));
+        assert_eq!(store.collect_mvars(&input), HashSet::from([b.clone()]));
+        assert_eq!(store.instantiate(&input), metadata(metadata(Expr::mvar(b.clone()))));
+        let value = Expr::sort(Level::zero());
+        store
+            .assign(b, value.clone(), AssignmentJustification::DirectDefEq)
+            .unwrap();
+        assert_eq!(store.instantiate(&input), metadata(metadata(value)));
+        assert!(store.collect_mvars(&input).is_empty());
+    }
+
+    #[test]
+    fn every_expression_container_is_substituted() {
+        let mut store = MetavarStore::new();
+        let id = declare(&mut store, "m");
+        let name = Name::from_components(["x"]);
+        let build = |term: Expr| {
+            Expr::let_e(
+                name.clone(),
+                term.clone(),
+                Expr::lam(
+                    name.clone(),
+                    term.clone(),
+                    Expr::app(term.clone(), Expr::bvar(0).unwrap()),
+                    BinderInfo::Implicit,
+                ),
+                Expr::forall_e(
+                    name.clone(),
+                    term.clone(),
+                    Expr::proj(name.clone(), 2, metadata(term)),
+                    BinderInfo::InstImplicit,
+                ),
+                true,
+            )
+        };
+        let input = build(Expr::mvar(id.clone()));
+        assert_eq!(store.collect_mvars(&input), HashSet::from([id.clone()]));
+        let value = Expr::sort(Level::zero());
+        store
+            .assign(id, value.clone(), AssignmentJustification::DirectDefEq)
+            .unwrap();
+        assert_eq!(store.instantiate(&input), build(value));
+    }
+
+    #[test]
+    fn an_unaffected_open_subterm_keeps_its_identity() {
+        let mut store = MetavarStore::new();
+        let assigned = declare(&mut store, "assigned");
+        let open = declare(&mut store, "open");
+        store
+            .assign(
+                assigned,
+                Expr::sort(Level::zero()),
+                AssignmentJustification::DirectDefEq,
+            )
+            .unwrap();
+        let input = metadata(Expr::mvar(open));
+        let output = store.instantiate(&input);
+        assert!(std::ptr::eq(input.node(), output.node()));
+    }
+
+    #[test]
+    fn exponentially_shared_input_is_not_expanded_into_a_tree() {
+        let mut store = MetavarStore::new();
+        let id = declare(&mut store, "m");
+        let mut input = Expr::mvar(id.clone());
+        for _ in 0..60 {
+            input = Expr::app(input.clone(), input);
         }
-        match expr.node() {
-            ExprNode::MVar { id } => {
-                if let Some(assignment) = self.assignments.get(id) {
-                    self.collect_mvars_into(&assignment.expr, mvars);
-                } else {
-                    mvars.insert(id.clone());
+        assert_eq!(store.collect_mvars(&input), HashSet::from([id.clone()]));
+        let value = Expr::sort(Level::zero());
+        store
+            .assign(id, value.clone(), AssignmentJustification::DirectDefEq)
+            .unwrap();
+        let mut output = store.instantiate(&input);
+        for _ in 0..60 {
+            let ExprNode::App { f, a } = output.node() else {
+                panic!("shared application shape must be retained");
+            };
+            assert!(std::ptr::eq(f.node(), a.node()));
+            output = f.clone();
+        }
+        assert_eq!(output, value);
+    }
+
+    #[test]
+    fn deep_substitution_and_occurs_check_fit_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut store = MetavarStore::new();
+                let id = declare(&mut store, "m");
+                let mut input = Expr::mvar(id.clone());
+                for _ in 0..20_000 {
+                    input = metadata(input);
                 }
-            }
-            ExprNode::App { f, a } => {
-                self.collect_mvars_into(f, mvars);
-                self.collect_mvars_into(a, mvars);
-            }
-            ExprNode::Lam {
-                binder_type, body, ..
-            }
-            | ExprNode::ForallE {
-                binder_type, body, ..
-            } => {
-                self.collect_mvars_into(binder_type, mvars);
-                self.collect_mvars_into(body, mvars);
-            }
-            ExprNode::LetE {
-                type_, value, body, ..
-            } => {
-                self.collect_mvars_into(type_, mvars);
-                self.collect_mvars_into(value, mvars);
-                self.collect_mvars_into(body, mvars);
-            }
-            ExprNode::Proj { expr, .. } => {
-                self.collect_mvars_into(expr, mvars);
-            }
-            _ => {}
-        }
+                assert!(store.occurs_check(&id, &input));
+                store
+                    .assign(
+                        id,
+                        Expr::sort(Level::zero()),
+                        AssignmentJustification::DirectDefEq,
+                    )
+                    .unwrap();
+                assert!(!store.instantiate(&input).has_expr_mvar());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
