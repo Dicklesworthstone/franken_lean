@@ -11,7 +11,7 @@ permissions:
 jobs:
   source-inference:
     if: >-
-      startsWith(github.event.head_commit.message, 'feat(elab): land tested bidirectional source inference')
+      startsWith(github.event.head_commit.message, 'feat(elab): land dependent source signatures')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -22,61 +22,36 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv
-      - name: Recover and verify exact tested source patches
+      - name: Verify and apply exact implementation patch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p target/source-landing
-          for sha in 81b5b7bd3e53df33bcfdb9f166bf51058276e5ef e0ef853c40138187ef2261a8021f89056e42906e; do
-            curl --fail --silent --show-error -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/$sha" > "target/source-landing/$sha.json"
-          done
+          curl --fail --silent --show-error -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/d70c2f62ff1e83a04771d6a00ac4257659c0cb0e > target/source-landing/blob.json
           python3 -I - <<'PY'
           import base64, gzip, hashlib, json, pathlib
           root = pathlib.Path('target/source-landing')
-          content = ''.join(json.loads((root / '81b5b7bd3e53df33bcfdb9f166bf51058276e5ef.json').read_text())['content'].split())
-          content = content.replace('PbRWuvxa2Op', 'PbRWuvxaOp')
-          content += '=' * (-len(content) % 4)
-          patch = gzip.decompress(base64.b64decode(content, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '1f550b3dee4d4572eee942c5ca0a419baa412dc399842e83855c66897c0098cb'
+          encoded = base64.b64decode(json.loads((root / 'blob.json').read_text())['content'])
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'f40e40f34a174963075f16411d1aa42bcfd4d16eb7a40f177058b377b0fdf2bb'
           (root / 'source.patch').write_bytes(patch)
-          content = json.loads((root / 'e0ef853c40138187ef2261a8021f89056e42906e.json').read_text())['content']
-          patch = base64.b64decode(content)
-          assert hashlib.sha256(patch).hexdigest() == '67a24973de0fa209b5ee126589611c4691d2e434d371f86812bdba13c5378018'
-          (root / 'diagnostic.patch').write_bytes(patch)
           PY
           git apply --check --index target/source-landing/source.patch
           git apply --index target/source-landing/source.patch
-          git apply --check --index target/source-landing/diagnostic.patch
-          git apply --index target/source-landing/diagnostic.patch
-          cat > target/source-landing/engine-error.patch <<'PATCH'
-          diff --git a/crates/fln/src/lib.rs b/crates/fln/src/lib.rs
-          --- a/crates/fln/src/lib.rs
-          +++ b/crates/fln/src/lib.rs
-          @@ -6169,3 +6169,4 @@
-          -/// A completed refusal before Golem execution. Non-answers live in `Outcome`.
-          -#[derive(Debug, Clone, PartialEq, Eq)]
-          +/// A refusal before Golem execution. Inference failures retain typed causes,
-          +/// including complete kernel nonanswers from speculative assignment checks.
-          +#[derive(Debug, Clone, PartialEq)]
-           pub enum EngineExecutionError {
-          PATCH
-          git apply --check --index target/source-landing/engine-error.patch
-          git apply --index target/source-landing/engine-error.patch
           python3 -I - <<'PY'
           import subprocess
-          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          expected = {'crates/fln-elab/src/constraint/unify.rs', 'crates/fln-elab/src/lib.rs', 'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/levels.rs', 'crates/fln-elab/src/source_diagnostic.rs', 'crates/fln-elab/tests/source_inference.rs', 'crates/fln/src/lib.rs'}
-          assert actual == expected, (actual, expected)
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert paths == {'crates/fln-parse/src/lib.rs', 'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/infer.rs', 'crates/fln-elab/tests/source_inference.rs'}, paths
           PY
-      - name: Verify source implementation
+      - name: Verify parser elaborator and engine
         run: |
           set -euo pipefail
           git diff --cached --check
-          rustfmt --edition 2024 --check crates/fln-elab/src/source.rs crates/fln-elab/src/lib.rs crates/fln-elab/src/constraint/unify.rs crates/fln-elab/tests/source_inference.rs crates/fln/src/lib.rs
-          cargo check --locked -p fln-elab --all-targets 2>&1 | tee target/source-landing/check.log
+          rustfmt --edition 2024 --check crates/fln-parse/src/lib.rs crates/fln-elab/src/source.rs crates/fln-elab/tests/source_inference.rs
+          cargo test --locked -p fln-parse --lib --no-fail-fast 2>&1 | tee target/source-landing/parser-test.log
           cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/source-landing/test.log
-          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/source-landing/clippy.log
+          cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings 2>&1 | tee target/source-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/source-landing/workspace.log
           cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/source-landing/engine-test.log
       - name: Commit verified implementation directly to main
@@ -84,7 +59,7 @@ jobs:
           set -euo pipefail
           git config user.name 'FrankenLean implementation'
           git config user.email 'noreply@github.com'
-          git commit -m 'feat(elab): infer source implicit and universe arguments through native unification'
+          git commit -m 'feat(elab): elaborate source dependent and implicit binder signatures'
           git push origin HEAD:main
           git rev-parse HEAD | tee target/source-landing/published-commit.txt
       - name: Retain validation
