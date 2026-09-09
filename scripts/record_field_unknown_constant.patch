@@ -1,0 +1,25 @@
+diff --git a/crates/fln-elab/src/source/record_terms.rs b/crates/fln-elab/src/source/record_terms.rs
+index b3b284e..470e4d5 100644
+--- a/crates/fln-elab/src/source/record_terms.rs
++++ b/crates/fln-elab/src/source/record_terms.rs
+@@ -88,8 +88,18 @@ impl Context {
+                 None
+             };
+             if let Some(mut receiver) = receiver {
+-                for field in suffix.iter().rev() {
+-                    receiver = self.record_field(receiver, field)?;
++                for (index, field) in suffix.iter().rev().enumerate() {
++                    receiver = match self.record_field(receiver, field) {
++                        Ok(term) => term,
++                        Err(NatDefinitionElabError::Inference(
++                            SourceInferenceError::RecordTerm(RecordTermError::ExpectedRecordType),
++                        )) if index == 0 => {
++                            // A namespace prefix such as Nat is not a receiver.
++                            // Keep its missing constant on the original path.
++                            return Ok(None);
++                        }
++                        Err(error) => return Err(error),
++                    };
+                 }
+                 return Ok(Some(receiver));
+             }
