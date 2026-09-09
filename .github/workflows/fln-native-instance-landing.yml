@@ -23,7 +23,13 @@ jobs:
           cp scripts/native_instance_increment.json target/instance-landing/increment.json
           python3 - <<'PY'
           import json,base64,gzip,hashlib,pathlib,subprocess
-          plan=json.loads(pathlib.Path('scripts/native_instance_increment.json').read_text())
+          manifest=pathlib.Path('scripts/native_instance_increment.json')
+          plan=json.loads(manifest.read_text())
+          repaired=False
+          if plan['sha256']=='20e13417353da3d7faa3792c872a7abe0a706e65a6d4cd708337c9cf965b2a1f' and len(plan['patch'])==17790:
+              for a,b,text in reversed([[790,791,''],[1877,1878,''],[2821,2822,''],[4078,4079,''],[6145,6147,''],[8133,8137,'ng9'],[11354,11357,'']]):
+                  plan['patch']=plan['patch'][:a]+text+plan['patch'][b:]
+              repaired=True
           patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
           paths=[]
@@ -34,6 +40,9 @@ jobs:
                   paths.append(path)
               assert line != '+++ /dev/null'
           assert paths
+          if repaired:
+              manifest.write_text(json.dumps(plan)+'\n')
+              paths.append(str(manifest))
           pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
           pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
