@@ -136,6 +136,10 @@ impl Context {
         Ok(Level::mvar(LMVarId(self.fresh_name()?)))
     }
 
+    fn type_expected(&mut self) -> Result<Expr, NatDefinitionElabError> {
+        Ok(Expr::sort(self.level()?))
+    }
+
     fn hole(&mut self, type_: Expr) -> Result<Expr, NatDefinitionElabError> {
         let name = self.fresh_name()?;
         let id = MVarId(name.clone());
@@ -427,6 +431,36 @@ impl Context {
         }
     }
 
+    fn constrain_type(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        // Source type conversion unfolds safe definitions, including dictionary
+        // projections. Instance candidate matching retains its narrower policy.
+        let actual = self.instantiate(actual)?;
+        let expected = self.instantiate(expected)?;
+        // Preserve a named type when assigning an unknown expected type; its
+        // identity may determine which class instance is eligible.
+        let actual = if matches!(expected.node(), ExprNode::MVar { .. })
+            && matches!(
+                actual.node(),
+                ExprNode::Const { .. } | ExprNode::FVar { .. }
+            ) {
+            actual
+        } else {
+            self.whnf(&actual)?
+        };
+        // An unknown type must retain the named target it is assigned. Unfolding
+        // Alias here would make inferInstance accept a non-reducible class head.
+        let expected = if matches!(actual.node(), ExprNode::MVar { .. }) {
+            expected
+        } else {
+            self.whnf(&expected)?
+        };
+        self.constrain(&actual, &expected)
+    }
+
     fn constrain(&mut self, actual: &Expr, expected: &Expr) -> Result<(), NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
@@ -478,13 +512,13 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         loop {
             self.tick()?;
-            term.type_ = self.whnf(&term.type_)?;
+            let reduced = self.whnf(&term.type_)?;
             let ExprNode::ForallE {
                 binder_type,
                 body,
                 binder_info,
                 ..
-            } = term.type_.node()
+            } = reduced.node()
             else {
                 break;
             };
@@ -498,12 +532,14 @@ impl Context {
                 }
             };
             if !insert {
+                term.type_ = reduced;
                 break;
             }
             if let ImplicitInsertion::Expected(Some(expected)) = insertion {
                 let expected = self.whnf(expected)?;
                 if matches!(expected.node(), ExprNode::ForallE { binder_info: style, .. } if style == binder_info)
                 {
+                    term.type_ = reduced;
                     break;
                 }
             }
@@ -529,7 +565,7 @@ impl Context {
         // unification. Unknown class inputs still wait for the expected type.
         self.resolve_instances(false)?;
         if let Some(expected) = expected {
-            self.constrain(&term.type_, expected)?;
+            self.constrain_type(&term.type_, expected)?;
         }
         self.resolve_instances(false)?;
         Ok(term)
@@ -542,7 +578,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
             Ascription(&'a Syntax, Option<Expr>),
-            AscribedValue(Expr),
+            AscribedValue(Expr, Option<Expr>),
             Projection(Name, Option<Expr>, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -558,7 +594,7 @@ impl Context {
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
-            Lambda(LocalContext, Vec<LocalDecl>),
+            Lambda(LocalContext, Vec<LocalDecl>, Option<Expr>),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -597,14 +633,18 @@ impl Context {
                                 return Err(failure(SourceInferenceError::Scope));
                             };
                             tasks.push(Task::Ascription(&parts[1], expected));
-                            tasks.push(Task::Visit(annotation, None, true));
+                            tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
                             continue;
                         }
                         if kind == &parser_kind(&["Term", "structInst"]) {
                             let parts = self.record_parts(syntax)?;
                             if let Some(annotation) = parts.annotation {
                                 tasks.push(Task::RecordType(parts, expected));
-                                tasks.push(Task::Visit(annotation, None, true));
+                                tasks.push(Task::Visit(
+                                    annotation,
+                                    Some(self.type_expected()?),
+                                    true,
+                                ));
                             } else {
                                 tasks.push(Task::RecordPrepare(parts, expected, Vec::new()));
                             }
@@ -637,7 +677,7 @@ impl Context {
                             }
                             let saved = self.txn.lctx.clone();
                             let mut binders = Vec::new();
-                            let mut expected_body = expected;
+                            let mut expected_body = expected.clone();
                             for name in names {
                                 self.tick()?;
                                 let Syntax::Ident { val: name, .. } = name else {
@@ -648,18 +688,23 @@ impl Context {
                                 }
                                 let (domain, codomain) = if let Some(expected) = &expected_body {
                                     let expected = self.whnf(expected)?;
-                                    let ExprNode::ForallE {
-                                        binder_type,
-                                        body,
-                                        binder_info: BinderInfo::Default,
-                                        ..
-                                    } = expected.node()
-                                    else {
-                                        return Err(failure(
-                                            SourceInferenceError::ExpectedFunction,
-                                        ));
-                                    };
-                                    (binder_type.clone(), Some(body.clone()))
+                                    match expected.node() {
+                                        ExprNode::ForallE {
+                                            binder_type,
+                                            body,
+                                            binder_info: BinderInfo::Default,
+                                            ..
+                                        } => (binder_type.clone(), Some(body.clone())),
+                                        ExprNode::MVar { .. } => {
+                                            let universe = self.level()?;
+                                            (self.hole(Expr::sort(universe))?, None)
+                                        }
+                                        _ => {
+                                            return Err(failure(
+                                                SourceInferenceError::ExpectedFunction,
+                                            ));
+                                        }
+                                    }
                                 } else {
                                     let universe = self.level()?;
                                     (self.hole(Expr::sort(universe))?, None)
@@ -678,7 +723,7 @@ impl Context {
                                     self.txn.lctx.find(&id).expect("new lambda binder").clone(),
                                 );
                             }
-                            tasks.push(Task::Lambda(saved, binders));
+                            tasks.push(Task::Lambda(saved, binders, expected));
                             tasks.push(Task::Visit(&basic[3], expected_body, true));
                             continue;
                         }
@@ -686,7 +731,11 @@ impl Context {
                             let (name, annotation, value, body) = self.let_parts(args)?;
                             if let Some(annotation) = annotation {
                                 tasks.push(Task::LetAnnotation(name, value, body, expected));
-                                tasks.push(Task::Visit(annotation, None, true));
+                                tasks.push(Task::Visit(
+                                    annotation,
+                                    Some(self.type_expected()?),
+                                    true,
+                                ));
                             } else {
                                 tasks.push(Task::LetValue(name, None, body, expected));
                                 tasks.push(Task::Visit(value, None, true));
@@ -702,8 +751,8 @@ impl Context {
                                 return Err(failure(SourceInferenceError::Scope));
                             }
                             tasks.push(Task::Arrow(expected));
-                            tasks.push(Task::Visit(codomain, None, true));
-                            tasks.push(Task::Visit(domain, None, true));
+                            tasks.push(Task::Visit(codomain, Some(self.type_expected()?), true));
+                            tasks.push(Task::Visit(domain, Some(self.type_expected()?), true));
                             continue;
                         }
                         if kind == &parser_kind(&["Term", "app"]) {
@@ -744,14 +793,18 @@ impl Context {
                 Task::Ascription(syntax, expected) => {
                     let type_ = values.pop().expect("ascription type visit");
                     self.sort_level(&type_)?;
-                    if let Some(expected) = expected {
-                        self.constrain(&type_.value, &expected)?;
-                    }
-                    tasks.push(Task::AscribedValue(type_.value.clone()));
+                    tasks.push(Task::AscribedValue(type_.value.clone(), expected));
                     tasks.push(Task::Visit(syntax, Some(type_.value), true));
                 }
-                Task::AscribedValue(annotation) => {
+                Task::AscribedValue(annotation, expected) => {
                     let term = values.pop().expect("ascribed term follows its annotation");
+                    // The value's actual type guides surrounding inference.
+                    // The written annotation still constrains the inner value
+                    // and remains in the checked term even when ignored later.
+                    if let Some(expected) = expected {
+                        self.constrain_type(&term.type_, &expected)?;
+                        self.resolve_instances(false)?;
+                    }
                     // Expected types guide inference but closed constraints are
                     // left to K1. Retain this assertion in the checked term,
                     // including when the surrounding program ignores its value.
@@ -763,14 +816,14 @@ impl Context {
                             Expr::bvar(0).expect("fixed ascription identity binder"),
                             false,
                         ),
-                        type_: annotation,
+                        type_: term.type_,
                     });
                 }
                 Task::RecordType(parts, expected) => {
                     let type_ = values.pop().expect("record type visit");
                     self.sort_level(&type_)?;
                     if let Some(expected) = expected {
-                        self.constrain(&type_.value, &expected)?;
+                        self.constrain_type(&type_.value, &expected)?;
                     }
                     tasks.push(Task::RecordPrepare(parts, Some(type_.value), Vec::new()));
                 }
@@ -855,7 +908,7 @@ impl Context {
                     }
                     tasks.push(Task::Proof(proof));
                 }
-                Task::Lambda(saved, binders) => {
+                Task::Lambda(saved, binders, expected) => {
                     let mut body = values.pop().expect("lambda body visit");
                     self.flush(false)?;
                     body.value = self.instantiate(&body.value)?;
@@ -881,7 +934,7 @@ impl Context {
                             Expr::forall_e(local.user_name, domain, body.type_, local.binder_info);
                     }
                     self.txn.lctx = saved;
-                    values.push(body);
+                    values.push(self.finish_term(body, expected.as_ref())?);
                 }
                 Task::Function(arguments, expected) => {
                     let function = values.pop().expect("function task follows its visit");
@@ -906,7 +959,7 @@ impl Context {
                             && !codomain.has_loose_bvar(0)
                             && let Some(expected) = &expected
                         {
-                            self.constrain(&codomain, expected)?;
+                            self.constrain_type(&codomain, expected)?;
                         }
                         tasks.push(Task::Argument(function, codomain, rest, expected));
                         tasks.push(Task::Visit(first, Some(domain), true));
@@ -955,7 +1008,7 @@ impl Context {
                         let domain = binder_type.clone();
                         let body = body.clone();
                         let argument = self.finish_term(argument, Some(&domain))?;
-                        self.constrain(&argument.type_, &domain)?;
+                        self.constrain_type(&argument.type_, &domain)?;
                         function.type_ = self.substitute(&body, &argument.value)?;
                         function.value = Expr::app(function.value, argument.value);
                     }
@@ -1092,9 +1145,28 @@ impl Context {
     }
 
     fn type_term(&mut self, syntax: &Syntax) -> Result<Expr, NatDefinitionElabError> {
-        let term = self.term(syntax, None)?;
+        // Carry the sort into the term so implicit insertion happens while
+        // annotation-local lets and their instance dictionaries remain in scope.
+        let expected = self.type_expected()?;
+        let term = self.term(syntax, Some(expected))?;
         self.sort_level(&term)?;
         Ok(term.value)
+    }
+
+    fn require_resolved(&self, terms: &[Expr]) -> Result<(), NatDefinitionElabError> {
+        let mut holes = std::collections::HashSet::new();
+        for term in terms {
+            holes.extend(self.txn.mvars.collect_mvars(term));
+        }
+        if !holes.is_empty() {
+            return Err(failure(SourceInferenceError::UnresolvedHoles {
+                count: holes.len(),
+            }));
+        }
+        if terms.iter().any(Expr::has_level_mvar) {
+            return Err(failure(SourceInferenceError::UnresolvedUniverses));
+        }
+        Ok(())
     }
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
@@ -1102,16 +1174,7 @@ impl Context {
         self.flush(true)?;
         let value = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
-        let mut holes = self.txn.mvars.collect_mvars(&value);
-        holes.extend(self.txn.mvars.collect_mvars(&type_));
-        if !holes.is_empty() {
-            return Err(failure(SourceInferenceError::UnresolvedHoles {
-                count: holes.len(),
-            }));
-        }
-        if value.has_level_mvar() || type_.has_level_mvar() {
-            return Err(failure(SourceInferenceError::UnresolvedUniverses));
-        }
+        self.require_resolved(&[value.clone(), type_.clone()])?;
         Ok(Typed { value, type_ })
     }
 }
@@ -1297,6 +1360,19 @@ pub(super) fn definition(
             .map(|syntax| context.type_term(syntax))
             .transpose()?
     };
+    // Later binders may determine earlier class inputs, but the body may not
+    // rescue a stuck header instance. An explicit result also closes ordinary
+    // header holes; inferred results may still constrain ordinary parameters.
+    context.resolve_instances(true)?;
+    if let Some(expected) = &expected {
+        context.flush(true)?;
+        let mut types = Vec::with_capacity(parameters.len() + 1);
+        for parameter in &parameters {
+            types.push(context.instantiate(&parameter.type_)?);
+        }
+        types.push(context.instantiate(expected)?);
+        context.require_resolved(&types)?;
+    }
     let parts = expect_node(
         &definition[3],
         &parser_kind(&["Command", "declValSimple"]),
