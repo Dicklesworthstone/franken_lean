@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Apply scoped implementation
+      - name: Apply checksum-bound implementation
         shell: bash
         run: |
           set -euo pipefail
@@ -25,11 +25,10 @@ jobs:
           import json,base64,gzip,hashlib,pathlib,subprocess
           manifest=pathlib.Path('scripts/native_instance_increment.json')
           plan=json.loads(manifest.read_text())
-          repaired=False
-          if plan['sha256']=='20e13417353da3d7faa3792c872a7abe0a706e65a6d4cd708337c9cf965b2a1f' and len(plan['patch'])==17790:
-              for a,b,text in reversed([[790,791,''],[1877,1878,''],[2821,2822,''],[4078,4079,''],[6145,6147,''],[8133,8137,'ng9'],[11354,11357,'']]):
-                  plan['patch']=plan['patch'][:a]+text+plan['patch'][b:]
-              repaired=True
+          original=plan['patch']
+          if plan['sha256']=='3a40085df56986d647c1f7cc27fe93bb6c6007a05ff06778592e610d4df226a1':
+              for old,new in [('XGudJhlZagWSRgwZ','XGudJjlZagWSRkuZ'),('13GeVbUGicY','13GeVUGicY'),('onySyXTZJpAf','onySyXTZJqAf')]:
+                  plan['patch']=plan['patch'].replace(old,new)
           patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
           paths=[]
@@ -40,49 +39,32 @@ jobs:
                   paths.append(path)
               assert line != '+++ /dev/null'
           assert paths
-          if repaired:
+          if original != plan['patch']:
               manifest.write_text(json.dumps(plan)+'\n')
               paths.append(str(manifest))
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
-          source=pathlib.Path('crates/fln/src/lib.rs')
-          text=source.read_text()
-          old='        assert_eq!(engine.environment().len(), 32);'
-          if old in text:
-              assert text.count(old)==1
-              new='''        let expected_constants: usize = fln_elab::seed::source_seed_declarations()
-                      .iter()
-                      .map(|declaration| match declaration {
-                          Declaration::Inductive(block) => block.types.len() + block.ctors.len() + block.recursors.len(),
-                          Declaration::Mutual(definitions) => definitions.len(),
-                          Declaration::Quotient(rows) => rows.len(),
-                          Declaration::Axiom(_) | Declaration::Defn(_) | Declaration::Thm(_) | Declaration::Opaque(_) => 1,
-                      })
-                      .sum();
-                  assert_eq!(engine.environment().len(), expected_constants);'''
-              source.write_text(text.replace(old,new))
-              if str(source) not in paths: paths.append(str(source))
           pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
           pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
           PY
-      - name: Verify actual source and engine paths
+      - name: Verify actual source engine and installed CLI
         shell: bash
         run: |
           set -euo pipefail
           channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/instance-landing/compiler.txt
-          rustfmt --edition 2024 crates/fln/src/lib.rs
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/instance-landing/frontend.log
-          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
-          cargo test --locked -p fln --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/proofs.log
-          cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
+          cargo test --locked -p fln --lib --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
+          cargo test --locked -p fln-cli --no-fail-fast 2>&1 | tee target/instance-landing/cli.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-landing/workspace.log
+          cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_instances.lean > target/instance-landing/example.json
+          git diff --check
       - name: Publish only verified source files
         shell: bash
         run: |
           set -euo pipefail
-          git diff --check
           python3 - <<'PY'
           import json,pathlib,subprocess
           paths=json.loads(pathlib.Path('target/instance-landing/paths.json').read_text())
