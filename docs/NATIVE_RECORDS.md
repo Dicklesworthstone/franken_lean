@@ -104,6 +104,20 @@ The actual receiver is preserved even when it returns a class dictionary and a
 different ambient instance exists. Strict-implicit and explicit receiver arguments
 remain unapplied; field access does not count as an explicit argument.
 
+Type annotations also insert ordinary implicit and instance arguments. A class
+projection such as `Factory.carrier` can supply a declaration or binder type,
+an arrow operand, a let or term annotation, or an explicit record type.
+Later binders can constrain earlier implicit types before the complete header
+resolves its instance goals. An explicit result annotation must leave the entire
+header resolved before the body; an inferred result can still determine ordinary
+parameter holes. Nested annotations retain the surrounding term's inference.
+Ascriptions preserve the value's actual type for instance selection while keeping
+the written annotation in the checked term. Lambdas can infer their function type
+when an annotation leaves it unknown; a known non-function type is still refused.
+Strict-implicit and explicit type-function parameters remain unapplied.
+Nested let expressions remain outside the bounded source parser's grammar;
+the supported top-level let chain retains its local dictionaries.
+
 This bounded field notation selects actual named fields of admitted single-
 constructor records. It does not search arbitrary namespace functions, base
 structures or numeric fields. Literal fields currently require comma separators;
