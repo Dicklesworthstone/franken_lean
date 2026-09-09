@@ -1,0 +1,84 @@
+name: Native explicit-set simplification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/land_native_simp_only.py'
+      - '.github/workflows/fln-native-simp-only.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-native-simp-only
+  cancel-in-progress: false
+
+jobs:
+  simplification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Prepare compiler and guarded source integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/simp-only-verification
+          git rev-parse HEAD | tee target/simp-only-verification/input-commit.txt
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee target/simp-only-verification/compiler.txt
+          python3 -I - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/land_native_simp_only.py').resolve()
+          code = path.read_text()
+          old = "parser = parser[:array_end] + ', \"simp\"' + parser[array_end:]"
+          new = "parser = parser[:array_end].rstrip().rstrip(',') + ', \"simp\"' + parser[array_end:]"
+          if code.count(old) != 1:
+              raise SystemExit('Installer anchor changed; refusing ambiguous parser modification')
+          namespace = {'__file__': str(path), '__name__': 'native_simp_installer'}
+          exec(compile(code.replace(old, new), str(path), 'exec'), namespace)
+          namespace['main']()
+          PY
+          rustfmt --edition 2024 crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/rewrite.rs crates/fln-elab/src/source/tactics/rewrite/matching.rs crates/fln-elab/src/source/tactics/rewrite/simplify.rs crates/fln-parse/src/proofs.rs crates/fln/tests/source_simplification.rs
+          git diff --check
+          git diff > target/simp-only-verification/implementation.patch
+      - name: Test the real source proof pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets 2>&1 | tee target/simp-only-verification/check.log
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/simp-only-verification/parser-elaborator-tests.log
+          cargo test --locked -p fln --lib --test source_automation --test source_equality --test source_rewriting --test source_file_check --test source_simplification --no-fail-fast 2>&1 | tee target/simp-only-verification/engine-tests.log
+          cargo test --locked -p fln-cli --no-fail-fast 2>&1 | tee target/simp-only-verification/cli-tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings 2>&1 | tee target/simp-only-verification/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/simp-only-verification/workspace-check.log
+      - name: Commit tested production code directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=(crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/rewrite.rs crates/fln-elab/src/source/tactics/rewrite/matching.rs crates/fln-elab/src/source/tactics/rewrite/simplify.rs crates/fln-parse/src/proofs.rs crates/fln/tests/source_simplification.rs)
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln-elab/src/source/tactics.rs|crates/fln-elab/src/source/tactics/rewrite.rs|crates/fln-elab/src/source/tactics/rewrite/matching.rs|crates/fln-elab/src/source/tactics/rewrite/simplify.rs|crates/fln-parse/src/proofs.rs|crates/fln/tests/source_simplification.rs) ;;
+              *) printf 'Unexpected modified source path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git add -- "${paths[@]}"
+          git diff --cached --check
+          git diff --cached > target/simp-only-verification/implementation.patch
+          git config user.name 'FrankenLean native simplification'
+          git config user.email 'noreply@github.com'
+          git commit -m 'feat(elab): simplify explicit equality sets with inferred proof-producing rewrites'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/simp-only-verification/published-commit.txt
+      - name: Retain exact source and test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-simp-only-${{ github.sha }}
+          path: target/simp-only-verification
+          if-no-files-found: error
+          retention-days: 7
