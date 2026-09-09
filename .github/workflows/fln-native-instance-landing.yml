@@ -37,6 +37,14 @@ jobs:
           assert paths
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
+          if plan['sha256']=='5f12a449bd66805cb791dc9ac23d8c15b441d825f5533fc976081038f56cef61':
+              amendment=pathlib.Path('scripts/record_field_unknown_constant.patch').read_bytes()
+              assert hashlib.sha256(amendment).hexdigest()=='a75bce8c71379ca09187cf68139cb991996eb080a319ff4bcbe8e8efe35559f3'
+              subprocess.run(['git','apply','--check','-'],input=amendment,check=True)
+              subprocess.run(['git','apply','-'],input=amendment,check=True)
+              target=pathlib.Path('crates/fln-elab/src/source/record_terms.rs')
+              assert hashlib.sha256(target.read_bytes()).hexdigest()=='4eac9caf04b91f9e884ad38dfc882197e5ee40e4e8794b0f218c0f7ce2fb5ed1'
+              pathlib.Path('target/instance-landing/amendment.patch').write_bytes(amendment)
           pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
           pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
           pathlib.Path('target/instance-landing/source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths},indent=2))
