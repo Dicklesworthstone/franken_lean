@@ -229,12 +229,21 @@ fn instance_source_does_not_turn_kernel_exhaustion_into_rejection() {
     let base = engine();
     let mut low = limits();
     low.admission.kernel = low.admission.kernel.narrowed(0, 32);
-    let result = base.check_source_files(&[b"def f : Nat := default"], &KVMap::new(), low);
-    assert!(
-        matches!(result, Ok(Outcome::Inconclusive(_)))
-            || result
-                .as_ref()
-                .is_err_and(|error| error.disposition().2 == 3)
+    for source in [
+        "def f : Nat := default",
+        "def f : Nat -> Inhabited Nat := inferInstance",
+    ] {
+        let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), low);
+        assert!(
+            matches!(result, Ok(Outcome::Inconclusive(_)))
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.disposition().2 == 3)
+        );
+    }
+    checked(
+        &base,
+        "def recovery : Nat -> Inhabited Nat := inferInstance",
     );
 }
 
@@ -358,6 +367,59 @@ fn infer_instance_prefers_the_current_local_dictionary() {
     checked(
         &engine(),
         "def dictionary [i : Inhabited Nat] : Inhabited Nat := inferInstance\ntheorem same [i : Inhabited Nat] : dictionary = i := by rfl",
+    );
+}
+
+#[test]
+fn function_instance_targets_preserve_ambient_dictionary_selection() {
+    checked(
+        &engine(),
+        "def constant : Nat -> Inhabited Nat := inferInstance\n\
+         theorem constant_ok : constant 3 = instInhabitedNat := by rfl\n\
+         def ignored : Inhabited Nat -> Inhabited Nat -> Inhabited Nat := inferInstance\n\
+         theorem ignored_ok (a b : Inhabited Nat) : ignored a b = instInhabitedNat := by rfl\n\
+         def ambient (i : Inhabited Nat) : Inhabited Nat -> Inhabited Nat := inferInstance\n\
+         theorem ambient_ok (i j : Inhabited Nat) : ambient i j = i := by rfl",
+    );
+}
+
+#[test]
+fn function_instance_targets_use_source_defined_classes_and_recursive_fallback() {
+    checked(
+        &engine(),
+        "class Choice (A : Type) where\n  value : A\n\
+         instance natChoice : Choice Nat := Choice.mk 11\n\
+         instance recursive {A : Type} [i : Choice A] : Choice A := i\n\
+         def dictionary : Nat -> Nat -> Choice Nat := inferInstance\n\
+         theorem dictionary_ok : dictionary 4 5 = natChoice := by rfl",
+    );
+}
+
+#[test]
+fn failed_function_instance_targets_publish_nothing_and_recover() {
+    let base = checked(
+        &engine(),
+        "class Choice (A : Type) where\n  value : A\n\
+         instance natChoice : Choice Nat := Choice.mk 11\n\
+         instance recursive {A : Type} [i : Choice A] : Choice A := i",
+    );
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "def missing : Nat -> Choice Bool := inferInstance",
+        "def nonclass : Nat -> Nat := inferInstance",
+        "def wrong : Choice Nat -> Choice Nat := inferInstance\n\
+         theorem leaked (i : Choice Nat) : wrong i = i := by rfl",
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error}");
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+    checked(
+        &base,
+        "def recovery : Nat -> Choice Nat := inferInstance\n\
+         theorem recovery_ok : recovery 3 = natChoice := by rfl",
     );
 }
 

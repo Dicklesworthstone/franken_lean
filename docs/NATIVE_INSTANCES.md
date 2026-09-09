@@ -24,6 +24,15 @@ The source prelude contains the ordinary one-field `Inhabited` inductive block, 
 
 Both `[Inhabited A]` and `[i : Inhabited A]` are accepted in signatures. The newest eligible local instance is considered before registered globals. Ordinary parameters such as `(i : Inhabited A)` and class-valued local lets also qualify. Class discovery unfolds abbreviations, but neither ordinary definition aliases nor local type aliases; ordinary functions returning a class do not qualify. The same reduction policy governs instance binder annotations and search targets. Source instance declarations require an explicit name and result type. Global priorities are nonnegative decimal `u32` values, defaulting to 1000; higher values precede lower values, and newer registrations precede older ones at equal priority.
 
+Function targets are supported: `def dictionary : Nat -> Inhabited Nat := inferInstance`
+synthesizes the result dictionary and returns a checked lambda. Search preserves
+the ambient local-instance population while opening the target's binders. Thus
+`Inhabited Nat -> Inhabited Nat` uses the ambient/global dictionary, rather than
+its argument; an ordinary dictionary parameter already in scope remains eligible.
+The same path works with source-defined classes and recursive instance candidates.
+The source grammar currently exposes nondependent arrow targets; this does not
+establish full dependent-function or instance-trace parity.
+
 An instance declaration is a safe definition candidate. Only after its normal K1-plus-checker admission does the engine register its name for search. Failed declarations and late failures in an ordered multi-file check expose neither a new declaration snapshot nor a registration. The returned result root describes the successor after registration, not the pre-registration intermediate.
 
 ## Search and tactic integration
@@ -40,6 +49,6 @@ The independent checker now considers the major expression beneath a projection 
 
 `fln_elab::instances::register_class` and `register_instance` return immutable environment successors referring only to already admitted declarations. The journal uses its own versioned native schema, structural name encoding, bounded rows/payloads, and explicit merge/checkpoint semantics. Malformed or incompatible metadata is a refusal, not an empty candidate table. These registrations participate in logical roots.
 
-Source `class`/`structure` declarations, anonymous or scoped instances, automatic derived instances, `outParam`/`semiOutParam`, full tabling, SearchCards, complete coercion/default-instance semantics and Reference trace parity are not implemented by this increment. The native journal is not the Reference `.olean` instance extension. Import-free `check-source` files are the current source publication path; the separate execution command refuses instance declarations rather than running dictionary definitions or dropping their registrations.
+Source `class`/`structure` declarations are available in the bounded [native records surface](NATIVE_RECORDS.md). Anonymous or scoped instances, automatic derived instances, `outParam`/`semiOutParam`, full tabling, SearchCards, complete coercion/default-instance semantics and Reference trace parity remain unimplemented. The native journal is not the Reference `.olean` instance extension. Import-free `check-source` files are the current source publication path; the separate execution command refuses instance declarations rather than running dictionary definitions or dropping their registrations.
 
 The W6 Synod workstream remains open. The regression targets are `fln::source_instances`, `fln-elab::native_unification`, `fln-checker::projection_delta` and `fln-cli::source_check`, alongside the existing parser, elaborator, engine and CLI suites. Tests cover computation, local precedence, global priority, recursion/fallback, rollback, canonical source reconstruction, malformed metadata, missing dictionaries, kernel resource stops and the real installed CLI. Scoped test results are not a whole-workspace test-suite or release-gate claim.

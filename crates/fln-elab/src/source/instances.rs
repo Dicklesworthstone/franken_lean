@@ -20,6 +20,7 @@ struct Expansion {
 struct Frame {
     goal: MVarId,
     target: Expr,
+    binders: Vec<LocalDecl>,
     base: Context,
     candidates: Vec<Candidate>,
     cursor: usize,
@@ -178,6 +179,7 @@ impl Context {
         &mut self,
         goal: MVarId,
         registry: &InstanceRegistry,
+        ambient: &LocalContext,
     ) -> Result<Frame, NatDefinitionElabError> {
         let decl = self
             .txn
@@ -186,7 +188,26 @@ impl Context {
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::Scope))?;
         self.txn.lctx = decl.lctx;
-        let target = self.instance_type(&decl.type_)?;
+        let mut target = self.instance_type(&decl.type_)?;
+        let mut binders = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = target.node()
+        {
+            self.tick()?;
+            let id = FVarId(self.fresh_name()?);
+            let body = self.substitute(body, &Expr::fvar(id.clone()))?;
+            binders.push(
+                self.txn
+                    .lctx
+                    .add_param(id, binder_name.clone(), binder_type.clone(), *binder_info)
+                    .clone(),
+            );
+            target = self.instance_type(&body)?;
+        }
         let class = result_head(&target)
             .filter(|c| registry.is_class(c))
             .ok_or_else(|| failure(SourceInferenceError::InvalidInstanceBinder))?;
@@ -194,6 +215,12 @@ impl Context {
         // Lean tries the newest local instance before global registrations.
         let locals = self.txn.lctx.clone();
         for local in locals.decls().iter().rev() {
+            // Target binders give candidate terms their scope, but do not
+            // extend the local-instance population of this search. This also
+            // holds for recursive prerequisites under those binders.
+            if !ambient.contains(&local.id) {
+                continue;
+            }
             let eligible = if local.binder_info == BinderInfo::InstImplicit {
                 true
             } else {
@@ -214,6 +241,7 @@ impl Context {
         Ok(Frame {
             goal,
             target,
+            binders,
             base: self.clone(),
             candidates,
             cursor: 0,
@@ -282,7 +310,14 @@ impl Context {
         root: MVarId,
         registry: &InstanceRegistry,
     ) -> Result<bool, NatDefinitionElabError> {
-        let first = self.instance_frame(root, registry)?;
+        let ambient = self
+            .txn
+            .mvars
+            .get_decl(&root)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?
+            .lctx
+            .clone();
+        let first = self.instance_frame(root, registry, &ambient)?;
         let mut frames = vec![first];
         let mut attempts = 0usize;
         while !frames.is_empty() {
@@ -313,16 +348,29 @@ impl Context {
                         frames[index].chosen = None;
                         continue;
                     }
+                    let child = self.instance_frame(id, registry, &ambient)?;
+                    if frames.iter().any(|frame| frame.target == child.target) {
+                        frames[index].chosen = None;
+                        continue;
+                    }
                     if frames.len() >= MAX_SEARCH_DEPTH {
                         return Err(failure(SourceInferenceError::ResourceLimit));
                     }
-                    frames.push(self.instance_frame(id, registry)?);
+                    frames.push(child);
                     continue;
                 }
-                let value = self.instantiate(&expansion.value)?;
+                let mut value = self.instantiate(&expansion.value)?;
                 if value.has_expr_mvar() || value.has_level_mvar() {
                     frames[index].chosen = None;
                     continue;
+                }
+                for binder in frames[index].binders.iter().rev() {
+                    self.tick()?;
+                    let domain = self.instantiate(&binder.type_)?;
+                    value = value
+                        .abstract_fvar(&binder.id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    value = Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info);
                 }
                 let id = frames[index].goal.clone();
                 let class = result_head(&frames[index].target)
