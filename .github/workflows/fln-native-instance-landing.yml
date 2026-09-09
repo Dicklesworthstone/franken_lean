@@ -43,10 +43,27 @@ jobs:
           if repaired:
               manifest.write_text(json.dumps(plan)+'\n')
               paths.append(str(manifest))
-          pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
-          pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
+          source=pathlib.Path('crates/fln/src/lib.rs')
+          text=source.read_text()
+          old='        assert_eq!(engine.environment().len(), 32);'
+          if old in text:
+              assert text.count(old)==1
+              new='''        let expected_constants: usize = fln_elab::seed::source_seed_declarations()
+                      .iter()
+                      .map(|declaration| match declaration {
+                          Declaration::Inductive(block) => block.types.len() + block.ctors.len() + block.recursors.len(),
+                          Declaration::Mutual(definitions) => definitions.len(),
+                          Declaration::Quotient(rows) => rows.len(),
+                          Declaration::Axiom(_) | Declaration::Defn(_) | Declaration::Thm(_) | Declaration::Opaque(_) => 1,
+                      })
+                      .sum();
+                  assert_eq!(engine.environment().len(), expected_constants);'''
+              source.write_text(text.replace(old,new))
+              if str(source) not in paths: paths.append(str(source))
+          pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
+          pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
           PY
       - name: Verify actual source and engine paths
         shell: bash
@@ -55,6 +72,7 @@ jobs:
           channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/instance-landing/compiler.txt
+          rustfmt --edition 2024 crates/fln/src/lib.rs
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/instance-landing/frontend.log
           cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
           cargo test --locked -p fln --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/proofs.log
@@ -72,6 +90,7 @@ jobs:
           subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
           subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
           subprocess.run(['git','add','--',*paths],check=True)
+          pathlib.Path('target/instance-landing/verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
           subprocess.run(['git','commit','-m',plan['message']],check=True)
           subprocess.run(['git','push','origin','HEAD:main'],check=True)
           pathlib.Path('target/instance-landing/published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
