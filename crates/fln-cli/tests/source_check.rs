@@ -377,3 +377,46 @@ fn installed_binary_checks_function_dictionaries_and_refuses_late_false_proofs()
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_instance_dependent_field_receivers_atomically() {
+    let prefix = file(
+        "structure Point where\n  x : Nat\n\
+         def point [Inhabited Nat] : Point := { x := default }",
+    );
+    let good = file(
+        "theorem dotted : point.x = 0 := by rfl\n\
+         theorem postfix : (point).x = 0 := by rfl",
+    );
+    let bad = file("theorem wrong : point.x = 1 := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for required in [
+                "\"commands\":4",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(required), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+    }
+}

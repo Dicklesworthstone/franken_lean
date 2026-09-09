@@ -96,6 +96,14 @@ replaced with a dictionary from instance search. Exact local/global qualified
 names are resolved first; only unresolved names fall back to field access.
 Escaped dots remain parts of an identifier, not path separators.
 
+Field receivers insert ordinary implicit and instance arguments. For example,
+`point.x` and `(point).x` work when `point [Inhabited Nat] : Point` needs a
+dictionary. Known dictionaries are resolved before selecting the record type;
+unknown class inputs remain deferred so the expected field type can infer them.
+The actual receiver is preserved even when it returns a class dictionary and a
+different ambient instance exists. Strict-implicit and explicit receiver arguments
+remain unapplied; field access does not count as an explicit argument.
+
 This bounded field notation selects actual named fields of admitted single-
 constructor records. It does not search arbitrary namespace functions, base
 structures or numeric fields. Literal fields currently require comma separators;
