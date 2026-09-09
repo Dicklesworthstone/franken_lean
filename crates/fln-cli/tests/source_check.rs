@@ -336,3 +336,44 @@ fn late_record_field_failure_emits_no_success_or_output_artifacts() {
         output.stderr
     );
 }
+
+#[test]
+fn installed_binary_checks_function_dictionaries_and_refuses_late_false_proofs() {
+    let one = file(
+        "class Choice (A : Type) where\n  value : A\n\
+         instance natChoice : Choice Nat := Choice.mk 11\n\
+         def dictionary : Nat -> Choice Nat := inferInstance",
+    );
+    let two = file("theorem result : dictionary 7 = natChoice := by rfl");
+    let bad = file("theorem wrong : dictionary 7 = Choice.mk 12 := by rfl");
+    for (last, success) in [(&two, true), (&bad, false), (&two, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&one)
+            .arg(last)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for required in [
+                "\"commands\":4",
+                "\"theorems\":1",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(required), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+    }
+}
