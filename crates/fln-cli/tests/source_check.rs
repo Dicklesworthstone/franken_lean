@@ -516,3 +516,46 @@ fn installed_binary_checks_defaults_updates_and_late_failure_without_partial_suc
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_constructor_matches_and_refuses_an_invalid_unused_branch() {
+    let prefix = file(
+        "inductive Item (A : Type) where | none | some (value : A)\n\
+         def get (item : Item Nat) : Nat := match item with | .none => 0 | .some n => n\n\
+         def predecessor (n : Nat) : Nat := match n with | .zero => 0 | .succ k => k",
+    );
+    let good = file(
+        "theorem payload : get (Item.some 12) = 12 := by rfl\ntheorem pred : predecessor 6 = 5 := by rfl",
+    );
+    let bad = file("def invalid : Nat := match true with | true => 0 | false => (0 : String)");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":5",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+    }
+}

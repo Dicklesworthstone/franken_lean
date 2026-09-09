@@ -10,6 +10,7 @@ mod infer;
 mod instance_command;
 mod instances;
 mod levels;
+mod matching;
 mod record;
 mod record_terms;
 mod tactics;
@@ -22,6 +23,7 @@ use fln_core::options::KVMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
+    Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
     ExpectedFunction,
@@ -43,6 +45,7 @@ pub enum SourceInferenceError {
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
             Self::UnknownConstant(_) => {
                 write!(f, "source reference does not name a known constant")
@@ -580,6 +583,9 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            MatchNext(matching::MatchBuild<'a>),
+            MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>),
             AscribedValue(Expr, Option<Expr>),
             Projection(Name, Option<Expr>, bool),
@@ -619,6 +625,13 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "match"]) {
+                            let parts = self.match_parts(syntax)?;
+                            let discriminant = parts.discriminant;
+                            tasks.push(Task::MatchDiscriminant(parts, expected));
+                            tasks.push(Task::Visit(discriminant, None, true));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "proj"]) {
                             let parts = expect_node(syntax, kind, 3, "field projection")?;
                             expect_atom(&parts[1], ".", "field dot")?;
@@ -792,6 +805,26 @@ impl Context {
                     } else {
                         term
                     });
+                }
+                Task::MatchDiscriminant(parts, expected) => {
+                    let major = values.pop().expect("match discriminant visit");
+                    tasks.push(Task::MatchNext(self.start_match(parts, major, expected)?));
+                }
+                Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
+                    matching::MatchStep::Branch {
+                        syntax,
+                        expected,
+                        binders,
+                    } => {
+                        tasks.push(Task::MatchBranch(state, binders));
+                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                    }
+                    matching::MatchStep::Complete(term) => values.push(term),
+                },
+                Task::MatchBranch(mut state, binders) => {
+                    let branch = values.pop().expect("match branch visit");
+                    self.accept_match_branch(&mut state, binders, branch)?;
+                    tasks.push(Task::MatchNext(state));
                 }
                 Task::Ascription(syntax, expected) => {
                     let type_ = values.pop().expect("ascription type visit");
