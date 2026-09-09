@@ -77,6 +77,66 @@ impl Context {
         *self = original;
     }
 
+    /// Only selected definitions participate in conversion of a side condition.
+    fn simp_premise_target(
+        &mut self,
+        target: &Expr,
+        rules: &[RewriteRule<'_>],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut target = target.clone();
+        for _ in 0..MAX_SIMPLIFICATION_STEPS {
+            let mut changed = false;
+            for rule in rules {
+                self.tick()?;
+                if let UnfoldResult::Changed(next) =
+                    self.unfold_simp_term(rule.syntax, rule.reverse, &target)?
+                {
+                    target = next;
+                    changed = true;
+                }
+            }
+            if !changed { return Ok(target); }
+        }
+        Err(failure(SourceInferenceError::ResourceLimit))
+    }
+
+    fn simp_selected_proof(
+        &mut self,
+        target: &Expr,
+        rules: &[RewriteRule<'_>],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        for rule in rules {
+            self.tick()?;
+            let selected = self.term(rule.syntax, None)?;
+            let type_ = self.simp_premise_target(&selected.type_, rules)?;
+            let mut budget = UnificationBudget::new(self.kernel);
+            budget.zeta_delta = false;
+            if self.proof_types_match_with_budget(&type_, target, budget)? {
+                let value = self.instantiate(&selected.value)?;
+                if !value.has_expr_mvar() && !value.has_level_mvar() {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn simp_discharge_premise(
+        &mut self,
+        id: &MVarId,
+        target: &Expr,
+        rules: &[RewriteRule<'_>],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let target = self.simp_premise_target(target, rules)?;
+        if let Some(value) = self.simp_selected_proof(&target, rules)? {
+            return Ok(Some(value));
+        }
+        let goal = ProofGoal {
+            id: id.clone(), target, lctx: self.txn.lctx.clone(), introduced: Vec::new(),
+        };
+        self.automatic_reflexivity_candidate(&goal, false)
+    }
+
     /// Check a candidate only after the shared automatic-closure policy admits
     /// it. Full K1 assignment conversion alone would unfold ordinary definitions
     /// that are absent from this tactic's explicit rule set.
@@ -138,13 +198,16 @@ impl Context {
                     UnfoldResult::NotDefinition => {
                         // Re-elaboration gives each polymorphic use fresh universes.
                         let term = self.term(rule.syntax, None)?;
-                        match self.instantiate_rewrite_rule(term, &target, rule.reverse, true)? {
-                            Some((term, occurrence)) => Some(self.rewrite_transport(
+                        match self.instantiate_rewrite_rule(term, &target, rule.reverse, true, &rules)? {
+                            Some(RewriteMatch { rule: term, occurrence, premises }) => {
+                                assert!(premises.is_empty(), "simp discharges its own premises");
+                                Some(self.rewrite_transport(
                                 &goal,
                                 term,
                                 &occurrence,
                                 rule.reverse,
-                            )?),
+                            )?)
+                            },
                             None => None,
                         }
                     }
@@ -173,7 +236,9 @@ impl Context {
             if advanced {
                 continue;
             }
-            if let Some(value) = self.simp_reflexivity(&goal)? {
+            if let Some(value) = self.simp_selected_proof(&goal.target, &rules)? {
+                self.close_proof_goal(goal, value)?;
+            } else if let Some(value) = self.simp_reflexivity(&goal)? {
                 self.close_proof_goal(goal, value)?;
             } else if steps > 0 {
                 // Simplification can expose a non-reflexive remaining goal.

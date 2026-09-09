@@ -3,6 +3,12 @@
 mod matching;
 mod simplify;
 
+pub(in crate::source) struct RewriteMatch {
+    rule: Typed,
+    occurrence: Expr,
+    premises: Vec<ProofGoal>,
+}
+
 use super::*;
 use fln_core::level::LevelView;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -181,11 +187,14 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         self.flush(false)?;
         let original_target = self.instantiate(&goal.target)?;
-        let (rule, occurrence) = self
-            .instantiate_rewrite_rule(rule, &original_target, reverse, false)?
+        let RewriteMatch { rule, occurrence, premises } = self
+            .instantiate_rewrite_rule(rule, &original_target, reverse, false, &[])?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
         let (next_goal, value) = self.rewrite_transport(&goal, rule, &occurrence, reverse)?;
         proof.work.push(Work::Close(goal, value));
+        // LIFO: the rewritten goal comes first, then this rule's premises in
+        // telescope order. A later rule's premises precede earlier ones.
+        proof.work.extend(premises.into_iter().rev().map(Work::Goal));
         proof.work.push(Work::Rewrite(next_goal, remaining, close));
         Ok(())
     }
@@ -235,7 +244,10 @@ impl Context {
         // transport. Final admission still checks the original goal by conversion.
         let reduced_from = self.whnf(&from)?;
         let reduced_to = self.whnf(&to)?;
-        if self.proof_types_match(&reduced_from, &reduced_to)? {
+        if !reduced_from.has_expr_mvar()
+            && !reduced_to.has_expr_mvar()
+            && self.proof_types_match(&reduced_from, &reduced_to)?
+        {
             return Ok((next_goal, child));
         }
         let eq_domain = app(

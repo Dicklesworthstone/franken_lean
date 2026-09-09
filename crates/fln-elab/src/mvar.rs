@@ -155,6 +155,19 @@ impl MetavarStore {
         self.decls.get(id)
     }
 
+    /// Change inference policy without replacing scope, dependencies, or assignments.
+    pub(crate) fn set_kind(
+        &mut self,
+        id: &MVarId,
+        kind: MetavarKind,
+    ) -> Result<(), MetavarError> {
+        self.decls
+            .get_mut(id)
+            .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?
+            .kind = kind;
+        Ok(())
+    }
+
     pub fn is_declared(&self, id: &MVarId) -> bool {
         self.decls.contains_key(id)
     }

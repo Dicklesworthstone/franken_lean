@@ -62,6 +62,7 @@ impl Context {
     fn discharge_rewrite_premises(
         &mut self,
         holes: &[MVarId],
+        selected_rules: &[RewriteRule<'_>],
     ) -> Result<bool, NatDefinitionElabError> {
         loop {
             let before = self.txn.mvars.assignments().len();
@@ -78,6 +79,11 @@ impl Context {
                     .type_
                     .clone();
                 let target = self.instantiate(&raw)?;
+                // Simp may discharge a proposition fixed by the match, but may
+                // not guess a remaining data parameter from a selected proof.
+                if target.has_expr_mvar() || target.has_level_mvar() {
+                    continue;
+                }
                 let Some(universe) = self.known_type(&target)? else {
                     continue;
                 };
@@ -87,26 +93,7 @@ impl Context {
                 if !matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
                     continue;
                 }
-                let locals = self.txn.lctx.decls().to_vec();
-                let mut value = None;
-                for local in locals.iter().rev() {
-                    self.tick()?;
-                    if self.proof_types_match(&local.type_, &target)? {
-                        value = Some(Expr::fvar(local.id.clone()));
-                        break;
-                    }
-                }
-                if value.is_none() {
-                    let target = self.whnf(&target)?;
-                    if let Some((u, alpha, lhs, rhs)) = equality_target(&target)
-                        && self.proof_types_match(&lhs, &rhs)?
-                    {
-                        value = Some(app(
-                            Expr::const_(Name::from_components(["Eq", "refl"]), vec![u]),
-                            [alpha, lhs],
-                        ));
-                    }
-                }
+                let value = self.simp_discharge_premise(id, &target, selected_rules)?;
                 if let Some(value) = value {
                     self.txn
                         .assign_mvar(
@@ -141,7 +128,8 @@ impl Context {
         target: &Expr,
         reverse: bool,
         inside_out: bool,
-    ) -> Result<Option<(Typed, Expr)>, NatDefinitionElabError> {
+        selected_rules: &[RewriteRule<'_>],
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
         let mut holes = Vec::new();
@@ -169,8 +157,18 @@ impl Context {
             rule.type_ = template.substitute(&body, &argument)?;
             rule.value = Expr::app(rule.value, argument);
         }
-        let (_, alpha, lhs, rhs) =
-            equality_target(&rule.type_).ok_or_else(|| error(TacticError::ExpectedEquality))?;
+        let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
+            // An explicitly selected proposition proof can discharge another
+            // rule's premise without itself being an equality rewrite.
+            if inside_out && let Some(universe) = template.known_type(&rule.type_)? {
+                let universe = template.whnf(&universe)?;
+                if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                    self.charge_rewrite_trial(&template);
+                    return Ok(None);
+                }
+            }
+            return Err(error(TacticError::ExpectedEquality));
+        };
         let pattern = if reverse { rhs } else { lhs };
         self.charge_rewrite_trial(&template);
         if !inside_out {
@@ -222,17 +220,17 @@ impl Context {
             let mut trial = template.rewrite_trial();
             trial.txn.budget = self.txn.budget.clone();
             let attempt = (|| {
-                if !trial.match_rewrite_occurrence(&pattern, &alpha, term)?
-                    || !trial.discharge_rewrite_premises(&holes)?
-                {
+                if !trial.match_rewrite_occurrence(&pattern, &alpha, term)? {
+                    return Ok(None);
+                }
+                if inside_out && !trial.discharge_rewrite_premises(&holes, selected_rules)? {
                     return Ok(None);
                 }
                 let value = trial.instantiate(&rule.value)?;
                 let type_ = trial.instantiate(&rule.type_)?;
-                if value.has_expr_mvar()
-                    || value.has_level_mvar()
-                    || type_.has_expr_mvar()
+                if value.has_level_mvar()
                     || type_.has_level_mvar()
+                    || inside_out && (value.has_expr_mvar() || type_.has_expr_mvar())
                 {
                     return Ok(None);
                 }
@@ -245,7 +243,25 @@ impl Context {
                         return Ok(None);
                     }
                 }
-                Ok(Some((Typed { value, type_ }, occurrence)))
+                let mut premises = Vec::new();
+                if !inside_out {
+                    for id in &holes {
+                        trial.tick()?;
+                        if trial.txn.mvars.is_assigned(id) { continue; }
+                        let declaration = trial.txn.mvars.get_decl(id)
+                            .expect("rule parameter was declared").clone();
+                        let target = trial.instantiate(&declaration.type_)?;
+                        if let Some(universe) = trial.known_type(&target)? {
+                            let universe = trial.whnf(&universe)?;
+                            if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                                trial.txn.mvars.set_kind(id, MetavarKind::SyntheticOpaque)
+                                    .map_err(|e| failure(SourceInferenceError::Unification(Box::new(UnificationError::Metavariable(e)))))?;
+                            }
+                        }
+                        premises.push(ProofGoal { id: id.clone(), target, lctx: declaration.lctx, introduced: Vec::new() });
+                    }
+                }
+                Ok(Some(RewriteMatch { rule: Typed { value, type_ }, occurrence, premises }))
             })();
             self.charge_rewrite_trial(&trial);
             match attempt {
