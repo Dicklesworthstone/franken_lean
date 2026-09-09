@@ -1766,3 +1766,286 @@ fn k_corner_stays_stuck_when_endpoints_differ() {
         "the application is returned unreduced when the endpoints differ"
     );
 }
+
+// An independently assembled, ordinary Nat telescope. Tests of this layer use
+// checker-owned metadata; source_matching also exercises actual dual admission.
+fn nat_literal_family_entries() -> Vec<ConstantEntry> {
+    use fln_core::expr::{Literal, NatLit};
+    let n = FVarId(primary_name("n"));
+    let m = FVarId(primary_name("m"));
+    let z = FVarId(primary_name("z"));
+    let s = FVarId(primary_name("s"));
+    let ih = FVarId(primary_name("ih"));
+    let nat = constant("Nat");
+    let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+    let succ = |value| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            value,
+        )
+    };
+    let close = |variables: &[(FVarId, Expr)], mut body: Expr, lambda: bool| {
+        for (id, ty) in variables.iter().rev() {
+            body = body.abstract_fvar(id, 0).unwrap();
+            body = if lambda {
+                Expr::lam(id.0.clone(), ty.clone(), body, BinderInfo::Default)
+            } else {
+                Expr::forall_e(id.0.clone(), ty.clone(), body, BinderInfo::Default)
+            };
+        }
+        body
+    };
+    let motive = close(
+        &[(n.clone(), nat.clone())],
+        Expr::sort(Level::param(primary_name("u"))),
+        false,
+    );
+    let zero_case = Expr::app(Expr::fvar(m.clone()), zero.clone());
+    let succ_case = close(
+        &[
+            (n.clone(), nat.clone()),
+            (ih, Expr::app(Expr::fvar(m.clone()), Expr::fvar(n.clone()))),
+        ],
+        Expr::app(Expr::fvar(m.clone()), succ(Expr::fvar(n.clone()))),
+        false,
+    );
+    let prefix = vec![
+        (m.clone(), motive),
+        (z.clone(), zero_case),
+        (s.clone(), succ_case),
+    ];
+    let mut all = prefix.clone();
+    all.push((n.clone(), nat.clone()));
+    let rec_type = close(
+        &all,
+        Expr::app(Expr::fvar(m.clone()), Expr::fvar(n.clone())),
+        false,
+    );
+    let rec_call = [
+        Expr::fvar(m),
+        Expr::fvar(z.clone()),
+        Expr::fvar(s.clone()),
+        Expr::fvar(n.clone()),
+    ]
+    .into_iter()
+    .fold(
+        Expr::const_(
+            Name::from_components(["Nat", "rec"]),
+            vec![Level::param(primary_name("u"))],
+        ),
+        Expr::app,
+    );
+    let succ_rhs = close(
+        &all,
+        Expr::app(Expr::app(Expr::fvar(s), Expr::fvar(n)), rec_call),
+        true,
+    );
+    let zero_rhs = close(&prefix, Expr::fvar(z), true);
+    let nat_name = checker_name("Nat");
+    let zero_name = checker_qualified(&["Nat", "zero"]);
+    let succ_name = checker_qualified(&["Nat", "succ"]);
+    vec![
+        ConstantEntry::new(
+            nat_name.clone(),
+            ConstantDeclaration::inductive(
+                vec![],
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![nat_name.clone()],
+                    vec![zero_name.clone(), succ_name.clone()],
+                    0,
+                    true,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            zero_name.clone(),
+            ConstantDeclaration::constructor(
+                vec![],
+                decoded(&nat),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(nat_name.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            succ_name.clone(),
+            ConstantDeclaration::constructor(
+                vec![],
+                decoded(&Expr::forall_e(
+                    Name::anonymous(),
+                    nat.clone(),
+                    nat,
+                    BinderInfo::Default,
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(nat_name.clone(), 1, 0, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Nat", "rec"]),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u")],
+                decoded(&rec_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![nat_name],
+                    0,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(zero_name, 0, decoded(&zero_rhs)),
+                        RecursorRule::new(succ_name, 1, decoded(&succ_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+        definition_entry(
+            "five",
+            vec![],
+            decoded(&Expr::lit(Literal::Nat(NatLit::from_u64(5)))),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ]
+}
+fn nat_predecessor_application(major: Expr) -> Expr {
+    use fln_core::expr::{Literal, NatLit};
+    let nat = constant("Nat");
+    let motive = Expr::lam(
+        Name::anonymous(),
+        nat.clone(),
+        nat.clone(),
+        BinderInfo::Default,
+    );
+    let step = Expr::lam(
+        primary_name("n"),
+        nat.clone(),
+        Expr::lam(
+            primary_name("ih"),
+            nat,
+            Expr::bvar(1).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    [
+        motive,
+        Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+        step,
+        major,
+    ]
+    .into_iter()
+    .fold(
+        Expr::const_(Name::from_components(["Nat", "rec"]), vec![Level::one()]),
+        Expr::app,
+    )
+}
+
+#[test]
+fn nat_recursor_literal_major_is_compact_and_handles_multi_limb_borrow() {
+    use fln_core::expr::{Literal, NatLit};
+    let context = definition_context(nat_literal_family_entries());
+    for (input, expected) in [
+        (vec![], vec![]),
+        (vec![1], vec![]),
+        (vec![5], vec![4]),
+        (vec![0, 1], vec![u64::MAX]),
+        (vec![0, 0, 1], vec![u64::MAX, u64::MAX]),
+        (vec![0, 3], vec![u64::MAX, 2]),
+        (vec![u64::MAX], vec![u64::MAX - 1]),
+    ] {
+        let term =
+            nat_predecessor_application(Expr::lit(Literal::Nat(NatLit::from_limbs_le(input))));
+        let result = complete(whnf(&decoded(&term), &context, WhnfBudget::unlimited()));
+        assert_eq!(
+            result.term.node(result.term.root()),
+            Some(&ExprNode::NatLiteral { limbs_le: expected })
+        );
+        assert!(
+            result.term.nodes().len() < 5,
+            "must not construct unary numeral trees"
+        );
+        assert!(
+            result.steps < 100,
+            "magnitude must not drive reduction steps"
+        );
+    }
+    let result = complete(whnf(
+        &decoded(&nat_predecessor_application(constant("five"))),
+        &context,
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(
+        result.term.node(result.term.root()),
+        Some(&ExprNode::NatLiteral { limbs_le: vec![4] })
+    );
+}
+
+#[test]
+fn nat_literal_recursor_does_not_borrow_another_familys_constructor_rules() {
+    use fln_core::expr::{Literal, NatLit};
+    let application = [
+        constant("Motive"),
+        constant("Left"),
+        constant("Right"),
+        Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+    ]
+    .into_iter()
+    .fold(
+        Expr::const_(Name::from_components(["Two", "rec"]), vec![Level::one()]),
+        Expr::app,
+    );
+    let result = complete(whnf(
+        &decoded(&application),
+        &definition_context(two_family_entries()),
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(result.reductions, 0);
+    let mut entries = nat_literal_family_entries();
+    entries.retain(|e| e.name() != &checker_qualified(&["Nat", "succ"]));
+    let major = Expr::lit(Literal::Nat(NatLit::from_u64(5)));
+    let result = complete(whnf(
+        &decoded(&nat_predecessor_application(major)),
+        &definition_context(entries),
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(
+        result.reductions, 0,
+        "no reduction from a missing constructor declaration"
+    );
+}
+
+#[test]
+fn nat_literal_recursor_work_exhaustion_and_cancellation_are_nonanswers() {
+    use fln_core::expr::{Literal, NatLit};
+    let term = decoded(&nat_predecessor_application(Expr::lit(Literal::Nat(
+        NatLit::from_limbs_le(vec![0, 0, 1]),
+    ))));
+    let context = definition_context(nat_literal_family_entries());
+    assert!(matches!(
+        whnf(
+            &term,
+            &context,
+            WhnfBudget::new(u64::MAX, 0, TermBudget::unlimited())
+        ),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        whnf(
+            &term,
+            &context,
+            WhnfBudget::new(0, u64::MAX, TermBudget::unlimited())
+        ),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        whnf_with(&term, &context, WhnfBudget::unlimited(), || true),
+        WhnfOutcome::Inconclusive(_)
+    ));
+}

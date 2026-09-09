@@ -9,13 +9,12 @@
 //! declaration.
 //!
 //! This is not FrankenLean's real Prelude. Its raw fixture admits an opaque
-//! `Nat : Sort 1`; the embeddable source constructor additionally admits opaque
-//! `String : Sort 1`, the pin-shaped `Bool` inductive block, an explicit
-//! allowlist of checked scalar Nat operations, and the checked String extern
-//! signatures. Those checked rows let the compiler reach Golem's matching
-//! intrinsic implementations. Bool's two nullary constructors are live; source
-//! pattern syntax, recursor elaboration, Nat/String constructors, and the rest
-//! of Prelude still belong to later ingestion work.
+//! `Nat : Sort 1`; the embeddable source constructor instead admits the ordinary
+//! recursive Nat family, opaque `String : Sort 1`, the pin-shaped Bool block,
+//! an explicit allowlist of checked scalar Nat operations, and checked String
+//! extern signatures. Nat/Bool constructors and eliminators are real admitted
+//! declarations. String constructors and the rest of Prelude remain separate
+//! ingestion work; this seed does not claim full Prelude compatibility.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
 //! internal fault while constructing this environment is never rendered as a
@@ -101,6 +100,46 @@ pub fn nat_seed_declaration() -> Declaration {
         },
         is_unsafe: false,
     })
+}
+
+/// Construct the ordinary recursive Nat family for the full source seed.
+/// The minimal `bootstrap_nat_environment` fixture deliberately stays opaque;
+/// source matching instead needs checked constructors and a regenerated eliminator.
+/// This is a fixed candidate, still subject to K1 and the independent checker.
+pub fn nat_inductive_seed_declaration() -> Declaration {
+    use crate::inductive::{ConstructorSpec, InductiveSpec, inductive_declaration};
+    use crate::lctx::LocalDecl;
+    use crate::records::RecordBudget;
+    use fln_core::expr::FVarId;
+
+    let name = Name::from_components(["Nat"]);
+    inductive_declaration(
+        &InductiveSpec {
+            name: name.clone(),
+            level_params: Vec::new(),
+            parameters: Vec::new(),
+            constructors: vec![
+                ConstructorSpec {
+                    name: Name::from_components(["zero"]),
+                    fields: Vec::new(),
+                },
+                ConstructorSpec {
+                    name: Name::from_components(["succ"]),
+                    fields: vec![LocalDecl {
+                        id: FVarId(Name::from_components(["_fln_nat_seed", "n"])),
+                        user_name: Name::from_components(["n"]),
+                        type_: Expr::const_(name, Vec::new()),
+                        value: None,
+                        binder_info: BinderInfo::Default,
+                        index: 0,
+                    }],
+                },
+            ],
+            result_level: Level::one(),
+        },
+        RecordBudget::default(),
+    )
+    .expect("the fixed Nat family has a valid direct-recursive telescope")
 }
 
 /// Construct the equally opaque `String : Sort 1` candidate needed to type
@@ -569,7 +608,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// be admitted.
 pub fn source_seed_declarations() -> [Declaration; 34] {
     [
-        nat_seed_declaration(),
+        nat_inductive_seed_declaration(),
         string_seed_declaration(),
         bool_seed_declaration(),
         nat_add_seed_declaration(),
@@ -675,7 +714,7 @@ mod tests {
     #[test]
     fn source_seed_orders_types_before_the_exact_intrinsic_signatures() {
         let declarations = source_seed_declarations();
-        assert_eq!(declarations[0], nat_seed_declaration());
+        assert_eq!(declarations[0], nat_inductive_seed_declaration());
         assert_eq!(declarations[1], string_seed_declaration());
         assert_eq!(declarations[2], bool_seed_declaration());
         assert_eq!(declarations[3], nat_add_seed_declaration());
