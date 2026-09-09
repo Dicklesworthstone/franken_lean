@@ -28,6 +28,9 @@ jobs:
           original=plan['patch']
           if plan['sha256']=='be7e19eafca75e6fac86d8f3ac29e62889610e0697c69d31efdf61d1f9d940f4':
               plan['patch']=plan['patch'].replace('eLTF/FHs','eLT/FHs').replace('hlhZa3c7b7QV34','hlhZa3cQV34')
+          if hashlib.sha256(original.encode()).hexdigest()=='35d67ff3a5b1b9df6640acf2a2cd523def66b87b322e01d1ecb94c5108e03ba7':
+              for start,end,text in reversed([[2995,2996,''],[3135,3136,''],[3156,3157,''],[3215,3216,'q'],[3243,3244,'9'],[3257,3259,''],[9138,9139,''],[16690,16690,'YNBD']]):
+                  plan['patch']=plan['patch'][:start]+text+plan['patch'][end:]
           patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
           paths=[]
