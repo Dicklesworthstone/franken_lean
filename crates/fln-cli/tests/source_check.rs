@@ -296,3 +296,43 @@ fn later_record_file_failure_emits_no_successful_prefix_or_class_registration() 
     assert!(error.contains("kernel-rejection"), "{error}");
     assert!(!error.contains("\"outcome\":\"complete\""));
 }
+
+#[test]
+fn installed_binary_checks_named_fields_and_dependent_projection_chains() {
+    let path = file(include_str!("../../../examples/native_record_values.lean"));
+    let before = std::fs::read(&path).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("\"commands\":10"), "{text}");
+    assert!(text.contains("\"theorems\":4"), "{text}");
+    assert!(text.contains("\"executed\":false"), "{text}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn late_record_field_failure_emits_no_success_or_output_artifacts() {
+    let prefix = file("structure Point where\n  x : Nat\ndef point : Point := { x := 7 }");
+    let suffix = file("def failure : Nat := point.unknown");
+    let output = run(vec![
+        "check-source".into(),
+        "--json".into(),
+        prefix.into_os_string(),
+        suffix.into_os_string(),
+    ]);
+    assert_ne!(output.exit_code, 0);
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.contains("unknown record field"),
+        "{}",
+        output.stderr
+    );
+}

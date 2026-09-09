@@ -56,8 +56,8 @@ unsupported syntax are refused. Resource stops remain distinct from rejection.
 Current scope: simple named fields, typed method arguments, empty records,
 nonrecursive Type-valued records, and named class/instance declarations. Source
 inheritance, custom constructor names, grouped fields, field defaults, deriving,
-explicit universe-polymorphic headers, record literals, and field-dot notation
-remain outside this increment. Core `RecordSpec` generation supports universe
+explicit universe-polymorphic headers, record updates, field defaults, numeric
+projections and general extended field notation remain outside this increment. Core `RecordSpec` generation supports universe
 parameters separately; this is not evidence for full source-level universe or
 Reference record elaboration parity. Built-in-name checker specializations may
 also refuse incompatible user declarations with those names.
@@ -66,3 +66,44 @@ Regression targets: `fln::source_records`, `fln::record_generation`, parser reco
 roundtrips/refusals, and `fln-cli::source_check`, plus the existing frontend, proof,
 instance and engine tests. Positive tests use real checking engines, including
 dependent projection conversion and recursive dictionaries of user-defined classes.
+
+## Constructing and accessing records
+
+Named-field literals now elaborate against their expected or explicit record type:
+
+```lean
+structure Package where
+  carrier : Type
+  value : carrier
+
+def wrapped : Package := { value := 23, carrier := Nat }
+def unpack (p : Package) : p.carrier := p.value
+theorem wrapped_ok : (wrapped).value = 23 := by rfl
+```
+
+Values are elaborated in constructor-field order, even when written in a different
+order, so each dependent field receives the actual earlier values in its expected
+type. Nested literals, method lambdas, proof terms, punned fields (`{ value }`),
+empty records and a trailing comma are supported. Either `{ value := 7 : Box Nat }`
+or `({ value := 7 } : Box Nat)` supplies an explicit type. Every field must be
+present exactly once; unknown, duplicate, missing, ill-typed or unresolved fields
+are refused. No record type is guessed from field labels.
+
+Field access supports both `receiver.field` and `(expression).field`, including
+chained paths and function-valued fields. Dependent projection types retain the
+actual receiver. Explicit class receivers are applied directly rather than
+replaced with a dictionary from instance search. Exact local/global qualified
+names are resolved first; only unresolved names fall back to field access.
+Escaped dots remain parts of an identifier, not path separators.
+
+This bounded field notation selects actual named fields of admitted single-
+constructor records. It does not search arbitrary namespace functions, base
+structures or numeric fields. Literal fields currently require comma separators;
+record updates, omitted defaults and inheritance remain explicit unsupported
+cases. Parsing and elaboration use heap worklists, including nested literals and
+parenthesized type ascriptions.
+
+`examples/native_record_values.lean` exercises dependent fields and explicit versus
+inferred class receivers through the installed `fln check-source --json` command.
+The `fln::source_record_literals` tests cover failure atomicity as well as positive
+kernel/checker acceptance; installed CLI tests verify the same code path.

@@ -247,6 +247,9 @@ impl Context {
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
+                if let Some(term) = self.qualified_record_field(name)? {
+                    return Ok(term);
+                }
                 if name == &Name::from_components(["true"]) {
                     resolved = Name::from_components(["Bool", "true"]);
                 }
@@ -527,6 +530,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
             Ascription(&'a Syntax, Option<Expr>),
+            Projection(Name, Option<Expr>, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordNext(record_terms::RecordBuild<'a>),
             RecordField(record_terms::RecordBuild<'a>, Expr),
@@ -561,6 +565,16 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "proj"]) {
+                            let parts = expect_node(syntax, kind, 3, "field projection")?;
+                            expect_atom(&parts[1], ".", "field dot")?;
+                            let Syntax::Ident { val: field, .. } = &parts[2] else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            tasks.push(Task::Projection(field.clone(), expected, finish));
+                            tasks.push(Task::Visit(&parts[0], None, true));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "typeAscription"]) {
                             let parts = expect_node(syntax, kind, 5, "term ascription")?;
                             expect_atom(&parts[2], ":", "ascription colon")?;
@@ -697,6 +711,15 @@ impl Context {
                         }
                     }
                     let term = self.atom(syntax, expected.as_ref())?;
+                    values.push(if finish {
+                        self.finish_term(term, expected.as_ref())?
+                    } else {
+                        term
+                    });
+                }
+                Task::Projection(field, expected, finish) => {
+                    let receiver = values.pop().expect("receiver precedes projection");
+                    let term = self.record_field_path(receiver, &field)?;
                     values.push(if finish {
                         self.finish_term(term, expected.as_ref())?
                     } else {

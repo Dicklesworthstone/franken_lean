@@ -147,3 +147,62 @@ fn proof_fields_use_the_ordinary_tactic_and_kernel_path() {
         "structure Witness where\n  value : Nat\n  equal : value = 7\ndef witness : Witness := { equal := by rfl, value := 7 }\ntheorem value_ok : Witness.value witness = 7 := by rfl",
     );
 }
+
+#[test]
+fn named_field_access_carries_receiver_and_dependent_field_types() {
+    check(
+        &engine(),
+        "structure Package where\n  carrier : Type\n  value : carrier\ndef packed : Package := { carrier := Nat, value := 23 }\ndef read (p : Package) : p.carrier := p.value\ntheorem value_ok : packed.value = 23 := by rfl\ntheorem read_ok : read packed = 23 := by rfl",
+    );
+}
+#[test]
+fn postfix_field_access_handles_parenthesized_terms_and_nested_paths() {
+    check(
+        &engine(),
+        "structure Point where\n  x : Nat\nstructure Outer where\n  point : Point\ndef make (n : Nat) : Outer := { point := { x := n } }\ntheorem nested : (make 7).point.x = 7 := by rfl\ntheorem literal : ({ x := 8 } : Point).x = 8 := by rfl",
+    );
+}
+#[test]
+fn field_methods_stay_functions_and_preserve_application_precedence() {
+    check(
+        &engine(),
+        "structure Box (A : Type) where\n  value : A\n  transform (x : A) : A\ndef box : Box Nat := { value := 4, transform := fun x => x + 1 }\ndef add (a b : Nat) : Nat := a + b\ntheorem method : box.transform box.value = 5 := by rfl\ntheorem precedence : add 2 (box).value = 6 := by rfl",
+    );
+}
+#[test]
+fn explicit_class_receiver_is_not_replaced_by_an_ambient_instance() {
+    check(
+        &engine(),
+        "class Choice (A : Type) where\n  value : A\ninstance selected : Choice Nat := { value := 11 }\ndef different : Choice Nat := { value := 7 }\ntheorem receiver : different.value = 7 := by rfl\ntheorem parenthesized : (different).value = 7 := by rfl\ntheorem global : Choice.value = 11 := by rfl",
+    );
+}
+#[test]
+fn exact_qualified_names_and_escaped_components_keep_their_identity() {
+    check(
+        &engine(),
+        "structure Point where\n  x : Nat\ndef point : Point := { x := 4 }\ndef point.x : Nat := 99\ndef «point.x» : Nat := 77\ntheorem exact_global : point.x = 99 := by rfl\ntheorem explicit_projection : (point).x = 4 := by rfl\ntheorem escaped : «point.x» = 77 := by rfl\ndef local_name (point.x : Nat) : Nat := point.x\ntheorem exact_local : local_name 3 = 3 := by rfl",
+    );
+}
+#[test]
+fn unknown_fields_do_not_resolve_as_arbitrary_namespace_methods() {
+    let e = check(&engine(), "structure Point where\n  x : Nat\ndef Point.notAField (p : Point) : Nat := 7\ndef point : Point := { x := 2 }").engine;
+    let root = e.environment().logical_root(&KVMap::new());
+    for text in [
+        "def bad : Nat := point.missing",
+        "def bad : Nat := point.notAField",
+        "def bad : Nat := (1).x",
+        "def bad : Nat := (point) .x",
+        "def bad : Nat := (point). x",
+    ] {
+        assert!(
+            e.check_source_files(
+                &[text.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{text}"
+        );
+        assert_eq!(e.environment().logical_root(&KVMap::new()), root);
+    }
+}

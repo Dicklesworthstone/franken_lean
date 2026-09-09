@@ -511,6 +511,7 @@ fn nat_definition_token_table() -> TokenTable {
         "Prop",
         "_",
         "{",
+        ".",
         "}",
         "⦃",
         "⦄",
@@ -568,6 +569,7 @@ fn source_module_token_table() -> TokenTable {
         "Prop",
         "_",
         "{",
+        ".",
         "}",
         "⦃",
         "⦄",
@@ -1132,6 +1134,32 @@ fn bounded_term(
                     operands: Vec::new(),
                     operators: Vec::new(),
                 });
+                cursor += 1;
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "." =>
+            {
+                let refusal = || NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: NatDefinitionExpectation::RecordField,
+                };
+                if index == range.start
+                    || cursor >= range.end
+                    || tokens[index - 1].extent.end() != tokens[index].extent.start()
+                    || tokens[index].extent.end() != tokens[cursor].extent.start()
+                    || !matches!(&tokens[cursor].kind, TokenKind::Ident(_))
+                {
+                    return Err(refusal());
+                }
+                let frame = frames.last_mut().expect("root term frame");
+                let (receiver, start) = frame.application.pop().ok_or_else(refusal)?;
+                frame.application.push((
+                    Syntax::node(
+                        parser_kind(&["Term", "proj"]),
+                        vec![receiver, leaves.leaf(index)?, leaves.leaf(cursor)?],
+                    ),
+                    start,
+                ));
                 cursor += 1;
             }
             Some(TokenKind::Symbol(symbol))

@@ -2,6 +2,7 @@
 //! independent declarations or trusted projections. Elaboration follows the
 //! constructor telescope so later field types see the actual earlier values.
 use super::*;
+use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
 
@@ -54,6 +55,170 @@ pub(super) enum RecordStep<'a> {
 }
 
 impl Context {
+    /// Resolve a qualified identifier only after exact local/global lookup has
+    /// failed. Names are split structurally: an escaped dot is never a separator.
+    pub(super) fn qualified_record_field(
+        &mut self,
+        name: &Name,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let mut prefix = name.clone();
+        let mut suffix = Vec::new();
+        while !prefix.is_anonymous() {
+            self.tick()?;
+            let LeafView::Str(part) = prefix.leaf_view() else {
+                return Ok(None);
+            };
+            suffix.push(Name::from_components([part]));
+            prefix = prefix.parent().clone();
+            let receiver = if let Some(local) = self
+                .txn
+                .lctx
+                .decls()
+                .iter()
+                .rev()
+                .find(|local| local.user_name == prefix)
+            {
+                Some(Typed {
+                    value: Expr::fvar(local.id.clone()),
+                    type_: local.type_.clone(),
+                })
+            } else if self.txn.env.contains(&prefix) {
+                Some(self.constant(&prefix)?)
+            } else {
+                None
+            };
+            if let Some(mut receiver) = receiver {
+                for (index, field) in suffix.iter().rev().enumerate() {
+                    receiver = match self.record_field(receiver, field) {
+                        Ok(term) => term,
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::RecordTerm(RecordTermError::ExpectedRecordType),
+                        )) if index == 0 => {
+                            // A namespace prefix such as Nat is not a receiver.
+                            // Keep its missing constant on the original path.
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                }
+                return Ok(Some(receiver));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Apply admitted generated projections to the actual receiver. In
+    /// particular, an instance-implicit class receiver must not be replaced by
+    /// a dictionary selected from the surrounding context.
+    pub(super) fn record_field_path(
+        &mut self,
+        mut receiver: Typed,
+        path: &Name,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let mut parts = Vec::new();
+        let mut name = path.clone();
+        while !name.is_anonymous() {
+            self.tick()?;
+            let LeafView::Str(part) = name.leaf_view() else {
+                return Err(error(RecordTermError::UnknownField(path.clone())));
+            };
+            parts.push(Name::from_components([part]));
+            name = name.parent().clone();
+        }
+        if parts.is_empty() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        for part in parts.iter().rev() {
+            receiver = self.record_field(receiver, part)?;
+        }
+        Ok(receiver)
+    }
+
+    fn record_field(
+        &mut self,
+        receiver: Typed,
+        field: &Name,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        self.flush(false)?;
+        let target = self.whnf(&receiver.type_)?;
+        let mut head = &target;
+        let mut params = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            params.push(a.clone());
+            head = f;
+        }
+        params.reverse();
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name).cloned() else {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        };
+        if family.is_unsafe
+            || family.is_rec
+            || family.num_indices != 0
+            || family.ctors.len() != 1
+            || params.len() != family.num_params as usize
+            || levels.len() != family.base.level_params.len()
+        {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        }
+        let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(&family.ctors[0]).cloned() else {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        };
+        if ctor.is_unsafe || ctor.induct != *name || ctor.num_params != family.num_params {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        }
+        let mut telescope = &ctor.base.type_;
+        let mut found = false;
+        for index in 0..u64::from(ctor.num_params) + u64::from(ctor.num_fields) {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_name, body, ..
+            } = telescope.node()
+            else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            if index >= u64::from(ctor.num_params) && binder_name == field {
+                found = true;
+            }
+            telescope = body;
+        }
+        if !found {
+            return Err(error(RecordTermError::UnknownField(field.clone())));
+        }
+        let projection_name = name.append_core(field);
+        let Some(ConstantInfo::Defn(projection)) = self.txn.env.find(&projection_name).cloned()
+        else {
+            return Err(error(RecordTermError::UnknownField(field.clone())));
+        };
+        if projection.safety != DefinitionSafety::Safe
+            || projection.base.level_params.len() != levels.len()
+        {
+            return Err(error(RecordTermError::UnknownField(field.clone())));
+        }
+        let mut term = Typed {
+            value: Expr::const_(projection_name, levels.clone()),
+            type_: self.instantiate_params(
+                &projection.base.type_,
+                &projection.base.level_params,
+                levels,
+            )?,
+        };
+        params.push(receiver.value);
+        for argument in params {
+            self.tick()?;
+            let type_ = self.whnf(&term.type_)?;
+            let ExprNode::ForallE { body, .. } = type_.node() else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            term.type_ = self.substitute(body, &argument)?;
+            term.value = Expr::app(term.value, argument);
+        }
+        Ok(term)
+    }
+
     pub(super) fn record_parts<'a>(
         &mut self,
         syntax: &'a Syntax,

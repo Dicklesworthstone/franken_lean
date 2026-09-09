@@ -174,6 +174,9 @@ mod tests {
             "def x := ({ value := 7 } : Box Nat)",
             "def x (value : Nat) : Box Nat := { value }",
             "def x : Proof := { proof := by rfl, value := 1 }",
+            "def x := ({ value := 7 } : Box Nat).value",
+            "def x := (make 3).inner.value -- projection\r\n",
+            "def x (p : Point) : Nat := p.chaînes",
         ] {
             let parsed = parse_definition(text.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_original(), text.as_bytes());
