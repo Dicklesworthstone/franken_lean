@@ -525,6 +525,9 @@ impl Context {
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
+        // Resolve known dictionaries before their dependent result types enter
+        // unification. Unknown class inputs still wait for the expected type.
+        self.resolve_instances(false)?;
         if let Some(expected) = expected {
             self.constrain(&term.type_, expected)?;
         }
