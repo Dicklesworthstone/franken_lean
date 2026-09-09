@@ -1,5 +1,7 @@
 //! Goal rewriting by explicit equality proofs. The result is an Eq.rec term,
 //! never an unchecked change of the goal's type or a new equality axiom.
+mod matching;
+
 use super::*;
 use fln_core::level::LevelView;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -62,6 +64,8 @@ impl Context {
         let Some((level, alpha, left, right)) = equality_target(&target) else {
             return Ok(false);
         };
+        let left = self.whnf(&left)?;
+        let right = self.whnf(&right)?;
         if !self.proof_types_match(&left, &right)? {
             return Ok(false);
         }
@@ -98,6 +102,10 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.flush(false)?;
+        let original_target = self.instantiate(&goal.target)?;
+        let (rule, occurrence) = self
+            .instantiate_rewrite_rule(rule, &original_target, reverse, false)?
+            .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
         let rule_type = self.whnf(&rule.type_)?;
         let (u, alpha, from, to) =
             equality_target(&rule_type).ok_or_else(|| error(TacticError::ExpectedEquality))?;
@@ -106,7 +114,7 @@ impl Context {
         let to = self.instantiate(&to)?;
         let alpha = self.instantiate(&alpha)?;
         let rule_value = self.instantiate(&rule.value)?;
-        let pattern = if reverse { &to } else { &from };
+        let pattern = &occurrence;
         let replacement = if reverse { &from } else { &to };
         if pattern.has_expr_mvar() || pattern.has_level_mvar() || pattern.has_loose_bvars() {
             return Err(error(TacticError::ExpectedEquality));
@@ -129,6 +137,16 @@ impl Context {
             return Err(failure(SourceInferenceError::ExpectedType));
         };
         let (child, next_goal) = self.proof_goal(next_target)?;
+        // Definitionally identical endpoints need no equality elimination.
+        // Keep the requested syntactic target, but avoid an unnecessary dependent
+        // transport. Final admission still checks the original goal by conversion.
+        let reduced_from = self.whnf(&from)?;
+        let reduced_to = self.whnf(&to)?;
+        if self.proof_types_match(&reduced_from, &reduced_to)? {
+            proof.work.push(Work::Close(goal, child));
+            proof.work.push(Work::Rewrite(next_goal, remaining, close));
+            return Ok(());
+        }
         let eq_domain = app(
             Expr::const_(Name::from_components(["Eq"]), vec![u.clone()]),
             [alpha.clone(), from.clone(), Expr::fvar(marker.clone())],
