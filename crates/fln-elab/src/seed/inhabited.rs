@@ -224,6 +224,52 @@ pub fn default_seed_declaration(qualified: bool) -> Declaration {
     })
 }
 
+/// The ordinary identity definition exposes instance synthesis as a term.
+/// It asserts no inhabitance: elaboration must supply the instance argument.
+pub fn infer_instance_seed_declaration() -> Declaration {
+    let u_name = name("u");
+    let universe = Expr::sort(Level::param(u_name.clone()));
+    let alpha = local("α");
+    let type_ = bind(
+        "α",
+        universe.clone(),
+        bind(
+            "instance",
+            alpha.clone(),
+            alpha.clone(),
+            BinderInfo::InstImplicit,
+            false,
+        ),
+        BinderInfo::Implicit,
+        false,
+    );
+    let value = bind(
+        "α",
+        universe,
+        bind(
+            "instance",
+            alpha,
+            local("instance"),
+            BinderInfo::InstImplicit,
+            true,
+        ),
+        BinderInfo::Implicit,
+        true,
+    );
+    let n = name("inferInstance");
+    Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: n.clone(),
+            level_params: vec![u_name],
+            type_,
+        },
+        value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![n],
+    })
+}
+
 pub fn scalar_inhabited_seed_declaration(scalar: &str) -> Declaration {
     let (n, value) = match scalar {
         "Nat" => (

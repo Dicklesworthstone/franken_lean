@@ -178,6 +178,7 @@ impl Context {
         value: Expr,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx;
+        self.resolve_instances(false)?;
         self.flush(false)?;
         let mut value = self.instantiate(&value)?;
         for local in goal.introduced.into_iter().rev() {
@@ -381,16 +382,19 @@ impl Context {
             else {
                 return Err(error(TacticError::ApplyMismatch));
             };
-            if *binder_info == BinderInfo::InstImplicit {
-                return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
-            }
             let domain = binder_type.clone();
             let body = body.clone();
-            let (argument, subgoal) = self.proof_goal(domain)?;
+            let argument = if *binder_info == BinderInfo::InstImplicit {
+                self.instance_hole(domain)?
+            } else {
+                let (argument, subgoal) = self.proof_goal(domain)?;
+                arguments.push(subgoal);
+                argument
+            };
             term.value = Expr::app(term.value, argument.clone());
             term.type_ = self.substitute(&body, &argument)?;
-            arguments.push(subgoal);
         }
+        self.resolve_instances(false)?;
         proof.work.push(Work::Close(goal, term.value));
         // Dependency-producing parameters precede later parameters. Metavariables
         // already inferred while matching the conclusion are skipped by advance.

@@ -306,3 +306,74 @@ fn explicit_instance_admission_binds_the_registered_successor_root() {
     );
     checked(&result.engine, "theorem seen : default = 13 := by rfl");
 }
+
+#[test]
+fn infer_instance_is_an_ordinary_checked_identity_term() {
+    checked(
+        &engine(),
+        "def dictionary : Inhabited Nat := inferInstance\ntheorem same : dictionary = instInhabitedNat := by rfl\ndef fromProof : Inhabited Nat := by exact inferInstance\ntheorem sameProof : fromProof = dictionary := by rfl",
+    );
+}
+
+#[test]
+fn infer_instance_prefers_the_current_local_dictionary() {
+    checked(
+        &engine(),
+        "def dictionary [i : Inhabited Nat] : Inhabited Nat := inferInstance\ntheorem same [i : Inhabited Nat] : dictionary = i := by rfl",
+    );
+}
+
+#[test]
+fn apply_synthesizes_instance_parameters_without_exposing_them_as_proof_goals() {
+    let e = checked(
+        &engine(),
+        "theorem keep {A : Type} [Inhabited A] (x : A) : x = x := by rfl\ntheorem use (x : Nat) : x = x := by apply keep",
+    );
+    let ConstantInfo::Thm(theorem) = e.environment().find(&n("use")).unwrap() else {
+        panic!("theorem")
+    };
+    assert!(has_constant(&theorem.value, &n("keep")));
+    assert!(has_constant(&theorem.value, &n("instInhabitedNat")));
+}
+
+#[test]
+fn apply_keeps_introduced_instance_scopes_inside_the_final_lambda() {
+    checked(
+        &engine(),
+        "def choose {A : Type} [Inhabited A] (x : A) : A := default\ndef use (A : Type) [i : Inhabited A] : A -> A := by intro x; apply choose; exact x",
+    );
+}
+
+#[test]
+fn rewriting_and_simp_synthesize_lemma_instances_without_implicit_hypothesis_search() {
+    let e = checked(
+        &engine(),
+        "theorem keep {A : Type} [Inhabited A] (f : A -> A) (x : A) (h : f x = x) : f x = x := by exact h",
+    );
+    checked(
+        &e,
+        "theorem rewriteUse (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by rw [keep f]; exact h\ntheorem simpUse (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [keep f, h]",
+    );
+    let before = e.environment().logical_root(&KVMap::new());
+    assert!(e.check_source_files(&[b"theorem mustNotUseHidden (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by simp only [keep f]"], &KVMap::new(), limits()).is_err());
+    assert_eq!(e.environment().logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn instance_dependent_tactics_refuse_missing_dictionaries_without_publishing() {
+    let e = checked(
+        &engine(),
+        "theorem keep {A : Type} [Inhabited A] (x : A) : x = x := by rfl",
+    );
+    let before = e.environment().logical_root(&KVMap::new());
+    for source in [
+        "def missing (A : Type) : Inhabited A := inferInstance",
+        "theorem missing (A : Type) (x : A) : x = x := by apply keep",
+    ] {
+        assert!(
+            e.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err()
+        );
+        assert_eq!(e.environment().logical_root(&KVMap::new()), before);
+    }
+}

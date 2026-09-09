@@ -172,3 +172,47 @@ fn a_late_simp_failure_does_not_emit_partial_success_for_prior_files() {
     assert!(refused.stdout.is_empty());
     assert!(!refused.stderr.contains("\"outcome\":\"complete\""));
 }
+
+#[test]
+fn installed_binary_resolves_source_instances_across_files_without_execution() {
+    let one = file(
+        "instance (priority := 2000) seven : Inhabited Nat := Inhabited.mk 7\ninstance constantFunction {A : Type} [Inhabited A] : Inhabited (Nat -> A) := Inhabited.mk (fun x => default)",
+    );
+    let two = file(
+        "def dictionary : Inhabited Nat := inferInstance\ndef nested : Nat -> Nat -> Nat := default\ntheorem computes : nested 1 2 = 7 := by rfl",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&one)
+        .arg(&two)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for required in [
+        "\"files\":2",
+        "\"commands\":5",
+        "\"theorems\":1",
+        "\"executed\":false",
+    ] {
+        assert!(text.contains(required), "{text}");
+    }
+    std::fs::write(&two, "theorem falseDefault : default = 8 := by rfl").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(one)
+        .arg(two)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "late failure must not expose successful prefix"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+}

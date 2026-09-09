@@ -567,7 +567,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 33] {
+pub fn source_seed_declarations() -> [Declaration; 34] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
@@ -602,6 +602,7 @@ pub fn source_seed_declarations() -> [Declaration; 33] {
         inhabited::scalar_inhabited_seed_declaration("Nat"),
         inhabited::scalar_inhabited_seed_declaration("String"),
         inhabited::scalar_inhabited_seed_declaration("Bool"),
+        inhabited::infer_instance_seed_declaration(),
     ]
 }
 

@@ -74,7 +74,7 @@ Current boundaries are explicit:
 
 - `check-source` accepts import-free `def` and `theorem` files. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
 - Rewriting and simplification are goal-only. Quantified rules use the native bounded unifier, not general higher-order theorem search. Hypothesis locations (`at h`), occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
-- General typeclass synthesis, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier are not established by this increment.
+- [Native instance synthesis](NATIVE_INSTANCES.md) now supports registered classes, local instances, named global instances and selected tactic-lemma arguments. Full Synod semantics, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier remain incomplete.
 
 ## Verification
 

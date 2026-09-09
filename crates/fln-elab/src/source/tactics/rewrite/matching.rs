@@ -63,7 +63,7 @@ impl Context {
             let before = self.txn.mvars.assignments().len();
             for id in holes {
                 self.tick()?;
-                if self.txn.mvars.is_assigned(id) {
+                if self.txn.mvars.is_assigned(id) || self.instance_goals.contains(id) {
                     continue;
                 }
                 let raw = self
@@ -158,12 +158,13 @@ impl Context {
             else {
                 break;
             };
-            if *binder_info == BinderInfo::InstImplicit {
-                return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
-            }
             let domain = binder_type.clone();
             let body = body.clone();
-            let argument = template.hole(domain)?;
+            let argument = if *binder_info == BinderInfo::InstImplicit {
+                template.instance_hole(domain)?
+            } else {
+                template.hole(domain)?
+            };
             if let ExprNode::MVar { id } = argument.node() {
                 holes.push(id.clone());
             }
@@ -239,6 +240,13 @@ impl Context {
                 if !trial.match_rewrite_occurrence(&pattern, &alpha, term)? {
                     return Ok(None);
                 }
+                trial.resolve_instances(false)?;
+                if holes
+                    .iter()
+                    .any(|id| trial.instance_goals.contains(id) && !trial.txn.mvars.is_assigned(id))
+                {
+                    return Ok(None);
+                }
                 if inside_out && !trial.discharge_rewrite_premises(&holes, selected_rules)? {
                     return Ok(None);
                 }
@@ -305,9 +313,7 @@ impl Context {
             self.charge_rewrite_trial(&trial);
             match attempt {
                 Ok(Some(rule)) => {
-                    self.txn = trial.txn;
-                    self.next = trial.next;
-                    self.equations = trial.equations;
+                    *self = trial;
                     return Ok(Some(rule));
                 }
                 Ok(None) => {}
