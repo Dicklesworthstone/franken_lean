@@ -22,7 +22,7 @@ jobs:
           mkdir -p target/elimination-landing
           git rev-parse HEAD > target/elimination-landing/input-commit.txt
           python3 - <<'PY'
-          import hashlib,json,pathlib,subprocess
+          import hashlib,json,pathlib,re,subprocess
           raw=pathlib.Path('scripts/native_elimination_increment.json').read_bytes()
           plan=json.loads(raw)
           source=pathlib.PurePosixPath(plan['patch_file'])
@@ -30,6 +30,11 @@ jobs:
           patch=pathlib.Path(source).read_bytes()
           assert len(patch)<2_000_000
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
+          out=pathlib.Path('target/elimination-landing')
+          (out/'input.patch').write_bytes(patch)
+          if plan['sha256']=='f033cfc4ea6c5ac48521d6441eaabb4a21ebef62786608e9170a558c8e9b56a9':
+              patch=re.sub(rb'(^diff --git [^\n]+\n)(?=--- /dev/null\n)',rb'\1new file mode 100644\n',patch,flags=re.M)
+              assert hashlib.sha256(patch).hexdigest()=='1139b793a5db3acd110bcce2fc718c4eee79eec65eeb74522de8ecc709652d8b'
           paths=plan['paths']
           required=plan.get('required',{})
           assert paths and len(paths)==len(set(paths))
@@ -43,7 +48,6 @@ jobs:
           assert b'+++ /dev/null' not in patch
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
-          out=pathlib.Path('target/elimination-landing')
           (out/'paths.json').write_text(json.dumps(paths))
           (out/'increment.json').write_bytes(raw)
           (out/'change.patch').write_bytes(patch)
