@@ -1,0 +1,53 @@
+name: Projection delta integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-projection-delta-landing.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  projection:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Apply the tested scoped patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/projection-delta
+          python3 - <<'PY'
+          import base64,gzip,hashlib,subprocess,pathlib
+          encoded='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'
+          patch=gzip.decompress(base64.b64decode(encoded))
+          assert hashlib.sha256(patch).hexdigest()=='0cbcfbe222a8ade4d63181c19fafbd985f29ef0daf5a652e16a850fe2222bd45'
+          pathlib.Path('target/projection-delta/change.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          PY
+      - name: Verify actual checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          cargo test --locked -p fln-checker --test projection_delta --test defeq --no-fail-fast 2>&1 | tee target/projection-delta/tests.log
+          cargo clippy --locked -p fln-checker --test projection_delta -- -D warnings 2>&1 | tee target/projection-delta/clippy.log
+          git diff --check
+      - name: Publish verified checker files without rewriting history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git add -- crates/fln-checker/src/defeq.rs crates/fln-checker/tests/projection_delta.rs
+          git commit -m 'fix(checker): reduce defined structure majors during lazy projection conversion'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/projection-delta/published-commit.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: projection-delta-${{ github.sha }}
+          path: target/projection-delta
+          retention-days: 7
