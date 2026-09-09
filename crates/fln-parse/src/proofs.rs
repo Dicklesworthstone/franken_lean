@@ -34,6 +34,7 @@ pub(super) fn parse(
                 }
                 depth -= 1;
             }
+            TokenKind::Symbol(symbol) if symbol == "," && depth == 0 => break,
             _ => {}
         }
         end += 1;

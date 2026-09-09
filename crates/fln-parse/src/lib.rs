@@ -31,6 +31,7 @@ pub mod registry;
 pub mod state;
 
 mod proofs;
+mod record_terms;
 mod records;
 
 use build::{BuildError, Leaves};
@@ -247,6 +248,8 @@ struct LambdaTokens {
 }
 
 struct BoundedTermFrame {
+    record: Option<record_terms::RecordFrame>,
+    ascription: Option<(Syntax, usize)>,
     open: Option<usize>,
     lambda: Option<LambdaTokens>,
     application: Vec<(Syntax, usize)>,
@@ -1062,6 +1065,8 @@ fn bounded_term(
     grammar: DefinitionGrammar,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut frames = vec![BoundedTermFrame {
+        record: None,
+        ascription: None,
         open: None,
         lambda: None,
         application: Vec::new(),
@@ -1115,6 +1120,8 @@ fn bounded_term(
                     });
                 }
                 frames.push(BoundedTermFrame {
+                    record: None,
+                    ascription: None,
                     open: None,
                     lambda: Some(LambdaTokens {
                         keyword: index,
@@ -1127,8 +1134,55 @@ fn bounded_term(
                 });
                 cursor += 1;
             }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "{" =>
+            {
+                let frame = record_terms::open(view, tokens, index, &mut cursor, range.end)?;
+                frames.push(frame);
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar
+                    && matches!(symbol.as_str(), "," | "}" | ":") =>
+            {
+                finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+                if frames.last().is_some_and(|frame| frame.record.is_some()) {
+                    record_terms::delimiter(
+                        leaves,
+                        view,
+                        tokens,
+                        &mut frames,
+                        index,
+                        &mut cursor,
+                        range.end,
+                    )?;
+                } else if symbol == ":"
+                    && frames
+                        .last()
+                        .is_some_and(|frame| frame.open.is_some() && frame.ascription.is_none())
+                {
+                    let frame = frames.pop().expect("parenthesis frame");
+                    let open = frame.open;
+                    let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+                    frames.push(BoundedTermFrame {
+                        record: None,
+                        ascription: Some((value, index)),
+                        open,
+                        lambda: None,
+                        application: Vec::new(),
+                        operands: Vec::new(),
+                        operators: Vec::new(),
+                    });
+                } else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: grammar.value_expectation(),
+                    });
+                }
+            }
             Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
                 frames.push(BoundedTermFrame {
+                    record: None,
+                    ascription: None,
                     open: Some(index),
                     lambda: None,
                     application: Vec::new(),
@@ -1144,19 +1198,38 @@ fn bounded_term(
                         expected: NatDefinitionExpectation::EndOfCommand,
                     });
                 }
-                let frame = frames
+                let mut frame = frames
                     .pop()
                     .expect("a closing parenthesis has an inner frame");
-                let open = frame.open.expect("only the root frame lacks an opener");
+                let open = frame
+                    .open
+                    .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: NatDefinitionExpectation::RecordField,
+                    })?;
+                let ascription = frame.ascription.take();
                 let inner = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-                let grouped = Syntax::node(
-                    parser_kind(&["Term", "paren"]),
-                    vec![
-                        hygienic_lparen(leaves.leaf(open)?),
-                        inner,
-                        leaves.leaf(index)?,
-                    ],
-                );
+                let grouped = if let Some((value, colon)) = ascription {
+                    Syntax::node(
+                        parser_kind(&["Term", "typeAscription"]),
+                        vec![
+                            hygienic_lparen(leaves.leaf(open)?),
+                            value,
+                            leaves.leaf(colon)?,
+                            null_node(vec![inner]),
+                            leaves.leaf(index)?,
+                        ],
+                    )
+                } else {
+                    Syntax::node(
+                        parser_kind(&["Term", "paren"]),
+                        vec![
+                            hygienic_lparen(leaves.leaf(open)?),
+                            inner,
+                            leaves.leaf(index)?,
+                        ],
+                    )
+                };
                 frames
                     .last_mut()
                     .expect("the parent term frame remains live")

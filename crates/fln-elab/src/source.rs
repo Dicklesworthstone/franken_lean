@@ -10,6 +10,7 @@ mod instance_command;
 mod instances;
 mod levels;
 mod record;
+mod record_terms;
 mod tactics;
 
 use super::*;
@@ -23,6 +24,7 @@ pub enum SourceInferenceError {
     UnknownConstant(Name),
     ExpectedFunction,
     ExpectedType,
+    RecordTerm(record_terms::RecordTermError),
     Record(crate::records::RecordError),
     Tactic(tactics::TacticError),
     UnresolvedHoles { count: usize },
@@ -45,6 +47,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
             Self::Tactic(error) => write!(f, "{error}"),
             Self::Record(error) => write!(f, "{error}"),
+            Self::RecordTerm(error) => write!(f, "{error}"),
             Self::ExpectedType => write!(f, "source annotation requires a type"),
             Self::UnresolvedHoles { count } => write!(
                 f,
@@ -523,6 +526,10 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            Ascription(&'a Syntax, Option<Expr>),
+            RecordType(record_terms::RecordParts<'a>, Option<Expr>),
+            RecordNext(record_terms::RecordBuild<'a>),
+            RecordField(record_terms::RecordBuild<'a>, Expr),
             Visit(&'a Syntax, Option<Expr>, bool),
             Function(&'a [Syntax], Option<Expr>),
             Argument(Typed, Expr, &'a [Syntax], Option<Expr>),
@@ -554,6 +561,26 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "typeAscription"]) {
+                            let parts = expect_node(syntax, kind, 5, "term ascription")?;
+                            expect_atom(&parts[2], ":", "ascription colon")?;
+                            let [annotation] = expect_null_args(&parts[3], "ascribed type")? else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            tasks.push(Task::Ascription(&parts[1], expected));
+                            tasks.push(Task::Visit(annotation, None, true));
+                            continue;
+                        }
+                        if kind == &parser_kind(&["Term", "structInst"]) {
+                            let parts = self.record_parts(syntax)?;
+                            if let Some(annotation) = parts.annotation {
+                                tasks.push(Task::RecordType(parts, expected));
+                                tasks.push(Task::Visit(annotation, None, true));
+                            } else {
+                                tasks.push(Task::RecordNext(self.start_record(parts, expected)?));
+                            }
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "byTactic"]) {
                             tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
                             continue;
@@ -675,6 +702,40 @@ impl Context {
                     } else {
                         term
                     });
+                }
+                Task::Ascription(syntax, expected) => {
+                    let type_ = values.pop().expect("ascription type visit");
+                    self.sort_level(&type_)?;
+                    if let Some(expected) = expected {
+                        self.constrain(&type_.value, &expected)?;
+                    }
+                    tasks.push(Task::Visit(syntax, Some(type_.value), true));
+                }
+                Task::RecordType(parts, expected) => {
+                    let type_ = values.pop().expect("record type visit");
+                    self.sort_level(&type_)?;
+                    if let Some(expected) = expected {
+                        self.constrain(&type_.value, &expected)?;
+                    }
+                    tasks.push(Task::RecordNext(
+                        self.start_record(parts, Some(type_.value))?,
+                    ));
+                }
+                Task::RecordNext(mut state) => match self.next_record_field(&mut state)? {
+                    record_terms::RecordStep::Field {
+                        syntax,
+                        domain,
+                        codomain,
+                    } => {
+                        tasks.push(Task::RecordField(state, codomain));
+                        tasks.push(Task::Visit(syntax, Some(domain), true));
+                    }
+                    record_terms::RecordStep::Complete(term) => values.push(term),
+                },
+                Task::RecordField(mut state, codomain) => {
+                    let value = values.pop().expect("record field visit");
+                    self.accept_record_field(&mut state, &codomain, value)?;
+                    tasks.push(Task::RecordNext(state));
                 }
                 Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
                     tactics::ProofAction::Rewrite {
