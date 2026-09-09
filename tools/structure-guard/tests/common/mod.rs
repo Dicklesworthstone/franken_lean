@@ -231,13 +231,13 @@ suite-dep asupersync
 
 pub const EMPTY_LEDGER: &str = "schema fln-unsafe-ledger/1\n";
 
-pub const TOOLCHAIN_PIN: &str = "[toolchain]\nchannel = \"nightly-2026-07-13\"\n";
+pub const TOOLCHAIN_PIN: &str = "[toolchain]\nchannel = \"nightly-2026-08-31\"\n";
 
 pub const SUITE_LOCK_FIXTURE: &str = "\
 schema fln-suite-lock/1
-rust-nightly nightly-2026-07-13
-rust-release 1.99.0-nightly
-rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
+rust-nightly nightly-2026-08-31
+rust-release 1.100.0-nightly
+rust-commit 90850177249efe0321573c569aec5d12b257f8d6
 target x86_64-unknown-linux-gnu
 suite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
 crate asupersync repo=asupersync

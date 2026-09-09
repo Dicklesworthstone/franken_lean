@@ -153,9 +153,9 @@ const BOUNDARY_LIB: &str =
 
 const SUITE_LOCK: &str = "\
 schema fln-suite-lock/1
-rust-nightly nightly-2026-07-13
-rust-release 1.99.0-nightly
-rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
+rust-nightly nightly-2026-08-31
+rust-release 1.100.0-nightly
+rust-commit 90850177249efe0321573c569aec5d12b257f8d6
 target x86_64-unknown-linux-gnu
 suite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
 crate asupersync repo=asupersync
@@ -183,7 +183,7 @@ const EXTERN_BUILTIN_ENVIRONMENT: &str =
     include_str!("../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
 
 const TOOLCHAIN: &str =
-    "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\", \"clippy\"]\n";
+    "[toolchain]\nchannel = \"nightly-2026-08-31\"\ncomponents = [\"rustfmt\", \"clippy\"]\n";
 
 fn base_files() -> Vec<(String, String)> {
     let crates = [

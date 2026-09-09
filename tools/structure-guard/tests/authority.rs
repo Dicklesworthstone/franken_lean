@@ -851,10 +851,15 @@ fn a_concurrent_governed_root_change_is_typed_inconclusive() {
 fn a_mismatched_effective_compiler_is_typed_inconclusive() {
     let ws = TempWs::new("authority-compiler-mismatch");
     base(&ws);
-    ws.write(
-        "SUITE.lock",
-        &SUITE_LOCK_FIXTURE.replace("rust-release 1.99.0-nightly", "rust-release 1.98.0-nightly"),
+    let mismatched = SUITE_LOCK_FIXTURE.replace(
+        "rust-release 1.100.0-nightly",
+        "rust-release 1.98.0-nightly",
     );
+    assert_ne!(
+        mismatched, SUITE_LOCK_FIXTURE,
+        "compiler mismatch was planted"
+    );
+    ws.write("SUITE.lock", &mismatched);
     let out = ws.run();
     assert_eq!(out.authority, Authority::Incomplete);
     assert_eq!(out.verdict(), "inconclusive");
