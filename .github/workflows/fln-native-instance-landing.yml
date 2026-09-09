@@ -1,0 +1,75 @@
+name: Native instance integration
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/native_instance_increment.json', '.github/workflows/fln-native-instance-landing.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-native-instance-landing
+  cancel-in-progress: false
+jobs:
+  instances:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Apply scoped implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/instance-landing
+          cp scripts/native_instance_increment.json target/instance-landing/increment.json
+          python3 - <<'PY'
+          import json,base64,gzip,hashlib,pathlib,subprocess
+          plan=json.loads(pathlib.Path('scripts/native_instance_increment.json').read_text())
+          patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
+          assert hashlib.sha256(patch).hexdigest()==plan['sha256']
+          paths=[]
+          for line in patch.decode().splitlines():
+              if line.startswith('+++ b/'):
+                  path=line[6:]
+                  assert path.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln/','crates/fln-cli/','examples/','docs/')) and '..' not in path.split('/')
+                  paths.append(path)
+              assert line != '+++ /dev/null'
+          assert paths
+          pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
+          pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          PY
+      - name: Verify actual source and engine paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv | tee target/instance-landing/compiler.txt
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/instance-landing/frontend.log
+          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
+          cargo test --locked -p fln --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/proofs.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-landing/workspace.log
+      - name: Publish only verified source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import json,pathlib,subprocess
+          paths=json.loads(pathlib.Path('target/instance-landing/paths.json').read_text())
+          plan=json.loads(pathlib.Path('scripts/native_instance_increment.json').read_text())
+          subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+          subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+          subprocess.run(['git','add','--',*paths],check=True)
+          subprocess.run(['git','commit','-m',plan['message']],check=True)
+          subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          pathlib.Path('target/instance-landing/published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-instances-${{ github.sha }}
+          path: target/instance-landing
+          retention-days: 7
