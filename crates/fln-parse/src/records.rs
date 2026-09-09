@@ -14,13 +14,13 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], index: usize) -> NatDefiniti
 fn symbol(tokens: &[LexedToken], index: usize, text: &str) -> bool {
     matches!(tokens.get(index).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text)
 }
-fn modifiers() -> Syntax {
+pub(super) fn modifiers() -> Syntax {
     Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
         (0..7).map(|_| null_node(Vec::new())).collect(),
     )
 }
-fn optional_type(
+pub(super) fn optional_type(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],

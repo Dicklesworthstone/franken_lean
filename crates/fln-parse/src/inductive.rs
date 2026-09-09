@@ -20,7 +20,10 @@ fn ctor(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
     if !symbol(tokens, start, "|")
-        || !matches!(tokens.get(start + 1).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+        || !matches!(
+            tokens.get(start + 1).map(|t| &t.kind),
+            Some(TokenKind::Ident(_))
+        )
     {
         return Err(refuse(view, tokens, start));
     }
@@ -84,15 +87,10 @@ pub(super) fn parse(
     }
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
-    let params = bounded_binder_syntax(
-        &leaves,
-        &view,
-        &tokens,
-        groups,
-        DefinitionGrammar::Scalar,
-    )?;
+    let params = bounded_binder_syntax(&leaves, &view, &tokens, groups, DefinitionGrammar::Scalar)?;
     let result = records::optional_type(&leaves, &view, &tokens, cursor..end_header)?;
-    let body_keyword = if symbol(&tokens, end_header, "where") || symbol(&tokens, end_header, ":=") {
+    let body_keyword = if symbol(&tokens, end_header, "where") || symbol(&tokens, end_header, ":=")
+    {
         let keyword = null_node(vec![leaves.leaf(end_header)?]);
         end_header += 1;
         keyword
@@ -124,24 +122,37 @@ pub(super) fn parse(
         return Err(refuse(&view, &tokens, end_header));
     }
     begins.push(tokens.len());
-    let ctors = begins.windows(2)
+    let ctors = begins
+        .windows(2)
         .map(|w| ctor(&leaves, &view, &tokens, w[0]..w[1]))
         .collect::<Result<Vec<_>, _>>()?;
     let command = Syntax::node(
         parser_kind(&["Command", "inductive"]),
         vec![
             leaves.leaf(0)?,
-            Syntax::node(parser_kind(&["Command", "declId"]), vec![leaves.leaf(1)?, null_node(vec![])]),
-            Syntax::node(parser_kind(&["Command", "optDeclSig"]), vec![null_node(params), result]),
+            Syntax::node(
+                parser_kind(&["Command", "declId"]),
+                vec![leaves.leaf(1)?, null_node(vec![])],
+            ),
+            Syntax::node(
+                parser_kind(&["Command", "optDeclSig"]),
+                vec![null_node(params), result],
+            ),
             body_keyword,
             null_node(ctors),
             null_node(vec![]),
-            Syntax::node(parser_kind(&["Command", "optDeriving"]), vec![null_node(vec![])]),
+            Syntax::node(
+                parser_kind(&["Command", "optDeriving"]),
+                vec![null_node(vec![])],
+            ),
         ],
     );
     Ok(ParsedDefinition {
         source_view: view,
-        syntax: Syntax::node(parser_kind(&["Command", "declaration"]), vec![records::modifiers(), command]),
+        syntax: Syntax::node(
+            parser_kind(&["Command", "declaration"]),
+            vec![records::modifiers(), command],
+        ),
         epilogue,
     })
 }
@@ -154,14 +165,21 @@ mod tests {
         let text = "-- item\r\ninductive Choice (A : Type) where\r\n | none : Choice A\r\n | some (value : A) : Choice A\r\n";
         let parsed = parse_definition(text.as_bytes()).unwrap();
         assert_eq!(parsed.reconstruct_original(), text.as_bytes());
-        assert_eq!(parsed.reconstruct_normalized().unwrap(), text.replace("\r\n", "\n").as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            text.replace("\r\n", "\n").as_bytes()
+        );
         assert!(parse_nat_definition(text.as_bytes()).is_err());
     }
     #[test]
     fn constructors_and_later_declarations_have_distinct_boundaries() {
         let source = b"inductive Flag where | off | on\ndef selected : Flag := Flag.on";
         assert_eq!(partition_definition_commands(source).unwrap().len(), 2);
-        for source in ["inductive X where |", "inductive X where | c (x : Nat", "inductive X where | c deriving Inhabited"] {
+        for source in [
+            "inductive X where |",
+            "inductive X where | c (x : Nat",
+            "inductive X where | c deriving Inhabited",
+        ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
     }

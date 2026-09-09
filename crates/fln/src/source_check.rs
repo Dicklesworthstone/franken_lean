@@ -87,6 +87,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         )) => match reason {
             SourceInferenceError::ResourceLimit
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
+            | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)
             | SourceInferenceError::InstanceRegistry(
                 fln_elab::instances::InstanceRegistryError::Limit,
             ) => ("resource", false, 3),

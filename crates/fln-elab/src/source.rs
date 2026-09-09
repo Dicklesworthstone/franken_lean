@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod inductive;
 mod infer;
 mod instance_command;
 mod instances;
@@ -21,6 +22,7 @@ use fln_core::options::KVMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
+    Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
     ExpectedFunction,
     ExpectedType,
@@ -41,6 +43,7 @@ pub enum SourceInferenceError {
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Inductive(error) => write!(f, "{error}"),
             Self::UnknownConstant(_) => {
                 write!(f, "source reference does not name a known constant")
             }
@@ -1516,3 +1519,5 @@ pub fn instance_registration(
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.
 pub use record::{SourceRecord, elaborate_record, is_record};
+
+pub use inductive::{elaborate_inductive, is_inductive};
