@@ -1,0 +1,71 @@
+name: Native source inductive integration
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/land_source_inductive_integration.py
+      - .github/workflows/fln-source-inductive-integration.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-source-inductive-integration
+  cancel-in-progress: false
+jobs:
+  inductives:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Connect existing source implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/source-inductive-integration
+          git rev-parse HEAD > target/source-inductive-integration/input-commit.txt
+          python3 -I scripts/land_source_inductive_integration.py
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/source-inductive-integration/compiler.txt
+          python3 -I - <<'PY'
+          import json, pathlib, subprocess
+          paths=json.loads(pathlib.Path('target/source-inductive-integration/paths.json').read_text())
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',*paths],check=True)
+          PY
+          git diff --check
+          git diff > target/source-inductive-integration/connected.patch
+      - name: Exercise actual constructor-family source commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --test source_inductive --no-fail-fast 2>&1 | tee target/source-inductive-integration/inductive-tests.log
+          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/source-inductive-integration/frontend.log
+          cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee target/source-inductive-integration/engine.log
+          cargo test --locked -p fln-cli --no-fail-fast 2>&1 | tee target/source-inductive-integration/cli.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/source-inductive-integration/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-inductive-integration/workspace.log
+      - name: Publish only tested production changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, pathlib, subprocess
+          paths=json.loads(pathlib.Path('target/source-inductive-integration/paths.json').read_text())
+          changed=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          assert set(changed)<=set(paths), 'unrelated working-tree changes'
+          if changed:
+              subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+              subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+              subprocess.run(['git','add','--',*changed],check=True)
+              subprocess.run(['git','commit','-m','feat(source): connect checked algebraic datatype declarations'],check=True)
+              subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          pathlib.Path('target/source-inductive-integration/published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - name: Retain compiler, patch and verification results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-inductives-${{ github.sha }}
+          path: target/source-inductive-integration
+          retention-days: 7
+          if-no-files-found: error
