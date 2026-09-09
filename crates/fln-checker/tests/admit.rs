@@ -522,6 +522,13 @@ fn enumeration_entries(recursor_motive_binder: BinderInfo) -> Vec<ConstantEntry>
 }
 
 fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
+    dependent_field_inductive_entries_at(Level::zero(), Level::one())
+}
+
+fn dependent_field_inductive_entries_at(
+    field_universe: Level,
+    record_universe: Level,
+) -> Vec<ConstantEntry> {
     let witness = primary_name("Witness");
     let make = Name::str(witness.clone(), "mk");
     let u_name = primary_name("u");
@@ -532,7 +539,7 @@ fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
     let constructor_type = primary_pi(
         "proposition",
         BinderInfo::Default,
-        Expr::sort(Level::zero()),
+        Expr::sort(field_universe.clone()),
         primary_pi("proof", BinderInfo::Default, bv(0), witness_expr()),
     );
     let motive_type = primary_pi(
@@ -544,7 +551,7 @@ fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
     let minor_type = primary_pi(
         "proposition",
         BinderInfo::Default,
-        Expr::sort(Level::zero()),
+        Expr::sort(field_universe.clone()),
         primary_pi(
             "proof",
             BinderInfo::Default,
@@ -576,7 +583,7 @@ fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
             minor_type,
             Expr::lam(
                 primary_name("proposition"),
-                Expr::sort(Level::zero()),
+                Expr::sort(field_universe.clone()),
                 Expr::lam(
                     primary_name("proof"),
                     bv(0),
@@ -594,7 +601,7 @@ fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
             checker_name("Witness"),
             ConstantDeclaration::inductive(
                 Vec::new(),
-                decoded(&Expr::sort(Level::one())),
+                decoded(&Expr::sort(record_universe)),
                 ConstantSafety::Safe,
                 InductiveDeclaration::new(
                     0,
@@ -14585,5 +14592,60 @@ fn kr600_803_class_block_reconstructs_an_inst_implicit_field() {
     assert!(
         verdict.is_admitted(),
         "inst-implicit-field class block admits: {verdict:?}"
+    );
+}
+
+#[test]
+fn nonrecursive_higher_universe_records_are_checked_independently() {
+    use fln_checker::admit::InductiveVerdict;
+    let two = Level::one().succ().unwrap();
+    for universe in [two.clone(), Level::max(Level::one(), two).unwrap()] {
+        let rows = dependent_field_inductive_entries_at(Level::one(), universe);
+        let result = admit_inductive(
+            &environment_of(vec![]),
+            &rows,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            matches!(result, InductiveVerdict::Admitted(_)),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn nonrecursive_field_universes_cannot_exceed_the_declared_result() {
+    use fln_checker::admit::{InductiveRejection, InductiveVerdict};
+    let rows = dependent_field_inductive_entries_at(Level::one(), Level::one());
+    let result = admit_inductive(
+        &environment_of(vec![]),
+        &rows,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            result,
+            InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn higher_universe_record_cancellation_is_not_a_shape_verdict() {
+    use fln_checker::admit::InductiveVerdict;
+    let rows = dependent_field_inductive_entries_at(Level::one(), Level::one().succ().unwrap());
+    let result = admit_inductive_with(
+        &environment_of(vec![]),
+        &rows,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+        || true,
+    );
+    assert!(
+        matches!(result, InductiveVerdict::Inconclusive(_)),
+        "{result:?}"
     );
 }

@@ -1,4 +1,4 @@
-name: Native instance integration
+name: Native source integration
 on:
   push:
     branches: [main]
@@ -26,16 +26,18 @@ jobs:
           manifest=pathlib.Path('scripts/native_instance_increment.json')
           plan=json.loads(manifest.read_text())
           original=plan['patch']
-          if plan['sha256']=='3a40085df56986d647c1f7cc27fe93bb6c6007a05ff06778592e610d4df226a1':
-              for old,new in [('XGudJhlZagWSRgwZ','XGudJjlZagWSRkuZ'),('13GeVbUGicY','13GeVUGicY'),('onySyXTZJpAf','onySyXTZJqAf')]:
-                  plan['patch']=plan['patch'].replace(old,new)
+          if plan['sha256']=='be7e19eafca75e6fac86d8f3ac29e62889610e0697c69d31efdf61d1f9d940f4':
+              plan['patch']=plan['patch'].replace('eLTF/FHs','eLT/FHs').replace('hlhZa3c7b7QV34','hlhZa3cQV34')
+          if hashlib.sha256(original.encode()).hexdigest()=='35d67ff3a5b1b9df6640acf2a2cd523def66b87b322e01d1ecb94c5108e03ba7':
+              for start,end,text in reversed([[2995,2996,''],[3135,3136,''],[3156,3157,''],[3215,3216,'q'],[3243,3244,'9'],[3257,3259,''],[9138,9139,''],[16690,16690,'YNBD']]):
+                  plan['patch']=plan['patch'][:start]+text+plan['patch'][end:]
           patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
           paths=[]
           for line in patch.decode().splitlines():
               if line.startswith('+++ b/'):
                   path=line[6:]
-                  assert path.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln/','crates/fln-cli/','examples/','docs/')) and '..' not in path.split('/')
+                  assert path.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','examples/','docs/')) and '..' not in path.split('/')
                   paths.append(path)
               assert line != '+++ /dev/null'
           assert paths
@@ -55,11 +57,18 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/instance-landing/compiler.txt
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/instance-landing/frontend.log
-          cargo test --locked -p fln --lib --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
+          cargo test --locked -p fln-checker --test admit --no-fail-fast 2>&1 | tee target/instance-landing/checker.log
+          cargo test --locked -p fln --lib --test record_generation --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
+          if test -f crates/fln/tests/source_records.rs; then
+            cargo test --locked -p fln --test source_records --no-fail-fast 2>&1 | tee target/instance-landing/records.log
+          fi
           cargo test --locked -p fln-cli --no-fail-fast 2>&1 | tee target/instance-landing/cli.log
-          cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-landing/workspace.log
           cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_instances.lean > target/instance-landing/example.json
+          if test -f examples/native_records.lean; then
+            cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_records.lean > target/instance-landing/records-example.json
+          fi
           git diff --check
       - name: Publish only verified source files
         shell: bash

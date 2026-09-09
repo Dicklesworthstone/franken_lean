@@ -570,6 +570,7 @@ struct DeclaredTypeFacts {
     /// The declared type's own type reduced to `Sort u` with `u` normalizing to
     /// zero — i.e. the declared type is a `Prop`.
     is_proposition: bool,
+    explicit_universe: Option<u32>,
 }
 
 fn stopped(name: &WireName, phase: AdmissionPhase) -> Verdict {
@@ -737,6 +738,7 @@ fn reduces_to_a_sort(
                         normal.nodes().get(normal.root().index()),
                         Some(NormalNode::Zero)
                     ),
+                    explicit_universe: explicit_normal_universe(&normal),
                 }),
                 Err(_) => Err(Verdict::InternalFault(
                     AdmissionFault::UniverseNotNormalizable { name: name.clone() },
@@ -2085,6 +2087,43 @@ impl InductiveVerdict {
             self,
             Self::Deferred(_) | Self::Inconclusive(_) | Self::InternalFault(_)
         )
+    }
+}
+
+/// Only an explicit numeral is used by this bounded, monomorphic lane.
+fn explicit_normal_universe(level: &crate::universe::NormalizedLevel) -> Option<u32> {
+    let mut current = level.root();
+    let mut value = 0_u32;
+    for _ in 0..=level.nodes().len() {
+        match level.node(current)? {
+            NormalNode::Zero => return Some(value),
+            NormalNode::Succ(child) if child.index() < current.index() => {
+                value = value.checked_add(1)?;
+                current = *child;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn positive_explicit_sort(expr: &WireExpr) -> Option<u32> {
+    if expr.levels().len() > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
+        return None;
+    }
+    let mut root = expr.root();
+    loop {
+        match expr.node(root)? {
+            ExprNode::Metadata { expression, .. } if expression.index() < root.index() => {
+                root = *expression
+            }
+            ExprNode::Sort { level } => {
+                let level =
+                    normalize(&WireLevel::from_parts(expr.levels().to_vec(), *level)).ok()?;
+                return explicit_normal_universe(&level).filter(|value| *value > 0);
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -7821,21 +7860,11 @@ pub fn admit_inductive_with(
             limit: MAX_NONRECURSIVE_CONSTRUCTORS,
         });
     }
-    let Some(expected_type) = nonrecursive_inductive_type() else {
-        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    // The zero-parameter reconstruction is independent of the family's
+    // positive concrete universe. Keep Prop on its distinct elimination lane.
+    let Some(result_universe) = positive_explicit_sort(declaration.type_()) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
     };
-    match compare_inductive_expression(
-        declaration.type_(),
-        &expected_type,
-        &mut comparison,
-        &mut cancelled,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
-        }
-        Err(verdict) => return verdict,
-    }
 
     let expected_count = metadata.constructors().len().saturating_add(2);
     if declarations.len() != expected_count {
@@ -7957,14 +7986,27 @@ pub fn admit_inductive_with(
                 .saturating_add(field.type_root.index().saturating_add(1))
                 .saturating_add(field.source.levels().len());
         }
-        if let Err(verdict) = declared_type_is_a_type(
+        let constructor_facts = match declared_type_is_a_type(
             &staged_environment,
             constructor_name,
             constructor.declaration(),
             &budget,
             &mut cancelled,
         ) {
-            return map_member_preamble(constructor_name, verdict);
+            Ok(facts) => facts,
+            Err(verdict) => return map_member_preamble(constructor_name, verdict),
+        };
+        // For a positive, parameter-free family, the constructor telescope
+        // lives in max(field universes, family universe). Inferring that
+        // telescope independently enforces each field's universe bound.
+        match constructor_facts.explicit_universe {
+            Some(required) if required <= result_universe => {}
+            Some(_) => {
+                return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                    name: constructor_name.clone(),
+                });
+            }
+            None => return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse),
         }
         staged_environment = match stage_inductive_member(
             &staged_environment,

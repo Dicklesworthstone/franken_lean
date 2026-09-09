@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 pub mod source_check;
+mod source_records;
 pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 
 pub use fln_checker::admit::{

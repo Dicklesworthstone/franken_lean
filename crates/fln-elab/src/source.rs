@@ -9,6 +9,7 @@ mod infer;
 mod instance_command;
 mod instances;
 mod levels;
+mod record;
 mod tactics;
 
 use super::*;
@@ -22,6 +23,7 @@ pub enum SourceInferenceError {
     UnknownConstant(Name),
     ExpectedFunction,
     ExpectedType,
+    Record(crate::records::RecordError),
     Tactic(tactics::TacticError),
     UnresolvedHoles { count: usize },
     UnresolvedUniverses,
@@ -42,6 +44,7 @@ impl std::fmt::Display for SourceInferenceError {
             }
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
             Self::Tactic(error) => write!(f, "{error}"),
+            Self::Record(error) => write!(f, "{error}"),
             Self::ExpectedType => write!(f, "source annotation requires a type"),
             Self::UnresolvedHoles { count } => write!(
                 f,
@@ -275,60 +278,106 @@ impl Context {
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut head = self.instantiate(expr)?;
         let mut arguments = Vec::new();
+        let mut projections: Vec<(Name, u64, Vec<Expr>)> = Vec::new();
         loop {
-            self.tick()?;
-            match head.node() {
-                ExprNode::MData { expr, .. } => head = expr.clone(),
-                ExprNode::App { f, a } => {
-                    arguments.push(a.clone());
-                    head = f.clone();
-                }
-                ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
-                ExprNode::Lam { body, .. } if !arguments.is_empty() => {
-                    let value = arguments.pop().expect("guarded application");
-                    head = self.substitute(body, &value)?;
-                }
-                ExprNode::FVar { id } if zeta_delta => {
-                    let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
-                    match value {
-                        Some(value) => head = value,
-                        None => break,
+            loop {
+                self.tick()?;
+                match head.node() {
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => {
+                        projections.push((
+                            struct_name.clone(),
+                            *idx,
+                            std::mem::take(&mut arguments),
+                        ));
+                        head = expr.clone();
                     }
-                }
-                ExprNode::Const { name, levels } => {
-                    let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
-                        self.txn.env.find(name).cloned()
-                    else {
-                        break;
-                    };
-                    if definition.safety != DefinitionSafety::Safe
-                        || !match transparency {
-                            UnificationTransparency::None => false,
-                            UnificationTransparency::Abbreviations => {
-                                definition.hints == ReducibilityHints::Abbrev
-                            }
-                            UnificationTransparency::SafeDefinitions => true,
+                    ExprNode::MData { expr, .. } => head = expr.clone(),
+                    ExprNode::App { f, a } => {
+                        arguments.push(a.clone());
+                        head = f.clone();
+                    }
+                    ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
+                    ExprNode::Lam { body, .. } if !arguments.is_empty() => {
+                        let value = arguments.pop().expect("guarded application");
+                        head = self.substitute(body, &value)?;
+                    }
+                    ExprNode::FVar { id } if zeta_delta => {
+                        let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
+                        match value {
+                            Some(value) => head = value,
+                            None => break,
                         }
-                    {
-                        break;
                     }
-                    if definition.base.level_params.len() != levels.len() {
-                        return Err(failure(SourceInferenceError::Scope));
+                    ExprNode::Const { name, levels } => {
+                        let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
+                            self.txn.env.find(name).cloned()
+                        else {
+                            break;
+                        };
+                        if definition.safety != DefinitionSafety::Safe
+                            || !match transparency {
+                                UnificationTransparency::None => false,
+                                UnificationTransparency::Abbreviations => {
+                                    definition.hints == ReducibilityHints::Abbrev
+                                }
+                                UnificationTransparency::SafeDefinitions => true,
+                            }
+                        {
+                            break;
+                        }
+                        if definition.base.level_params.len() != levels.len() {
+                            return Err(failure(SourceInferenceError::Scope));
+                        }
+                        head = self.instantiate_params(
+                            &definition.value,
+                            &definition.base.level_params,
+                            levels,
+                        )?;
                     }
-                    head = self.instantiate_params(
-                        &definition.value,
-                        &definition.base.level_params,
-                        levels,
-                    )?;
+                    _ => break,
                 }
-                _ => break,
             }
+            if let Some((structure, index, outer)) = projections.pop() {
+                self.tick()?;
+                if let Some(field) = crate::records::constructor_field(
+                    &self.txn.env,
+                    &structure,
+                    index,
+                    &head,
+                    &arguments,
+                ) {
+                    head = field;
+                    arguments = outer;
+                    continue;
+                }
+                for argument in arguments.into_iter().rev() {
+                    self.tick()?;
+                    head = Expr::app(head, argument);
+                }
+                head = Expr::proj(structure, index, head);
+                arguments = outer;
+                // A stuck major cannot unlock an outer projection. Unwind without
+                // feeding that same blocked projection back into the reduction loop.
+                while let Some((structure, index, outer)) = projections.pop() {
+                    self.tick()?;
+                    for argument in arguments.into_iter().rev() {
+                        self.tick()?;
+                        head = Expr::app(head, argument);
+                    }
+                    head = Expr::proj(structure, index, head);
+                    arguments = outer;
+                }
+            }
+            for argument in arguments.into_iter().rev() {
+                self.tick()?;
+                head = Expr::app(head, argument);
+            }
+            return Ok(head);
         }
-        for argument in arguments.into_iter().rev() {
-            self.tick()?;
-            head = Expr::app(head, argument);
-        }
-        Ok(head)
     }
 
     /// Enough type reconstruction to generate the universe side of an implicit
@@ -951,6 +1000,81 @@ fn optional_type_syntax(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinitio
     Ok(Some(&parts[1]))
 }
 
+impl Context {
+    fn bind_parameters(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
+        let mut parameters = Vec::new();
+        for syntax in expect_null_args(syntax, "declaration binders")? {
+            let Syntax::Node { kind, .. } = syntax else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            if kind == &parser_kind(&["Term", "instBinder"]) {
+                let parts = expect_node(syntax, kind, 4, "instance binder")?;
+                expect_atom(&parts[0], "[", "instance binder opener")?;
+                expect_atom(&parts[3], "]", "instance binder closer")?;
+                let optional = expect_null_args(&parts[1], "optional instance name")?;
+                let user_name = match optional {
+                    [] => self.fresh_name()?,
+                    [Syntax::Ident { val, .. }, colon] => {
+                        expect_atom(colon, ":", "instance name colon")?;
+                        val.clone()
+                    }
+                    _ => return Err(failure(SourceInferenceError::Scope)),
+                };
+                let domain = self.type_term(&parts[2])?;
+                self.validate_instance_binder(&domain)?;
+                let id = FVarId(self.fresh_name()?);
+                self.txn.lctx.add_param(
+                    id.clone(),
+                    user_name.clone(),
+                    domain.clone(),
+                    BinderInfo::InstImplicit,
+                );
+                parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
+                continue;
+            }
+            let (style, open, close, arity) = if kind == &parser_kind(&["Term", "implicitBinder"]) {
+                (BinderInfo::Implicit, "{", "}", 4)
+            } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {
+                (BinderInfo::StrictImplicit, "⦃", "⦄", 4)
+            } else if kind == &parser_kind(&["Term", "explicitBinder"]) {
+                (BinderInfo::Default, "(", ")", 5)
+            } else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            let parts = expect_node(syntax, kind, arity, "typed binder")?;
+            expect_atom(&parts[0], open, "binder opener")?;
+            expect_atom(&parts[arity - 1], close, "binder closer")?;
+            if style == BinderInfo::Default {
+                expect_empty_null(&parts[3], "absent binder default")?;
+            }
+            let names = expect_null_args(&parts[1], "binder names")?;
+            if names.is_empty() {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            let type_parts = expect_null_args(&parts[2], "binder type")?;
+            let [colon, type_syntax] = type_parts else {
+                return Err(failure(SourceInferenceError::ExpectedType));
+            };
+            expect_atom(colon, ":", "binder type ascription")?;
+            let domain = self.type_term(type_syntax)?;
+            for name in names {
+                let Syntax::Ident { val: name, .. } = name else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                let id = FVarId(self.fresh_name()?);
+                self.txn
+                    .lctx
+                    .add_param(id.clone(), name.clone(), domain.clone(), style);
+                parameters.push(self.txn.lctx.find(&id).expect("inserted parameter").clone());
+            }
+        }
+        Ok(parameters)
+    }
+}
+
 pub(super) fn definition(
     syntax: &Syntax,
     environment: &Environment,
@@ -1024,73 +1148,7 @@ pub(super) fn definition(
         2,
         "declaration signature",
     )?;
-    let mut parameters = Vec::new();
-    for syntax in expect_null_args(&signature[0], "definition binders")? {
-        let Syntax::Node { kind, .. } = syntax else {
-            return Err(failure(SourceInferenceError::Scope));
-        };
-        if kind == &parser_kind(&["Term", "instBinder"]) {
-            let parts = expect_node(syntax, kind, 4, "instance binder")?;
-            expect_atom(&parts[0], "[", "instance binder opener")?;
-            expect_atom(&parts[3], "]", "instance binder closer")?;
-            let optional = expect_null_args(&parts[1], "optional instance name")?;
-            let user_name = match optional {
-                [] => context.fresh_name()?,
-                [Syntax::Ident { val, .. }, colon] => {
-                    expect_atom(colon, ":", "instance name colon")?;
-                    val.clone()
-                }
-                _ => return Err(failure(SourceInferenceError::Scope)),
-            };
-            let domain = context.type_term(&parts[2])?;
-            context.validate_instance_binder(&domain)?;
-            let id = FVarId(context.fresh_name()?);
-            context.txn.lctx.add_param(
-                id.clone(),
-                user_name.clone(),
-                domain.clone(),
-                BinderInfo::InstImplicit,
-            );
-            parameters.push((id, user_name, domain, BinderInfo::InstImplicit));
-            continue;
-        }
-        let (style, open, close, arity) = if kind == &parser_kind(&["Term", "implicitBinder"]) {
-            (BinderInfo::Implicit, "{", "}", 4)
-        } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {
-            (BinderInfo::StrictImplicit, "⦃", "⦄", 4)
-        } else if kind == &parser_kind(&["Term", "explicitBinder"]) {
-            (BinderInfo::Default, "(", ")", 5)
-        } else {
-            return Err(failure(SourceInferenceError::Scope));
-        };
-        let parts = expect_node(syntax, kind, arity, "typed binder")?;
-        expect_atom(&parts[0], open, "binder opener")?;
-        expect_atom(&parts[arity - 1], close, "binder closer")?;
-        if style == BinderInfo::Default {
-            expect_empty_null(&parts[3], "absent binder default")?;
-        }
-        let names = expect_null_args(&parts[1], "binder names")?;
-        if names.is_empty() {
-            return Err(failure(SourceInferenceError::Scope));
-        }
-        let type_parts = expect_null_args(&parts[2], "binder type")?;
-        let [colon, type_syntax] = type_parts else {
-            return Err(failure(SourceInferenceError::ExpectedType));
-        };
-        expect_atom(colon, ":", "binder type ascription")?;
-        let domain = context.type_term(type_syntax)?;
-        for name in names {
-            let Syntax::Ident { val: name, .. } = name else {
-                return Err(failure(SourceInferenceError::Scope));
-            };
-            let id = FVarId(context.fresh_name()?);
-            context
-                .txn
-                .lctx
-                .add_param(id.clone(), name.clone(), domain.clone(), style);
-            parameters.push((id, name.clone(), domain.clone(), style));
-        }
-    }
+    let parameters = context.bind_parameters(&signature[0])?;
     let expected = if is_theorem || is_instance {
         let parts = expect_node(
             &signature[1],
@@ -1138,7 +1196,14 @@ pub(super) fn definition(
     }
     let mut term = context.finish(term)?;
     term.value = eta_expand_nondependent(term.value, &term.type_)?;
-    for (id, name, domain, style) in parameters.into_iter().rev() {
+    for local in parameters.into_iter().rev() {
+        let LocalDecl {
+            id,
+            user_name: name,
+            type_: domain,
+            binder_info: style,
+            ..
+        } = local;
         let domain = context.instantiate(&domain)?;
         term.value = term
             .value
@@ -1236,3 +1301,8 @@ pub fn instance_registration(
 ) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
     instance_command::registration(syntax)
 }
+
+/// A source record/class expands to a block and projections, not one definition.
+/// These are untrusted candidates. The caller must admit the whole sequence
+/// before registering the class or exposing any successor.
+pub use record::{SourceRecord, elaborate_record, is_record};

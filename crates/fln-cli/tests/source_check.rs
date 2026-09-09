@@ -251,3 +251,48 @@ fn installed_binary_checks_local_dictionaries_and_conditional_instance_rewrites(
     assert!(refused.stdout.is_empty());
     assert!(refused.stderr.contains("kernel-rejection"));
 }
+
+#[test]
+fn installed_binary_checks_source_defined_records_and_recursive_classes() {
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native_records.lean");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(example)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    for required in [
+        "\"commands\":8",
+        "\"theorems\":2",
+        "\"executed\":false",
+        "\"authority\":true",
+    ] {
+        assert!(text.contains(required), "{text}");
+    }
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn later_record_file_failure_emits_no_successful_prefix_or_class_registration() {
+    let one = file("class Choice (A : Type) where\n  value : A");
+    let two = file(
+        "instance natChoice : Choice Nat := Choice.mk 13\ntheorem bad : Choice.value = 14 := by rfl",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(one)
+        .arg(two)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("kernel-rejection"), "{error}");
+    assert!(!error.contains("\"outcome\":\"complete\""));
+}

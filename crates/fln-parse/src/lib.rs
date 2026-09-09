@@ -31,6 +31,7 @@ pub mod registry;
 pub mod state;
 
 mod proofs;
+mod records;
 
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
@@ -63,6 +64,7 @@ pub enum NatDefinitionExpectation {
     LambdaArrow,
     Tactic,
     TheoremType,
+    RecordField,
     NaturalType,
     ScalarType,
     ClosingParenthesis,
@@ -474,18 +476,112 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "def", "let", "(", ")", ":", ":=", ";", "=", "==", "|||", "^^^", "&&&", "+", "-", "++",
-        "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->",
-        "→", "fun", "λ", "=>", "↦", "theorem", "instance", "by", "[", "]", ",", "←", "<-",
+        "structure",
+        "class",
+        "where",
+        "extends",
+        "deriving",
+        "def",
+        "let",
+        "(",
+        ")",
+        ":",
+        ":=",
+        ";",
+        "=",
+        "==",
+        "|||",
+        "^^^",
+        "&&&",
+        "+",
+        "-",
+        "++",
+        "*",
+        "/",
+        "%",
+        "<<<",
+        ">>>",
+        "^",
+        "<=",
+        "<",
+        "Type",
+        "Prop",
+        "_",
+        "{",
+        "}",
+        "⦃",
+        "⦄",
+        "->",
+        "→",
+        "fun",
+        "λ",
+        "=>",
+        "↦",
+        "theorem",
+        "instance",
+        "by",
+        "[",
+        "]",
+        ",",
+        "←",
+        "<-",
     ])
 }
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "=", "==", "|||",
-        "^^^", "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop",
-        "_", "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦", "theorem", "instance", "by",
-        "[", "]", ",", "←", "<-",
+        "structure",
+        "class",
+        "where",
+        "extends",
+        "deriving",
+        "import",
+        "def",
+        "#eval",
+        "#check",
+        "let",
+        "(",
+        ")",
+        ":",
+        ":=",
+        ";",
+        "=",
+        "==",
+        "|||",
+        "^^^",
+        "&&&",
+        "+",
+        "-",
+        "++",
+        "*",
+        "/",
+        "%",
+        "<<<",
+        ">>>",
+        "^",
+        "<=",
+        "<",
+        "Type",
+        "Prop",
+        "_",
+        "{",
+        "}",
+        "⦃",
+        "⦄",
+        "->",
+        "→",
+        "fun",
+        "λ",
+        "=>",
+        "↦",
+        "theorem",
+        "instance",
+        "by",
+        "[",
+        "]",
+        ",",
+        "←",
+        "<-",
     ])
 }
 
@@ -1147,7 +1243,9 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
     });
     match first {
         Some(token) => match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "def" || symbol == "theorem" => {
+            TokenKind::Symbol(symbol)
+                if matches!(symbol.as_str(), "def" | "theorem" | "structure" | "class") =>
+            {
                 let parsed = parse_definition(source)?;
                 Ok(ParsedSourceCommand {
                     kind: SourceCommandKind::Definition,
@@ -1217,6 +1315,151 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
     }
 }
 
+fn bounded_binders(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut cursor: usize,
+    grammar: DefinitionGrammar,
+) -> Result<(Vec<ExplicitBinderTokens>, usize), NatDefinitionParseError> {
+    let mut parameter_groups = Vec::new();
+    while matches!(
+        tokens.get(cursor).map(|token| &token.kind),
+        Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃" | "["))
+    ) {
+        let open = cursor;
+        let (kind, closing) = match tokens.get(cursor).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(symbol)) if symbol == "{" => ("implicitBinder", "}"),
+            Some(TokenKind::Symbol(symbol)) if symbol == "⦃" => ("strictImplicitBinder", "⦄"),
+            Some(TokenKind::Symbol(symbol)) if symbol == "[" => ("instBinder", "]"),
+            _ => ("explicitBinder", ")"),
+        };
+        cursor += 1;
+        if kind == "instBinder" {
+            let names_start = cursor;
+            let named = matches!(
+                tokens.get(cursor).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) && matches!(tokens.get(cursor+1).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==":");
+            let colon = if named { cursor + 1 } else { open };
+            if named {
+                cursor += 2;
+            }
+            let start = cursor;
+            cursor = type_end(tokens, start, "]");
+            if !matches!(tokens.get(cursor).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s=="]") {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, cursor),
+                    expected: NatDefinitionExpectation::ClosingParenthesis,
+                });
+            }
+            parameter_groups.push(ExplicitBinderTokens {
+                open,
+                names: names_start..names_start + usize::from(named),
+                colon,
+                type_range: start..cursor,
+                close: cursor,
+                kind,
+            });
+            cursor += 1;
+            continue;
+        }
+        let names_start = cursor;
+        while matches!(
+            tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        ) {
+            cursor += 1;
+        }
+        if cursor == names_start {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, cursor),
+                expected: NatDefinitionExpectation::ParameterIdentifier,
+            });
+        }
+        if !matches!(
+            tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == ":"
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, cursor),
+                expected: NatDefinitionExpectation::ParameterTypeAscription,
+            });
+        }
+        let colon = cursor;
+        cursor += 1;
+        let start = cursor;
+        cursor = type_end(tokens, start, closing);
+        let type_range = start..cursor;
+        if !matches!(
+            tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == closing
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, cursor),
+                expected: NatDefinitionExpectation::ClosingParenthesis,
+            });
+        }
+        let close = cursor;
+        cursor += 1;
+        parameter_groups.push(ExplicitBinderTokens {
+            open,
+            names: names_start..colon,
+            colon,
+            type_range,
+            close,
+            kind,
+        });
+    }
+    Ok((parameter_groups, cursor))
+}
+
+fn bounded_binder_syntax(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    parameter_groups: Vec<ExplicitBinderTokens>,
+    grammar: DefinitionGrammar,
+) -> Result<Vec<Syntax>, NatDefinitionParseError> {
+    let mut parameters = Vec::new();
+    for group in parameter_groups {
+        if group.kind == "instBinder" {
+            let names = if group.names.is_empty() {
+                Vec::new()
+            } else {
+                vec![leaves.leaf(group.names.start)?, leaves.leaf(group.colon)?]
+            };
+            parameters.push(Syntax::node(
+                parser_kind(&["Term", "instBinder"]),
+                vec![
+                    leaves.leaf(group.open)?,
+                    null_node(names),
+                    bounded_type(leaves, view, tokens, group.type_range, grammar)?,
+                    leaves.leaf(group.close)?,
+                ],
+            ));
+            continue;
+        }
+        let names = group
+            .names
+            .map(|index| leaves.leaf(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut children = vec![
+            leaves.leaf(group.open)?,
+            null_node(names),
+            null_node(vec![
+                leaves.leaf(group.colon)?,
+                bounded_type(leaves, view, tokens, group.type_range, grammar)?,
+            ]),
+        ];
+        if group.kind == "explicitBinder" {
+            children.push(null_node(Vec::new()));
+        }
+        children.push(leaves.leaf(group.close)?);
+        parameters.push(Syntax::node(parser_kind(&["Term", group.kind]), children));
+    }
+    Ok(parameters)
+}
+
 fn parse_definition_with_grammar(
     source: &[u8],
     grammar: DefinitionGrammar,
@@ -1245,6 +1488,12 @@ fn parse_definition_with_grammar(
             Event::Trivia(_) | Event::Refused { .. } => None,
         })
         .collect::<Vec<_>>();
+
+    if grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.first().map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
+    {
+        return records::parse(view, tokens);
+    }
 
     if !matches!(
         tokens.first().map(|token| &token.kind),
@@ -1291,95 +1540,8 @@ fn parse_definition_with_grammar(
         });
     }
     cursor += 1;
-    let mut parameter_groups = Vec::new();
-    while matches!(
-        tokens.get(cursor).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃" | "["))
-    ) {
-        let open = cursor;
-        let (kind, closing) = match tokens.get(cursor).map(|token| &token.kind) {
-            Some(TokenKind::Symbol(symbol)) if symbol == "{" => ("implicitBinder", "}"),
-            Some(TokenKind::Symbol(symbol)) if symbol == "⦃" => ("strictImplicitBinder", "⦄"),
-            Some(TokenKind::Symbol(symbol)) if symbol == "[" => ("instBinder", "]"),
-            _ => ("explicitBinder", ")"),
-        };
-        cursor += 1;
-        if kind == "instBinder" {
-            let names_start = cursor;
-            let named = matches!(
-                tokens.get(cursor).map(|t| &t.kind),
-                Some(TokenKind::Ident(_))
-            ) && matches!(tokens.get(cursor+1).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==":");
-            let colon = if named { cursor + 1 } else { open };
-            if named {
-                cursor += 2;
-            }
-            let start = cursor;
-            cursor = type_end(&tokens, start, "]");
-            if !matches!(tokens.get(cursor).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s=="]") {
-                return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(&view, &tokens, cursor),
-                    expected: NatDefinitionExpectation::ClosingParenthesis,
-                });
-            }
-            parameter_groups.push(ExplicitBinderTokens {
-                open,
-                names: names_start..names_start + usize::from(named),
-                colon,
-                type_range: start..cursor,
-                close: cursor,
-                kind,
-            });
-            cursor += 1;
-            continue;
-        }
-        let names_start = cursor;
-        while matches!(
-            tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Ident(_))
-        ) {
-            cursor += 1;
-        }
-        if cursor == names_start {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor),
-                expected: NatDefinitionExpectation::ParameterIdentifier,
-            });
-        }
-        if !matches!(
-            tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == ":"
-        ) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor),
-                expected: NatDefinitionExpectation::ParameterTypeAscription,
-            });
-        }
-        let colon = cursor;
-        cursor += 1;
-        let start = cursor;
-        cursor = type_end(&tokens, start, closing);
-        let type_range = start..cursor;
-        if !matches!(
-            tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == closing
-        ) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor),
-                expected: NatDefinitionExpectation::ClosingParenthesis,
-            });
-        }
-        let close = cursor;
-        cursor += 1;
-        parameter_groups.push(ExplicitBinderTokens {
-            open,
-            names: names_start..colon,
-            colon,
-            type_range,
-            close,
-            kind,
-        });
-    }
+    let (parameter_groups, next) = bounded_binders(&view, &tokens, cursor, grammar)?;
+    cursor = next;
     let explicit_result_type = if matches!(
         tokens.get(cursor).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == ":"
@@ -1432,43 +1594,7 @@ fn parse_definition_with_grammar(
         parser_kind(&["Command", "declId"]),
         vec![declaration_name, null_node(Vec::new())],
     );
-    let mut parameters = Vec::new();
-    for group in parameter_groups {
-        if group.kind == "instBinder" {
-            let names = if group.names.is_empty() {
-                Vec::new()
-            } else {
-                vec![leaves.leaf(group.names.start)?, leaves.leaf(group.colon)?]
-            };
-            parameters.push(Syntax::node(
-                parser_kind(&["Term", "instBinder"]),
-                vec![
-                    leaves.leaf(group.open)?,
-                    null_node(names),
-                    bounded_type(&leaves, &view, &tokens, group.type_range, grammar)?,
-                    leaves.leaf(group.close)?,
-                ],
-            ));
-            continue;
-        }
-        let names = group
-            .names
-            .map(|index| leaves.leaf(index))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut children = vec![
-            leaves.leaf(group.open)?,
-            null_node(names),
-            null_node(vec![
-                leaves.leaf(group.colon)?,
-                bounded_type(&leaves, &view, &tokens, group.type_range, grammar)?,
-            ]),
-        ];
-        if group.kind == "explicitBinder" {
-            children.push(null_node(Vec::new()));
-        }
-        children.push(leaves.leaf(group.close)?);
-        parameters.push(Syntax::node(parser_kind(&["Term", group.kind]), children));
-    }
+    let parameters = bounded_binder_syntax(&leaves, &view, &tokens, parameter_groups, grammar)?;
     let result_type = if let Some((colon, type_range)) = explicit_result_type {
         null_node(vec![Syntax::node(
             parser_kind(&["Term", "typeSpec"]),
@@ -1614,7 +1740,7 @@ pub fn partition_definition_commands(
             Event::Token(LexedToken {
                 kind: TokenKind::Symbol(symbol),
                 extent,
-            }) if symbol == "def"
+            }) if matches!(symbol.as_str(), "def" | "structure" | "class")
                 || symbol == "theorem"
                 || symbol == "instance"
                 || symbol == "#eval"
