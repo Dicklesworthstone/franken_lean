@@ -337,3 +337,121 @@ fn field_receivers_refuse_missing_instances_and_unapplied_parameters_atomically(
     }
     check(&base, "theorem recovery : point.x = 0 := by rfl");
 }
+
+fn type_factory() -> Engine {
+    check(
+        &engine(),
+        "class Factory where\n  carrier : Type\n  produce : carrier\n\
+         instance natFactory : Factory := { carrier := Nat, produce := 7 }",
+    )
+    .engine
+}
+
+#[test]
+fn type_positions_insert_class_receivers_in_result_arrow_let_and_ascription() {
+    let base = type_factory();
+    for (declaration, result) in [
+        ("def answer : Factory.carrier := Factory.produce", "answer = 7"),
+        ("def answer : Factory.carrier -> Nat := fun x => x", "answer 7 = 7"),
+        ("def answer : Nat -> Factory.carrier := fun x => x", "answer 7 = 7"),
+        ("def answer : Nat := let x : Factory.carrier := Factory.produce; x", "answer = 7"),
+        ("def answer : Nat := (Factory.produce : Factory.carrier)", "answer = 7"),
+        ("structure Wrapped where\n  value : Factory.carrier\ndef answer : Wrapped := { value := 7 }", "answer.value = 7"),
+    ] {
+        check(&base, &format!("{declaration}\ntheorem result : {result} := by rfl"));
+    }
+}
+
+#[test]
+fn type_positions_keep_anonymous_named_and_ordinary_local_dictionaries() {
+    check(
+        &type_factory(),
+        "def make [Factory] : Factory.carrier := Factory.produce\n\
+         def keep [Factory] (x : Factory.carrier) : Factory.carrier := x\n\
+         def local (f : Factory) : f.carrier := (Factory.produce : Factory.carrier)\n\
+         theorem global : make = 7 := by rfl\n\
+         theorem kept : keep 9 = 9 := by rfl\n\
+         theorem selected : local { carrier := Nat, produce := 9 } = 9 := by rfl",
+    );
+}
+
+#[test]
+fn type_positions_resolve_explicit_record_annotations_before_field_elaboration() {
+    check(
+        &engine(),
+        "structure Point where\n  x : Nat\n\
+         class Factory where\n  carrier : Type\n  produce : carrier\n\
+         instance pointFactory : Factory := { carrier := Point, produce := { x := 7 } }\n\
+         def one := { x := 3 : Factory.carrier }\n\
+         def two := ({ x := 4 } : Factory.carrier)\n\
+         def make [Factory] : Factory.carrier := Factory.produce\n\
+         theorem one_ok : one.x = 3 := by rfl\n\
+         theorem two_ok : two.x = 4 := by rfl\n\
+         theorem made : make.x = 7 := by rfl",
+    );
+}
+
+#[test]
+fn type_positions_allow_later_header_constraints_before_resolving_instances() {
+    check(
+        &engine(),
+        "def inferred {A : Type} [Inhabited A] : Type := A\n\
+         def keep (x : inferred) (h : x = (0 : Nat)) : Nat := x\n\
+         theorem result : keep 0 (by rfl) = 0 := by rfl",
+    );
+}
+
+#[test]
+fn type_positions_preserve_pending_outer_and_nested_annotation_inference() {
+    check(
+        &engine(),
+        "def choose {A : Type} [Inhabited A] (x : A) : A := default\n\
+         def inferred {A : Type} [Inhabited A] : Type := A\n\
+         def family {A : Type} : Type := A\n\
+         def ascribed : Nat := choose (0 : Nat)\n\
+         def nested : Nat := ((0 : Nat) : inferred)\n\
+         def local (n : Nat) : Nat := let x : inferred := n; x\n\
+         def ordinary (x : family) := (x : Nat)\n\
+         theorem ascribed_ok : ascribed = 0 := by rfl\n\
+         theorem nested_ok : nested = 0 := by rfl\n\
+         theorem local_ok : local 9 = 9 := by rfl\n\
+         theorem ordinary_ok : ordinary 8 = 8 := by rfl",
+    );
+}
+
+#[test]
+fn type_positions_refuse_unresolved_headers_and_unapplied_types_atomically() {
+    let base = check(
+        &engine(),
+        "class Missing where\n  carrier : Type\n\
+         class Witness (A : Type) where\n  value : A\n\
+         def carrier {A : Type} [Witness A] : Type := A\n\
+         def inferred {A : Type} [Inhabited A] : Type := A\n\
+         def family {A : Type} : Type := A\n\
+         def strict ⦃A : Type⦄ : Type := A\n\
+         def explicit (A : Type) : Type := A",
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad (n : Nat) : inferred := n",
+        "def bad (n : Nat) : family := n",
+        "def bad (x : inferred) := (x : Nat)",
+        "def bad (x : carrier) [Witness Nat] (h : x = (0 : Nat)) : Nat := x",
+        "def bad : Missing.carrier := 0",
+        "def bad : strict := 0",
+        "def bad : explicit := 0",
+        "def bad : 7 := 0",
+        "def bad : Nat := (7 : Missing)",
+    ] {
+        let error = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        ).unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    }
+    check(&base, "theorem recovered : 0 = 0 := by rfl");
+}
