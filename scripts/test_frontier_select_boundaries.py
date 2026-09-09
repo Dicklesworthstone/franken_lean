@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import subprocess
 import sys
@@ -6,9 +7,16 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import frontier_select as fs
-from test_frontier_select import issue
+# Share the helpers and their exact-path-loaded subject without changing sys.path.
+SPEC = importlib.util.spec_from_file_location(
+    "test_frontier_select", Path(__file__).with_name("test_frontier_select.py")
+)
+assert SPEC is not None and SPEC.loader is not None
+HELPERS = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = HELPERS
+SPEC.loader.exec_module(HELPERS)
+fs = HELPERS.fs
+issue = HELPERS.issue
 
 
 class FrontierBoundaryTests(unittest.TestCase):

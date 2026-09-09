@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import subprocess
@@ -9,8 +10,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import frontier_select as fs
+# Load the sibling by its exact path without reopening isolated Python's search path.
+SPEC = importlib.util.spec_from_file_location(
+    "frontier_select", Path(__file__).with_name("frontier_select.py")
+)
+assert SPEC is not None and SPEC.loader is not None
+fs = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = fs
+SPEC.loader.exec_module(fs)
 
 
 def issue(
