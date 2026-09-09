@@ -1863,7 +1863,11 @@ fn definition_height(
             ExprNode::Apply { function, .. } => {
                 current = child(current, *function)?;
             }
-            ExprNode::Metadata { expression, .. } => {
+            ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
+                // A stuck projection demands its major premise. Its next
+                // delta step is the definition at that premise's head, not
+                // the projection node itself. WHNF still checks the structure,
+                // constructor and field before reducing the projection.
                 current = child(current, *expression)?;
             }
             ExprNode::Constant { name, .. } => {
@@ -1881,8 +1885,7 @@ fn definition_height(
             | ExprNode::Forall { .. }
             | ExprNode::Let { .. }
             | ExprNode::NatLiteral { .. }
-            | ExprNode::StringLiteral(_)
-            | ExprNode::Projection { .. } => return Ok(None),
+            | ExprNode::StringLiteral(_) => return Ok(None),
         }
     }
 }
