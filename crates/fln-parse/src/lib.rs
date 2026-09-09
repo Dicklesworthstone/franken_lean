@@ -482,6 +482,7 @@ fn nat_definition_token_table() -> TokenTable {
         "structure",
         "class",
         "where",
+        "with",
         "extends",
         "deriving",
         "def",
@@ -537,6 +538,7 @@ fn source_module_token_table() -> TokenTable {
         "structure",
         "class",
         "where",
+        "with",
         "extends",
         "deriving",
         "import",
@@ -1075,6 +1077,7 @@ fn bounded_term(
         operands: Vec::new(),
         operators: Vec::new(),
     }];
+    let updates = record_terms::update_openers(tokens, range.clone());
     let mut cursor = range.start;
     while cursor < range.end {
         let index = cursor;
@@ -1165,12 +1168,19 @@ fn bounded_term(
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "{" =>
             {
-                let frame = record_terms::open(view, tokens, index, &mut cursor, range.end)?;
+                let frame = record_terms::open(
+                    view,
+                    tokens,
+                    index,
+                    &mut cursor,
+                    range.end,
+                    updates.contains(&index),
+                )?;
                 frames.push(frame);
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar
-                    && matches!(symbol.as_str(), "," | "}" | ":") =>
+                    && matches!(symbol.as_str(), "," | "}" | ":" | "with") =>
             {
                 finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
                 if frames.last().is_some_and(|frame| frame.record.is_some()) {

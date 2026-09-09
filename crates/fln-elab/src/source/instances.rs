@@ -148,11 +148,23 @@ impl Context {
                 }
                 let mut trial = self.clone();
                 let saved = trial.txn.lctx.clone();
+                // An outer equation may itself need this dictionary's fields.
+                // Candidate matching must solve only its own equations, not
+                // demand the result of an as-yet unassigned dictionary. Retain
+                // all suspended obligations and retry them after publication.
+                let suspended = std::mem::take(&mut trial.equations);
                 let result = trial.search_instance(id, &registry);
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                 match result {
                     Ok(true) => {
                         trial.txn.lctx = saved;
+                        // Resume with the now-available dictionary projections,
+                        // without widening class-head matching transparency.
+                        for (left, right) in suspended {
+                            let left = trial.whnf(&left)?;
+                            let right = trial.whnf(&right)?;
+                            trial.equations.push((left, right));
+                        }
                         *self = trial;
                     }
                     Ok(false) => {}
