@@ -20,6 +20,7 @@ jobs:
           set -euo pipefail
           mkdir -p target/source-workbench
           git rev-parse HEAD > target/source-workbench/commit.txt
+          git rev-parse 'HEAD^{tree}' > target/source-workbench/tree.txt
           git archive --format=tar.gz HEAD > target/source-workbench/source.tar.gz
           sha256sum target/source-workbench/source.tar.gz > target/source-workbench/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
