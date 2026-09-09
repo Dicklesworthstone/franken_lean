@@ -187,6 +187,51 @@ fn simp_only_empty_set_uses_kernel_conversion_and_never_proves_false() {
 }
 
 #[test]
+fn simp_only_keeps_ordinary_definitions_closed_without_an_explicit_rule() {
+    let base = admit(&engine(), "def identity (x : Nat) : Nat := x");
+    let base = admit(
+        &base,
+        "theorem identity_eq (x : Nat) : identity x = x := by rfl",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad : identity 5 = 5 := by simp only []",
+        "theorem bad (x : Nat) : identity x = x := by simp only []",
+    ] {
+        let error = base
+            .admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("simp made no progress"),
+            "{error}"
+        );
+    }
+    admit(
+        &base,
+        "theorem explicit (x : Nat) : identity x = x := by simp only [identity_eq]",
+    );
+    admit(&base, "theorem explicit : identity 5 = 5 := by rfl");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
+}
+
+#[test]
+fn simp_only_arithmetic_resource_stop_remains_inconclusive() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let error = base
+        .check_source_files(
+            &[b"theorem bounded : (1 <<< 18446744073709551616) = 0 := by simp only []"],
+            &options,
+            fln::SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("inconclusive", false, 3));
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
 fn simp_only_preserves_introduced_context_and_leaves_real_remaining_goals() {
     let base = engine();
     admit(

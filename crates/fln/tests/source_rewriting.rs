@@ -62,6 +62,70 @@ fn explicit_rewrite_leaves_its_goal_while_rw_tries_reflexivity() {
             .is_err()
     );
 }
+
+#[test]
+fn rw_reflexivity_reduces_closed_arithmetic_through_the_kernel() {
+    prove("theorem arithmetic (x : Nat) (h : x = 5) : 2 + 3 = x := by rw [h]");
+    prove("theorem arithmetic (x : Nat) (h : 5 = x) : x = 2 + 3 := by rw [← h]");
+    prove("theorem nested (x : Nat) (h : x = 20) : (2 + 3) * 4 = x := by rw [h]");
+    prove(
+        "theorem large (x : Nat) (h : x = 18446744073709551617) : 18446744073709551616 + 1 = x := by rw [h]",
+    );
+}
+
+#[test]
+fn rw_arithmetic_does_not_widen_definition_transparency_or_prove_false_equalities() {
+    let options = KVMap::new();
+    let base = engine()
+        .admit_source_declaration(b"def identity (x : Nat) : Nat := x", &options, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    for source in [
+        "theorem bad (x : Nat) (h : x = 6) : 2 + 3 = x := by rw [h]",
+        "theorem bad (x y : Nat) (h : x = y) : identity x = y := by rw [h]",
+        "theorem bad (x : Nat) (h : x = 5) : identity x = 5 := by rw [h]",
+    ] {
+        let error = base
+            .admit_source_declaration(source.as_bytes(), &options, limits())
+            .unwrap_err();
+        assert!(error.to_string().contains("unsolved goals"), "{error}");
+    }
+    for source in [
+        "theorem explicit (x y : Nat) (h : x = y) : identity x = y := by rewrite [h]; rfl",
+        "theorem explicit (x : Nat) (h : x = 5) : identity x = 5 := by rewrite [h]; rfl",
+    ] {
+        base.admit_source_declaration(source.as_bytes(), &options, limits())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+    }
+    assert_eq!(base.logical_root(&options), root);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
+}
+
+#[test]
+fn rw_arithmetic_resource_stop_is_not_an_unsolved_goal_or_rejection() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let error = base
+        .check_source_files(
+            &[b"theorem bounded (x : Nat) (h : x = 0) : (1 <<< 18446744073709551616) = x := by rw [h]"],
+            &options,
+            fln::SourceCheckLimits::new(limits()),
+        )
+        .unwrap_err();
+    assert_eq!(error.disposition(), ("inconclusive", false, 3));
+    assert_eq!(base.logical_root(&options), root);
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["bounded"]))
+    );
+}
 #[test]
 fn rule_lists_apply_in_source_order_with_comments_and_newlines() {
     let source = "theorem trans (x y z : Nat) (h : x = y) (k : y = z) : x = z := by\r\n  rw [\r\n    h, -- first rewrite\r\n    k,\r\n  ]\r\n";
