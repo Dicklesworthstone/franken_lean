@@ -420,3 +420,58 @@ fn installed_binary_checks_instance_dependent_field_receivers_atomically() {
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_type_position_instances_and_header_refusal_with_recovery() {
+    let prefix = file(
+        "class Factory where\n  carrier : Type\n  produce : carrier\n\
+         instance natFactory : Factory := { carrier := Nat, produce := 7 }",
+    );
+    let good = file(
+        "def keep [Factory] (x : Factory.carrier) : Factory.carrier := x\n\
+         def answer : Nat := keep (Factory.produce : Factory.carrier)\n\
+         theorem result : answer = 7 := by rfl",
+    );
+    let bad = file(
+        "def inferred {A : Type} [Inhabited A] : Type := A\n\
+         def bad (n : Nat) : inferred := n",
+    );
+    let wrong = file("theorem wrong : Factory.produce = (8 : Nat) := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&wrong, false), (&good, true)] {
+        let before = std::fs::read(suffix).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for required in [
+                "\"commands\":5",
+                "\"theorems\":1",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(required), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("\"outcome\":\"complete\""));
+        }
+        assert_eq!(std::fs::read(suffix).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(suffix.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+}
