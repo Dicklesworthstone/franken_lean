@@ -74,22 +74,18 @@ impl Context {
         *self = original;
     }
 
-    /// Ask K1, through the checked-assignment API, whether reflexivity really
-    /// closes this target. This covers literal computation as well as beta/delta
-    /// conversion, without turning a failed or exhausted kernel call into a proof.
+    /// Check a candidate only after the shared automatic-closure policy admits
+    /// it. Full K1 assignment conversion alone would unfold ordinary definitions
+    /// that are absent from this tactic's explicit rule set.
     fn simp_reflexivity(
         &mut self,
         goal: &ProofGoal,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let target = self.whnf(&goal.target)?;
-        let Some((level, alpha, left, _)) = equality_target(&target) else {
+        let Some(candidate) = self.automatic_reflexivity_candidate(goal)? else {
             return Ok(None);
         };
+        let target = self.instantiate(&goal.target)?;
         let mut trial = self.rewrite_trial();
-        let candidate = app(
-            Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
-            [alpha, left],
-        );
         let hole = trial.hole(target)?;
         let result = trial
             .txn

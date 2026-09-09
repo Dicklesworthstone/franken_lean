@@ -61,19 +61,9 @@ impl Context {
         &mut self,
         goal: &ProofGoal,
     ) -> Result<bool, NatDefinitionElabError> {
-        let target = self.whnf(&goal.target)?;
-        let Some((level, alpha, left, right)) = equality_target(&target) else {
+        let Some(value) = self.automatic_reflexivity_candidate(goal)? else {
             return Ok(false);
         };
-        let left = self.whnf(&left)?;
-        let right = self.whnf(&right)?;
-        if !self.proof_types_match(&left, &right)? {
-            return Ok(false);
-        }
-        let value = app(
-            Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
-            [alpha, left],
-        );
         // Each rewrite created a separate child. Its parent's introduced-binder
         // closure remains below it on the work stack.
         self.txn
@@ -90,6 +80,90 @@ impl Context {
                 )))
             })?;
         Ok(true)
+    }
+
+    /// Automatic tactic closure uses reducible transparency for both the goal
+    /// head and its operands. Ordinary `rfl` retains its separate, wider policy.
+    fn automatic_reflexivity_candidate(
+        &mut self,
+        goal: &ProofGoal,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.flush(false)?;
+        let transparency = UnificationTransparency::Abbreviations;
+        let target = self.whnf_with_transparency(&goal.target, transparency)?;
+        let Some((level, alpha, left, right)) = equality_target(&target) else {
+            return Ok(None);
+        };
+        let left = self.whnf_with_transparency(&left, transparency)?;
+        let right = self.whnf_with_transparency(&right, transparency)?;
+        if !self.proof_types_match(&left, &right)?
+            && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(app(
+            Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
+            [alpha, left],
+        )))
+    }
+
+    /// The source unifier has no literal arithmetic reducer. Reuse K1 only
+    /// for closed arithmetic over the exact seed primitives: unrestricted
+    /// kernel conversion would also unfold ordinary definitions, exceeding
+    /// automatic closure's reducible transparency. Final admission checks both seats.
+    fn rewrite_arithmetic_reflexivity(
+        &mut self,
+        goal: &ProofGoal,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let left = self.instantiate(left)?;
+        let right = self.instantiate(right)?;
+        let mut work = vec![&left, &right];
+        let mut seen = HashSet::new();
+        while let Some(term) = work.pop() {
+            if !seen.insert(term.allocation_identity()) {
+                continue;
+            }
+            self.tick()?;
+            match term.node() {
+                ExprNode::Lit {
+                    literal: Literal::Nat(_),
+                } => {}
+                ExprNode::App { f, a } => work.extend([f, a]),
+                ExprNode::MData { expr, .. } => work.push(expr),
+                ExprNode::Const { name, levels } if levels.is_empty() => {
+                    let Some(Declaration::Axiom(expected)) =
+                        crate::seed::source_intrinsic_seed_declaration(name)
+                    else {
+                        return Ok(false);
+                    };
+                    let mut result = &expected.base.type_;
+                    while let ExprNode::ForallE { body, .. } = result.node() {
+                        result = body;
+                    }
+                    if !matches!(result.node(), ExprNode::Const { name, levels }
+                        if name == &Name::from_components(["Nat"]) && levels.is_empty())
+                        || self.txn.env.find(name)
+                            != Some(&fln_env::constants::ConstantInfo::Axiom(expected))
+                    {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        match fln_kernel::check_def_eq(&self.txn.env, &[], &left, &right, self.kernel) {
+            Outcome::Complete(Verdict::Accepted { .. }) => Ok(true),
+            Outcome::Complete(Verdict::Rejected { .. }) => Ok(false),
+            outcome => Err(failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::AssignmentCheck {
+                    id: goal.id.clone(),
+                    outcome: Box::new(outcome),
+                },
+            )))),
+        }
     }
 
     pub(in crate::source) fn rewrite_proof_term<'a>(

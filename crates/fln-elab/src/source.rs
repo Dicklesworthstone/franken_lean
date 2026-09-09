@@ -10,7 +10,7 @@ mod levels;
 mod tactics;
 
 use super::*;
-use crate::constraint::unify::{UnificationBudget, UnificationError};
+use crate::constraint::unify::{UnificationBudget, UnificationError, UnificationTransparency};
 use fln_core::expr::{FVarId, MVarId};
 use fln_core::level::{LMVarId, Level};
 use fln_core::options::KVMap;
@@ -252,6 +252,14 @@ impl Context {
     }
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        self.whnf_with_transparency(expr, UnificationTransparency::SafeDefinitions)
+    }
+
+    fn whnf_with_transparency(
+        &mut self,
+        expr: &Expr,
+        transparency: UnificationTransparency,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let mut head = self.instantiate(expr)?;
         let mut arguments = Vec::new();
         loop {
@@ -280,7 +288,15 @@ impl Context {
                     else {
                         break;
                     };
-                    if definition.safety != DefinitionSafety::Safe {
+                    if definition.safety != DefinitionSafety::Safe
+                        || !match transparency {
+                            UnificationTransparency::None => false,
+                            UnificationTransparency::Abbreviations => {
+                                definition.hints == ReducibilityHints::Abbrev
+                            }
+                            UnificationTransparency::SafeDefinitions => true,
+                        }
+                    {
                         break;
                     }
                     if definition.base.level_params.len() != levels.len() {
