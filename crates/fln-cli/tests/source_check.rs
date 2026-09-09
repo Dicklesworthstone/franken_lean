@@ -475,3 +475,44 @@ fn installed_binary_checks_type_position_instances_and_header_refusal_with_recov
         );
     }
 }
+
+#[test]
+fn installed_binary_checks_defaults_updates_and_late_failure_without_partial_success() {
+    let prefix = file(
+        "structure Config where\n  base : Nat := 3\n  twice : Nat := base + base\ndef custom : Config := { base := 7 }\ndef copied := { custom with base := 20 }",
+    );
+    let good = file(
+        "theorem ok : custom.twice = 14 := by rfl\ntheorem retained : copied.twice = 14 := by rfl",
+    );
+    let bad = file("theorem wrong : copied.twice = 40 := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":5",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+    }
+}

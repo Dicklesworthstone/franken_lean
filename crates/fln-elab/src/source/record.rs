@@ -1,6 +1,7 @@
 //! Source record signatures elaborate through the same bidirectional context as
 //! ordinary definitions. Result universes follow field domains unless explicit.
 use super::*;
+use crate::records::defaults::{RecordDefault, helper_name};
 use crate::records::{RecordBudget, RecordSpec, record_declarations};
 
 #[derive(Debug)]
@@ -9,6 +10,8 @@ pub struct SourceRecord {
     pub is_class: bool,
     /// The inductive block followed by each projection, all still untrusted.
     pub declarations: Vec<Declaration>,
+    /// References only: the caller registers these after admitting the full batch.
+    pub defaults: Vec<RecordDefault>,
 }
 
 pub fn is_record(syntax: &Syntax) -> bool {
@@ -118,6 +121,8 @@ pub fn elaborate_record(
         )));
     }
     let mut output = Vec::new();
+    let mut defaults = Vec::new();
+    let mut helpers = Vec::new();
     for field in fields {
         context.tick()?;
         let parts = expect_node(
@@ -127,7 +132,20 @@ pub fn elaborate_record(
             "named structure field",
         )?;
         empty_modifiers(&parts[0])?;
-        expect_empty_null(&parts[3], "unsupported field default")?;
+        let default = match expect_null_args(&parts[3], "field default")? {
+            [] => None,
+            [syntax] => {
+                let parts = expect_node(
+                    syntax,
+                    &parser_kind(&["Term", "binderDefault"]),
+                    2,
+                    "field default value",
+                )?;
+                expect_atom(&parts[0], ":=", "field default assignment")?;
+                Some(&parts[1])
+            }
+            _ => return Err(failure(SourceInferenceError::Scope)),
+        };
         let Syntax::Ident { val: user_name, .. } = &parts[1] else {
             return Err(failure(SourceInferenceError::Scope));
         };
@@ -142,6 +160,59 @@ pub fn elaborate_record(
         let annotation = optional_type_syntax(&sig[1])?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         let mut domain = context.type_term(annotation)?;
+        if let Some(syntax) = default {
+            let term = context.term(syntax, Some(domain.clone()))?;
+            // Preserve the declared type even when the default is never selected.
+            // Its ordinary helper declaration must still pass kernel checking.
+            let mut term = context.finish(Typed {
+                value: term.value,
+                type_: domain.clone(),
+            })?;
+            let locals = context.txn.lctx.decls().to_vec();
+            for (index, local) in locals.iter().enumerate().rev() {
+                context.tick()?;
+                let local_type = context.instantiate(&local.type_)?;
+                let style = if index < parameters.len() && local.binder_info == BinderInfo::Default
+                {
+                    BinderInfo::Implicit
+                } else {
+                    local.binder_info
+                };
+                term.value = term
+                    .value
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                term.type_ = term
+                    .type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                term.value = Expr::lam(
+                    local.user_name.clone(),
+                    local_type.clone(),
+                    term.value,
+                    style,
+                );
+                term.type_ = Expr::forall_e(local.user_name.clone(), local_type, term.type_, style);
+            }
+            let helper = helper_name(name, user_name);
+            helpers.push(Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: helper.clone(),
+                    level_params: Vec::new(),
+                    type_: term.type_,
+                },
+                value: term.value,
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![helper.clone()],
+            }));
+            defaults.push(RecordDefault {
+                record: name.clone(),
+                field: u32::try_from(output.len())
+                    .map_err(|_| failure(SourceInferenceError::ResourceLimit))?,
+                helper,
+            });
+        }
         for arg in arguments.iter().rev() {
             context.tick()?;
             domain = domain
@@ -204,11 +275,13 @@ pub fn elaborate_record(
         result_level,
         is_class,
     };
-    let declarations =
+    let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
+    declarations.extend(helpers);
     Ok(SourceRecord {
         name: name.clone(),
         is_class,
         declarations,
+        defaults,
     })
 }

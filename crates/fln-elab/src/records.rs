@@ -3,6 +3,8 @@
 //! This module owns no admission authority. The generated block (including its
 //! proposed eliminator) and each projection must pass the ordinary kernel and
 //! the caller's independent-checker policy before any successor is exposed.
+pub mod defaults;
+
 use crate::lctx::LocalDecl;
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;

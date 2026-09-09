@@ -42,6 +42,17 @@ impl Engine {
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut batch) => {
+                batch.engine.environment = fln_elab::records::defaults::register_defaults(
+                    batch.engine.environment(),
+                    &record.defaults,
+                )
+                .map_err(|error| {
+                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::Record(error),
+                        ),
+                    ))
+                })?;
                 if record.is_class {
                     batch.engine.environment = fln_elab::instances::register_class(
                         batch.engine.environment(),
@@ -54,8 +65,8 @@ impl Engine {
                             ),
                         ))
                     })?;
-                    batch.result_logical_root = batch.engine.logical_root(options);
                 }
+                batch.result_logical_root = batch.engine.logical_root(options);
                 Outcome::Complete(batch)
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
