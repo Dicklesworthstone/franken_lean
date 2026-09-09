@@ -115,6 +115,27 @@ impl WhnfContext {
         &self.free_bindings
     }
 
+    /// Inference owns the private overlay and checks local-name freshness before
+    /// installing a let. The reducer still validates the complete binding set.
+    pub(crate) fn push_scoped_binding(&mut self, binding: FreeBinding) {
+        self.free_bindings.push(binding);
+    }
+
+    /// Lexical scopes must close in reverse installation order. Never remove
+    /// another binding, including an original caller-supplied local definition.
+    pub(crate) fn pop_scoped_binding(&mut self, name: &WireName) -> bool {
+        if self
+            .free_bindings
+            .last()
+            .is_some_and(|binding| binding.name() == name)
+        {
+            self.free_bindings.pop();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn projection_rules(&self) -> &[ProjectionRule] {
         &self.projection_rules
     }

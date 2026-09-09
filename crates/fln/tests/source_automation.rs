@@ -328,3 +328,84 @@ fn simp_only_reverses_rules_and_is_repeatable() {
     let b = admit(&base, source);
     assert_eq!(a.logical_root(&KVMap::new()), b.logical_root(&KVMap::new()));
 }
+
+#[test]
+fn simp_only_unfolds_selected_definitions_and_combines_them_with_proved_rules() {
+    let base = admit(
+        &engine(),
+        "def twice (f : Nat -> Nat) (x : Nat) : Nat := f (f x)",
+    );
+    admit(
+        &base,
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : twice f (twice f x) = x := by simp only [twice, h]",
+    );
+    let base = admit(&base, "def identity {A : Type} (x : A) : A := x");
+    admit(
+        &base,
+        "theorem use {A : Type} (x : A) : identity (identity x) = x := by simp only [identity]",
+    );
+    admit(
+        &base,
+        "theorem use (x : Nat) : x = x := by simp only [twice]",
+    );
+}
+
+#[test]
+fn simp_only_local_shadowing_never_unfolds_a_same_named_global() {
+    let base = admit(&engine(), "def rule (x : Nat) : Nat := x");
+    admit(
+        &base,
+        "theorem use (x y : Nat) (rule : x = y) : y = x := by simp only [rule]",
+    );
+    assert!(
+        base.admit_source_declaration(
+            b"theorem bad (x : Nat) : x = x := by simp only [<- rule]",
+            &KVMap::new(),
+            limits()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn simp_only_specializes_polymorphic_rules_at_distinct_types_in_one_goal() {
+    let base = admit(&engine(), "def identity {A : Type} (x : A) : A := x");
+    let base = admit(
+        &base,
+        "theorem identity_eq {A : Type} (x : A) : identity x = x := by rfl",
+    );
+    admit(
+        &base,
+        "theorem use (f : Nat -> String -> Nat) (x : Nat) (s : String) : f (identity x) (identity s) = f x s := by simp only [identity_eq]",
+    );
+}
+
+#[test]
+fn independent_checker_converts_equal_terms_with_different_erased_arguments() {
+    let base = admit(&engine(), "def erase (x : Nat) : Nat := 7");
+    admit(&base, "theorem use : erase 1 = erase 2 := by rfl");
+    admit(
+        &base,
+        "theorem use : erase 1 = erase 2 := by simp only [erase]",
+    );
+    assert!(
+        base.admit_source_declaration(
+            b"theorem bad : erase 1 = 8 := by rfl",
+            &KVMap::new(),
+            limits()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn simp_only_unfolds_local_lets_in_tactic_generated_subgoals() {
+    let base = admit(
+        &engine(),
+        "theorem step (y x : Nat) (h : y = x) : x = x := by rfl",
+    );
+    admit(
+        &base,
+        "theorem use (x : Nat) : x = x := let y := x; by apply step y; simp only [y]",
+    );
+}

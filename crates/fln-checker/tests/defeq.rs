@@ -2043,3 +2043,140 @@ fn a_redex_side_is_normalized_before_spine_congruence() {
         DefEqOutcome::Equal(..)
     ));
 }
+
+#[test]
+fn safe_delta_heads_normalize_whole_applications_before_congruence() {
+    let f = Expr::fvar(FVarId(name("f")));
+    let x = Expr::fvar(FVarId(name("x")));
+    let twice = Expr::lam(
+        name("f"),
+        Expr::sort(Level::zero()),
+        Expr::lam(
+            name("x"),
+            Expr::sort(Level::zero()),
+            Expr::app(
+                Expr::bvar(1).unwrap(),
+                Expr::app(Expr::bvar(1).unwrap(), Expr::bvar(0).unwrap()),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let context = definition_context(vec![definition_entry(
+        "twice",
+        decoded(&twice),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    )]);
+    let lhs = decoded(&Expr::app(
+        Expr::app(constant("twice"), f.clone()),
+        x.clone(),
+    ));
+    let rhs = decoded(&Expr::app(f.clone(), Expr::app(f, x)));
+    assert!(matches!(
+        def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(matches!(
+        def_eq(&rhs, &lhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn quick_argument_mismatches_do_not_reject_erasing_beta_or_delta_functions() {
+    let erase = Expr::lam(
+        name("x"),
+        constant("Nat"),
+        nat_literal(7),
+        BinderInfo::Default,
+    );
+    let context = definition_context(vec![definition_entry(
+        "erase",
+        decoded(&erase),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    )]);
+    for head in [erase, constant("erase")] {
+        let lhs = decoded(&Expr::app(head.clone(), nat_literal(1)));
+        let rhs = decoded(&Expr::app(head, nat_literal(2)));
+        assert!(matches!(
+            quick_def_eq(&lhs, &rhs, QuickDefEqBudget::unlimited()),
+            QuickDefEqOutcome::NotEqual { .. }
+        ));
+        assert!(matches!(
+            def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
+            DefEqOutcome::Equal(_)
+        ));
+        assert!(matches!(
+            def_eq_with(&lhs, &rhs, &context, DefEqBudget::unlimited(), || true),
+            DefEqOutcome::Inconclusive(_)
+        ));
+    }
+    assert!(matches!(
+        def_eq(
+            &decoded(&nat_literal(1)),
+            &decoded(&nat_literal(2)),
+            &context,
+            DefEqBudget::unlimited()
+        ),
+        DefEqOutcome::NotEqual { .. }
+    ));
+}
+
+#[test]
+fn zeta_ignores_unused_values_instead_of_comparing_them_as_injective_arguments() {
+    let term = |value| {
+        decoded(&Expr::let_e(
+            name("unused"),
+            constant("Nat"),
+            nat_literal(value),
+            nat_literal(7),
+            true,
+        ))
+    };
+    assert!(matches!(
+        def_eq(
+            &term(1),
+            &term(2),
+            &WhnfContext::default(),
+            DefEqBudget::unlimited()
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn a_local_definition_can_erase_different_arguments_without_false_mismatch() {
+    let local = name("local_function");
+    let erase = Expr::lam(
+        name("x"),
+        constant("Nat"),
+        nat_literal(7),
+        BinderInfo::Default,
+    );
+    let context = WhnfContext::new(
+        vec![FreeBinding::new(
+            checker_name("local_function"),
+            decoded(&erase),
+        )],
+        Vec::new(),
+        ConstantEnvironment::empty(),
+    );
+    let head = Expr::fvar(FVarId(local));
+    let left = decoded(&Expr::app(head.clone(), nat_literal(1)));
+    let right = decoded(&Expr::app(head, nat_literal(2)));
+    assert!(matches!(
+        def_eq(&left, &right, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(!matches!(
+        def_eq(
+            &left,
+            &decoded(&nat_literal(8)),
+            &context,
+            DefEqBudget::unlimited()
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+}

@@ -38,6 +38,32 @@ theorem transport (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := 
 
 `rw [h]`, `rw [← h]` (also `<-`), and ordered rule lists generate ordinary `Eq.rec` transports. The equality proof is retained in the final term. `rw` attempts reflexivity after the list; `rewrite [h]` leaves the resulting goal for a following tactic. Rules use normal source-term elaboration, including explicit applications. Tests cover introduced locals, dependent predicates, generic types and Type-valued transport. Matching and template reconstruction are metered, allocation-memoized DAG walks.
 
+## Quantified rewriting and explicit-set simplification
+
+Quantified rewrite instantiation landed at `175bdcf73091da85ace6c97698e6a81541908c63`; source `simp only` landed at `3377252edda6a19f13a2a303ec86f5370be44336`. Rules can infer remaining expression and universe parameters from a matching goal occurrence. Propositional premises can be discharged by existing local proofs or equality reflexivity; unproved premises are never assumed. Failed matches roll back their assignments while retaining consumed work.
+
+```lean
+theorem contract (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by
+  exact h
+
+theorem nested (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f (f x)) = x := by
+  simp only [contract f]
+```
+
+`simp only [h, <- k]` repeatedly tries the explicit rules in deterministic order, searching occurrences inside-out, with fresh parameter instantiation for every application. Every productive equality rewrite creates an ordinary `Eq.rec` transport, or uses conversion when the endpoints are already definitionally equal. `simp only []` can close reflexive equalities using K1 conversion, including literal arithmetic. Unknown rules are errors even when the goal happens to be reflexive. Plain `simp` is not silently treated as an empty default simp set.
+
+A bare safe definition in the list requests selected unfolding. For example, `simp only [twice, h]` unfolds the actual `twice` body at each occurrence's universe arguments, reduces beta/zeta redexes, then applies `h`. A named local let can be unfolded in the same way; local names shadow globals. Definition expansion does not request delta unfolding of unrelated definitions, although ordinary final kernel conversion still applies. Reverse definition unfolding is unsupported and explicitly refused.
+
+```bash
+fln check-source --json examples/native_simplification.lean
+```
+
+That runnable example contains one definition and five theorems: quantified conditional rewriting, repeated nested rewriting, selected unfolding, transport leaving a genuine goal for `exact`, and arithmetic conversion. Installed-command tests check its actual result and late-failure atomicity across multiple files.
+
+Simplification is progress, not unconditional proof completion. A non-reflexive remaining goal must be solved by following tactics. Cyclic rule sets produce `SimplificationCycle`; productive steps are bounded at 256, in addition to the source heartbeat and kernel budgets. This bounded lane has no global simp registry, theorem ranking, automatic orientation, congruence-lemma database, or full Lean simp parity.
+
+The source integration exposed two independent-checker conversion gaps, repaired in the checker rather than bypassing its veto. Reducible applications normalize before argument congruence, so discarded arguments cannot cause a false mismatch. Scoped let values now enter a private reduction overlay during body inference and are removed at scope exit; inferred local types remain the declared types. Original caller contexts are unchanged on success, cancellation, or failure. Kernel/checker implementations remain separate.
+
 ## APIs and limits
 
 `Engine::admit_source_declaration` checks one definition or theorem without execution. `Engine::check_source_files` checks an ordered batch and returns a `SourceFileCheck` only on complete success. Both use the existing K1 plus independent-checker council and immutable publication path.
@@ -47,7 +73,7 @@ theorem transport (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := 
 Current boundaries are explicit:
 
 - `check-source` accepts import-free `def` and `theorem` files. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
-- Rewriting is goal-only and matches exact elaborated occurrences of already instantiated equality rules. Hypothesis locations (`at h`), occurrence controls, automatic instantiation of arbitrary rewrite lemmas, simplification and full Lean `rw` parity remain open.
+- Rewriting and simplification are goal-only. Quantified rules use the native bounded unifier, not general higher-order theorem search. Hypothesis locations (`at h`), occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
 - General typeclass synthesis, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier are not established by this increment.
 
 ## Verification
@@ -55,3 +81,5 @@ Current boundaries are explicit:
 The equality and rewriting production commits were made only after actual source tests, engine council tests, Clippy with warnings denied and workspace all-target compilation passed. Rewriting run `34291847903` retained 382 passing elaborator/parser tests and 109 passing engine-library/equality/rewrite tests. Command run `34292521199` additionally verified the new source-file and installed-command tests before publication.
 
 The final local scoped runs reported 382 elaborator/parser tests, 113 engine-library and focused proof tests, and all 70 CLI package tests passing, with zero failures or ignored tests. Package Clippy and workspace all-target compilation passed. These are scoped observations on the configured `nightly-2026-08-31` compiler, not a full workspace test-suite, Reference-parity, or release-gate claim.
+
+The proof-automation increment is additionally tested with the complete checker package, the complete parser/elaborator packages, the engine library and source equality/rewriting/file/automation targets, and the complete CLI package. Scoped Clippy with warnings denied and all-target workspace compilation are run before publication. The exact patch and command logs are retained by the source-simplification landing run; these checks do not close the full-workspace test, real-Prelude council, general elaboration, or release gates. The larger `fln-kpd` / `franken_lean-jxw` workstreams remain open.
