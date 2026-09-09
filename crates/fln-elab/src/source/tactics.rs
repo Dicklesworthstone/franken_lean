@@ -18,6 +18,7 @@ pub enum TacticError {
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
+    RewriteMetavariablePattern,
     SimplificationNoProgress,
     SimplificationCycle,
 }
@@ -31,6 +32,9 @@ impl std::fmt::Display for TacticError {
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
             Self::ExpectedEquality => write!(f, "rewrite requires an instantiated equality proof"),
             Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
+            Self::RewriteMetavariablePattern => {
+                write!(f, "rewrite pattern has an unresolved metavariable head")
+            }
             Self::SimplificationNoProgress => write!(f, "simp only made no progress"),
             Self::SimplificationCycle => write!(f, "simp only encountered a rewrite cycle"),
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
@@ -143,11 +147,17 @@ impl Context {
         left: &Expr,
         right: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
+        self.proof_types_match_with_budget(left, right, UnificationBudget::new(self.kernel))
+    }
+
+    fn proof_types_match_with_budget(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        budget: UnificationBudget,
+    ) -> Result<bool, NatDefinitionElabError> {
         self.flush(false)?;
-        match self
-            .txn
-            .unify(left, right, UnificationBudget::new(self.kernel))
-        {
+        match self.txn.unify(left, right, budget) {
             Ok(report) => {
                 assert!(report.awakened.is_empty(), "private source queue");
                 Ok(true)

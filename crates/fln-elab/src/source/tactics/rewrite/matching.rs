@@ -173,6 +173,22 @@ impl Context {
             equality_target(&rule.type_).ok_or_else(|| error(TacticError::ExpectedEquality))?;
         let pattern = if reverse { rhs } else { lhs };
         self.charge_rewrite_trial(&template);
+        if !inside_out {
+            let pattern = template.instantiate(&pattern)?;
+            self.charge_rewrite_trial(&template);
+            let mut head = &pattern;
+            loop {
+                self.tick()?;
+                match head.node() {
+                    ExprNode::App { f, .. } => head = f,
+                    ExprNode::MData { expr, .. } => head = expr,
+                    ExprNode::MVar { .. } => {
+                        return Err(error(TacticError::RewriteMetavariablePattern));
+                    }
+                    _ => break,
+                }
+            }
+        }
         let mut pending = vec![(target, false)];
         let mut visited = HashSet::new();
         while let Some((term, exit)) = pending.pop() {

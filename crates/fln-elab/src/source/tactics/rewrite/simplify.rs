@@ -84,7 +84,7 @@ impl Context {
         &mut self,
         goal: &ProofGoal,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let Some(candidate) = self.automatic_reflexivity_candidate(goal)? else {
+        let Some(candidate) = self.automatic_reflexivity_candidate(goal, false)? else {
             return Ok(None);
         };
         let target = self.instantiate(&goal.target)?;

@@ -61,7 +61,7 @@ impl Context {
         &mut self,
         goal: &ProofGoal,
     ) -> Result<bool, NatDefinitionElabError> {
-        let Some(value) = self.automatic_reflexivity_candidate(goal)? else {
+        let Some(value) = self.automatic_reflexivity_candidate(goal, true)? else {
             return Ok(false);
         };
         // Each rewrite created a separate child. Its parent's introduced-binder
@@ -87,17 +87,20 @@ impl Context {
     fn automatic_reflexivity_candidate(
         &mut self,
         goal: &ProofGoal,
+        zeta_delta: bool,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.flush(false)?;
         let transparency = UnificationTransparency::Abbreviations;
-        let target = self.whnf_with_transparency(&goal.target, transparency)?;
+        let target = self.whnf_with_transparency(&goal.target, transparency, zeta_delta)?;
         let Some((level, alpha, left, right)) = equality_target(&target) else {
             return Ok(None);
         };
-        let left = self.whnf_with_transparency(&left, transparency)?;
-        let right = self.whnf_with_transparency(&right, transparency)?;
-        if !self.proof_types_match(&left, &right)?
+        let left = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
+        let right = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.zeta_delta = zeta_delta;
+        if !self.proof_types_match_with_budget(&left, &right, budget)?
             && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?
         {
             return Ok(None);

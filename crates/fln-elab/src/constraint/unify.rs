@@ -46,6 +46,9 @@ pub struct UnificationBudget {
     pub max_assignments: usize,
     pub max_metavar_depth: u32,
     pub transparency: UnificationTransparency,
+    /// Unfold local let declarations. This is independent of global delta
+    /// transparency; automatic `simp` closure leaves these names closed.
+    pub zeta_delta: bool,
     /// A separate, caller-calibrated bound for each assignment's K1 check.
     pub kernel: Budget,
 }
@@ -58,6 +61,7 @@ impl UnificationBudget {
             max_assignments: 256,
             max_metavar_depth: 0,
             transparency: UnificationTransparency::Abbreviations,
+            zeta_delta: true,
             kernel,
         }
     }
@@ -482,7 +486,7 @@ impl Engine<'_> {
                         break;
                     }
                 }
-                ExprNode::FVar { id } => {
+                ExprNode::FVar { id } if self.budget.zeta_delta => {
                     if let Some(value) = locals.find(id).and_then(|local| local.value.as_ref()) {
                         head = value.clone();
                     } else {

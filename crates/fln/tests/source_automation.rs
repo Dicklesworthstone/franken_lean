@@ -24,26 +24,40 @@ fn admit(base: &Engine, source: &str) -> Engine {
 #[test]
 fn rewrite_infers_explicit_parameters_from_the_first_matching_occurrence() {
     let base = engine();
-    let base = admit(&base, "theorem same (x : Nat) : x = x := by rfl");
-    admit(&base, "theorem use (x : Nat) : x = x := by rw [same]");
+    let base = admit(&base, "def identity (x : Nat) : Nat := x");
+    let base = admit(
+        &base,
+        "theorem identity_eq (x : Nat) : identity x = x := by rfl",
+    );
+    admit(
+        &base,
+        "theorem use (x : Nat) : identity x = x := by rw [identity_eq]",
+    );
     let base = admit(
         &base,
         "theorem congruent (f : Nat -> Nat) (x : Nat) : f x = f x := by rfl",
     );
     admit(
         &base,
-        "theorem use (g : Nat -> Nat) (x : Nat) : g x = g x := by rw [congruent]",
+        "theorem use (g : Nat -> Nat) (x : Nat) : g x = g x := by rw [congruent g]",
     );
 }
 
 #[test]
 fn polymorphic_rewrite_infers_type_and_universe_parameters() {
     let base = engine();
-    let base = admit(&base, "theorem same {A : Type} (x : A) : x = x := by rfl");
-    admit(&base, "theorem use (x : Nat) : x = x := by rw [same]");
+    let base = admit(&base, "def identity {A : Type} (x : A) : A := x");
+    let base = admit(
+        &base,
+        "theorem identity_eq {A : Type} (x : A) : identity x = x := by rfl",
+    );
     admit(
         &base,
-        "theorem use {A : Type} (x : A) : x = x := by rw [same]",
+        "theorem use (x : Nat) : identity x = x := by rw [identity_eq]",
+    );
+    admit(
+        &base,
+        "theorem use {A : Type} (x : A) : identity x = x := by rw [identity_eq]",
     );
 }
 
@@ -101,12 +115,44 @@ fn reversed_and_partially_applied_rewrite_rules_infer_remaining_arguments() {
     let base = admit(&base, "def identity {A : Type} (x : A) : A := x");
     let base = admit(
         &base,
-        "theorem identity_eq {A : Type} (x : A) : identity x = x := by rfl",
+        "theorem compose_identity {A : Type} (f : A -> A) (x : A) : identity (f x) = f x := by rfl",
     );
     admit(
         &base,
-        "theorem use (x : Nat) : x = identity x := by rw [<- identity_eq]",
+        "theorem use (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [<- compose_identity f]",
     );
+}
+
+#[test]
+fn rewriting_refuses_unresolved_metavariable_pattern_heads() {
+    let base = admit(&engine(), "def identity {A : Type} (x : A) : A := x");
+    let base = admit(&base, "theorem same (x : Nat) : x = x := by rfl");
+    let base = admit(
+        &base,
+        "theorem congruent (f : Nat -> Nat) (x : Nat) : f x = f x := by rfl",
+    );
+    let base = admit(
+        &base,
+        "theorem identity_eq {A : Type} (x : A) : identity x = x := by rfl",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad (x : Nat) : x = x := by rw [same]",
+        "theorem bad (g : Nat -> Nat) (x : Nat) : g x = g x := by rw [congruent]",
+        "theorem bad (x : Nat) : x = identity x := by rw [<- identity_eq]",
+    ] {
+        let error = base
+            .admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+            .expect_err("an unresolved rewrite pattern must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("rewrite pattern has an unresolved metavariable head"),
+            "{source}: {error}"
+        );
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
 }
 
 #[test]
@@ -203,7 +249,7 @@ fn simp_only_keeps_ordinary_definitions_closed_without_an_explicit_rule() {
             panic!("automatic simplification unfolded an ordinary definition: {source}");
         };
         assert!(
-            error.to_string().contains("simp made no progress"),
+            error.to_string().contains("simp only made no progress"),
             "{error}"
         );
     }
@@ -233,16 +279,52 @@ fn simp_only_arithmetic_resource_stop_remains_inconclusive() {
 }
 
 #[test]
-fn automatic_reflexivity_preserves_beta_and_zeta_reduction() {
+fn automatic_reflexivity_preserves_beta_reduction() {
     let base = engine();
     for source in [
-        "theorem beta (x : Nat) (h : x = 5) : (fun n : Nat => n) 5 = x := by rw [h]",
-        "theorem zeta (x : Nat) (h : x = 5) : (let n : Nat := 5; n) = x := by rw [h]",
-        "theorem beta : (fun n : Nat => n) 5 = 5 := by simp only []",
-        "theorem zeta : (let n : Nat := 5; n) = 5 := by simp only []",
+        "theorem beta (x : Nat) (h : x = 5) : (fun n => n) 5 = x := by rw [h]",
+        "theorem beta : (fun n => n) 5 = 5 := by simp only []",
     ] {
         admit(&base, source);
     }
+}
+
+#[test]
+fn automatic_reflexivity_respects_local_let_unfolding_policy() {
+    let base = admit(
+        &engine(),
+        "theorem step (y x : Nat) (h : y = x) : x = x := by rfl",
+    );
+    let root = base.logical_root(&KVMap::new());
+    admit(
+        &base,
+        "theorem use (x : Nat) : x = x := let y := x; by apply step y; rfl",
+    );
+    for source in [
+        "theorem bad (x : Nat) : x = x := let y := x; by apply step y; simp only []",
+        "theorem bad (f : Nat -> Nat) (x : Nat) : f x = f x := let y := x; by apply step (f y); simp only []",
+    ] {
+        let error = match base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+        {
+            Err(error) => error,
+            Ok(outcome) => panic!(
+                "expected a tactic error for {source}, got {:?}",
+                outcome.into_complete().map(|_| ())
+            ),
+        };
+        assert!(
+            error.to_string().contains("simp only made no progress"),
+            "{error}"
+        );
+    }
+    for source in [
+        "theorem use (x : Nat) : x = x := let y := x; by apply step y; simp only [y]",
+        "theorem use (f : Nat -> Nat) (x : Nat) : f x = f x := let y := x; by apply step (f y); simp only [y]",
+    ] {
+        admit(&base, source);
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
 }
 
 #[test]
@@ -256,7 +338,7 @@ fn automatic_reflexivity_keeps_ordinary_goal_aliases_closed() {
         ),
         (
             "theorem bad (x : Nat) : SelfEq x := by simp only []",
-            "simp made no progress",
+            "simp only made no progress",
         ),
     ] {
         let Err(error) = base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())

@@ -252,13 +252,14 @@ impl Context {
     }
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        self.whnf_with_transparency(expr, UnificationTransparency::SafeDefinitions)
+        self.whnf_with_transparency(expr, UnificationTransparency::SafeDefinitions, true)
     }
 
     fn whnf_with_transparency(
         &mut self,
         expr: &Expr,
         transparency: UnificationTransparency,
+        zeta_delta: bool,
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut head = self.instantiate(expr)?;
         let mut arguments = Vec::new();
@@ -275,7 +276,7 @@ impl Context {
                     let value = arguments.pop().expect("guarded application");
                     head = self.substitute(body, &value)?;
                 }
-                ExprNode::FVar { id } => {
+                ExprNode::FVar { id } if zeta_delta => {
                     let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
                     match value {
                         Some(value) => head = value,
