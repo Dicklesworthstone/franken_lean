@@ -7,6 +7,7 @@
 //! inference with checker-owned right-associated `imax`. Later rule families
 //! are named by [`InferenceDeferred`] instead of being misreported as rejection.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -2253,6 +2254,9 @@ fn dispatch_reference(
 }
 
 struct InferenceEngine<'a> {
+    // The initial context stays borrowed. Only a scoped let needs a private
+    // reduction overlay; push/pop are amortized O(1), not a context clone per binder.
+    reduction: Cow<'a, WhnfContext>,
     input: &'a WireExpr,
     context: &'a InferenceContext,
     mode: InferenceMode,
@@ -2602,6 +2606,12 @@ impl<'a> InferenceEngine<'a> {
                 name: pending.local_name,
             }));
         }
+        self.reduction
+            .to_mut()
+            .push_scoped_binding(FreeBinding::from_shared(
+                pending.local_name.clone(),
+                Arc::clone(&pending.value),
+            ));
         state.binders.push(LetBinder {
             local_name: pending.local_name,
             local_reference: pending.local_reference,
@@ -2773,7 +2783,7 @@ impl<'a> InferenceEngine<'a> {
         match def_eq_with(
             actual,
             declared,
-            self.context.reduction(),
+            self.reduction.as_ref(),
             self.control.budget.defeq,
             &mut *self.cancelled,
         ) {
@@ -2849,7 +2859,7 @@ impl<'a> InferenceEngine<'a> {
         self.control.progress.whnf_queries = self.control.progress.whnf_queries.saturating_add(1);
         match whnf_with(
             type_,
-            self.context.reduction(),
+            self.reduction.as_ref(),
             self.control.budget.whnf,
             &mut *self.cancelled,
         ) {
@@ -3126,7 +3136,12 @@ impl<'a> InferenceEngine<'a> {
     /// silently tolerated state.
     fn remove_let_locals(&mut self, binders: &[LetBinder]) -> Result<(), LeafHalt> {
         for binder in binders.iter().rev() {
-            if self.scoped_locals.remove(&binder.local_name).is_none() {
+            if !self
+                .reduction
+                .to_mut()
+                .pop_scoped_binding(&binder.local_name)
+                || self.scoped_locals.remove(&binder.local_name).is_none()
+            {
                 return Err(LeafHalt::Fault(InferenceFault::MissingScopedLocal {
                     name: binder.local_name.clone(),
                 }));
@@ -3156,7 +3171,7 @@ impl<'a> InferenceEngine<'a> {
         self.control.progress.whnf_queries = self.control.progress.whnf_queries.saturating_add(1);
         let reduced = match whnf_with(
             inferred_type,
-            self.context.reduction(),
+            self.reduction.as_ref(),
             self.control.budget.whnf,
             &mut *self.cancelled,
         ) {
@@ -3651,7 +3666,7 @@ impl<'a> InferenceEngine<'a> {
             )?;
             let function_type = match whnf_with(
                 &instantiated,
-                self.context.reduction(),
+                self.reduction.as_ref(),
                 self.control.budget.whnf,
                 &mut *self.cancelled,
             ) {
@@ -3837,14 +3852,14 @@ impl<'a> InferenceEngine<'a> {
             ConversionMode::Ordinary => def_eq_with(
                 actual,
                 expected,
-                self.context.reduction(),
+                self.reduction.as_ref(),
                 self.control.budget.defeq,
                 &mut *self.cancelled,
             ),
             ConversionMode::EagerReduce => def_eq_eager_with(
                 actual,
                 expected,
-                self.context.reduction(),
+                self.reduction.as_ref(),
                 self.control.budget.defeq,
                 &mut *self.cancelled,
             ),
@@ -4077,6 +4092,7 @@ pub fn infer_with(
 ) -> InferenceOutcome {
     let mut control = Control::new(budget);
     let result = InferenceEngine {
+        reduction: Cow::Borrowed(context.reduction()),
         input: term,
         context,
         mode,

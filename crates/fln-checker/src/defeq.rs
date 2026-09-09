@@ -1249,11 +1249,6 @@ enum PairAction {
     Done,
     Push1((DefEqTerm, DefEqTerm)),
     Push2((DefEqTerm, DefEqTerm), (DefEqTerm, DefEqTerm)),
-    Push3(
-        (DefEqTerm, DefEqTerm),
-        (DefEqTerm, DefEqTerm),
-        (DefEqTerm, DefEqTerm),
-    ),
     NotEqual(DefEqMismatch),
     Normalize(DefEqDeferred),
 }
@@ -1272,19 +1267,34 @@ fn defer_pair(
     })
 }
 
-/// Whether the application spine rooted at `root` is an unreduced beta-redex,
-/// i.e. its head is a lambda. The slow worklist must route such a side through
+/// Whether this application spine exposes a beta/zeta redex or a safe delta
+/// body. Application arguments are not injective through such a head: a
+/// definition may discard or duplicate them before producing its weak head.
+/// The slow worklist must route such a side through
 /// normalization BEFORE congruence decomposition: decomposing first would
 /// expose the lambda HEAD to a head it can never match (a telescope local, a
 /// constant), even though weak-head-normalizing it dissolves the redex and
 /// lets the spines meet. The real pinned `Init.instTransEq_1` body deferred on
 /// exactly that exposure (fln-51y8 item 120).
-fn spine_head_is_lambda(term: &WireExpr, root: ExprId) -> bool {
+fn spine_head_reduces(term: &WireExpr, root: ExprId, context: &WhnfContext) -> bool {
     let mut current = root;
     loop {
         match term.node(current) {
             Some(ExprNode::Apply { function, .. }) => current = *function,
-            Some(ExprNode::Lambda { .. }) => return true,
+            Some(ExprNode::Metadata { expression, .. }) => current = *expression,
+            Some(ExprNode::Lambda { .. } | ExprNode::Let { .. }) => return true,
+            Some(ExprNode::Free { name }) => {
+                return context
+                    .free_bindings()
+                    .iter()
+                    .any(|binding| binding.name() == name);
+            }
+            Some(ExprNode::Constant { name, .. }) => {
+                return context
+                    .constants()
+                    .find(name)
+                    .is_some_and(|entry| entry.delta_body().is_some());
+            }
             _ => return false,
         }
     }
@@ -1332,6 +1342,7 @@ fn compare_pair(
     left: &WireExpr,
     right: &WireExpr,
     generated: &[WireExpr],
+    context: &WhnfContext,
 ) -> Result<PairAction, SlowHalt> {
     let (left_term, left_node) = slow_node(left_reference, left, right, generated)?;
     let (right_term, right_node) = slow_node(right_reference, left, right, generated)?;
@@ -1457,8 +1468,8 @@ fn compare_pair(
                 argument: right_argument,
             },
         ) => {
-            if spine_head_is_lambda(left_term, left_reference.root)
-                || spine_head_is_lambda(right_term, right_reference.root)
+            if spine_head_reduces(left_term, left_reference.root, context)
+                || spine_head_reduces(right_term, right_reference.root, context)
             {
                 return Ok(defer_pair(
                     left_reference,
@@ -1511,32 +1522,11 @@ fn compare_pair(
                 child(right_reference, *right_body)?,
             ),
         )),
-        (
-            ExprNode::Let {
-                type_: left_type,
-                value: left_value,
-                body: left_body,
-                ..
-            },
-            ExprNode::Let {
-                type_: right_type,
-                value: right_value,
-                body: right_body,
-                ..
-            },
-        ) => Ok(PairAction::Push3(
-            (
-                child(left_reference, *left_type)?,
-                child(right_reference, *right_type)?,
-            ),
-            (
-                child(left_reference, *left_value)?,
-                child(right_reference, *right_value)?,
-            ),
-            (
-                child(left_reference, *left_body)?,
-                child(right_reference, *right_body)?,
-            ),
+        (ExprNode::Let { .. }, ExprNode::Let { .. }) => Ok(defer_pair(
+            left_reference,
+            right_reference,
+            left_node,
+            right_node,
         )),
         (
             ExprNode::NatLiteral {
@@ -2544,17 +2534,19 @@ fn run_slow(
             continue;
         }
         control.comparison(cancelled)?;
-        match compare_pair(left_reference, right_reference, left, right, &generated)? {
+        match compare_pair(
+            left_reference,
+            right_reference,
+            left,
+            right,
+            &generated,
+            context,
+        )? {
             PairAction::Done => {}
             PairAction::Push1((next_left, next_right)) => {
                 pending.push((next_left, next_right, offset_context, string_context));
             }
             PairAction::Push2(first, second) => {
-                pending.push((second.0, second.1, offset_context, string_context));
-                pending.push((first.0, first.1, offset_context, string_context));
-            }
-            PairAction::Push3(first, second, third) => {
-                pending.push((third.0, third.1, offset_context, string_context));
                 pending.push((second.0, second.1, offset_context, string_context));
                 pending.push((first.0, first.1, offset_context, string_context));
             }
@@ -2952,13 +2944,41 @@ fn def_eq_scoped_with(
         QuickDefEqOutcome::NotEqual {
             mismatch,
             completed_comparisons,
-        } => DefEqOutcome::NotEqual {
-            mismatch: map_quick_mismatch(mismatch),
-            progress: DefEqProgress {
-                quick_comparisons: completed_comparisons,
-                ..DefEqProgress::default()
-            },
-        },
+        } => {
+            // Quick congruence can discover different literal arguments under
+            // a function that erases them. Only a root atomic mismatch is a
+            // final negative verdict; nested mismatches need actual conversion.
+            if matches!(
+                (left.node(left.root()), right.node(right.root())),
+                (Some(ExprNode::Sort { .. }), Some(ExprNode::Sort { .. }))
+                    | (
+                        Some(ExprNode::NatLiteral { .. }),
+                        Some(ExprNode::NatLiteral { .. })
+                    )
+                    | (
+                        Some(ExprNode::StringLiteral(_)),
+                        Some(ExprNode::StringLiteral(_))
+                    )
+            ) {
+                DefEqOutcome::NotEqual {
+                    mismatch: map_quick_mismatch(mismatch),
+                    progress: DefEqProgress {
+                        quick_comparisons: completed_comparisons,
+                        ..DefEqProgress::default()
+                    },
+                }
+            } else {
+                slow_outcome(run_slow(
+                    left,
+                    right,
+                    context,
+                    budget,
+                    completed_comparisons,
+                    nat_scope,
+                    cancelled,
+                ))
+            }
+        }
         QuickDefEqOutcome::Deferred {
             completed_comparisons,
             ..

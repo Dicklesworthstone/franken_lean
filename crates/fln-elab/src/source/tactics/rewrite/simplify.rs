@@ -3,7 +3,10 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod unfold;
+
 use super::*;
+use unfold::UnfoldResult;
 
 const MAX_SIMPLIFICATION_STEPS: usize = 256;
 
@@ -130,20 +133,33 @@ impl Context {
             for rule in &rules {
                 self.tick()?;
                 let original = self.rewrite_trial();
-                // Each use gets fresh universe arguments, including a second
-                // occurrence of a polymorphic lemma at a different type.
-                let term = self.term(rule.syntax, None)?;
-                let Some((term, occurrence)) =
-                    self.instantiate_rewrite_rule(term, &target, rule.reverse, true)?
-                else {
+                let transition = match self.unfold_simp_term(rule.syntax, rule.reverse, &target)? {
+                    UnfoldResult::Unchanged => None,
+                    UnfoldResult::Changed(next_target) => {
+                        let (child, next_goal) = self.proof_goal(next_target)?;
+                        Some((next_goal, child))
+                    }
+                    UnfoldResult::NotDefinition => {
+                        // Re-elaboration gives each polymorphic use fresh universes.
+                        let term = self.term(rule.syntax, None)?;
+                        match self.instantiate_rewrite_rule(term, &target, rule.reverse, true)? {
+                            Some((term, occurrence)) => Some(self.rewrite_transport(
+                                &goal,
+                                term,
+                                &occurrence,
+                                rule.reverse,
+                            )?),
+                            None => None,
+                        }
+                    }
+                };
+                let Some((next_goal, value)) = transition else {
                     self.restore_simp_trial(original);
                     continue;
                 };
                 if steps >= MAX_SIMPLIFICATION_STEPS {
                     return Err(failure(SourceInferenceError::ResourceLimit));
                 }
-                let (next_goal, value) =
-                    self.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
                 let next_target = self.instantiate(&next_goal.target)?;
                 for previous in &history {
                     self.tick()?;

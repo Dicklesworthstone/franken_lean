@@ -2,11 +2,20 @@
 
 This is the synthesized, agent-facing changelog for **franken_lean**. It records what has actually landed. [`README.md`](README.md) is intentionally written as the finished 1.0 target, while [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) is the current evidence-graded state ledger.
 
-Scope: project inception on **2026-07-21** through the September 3 source-aware and interleaved Lantern tranche rooted at substantive commits [`db4e3058`](https://github.com/Dicklesworthstone/franken_lean/commit/db4e30582303ee90b9f385634be96fe1fe7e9bc5) and [`852ca5af`](https://github.com/Dicklesworthstone/franken_lean/commit/852ca5af296e560f01187edc3a8bb98178a52efd).
+Historical synthesis: project inception on **2026-07-21** through the September 3 source-aware and interleaved Lantern tranche rooted at substantive commits [`db4e3058`](https://github.com/Dicklesworthstone/franken_lean/commit/db4e30582303ee90b9f385634be96fe1fe7e9bc5) and [`852ca5af`](https://github.com/Dicklesworthstone/franken_lean/commit/852ca5af296e560f01187edc3a8bb98178a52efd).
 
 No GitHub Release is implied by this history. Representative commits are navigation aids, not substitutes for the Beads graph, generated contracts, real-artifact receipts, or governed release evidence.
 
 ---
+
+## Native proof automation — 2026-09-08 (America/New_York)
+
+- `175bdcf7`: rewrite lemmas infer remaining explicit/implicit parameters and universes from goal occurrences; proved local side conditions can determine remaining parameters. Failed alternatives do not leak assignments.
+- `3377252e`: source `simp only` repeatedly applies an explicit rule set and constructs actual transport proofs. It distinguishes a solved equality from a remaining goal and stops visibly on cycles or budget exhaustion.
+- Explicit simplification lists can unfold selected safe definitions and local lets, preserving polymorphic arguments and local shadowing. Installed file-checking tests exercise `examples/native_simplification.lean` and multi-file failure atomicity.
+- Independent-checker conversion now reduces applicable beta/delta/zeta heads before rejecting unequal arguments, and sees scoped let values during dependent body inference. No shared primary semantic code or second admission door was introduced.
+
+Scope and verification boundaries: [Native source proofs](docs/NATIVE_SOURCE_PROOFS.md). This addition does not claim default-set simp, general instance synthesis, full Lean compatibility, or a full-workspace release gate.
 
 ## Timeline
 

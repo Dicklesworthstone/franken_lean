@@ -75,7 +75,17 @@ Implemented:
 
 **Verification scope:** Linux x86-64, `nightly-2026-08-31`, rustc `90850177249efe0321573c569aec5d12b257f8d6`, selected from `rust-toolchain.toml`. The existing global preflight still has a conflicting `SUITE.lock` Rust pin (`nightly-2026-07-13`); the functional run does not claim that governed pin-consistency gate passed. The full workspace test suite, full-workspace Clippy, all-workspace formatting, UBS and a new real-Prelude council run are not claimed by this package-level observation.
 
-**Still incomplete:** general source elaboration does not yet route arbitrary Lean holes, implicit arguments, tactics or instance search through this solver. The full upstream approximation ladder, general flex-flex solving, complete universe normalization/solving, polymorphic delta, full recursor/quotient/proof-irrelevance conversion and oracle-trace parity remain open. The next functional integration is expected-type propagation and source/tactic-generated constraints through these live APIs, not more standalone state containers. The independent-checker's recursive indexed-inductive frontier is a separate open task; this solver does not bypass it or constitute kernel admission.
+**Still incomplete:** general source elaboration does not yet route arbitrary Lean holes, implicit arguments, tactics or instance search through this solver. The full upstream approximation ladder, general flex-flex solving, complete universe normalization/solving, polymorphic delta, full recursor/quotient/proof-irrelevance conversion and oracle-trace parity remain open. The bounded source/tactic integration described below now uses these APIs; general upstream elaboration remains incomplete. The independent-checker's recursive indexed-inductive frontier is a separate open task; this solver does not bypass it or constitute kernel admission.
+
+### Native source proof automation
+
+**Status: bounded source inference, theorem checking, quantified rewriting and explicit-set simplification are executable.** The source-generated constraint integration is no longer only a planned consumer of Athanor. Dependent signatures, implicit arguments, source lambdas and the supported tactic forms use the native elaboration path. `fln check-source` admits import-free definition/theorem files through K1 and the independent checker without compiling or executing user programs.
+
+`175bdcf7` adds quantified rewrite-rule instantiation, universe inference, and proof-backed local side-condition discharge; `3377252e` adds repeated proof-producing `simp only`. Selected safe definitions and local lets can also be unfolded from the explicit list. Each equality transformation retains a real proof or uses valid definitional conversion; unresolved goals, unsupported features, cycles and resource stops never become successful theorems.
+
+The integration repairs independent-checker application conversion (normalize reducible heads before decomposing arguments) and scoped let conversion (a private reduction overlay that closes with the lexical scope). The ordinary kernel and independent-checker veto remain in force. [Native source proofs](docs/NATIVE_SOURCE_PROOFS.md) describes current behavior and verification boundaries; `examples/native_simplification.lean` is exercised by the installed command tests.
+
+**Remaining product gaps:** general typeclass synthesis, automatic default simp sets, hypothesis rewriting, full binder-aware congruence, general inductive/source-language coverage, and complete upstream tactic parity. The parent workstreams remain open. Scoped checker/source/engine/CLI tests and Clippy plus workspace compilation are not a full release-gate claim.
 
 ### Lantern / LSP server
 

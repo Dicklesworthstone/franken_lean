@@ -4525,3 +4525,174 @@ fn kr112_a_rule_naming_a_non_constructor_is_refused() {
         "the control must still infer -- otherwise the refusal above proves nothing"
     );
 }
+
+#[test]
+fn scoped_let_values_are_visible_during_dependent_application_conversion() {
+    let a_type = Expr::fvar(FVarId(primary_name("A")));
+    let a = Expr::fvar(FVarId(primary_name("a")));
+    let b = Expr::fvar(FVarId(primary_name("b")));
+    let p_family = Expr::fvar(FVarId(primary_name("P")));
+    let p = Expr::fvar(FVarId(primary_name("p")));
+    let expected = Expr::app(p_family.clone(), a.clone());
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), sort(Level::one())),
+            LocalDeclaration::assumption(checker_name("a"), decoded(&a_type)),
+            LocalDeclaration::assumption(checker_name("b"), decoded(&a_type)),
+            LocalDeclaration::assumption(
+                checker_name("P"),
+                decoded(&Expr::forall_e(
+                    primary_name("t"),
+                    a_type.clone(),
+                    Expr::sort(Level::one()),
+                    BinderInfo::Default,
+                )),
+            ),
+            LocalDeclaration::assumption(checker_name("p"), decoded(&expected)),
+            LocalDeclaration::definition(checker_name("alias"), decoded(&a_type), decoded(&a)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let before = context.clone();
+    let term = |value: Expr| {
+        Expr::let_e(
+            primary_name("y"),
+            a_type.clone(),
+            value,
+            Expr::let_e(
+                primary_name("y"),
+                a_type.clone(),
+                bvar(0),
+                Expr::app(
+                    Expr::lam(
+                        primary_name("q"),
+                        Expr::app(p_family.clone(), bvar(0)),
+                        bvar(0),
+                        BinderInfo::Default,
+                    ),
+                    p.clone(),
+                ),
+                false,
+            ),
+            false,
+        )
+    };
+    for mode in let_modes() {
+        let result = complete(infer(
+            &decoded(&term(a.clone())),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        ));
+        assert!(matches!(
+            def_eq(
+                &result.type_,
+                &decoded(&expected),
+                context.reduction(),
+                DefEqBudget::unlimited()
+            ),
+            DefEqOutcome::Equal(_)
+        ));
+        assert_eq!(
+            context, before,
+            "a scoped let must never mutate the caller's reduction context"
+        );
+        // InferOnly deliberately omits argument validation; only Checking
+        // may reject the mismatched dependent argument.
+        if mode != InferenceMode::InferOnly {
+            assert!(
+                !matches!(
+                    infer(
+                        &decoded(&term(b.clone())),
+                        &context,
+                        mode,
+                        InferenceBudget::unlimited()
+                    ),
+                    InferenceOutcome::Complete(_)
+                ),
+                "the overlay must use the actual let value, not any equally typed local"
+            );
+        }
+        assert_eq!(context, before);
+        let alias = decoded(&Expr::fvar(FVarId(primary_name("alias"))));
+        assert!(
+            matches!(
+                def_eq(
+                    &alias,
+                    &decoded(&a),
+                    context.reduction(),
+                    DefEqBudget::unlimited()
+                ),
+                DefEqOutcome::Equal(_)
+            ),
+            "original local definitions must survive nested scoped reductions"
+        );
+    }
+}
+
+#[test]
+fn scoped_reduction_overlay_is_discarded_on_cancellation_and_resource_stop() {
+    // let A := Prop; (fun (x : A) => x) p, where p : Prop.
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("p"),
+            sort(Level::zero()),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    let before = context.clone();
+    let term = decoded(&Expr::let_e(
+        primary_name("A"),
+        Expr::sort(Level::one()),
+        Expr::sort(Level::zero()),
+        Expr::app(
+            Expr::lam(primary_name("x"), bvar(0), bvar(0), BinderInfo::Default),
+            Expr::fvar(FVarId(primary_name("p"))),
+        ),
+        false,
+    ));
+    let mut polls = 0_usize;
+    complete(infer_with(
+        &term,
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+        || {
+            polls += 1;
+            false
+        },
+    ));
+    for stop_at in [1, polls / 2, polls.saturating_sub(1)] {
+        let mut observed = 0_usize;
+        let result = infer_with(
+            &term,
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+            || {
+                observed += 1;
+                observed >= stop_at
+            },
+        );
+        assert!(
+            !matches!(result, InferenceOutcome::Complete(_)),
+            "cancellation cannot be success"
+        );
+        assert_eq!(context, before);
+    }
+    let mut budget = InferenceBudget::unlimited();
+    budget.max_steps = 1;
+    assert!(matches!(
+        infer(&term, &context, InferenceMode::InferOnly, budget),
+        InferenceOutcome::Inconclusive(_)
+    ));
+    assert_eq!(context, before);
+    complete(infer(
+        &term,
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+}

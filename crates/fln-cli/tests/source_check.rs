@@ -124,3 +124,51 @@ fn unsupported_commands_never_execute_and_end_of_options_preserves_dash_paths() 
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn installed_binary_checks_quantified_simp_and_selected_definition_proofs() {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/native_simplification.lean");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(example)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    for field in [
+        "\"commands\":6",
+        "\"theorems\":5",
+        "\"executed\":false",
+        "\"outcome\":\"complete\"",
+    ] {
+        assert!(text.contains(field), "{text}");
+    }
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn a_late_simp_failure_does_not_emit_partial_success_for_prior_files() {
+    let one =
+        file("theorem contract (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by exact h");
+    let two = file(
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f]",
+    );
+    let args = vec![
+        "check-source".into(),
+        "--json".into(),
+        one.into_os_string(),
+        two.clone().into_os_string(),
+    ];
+    let complete = run(args.clone());
+    assert_eq!(complete.exit_code, 0, "{}", complete.stderr);
+    std::fs::write(two, "theorem bad : 1 = 2 := by simp only []").unwrap();
+    let refused = run(args);
+    assert_ne!(refused.exit_code, 0);
+    assert!(refused.stdout.is_empty());
+    assert!(!refused.stderr.contains("\"outcome\":\"complete\""));
+}
