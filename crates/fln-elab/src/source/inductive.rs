@@ -1,0 +1,102 @@
+//! Source constructor telescopes are elaborated in isolated local contexts.
+//! The provisional family is a local type parameter, never an unchecked global.
+use super::*;
+use crate::inductive::{ConstructorSpec, InductiveError, InductiveSpec, inductive_declaration};
+use crate::records::{Builder, RecordBudget};
+
+pub fn is_inductive(syntax: &Syntax) -> bool {
+    matches!(syntax,Syntax::Node { kind,args,.. } if kind == &parser_kind(&["Command","declaration"])
+        && matches!(args.as_slice(),[_,Syntax::Node { kind,.. }] if kind == &parser_kind(&["Command","inductive"])))
+}
+fn invalid() -> NatDefinitionElabError {
+    failure(SourceInferenceError::Inductive(InductiveError::InvalidTelescope))
+}
+
+pub fn elaborate_inductive(syntax: &Syntax, env: &Environment, kernel: Budget, budget: RecordBudget) -> Result<Declaration,NatDefinitionElabError> {
+    let root=expect_node(syntax,&parser_kind(&["Command","declaration"]),2,"inductive declaration")?;
+    let modifiers=expect_node(&root[0],&parser_kind(&["Command","declModifiers"]),7,"inductive modifiers")?;
+    for part in modifiers { expect_empty_null(part,"absent inductive modifiers")?; }
+    let parts=expect_node(&root[1],&parser_kind(&["Command","inductive"]),7,"inductive command")?;
+    expect_atom(&parts[0],"inductive","inductive keyword")?;
+    let id=expect_node(&parts[1],&parser_kind(&["Command","declId"]),2,"inductive name")?;
+    expect_empty_null(&id[1],"absent explicit universe parameters")?;
+    let Syntax::Ident { val:name,.. }=&id[0] else { return Err(invalid()); };
+    if name.is_anonymous() || env.contains(name) { return Err(invalid()); }
+    let sig=expect_node(&parts[2],&parser_kind(&["Command","optDeclSig"]),2,"inductive signature")?;
+    match expect_null_args(&parts[3],"inductive body keyword")? {
+        []=>{},[Syntax::Atom { val,.. }] if val=="where" || val==":="=>{},_=>return Err(invalid()),
+    }
+    expect_empty_null(&parts[5],"unsupported computed inductive fields")?;
+    let deriving=expect_node(&parts[6],&parser_kind(&["Command","optDeriving"]),1,"inductive deriving")?;
+    expect_empty_null(&deriving[0],"unsupported deriving")?;
+    let ctors=expect_null_args(&parts[4],"constructors")?;
+    if ctors.len()>budget.max_binders { return Err(failure(SourceInferenceError::ResourceLimit)); }
+    let mut context=Context::new(env,kernel);
+    let mut parameters=context.bind_parameters(&sig[0])?;
+    if parameters.iter().any(|p| &p.user_name==name) { return Err(invalid()); }
+    let explicit=if let Some(annotation)=optional_type_syntax(&sig[1])? {
+        let value=context.type_term(annotation)?;
+        let value=context.whnf(&value)?;
+        let ExprNode::Sort { level }=value.node() else { return Err(invalid()); };
+        Some(level.clone())
+    } else { None };
+    let provisional=explicit.clone().unwrap_or_else(Level::one);
+    if !provisional.is_never_zero() || provisional.has_mvar() { return Err(failure(SourceInferenceError::Inductive(InductiveError::UnsupportedSort))); }
+    let mut closer=Builder { remaining:budget.max_nodes };
+    let family_type=closer.close(&parameters,Expr::sort(provisional),false,false).map_err(|e|failure(SourceInferenceError::Inductive(e.into())))?;
+    let self_id=FVarId(context.fresh_name()?);
+    context.txn.lctx.add_param(self_id.clone(),name.clone(),family_type,BinderInfo::Default);
+    let base=context.txn.lctx.clone();
+    let family=parameters.iter().fold(Expr::fvar(self_id.clone()),|f,p|Expr::app(f,Expr::fvar(p.id.clone())));
+    let mut constructors=Vec::new();
+    let mut inferred=Level::one();
+    let mut count=parameters.len();
+    for ctor in ctors {
+        context.tick()?;
+        context.txn.lctx=base.clone();
+        let parts=expect_node(ctor,&parser_kind(&["Command","ctor"]),5,"inductive constructor")?;
+        expect_empty_null(&parts[0],"absent constructor documentation")?;
+        expect_atom(&parts[1],"|","constructor separator")?;
+        let modifiers=expect_node(&parts[2],&parser_kind(&["Command","declModifiers"]),7,"constructor modifiers")?;
+        for part in modifiers { expect_empty_null(part,"absent constructor modifier")?; }
+        let Syntax::Ident { val:ctor_name,.. }=&parts[3] else { return Err(invalid()); };
+        let sig=expect_node(&parts[4],&parser_kind(&["Command","optDeclSig"]),2,"constructor signature")?;
+        let mut fields=context.bind_parameters(&sig[0])?;
+        if let Some(result)=optional_type_syntax(&sig[1])? {
+            let mut result=context.type_term(result)?;
+            loop {
+                context.tick()?;
+                result=context.whnf(&result)?;
+                let ExprNode::ForallE { binder_name,binder_type,body,binder_info }=result.node() else { break; };
+                if count.saturating_add(fields.len())>=budget.max_binders { return Err(failure(SourceInferenceError::ResourceLimit)); }
+                let id=FVarId(context.fresh_name()?);
+                context.txn.lctx.add_param(id.clone(),binder_name.clone(),binder_type.clone(),*binder_info);
+                fields.push(context.txn.lctx.find(&id).expect("new constructor field").clone());
+                result=context.substitute(body,&Expr::fvar(id))?;
+            }
+            // Constructor result annotations are obligations, never hints to
+            // discard. This is the same local family and uniform parameters.
+            let result=context.instantiate(&result)?;
+            let family=context.instantiate(&family)?;
+            context.txn.unify(&result,&family,UnificationBudget::new(kernel))
+                .map_err(|e|failure(SourceInferenceError::Unification(Box::new(e))))?;
+        }
+        count=count.checked_add(fields.len()).and_then(|n|n.checked_add(1)).ok_or_else(||failure(SourceInferenceError::ResourceLimit))?;
+        if count>budget.max_binders { return Err(failure(SourceInferenceError::ResourceLimit)); }
+        for field in &mut fields {
+            let domain=context.instantiate(&field.type_)?;
+            let ty=context.known_type(&domain)?.ok_or_else(invalid)?;
+            let completed=context.finish(Typed { value:domain,type_:ty })?;
+            let universe=context.sort_level(&completed)?;
+            inferred=Level::max(inferred,universe).map_err(|_|invalid())?;
+            // Replace only the provisional family identity. Parameter and field
+            // locals stay available for the candidate builder to close exactly.
+            field.type_=completed.value.abstract_fvar(&self_id,0).map_err(|_|invalid())?
+                .subst_loose(0,&[Expr::const_(name.clone(),vec![])]).map_err(|_|invalid())?;
+        }
+        constructors.push(ConstructorSpec { name:ctor_name.clone(),fields });
+    }
+    for parameter in &mut parameters { parameter.type_=context.instantiate(&parameter.type_)?; }
+    let specification=InductiveSpec { name:name.clone(),level_params:vec![],parameters,constructors,result_level:explicit.unwrap_or(inferred) };
+    inductive_declaration(&specification,budget).map_err(|e|failure(SourceInferenceError::Inductive(e)))
+}
