@@ -2129,6 +2129,27 @@ impl Engine {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             }
         }
+        engine.environment = fln_elab::instances::register_class(
+            &engine.environment,
+            &Name::from_components(["Inhabited"]),
+        )
+        .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+            detail: "source class registration failed",
+        })?;
+        for name in [
+            "instInhabitedNat",
+            "instInhabitedString",
+            "instInhabitedBool",
+        ] {
+            engine.environment = fln_elab::instances::register_instance(
+                &engine.environment,
+                &Name::from_components([name]),
+                1000,
+            )
+            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                detail: "source instance registration failed",
+            })?;
+        }
         Ok(Outcome::Complete(engine))
     }
 
@@ -9649,7 +9670,21 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 32);
+        let expected_constants: usize = fln_elab::seed::source_seed_declarations()
+            .iter()
+            .map(|declaration| match declaration {
+                Declaration::Inductive(block) => {
+                    block.types.len() + block.ctors.len() + block.recursors.len()
+                }
+                Declaration::Mutual(definitions) => definitions.len(),
+                Declaration::Quotient(rows) => rows.len(),
+                Declaration::Axiom(_)
+                | Declaration::Defn(_)
+                | Declaration::Thm(_)
+                | Declaration::Opaque(_) => 1,
+            })
+            .sum();
+        assert_eq!(engine.environment().len(), expected_constants);
         assert!(
             engine
                 .environment()

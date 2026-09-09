@@ -7,12 +7,7 @@ use std::collections::HashSet;
 
 impl Context {
     pub(super) fn rewrite_trial(&self) -> Self {
-        Self {
-            txn: self.txn.clone(),
-            kernel: self.kernel,
-            next: self.next,
-            equations: self.equations.clone(),
-        }
+        self.clone()
     }
 
     /// Retain the cost of unsuccessful alternatives without retaining their

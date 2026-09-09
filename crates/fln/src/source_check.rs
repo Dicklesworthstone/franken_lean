@@ -85,7 +85,10 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
-            SourceInferenceError::ResourceLimit => ("resource", false, 3),
+            SourceInferenceError::ResourceLimit
+            | SourceInferenceError::InstanceRegistry(
+                fln_elab::instances::InstanceRegistryError::Limit,
+            ) => ("resource", false, 3),
             SourceInferenceError::Universe(
                 UniverseInstantiationError::VisitLimit { .. }
                 | UniverseInstantiationError::LevelTooDeep(_),

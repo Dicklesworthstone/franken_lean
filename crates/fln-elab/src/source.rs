@@ -6,6 +6,7 @@
 //! The caller still owns final kernel checking and declaration publication.
 
 mod infer;
+mod instances;
 mod levels;
 mod tactics;
 
@@ -24,6 +25,8 @@ pub enum SourceInferenceError {
     UnresolvedHoles { count: usize },
     UnresolvedUniverses,
     InstanceSynthesisRequired,
+    InvalidInstanceBinder,
+    InstanceRegistry(crate::instances::InstanceRegistryError),
     ResourceLimit,
     Scope,
     Universe(crate::universe::UniverseInstantiationError),
@@ -46,8 +49,13 @@ impl std::fmt::Display for SourceInferenceError {
             Self::UnresolvedUniverses => write!(f, "source elaboration left unresolved universes"),
             Self::InstanceSynthesisRequired => write!(
                 f,
-                "source application requires unsupported instance synthesis"
+                "native instance search could not resolve all instance arguments"
             ),
+            Self::InvalidInstanceBinder => write!(
+                f,
+                "instance binder must end in a registered class with inferable parameters"
+            ),
+            Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::ResourceLimit => write!(f, "source elaboration work limit reached"),
             Self::Scope => write!(
                 f,
@@ -67,11 +75,13 @@ struct Typed {
     type_: Expr,
 }
 
+#[derive(Clone)]
 struct Context {
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
     equations: Vec<(Expr, Expr)>,
+    instance_goals: Vec<MVarId>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -87,6 +97,7 @@ impl Context {
             kernel,
             next: 0,
             equations: Vec::new(),
+            instance_goals: Vec::new(),
         }
     }
 
@@ -419,10 +430,7 @@ impl Context {
                 BinderInfo::Default => false,
                 BinderInfo::Implicit => explicit_follows || expected.is_some(),
                 BinderInfo::StrictImplicit => explicit_follows,
-                BinderInfo::InstImplicit if explicit_follows || expected.is_some() => {
-                    return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
-                }
-                BinderInfo::InstImplicit => false,
+                BinderInfo::InstImplicit => explicit_follows || expected.is_some(),
             };
             if !insert {
                 break;
@@ -434,8 +442,12 @@ impl Context {
                     break;
                 }
             }
-            let argument = self.hole(binder_type.clone())?;
             let body = body.clone();
+            let argument = if *binder_info == BinderInfo::InstImplicit {
+                self.instance_hole(binder_type.clone())?
+            } else {
+                self.hole(binder_type.clone())?
+            };
             term.value = Expr::app(term.value, argument.clone());
             term.type_ = self.substitute(&body, &argument)?;
         }
@@ -451,6 +463,7 @@ impl Context {
         if let Some(expected) = expected {
             self.constrain(&term.type_, expected)?;
         }
+        self.resolve_instances(false)?;
         Ok(term)
     }
 
@@ -703,6 +716,15 @@ impl Context {
                         };
                         let domain = binder_type.clone();
                         let codomain = body.clone();
+                        // Propagate a known result before checking the last
+                        // explicit argument when the codomain does not depend
+                        // on that argument (e.g. Inhabited.mk (fun x => ...)).
+                        if rest.is_empty()
+                            && !codomain.has_loose_bvar(0)
+                            && let Some(expected) = &expected
+                        {
+                            self.constrain(&codomain, expected)?;
+                        }
                         tasks.push(Task::Argument(function, codomain, rest, expected));
                         tasks.push(Task::Visit(first, Some(domain), true));
                     } else {
@@ -748,6 +770,7 @@ impl Context {
                         };
                         let domain = binder_type.clone();
                         let body = body.clone();
+                        let argument = self.finish_term(argument, Some(&domain))?;
                         self.constrain(&argument.type_, &domain)?;
                         function.type_ = self.substitute(&body, &argument.value)?;
                         function.value = Expr::app(function.value, argument.value);
@@ -891,6 +914,7 @@ impl Context {
     }
 
     fn finish(&mut self, term: Typed) -> Result<Typed, NatDefinitionElabError> {
+        self.resolve_instances(true)?;
         self.flush(true)?;
         let value = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
@@ -984,6 +1008,31 @@ pub(super) fn definition(
         let Syntax::Node { kind, .. } = syntax else {
             return Err(failure(SourceInferenceError::Scope));
         };
+        if kind == &parser_kind(&["Term", "instBinder"]) {
+            let parts = expect_node(syntax, kind, 4, "instance binder")?;
+            expect_atom(&parts[0], "[", "instance binder opener")?;
+            expect_atom(&parts[3], "]", "instance binder closer")?;
+            let optional = expect_null_args(&parts[1], "optional instance name")?;
+            let user_name = match optional {
+                [] => context.fresh_name()?,
+                [Syntax::Ident { val, .. }, colon] => {
+                    expect_atom(colon, ":", "instance name colon")?;
+                    val.clone()
+                }
+                _ => return Err(failure(SourceInferenceError::Scope)),
+            };
+            let domain = context.type_term(&parts[2])?;
+            context.validate_instance_binder(&domain)?;
+            let id = FVarId(context.fresh_name()?);
+            context.txn.lctx.add_param(
+                id.clone(),
+                user_name.clone(),
+                domain.clone(),
+                BinderInfo::InstImplicit,
+            );
+            parameters.push((id, user_name, domain, BinderInfo::InstImplicit));
+            continue;
+        }
         let (style, open, close, arity) = if kind == &parser_kind(&["Term", "implicitBinder"]) {
             (BinderInfo::Implicit, "{", "}", 4)
         } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {

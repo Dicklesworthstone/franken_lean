@@ -22,6 +22,7 @@
 //! kernel rejection (FL-INV-07).
 
 pub mod equality;
+pub mod inhabited;
 pub use equality::{eq_seed_declaration, rfl_seed_declaration};
 
 use fln_core::expr::{BinderInfo, Expr};
@@ -566,7 +567,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 27] {
+pub fn source_seed_declarations() -> [Declaration; 33] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
@@ -595,6 +596,12 @@ pub fn source_seed_declarations() -> [Declaration; 27] {
         string_dec_eq_seed_declaration(),
         eq_seed_declaration(),
         rfl_seed_declaration(),
+        inhabited::inhabited_seed_declaration(),
+        inhabited::default_seed_declaration(true),
+        inhabited::default_seed_declaration(false),
+        inhabited::scalar_inhabited_seed_declaration("Nat"),
+        inhabited::scalar_inhabited_seed_declaration("String"),
+        inhabited::scalar_inhabited_seed_declaration("Bool"),
     ]
 }
 

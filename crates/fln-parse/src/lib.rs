@@ -1269,15 +1269,45 @@ fn parse_definition_with_grammar(
     let mut cursor = 2;
     while matches!(
         tokens.get(cursor).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃"))
+        Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃" | "["))
     ) {
         let open = cursor;
         let (kind, closing) = match tokens.get(cursor).map(|token| &token.kind) {
             Some(TokenKind::Symbol(symbol)) if symbol == "{" => ("implicitBinder", "}"),
             Some(TokenKind::Symbol(symbol)) if symbol == "⦃" => ("strictImplicitBinder", "⦄"),
+            Some(TokenKind::Symbol(symbol)) if symbol == "[" => ("instBinder", "]"),
             _ => ("explicitBinder", ")"),
         };
         cursor += 1;
+        if kind == "instBinder" {
+            let names_start = cursor;
+            let named = matches!(
+                tokens.get(cursor).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) && matches!(tokens.get(cursor+1).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==":");
+            let colon = if named { cursor + 1 } else { open };
+            if named {
+                cursor += 2;
+            }
+            let start = cursor;
+            cursor = type_end(&tokens, start, "]");
+            if !matches!(tokens.get(cursor).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s=="]") {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(&view, &tokens, cursor),
+                    expected: NatDefinitionExpectation::ClosingParenthesis,
+                });
+            }
+            parameter_groups.push(ExplicitBinderTokens {
+                open,
+                names: names_start..names_start + usize::from(named),
+                colon,
+                type_range: start..cursor,
+                close: cursor,
+                kind,
+            });
+            cursor += 1;
+            continue;
+        }
         let names_start = cursor;
         while matches!(
             tokens.get(cursor).map(|token| &token.kind),
@@ -1379,6 +1409,23 @@ fn parse_definition_with_grammar(
     );
     let mut parameters = Vec::new();
     for group in parameter_groups {
+        if group.kind == "instBinder" {
+            let names = if group.names.is_empty() {
+                Vec::new()
+            } else {
+                vec![leaves.leaf(group.names.start)?, leaves.leaf(group.colon)?]
+            };
+            parameters.push(Syntax::node(
+                parser_kind(&["Term", "instBinder"]),
+                vec![
+                    leaves.leaf(group.open)?,
+                    null_node(names),
+                    bounded_type(&leaves, &view, &tokens, group.type_range, grammar)?,
+                    leaves.leaf(group.close)?,
+                ],
+            ));
+            continue;
+        }
         let names = group
             .names
             .map(|index| leaves.leaf(index))
