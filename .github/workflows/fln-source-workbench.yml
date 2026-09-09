@@ -23,6 +23,7 @@ jobs:
           git rev-parse 'HEAD^{tree}' > target/source-workbench/tree.txt
           git show -s --format=fuller HEAD > target/source-workbench/commit-metadata.txt
           git ls-tree -r HEAD > target/source-workbench/tracked-files.txt
+          git status --porcelain=v1 > target/source-workbench/checkout-status.txt
           git archive --format=tar.gz HEAD > target/source-workbench/source.tar.gz
           sha256sum target/source-workbench/source.tar.gz > target/source-workbench/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
