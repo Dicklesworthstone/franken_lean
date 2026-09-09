@@ -86,6 +86,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
             SourceInferenceError::ResourceLimit
+            | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
             | SourceInferenceError::InstanceRegistry(
                 fln_elab::instances::InstanceRegistryError::Limit,
             ) => ("resource", false, 3),
@@ -117,7 +118,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
 }
 
 impl Engine {
-    /// Check ordered, import-free files containing native `def` and `theorem`
+    /// Check ordered, import-free native definition, theorem, instance and record
     /// commands. Earlier declarations are available to later commands. Imports,
     /// evaluation and queries are not silently ignored: the parser refuses them.
     /// Limits apply across the batch; each kernel check uses the supplied budget.
@@ -169,7 +170,7 @@ impl Engine {
             }
             for (start, command) in commands {
                 let result = engine
-                    .admit_source_declaration(command, options, limits.admission)
+                    .admit_source_command(command, options, limits.admission)
                     .map_err(|error| SourceCheckError::Command {
                         file,
                         command: count,
@@ -183,7 +184,11 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                theorems += usize::from(matches!(admitted.declaration, Declaration::Thm(_)));
+                theorems += admitted
+                    .admissions
+                    .iter()
+                    .filter(|row| matches!(row.declaration, Declaration::Thm(_)))
+                    .count();
                 engine = admitted.engine;
                 count += 1;
             }
