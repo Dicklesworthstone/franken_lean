@@ -18,6 +18,8 @@ pub enum TacticError {
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
+    SimplificationNoProgress,
+    SimplificationCycle,
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -29,6 +31,8 @@ impl std::fmt::Display for TacticError {
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
             Self::ExpectedEquality => write!(f, "rewrite requires an instantiated equality proof"),
             Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
+            Self::SimplificationNoProgress => write!(f, "simp only made no progress"),
+            Self::SimplificationCycle => write!(f, "simp only encountered a rewrite cycle"),
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
         }
     }
@@ -244,7 +248,9 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "rwSeq"])
+            if kind == &parser_kind(&["Tactic", "simp"]) {
+                self.simplify_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "rwSeq"])
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
             {
                 let close = kind == &parser_kind(&["Tactic", "rwSeq"]);

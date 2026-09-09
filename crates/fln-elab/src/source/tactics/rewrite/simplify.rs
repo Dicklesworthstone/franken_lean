@@ -1,0 +1,176 @@
+//! Explicit-set, proof-producing simplification. There is no ambient simp set.
+//! Rules are tried deterministically and re-instantiated for every application.
+//! An unsuccessful alternative restores its complete elaboration state while
+//! retaining spent work. Every productive step is ordinary Eq.rec transport.
+
+use super::*;
+
+const MAX_SIMPLIFICATION_STEPS: usize = 256;
+
+impl Context {
+    fn simp_rules<'a>(
+        &mut self,
+        args: &'a [Syntax],
+    ) -> Result<Vec<RewriteRule<'a>>, NatDefinitionElabError> {
+        let [keyword, config, discharger, only, arguments, location] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "simp", "simplification keyword")?;
+        expect_empty_null(config, "default simplification configuration")?;
+        expect_empty_null(discharger, "default simplification discharger")?;
+        expect_empty_null(location, "goal-only simplification")?;
+        let [only] = expect_null_args(only, "explicit simp set")? else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(only, "only", "explicit-set simplification")?;
+        let arguments = expect_null_args(arguments, "optional simp rule list")?;
+        if arguments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let [open, rows, close] = arguments else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(open, "[", "simp rule opener")?;
+        expect_atom(close, "]", "simp rule closer")?;
+        let rows = expect_null_args(rows, "simp rules")?;
+        let mut rules = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            self.tick()?;
+            if index % 2 == 1 {
+                expect_atom(row, ",", "simp rule separator")?;
+                continue;
+            }
+            let parts = expect_node(row, &parser_kind(&["Tactic", "simpLemma"]), 3, "simp lemma")?;
+            expect_empty_null(&parts[0], "default post-order simp rule")?;
+            let reverse = match expect_null_args(&parts[1], "simp direction")? {
+                [] => false,
+                [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => true,
+                _ => return Err(error(TacticError::MalformedScript)),
+            };
+            // `term` below runs the normal heap-driven elaborator. The source
+            // parser already forbids nested proof scripts, but a caller can
+            // supply Syntax directly: enforce the same boundary here so this
+            // one level of re-entry can never grow with source-controlled depth.
+            let mut pending = vec![&parts[2]];
+            while let Some(term) = pending.pop() {
+                self.tick()?;
+                if let Syntax::Node { kind, args, .. } = term {
+                    if kind == &parser_kind(&["Term", "byTactic"]) {
+                        return Err(error(TacticError::MalformedScript));
+                    }
+                    pending.extend(args);
+                }
+            }
+            rules.push(RewriteRule {
+                syntax: &parts[2],
+                reverse,
+            });
+        }
+        Ok(rules)
+    }
+
+    fn restore_simp_trial(&mut self, mut original: Self) {
+        original.txn.budget.heartbeats_consumed = self.txn.budget.heartbeats_consumed;
+        *self = original;
+    }
+
+    /// Ask K1, through the checked-assignment API, whether reflexivity really
+    /// closes this target. This covers literal computation as well as beta/delta
+    /// conversion, without turning a failed or exhausted kernel call into a proof.
+    fn simp_reflexivity(
+        &mut self,
+        goal: &ProofGoal,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let target = self.whnf(&goal.target)?;
+        let Some((level, alpha, left, _)) = equality_target(&target) else {
+            return Ok(None);
+        };
+        let mut trial = self.rewrite_trial();
+        let candidate = app(
+            Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
+            [alpha, left],
+        );
+        let hole = trial.hole(target)?;
+        let result = trial
+            .txn
+            .unify(&hole, &candidate, UnificationBudget::new(trial.kernel));
+        self.charge_rewrite_trial(&trial);
+        match result {
+            Ok(report) => {
+                assert!(report.awakened.is_empty(), "private source queue");
+                let candidate = trial.instantiate(&candidate)?;
+                *self = trial;
+                Ok(Some(candidate))
+            }
+            Err(error) => {
+                let error = failure(SourceInferenceError::Unification(Box::new(error)));
+                if Self::rewrite_nonmatch(&error) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub(in crate::source) fn simplify_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        args: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let rules = self.simp_rules(args)?;
+        let mut history = vec![self.instantiate(&goal.target)?];
+        let mut steps = 0;
+        loop {
+            self.tick()?;
+            self.txn.lctx = goal.lctx.clone();
+            let target = self.instantiate(&goal.target)?;
+            let mut advanced = false;
+            for rule in &rules {
+                self.tick()?;
+                let original = self.rewrite_trial();
+                // Each use gets fresh universe arguments, including a second
+                // occurrence of a polymorphic lemma at a different type.
+                let term = self.term(rule.syntax, None)?;
+                let Some((term, occurrence)) =
+                    self.instantiate_rewrite_rule(term, &target, rule.reverse, true)?
+                else {
+                    self.restore_simp_trial(original);
+                    continue;
+                };
+                if steps >= MAX_SIMPLIFICATION_STEPS {
+                    return Err(failure(SourceInferenceError::ResourceLimit));
+                }
+                let (next_goal, value) =
+                    self.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
+                let next_target = self.instantiate(&next_goal.target)?;
+                for previous in &history {
+                    self.tick()?;
+                    if self.rewrite_same(previous, &next_target)? {
+                        return Err(error(TacticError::SimplificationCycle));
+                    }
+                }
+                history.push(next_target);
+                proof.work.push(Work::Close(goal, value));
+                goal = next_goal;
+                steps += 1;
+                advanced = true;
+                break;
+            }
+            if advanced {
+                continue;
+            }
+            if let Some(value) = self.simp_reflexivity(&goal)? {
+                self.close_proof_goal(goal, value)?;
+            } else if steps > 0 {
+                // Simplification can expose a non-reflexive remaining goal.
+                // Later instructions must solve it; progress is not completion.
+                proof.work.push(Work::Goal(goal));
+            } else {
+                return Err(error(TacticError::SimplificationNoProgress));
+            }
+            return Ok(());
+        }
+    }
+}

@@ -1,6 +1,7 @@
 //! Goal rewriting by explicit equality proofs. The result is an Eq.rec term,
 //! never an unchecked change of the goal's type or a new equality axiom.
 mod matching;
+mod simplify;
 
 use super::*;
 use fln_core::level::LevelView;
@@ -106,6 +107,21 @@ impl Context {
         let (rule, occurrence) = self
             .instantiate_rewrite_rule(rule, &original_target, reverse, false)?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
+        let (next_goal, value) = self.rewrite_transport(&goal, rule, &occurrence, reverse)?;
+        proof.work.push(Work::Close(goal, value));
+        proof.work.push(Work::Rewrite(next_goal, remaining, close));
+        Ok(())
+    }
+
+    /// Build one ordinary conversion/equality transport. The caller owns the
+    /// continuation and must close introduced binders only after its child.
+    fn rewrite_transport(
+        &mut self,
+        goal: &ProofGoal,
+        rule: Typed,
+        occurrence: &Expr,
+        reverse: bool,
+    ) -> Result<(ProofGoal, Expr), NatDefinitionElabError> {
         let rule_type = self.whnf(&rule.type_)?;
         let (u, alpha, from, to) =
             equality_target(&rule_type).ok_or_else(|| error(TacticError::ExpectedEquality))?;
@@ -114,7 +130,7 @@ impl Context {
         let to = self.instantiate(&to)?;
         let alpha = self.instantiate(&alpha)?;
         let rule_value = self.instantiate(&rule.value)?;
-        let pattern = &occurrence;
+        let pattern = occurrence;
         let replacement = if reverse { &from } else { &to };
         if pattern.has_expr_mvar() || pattern.has_level_mvar() || pattern.has_loose_bvars() {
             return Err(error(TacticError::ExpectedEquality));
@@ -143,9 +159,7 @@ impl Context {
         let reduced_from = self.whnf(&from)?;
         let reduced_to = self.whnf(&to)?;
         if self.proof_types_match(&reduced_from, &reduced_to)? {
-            proof.work.push(Work::Close(goal, child));
-            proof.work.push(Work::Rewrite(next_goal, remaining, close));
-            return Ok(());
+            return Ok((next_goal, child));
         }
         let eq_domain = app(
             Expr::const_(Name::from_components(["Eq"]), vec![u.clone()]),
@@ -190,9 +204,7 @@ impl Context {
         } else {
             Expr::app(transport, child)
         };
-        proof.work.push(Work::Close(goal, value));
-        proof.work.push(Work::Rewrite(next_goal, remaining, close));
-        Ok(())
+        Ok((next_goal, value))
     }
 
     /// Allocation-memoized replacement of exact elaborated occurrences. The

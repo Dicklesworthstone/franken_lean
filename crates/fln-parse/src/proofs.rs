@@ -133,6 +133,7 @@ fn tactic(
             "rfl",
             "rw",
             "rewrite",
+            "simp",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word]))
@@ -146,6 +147,9 @@ fn tactic(
         info: leaf.info(),
         val: keyword.to_string(),
     }];
+    if keyword == "simp" {
+        return simplify(leaves, view, tokens, range, args.remove(0));
+    }
     if keyword == "rw" || keyword == "rewrite" {
         return rewrite(leaves, view, tokens, range, args.remove(0), keyword == "rw");
     }
@@ -249,4 +253,145 @@ fn rewrite(
         parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
         vec![keyword, null_node(Vec::new()), rules, null_node(Vec::new())],
     ))
+}
+
+/// Explicit-set simplification. Plain `simp` needs an attribute registry and
+/// is refused rather than silently pretending its default simp set is empty.
+fn simplify(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let only = range.start + 1;
+    if !matches!(tokens.get(only).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components(["only"]))
+    {
+        return Err(refusal(view, tokens, only));
+    }
+    let only_leaf = leaves.leaf(only)?;
+    let only = null_node(vec![Syntax::Atom {
+        info: only_leaf.info(),
+        val: "only".to_string(),
+    }]);
+    let open = range.start + 2;
+    let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
+    let arguments = if open == range.end {
+        null_node(Vec::new())
+    } else {
+        if range.end < open + 2 || !is(open, "[") || !is(range.end - 1, "]") {
+            return Err(refusal(view, tokens, open));
+        }
+        let mut rows = Vec::new();
+        let mut start = open + 1;
+        let mut depth = 0_usize;
+        for at in open + 1..range.end {
+            let end = at == range.end - 1;
+            if end || depth == 0 && is(at, ",") {
+                if at == start {
+                    if end && (start == open + 1 || !rows.is_empty()) {
+                        break;
+                    }
+                    return Err(refusal(view, tokens, at));
+                }
+                let reverse = is(start, "←") || is(start, "<-");
+                let direction = if reverse {
+                    null_node(vec![leaves.leaf(start)?])
+                } else {
+                    null_node(Vec::new())
+                };
+                let term = bounded_term(
+                    leaves,
+                    view,
+                    tokens,
+                    start + usize::from(reverse)..at,
+                    DefinitionGrammar::Scalar,
+                )?;
+                rows.push(Syntax::node(
+                    parser_kind(&["Tactic", "simpLemma"]),
+                    vec![null_node(Vec::new()), direction, term],
+                ));
+                if !end {
+                    rows.push(leaves.leaf(at)?);
+                }
+                start = at + 1;
+            } else if is(at, "(") {
+                depth += 1;
+            } else if is(at, ")") {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| refusal(view, tokens, at))?;
+            }
+        }
+        if depth != 0 {
+            return Err(refusal(view, tokens, range.end));
+        }
+        null_node(vec![
+            leaves.leaf(open)?,
+            null_node(rows),
+            leaves.leaf(range.end - 1)?,
+        ])
+    };
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "simp"]),
+        vec![
+            keyword,
+            null_node(Vec::new()),
+            null_node(Vec::new()),
+            only,
+            arguments,
+            null_node(Vec::new()),
+        ],
+    ))
+}
+
+#[cfg(test)]
+mod simp_tests {
+    use super::*;
+
+    #[test]
+    fn simp_only_accepts_empty_ordered_reverse_and_multiline_rule_lists() {
+        for source in [
+            "theorem t (x : Nat) : x = x := by simp only []",
+            "theorem t (x : Nat) : x = x := by simp only",
+            "theorem t (x : Nat) : x = x := by simp only [h, <- k,]",
+            "theorem t (x : Nat) : x = x := by\n  simp only [h,\n    <- k]\n  exact p",
+        ] {
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            let mut pending = vec![&parsed.syntax];
+            let mut found = false;
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = syntax {
+                    if kind == &parser_kind(&["Tactic", "simp"]) {
+                        assert_eq!(args.len(), 6);
+                        assert!(
+                            matches!(&args[3], Syntax::Node { args, .. } if matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "only"))
+                        );
+                        found = true;
+                    }
+                    pending.extend(args);
+                }
+            }
+            assert!(found);
+        }
+    }
+
+    #[test]
+    fn unsupported_simp_features_are_not_silently_ignored() {
+        for tail in [
+            "simp",
+            "simp [h]",
+            "simp only [h] at h",
+            "simp only [*]",
+            "simp only [,h]",
+            "simp only [h,,k]",
+            "simp only [<-]",
+            "simp only [h] garbage",
+            "simp only [by rfl]",
+        ] {
+            let source = format!("theorem t (x : Nat) : x = x := by {tail}");
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+        assert!(parse_definition(b"def simp (only : Nat) := only").is_ok());
+    }
 }

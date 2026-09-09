@@ -6,7 +6,7 @@ use super::*;
 use std::collections::HashSet;
 
 impl Context {
-    fn rewrite_trial(&self) -> Self {
+    pub(super) fn rewrite_trial(&self) -> Self {
         Self {
             txn: self.txn.clone(),
             kernel: self.kernel,
@@ -17,11 +17,11 @@ impl Context {
 
     /// Retain the cost of unsuccessful alternatives without retaining their
     /// semantic state. Every trial begins at the already charged parent budget.
-    fn charge_rewrite_trial(&mut self, trial: &Self) {
+    pub(super) fn charge_rewrite_trial(&mut self, trial: &Self) {
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
     }
 
-    fn rewrite_nonmatch(error: &NatDefinitionElabError) -> bool {
+    pub(super) fn rewrite_nonmatch(error: &NatDefinitionElabError) -> bool {
         let NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) = error
         else {
             return false;
@@ -220,7 +220,16 @@ impl Context {
                 {
                     return Ok(None);
                 }
-                Ok(Some((Typed { value, type_ }, trial.instantiate(term)?)))
+                let occurrence = trial.instantiate(term)?;
+                if inside_out {
+                    let (_, _, from, to) = equality_target(&type_)
+                        .expect("instantiated equality retains its shape");
+                    let replacement = if reverse { from } else { to };
+                    if trial.rewrite_same(&occurrence, &replacement)? {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some((Typed { value, type_ }, occurrence)))
             })();
             self.charge_rewrite_trial(&trial);
             match attempt {

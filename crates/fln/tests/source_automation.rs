@@ -150,3 +150,97 @@ fn failed_matches_do_not_leak_instantiations_to_later_candidates() {
     );
     assert_eq!(base.logical_root(&KVMap::new()), root);
 }
+
+#[test]
+fn simp_only_repeats_inside_out_until_nested_occurrences_are_gone() {
+    admit(
+        &engine(),
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f (f x)) = x := by simp only [h]",
+    );
+}
+
+#[test]
+fn simp_only_instantiates_quantified_conditional_rules_repeatedly() {
+    let base = admit(
+        &engine(),
+        "theorem contract (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by exact h",
+    );
+    admit(
+        &base,
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f]",
+    );
+}
+
+#[test]
+fn simp_only_empty_set_uses_kernel_conversion_and_never_proves_false() {
+    let base = engine();
+    admit(&base, "theorem arithmetic : 2 + 3 = 5 := by simp only []");
+    admit(&base, "theorem reflexive (x : Nat) : x = x := by simp only");
+    assert!(
+        base.admit_source_declaration(
+            b"theorem falsehood : 1 = 2 := by simp only []",
+            &KVMap::new(),
+            limits()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn simp_only_preserves_introduced_context_and_leaves_real_remaining_goals() {
+    let base = engine();
+    admit(
+        &base,
+        "theorem use (x y : Nat) : (x = y) -> (y = x) := by intro h; simp only [h]",
+    );
+    admit(
+        &base,
+        "theorem use (P : Nat -> Prop) (x y : Nat) (h : x = y) (hy : P y) : P x := by simp only [h]; exact hy",
+    );
+}
+
+#[test]
+fn simp_only_skips_unused_rules_but_not_unknown_rules_or_missing_proofs() {
+    let base = engine();
+    admit(
+        &base,
+        "theorem use (x y z : Nat) (unused : y = z) (h : x = z) : x = z := by simp only [unused, h]",
+    );
+    for source in [
+        "theorem bad (P : Prop) (x y : Nat) (h : P -> x = y) : x = y := by simp only [h]",
+        "theorem bad (x : Nat) : x = x := by simp only [missing]",
+        "theorem bad (x : Nat) : x = x := by simp",
+    ] {
+        assert!(
+            base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn simp_only_skips_reflexive_rules_and_refuses_nonterminating_rule_sets() {
+    let base = engine();
+    admit(
+        &base,
+        "theorem use (x : Nat) (h : x = x) : x = x := by simp only [h]",
+    );
+    let root = base.logical_root(&KVMap::new());
+    let error = base.admit_source_declaration(b"theorem cycle (P : Nat -> Prop) (x y : Nat) (h : x = y) (k : y = x) : P x := by simp only [h, k]", &KVMap::new(), limits()).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("SimplificationCycle"),
+        "{error:?}"
+    );
+    assert_eq!(root, base.logical_root(&KVMap::new()));
+}
+
+#[test]
+fn simp_only_reverses_rules_and_is_repeatable() {
+    let base = engine();
+    let source =
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : x = f x) : f (f x) = x := by simp only [<- h]";
+    let a = admit(&base, source);
+    let b = admit(&base, source);
+    assert_eq!(a.logical_root(&KVMap::new()), b.logical_root(&KVMap::new()));
+}
