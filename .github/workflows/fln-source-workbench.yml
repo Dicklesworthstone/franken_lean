@@ -15,7 +15,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Export current implementation inputs
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p target/source-workbench
           git archive --format=tar.gz HEAD > target/source-workbench/source.tar.gz
           git rev-parse HEAD > target/source-workbench/commit.txt
