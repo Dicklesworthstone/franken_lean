@@ -486,3 +486,97 @@ fn loose_bound_variables_are_not_interpreted_as_locals() {
         Err(UnificationError::LooseBoundVariable)
     ));
 }
+
+#[test]
+fn elementary_universe_identities_are_solved_without_assigning_parameters() {
+    let a = Level::param(name("a"));
+    let b = Level::param(name("b")).succ().unwrap();
+    let pairs = [
+        (Level::max(Level::zero(), a.clone()).unwrap(), a.clone()),
+        (Level::max(a.clone(), Level::zero()).unwrap(), a.clone()),
+        (Level::max(a.clone(), a.clone()).unwrap(), a.clone()),
+        (
+            Level::imax(a.clone(), Level::zero()).unwrap(),
+            Level::zero(),
+        ),
+        (Level::imax(Level::zero(), a.clone()).unwrap(), a.clone()),
+        (Level::imax(a.clone(), a.clone()).unwrap(), a.clone()),
+        (
+            Level::imax(a.clone(), b.clone()).unwrap(),
+            Level::max(a, b).unwrap(),
+        ),
+    ];
+    for (left, right) in pairs {
+        let mut txn = transaction();
+        let report = txn
+            .unify(&Expr::sort(left), &Expr::sort(right), budget())
+            .unwrap();
+        assert!(report.universe_assignments.is_empty());
+        assert!(txn.universes.is_empty());
+    }
+}
+
+#[test]
+fn function_universes_propagate_into_a_later_type_assignment() {
+    let mut txn = transaction();
+    let u = LMVarId(name("function_universe"));
+    let function = pi(nat(), nat());
+    let ty = natural(
+        &mut txn,
+        "function_type",
+        Expr::sort(Level::mvar(u.clone())),
+    );
+    let report = txn
+        .unify_many_with(
+            &[
+                (
+                    Expr::sort(Level::mvar(u.clone())),
+                    Expr::sort(Level::imax(Level::one(), Level::one()).unwrap()),
+                ),
+                (Expr::mvar(ty.clone()), function.clone()),
+            ],
+            budget(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(
+        txn.universes.instantiate(&Level::mvar(u)).unwrap(),
+        Level::one()
+    );
+    assert_eq!(txn.instantiate_expr(&Expr::mvar(ty)).unwrap(), function);
+}
+
+#[test]
+fn symbolic_imax_is_not_replaced_by_max_without_a_positive_right_side() {
+    let mut txn = transaction();
+    let a = Level::param(name("a"));
+    let b = Level::param(name("b"));
+    let before = txn.clone();
+    assert!(matches!(
+        txn.unify(
+            &Expr::sort(Level::imax(a.clone(), b.clone()).unwrap()),
+            &Expr::sort(Level::max(a, b).unwrap()),
+            budget()
+        ),
+        Err(UnificationError::Deferred(_))
+    ));
+    assert_semantics_unchanged(&txn, &before);
+}
+
+#[test]
+fn universe_simplification_stays_inside_the_unifier_work_budget() {
+    let mut txn = transaction();
+    let before = txn.clone();
+    let mut limits = budget();
+    limits.max_steps = 1;
+    assert!(matches!(
+        txn.unify(
+            &Expr::sort(Level::imax(Level::one(), Level::one()).unwrap()),
+            &Expr::sort(Level::one()),
+            limits
+        ),
+        Err(UnificationError::StepLimit { .. })
+    ));
+    assert_semantics_unchanged(&txn, &before);
+}

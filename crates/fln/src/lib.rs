@@ -2877,8 +2877,34 @@ impl Engine {
         )
         .map_err(DefinitionFrontendError::Elaborate)
         .map_err(EngineExecutionError::Frontend)?;
-        self.admit_declaration(declaration, options, limits)
-            .map_err(EngineExecutionError::from)
+        let registration = fln_elab::source::instance_registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let result = self
+            .admit_declaration(declaration, options, limits)
+            .map_err(EngineExecutionError::from)?;
+        Ok(match result {
+            Outcome::Complete(mut admitted) => {
+                if let Some((name, priority)) = registration {
+                    admitted.engine.environment = fln_elab::instances::register_instance(
+                        admitted.engine.environment(),
+                        &name,
+                        priority,
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ))
+                    })?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                Outcome::Complete(admitted)
+            }
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        })
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
@@ -3600,6 +3626,19 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        if fln_elab::source::instance_registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .is_some()
+        {
+            return Err(EngineExecutionError::Frontend(
+                DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "an executable definition; use check-source for instance declarations",
+                    },
+                ),
+            ));
+        }
         let declaration = fln_elab::elaborate_definition_in_with_budget(
             parsed.syntax(),
             self.environment(),

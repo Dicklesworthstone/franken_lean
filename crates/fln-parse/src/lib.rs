@@ -476,7 +476,7 @@ fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "def", "let", "(", ")", ":", ":=", ";", "=", "==", "|||", "^^^", "&&&", "+", "-", "++",
         "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop", "_", "{", "}", "⦃", "⦄", "->",
-        "→", "fun", "λ", "=>", "↦", "theorem", "by", "[", "]", ",", "←", "<-",
+        "→", "fun", "λ", "=>", "↦", "theorem", "instance", "by", "[", "]", ",", "←", "<-",
     ])
 }
 
@@ -484,8 +484,8 @@ fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
         "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "=", "==", "|||",
         "^^^", "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^", "<=", "<", "Type", "Prop",
-        "_", "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦", "theorem", "by", "[", "]", ",",
-        "←", "<-",
+        "_", "{", "}", "⦃", "⦄", "->", "→", "fun", "λ", "=>", "↦", "theorem", "instance", "by",
+        "[", "]", ",", "←", "<-",
     ])
 }
 
@@ -1248,25 +1248,50 @@ fn parse_definition_with_grammar(
 
     if !matches!(
         tokens.first().map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && symbol == "theorem")
+        Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "instance"))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, 0),
             expected: NatDefinitionExpectation::DefinitionKeyword,
         });
     }
+    let is_theorem = matches!(&tokens[0].kind, TokenKind::Symbol(symbol) if symbol == "theorem");
+    let is_instance = matches!(&tokens[0].kind, TokenKind::Symbol(symbol) if symbol == "instance");
+    let mut cursor = 1;
+    let priority_range = if is_instance
+        && matches!(tokens.get(cursor).map(|t|&t.kind), Some(TokenKind::Symbol(s)) if s=="(")
+    {
+        let start = cursor;
+        if !matches!(tokens.get(start+1).map(|t|&t.kind),Some(TokenKind::Ident(n)) if n==&Name::from_components(["priority"]))
+            || !matches!(tokens.get(start+2).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==":=")
+            || !matches!(
+                tokens.get(start + 3).map(|t| &t.kind),
+                Some(TokenKind::Literal(LiteralKind::Nat))
+            )
+            || !matches!(tokens.get(start+4).map(|t|&t.kind),Some(TokenKind::Symbol(s)) if s==")")
+        {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, start),
+                expected: NatDefinitionExpectation::DeclarationIdentifier,
+            });
+        }
+        cursor += 5;
+        Some(start..cursor)
+    } else {
+        None
+    };
+    let name_index = cursor;
     if !matches!(
-        tokens.get(1).map(|token| &token.kind),
+        tokens.get(cursor).map(|t| &t.kind),
         Some(TokenKind::Ident(_))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(&view, &tokens, 1),
+            at: original_position(&view, &tokens, cursor),
             expected: NatDefinitionExpectation::DeclarationIdentifier,
         });
     }
-    let is_theorem = matches!(&tokens[0].kind, TokenKind::Symbol(symbol) if symbol == "theorem");
+    cursor += 1;
     let mut parameter_groups = Vec::new();
-    let mut cursor = 2;
     while matches!(
         tokens.get(cursor).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == "(" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "{" | "⦃" | "["))
@@ -1367,7 +1392,7 @@ fn parse_definition_with_grammar(
     } else {
         None
     };
-    if is_theorem && explicit_result_type.is_none() {
+    if (is_theorem || is_instance) && explicit_result_type.is_none() {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, cursor),
             expected: NatDefinitionExpectation::TheoremType,
@@ -1388,7 +1413,7 @@ fn parse_definition_with_grammar(
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
-    let declaration_name = leaves.leaf(1)?;
+    let declaration_name = leaves.leaf(name_index)?;
     let assignment = leaves.leaf(assignment_index)?;
 
     let modifiers = Syntax::node(
@@ -1455,7 +1480,7 @@ fn parse_definition_with_grammar(
     } else {
         null_node(Vec::new())
     };
-    let result_type = if is_theorem {
+    let result_type = if is_theorem || is_instance {
         let Syntax::Node { args, .. } = &result_type else {
             unreachable!("optional type container");
         };
@@ -1464,7 +1489,14 @@ fn parse_definition_with_grammar(
         result_type
     };
     let optional_signature = Syntax::node(
-        parser_kind(&["Command", if is_theorem { "declSig" } else { "optDeclSig" }]),
+        parser_kind(&[
+            "Command",
+            if is_theorem || is_instance {
+                "declSig"
+            } else {
+                "optDeclSig"
+            },
+        ]),
         vec![null_node(parameters), result_type],
     );
     let value = bounded_value_syntax(&leaves, &view, &tokens, let_bindings, body_start, grammar)?;
@@ -1476,19 +1508,60 @@ fn parse_definition_with_grammar(
         parser_kind(&["Command", "declValSimple"]),
         vec![assignment, value, termination, null_node(Vec::new())],
     );
-    let mut definition_parts = vec![
-        definition_keyword,
-        declaration_id,
-        optional_signature,
-        declaration_value,
-    ];
-    if !is_theorem {
-        definition_parts.push(null_node(Vec::new()));
-    }
-    let definition = Syntax::node(
-        parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
-        definition_parts,
-    );
+    let definition = if is_instance {
+        let priority = match priority_range {
+            None => null_node(Vec::new()),
+            Some(range) => {
+                let start = range.start;
+                let keyword = leaves.leaf(start + 1)?;
+                let priority = Syntax::node(
+                    parser_kind(&["Command", "namedPrio"]),
+                    vec![
+                        leaves.leaf(start)?,
+                        Syntax::Atom {
+                            info: keyword.info(),
+                            val: "priority".into(),
+                        },
+                        leaves.leaf(start + 2)?,
+                        Syntax::node(
+                            Name::from_components(["num"]),
+                            vec![leaves.leaf(start + 3)?],
+                        ),
+                        leaves.leaf(start + 4)?,
+                    ],
+                );
+                null_node(vec![priority])
+            }
+        };
+        Syntax::node(
+            parser_kind(&["Command", "instance"]),
+            vec![
+                Syntax::node(
+                    parser_kind(&["Term", "attrKind"]),
+                    vec![null_node(Vec::new())],
+                ),
+                definition_keyword,
+                priority,
+                null_node(vec![declaration_id]),
+                optional_signature,
+                declaration_value,
+            ],
+        )
+    } else {
+        let mut parts = vec![
+            definition_keyword,
+            declaration_id,
+            optional_signature,
+            declaration_value,
+        ];
+        if !is_theorem {
+            parts.push(null_node(Vec::new()));
+        }
+        Syntax::node(
+            parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
+            parts,
+        )
+    };
     let syntax = Syntax::node(
         parser_kind(&["Command", "declaration"]),
         vec![modifiers, definition],
@@ -1543,6 +1616,7 @@ pub fn partition_definition_commands(
                 extent,
             }) if symbol == "def"
                 || symbol == "theorem"
+                || symbol == "instance"
                 || symbol == "#eval"
                 || symbol == "#check" =>
             {

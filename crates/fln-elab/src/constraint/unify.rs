@@ -28,7 +28,7 @@ use fln_env::constants::{
 };
 use fln_kernel::verdict::{Budget, Verdict};
 use fln_kernel::{Declaration, check};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Native delta policy. Opaque declarations, unsafe definitions and partial
 /// definitions never unfold. Polymorphic delta is outside this bounded lane.
@@ -255,6 +255,59 @@ fn facts(expr: &Expr, meter: &mut Meter<'_>) -> Result<Facts, UnificationError> 
         }
     }
     Ok(result)
+}
+
+/// Simplify the elementary max/imax identities on a metered postorder DAG.
+/// This is not the complete universe solver; it makes explicit function sorts
+/// compare with their equivalent scalar sorts without guessing an assignment.
+fn simplify_level(level: &Level, meter: &mut Meter<'_>) -> Result<Level, UnificationError> {
+    let mut done = HashMap::<*const Level, Level>::new();
+    let mut pending = vec![(level, false)];
+    while let Some((current, exit)) = pending.pop() {
+        let key = std::ptr::from_ref(current);
+        if done.contains_key(&key) {
+            continue;
+        }
+        if !exit {
+            meter.node()?;
+            pending.push((current, true));
+            match current.view() {
+                LevelView::Succ(inner) => pending.push((inner, false)),
+                LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                    pending.push((b, false));
+                    pending.push((a, false));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let child = |x: &Level| {
+            done.get(&std::ptr::from_ref(x))
+                .expect("level postorder")
+                .clone()
+        };
+        let result = match current.view() {
+            LevelView::Succ(inner) => child(inner).succ(),
+            LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                let a = child(a);
+                let b = child(b);
+                let imax = matches!(current.view(), LevelView::IMax(..));
+                if a.is_zero() || a == b || (imax && b.is_zero()) {
+                    Ok(b)
+                } else if b.is_zero() {
+                    Ok(a)
+                } else if !imax || matches!(b.view(), LevelView::Succ(_)) {
+                    Level::max(a, b)
+                } else {
+                    Level::imax(a, b)
+                }
+            }
+            _ => Ok(current.clone()),
+        }
+        .map_err(|e| UnificationError::Universe(e.into()))?;
+        done.insert(key, result);
+    }
+    Ok(done.remove(&std::ptr::from_ref(level)).expect("level root"))
 }
 
 fn same_levels(
@@ -641,6 +694,8 @@ impl Engine<'_> {
                 .universes
                 .instantiate_with_limit(&right, remaining)
                 .map_err(UnificationError::Universe)?;
+            let left = simplify_level(&left, &mut self.meter)?;
+            let right = simplify_level(&right, &mut self.meter)?;
             self.scan(&Expr::sort(left.clone()))?;
             self.scan(&Expr::sort(right.clone()))?;
             if same_levels(&left, &right, &mut self.meter)? {

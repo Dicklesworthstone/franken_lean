@@ -6,6 +6,7 @@
 //! The caller still owns final kernel checking and declaration publication.
 
 mod infer;
+mod instance_command;
 mod instances;
 mod levels;
 mod tactics;
@@ -971,19 +972,32 @@ pub(super) fn definition(
     for modifier in modifiers {
         expect_empty_null(modifier, "empty declaration modifier")?;
     }
-    let is_theorem = matches!(&declaration[1], Syntax::Node { kind, .. }
-        if kind == &parser_kind(&["Command", "theorem"]));
-    let definition = expect_node(
-        &declaration[1],
-        &parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
-        if is_theorem { 4 } else { 5 },
-        "named declaration",
-    )?;
-    expect_atom(
-        &definition[0],
-        if is_theorem { "theorem" } else { "def" },
-        "declaration keyword",
-    )?;
+    let is_instance = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","instance"]));
+    let is_theorem = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","theorem"]));
+    let instance_parts;
+    let definition = if is_instance {
+        let parts = instance_command::parts(&declaration[1])?;
+        instance_parts = [
+            parts.keyword.clone(),
+            parts.id.clone(),
+            parts.signature.clone(),
+            parts.value.clone(),
+        ];
+        &instance_parts[..]
+    } else {
+        let parts = expect_node(
+            &declaration[1],
+            &parser_kind(&["Command", if is_theorem { "theorem" } else { "definition" }]),
+            if is_theorem { 4 } else { 5 },
+            "named declaration",
+        )?;
+        expect_atom(
+            &parts[0],
+            if is_theorem { "theorem" } else { "def" },
+            "declaration keyword",
+        )?;
+        parts
+    };
     let id = expect_node(
         &definition[1],
         &parser_kind(&["Command", "declId"]),
@@ -999,7 +1013,14 @@ pub(super) fn definition(
     expect_empty_null(&id[1], "absent declaration pre-parser")?;
     let signature = expect_node(
         &definition[2],
-        &parser_kind(&["Command", if is_theorem { "declSig" } else { "optDeclSig" }]),
+        &parser_kind(&[
+            "Command",
+            if is_theorem || is_instance {
+                "declSig"
+            } else {
+                "optDeclSig"
+            },
+        ]),
         2,
         "declaration signature",
     )?;
@@ -1070,7 +1091,7 @@ pub(super) fn definition(
             parameters.push((id, name.clone(), domain.clone(), style));
         }
     }
-    let expected = if is_theorem {
+    let expected = if is_theorem || is_instance {
         let parts = expect_node(
             &signature[1],
             &parser_kind(&["Term", "typeSpec"]),
@@ -1101,8 +1122,15 @@ pub(super) fn definition(
         expect_empty_null(part, "absent termination clause")?;
     }
     expect_empty_null(&parts[3], "absent where clause")?;
-    if !is_theorem {
+    if !is_theorem && !is_instance {
         expect_empty_null(&definition[4], "absent definition clauses")?;
+    }
+    if is_instance {
+        context.validate_instance_binder(
+            expected
+                .as_ref()
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
+        )?;
     }
     let mut term = context.term(&parts[1], expected.clone())?;
     if let Some(expected) = expected {
@@ -1199,4 +1227,12 @@ pub(super) fn query(
         safety: DefinitionSafety::Safe,
         all: vec![name],
     }))
+}
+
+/// Registration requested by a canonical named source instance. The caller must
+/// still obtain ordinary declaration admission before installing this metadata.
+pub fn instance_registration(
+    syntax: &Syntax,
+) -> Result<Option<(Name, u32)>, NatDefinitionElabError> {
+    instance_command::registration(syntax)
 }
