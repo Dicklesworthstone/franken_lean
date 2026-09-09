@@ -206,3 +206,26 @@ fn unknown_fields_do_not_resolve_as_arbitrary_namespace_methods() {
         assert_eq!(e.environment().logical_root(&KVMap::new()), root);
     }
 }
+
+#[test]
+fn expression_ascriptions_cannot_disappear_before_kernel_checking() {
+    let e = engine();
+    for text in [
+        "def bad : Nat := (1 : String)",
+        "def bad : Nat := let x := (1 : String); 0",
+        "def ignored (x : String) : Nat := 0\ndef bad : Nat := ignored (1 : String)",
+        "def bad : Nat := ((fun x => x) : String -> String) 1",
+    ] {
+        let result = e.check_source_files(
+            &[text.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        let refusal = result.expect_err("a false source ascription must reach rejection");
+        assert_eq!(
+            refusal.disposition(),
+            ("kernel-rejection", true, 1),
+            "{text}: {refusal:?}"
+        );
+    }
+}

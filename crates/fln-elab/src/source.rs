@@ -530,6 +530,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
             Ascription(&'a Syntax, Option<Expr>),
+            AscribedValue(Expr),
             Projection(Name, Option<Expr>, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordNext(record_terms::RecordBuild<'a>),
@@ -732,7 +733,24 @@ impl Context {
                     if let Some(expected) = expected {
                         self.constrain(&type_.value, &expected)?;
                     }
+                    tasks.push(Task::AscribedValue(type_.value.clone()));
                     tasks.push(Task::Visit(syntax, Some(type_.value), true));
+                }
+                Task::AscribedValue(annotation) => {
+                    let term = values.pop().expect("ascribed term follows its annotation");
+                    // Expected types guide inference but closed constraints are
+                    // left to K1. Retain this assertion in the checked term,
+                    // including when the surrounding program ignores its value.
+                    values.push(Typed {
+                        value: Expr::let_e(
+                            Name::anonymous(),
+                            annotation.clone(),
+                            term.value,
+                            Expr::bvar(0).expect("fixed ascription identity binder"),
+                            false,
+                        ),
+                        type_: annotation,
+                    });
                 }
                 Task::RecordType(parts, expected) => {
                     let type_ = values.pop().expect("record type visit");
