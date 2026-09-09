@@ -38,17 +38,25 @@ fn error(reason: RecordTermError) -> NatDefinitionElabError {
 pub(super) struct RecordParts<'a> {
     fields: Vec<(Name, &'a Syntax)>,
     pub(super) annotation: Option<&'a Syntax>,
+    pub(super) sources: Vec<&'a Syntax>,
 }
 pub(super) struct RecordBuild<'a> {
     fields: HashMap<Name, &'a Syntax>,
     constructor: Typed,
     remaining: u32,
     expected: Expr,
+    sources: Vec<Typed>,
+    source_bindings: Vec<LocalDecl>,
+    saved_lctx: LocalContext,
 }
 pub(super) enum RecordStep<'a> {
     Field {
         syntax: &'a Syntax,
         domain: Expr,
+        codomain: Expr,
+    },
+    Copy {
+        value: Typed,
         codomain: Expr,
     },
     Complete(Typed),
@@ -237,7 +245,26 @@ impl Context {
         )?;
         expect_atom(&parts[0], "{", "record opener")?;
         expect_atom(&parts[5], "}", "record closer")?;
-        expect_empty_null(&parts[1], "unsupported record update sources")?;
+        let mut sources = Vec::new();
+        match expect_null_args(&parts[1], "record update sources")? {
+            [] => {}
+            [items, keyword] => {
+                expect_atom(keyword, "with", "record update keyword")?;
+                let rows = expect_null_args(items, "record update source list")?;
+                if rows.is_empty() || rows.len() % 2 == 0 {
+                    return Err(failure(SourceInferenceError::Scope));
+                }
+                for (index, term) in rows.iter().enumerate() {
+                    self.tick()?;
+                    if index % 2 == 0 {
+                        sources.push(term);
+                    } else {
+                        expect_atom(term, ",", "record source separator")?;
+                    }
+                }
+            }
+            _ => return Err(failure(SourceInferenceError::Scope)),
+        }
         let ellipsis = expect_node(
             &parts[3],
             &parser_kind(&["Term", "optEllipsis"]),
@@ -308,16 +335,23 @@ impl Context {
             };
             fields.push((name.clone(), value));
         }
-        Ok(RecordParts { fields, annotation })
+        Ok(RecordParts {
+            fields,
+            annotation,
+            sources,
+        })
     }
 
     pub(super) fn start_record<'a>(
         &mut self,
         parts: RecordParts<'a>,
         expected: Option<Expr>,
+        sources: Vec<Typed>,
     ) -> Result<RecordBuild<'a>, NatDefinitionElabError> {
         self.flush(false)?;
-        let expected = expected.ok_or_else(|| error(RecordTermError::ExpectedRecordType))?;
+        let expected = expected
+            .or_else(|| sources.first().map(|source| source.type_.clone()))
+            .ok_or_else(|| error(RecordTermError::ExpectedRecordType))?;
         let target = self.whnf(&expected)?;
         let mut head = &target;
         let mut arguments = Vec::new();
@@ -383,11 +417,60 @@ impl Context {
                 return Err(error(RecordTermError::UnknownField(label.clone())));
             }
         }
+        // Bind update sources exactly once. Even an unused source remains a
+        // checked let value, so an ill-typed update source cannot disappear.
+        let saved_lctx = self.txn.lctx.clone();
+        let mut source_bindings = Vec::new();
+        let mut bound_sources = Vec::new();
+        for source in sources {
+            self.tick()?;
+            let type_ = self.whnf(&source.type_)?;
+            let mut head = &type_;
+            let mut params = 0_u32;
+            while let ExprNode::App { f, .. } = head.node() {
+                self.tick()?;
+                params = params
+                    .checked_add(1)
+                    .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                head = f;
+            }
+            let ExprNode::Const { name, levels } = head.node() else {
+                return Err(error(RecordTermError::ExpectedRecordType));
+            };
+            if !matches!(self.txn.env.find(name), Some(ConstantInfo::Induct(family))
+                if !family.is_unsafe && !family.is_rec && family.num_indices == 0
+                && family.ctors.len() == 1 && params == family.num_params
+                && levels.len() == family.base.level_params.len())
+            {
+                return Err(error(RecordTermError::ExpectedRecordType));
+            }
+            let id = FVarId(self.fresh_name()?);
+            self.txn.lctx.add_let(
+                id.clone(),
+                Name::anonymous(),
+                source.type_.clone(),
+                source.value,
+            );
+            source_bindings.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("inserted source binding")
+                    .clone(),
+            );
+            bound_sources.push(Typed {
+                value: Expr::fvar(id),
+                type_: source.type_,
+            });
+        }
         Ok(RecordBuild {
             fields: parts.fields.into_iter().collect(),
             constructor,
             remaining: ctor.num_fields,
             expected,
+            sources: bound_sources,
+            source_bindings,
+            saved_lctx,
         })
     }
 
@@ -400,9 +483,32 @@ impl Context {
             if !state.fields.is_empty() {
                 return Err(failure(SourceInferenceError::Scope));
             }
-            return Ok(RecordStep::Complete(
-                self.finish_term(state.constructor.clone(), Some(&state.expected))?,
-            ));
+            let mut term = self.finish_term(state.constructor.clone(), Some(&state.expected))?;
+            term.value = self.instantiate(&term.value)?;
+            term.type_ = self.instantiate(&term.type_)?;
+            for local in state.source_bindings.iter().rev() {
+                self.tick()?;
+                let type_ = self.instantiate(&local.type_)?;
+                let value = self.instantiate(local.value.as_ref().expect("source is a let"))?;
+                term.value = term
+                    .value
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                term.type_ = term
+                    .type_
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                term.value = Expr::let_e(
+                    Name::anonymous(),
+                    type_.clone(),
+                    value.clone(),
+                    term.value,
+                    false,
+                );
+                term.type_ = Expr::let_e(Name::anonymous(), type_, value, term.type_, false);
+            }
+            self.txn.lctx = state.saved_lctx.clone();
+            return Ok(RecordStep::Complete(term));
         }
         let type_ = self.whnf(&state.constructor.type_)?;
         let ExprNode::ForallE {
@@ -414,10 +520,27 @@ impl Context {
         else {
             return Err(failure(SourceInferenceError::Scope));
         };
-        let syntax = state
-            .fields
-            .remove(binder_name)
-            .ok_or_else(|| error(RecordTermError::MissingField(binder_name.clone())))?;
+        let Some(syntax) = state.fields.remove(binder_name) else {
+            // Source order is semantic: the first source providing a field wins.
+            // Copied fields remain real constructor arguments; K1 checks any
+            // dependency invalidated by a preceding explicit replacement.
+            for source in &state.sources {
+                match self.record_field(source.clone(), binder_name) {
+                    Ok(value) => {
+                        let value = self.finish_term(value, Some(binder_type))?;
+                        return Ok(RecordStep::Copy {
+                            value,
+                            codomain: body.clone(),
+                        });
+                    }
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
+                        RecordTermError::UnknownField(_),
+                    ))) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(error(RecordTermError::MissingField(binder_name.clone())));
+        };
         Ok(RecordStep::Field {
             syntax,
             domain: binder_type.clone(),

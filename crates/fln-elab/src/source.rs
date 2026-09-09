@@ -545,6 +545,8 @@ impl Context {
             AscribedValue(Expr),
             Projection(Name, Option<Expr>, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
+            RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
+            RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordNext(record_terms::RecordBuild<'a>),
             RecordField(record_terms::RecordBuild<'a>, Expr),
             Visit(&'a Syntax, Option<Expr>, bool),
@@ -604,7 +606,7 @@ impl Context {
                                 tasks.push(Task::RecordType(parts, expected));
                                 tasks.push(Task::Visit(annotation, None, true));
                             } else {
-                                tasks.push(Task::RecordNext(self.start_record(parts, expected)?));
+                                tasks.push(Task::RecordPrepare(parts, expected, Vec::new()));
                             }
                             continue;
                         }
@@ -770,9 +772,21 @@ impl Context {
                     if let Some(expected) = expected {
                         self.constrain(&type_.value, &expected)?;
                     }
-                    tasks.push(Task::RecordNext(
-                        self.start_record(parts, Some(type_.value))?,
-                    ));
+                    tasks.push(Task::RecordPrepare(parts, Some(type_.value), Vec::new()));
+                }
+                Task::RecordPrepare(parts, expected, sources) => {
+                    if let Some(syntax) = parts.sources.get(sources.len()).copied() {
+                        tasks.push(Task::RecordSource(parts, expected, sources));
+                        tasks.push(Task::Visit(syntax, None, true));
+                    } else {
+                        tasks.push(Task::RecordNext(
+                            self.start_record(parts, expected, sources)?,
+                        ));
+                    }
+                }
+                Task::RecordSource(parts, expected, mut sources) => {
+                    sources.push(values.pop().expect("record update source visit"));
+                    tasks.push(Task::RecordPrepare(parts, expected, sources));
                 }
                 Task::RecordNext(mut state) => match self.next_record_field(&mut state)? {
                     record_terms::RecordStep::Field {
@@ -782,6 +796,10 @@ impl Context {
                     } => {
                         tasks.push(Task::RecordField(state, codomain));
                         tasks.push(Task::Visit(syntax, Some(domain), true));
+                    }
+                    record_terms::RecordStep::Copy { value, codomain } => {
+                        self.accept_record_field(&mut state, &codomain, value)?;
+                        tasks.push(Task::RecordNext(state));
                     }
                     record_terms::RecordStep::Complete(term) => values.push(term),
                 },

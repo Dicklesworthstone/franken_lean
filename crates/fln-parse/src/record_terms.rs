@@ -7,6 +7,9 @@ pub(super) struct RecordFrame {
     rows: Vec<Syntax>,
     field: Option<(usize, Option<usize>)>,
     colon: Option<usize>,
+    sources: Vec<Syntax>,
+    source_mode: bool,
+    with_token: Option<usize>,
 }
 fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {
     NatDefinitionParseError::OutsideSeedGrammar {
@@ -51,18 +54,61 @@ fn prefix(
     };
     Ok(Some((name, assignment)))
 }
+/// Classify update openers in one pass. A field assignment ends the ambiguous
+/// prefix, and nested parentheses/braces cannot lend their `with` to a parent.
+pub(super) fn update_openers(
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+) -> std::collections::HashSet<usize> {
+    let mut stack = Vec::new();
+    let mut updates = std::collections::HashSet::new();
+    for index in range {
+        if let TokenKind::Symbol(s) = &tokens[index].kind {
+            match s.as_str() {
+                "{" => stack.push((index, "}", true)),
+                "(" => stack.push((index, ")", false)),
+                "[" => stack.push((index, "]", false)),
+                "⦃" => stack.push((index, "⦄", false)),
+                "}" | ")" | "]" | "⦄" => {
+                    stack.pop();
+                }
+                ":=" => {
+                    if let Some((_, _, eligible)) = stack.last_mut() {
+                        *eligible = false;
+                    }
+                }
+                "with" => {
+                    if let Some(&(open, "}", true)) = stack.last() {
+                        updates.insert(open);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    updates
+}
+
 pub(super) fn open(
     view: &SourceView,
     tokens: &[LexedToken],
     open: usize,
     cursor: &mut usize,
     end: usize,
+    source_mode: bool,
 ) -> Result<BoundedTermFrame, NatDefinitionParseError> {
     Ok(frame(RecordFrame {
         open,
         rows: Vec::new(),
-        field: prefix(view, tokens, cursor, end)?,
+        field: if source_mode {
+            None
+        } else {
+            prefix(view, tokens, cursor, end)?
+        },
         colon: None,
+        sources: Vec::new(),
+        source_mode,
+        with_token: None,
     }))
 }
 
@@ -77,6 +123,30 @@ pub(super) fn delimiter(
 ) -> Result<(), NatDefinitionParseError> {
     let mut current = frames.pop().expect("record term frame");
     let mut record = current.record.take().expect("record delimiter");
+    if record.source_mode {
+        if !symbol(tokens, at, ",") && !symbol(tokens, at, "with") {
+            return Err(refuse(view, tokens, at));
+        }
+        record.sources.push(finish_bounded_frame(
+            view,
+            tokens,
+            current,
+            DefinitionGrammar::Scalar,
+            at,
+        )?);
+        if symbol(tokens, at, ",") {
+            record.sources.push(leaves.leaf(at)?);
+        } else {
+            record.source_mode = false;
+            record.with_token = Some(at);
+            record.field = prefix(view, tokens, cursor, end)?;
+        }
+        frames.push(frame(record));
+        return Ok(());
+    }
+    if symbol(tokens, at, "with") {
+        return Err(refuse(view, tokens, at));
+    }
     let mut annotation = null_node(Vec::new());
     if let Some(colon) = record.colon {
         if !symbol(tokens, at, "}") {
@@ -141,7 +211,10 @@ pub(super) fn delimiter(
             parser_kind(&["Term", "structInst"]),
             vec![
                 leaves.leaf(open)?,
-                null_node(Vec::new()),
+                match record.with_token {
+                    Some(at) => null_node(vec![null_node(record.sources), leaves.leaf(at)?]),
+                    None => null_node(Vec::new()),
+                },
                 Syntax::node(
                     parser_kind(&["Term", "structInstFields"]),
                     vec![null_node(record.rows)],
@@ -186,6 +259,37 @@ mod tests {
             );
             assert!(parse_nat_definition(text.as_bytes()).is_err());
         }
+    }
+    #[test]
+    fn update_sources_roundtrip_without_recursive_lookahead() {
+        for text in [
+            "def p := { q with x := 1 }",
+            "def p : XYZ := { q, r with x := 1, }",
+            "def p := { (make 3) with }",
+            "def p := { { q with x := 1 } with y := 2 }",
+            "def p := { q with inner := { r with y := 2 } : Outer }",
+        ] {
+            let parsed = parse_definition(text.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+            assert_eq!(parsed.reconstruct_normalized().unwrap(), text.as_bytes());
+        }
+    }
+    #[test]
+    fn deeply_nested_updates_use_one_classification_pass() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let text = format!(
+                    "def nested := {}p{}",
+                    "{ ".repeat(6000),
+                    " with }".repeat(6000)
+                );
+                let parsed = parse_definition(text.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), text.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
     #[test]
     fn malformed_delimiters_are_refused_without_panics() {
