@@ -58,16 +58,18 @@ jobs:
           rustc -Vv | tee target/instance-landing/compiler.txt
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/instance-landing/frontend.log
           cargo test --locked -p fln-checker --test admit --no-fail-fast 2>&1 | tee target/instance-landing/checker.log
-          cargo test --locked -p fln --lib --test record_generation --test source_instances --test source_equality --test source_rewriting --test source_file_check --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
-          for target in source_records source_record_literals algebraic_generation source_algebraic source_matching; do
-            if test -f "crates/fln/tests/$target.rs"; then
+          cargo test --locked -p fln --lib --test record_generation --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
+          for file in crates/fln/tests/source_*.rs crates/fln/tests/algebraic_generation.rs; do
+            if test -f "$file"; then
+              target="${file##*/}"
+              target="${target%.rs}"
               cargo test --locked -p fln --test "$target" --no-fail-fast 2>&1 | tee "target/instance-landing/$target.log"
             fi
           done
           cargo test --locked -p fln-cli --no-fail-fast 2>&1 | tee target/instance-landing/cli.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-landing/workspace.log
-          for example in native_instances native_records native_record_values native_algebraic; do
+          for example in native_instances native_records native_record_values native_algebraic native_record_updates native_record_defaults native_record_inheritance; do
             if test -f "examples/$example.lean"; then
               cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/instance-landing/$example.json"
             fi
