@@ -113,7 +113,8 @@ header resolved before the body; an inferred result can still determine ordinary
 parameter holes. Nested annotations retain the surrounding term's inference.
 Ascriptions preserve the value's actual type for instance selection while keeping
 the written annotation in the checked term. Lambdas can infer their function type
-when an annotation leaves it unknown; a known non-function type is still refused.
+when an annotation leaves it unknown and any required dictionary is available;
+a known non-function type is still refused.
 Strict-implicit and explicit type-function parameters remain unapplied.
 Nested let expressions remain outside the bounded source parser's grammar;
 the supported top-level let chain retains its local dictionaries.

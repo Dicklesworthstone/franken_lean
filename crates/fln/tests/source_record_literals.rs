@@ -460,6 +460,7 @@ fn type_positions_preserve_pending_outer_and_nested_annotation_inference() {
         "def choose {A : Type} [Inhabited A] (x : A) : A := default\n\
          def inferred {A : Type} [Inhabited A] : Type := A\n\
          def family {A : Type} : Type := A\n\
+         instance functionDefault {A : Type} [Inhabited A] : Inhabited (Nat -> A) := Inhabited.mk (fun x => default)\n\
          def ascribed : Nat := choose (0 : Nat)\n\
          def nested : Nat := ((0 : Nat) : inferred)\n\
          def identity : Nat -> Nat := ((fun n => n) : inferred)\n\
@@ -484,7 +485,8 @@ fn type_positions_refuse_unresolved_headers_and_unapplied_types_atomically() {
          def family {A : Type} : Type := A\n\
          def strict ⦃A : Type⦄ : Type := A\n\
          def explicit (A : Type) : Type := A\n\
-         def hidden {A : Type} : Type := Nat",
+         def hidden {A : Type} : Type := Nat\n\
+         instance functionDefault {A : Type} [Inhabited A] : Inhabited (Nat -> A) := Inhabited.mk (fun x => default)",
     )
     .engine;
     let root = base.logical_root(&KVMap::new());
@@ -501,6 +503,7 @@ fn type_positions_refuse_unresolved_headers_and_unapplied_types_atomically() {
         "def bad : Nat := (7 : Missing)",
         "def bad : Nat := ((fun n => n) : inferred)",
         "def bad : Nat := ((fun n => n) : Nat)",
+        "def identity : Nat -> Nat := ((fun n => n) : inferred)\ntheorem bad : identity 7 = 8 := by rfl",
     ] {
         let error = base
             .check_source_files(
