@@ -229,3 +229,111 @@ fn expression_ascriptions_cannot_disappear_before_kernel_checking() {
         );
     }
 }
+
+#[test]
+fn field_receiver_explicit_projection_is_a_working_control() {
+    check(
+        &engine(),
+        "structure Point where\n  x : Nat\n\
+         def point [Inhabited Nat] : Point := { x := default }\n\
+         theorem read : Point.x point = 0 := by rfl",
+    );
+}
+
+#[test]
+fn field_receivers_insert_instances_and_preserve_ambient_selection() {
+    let base = check(
+        &engine(),
+        "structure Point where\n  x : Nat\n\
+         def point [Inhabited Nat] : Point := { x := default }",
+    )
+    .engine;
+    for receiver in ["point.x", "(point).x"] {
+        check(
+            &base,
+            &format!(
+                "theorem global : {receiver} = 0 := by rfl\n\
+                 theorem local (i : Inhabited Nat) : {receiver} = default := by rfl"
+            ),
+        );
+    }
+}
+
+#[test]
+fn field_receiver_implicit_parameters_follow_the_expected_field_type() {
+    let base = check(
+        &engine(),
+        "structure Box (A : Type) where\n  value : A\n\
+         def box {A : Type} [Inhabited A] : Box A := { value := default }",
+    )
+    .engine;
+    for receiver in ["box.value", "(box).value"] {
+        check(
+            &base,
+            &format!("def chosen : Nat := {receiver}\ntheorem result : chosen = 0 := by rfl"),
+        );
+    }
+}
+
+#[test]
+fn field_receiver_dictionaries_can_determine_the_record_type() {
+    let base = check(
+        &engine(),
+        "structure Point where\n  x : Nat\n\
+         class Factory where\n  carrier : Type\n  produce : carrier\n\
+         instance pointFactory : Factory := { carrier := Point, produce := { x := 7 } }\n\
+         def make [f : Factory] : f.carrier := f.produce",
+    )
+    .engine;
+    for receiver in ["make.x", "(make).x", "Point.x make"] {
+        check(&base, &format!("theorem result : {receiver} = 7 := by rfl"));
+    }
+}
+
+#[test]
+fn field_receiver_insertion_preserves_the_explicit_class_value() {
+    check(
+        &engine(),
+        "class Choice (A : Type) where\n  value : A\n\
+         instance selected : Choice Nat := { value := 11 }\n\
+         def factory [Inhabited Nat] : Choice Nat := { value := default }\n\
+         theorem dotted : factory.value = 0 := by rfl\n\
+         theorem postfix : (factory).value = 0 := by rfl\n\
+         theorem global : Choice.value = 11 := by rfl",
+    );
+}
+
+#[test]
+fn field_receivers_refuse_missing_instances_and_unapplied_parameters_atomically() {
+    let base = check(
+        &engine(),
+        "structure Point where\n  x : Nat\n\
+         def point [Inhabited Nat] : Point := { x := default }\n\
+         structure Box (A : Type) where\n  value : A\n\
+         def box {A : Type} [Inhabited A] : Box A := { value := default }\n\
+         def strict ⦃A : Type⦄ [Inhabited A] : Box A := { value := default }\n\
+         def takes (x : Nat) : Point := { x }",
+    )
+    .engine;
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad (A : Type) : A := box.value",
+        "def bad : Nat := strict.value",
+        "def bad : Nat := (strict).value",
+        "def bad : Nat := takes.x",
+        "def bad : Nat := point.missing",
+        "theorem bad (i : Inhabited Nat) : point.x = 0 := by rfl",
+    ] {
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap_err();
+        assert_eq!(error.disposition().2, 1, "{source}: {error:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&Name::from_components(["bad"])));
+    }
+    check(&base, "theorem recovery : point.x = 0 := by rfl");
+}

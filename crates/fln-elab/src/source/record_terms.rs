@@ -139,7 +139,13 @@ impl Context {
         receiver: Typed,
         field: &Name,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // Field access opens ordinary implicit/instance arguments, but is not
+        // an explicit argument that would trigger strict-implicit insertion.
+        let receiver = self.insert_implicits(receiver, ImplicitInsertion::FieldReceiver)?;
         self.flush(false)?;
+        // A known dictionary can determine the record's type itself. Unknown
+        // inputs stay deferred until the selected field receives its context.
+        self.resolve_instances(false)?;
         let target = self.whnf(&receiver.type_)?;
         let mut head = &target;
         let mut params = Vec::new();

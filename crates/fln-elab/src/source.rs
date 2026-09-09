@@ -82,6 +82,13 @@ struct Typed {
     type_: Expr,
 }
 
+#[derive(Clone, Copy)]
+enum ImplicitInsertion<'a> {
+    ExplicitArgument,
+    Expected(Option<&'a Expr>),
+    FieldReceiver,
+}
+
 #[derive(Clone)]
 struct Context {
     txn: ElabTxn,
@@ -467,8 +474,7 @@ impl Context {
     fn insert_implicits(
         &mut self,
         mut term: Typed,
-        explicit_follows: bool,
-        expected: Option<&Expr>,
+        insertion: ImplicitInsertion<'_>,
     ) -> Result<Typed, NatDefinitionElabError> {
         loop {
             self.tick()?;
@@ -484,14 +490,17 @@ impl Context {
             };
             let insert = match binder_info {
                 BinderInfo::Default => false,
-                BinderInfo::Implicit => explicit_follows || expected.is_some(),
-                BinderInfo::StrictImplicit => explicit_follows,
-                BinderInfo::InstImplicit => explicit_follows || expected.is_some(),
+                BinderInfo::Implicit | BinderInfo::InstImplicit => {
+                    !matches!(insertion, ImplicitInsertion::Expected(None))
+                }
+                BinderInfo::StrictImplicit => {
+                    matches!(insertion, ImplicitInsertion::ExplicitArgument)
+                }
             };
             if !insert {
                 break;
             }
-            if !explicit_follows && let Some(expected) = expected {
+            if let ImplicitInsertion::Expected(Some(expected)) = insertion {
                 let expected = self.whnf(expected)?;
                 if matches!(expected.node(), ExprNode::ForallE { binder_info: style, .. } if style == binder_info)
                 {
@@ -515,7 +524,7 @@ impl Context {
         term: Typed,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let term = self.insert_implicits(term, false, expected)?;
+        let term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
         if let Some(expected) = expected {
             self.constrain(&term.type_, expected)?;
         }
@@ -859,7 +868,8 @@ impl Context {
                 }
                 Task::Apply(function, arguments, expected) => {
                     if let Some((first, rest)) = arguments.split_first() {
-                        let function = self.insert_implicits(function, true, None)?;
+                        let function =
+                            self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
                         let ExprNode::ForallE {
                             binder_type, body, ..
                         } = function.type_.node()
@@ -913,7 +923,8 @@ impl Context {
                     };
                     let mut function = self.constant(&name)?;
                     for argument in [left, right] {
-                        function = self.insert_implicits(function, true, None)?;
+                        function =
+                            self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
                         let ExprNode::ForallE {
                             binder_type, body, ..
                         } = function.type_.node()
