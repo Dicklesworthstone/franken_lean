@@ -46,8 +46,15 @@ jobs:
           assert b'+++ /dev/null' not in patch
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
-          if repaired: paths.append(str(manifest))
           out=pathlib.Path('target/elimination-landing')
+          if plan['sha256']=='a57e5c4b15d26eba6265159ad98f005ecbc6c4c90763d4e4770dea52e8cb667b':
+              amendment=pathlib.Path('scripts/nat_seed_audit_tests.patch').read_bytes()
+              assert hashlib.sha256(amendment).hexdigest()=='3945ace0012188b10aee48f9d0cd54baffc38a46ff80f8afc67466f50211b5e6'
+              subprocess.run(['git','apply','--check','-'],input=amendment,check=True)
+              subprocess.run(['git','apply','-'],input=amendment,check=True)
+              paths.append('crates/fln-cli/src/lib.rs')
+              (out/'audit-amendment.patch').write_bytes(amendment)
+          if repaired: paths.append(str(manifest))
           (out/'paths.json').write_text(json.dumps(paths))
           (out/'increment.json').write_bytes(raw)
           (out/'change.patch').write_bytes(patch)
