@@ -156,7 +156,7 @@ fn a_late_simp_failure_does_not_emit_partial_success_for_prior_files() {
     let one =
         file("theorem contract (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by exact h");
     let two = file(
-        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f]",
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f, h]",
     );
     let args = vec![
         "check-source".into(),

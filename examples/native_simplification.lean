@@ -4,7 +4,7 @@ theorem contract (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by
   exact h
 
 theorem nested (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f (f x)) = x := by
-  simp only [contract f]
+  simp only [contract f, h]
 
 theorem unfolded (f : Nat -> Nat) (x : Nat) (h : f x = x) : twice f (twice f x) = x := by
   simp only [twice, h]
