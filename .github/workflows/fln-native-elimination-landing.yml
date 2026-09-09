@@ -22,43 +22,32 @@ jobs:
           mkdir -p target/elimination-landing
           git rev-parse HEAD > target/elimination-landing/input-commit.txt
           python3 - <<'PY'
-          import base64,gzip,hashlib,json,pathlib,subprocess
-          manifest=pathlib.Path('scripts/native_elimination_increment.json')
-          raw=manifest.read_bytes()
-          blob=lambda b:hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
-          repaired=False
-          if blob(raw)=='31e6cb0a9af53cc8af05bd438dd3423bcd4bfb2e':
-              raw=raw.replace(b'YnlYnlYBj',b'YnlYBj')
-              assert blob(raw)=='a64d536db17fc4cc950b3b2794ede58d68900e13'
-              manifest.write_bytes(raw)
-              repaired=True
+          import hashlib,json,pathlib,subprocess
+          raw=pathlib.Path('scripts/native_elimination_increment.json').read_bytes()
           plan=json.loads(raw)
-          patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
+          source=pathlib.PurePosixPath(plan['patch_file'])
+          assert str(source).startswith('scripts/') and '..' not in source.parts
+          patch=pathlib.Path(source).read_bytes()
           assert len(patch)<2_000_000
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
           paths=plan['paths']
+          required=plan.get('required',{})
           assert paths and len(paths)==len(set(paths))
-          for p in paths:
+          for p in [*paths,*required]:
               assert p.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
               assert '..' not in pathlib.PurePosixPath(p).parts
+          for p,digest in required.items():
+              assert hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==digest,p
           patch_paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
           assert set(paths)==set(patch_paths)
           assert b'+++ /dev/null' not in patch
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
           out=pathlib.Path('target/elimination-landing')
-          if plan['sha256']=='a57e5c4b15d26eba6265159ad98f005ecbc6c4c90763d4e4770dea52e8cb667b':
-              amendment=pathlib.Path('scripts/nat_seed_audit_tests.patch').read_bytes()
-              assert hashlib.sha256(amendment).hexdigest()=='3945ace0012188b10aee48f9d0cd54baffc38a46ff80f8afc67466f50211b5e6'
-              subprocess.run(['git','apply','--check','-'],input=amendment,check=True)
-              subprocess.run(['git','apply','-'],input=amendment,check=True)
-              paths.append('crates/fln-cli/src/lib.rs')
-              (out/'audit-amendment.patch').write_bytes(amendment)
-          if repaired: paths.append(str(manifest))
           (out/'paths.json').write_text(json.dumps(paths))
           (out/'increment.json').write_bytes(raw)
           (out/'change.patch').write_bytes(patch)
-          (out/'source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths},indent=2))
+          (out/'source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in [*paths,*required]},indent=2))
           PY
       - name: Test both checking engines and the real frontend and CLI
         shell: bash
@@ -72,13 +61,11 @@ jobs:
           cargo check --locked --workspace --all-targets 2>&1 | tee target/elimination-landing/workspace.log
           python3 - <<'PY'
           import json,subprocess
-          paths=json.load(open('target/elimination-landing/paths.json'))
-          rust=[p for p in paths if p.endswith('.rs')]
+          plan=json.load(open('target/elimination-landing/increment.json'))
+          rust=sorted({p for p in [*plan['paths'],*plan.get('required',{})] if p.endswith('.rs')})
           subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
           PY
-          if test -f examples/native_pattern_matching.lean; then
-            cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_pattern_matching.lean > target/elimination-landing/example.json
-          fi
+          cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_pattern_matching.lean > target/elimination-landing/example.json
           git diff --check
       - name: Publish only the tested changes without a force push
         shell: bash
