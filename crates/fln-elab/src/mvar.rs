@@ -156,11 +156,7 @@ impl MetavarStore {
     }
 
     /// Change inference policy without replacing scope, dependencies, or assignments.
-    pub(crate) fn set_kind(
-        &mut self,
-        id: &MVarId,
-        kind: MetavarKind,
-    ) -> Result<(), MetavarError> {
+    pub(crate) fn set_kind(&mut self, id: &MVarId, kind: MetavarKind) -> Result<(), MetavarError> {
         self.decls
             .get_mut(id)
             .ok_or_else(|| MetavarError::NotDeclared { id: id.clone() })?

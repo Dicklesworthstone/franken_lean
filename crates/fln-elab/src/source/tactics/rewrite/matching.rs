@@ -88,8 +88,8 @@ impl Context {
                     continue;
                 };
                 let universe = self.whnf(&universe)?;
-                // Data parameters are inferred by matching, not guessed from
-                // local values. A later propositional premise may determine one.
+                // Data parameters are inferred by the occurrence match, never
+                // guessed from a value mentioned in the selected simp set.
                 if !matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
                     continue;
                 }
@@ -132,6 +132,24 @@ impl Context {
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();
+        let mut implicit_holes = Vec::new();
+        // Rule elaboration has already inserted implicit arguments. They are
+        // obligations too, even when equality transport later erases the rule.
+        rule.value = template.instantiate(&rule.value)?;
+        let mut pending = vec![&rule.value];
+        let mut visited = HashSet::new();
+        while let Some(term) = pending.pop() {
+            template.tick()?;
+            if !visited.insert(term.allocation_identity()) {
+                continue;
+            }
+            if let ExprNode::MVar { id } = term.node()
+                && !implicit_holes.contains(id)
+            {
+                implicit_holes.push(id.clone());
+            }
+            pending.extend(children(term).into_iter().rev().flatten());
+        }
         let mut holes = Vec::new();
         loop {
             template.tick()?;
@@ -157,6 +175,9 @@ impl Context {
             rule.type_ = template.substitute(&body, &argument)?;
             rule.value = Expr::app(rule.value, argument);
         }
+        // Rewrite's newly applied parameters precede the unresolved implicit
+        // arguments inserted while elaborating the selected rule expression.
+        holes.extend(implicit_holes);
         let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
             // An explicitly selected proposition proof can discharge another
             // rule's premise without itself being an equality rewrite.
@@ -247,21 +268,44 @@ impl Context {
                 if !inside_out {
                     for id in &holes {
                         trial.tick()?;
-                        if trial.txn.mvars.is_assigned(id) { continue; }
-                        let declaration = trial.txn.mvars.get_decl(id)
-                            .expect("rule parameter was declared").clone();
+                        if trial.txn.mvars.is_assigned(id) {
+                            continue;
+                        }
+                        let declaration = trial
+                            .txn
+                            .mvars
+                            .get_decl(id)
+                            .expect("rule parameter was declared")
+                            .clone();
                         let target = trial.instantiate(&declaration.type_)?;
                         if let Some(universe) = trial.known_type(&target)? {
                             let universe = trial.whnf(&universe)?;
-                            if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
-                                trial.txn.mvars.set_kind(id, MetavarKind::SyntheticOpaque)
-                                    .map_err(|e| failure(SourceInferenceError::Unification(Box::new(UnificationError::Metavariable(e)))))?;
+                            if matches!(universe.node(), ExprNode::Sort { level } if level.is_zero())
+                            {
+                                trial
+                                    .txn
+                                    .mvars
+                                    .set_kind(id, MetavarKind::SyntheticOpaque)
+                                    .map_err(|e| {
+                                        failure(SourceInferenceError::Unification(Box::new(
+                                            UnificationError::Metavariable(e),
+                                        )))
+                                    })?;
                             }
                         }
-                        premises.push(ProofGoal { id: id.clone(), target, lctx: declaration.lctx, introduced: Vec::new() });
+                        premises.push(ProofGoal {
+                            id: id.clone(),
+                            target,
+                            lctx: declaration.lctx,
+                            introduced: Vec::new(),
+                        });
                     }
                 }
-                Ok(Some(RewriteMatch { rule: Typed { value, type_ }, occurrence, premises }))
+                Ok(Some(RewriteMatch {
+                    rule: Typed { value, type_ },
+                    occurrence,
+                    premises,
+                }))
             })();
             self.charge_rewrite_trial(&trial);
             match attempt {

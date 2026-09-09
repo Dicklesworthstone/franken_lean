@@ -70,7 +70,7 @@ fn rewriting_quantified_theorems_retains_the_real_theorem_dependency() {
     );
     let result = admit(
         &base,
-        "theorem use (f : Nat -> Nat) (x y : Nat) (h : x = y) : f x = f y := by rw [congruence f]",
+        "theorem use (f : Nat -> Nat) (x y : Nat) (h : x = y) : f x = f y := by rw [congruence f]; exact h",
     );
     let fln_env::constants::ConstantInfo::Thm(theorem) = result
         .environment()
@@ -156,15 +156,18 @@ fn rewriting_refuses_unresolved_metavariable_pattern_heads() {
 }
 
 #[test]
-fn conditional_rules_use_only_proved_local_side_conditions() {
+fn conditional_rewrites_leave_side_conditions_for_following_tactics() {
     let base = engine();
-    let source =
-        "theorem use (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : y = x := by rw [rule]";
+    let source = "theorem use (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : y = x := by rw [rule]; exact hp";
     admit(&base, source);
+    admit(
+        &base,
+        "theorem use (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : y = x := by rw [rule hp]",
+    );
     let root = base.logical_root(&KVMap::new());
     assert!(
         base.admit_source_declaration(
-            b"theorem bad (P : Prop) (x y : Nat) (rule : P -> x = y) : y = x := by rw [rule]",
+            b"theorem bad (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : y = x := by rw [rule]",
             &KVMap::new(),
             limits()
         )
@@ -213,8 +216,192 @@ fn simp_only_instantiates_quantified_conditional_rules_repeatedly() {
     );
     admit(
         &base,
-        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f]",
+        "theorem use (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f, h]",
     );
+    let error = base.admit_source_declaration(
+        b"theorem bad (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f x) = x := by simp only [contract f]",
+        &KVMap::new(), limits()).expect_err("unselected proof is not a simp premise");
+    assert!(
+        error.to_string().contains("simp only made no progress"),
+        "{error}"
+    );
+}
+
+#[test]
+fn rewrite_side_goals_preserve_primary_and_telescope_order() {
+    let base = engine();
+    admit(
+        &base,
+        "theorem use (P Q : Prop) (x y z w : Nat) (rp : P -> x = y) (rq : Q -> y = z) (main : z = w) (hp : P) (hq : Q) : x = w := by rw [rp, rq]; exact main; exact hq; exact hp",
+    );
+    admit(
+        &base,
+        "theorem use (P Q : Prop) (x y z : Nat) (r : P -> Q -> x = y) (main : y = z) (hp : P) (hq : Q) : x = z := by rw [r]; exact main; exact hp; exact hq",
+    );
+    for source in [
+        "theorem bad (P Q : Prop) (x y z w : Nat) (rp : P -> x = y) (rq : Q -> y = z) (main : z = w) (hp : P) (hq : Q) : x = w := by rw [rp, rq]; exact main; exact hp; exact hq",
+        "theorem bad (P Q : Prop) (x y z : Nat) (r : P -> Q -> x = y) (main : y = z) (hp : P) (hq : Q) : x = z := by rw [r]; exact main; exact hq; exact hp",
+    ] {
+        assert!(
+            base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn rewrite_data_goals_can_be_solved_explicitly_or_by_the_primary_goal() {
+    let base = admit(
+        &engine(),
+        "theorem rule (x y : Nat) (h : x = y) (n : Nat) : x = y := by exact h",
+    );
+    let base = admit(
+        &base,
+        "theorem conditional (P : Nat -> Prop) (x y : Nat) (h : x = y) (n : Nat) (hp : P n) : x = y := by exact h",
+    );
+    let base = admit(
+        &base,
+        "theorem choose (x n : Nat) (h : x = n) : x = n := by exact h",
+    );
+    admit(
+        &base,
+        "theorem use (x y : Nat) (h : x = y) : x = y := by rw [rule x y h]; exact 0",
+    );
+    admit(
+        &base,
+        "theorem use (P : Nat -> Prop) (x y : Nat) (h : x = y) (hp : P 0) : x = y := by rw [conditional P x y h]; exact 0; exact hp",
+    );
+    admit(
+        &base,
+        "theorem use (x y : Nat) (h : x = y) : x = y := by rw [choose x]; exact h",
+    );
+    let error = base
+        .admit_source_declaration(
+            b"theorem bad (x y : Nat) (h : x = y) : x = y := by rw [rule x y h]",
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("unused data is still an obligation");
+    assert!(error.to_string().contains("unsolved goals"), "{error}");
+}
+
+#[test]
+fn rewrite_retains_implicit_arguments_after_new_premises() {
+    let base = admit(
+        &engine(),
+        "theorem rule {A : Type} (f : Nat -> Nat) (x : Nat) : f x = f x := by rfl",
+    );
+    let error = base
+        .admit_source_declaration(
+            b"theorem bad (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [rule f]",
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("unused implicit type remains a goal even if transport erases the rule");
+    assert!(error.to_string().contains("unsolved goals"), "{error}");
+    admit(
+        &base,
+        "theorem use (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [rule f]; exact Nat",
+    );
+    let base = admit(
+        &base,
+        "theorem conditional {A : Type} (P : Prop) (f : Nat -> Nat) (x : Nat) (h : P) : f x = f x := by rfl",
+    );
+    admit(
+        &base,
+        "theorem use (P : Prop) (hp : P) (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [conditional P f]; exact hp; exact Nat",
+    );
+    assert!(
+        base.admit_source_declaration(
+            b"theorem bad (P : Prop) (hp : P) (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [conditional P f]; exact Nat; exact hp",
+            &KVMap::new(),
+            limits(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn redundant_rewrites_retain_explicit_rule_arguments_for_checking() {
+    let base = admit(
+        &engine(),
+        "theorem identity (P : Prop) (f : Nat -> Nat) (x : Nat) (h : P) : f x = f x := by rfl",
+    );
+    admit(
+        &base,
+        "theorem use (P : Prop) (hp : P) (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [identity P f x hp]",
+    );
+    admit(
+        &base,
+        "theorem use (P : Prop) (hp : P) (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [(fun h => identity P f x h) hp]",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad (P : Prop) (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [identity P f x Nat]",
+        "theorem bad (P : Prop) (f : Nat -> Nat) (x : Nat) : f x = f x := by rw [(fun h => identity P f x h) Nat]",
+    ] {
+        assert!(
+            base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn rewrite_does_not_discharge_even_reflexive_premises() {
+    let base = engine();
+    let error = base
+        .admit_source_declaration(
+            b"theorem bad (x y : Nat) (rule : (x = x) -> x = y) : x = y := by rw [rule]",
+            &KVMap::new(),
+            limits(),
+        )
+        .expect_err("rw must leave its reflexive premise");
+    assert!(error.to_string().contains("unsolved goals"), "{error}");
+    admit(
+        &base,
+        "theorem use (x y : Nat) (rule : (x = x) -> x = y) : x = y := by rw [rule]; rfl",
+    );
+    admit(
+        &base,
+        "theorem use (x y : Nat) (rule : (x = x) -> x = y) : x = y := by simp only [rule]",
+    );
+}
+
+#[test]
+fn simp_side_conditions_use_only_selected_proofs_and_definitions() {
+    let base = admit(&engine(), "def SelfEq (x : Nat) : Prop := x = x");
+    let base = admit(
+        &base,
+        "theorem conditional (P : Nat -> Prop) (x y : Nat) (h : x = y) (n : Nat) (hp : P n) : x = y := by exact h",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem use (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : x = y := by simp only [rule, hp]",
+        "theorem use (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : x = y := by simp only [hp, rule]",
+        "theorem use (P : Prop) (hp : P) : P := by simp only [hp]",
+        "theorem use (x y : Nat) (rule : SelfEq x -> x = y) : x = y := by simp only [rule, SelfEq]",
+    ] {
+        admit(&base, source);
+    }
+    for source in [
+        "theorem bad (P : Prop) (x y : Nat) (rule : P -> x = y) (hp : P) : x = y := by simp only [rule]",
+        "theorem bad (P : Nat -> Prop) (x y : Nat) (h : x = y) (hp : P 0) : x = y := by simp only [conditional P x y h, hp]",
+        "theorem bad (x y : Nat) (rule : SelfEq x -> x = y) : x = y := by simp only [rule]",
+    ] {
+        let error = base
+            .admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+            .expect_err("unselected or unresolved premise must remain");
+        assert!(
+            error.to_string().contains("simp only made no progress"),
+            "{source}: {error}"
+        );
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
 }
 
 #[test]

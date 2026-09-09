@@ -187,14 +187,20 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         self.flush(false)?;
         let original_target = self.instantiate(&goal.target)?;
-        let RewriteMatch { rule, occurrence, premises } = self
+        let RewriteMatch {
+            rule,
+            occurrence,
+            premises,
+        } = self
             .instantiate_rewrite_rule(rule, &original_target, reverse, false, &[])?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
         let (next_goal, value) = self.rewrite_transport(&goal, rule, &occurrence, reverse)?;
         proof.work.push(Work::Close(goal, value));
         // LIFO: the rewritten goal comes first, then this rule's premises in
         // telescope order. A later rule's premises precede earlier ones.
-        proof.work.extend(premises.into_iter().rev().map(Work::Goal));
+        proof
+            .work
+            .extend(premises.into_iter().rev().map(Work::Goal));
         proof.work.push(Work::Rewrite(next_goal, remaining, close));
         Ok(())
     }
@@ -239,17 +245,9 @@ impl Context {
             return Err(failure(SourceInferenceError::ExpectedType));
         };
         let (child, next_goal) = self.proof_goal(next_target)?;
-        // Definitionally identical endpoints need no equality elimination.
-        // Keep the requested syntactic target, but avoid an unnecessary dependent
-        // transport. Final admission still checks the original goal by conversion.
-        let reduced_from = self.whnf(&from)?;
-        let reduced_to = self.whnf(&to)?;
-        if !reduced_from.has_expr_mvar()
-            && !reduced_to.has_expr_mvar()
-            && self.proof_types_match(&reduced_from, &reduced_to)?
-        {
-            return Ok((next_goal, child));
-        }
+        // Retain the original rule even for definitionally equal endpoints.
+        // Its arguments must reach final admission before beta/zeta reduction
+        // can erase them, including answers to otherwise unused side goals.
         let eq_domain = app(
             Expr::const_(Name::from_components(["Eq"]), vec![u.clone()]),
             [alpha.clone(), from.clone(), Expr::fvar(marker.clone())],

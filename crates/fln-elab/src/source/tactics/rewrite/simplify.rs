@@ -95,7 +95,9 @@ impl Context {
                     changed = true;
                 }
             }
-            if !changed { return Ok(target); }
+            if !changed {
+                return Ok(target);
+            }
         }
         Err(failure(SourceInferenceError::ResourceLimit))
     }
@@ -109,6 +111,13 @@ impl Context {
             self.tick()?;
             let selected = self.term(rule.syntax, None)?;
             let type_ = self.simp_premise_target(&selected.type_, rules)?;
+            let Some(universe) = self.known_type(&type_)? else {
+                continue;
+            };
+            let universe = self.whnf(&universe)?;
+            if !matches!(universe.node(), ExprNode::Sort { level } if level.is_zero()) {
+                continue;
+            }
             let mut budget = UnificationBudget::new(self.kernel);
             budget.zeta_delta = false;
             if self.proof_types_match_with_budget(&type_, target, budget)? {
@@ -132,7 +141,10 @@ impl Context {
             return Ok(Some(value));
         }
         let goal = ProofGoal {
-            id: id.clone(), target, lctx: self.txn.lctx.clone(), introduced: Vec::new(),
+            id: id.clone(),
+            target,
+            lctx: self.txn.lctx.clone(),
+            introduced: Vec::new(),
         };
         self.automatic_reflexivity_candidate(&goal, false)
     }
@@ -198,16 +210,26 @@ impl Context {
                     UnfoldResult::NotDefinition => {
                         // Re-elaboration gives each polymorphic use fresh universes.
                         let term = self.term(rule.syntax, None)?;
-                        match self.instantiate_rewrite_rule(term, &target, rule.reverse, true, &rules)? {
-                            Some(RewriteMatch { rule: term, occurrence, premises }) => {
+                        match self.instantiate_rewrite_rule(
+                            term,
+                            &target,
+                            rule.reverse,
+                            true,
+                            &rules,
+                        )? {
+                            Some(RewriteMatch {
+                                rule: term,
+                                occurrence,
+                                premises,
+                            }) => {
                                 assert!(premises.is_empty(), "simp discharges its own premises");
                                 Some(self.rewrite_transport(
-                                &goal,
-                                term,
-                                &occurrence,
-                                rule.reverse,
-                            )?)
-                            },
+                                    &goal,
+                                    term,
+                                    &occurrence,
+                                    rule.reverse,
+                                )?)
+                            }
                             None => None,
                         }
                     }
