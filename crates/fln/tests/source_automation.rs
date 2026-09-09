@@ -405,6 +405,60 @@ fn simp_side_conditions_use_only_selected_proofs_and_definitions() {
 }
 
 #[test]
+fn simp_selected_equalities_prove_conditional_premises() {
+    let base = admit(
+        &engine(),
+        "def Wrapped (f : Nat -> Nat) (x y : Nat) : Prop := f x = f y",
+    );
+    for source in [
+        "theorem use (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : f x = f y -> a = b) : a = b := by simp only [rule, h]",
+        "theorem use (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : f (f x) = f (f y) -> a = b) : a = b := by simp only [h, rule]",
+        "theorem use (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : f x = f y -> a = b) : a = b := by simp only [rule, <- h]",
+        "theorem use (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : Wrapped f x y -> a = b) : a = b := by simp only [rule, h, Wrapped]",
+    ] {
+        admit(&base, source);
+    }
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : f x = f y -> a = b) : a = b := by simp only [rule]",
+        "theorem bad (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : Wrapped f x y -> a = b) : a = b := by simp only [rule, h]",
+    ] {
+        let error = base
+            .admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+            .expect_err("unselected equality or definition must remain unavailable");
+        assert!(
+            error.to_string().contains("simp only made no progress"),
+            "{source}: {error}"
+        );
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn simp_failed_premise_rewriting_restores_state_for_later_rules() {
+    let base = engine();
+    admit(
+        &base,
+        "theorem use (f : Nat -> Nat) (a b x y z : Nat) (h : x = y) (bad : f x = f z -> a = b) (good : f x = f y -> a = b) : a = b := by simp only [bad, good, h]",
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad (f : Nat -> Nat) (a b x y z : Nat) (h : x = y) (rule : f x = f z -> a = b) : a = b := by simp only [rule, h]",
+        "theorem bad (x y : Nat) (rule : (x = y) -> x = y) : x = y := by simp only [rule]",
+    ] {
+        let error = base
+            .admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+            .expect_err("partial progress or a circular premise is not a proof");
+        assert!(
+            error.to_string().contains("simp only made no progress"),
+            "{source}: {error}"
+        );
+    }
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    admit(&base, "theorem recovered (x : Nat) : x = x := by rfl");
+}
+
+#[test]
 fn simp_only_empty_set_uses_kernel_conversion_and_never_proves_false() {
     let base = engine();
     admit(&base, "theorem arithmetic : 2 + 3 = 5 := by simp only []");

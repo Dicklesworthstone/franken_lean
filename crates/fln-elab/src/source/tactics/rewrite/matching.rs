@@ -174,6 +174,13 @@ impl Context {
         // Rewrite's newly applied parameters precede the unresolved implicit
         // arguments inserted while elaborating the selected rule expression.
         holes.extend(implicit_holes);
+        // A known class input must select its dictionary before matching a
+        // pattern containing that dictionary. Synthetic-opaque instance holes
+        // cannot be assigned by occurrence unification. Inputs learned from
+        // the occurrence still get the second synthesis pass below.
+        let resolution = template.resolve_instances(false);
+        self.charge_rewrite_trial(&template);
+        resolution?;
         let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
             // An explicitly selected proposition proof can discharge another
             // rule's premise without itself being an equality rewrite.

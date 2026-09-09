@@ -141,8 +141,8 @@ fn installed_binary_checks_quantified_simp_and_selected_definition_proofs() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     for field in [
-        "\"commands\":6",
-        "\"theorems\":5",
+        "\"commands\":7",
+        "\"theorems\":6",
         "\"executed\":false",
         "\"outcome\":\"complete\"",
     ] {
@@ -215,4 +215,39 @@ fn installed_binary_resolves_source_instances_across_files_without_execution() {
         "late failure must not expose successful prefix"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+}
+
+#[test]
+fn installed_binary_checks_local_dictionaries_and_conditional_instance_rewrites() {
+    let one = file(
+        "def consume (i : Inhabited Nat) : Nat := 0\ntheorem rule (P : Prop) [i : Inhabited Nat] (hp : P) : consume i = 0 := by rfl",
+    );
+    let two = file(
+        "def dictionary (i : Inhabited Nat) : Inhabited Nat := inferInstance\ntheorem selected (i : Inhabited Nat) : dictionary i = i := by rfl\ntheorem use (P : Prop) (hp : P) : consume instInhabitedNat = 0 := by simp only [rule P, hp]",
+    );
+    let args = vec![
+        "check-source".into(),
+        "--json".into(),
+        one.into_os_string(),
+        two.clone().into_os_string(),
+    ];
+    let complete = run(args.clone());
+    assert_eq!(complete.exit_code, 0, "{}", complete.stderr);
+    for required in [
+        "\"files\":2",
+        "\"commands\":5",
+        "\"theorems\":3",
+        "\"executed\":false",
+    ] {
+        assert!(complete.stdout.contains(required), "{}", complete.stdout);
+    }
+    std::fs::write(
+        two,
+        "theorem wrong (i : Inhabited Nat) : default = 0 := by rfl",
+    )
+    .unwrap();
+    let refused = run(args);
+    assert_ne!(refused.exit_code, 0);
+    assert!(refused.stdout.is_empty());
+    assert!(refused.stderr.contains("kernel-rejection"));
 }

@@ -1,5 +1,5 @@
 //! Transactional, bounded native instance search. Class inputs must be known
-//! before search; unselected ordinary hypotheses are not local instances.
+//! before search; ordinary locals qualify only when their type is a class.
 //! Search uses an explicit stack and never turns exhaustion into "not found".
 use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
@@ -45,6 +45,13 @@ fn nonmatch(error: &NatDefinitionElabError) -> bool {
 }
 
 impl Context {
+    fn instance_type(&mut self, type_: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        // Class discovery unfolds abbreviations, but neither ordinary
+        // definitions nor local type aliases. Candidate matching can still
+        // use the ordinary unifier after this eligibility check.
+        self.whnf_with_transparency(type_, UnificationTransparency::Abbreviations, false)
+    }
+
     pub(super) fn instance_hole(&mut self, type_: Expr) -> Result<Expr, NatDefinitionElabError> {
         let name = self.fresh_name()?;
         let id = MVarId(name.clone());
@@ -74,7 +81,7 @@ impl Context {
         let result = (|| {
             loop {
                 trial.tick()?;
-                target = trial.whnf(&target)?;
+                target = trial.instance_type(&target)?;
                 let ExprNode::ForallE {
                     binder_type,
                     body,
@@ -179,14 +186,22 @@ impl Context {
             .cloned()
             .ok_or_else(|| failure(SourceInferenceError::Scope))?;
         self.txn.lctx = decl.lctx;
-        let target = self.whnf(&decl.type_)?;
+        let target = self.instance_type(&decl.type_)?;
         let class = result_head(&target)
             .filter(|c| registry.is_class(c))
             .ok_or_else(|| failure(SourceInferenceError::InvalidInstanceBinder))?;
         let mut candidates = Vec::new();
         // Lean tries the newest local instance before global registrations.
-        for local in self.txn.lctx.decls().iter().rev() {
-            if local.binder_info == BinderInfo::InstImplicit {
+        let locals = self.txn.lctx.clone();
+        for local in locals.decls().iter().rev() {
+            let eligible = if local.binder_info == BinderInfo::InstImplicit {
+                true
+            } else {
+                let type_ = self.instance_type(&local.type_)?;
+                !matches!(type_.node(), ExprNode::ForallE { .. })
+                    && result_head(&type_).is_some_and(|name| name == class)
+            };
+            if eligible {
                 candidates.push(Candidate::Local(local.id.clone()));
             }
         }

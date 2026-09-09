@@ -87,20 +87,58 @@ fn newest_local_instance_wins_without_using_the_global_default() {
     assert!(!has_constant(&def.value, &n("instInhabitedNat")));
 }
 #[test]
-fn an_ordinary_hypothesis_does_not_become_an_instance() {
+fn ordinary_class_parameters_are_local_instances() {
+    let base = checked(
+        &engine(),
+        "def dictionary (i : Inhabited Nat) : Inhabited Nat := inferInstance\ntheorem selected (i : Inhabited Nat) : dictionary i = i := by rfl",
+    );
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem wrong (i : Inhabited Nat) : default = 0 := by rfl",
+        "theorem wrong [i : Inhabited Nat] : default = 0 := by rfl",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+    checked(&base, "theorem recovery : default = 0 := by rfl");
+}
+
+#[test]
+fn class_valued_lets_follow_local_instance_recency() {
     checked(
         &engine(),
-        "theorem ordinary (i : Inhabited Nat) : default = 0 := by rfl",
+        "def chosen : Nat := let d := Inhabited.mk 9; default\ntheorem result : chosen = 9 := by rfl\ndef newest (i : Inhabited Nat) : Nat := let d := Inhabited.mk 7; default\ntheorem recent (i : Inhabited Nat) : newest i = 7 := by rfl",
     );
-    assert!(
-        engine()
-            .check_source_files(
-                &[b"theorem wrong [i : Inhabited Nat] : default = 0 := by rfl"],
-                &KVMap::new(),
-                limits()
-            )
-            .is_err()
+}
+
+#[test]
+fn ordinary_functions_and_opaque_type_aliases_are_not_local_instances() {
+    checked(
+        &engine(),
+        "def functionDictionary (f : Nat -> Inhabited Nat) : Inhabited Nat := inferInstance\ntheorem functionIgnored (f : Nat -> Inhabited Nat) : functionDictionary f = instInhabitedNat := by rfl\ndef Alias : Type := Inhabited Nat\ndef aliasDictionary (i : Alias) : Inhabited Nat := inferInstance\ntheorem aliasIgnored (i : Alias) : aliasDictionary i = instInhabitedNat := by rfl\ndef localAlias : Nat := let A : Type := Inhabited Nat; let i : A := Inhabited.mk 9; default\ntheorem localAliasIgnored : localAlias = 0 := by rfl",
     );
+}
+
+#[test]
+fn instance_binders_and_targets_require_a_reducible_class_head() {
+    let base = checked(&engine(), "def Alias : Type := Inhabited Nat");
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad [i : Alias] : Nat := 0",
+        "def bad : Alias := inferInstance",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+    checked(&base, "def recovery : Inhabited Nat := inferInstance");
 }
 #[test]
 fn nonclasses_and_missing_instances_are_visible_refusals() {
@@ -376,4 +414,75 @@ fn instance_dependent_tactics_refuse_missing_dictionaries_without_publishing() {
         );
         assert_eq!(e.environment().logical_root(&KVMap::new()), before);
     }
+}
+
+#[test]
+fn rewriting_synthesizes_known_dictionary_arguments_before_matching() {
+    let base = checked(
+        &engine(),
+        "def consume (i : Inhabited Nat) : Nat := 0\ntheorem rule (P : Prop) [i : Inhabited Nat] (hp : P) : consume i = 0 := by rfl",
+    );
+    for script in ["rw [rule P]; exact hp", "simp only [rule P, hp]"] {
+        let source = format!(
+            "theorem use (P : Prop) (hp : P) : consume instInhabitedNat = 0 := by {script}"
+        );
+        let result = checked(&base, &source);
+        let ConstantInfo::Thm(theorem) = result.environment().find(&n("use")).unwrap() else {
+            panic!("theorem")
+        };
+        assert!(has_constant(&theorem.value, &n("rule")));
+        assert!(has_constant(&theorem.value, &n("instInhabitedNat")));
+    }
+}
+
+#[test]
+fn fully_applied_dictionary_rules_keep_their_original_arguments() {
+    let base = checked(
+        &engine(),
+        "def consume (i : Inhabited Nat) : Nat := 0\ntheorem rule (P : Prop) [i : Inhabited Nat] (hp : P) : consume i = 0 := by rfl",
+    );
+    for script in ["rw [rule P hp]", "simp only [rule P hp]"] {
+        let source = format!(
+            "theorem use (P : Prop) (hp : P) : consume instInhabitedNat = 0 := by {script}"
+        );
+        let result = checked(&base, &source);
+        let ConstantInfo::Thm(theorem) = result.environment().find(&n("use")).unwrap() else {
+            panic!("theorem")
+        };
+        assert!(has_constant(&theorem.value, &n("rule")));
+        assert!(has_constant(&theorem.value, &n("instInhabitedNat")));
+    }
+}
+
+#[test]
+fn dictionary_rewriting_uses_local_precedence_without_guessing_from_occurrences() {
+    let base = checked(
+        &engine(),
+        "theorem rule (P : Prop) (f : Inhabited Nat -> Nat) [i : Inhabited Nat] (h : f i = 0) (hp : P) : f i = 0 := by exact h",
+    );
+    for binder in ["(i : Inhabited Nat)", "[i : Inhabited Nat]"] {
+        let source = format!(
+            "theorem use (P : Prop) (f : Inhabited Nat -> Nat) {binder} (h : f i = 0) (hp : P) : f i = 0 := by rw [rule P f]; exact h; exact hp"
+        );
+        let result = checked(&base, &source);
+        let ConstantInfo::Thm(theorem) = result.environment().find(&n("use")).unwrap() else {
+            panic!("theorem")
+        };
+        assert!(has_constant(&theorem.value, &n("rule")));
+        assert!(!has_constant(&theorem.value, &n("instInhabitedNat")));
+    }
+    checked(
+        &base,
+        "theorem use (P : Prop) (f : Inhabited Nat -> Nat) (h : f instInhabitedNat = 0) (hp : P) : f instInhabitedNat = 0 := by rw [rule P f]; exact h; exact hp",
+    );
+    let before = base.logical_root(&KVMap::new());
+    assert!(
+        base.check_source_files(
+            &[b"theorem wrong (P : Prop) (f : Inhabited Nat -> Nat) [i : Inhabited Nat] (h : f i = 0) (hp : P) : f instInhabitedNat = 0 := by rw [rule P f]; exact h; exact hp"],
+            &KVMap::new(),
+            limits(),
+        )
+        .is_err()
+    );
+    assert_eq!(before, base.logical_root(&KVMap::new()));
 }

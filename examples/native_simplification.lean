@@ -15,3 +15,6 @@ theorem transport (P : Nat -> Prop) (x y : Nat) (h : x = y) (hy : P y) : P x := 
 
 theorem computed : 2 + 3 = 5 := by
   simp only []
+
+theorem conditional (f : Nat -> Nat) (a b x y : Nat) (h : x = y) (rule : f x = f y -> a = b) : a = b := by
+  simp only [rule, h]
