@@ -1,0 +1,703 @@
+diff --git a/crates/fln-parse/src/lib.rs b/crates/fln-parse/src/lib.rs
+--- a/crates/fln-parse/src/lib.rs
++++ b/crates/fln-parse/src/lib.rs
+@@ -31,6 +31,7 @@
+ pub mod state;
+ 
+ mod inductive;
++mod matching;
+ mod proofs;
+ mod record_terms;
+ mod records;
+@@ -57,6 +58,7 @@
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum NatDefinitionExpectation {
+     InductiveConstructor,
++    MatchAlternative,
+     ImportOrCommand,
+     ImportedModule,
+     EndOfImportCommand,
+@@ -483,6 +485,7 @@
+     TokenTable::from_tokens([
+         "structure",
+         "inductive",
++        "match",
+         "|",
+         "class",
+         "where",
+@@ -541,6 +544,7 @@
+     TokenTable::from_tokens([
+         "structure",
+         "inductive",
++        "match",
+         "|",
+         "class",
+         "where",
+@@ -680,24 +684,32 @@
+     }
+ }
+ 
+-/// The let-body separator is the first `;` at parenthesis depth 0.
+-/// Scanning for the first `;` anywhere splits `let x := (1; 2); x` at the
+-/// inner semicolon, leaving `(1` as the value — fail-closed with the wrong
+-/// cut. Nested `let` in parens is outside the seed term grammar either way;
+-/// the depth walk makes the refusal land on the leftover token, not an
+-/// unclosed `(`.
++/// Find the separator belonging to this let, not one in a nested let or a
++/// delimited subexpression. The term parser still validates the resulting ranges.
+ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
+-    let mut depth = 0usize;
+-    for index in from..tokens.len() {
+-        match tokens.get(index).map(|token| &token.kind) {
+-            Some(TokenKind::Symbol(symbol)) if symbol == "(" => depth += 1,
+-            Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
+-                depth = depth.saturating_sub(1);
++    let mut delimiters = Vec::new();
++    let mut nested_lets = 0usize;
++    for (index, token) in tokens.iter().enumerate().skip(from) {
++        if let TokenKind::Symbol(symbol) = &token.kind {
++            match symbol.as_str() {
++                "(" => delimiters.push(")"),
++                "{" => delimiters.push("}"),
++                "[" => delimiters.push("]"),
++                "⦃" => delimiters.push("⦄"),
++                ")" | "}" | "]" | "⦄" => {
++                    if delimiters.pop() != Some(symbol.as_str()) {
++                        return None;
++                    }
++                }
++                "let" if delimiters.is_empty() => nested_lets += 1,
++                ";" if delimiters.is_empty() => {
++                    if nested_lets == 0 {
++                        return Some(index);
++                    }
++                    nested_lets -= 1;
++                }
++                _ => {}
+             }
+-            Some(TokenKind::Symbol(symbol)) if symbol == ";" && depth == 0 => {
+-                return Some(index);
+-            }
+-            _ => {}
+         }
+     }
+     None
+@@ -1074,6 +1086,19 @@
+     range: std::ops::Range<usize>,
+     grammar: DefinitionGrammar,
+ ) -> Result<Syntax, NatDefinitionParseError> {
++    matching::parse(leaves, view, tokens, range, grammar)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn bounded_term_spliced(
++    leaves: &Leaves,
++    view: &SourceView,
++    tokens: &[LexedToken],
++    range: std::ops::Range<usize>,
++    grammar: DefinitionGrammar,
++    splices: &mut matching::Splices,
++    updates: &std::collections::HashSet<usize>,
++) -> Result<Syntax, NatDefinitionParseError> {
+     let mut frames = vec![BoundedTermFrame {
+         record: None,
+         ascription: None,
+@@ -1083,16 +1108,34 @@
+         operands: Vec::new(),
+         operators: Vec::new(),
+     }];
+-    let updates = record_terms::update_openers(tokens, range.clone());
+     let mut cursor = range.start;
+     while cursor < range.end {
+         let index = cursor;
+         cursor += 1;
++        if let Some((end, syntax)) = splices.remove(&index) {
++            if end > range.end {
++                return Err(NatDefinitionParseError::OutsideSeedGrammar {
++                    at: original_position(view, tokens, index),
++                    expected: NatDefinitionExpectation::MatchAlternative,
++                });
++            }
++            frames
++                .last_mut()
++                .expect("root term frame")
++                .application
++                .push((syntax, index));
++            cursor = end;
++            continue;
++        }
+         match tokens.get(index).map(|token| &token.kind) {
+             Some(TokenKind::Symbol(symbol))
+                 if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
+             {
+                 let (proof, end) = proofs::parse(leaves, view, tokens, index, range.end)?;
++                // Tactic arguments are parsed by their own bounded term call.
++                // Its returned syntax already owns these matches. Nested by
++                // blocks are forbidden by that parser, bounding re-entry depth.
++                splices.retain(|start, _| *start < index || *start >= end);
+                 frames
+                     .last_mut()
+                     .expect("root term frame")
+diff --git a/crates/fln-elab/src/source.rs b/crates/fln-elab/src/source.rs
+--- a/crates/fln-elab/src/source.rs
++++ b/crates/fln-elab/src/source.rs
+@@ -10,6 +10,7 @@
+ mod instance_command;
+ mod instances;
+ mod levels;
++mod matching;
+ mod record;
+ mod record_terms;
+ mod tactics;
+@@ -22,6 +23,7 @@
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum SourceInferenceError {
++    Match(matching::MatchError),
+     Inductive(crate::inductive::InductiveError),
+     UnknownConstant(Name),
+     ExpectedFunction,
+@@ -43,6 +45,7 @@
+ impl std::fmt::Display for SourceInferenceError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
++            Self::Match(reason) => write!(f, "{reason}"),
+             Self::Inductive(error) => write!(f, "{error}"),
+             Self::UnknownConstant(_) => {
+                 write!(f, "source reference does not name a known constant")
+@@ -580,6 +583,9 @@
+         expected: Option<Expr>,
+     ) -> Result<Typed, NatDefinitionElabError> {
+         enum Task<'a> {
++            MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
++            MatchNext(matching::MatchBuild<'a>),
++            MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
+             Ascription(&'a Syntax, Option<Expr>),
+             AscribedValue(Expr, Option<Expr>),
+             Projection(Name, Option<Expr>, bool),
+@@ -619,6 +625,13 @@
+                         continue;
+                     }
+                     if let Syntax::Node { kind, args, .. } = syntax {
++                        if kind == &parser_kind(&["Term", "match"]) {
++                            let parts = self.match_parts(syntax)?;
++                            let discriminant = parts.discriminant;
++                            tasks.push(Task::MatchDiscriminant(parts, expected));
++                            tasks.push(Task::Visit(discriminant, None, true));
++                            continue;
++                        }
+                         if kind == &parser_kind(&["Term", "proj"]) {
+                             let parts = expect_node(syntax, kind, 3, "field projection")?;
+                             expect_atom(&parts[1], ".", "field dot")?;
+@@ -793,6 +806,26 @@
+                         term
+                     });
+                 }
++                Task::MatchDiscriminant(parts, expected) => {
++                    let major = values.pop().expect("match discriminant visit");
++                    tasks.push(Task::MatchNext(self.start_match(parts, major, expected)?));
++                }
++                Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
++                    matching::MatchStep::Branch {
++                        syntax,
++                        expected,
++                        binders,
++                    } => {
++                        tasks.push(Task::MatchBranch(state, binders));
++                        tasks.push(Task::Visit(syntax, Some(expected), true));
++                    }
++                    matching::MatchStep::Complete(term) => values.push(term),
++                },
++                Task::MatchBranch(mut state, binders) => {
++                    let branch = values.pop().expect("match branch visit");
++                    self.accept_match_branch(&mut state, binders, branch)?;
++                    tasks.push(Task::MatchNext(state));
++                }
+                 Task::Ascription(syntax, expected) => {
+                     let type_ = values.pop().expect("ascription type visit");
+                     self.sort_level(&type_)?;
+diff --git a/crates/fln/tests/source_matching.rs b/crates/fln/tests/source_matching.rs
+--- /dev/null
++++ b/crates/fln/tests/source_matching.rs
+@@ -0,0 +1,302 @@
++//! Pattern matches are checked as ordinary recursor applications by both engines.
++#![forbid(unsafe_code)]
++use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, Outcome, SourceCheckLimits};
++use fln_core::expr::{Expr, ExprNode};
++use fln_env::constants::ConstantInfo;
++use std::collections::HashSet;
++fn limits() -> EngineAdmissionLimits {
++    EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
++}
++fn engine() -> Engine {
++    Engine::with_source_seed(limits())
++        .unwrap()
++        .into_complete()
++        .unwrap()
++}
++fn check(text: &str) -> fln::SourceFileCheck {
++    let result = engine().check_source_files(
++        &[text.as_bytes()],
++        &KVMap::new(),
++        SourceCheckLimits::new(limits()),
++    );
++    result
++        .unwrap_or_else(|error| panic!("{text}\n{error:?}"))
++        .into_complete()
++        .unwrap()
++}
++fn constants(expr: &Expr) -> HashSet<Name> {
++    let mut found = HashSet::new();
++    let mut seen = HashSet::new();
++    let mut pending = vec![expr];
++    while let Some(expr) = pending.pop() {
++        if !seen.insert(expr.allocation_identity()) {
++            continue;
++        }
++        match expr.node() {
++            ExprNode::Const { name, .. } => {
++                found.insert(name.clone());
++            }
++            ExprNode::App { f, a } => {
++                pending.push(f);
++                pending.push(a);
++            }
++            ExprNode::Lam {
++                binder_type, body, ..
++            }
++            | ExprNode::ForallE {
++                binder_type, body, ..
++            } => {
++                pending.push(binder_type);
++                pending.push(body);
++            }
++            ExprNode::LetE {
++                type_, value, body, ..
++            } => {
++                pending.push(type_);
++                pending.push(value);
++                pending.push(body);
++            }
++            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
++            _ => {}
++        }
++    }
++    found
++}
++#[test]
++fn bool_match_computes_both_alternatives_and_keeps_the_real_recursor() {
++    let result = check(
++        "def flag (b : Bool) : Nat := match b with | true => 7 | false => 3\ntheorem yes : flag true = 7 := by rfl\ntheorem no : flag false = 3 := by rfl",
++    );
++    let Some(ConstantInfo::Defn(def)) = result
++        .engine
++        .environment()
++        .find(&Name::from_components(["flag"]))
++    else {
++        panic!("checked definition");
++    };
++    assert!(constants(&def.value).contains(&Name::from_components(["Bool", "rec"])));
++    assert_eq!(result.theorems, 2);
++}
++#[test]
++fn parameterized_variants_destructure_payloads_in_separate_scopes() {
++    check(
++        "inductive Maybe (A : Type) where | none | some (value : A)\ndef get (m : Maybe Nat) : Nat := match m with | .some n => n | .none => 0\ntheorem some_ok : get (Maybe.some 13) = 13 := by rfl\ntheorem none_ok : get Maybe.none = 0 := by rfl",
++    );
++    check(
++        "inductive Either (A B : Type) where | left (value : A) | right (value : B)\ndef choose (e : Either Nat Nat) : Nat := match e with | Either.left x => x + 1 | Either.right x => x + 2\ntheorem left_ok : choose (Either.left 4) = 5 := by rfl\ntheorem right_ok : choose (Either.right 4) = 6 := by rfl",
++    );
++}
++#[test]
++fn direct_recursive_fields_are_destructured_without_exposing_induction_hypotheses() {
++    check(
++        "inductive Chain where | nil | cons (head : Nat) (tail : Chain)\ndef first (c : Chain) : Nat := match c with | .nil => 0 | .cons n _ => n\ntheorem head_ok : first (Chain.cons 9 (Chain.cons 7 Chain.nil)) = 9 := by rfl",
++    );
++    check(
++        "def pred (n : Nat) : Nat := match n with | Nat.zero => 0 | Nat.succ k => k\ntheorem pred_ok : pred 5 = 4 := by rfl",
++    );
++}
++#[test]
++fn catch_all_binds_the_actual_whole_constructor_value() {
++    check(
++        "inductive Letter where | a | b | c\ndef change (x : Letter) : Letter := match x with | .a => Letter.b | rest => rest\ntheorem a_ok : change Letter.a = Letter.b := by rfl\ntheorem c_ok : change Letter.c = Letter.c := by rfl",
++    );
++    check(
++        "def flag (b : Bool) : Nat := match b with | true => 7 | _ => 3\ntheorem no : flag false = 3 := by rfl",
++    );
++}
++#[test]
++fn nested_matches_work_inside_terms_and_record_values() {
++    check(
++        "def f (a b : Bool) : Nat := match a with\n  | true => match b with\n    | true => 1\n    | false => 2\n  | false => 3\ntheorem nested : f true false = 2 := by rfl",
++    );
++    check(
++        "structure Box where\n  value : Nat\ndef boxed (b : Bool) : Box := { value := (match b with | true => 9 | false => 2) + 1 }\ntheorem nested : (boxed true).value = 10 := by rfl",
++    );
++}
++#[test]
++fn inferred_result_types_and_function_valued_branches_are_supported() {
++    check(
++        "def choose (b : Bool) := match b with | true => 4 | false => 2\ntheorem selected : choose true = 4 := by rfl",
++    );
++    check(
++        "def select (b : Bool) : Nat -> Nat := match b with | true => fun x => x + 1 | false => fun x => x + 2\ntheorem chosen : select false 3 = 5 := by rfl",
++    );
++}
++#[test]
++fn dependent_record_match_refines_the_expected_type() {
++    check(
++        "structure Package where\n  carrier : Type\n  value : carrier\ndef extract (p : Package) : p.carrier := match p with | Package.mk A x => x\ndef packaged : Package := { carrier := Nat, value := 21 }\ntheorem extracted : extract packaged = 21 := by rfl",
++    );
++}
++#[test]
++fn proposition_valued_matches_build_proofs_for_every_branch() {
++    check("theorem self (b : Bool) : b = b := match b with | true => by rfl | false => by rfl");
++    check(
++        "inductive Item where | number (n : Nat) | flag (b : Bool)\ntheorem self (x : Item) : x = x := match x with | .number n => by rfl | .flag b => by rfl",
++    );
++}
++#[test]
++fn all_branches_are_checked_even_when_the_discriminant_is_a_literal() {
++    for text in [
++        "def bad : Nat := match true with | true => 1 | false => \"wrong\"",
++        "def bad : Nat := match true with | true => 1 | false => (1 : String)",
++        "theorem bad : 1 = 2 := match true with | true => by rfl | false => by rfl",
++    ] {
++        let e = engine();
++        let root = e.logical_root(&KVMap::new());
++        let result = e.check_source_files(
++            &[text.as_bytes()],
++            &KVMap::new(),
++            SourceCheckLimits::new(limits()),
++        );
++        let error = result.expect_err("every branch must typecheck");
++        assert_eq!(
++            error.disposition(),
++            ("kernel-rejection", true, 1),
++            "{error:?}"
++        );
++        assert_eq!(e.logical_root(&KVMap::new()), root);
++    }
++}
++#[test]
++fn coverage_wrong_arity_unknown_constructors_and_bad_scopes_refuse_atomically() {
++    for text in [
++        "def bad (b : Bool) : Nat := match b with | true => 1",
++        "def bad (b : Bool) : Nat := match b with | true => 1 | true => 2 | false => 3",
++        "def bad (b : Bool) : Nat := match b with | true x => 1 | false => 0",
++        "def bad (b : Bool) : Nat := match b with | .bogus => 1 | _ => 0",
++        "def bad (b : Bool) : Nat := match b with | Nat.zero => 1 | _ => 0",
++        "def bad (b : Bool) : Nat := match b with | _ => 1 | false => 0",
++        "inductive Pair where | mk (x y : Nat)\ndef bad (p : Pair) : Nat := match p with | .mk x x => x",
++        "inductive Maybe where | nil | some (x : Nat)\ndef bad (m : Maybe) : Nat := match m with | .some x => x | .nil => x",
++    ] {
++        let e = engine();
++        let root = e.logical_root(&KVMap::new());
++        assert!(
++            !matches!(
++                e.check_source_files(
++                    &[text.as_bytes()],
++                    &KVMap::new(),
++                    SourceCheckLimits::new(limits())
++                ),
++                Ok(Outcome::Complete(_))
++            ),
++            "{text}"
++        );
++        assert_eq!(e.logical_root(&KVMap::new()), root);
++    }
++}
++
++#[test]
++fn recursive_branches_with_multiple_recursive_fields_keep_only_named_payloads_visible() {
++    check(
++        "inductive Tree where | leaf (n : Nat) | fork (left right : Tree)\ndef leftmost (t : Tree) : Tree := match t with | .leaf n => Tree.leaf n | .fork l r => l\ntheorem left : leftmost (Tree.fork (Tree.leaf 9) (Tree.leaf 4)) = Tree.leaf 9 := by rfl",
++    );
++}
++
++#[test]
++fn compact_large_nat_literals_and_zero_branches_are_checked_by_both_engines() {
++    check(
++        "def predecessor (n : Nat) : Nat := match n with | .zero => 0 | .succ k => k\ntheorem zero_ok : predecessor 0 = 0 := by rfl\ntheorem large_ok : predecessor 340282366920938463463374607431768211456 = 340282366920938463463374607431768211455 := by rfl",
++    );
++}
++
++#[test]
++fn lets_in_branches_and_matches_in_let_values_preserve_scope() {
++    check(
++        "def f (b : Bool) : Nat := match b with | true => let x := 7; x + 1 | false => 0\ntheorem yes : f true = 8 := by rfl",
++    );
++    check(
++        "def f (b : Bool) : Nat := let x := match b with | true => 7 | false => 2; x + 1\ntheorem no : f false = 3 := by rfl",
++    );
++    check(
++        "def f (b c : Bool) : Nat := match b with | true => let x := match c with | true => 7 | false => 2; x + 1 | false => 0\ntheorem no : f true false = 3 := by rfl",
++    );
++}
++
++#[test]
++fn redundant_catch_all_cannot_hide_an_unchecked_branch() {
++    let e = engine();
++    let root = e.logical_root(&KVMap::new());
++    let result = e.check_source_files(
++        &[b"def f (b : Bool) : Nat := match b with | true => 0 | false => 1 | _ => (0 : String)"],
++        &KVMap::new(),
++        SourceCheckLimits::new(limits()),
++    );
++    assert!(result.is_err());
++    assert_eq!(e.logical_root(&KVMap::new()), root);
++}
++
++#[test]
++fn matching_in_tactics_and_lambda_arguments_preserves_checked_proof_terms() {
++    check(
++        "theorem bool_refl (b : Bool) : b = b := by exact (match b with | true => rfl | false => rfl)",
++    );
++    check(
++        "def applied (b : Bool) : Nat := (fun x => x + 1) (match b with | true => 5 | false => 8)\ntheorem yes : applied true = 6 := by rfl",
++    );
++}
++
++#[test]
++fn annotated_branch_lets_and_nested_let_values_keep_their_own_separators() {
++    check(
++        "def f (b : Bool) : Nat := match b with | true => let x : Nat := 7; x + 1 | false => 0\ntheorem yes : f true = 8 := by rfl",
++    );
++    check(
++        "def f (b : Bool) : Nat := let x := match b with | true => let y := 4; y + 1 | false => 0; x + 2\ntheorem yes : f true = 7 := by rfl",
++    );
++}
++
++#[test]
++fn failed_matches_cannot_publish_a_successful_prefix_across_files() {
++    let e = engine();
++    let root = e.logical_root(&KVMap::new());
++    let prefix = b"inductive Branch where | left (n : Nat) | right (n : Nat)\ndef value (b : Branch) : Nat := match b with | .left n => n | .right n => n + 1";
++    let good = b"theorem result : value (Branch.right 4) = 5 := by rfl";
++    let bad = b"theorem wrong : value (Branch.right 4) = 4 := by rfl";
++    for (suffix, success) in [
++        (good.as_slice(), true),
++        (bad.as_slice(), false),
++        (good.as_slice(), true),
++    ] {
++        let result = e.check_source_files(
++            &[prefix, suffix],
++            &KVMap::new(),
++            SourceCheckLimits::new(limits()),
++        );
++        if success {
++            let result = result.unwrap().into_complete().unwrap();
++            assert_eq!(result.commands, 3);
++            assert_eq!(result.theorems, 1);
++        } else {
++            assert_eq!(
++                result.unwrap_err().disposition(),
++                ("kernel-rejection", true, 1)
++            );
++        }
++        assert_eq!(e.logical_root(&KVMap::new()), root);
++        assert!(!e.environment().contains(&Name::from_components(["Branch"])));
++    }
++}
++
++#[test]
++fn a_match_resource_stop_is_not_a_kernel_rejection_or_partial_success() {
++    let e = engine();
++    let root = e.logical_root(&KVMap::new());
++    let mut bound = limits();
++    bound.kernel.steps = 1;
++    let result = e.check_source_files(
++        &[b"def f (b : Bool) : Nat := match b with | true => 1 | false => 0"],
++        &KVMap::new(),
++        SourceCheckLimits::new(bound),
++    );
++    match result {
++        Ok(Outcome::Inconclusive(_)) => {}
++        Err(error) => assert!(
++            matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
++            "{error:?}"
++        ),
++        other => panic!("expected a typed nonanswer: {other:?}"),
++    }
++    assert_eq!(e.logical_root(&KVMap::new()), root);
++}
+diff --git a/crates/fln-cli/tests/source_check.rs b/crates/fln-cli/tests/source_check.rs
+--- a/crates/fln-cli/tests/source_check.rs
++++ b/crates/fln-cli/tests/source_check.rs
+@@ -516,3 +516,46 @@
+         }
+     }
+ }
++
++#[test]
++fn installed_binary_checks_constructor_matches_and_refuses_an_invalid_unused_branch() {
++    let prefix = file(
++        "inductive Item (A : Type) where | none | some (value : A)\n\
++         def get (item : Item Nat) : Nat := match item with | .none => 0 | .some n => n\n\
++         def predecessor (n : Nat) : Nat := match n with | .zero => 0 | .succ k => k",
++    );
++    let good = file(
++        "theorem payload : get (Item.some 12) = 12 := by rfl\ntheorem pred : predecessor 6 = 5 := by rfl",
++    );
++    let bad = file("def invalid : Nat := match true with | true => 0 | false => (0 : String)");
++    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
++        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
++            .args(["check-source", "--json"])
++            .arg(&prefix)
++            .arg(suffix)
++            .output()
++            .unwrap();
++        assert_eq!(
++            output.status.success(),
++            success,
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        if success {
++            let text = String::from_utf8(output.stdout).unwrap();
++            for expected in [
++                "\"commands\":5",
++                "\"theorems\":2",
++                "\"files\":2",
++                "\"authority\":true",
++                "\"executed\":false",
++            ] {
++                assert!(text.contains(expected), "{text}");
++            }
++            assert!(output.stderr.is_empty());
++        } else {
++            assert!(output.stdout.is_empty());
++            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
++        }
++    }
++}
+diff --git a/examples/native_pattern_matching.lean b/examples/native_pattern_matching.lean
+--- /dev/null
++++ b/examples/native_pattern_matching.lean
+@@ -0,0 +1,41 @@
++inductive Maybe (A : Type) where
++  | none
++  | some (value : A)
++
++def get (item : Maybe Nat) : Nat := match item with
++  | .none => 0
++  | .some value => value
++
++theorem payload_ok : get (Maybe.some 23) = 23 := by rfl
++theorem none_ok : get Maybe.none = 0 := by rfl
++
++inductive Tree where
++  | leaf (value : Nat)
++  | fork (left right : Tree)
++
++def leftBranch (tree : Tree) : Tree := match tree with
++  | .leaf value => Tree.leaf value
++  | .fork left right => left
++
++theorem branch_ok : leftBranch (Tree.fork (Tree.leaf 7) (Tree.leaf 9)) = Tree.leaf 7 := by rfl
++
++def predecessor (n : Nat) : Nat := match n with
++  | .zero => 0
++  | .succ previous => previous
++
++theorem zero_ok : predecessor 0 = 0 := by rfl
++theorem large_ok : predecessor 340282366920938463463374607431768211456 = 340282366920938463463374607431768211455 := by rfl
++
++structure Package where
++  carrier : Type
++  value : carrier
++
++def unpack (package : Package) : package.carrier := match package with
++  | Package.mk carrier value => value
++
++def packed : Package := { carrier := Nat, value := 17 }
++theorem dependent_ok : unpack packed = 17 := by rfl
++
++theorem bool_refl (b : Bool) : b = b := match b with
++  | true => by rfl
++  | false => by rfl
+diff --git a/docs/NATIVE_PATTERN_MATCHING.md b/docs/NATIVE_PATTERN_MATCHING.md
+--- /dev/null
++++ b/docs/NATIVE_PATTERN_MATCHING.md
+@@ -0,0 +1,80 @@
++# Native constructor matching
++
++The import-free source checker accepts single-family `inductive` declarations and
++exhaustive constructor `match` expressions. These are ordinary checked inductive
++blocks and recursor applications, not Reference-toolchain calls or an additional
++proof-admission authority.
++
++```lean
++inductive Maybe (A : Type) where
++  | none
++  | some (value : A)
++
++def get (item : Maybe Nat) : Nat := match item with
++  | .none => 0
++  | .some value => value
++
++theorem payload_ok : get (Maybe.some 23) = 23 := by rfl
++```
++
++Run `fln check-source --json examples/native_pattern_matching.lean`. The installed
++command checks the whole file through K1 and the independent checker and does not
++compile or execute the source program. Ordinary checking still performs conversion
++to verify the example's computations and proofs.
++
++## What the implementation supports
++
++Each match has one discriminant. Patterns are flat constructor applications with
++variable or wildcard fields, qualified names such as `Maybe.some`, or expected-
++family names such as `.some`. The builtin Bool patterns `true` and `false` also
++work. A final `_` or single variable can cover all remaining constructors; a named
++catch-all is bound to the actual constructor value in each resulting branch.
++Duplicate constructors, wrong arities, duplicate variables, foreign constructors,
++missing alternatives and a redundant catch-all are explicit refusals.
++
++Branches have separate local scopes. Payload types may depend on parameters or
++earlier payloads. Dependent expected results generalize a local discriminant into
++the recursor motive, so a match on `package : Package` can produce a value of type
++`package.carrier`. Function-valued results, proof-valued results, inferred result
++types, branch-local let telescopes, nested match expressions, record values and
++matches in tactic terms are supported. Nested matches are parenthesized or their
++alternatives use distinct indentation; multiline alternatives at one level align.
++
++Direct uniform recursive fields receive the recursor's real induction-hypothesis
++binders, hidden from ordinary match syntax. Matching a recursive datatype does not
++yet implement recursive source functions or a termination checker. Cases return
++ordinary core terms and **every written branch remains checked**, including a bad
++branch unreachable for a literal discriminant. No branch is dropped based on
++executing the scrutinee in the elaborator.
++
++The full source seed now admits Nat as its ordinary recursive inductive family,
++with `Nat.zero`, `Nat.succ` and its regenerated dependent recursor. The tiny raw
++Nat elaboration fixture remains separate and unchanged. The independent checker's
++Nat-literal reduction exposes one constructor layer, retaining the predecessor as
++a compact arbitrary-precision literal. It does not allocate a unary chain. The
++TCB audit no longer reports Nat itself as a source-seed axiom; other explicit
++primitive signatures still appear in the audit and are not hidden.
++
++## Scope and evidence boundaries
++
++This is a bounded constructor-match compiler, not complete Lean match elaboration.
++Multiple discriminants, nested constructor patterns in a single alternative,
++numeric patterns, guards, indexed/mutual/nested families, inaccessible patterns,
++explicit motives, `match h : ...`, dependent generalization of other hypotheses,
++equation-compiler recursive definitions and structural/well-founded termination
++checking remain outside this increment. Numeric Nat values can be scrutinized
++with `.zero` and `.succ previous`; decimal-pattern syntax is not implemented.
++
++Resource bounds and checker nonanswers remain distinct from rejection. Parsing
++nested matches uses heap worklists, and elaboration shares the existing bounded
++term task machine. A failed branch, later command or later supplied file exposes
++no successful prefix environment. Existing `check-source` restrictions on imports
++and metaprogramming remain unchanged.
++
++Tests are the real `fln::source_inductive`, `fln::source_matching`, parser matching
++unit tests, independent-checker literal-elimination tests, and installed CLI
++`source_check` tests. They include deep parser inputs, large Nat literals, both
++branches of constructors, wrong branch types, invalid unused annotations, scope
++isolation, resource nonanswers, multi-file failure/recovery and actual recursor
++dependencies. Passing these tests is scoped evidence, not full language parity or
++a whole-workspace test/release-gate claim.
