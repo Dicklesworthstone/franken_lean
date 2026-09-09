@@ -198,9 +198,10 @@ fn simp_only_keeps_ordinary_definitions_closed_without_an_explicit_rule() {
         "theorem bad : identity 5 = 5 := by simp only []",
         "theorem bad (x : Nat) : identity x = x := by simp only []",
     ] {
-        let error = base
-            .admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
-            .unwrap_err();
+        let Err(error) = base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+        else {
+            panic!("automatic simplification unfolded an ordinary definition: {source}");
+        };
         assert!(
             error.to_string().contains("simp made no progress"),
             "{error}"
@@ -229,6 +230,44 @@ fn simp_only_arithmetic_resource_stop_remains_inconclusive() {
         .unwrap_err();
     assert_eq!(error.disposition(), ("inconclusive", false, 3));
     assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn automatic_reflexivity_preserves_beta_and_zeta_reduction() {
+    let base = engine();
+    for source in [
+        "theorem beta (x : Nat) (h : x = 5) : (fun n : Nat => n) 5 = x := by rw [h]",
+        "theorem zeta (x : Nat) (h : x = 5) : (let n : Nat := 5; n) = x := by rw [h]",
+        "theorem beta : (fun n : Nat => n) 5 = 5 := by simp only []",
+        "theorem zeta : (let n : Nat := 5; n) = 5 := by simp only []",
+    ] {
+        admit(&base, source);
+    }
+}
+
+#[test]
+fn automatic_reflexivity_keeps_ordinary_goal_aliases_closed() {
+    let base = admit(&engine(), "def SelfEq (x : Nat) : Prop := x = x");
+    let root = base.logical_root(&KVMap::new());
+    for (source, diagnostic) in [
+        (
+            "theorem bad (x : Nat) (h : x = 5) : SelfEq x := by rw [h]",
+            "unsolved goals",
+        ),
+        (
+            "theorem bad (x : Nat) : SelfEq x := by simp only []",
+            "simp made no progress",
+        ),
+    ] {
+        let Err(error) = base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())
+        else {
+            panic!("automatic reflexivity unfolded an ordinary goal alias: {source}");
+        };
+        assert!(error.to_string().contains(diagnostic), "{error}");
+    }
+    admit(&base, "theorem explicit (x : Nat) : SelfEq x := by rfl");
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(!base.environment().contains(&Name::from_components(["bad"])));
 }
 
 #[test]

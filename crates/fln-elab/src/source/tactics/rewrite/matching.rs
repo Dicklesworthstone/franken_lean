@@ -222,8 +222,8 @@ impl Context {
                 }
                 let occurrence = trial.instantiate(term)?;
                 if inside_out {
-                    let (_, _, from, to) = equality_target(&type_)
-                        .expect("instantiated equality retains its shape");
+                    let (_, _, from, to) =
+                        equality_target(&type_).expect("instantiated equality retains its shape");
                     let replacement = if reverse { from } else { to };
                     if trial.rewrite_same(&occurrence, &replacement)? {
                         return Ok(None);

@@ -88,9 +88,10 @@ fn rw_arithmetic_does_not_widen_definition_transparency_or_prove_false_equalitie
         "theorem bad (x y : Nat) (h : x = y) : identity x = y := by rw [h]",
         "theorem bad (x : Nat) (h : x = 5) : identity x = 5 := by rw [h]",
     ] {
-        let error = base
-            .admit_source_declaration(source.as_bytes(), &options, limits())
-            .unwrap_err();
+        let Err(error) = base.admit_source_declaration(source.as_bytes(), &options, limits())
+        else {
+            panic!("automatic rewriting exceeded reducible reflexivity: {source}");
+        };
         assert!(error.to_string().contains("unsolved goals"), "{error}");
     }
     for source in [
