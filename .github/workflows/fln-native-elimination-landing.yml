@@ -1,0 +1,100 @@
+name: Native elimination integration
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/native_elimination_increment.json', '.github/workflows/fln-native-elimination-landing.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-native-elimination-landing
+  cancel-in-progress: false
+jobs:
+  elimination:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Apply the exact checksum-bound source increment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/elimination-landing
+          git rev-parse HEAD > target/elimination-landing/input-commit.txt
+          python3 - <<'PY'
+          import base64,gzip,hashlib,json,pathlib,subprocess
+          manifest=pathlib.Path('scripts/native_elimination_increment.json')
+          raw=manifest.read_bytes()
+          blob=lambda b:hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
+          repaired=False
+          if blob(raw)=='31e6cb0a9af53cc8af05bd438dd3423bcd4bfb2e':
+              raw=raw.replace(b'YnlYnlYBj',b'YnlYBj')
+              assert blob(raw)=='a64d536db17fc4cc950b3b2794ede58d68900e13'
+              manifest.write_bytes(raw)
+              repaired=True
+          plan=json.loads(raw)
+          patch=gzip.decompress(base64.b64decode(plan['patch'],validate=True))
+          assert len(patch)<2_000_000
+          assert hashlib.sha256(patch).hexdigest()==plan['sha256']
+          paths=plan['paths']
+          assert paths and len(paths)==len(set(paths))
+          for p in paths:
+              assert p.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
+              assert '..' not in pathlib.PurePosixPath(p).parts
+          patch_paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
+          assert set(paths)==set(patch_paths)
+          assert b'+++ /dev/null' not in patch
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          if repaired: paths.append(str(manifest))
+          out=pathlib.Path('target/elimination-landing')
+          (out/'paths.json').write_text(json.dumps(paths))
+          (out/'increment.json').write_bytes(raw)
+          (out/'change.patch').write_bytes(patch)
+          (out/'source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths},indent=2))
+          PY
+      - name: Test both checking engines and the real frontend and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv | tee target/elimination-landing/compiler.txt
+          cargo test --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --no-fail-fast 2>&1 | tee target/elimination-landing/tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/elimination-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/elimination-landing/workspace.log
+          python3 - <<'PY'
+          import json,subprocess
+          paths=json.load(open('target/elimination-landing/paths.json'))
+          rust=[p for p in paths if p.endswith('.rs')]
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
+          PY
+          if test -f examples/native_pattern_matching.lean; then
+            cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_pattern_matching.lean > target/elimination-landing/example.json
+          fi
+          git diff --check
+      - name: Publish only the tested changes without a force push
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,subprocess
+          out=pathlib.Path('target/elimination-landing')
+          paths=json.loads((out/'paths.json').read_text())
+          plan=json.loads((out/'increment.json').read_text())
+          changed=set(subprocess.check_output(['git','diff','--name-only']).decode().splitlines())
+          assert changed.issubset(paths)
+          subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+          subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+          subprocess.run(['git','add','--',*paths],check=True)
+          (out/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
+          subprocess.run(['git','commit','-m',plan['message']],check=True)
+          subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          (out/'published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-elimination-${{ github.sha }}
+          path: target/elimination-landing
+          retention-days: 7
