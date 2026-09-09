@@ -63,18 +63,18 @@ impl std::fmt::Display for RecordError {
 }
 impl std::error::Error for RecordError {}
 
-struct Builder {
-    remaining: usize,
+pub(crate) struct Builder {
+    pub(crate) remaining: usize,
 }
 impl Builder {
-    fn tick(&mut self) -> Result<(), RecordError> {
+    pub(crate) fn tick(&mut self) -> Result<(), RecordError> {
         self.remaining = self
             .remaining
             .checked_sub(1)
             .ok_or(RecordError::ResourceLimit)?;
         Ok(())
     }
-    fn scan(
+    pub(crate) fn scan(
         &mut self,
         expr: &Expr,
         allowed: &HashSet<FVarId>,
@@ -123,7 +123,7 @@ impl Builder {
         }
         Ok(())
     }
-    fn close(
+    pub(crate) fn close(
         &mut self,
         locals: &[LocalDecl],
         mut body: Expr,
@@ -149,7 +149,12 @@ impl Builder {
         Ok(body)
     }
 }
-fn fresh(used: &mut HashSet<FVarId>, user_name: &str, type_: Expr, style: BinderInfo) -> LocalDecl {
+pub(crate) fn fresh(
+    used: &mut HashSet<FVarId>,
+    user_name: &str,
+    type_: Expr,
+    style: BinderInfo,
+) -> LocalDecl {
     let mut ordinal = 0;
     let id = loop {
         let id = FVarId(Name::num(Name::from_components(["_fln_record"]), ordinal));
@@ -167,10 +172,10 @@ fn fresh(used: &mut HashSet<FVarId>, user_name: &str, type_: Expr, style: Binder
         index: 0,
     }
 }
-fn fv(local: &LocalDecl) -> Expr {
+pub(crate) fn fv(local: &LocalDecl) -> Expr {
     Expr::fvar(local.id.clone())
 }
-fn app(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
+pub(crate) fn app(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments.into_iter().fold(head, Expr::app)
 }
 
