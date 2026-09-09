@@ -1,0 +1,1106 @@
+diff --git a/crates/fln-cli/tests/source_check.rs b/crates/fln-cli/tests/source_check.rs
+index a7d5aa43ebfb1243a12d28668322e38cfb83aece..93a912d83e9a599023f6563a10545ae15ce2f90c 100644
+--- a/crates/fln-cli/tests/source_check.rs
++++ b/crates/fln-cli/tests/source_check.rs
+@@ -475,3 +475,44 @@ fn installed_binary_checks_type_position_instances_and_header_refusal_with_recov
+         );
+     }
+ }
++
++#[test]
++fn installed_binary_checks_defaults_updates_and_late_failure_without_partial_success() {
++    let prefix = file(
++        "structure Config where\n  base : Nat := 3\n  twice : Nat := base + base\ndef custom : Config := { base := 7 }\ndef copied := { custom with base := 20 }",
++    );
++    let good = file(
++        "theorem ok : custom.twice = 14 := by rfl\ntheorem retained : copied.twice = 14 := by rfl",
++    );
++    let bad = file("theorem wrong : copied.twice = 40 := by rfl");
++    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
++        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
++            .args(["check-source", "--json"])
++            .arg(&prefix)
++            .arg(suffix)
++            .output()
++            .unwrap();
++        assert_eq!(
++            output.status.success(),
++            success,
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        if success {
++            let text = String::from_utf8(output.stdout).unwrap();
++            for expected in [
++                "\"commands\":5",
++                "\"theorems\":2",
++                "\"files\":2",
++                "\"authority\":true",
++                "\"executed\":false",
++            ] {
++                assert!(text.contains(expected), "{text}");
++            }
++            assert!(output.stderr.is_empty());
++        } else {
++            assert!(output.stdout.is_empty());
++            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
++        }
++    }
++}
+diff --git a/crates/fln-elab/src/instances.rs b/crates/fln-elab/src/instances.rs
+index 7e871372ab7824cc2bcb70926f5e998f12385d37..e5426b88bf91f79c44d430dde611545eb9725061 100644
+--- a/crates/fln-elab/src/instances.rs
++++ b/crates/fln-elab/src/instances.rs
+@@ -267,7 +267,7 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], InstanceRegistry
+     *bytes = tail;
+     Ok(head)
+ }
+-fn write_name(name: &Name, out: &mut Vec<u8>) -> Result<(), InstanceRegistryError> {
++pub(crate) fn write_name(name: &Name, out: &mut Vec<u8>) -> Result<(), InstanceRegistryError> {
+     let mut parts = Vec::new();
+     let mut cursor = name.clone();
+     while !cursor.is_anonymous() {
+@@ -311,7 +311,7 @@ fn write_name(name: &Name, out: &mut Vec<u8>) -> Result<(), InstanceRegistryErro
+     }
+     Ok(())
+ }
+-fn read_name(bytes: &mut &[u8]) -> Result<Name, InstanceRegistryError> {
++pub(crate) fn read_name(bytes: &mut &[u8]) -> Result<Name, InstanceRegistryError> {
+     let count = usize::from(u16::from_le_bytes(
+         take(bytes, 2)?
+             .try_into()
+diff --git a/crates/fln-elab/src/records.rs b/crates/fln-elab/src/records.rs
+index 3455d1b79cb8be8fcdece04e08700792f066a750..d57e41ab80c2a2dd3d547debd98c6c9659064be5 100644
+--- a/crates/fln-elab/src/records.rs
++++ b/crates/fln-elab/src/records.rs
+@@ -3,6 +3,8 @@
+ //! This module owns no admission authority. The generated block (including its
+ //! proposed eliminator) and each projection must pass the ordinary kernel and
+ //! the caller's independent-checker policy before any successor is exposed.
++pub mod defaults;
++
+ use crate::lctx::LocalDecl;
+ use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
+ use fln_core::level::Level;
+diff --git a/crates/fln-elab/src/records/defaults.rs b/crates/fln-elab/src/records/defaults.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..53ed0ace600b298321b71e4c70ea80818ace9e64
+--- /dev/null
++++ b/crates/fln-elab/src/records/defaults.rs
+@@ -0,0 +1,333 @@
++//! References to checked field-default helpers in an immutable native journal.
++//!
++//! A matching helper name alone never enables a default. Registration is separate
++//! from candidate construction and only refers to already admitted definitions.
++//! This schema is native, not the Reference structure-extension serialization.
++use super::RecordError;
++use crate::instances::{InstanceRegistryError, read_name, write_name};
++use fln_core::expr::{Expr, ExprNode};
++use fln_core::name::Name;
++use fln_env::constants::{ConstantInfo, DefinitionSafety};
++use fln_env::environment::Environment;
++use fln_env::extensions::{
++    CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
++};
++use std::collections::{BTreeMap, HashSet};
++
++const MAGIC: &[u8] = b"FLNRDEF\x01";
++const MAX_ROWS: usize = 16_384;
++const MAX_PAYLOAD: usize = 65_536;
++const MAX_BYTES: usize = 16 * 1024 * 1024;
++const MAX_NODES: usize = 100_000;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RecordDefault {
++    pub record: Name,
++    pub field: u32,
++    pub helper: Name,
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct RecordDefaults {
++    helpers: BTreeMap<(Name, u32), Name>,
++}
++
++fn extension_name() -> Name {
++    Name::from_components(["FrankenLean", "sourceRecordDefaults", "v1"])
++}
++fn descriptor() -> ExtensionDescriptor {
++    ExtensionDescriptor {
++        name: extension_name(),
++        merge: MergeSemantics::AppendOrdered,
++        checkpoint: CheckpointSemantics::FullJournal,
++        provenance: PayloadProvenance::Understood,
++    }
++}
++fn codec_error(error: InstanceRegistryError) -> RecordError {
++    if error == InstanceRegistryError::Limit {
++        RecordError::ResourceLimit
++    } else {
++        RecordError::InvalidTelescope
++    }
++}
++fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], RecordError> {
++    if n > input.len() {
++        return Err(RecordError::InvalidTelescope);
++    }
++    let (part, rest) = input.split_at(n);
++    *input = rest;
++    Ok(part)
++}
++fn charge(remaining: &mut usize) -> Result<(), RecordError> {
++    *remaining = remaining.checked_sub(1).ok_or(RecordError::ResourceLimit)?;
++    Ok(())
++}
++fn scan(expr: &Expr, remaining: &mut usize) -> Result<(), RecordError> {
++    let mut pending = vec![expr];
++    let mut seen = HashSet::new();
++    while let Some(expr) = pending.pop() {
++        if !seen.insert(expr.allocation_identity()) {
++            continue;
++        }
++        charge(remaining)?;
++        match expr.node() {
++            ExprNode::App { f, a } => {
++                pending.push(a);
++                pending.push(f);
++            }
++            ExprNode::Lam {
++                binder_type, body, ..
++            }
++            | ExprNode::ForallE {
++                binder_type, body, ..
++            } => {
++                pending.push(body);
++                pending.push(binder_type);
++            }
++            ExprNode::LetE {
++                type_, value, body, ..
++            } => {
++                pending.push(body);
++                pending.push(value);
++                pending.push(type_);
++            }
++            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
++pub fn helper_name(record: &Name, field: &Name) -> Name {
++    Name::str(record.append_core(field), "_default")
++}
++
++/// Independently bind registration to the constructor's field telescope. This
++/// checks metadata identity; it does not check or admit a candidate definition.
++fn validate(
++    env: &Environment,
++    row: &RecordDefault,
++    remaining: &mut usize,
++) -> Result<(), RecordError> {
++    let Some(ConstantInfo::Induct(family)) = env.find(&row.record) else {
++        return Err(RecordError::InvalidTelescope);
++    };
++    if family.is_rec || family.is_unsafe || family.num_indices != 0 || family.ctors.len() != 1 {
++        return Err(RecordError::InvalidTelescope);
++    }
++    let Some(ConstantInfo::Ctor(ctor)) = env.find(&family.ctors[0]) else {
++        return Err(RecordError::InvalidTelescope);
++    };
++    if ctor.is_unsafe
++        || ctor.induct != row.record
++        || row.field >= ctor.num_fields
++        || ctor.num_params != family.num_params
++    {
++        return Err(RecordError::InvalidTelescope);
++    }
++    let Some(ConstantInfo::Defn(helper)) = env.find(&row.helper) else {
++        return Err(RecordError::InvalidTelescope);
++    };
++    if helper.safety != DefinitionSafety::Safe
++        || helper.base.level_params != family.base.level_params
++    {
++        return Err(RecordError::InvalidTelescope);
++    }
++    scan(&ctor.base.type_, remaining)?;
++    scan(&helper.base.type_, remaining)?;
++    let prefix_len = family
++        .num_params
++        .checked_add(row.field)
++        .ok_or(RecordError::ResourceLimit)?;
++    if prefix_len > 256 {
++        return Err(RecordError::ResourceLimit);
++    }
++    let mut prefix = Vec::new();
++    let mut cursor = &ctor.base.type_;
++    for _ in 0..prefix_len {
++        charge(remaining)?;
++        let ExprNode::ForallE {
++            binder_name,
++            binder_type,
++            binder_info,
++            body,
++        } = cursor.node()
++        else {
++            return Err(RecordError::InvalidTelescope);
++        };
++        prefix.push((binder_name, binder_type, binder_info));
++        cursor = body;
++    }
++    let ExprNode::ForallE {
++        binder_name,
++        binder_type,
++        ..
++    } = cursor.node()
++    else {
++        return Err(RecordError::InvalidTelescope);
++    };
++    if row.helper != helper_name(&row.record, binder_name) {
++        return Err(RecordError::InvalidName);
++    }
++    let mut expected = binder_type.clone();
++    for (name, domain, style) in prefix.into_iter().rev() {
++        expected = Expr::forall_e(name.clone(), domain.clone(), expected, *style);
++    }
++    if helper.base.type_ != expected {
++        return Err(RecordError::InvalidTelescope);
++    }
++    Ok(())
++}
++
++impl RecordDefaults {
++    pub fn helper(&self, record: &Name, field: u32) -> Option<&Name> {
++        self.helpers.get(&(record.clone(), field))
++    }
++    pub fn read(env: &Environment) -> Result<Self, RecordError> {
++        let Some(extension) = env.extension(&extension_name()) else {
++            return Ok(Self::default());
++        };
++        if extension.descriptor != descriptor() {
++            return Err(RecordError::InvalidTelescope);
++        }
++        if extension.len() > MAX_ROWS {
++            return Err(RecordError::ResourceLimit);
++        }
++        let mut remaining = MAX_NODES;
++        let mut bytes_left = MAX_BYTES;
++        let mut registry = Self::default();
++        for entry in extension.entries() {
++            if entry.payload.len() > MAX_PAYLOAD {
++                return Err(RecordError::ResourceLimit);
++            }
++            bytes_left = bytes_left
++                .checked_sub(entry.payload.len())
++                .ok_or(RecordError::ResourceLimit)?;
++            let mut input: &[u8] = &entry.payload;
++            if take(&mut input, MAGIC.len())? != MAGIC {
++                return Err(RecordError::InvalidTelescope);
++            }
++            let record = read_name(&mut input).map_err(codec_error)?;
++            let field = u32::from_le_bytes(
++                take(&mut input, 4)?
++                    .try_into()
++                    .map_err(|_| RecordError::InvalidTelescope)?,
++            );
++            let helper = read_name(&mut input).map_err(codec_error)?;
++            if !input.is_empty() {
++                return Err(RecordError::InvalidTelescope);
++            }
++            let row = RecordDefault {
++                record,
++                field,
++                helper,
++            };
++            validate(env, &row, &mut remaining)?;
++            if registry
++                .helpers
++                .insert((row.record, row.field), row.helper)
++                .is_some()
++            {
++                return Err(RecordError::DuplicateField);
++            }
++        }
++        Ok(registry)
++    }
++}
++
++/// Publish a complete registration batch only after its record, projections and
++/// helper definitions have passed the caller's normal admission policy.
++pub fn register_defaults(
++    env: &Environment,
++    rows: &[RecordDefault],
++) -> Result<Environment, RecordError> {
++    if rows.is_empty() {
++        return Ok(env.clone());
++    }
++    let mut registry = RecordDefaults::read(env)?;
++    if registry.helpers.len().saturating_add(rows.len()) > MAX_ROWS {
++        return Err(RecordError::ResourceLimit);
++    }
++    let mut remaining = MAX_NODES;
++    let mut bytes_left = MAX_BYTES;
++    if let Some(extension) = env.extension(&extension_name()) {
++        for entry in extension.entries() {
++            bytes_left = bytes_left
++                .checked_sub(entry.payload.len())
++                .ok_or(RecordError::ResourceLimit)?;
++        }
++    }
++    let mut payloads = Vec::new();
++    for row in rows {
++        validate(env, row, &mut remaining)?;
++        if registry
++            .helpers
++            .insert((row.record.clone(), row.field), row.helper.clone())
++            .is_some()
++        {
++            return Err(RecordError::DuplicateField);
++        }
++        let mut payload = MAGIC.to_vec();
++        write_name(&row.record, &mut payload).map_err(codec_error)?;
++        payload.extend(row.field.to_le_bytes());
++        write_name(&row.helper, &mut payload).map_err(codec_error)?;
++        if payload.len() > MAX_PAYLOAD {
++            return Err(RecordError::ResourceLimit);
++        }
++        bytes_left = bytes_left
++            .checked_sub(payload.len())
++            .ok_or(RecordError::ResourceLimit)?;
++        payloads.push(payload);
++    }
++    let mut out = if env.extension(&extension_name()).is_none() {
++        env.register_extension(descriptor())
++            .map_err(|_| RecordError::InvalidTelescope)?
++    } else {
++        env.clone()
++    };
++    for payload in payloads {
++        out = out
++            .push_extension_entry(&extension_name(), payload)
++            .map_err(|_| RecordError::InvalidTelescope)?;
++    }
++    Ok(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn malformed_default_metadata_never_becomes_an_empty_registry() {
++        for payload in [
++            Vec::new(),
++            b"FLNRDEF\x02".to_vec(),
++            [MAGIC, &[0, 0]].concat(),
++        ] {
++            let env = Environment::new()
++                .register_extension(descriptor())
++                .unwrap()
++                .push_extension_entry(&extension_name(), payload)
++                .unwrap();
++            assert!(RecordDefaults::read(&env).is_err());
++        }
++        let mut foreign = descriptor();
++        foreign.provenance = PayloadProvenance::Opaque;
++        let env = Environment::new().register_extension(foreign).unwrap();
++        assert!(RecordDefaults::read(&env).is_err());
++    }
++    #[test]
++    fn unadmitted_helpers_cannot_be_registered() {
++        let env = Environment::new();
++        let record = Name::from_components(["Missing"]);
++        let row = RecordDefault {
++            helper: helper_name(&record, &Name::from_components(["value"])),
++            record,
++            field: 0,
++        };
++        assert!(register_defaults(&env, &[row]).is_err());
++        assert_eq!(
++            RecordDefaults::read(&env).unwrap(),
++            RecordDefaults::default()
++        );
++    }
++}
+diff --git a/crates/fln-elab/src/source/record.rs b/crates/fln-elab/src/source/record.rs
+index 6838d99a0a71e4ea2e887631c906c7dfdb04a801..8642dda8d16ef58cf952723ea99223467dce16a4 100644
+--- a/crates/fln-elab/src/source/record.rs
++++ b/crates/fln-elab/src/source/record.rs
+@@ -1,6 +1,7 @@
+ //! Source record signatures elaborate through the same bidirectional context as
+ //! ordinary definitions. Result universes follow field domains unless explicit.
+ use super::*;
++use crate::records::defaults::{RecordDefault, helper_name};
+ use crate::records::{RecordBudget, RecordSpec, record_declarations};
+ 
+ #[derive(Debug)]
+@@ -9,6 +10,8 @@ pub struct SourceRecord {
+     pub is_class: bool,
+     /// The inductive block followed by each projection, all still untrusted.
+     pub declarations: Vec<Declaration>,
++    /// References only: the caller registers these after admitting the full batch.
++    pub defaults: Vec<RecordDefault>,
+ }
+ 
+ pub fn is_record(syntax: &Syntax) -> bool {
+@@ -118,6 +121,8 @@ pub fn elaborate_record(
+         )));
+     }
+     let mut output = Vec::new();
++    let mut defaults = Vec::new();
++    let mut helpers = Vec::new();
+     for field in fields {
+         context.tick()?;
+         let parts = expect_node(
+@@ -127,7 +132,20 @@ pub fn elaborate_record(
+             "named structure field",
+         )?;
+         empty_modifiers(&parts[0])?;
+-        expect_empty_null(&parts[3], "unsupported field default")?;
++        let default = match expect_null_args(&parts[3], "field default")? {
++            [] => None,
++            [syntax] => {
++                let parts = expect_node(
++                    syntax,
++                    &parser_kind(&["Term", "binderDefault"]),
++                    2,
++                    "field default value",
++                )?;
++                expect_atom(&parts[0], ":=", "field default assignment")?;
++                Some(&parts[1])
++            }
++            _ => return Err(failure(SourceInferenceError::Scope)),
++        };
+         let Syntax::Ident { val: user_name, .. } = &parts[1] else {
+             return Err(failure(SourceInferenceError::Scope));
+         };
+@@ -142,6 +160,59 @@ pub fn elaborate_record(
+         let annotation = optional_type_syntax(&sig[1])?
+             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+         let mut domain = context.type_term(annotation)?;
++        if let Some(syntax) = default {
++            let term = context.term(syntax, Some(domain.clone()))?;
++            // Preserve the declared type even when the default is never selected.
++            // Its ordinary helper declaration must still pass kernel checking.
++            let mut term = context.finish(Typed {
++                value: term.value,
++                type_: domain.clone(),
++            })?;
++            let locals = context.txn.lctx.decls().to_vec();
++            for (index, local) in locals.iter().enumerate().rev() {
++                context.tick()?;
++                let local_type = context.instantiate(&local.type_)?;
++                let style = if index < parameters.len() && local.binder_info == BinderInfo::Default
++                {
++                    BinderInfo::Implicit
++                } else {
++                    local.binder_info
++                };
++                term.value = term
++                    .value
++                    .abstract_fvar(&local.id, 0)
++                    .map_err(|_| failure(SourceInferenceError::Scope))?;
++                term.type_ = term
++                    .type_
++                    .abstract_fvar(&local.id, 0)
++                    .map_err(|_| failure(SourceInferenceError::Scope))?;
++                term.value = Expr::lam(
++                    local.user_name.clone(),
++                    local_type.clone(),
++                    term.value,
++                    style,
++                );
++                term.type_ = Expr::forall_e(local.user_name.clone(), local_type, term.type_, style);
++            }
++            let helper = helper_name(name, user_name);
++            helpers.push(Declaration::Defn(DefinitionVal {
++                base: ConstantVal {
++                    name: helper.clone(),
++                    level_params: Vec::new(),
++                    type_: term.type_,
++                },
++                value: term.value,
++                hints: ReducibilityHints::Abbrev,
++                safety: DefinitionSafety::Safe,
++                all: vec![helper.clone()],
++            }));
++            defaults.push(RecordDefault {
++                record: name.clone(),
++                field: u32::try_from(output.len())
++                    .map_err(|_| failure(SourceInferenceError::ResourceLimit))?,
++                helper,
++            });
++        }
+         for arg in arguments.iter().rev() {
+             context.tick()?;
+             domain = domain
+@@ -204,11 +275,13 @@ pub fn elaborate_record(
+         result_level,
+         is_class,
+     };
+-    let declarations =
++    let mut declarations =
+         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
++    declarations.extend(helpers);
+     Ok(SourceRecord {
+         name: name.clone(),
+         is_class,
+         declarations,
++        defaults,
+     })
+ }
+diff --git a/crates/fln-elab/src/source/record_terms.rs b/crates/fln-elab/src/source/record_terms.rs
+index 5f26c587e05ea8c66b8c6e700b107e15270b4e45..272384b29af3c30894eae09f830d2c58c2280bcc 100644
+--- a/crates/fln-elab/src/source/record_terms.rs
++++ b/crates/fln-elab/src/source/record_terms.rs
+@@ -48,6 +48,8 @@ pub(super) struct RecordBuild<'a> {
+     sources: Vec<Typed>,
+     source_bindings: Vec<LocalDecl>,
+     saved_lctx: LocalContext,
++    defaults: Vec<Option<Name>>,
++    levels: Vec<Level>,
+ }
+ pub(super) enum RecordStep<'a> {
+     Field {
+@@ -417,6 +419,12 @@ impl Context {
+                 return Err(error(RecordTermError::UnknownField(label.clone())));
+             }
+         }
++        let registry = crate::records::defaults::RecordDefaults::read(&self.txn.env)
++            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
++        let defaults = (0..ctor.num_fields)
++            .map(|field| registry.helper(name, field).cloned())
++            .collect();
++        let levels = levels.clone();
+         // Bind update sources exactly once. Even an unused source remains a
+         // checked let value, so an ill-typed update source cannot disappear.
+         let saved_lctx = self.txn.lctx.clone();
+@@ -471,6 +479,8 @@ impl Context {
+             sources: bound_sources,
+             source_bindings,
+             saved_lctx,
++            defaults,
++            levels,
+         })
+     }
+ 
+@@ -539,6 +549,48 @@ impl Context {
+                     Err(error) => return Err(error),
+                 }
+             }
++            let index = state
++                .defaults
++                .len()
++                .checked_sub(state.remaining as usize)
++                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
++            if let Some(helper) = &state.defaults[index] {
++                let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(helper).cloned()
++                else {
++                    return Err(failure(SourceInferenceError::Scope));
++                };
++                let mut value = Typed {
++                    value: Expr::const_(helper.clone(), state.levels.clone()),
++                    type_: self.instantiate_params(
++                        &definition.base.type_,
++                        &definition.base.level_params,
++                        &state.levels,
++                    )?,
++                };
++                // Explicitly supply the actual parameters and preceding values,
++                // including instance parameters. Never re-search a dictionary.
++                let mut arguments = Vec::new();
++                let mut head = &state.constructor.value;
++                while let ExprNode::App { f, a } = head.node() {
++                    self.tick()?;
++                    arguments.push(a.clone());
++                    head = f;
++                }
++                for argument in arguments.into_iter().rev() {
++                    self.tick()?;
++                    let type_ = self.whnf(&value.type_)?;
++                    let ExprNode::ForallE { body, .. } = type_.node() else {
++                        return Err(failure(SourceInferenceError::Scope));
++                    };
++                    value.type_ = self.substitute(body, &argument)?;
++                    value.value = Expr::app(value.value, argument);
++                }
++                let value = self.finish_term(value, Some(binder_type))?;
++                return Ok(RecordStep::Copy {
++                    value,
++                    codomain: body.clone(),
++                });
++            }
+             return Err(error(RecordTermError::MissingField(binder_name.clone())));
+         };
+         Ok(RecordStep::Field {
+diff --git a/crates/fln-parse/src/records.rs b/crates/fln-parse/src/records.rs
+index 86742f7161fdcf48e1e15ebab6039b65d3d5aeea..dbcea0341d9c61155990dc14912ae9bef8695598 100644
+--- a/crates/fln-parse/src/records.rs
++++ b/crates/fln-parse/src/records.rs
+@@ -1,6 +1,6 @@
+ //! Bounded record/class declarations using the ordinary token leaves and types.
+ //! No source rewriting or fabricated definitions: field scopes survive as syntax.
+-//! Inheritance, custom constructors, field defaults and deriving remain explicit
++//! Inheritance, custom constructors and deriving remain explicit
+ //! refusals rather than ignored command suffixes.
+ use super::*;
+ use std::ops::Range;
+@@ -70,6 +70,27 @@ fn field(
+     }
+     let parameters =
+         bounded_binder_syntax(leaves, view, tokens, groups, DefinitionGrammar::Scalar)?;
++    let type_limit = type_end(&tokens[..range.end], colon, ":=");
++    let default = if type_limit < range.end {
++        let bounded_tokens = &tokens[..range.end];
++        let (bindings, body_start) = bounded_let_bindings(view, bounded_tokens, type_limit + 1)?;
++        null_node(vec![Syntax::node(
++            parser_kind(&["Term", "binderDefault"]),
++            vec![
++                leaves.leaf(type_limit)?,
++                bounded_value_syntax(
++                    leaves,
++                    view,
++                    bounded_tokens,
++                    bindings,
++                    body_start,
++                    DefinitionGrammar::Scalar,
++                )?,
++            ],
++        )])
++    } else {
++        null_node(Vec::new())
++    };
+     Ok(Syntax::node(
+         parser_kind(&["Command", "structSimpleBinder"]),
+         vec![
+@@ -79,10 +100,10 @@ fn field(
+                 parser_kind(&["Command", "optDeclSig"]),
+                 vec![
+                     null_node(parameters),
+-                    optional_type(leaves, view, tokens, colon..range.end)?,
++                    optional_type(leaves, view, tokens, colon..type_limit)?,
+                 ],
+             ),
+-            null_node(Vec::new()),
++            default,
+         ],
+     ))
+ }
+@@ -135,7 +156,7 @@ fn fields(
+                         return Err(refuse(view, tokens, index));
+                     }
+                 }
+-                "where" | "extends" | "deriving" | ":=" => return Err(refuse(view, tokens, index)),
++                "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
+                 _ => {}
+             }
+         }
+@@ -248,7 +269,7 @@ mod tests {
+             "structure A extends B where x : Nat",
+             "structure A where\nx : Nat",
+             "structure A where\n  x : Nat\n y : Nat",
+-            "structure A where\n  x : Nat := 0",
++            "structure A where\n  x : Nat :=",
+             "structure A where\n  x : Nat\nderiving Inhabited",
+             "structure A where\n  x Nat",
+             "class A where\n  x : (Nat",
+@@ -268,4 +289,26 @@ mod tests {
+             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
+         }
+     }
++    #[test]
++    fn default_bodies_preserve_crlf_comments_nested_literals_and_method_bindings() {
++        let text = "structure Config where\r\n  -- header\r\n  inner : Inner := { value := 7 }\r\n  twice : Nat := let x := inner.value; x + x\r\n  apply (x : Nat) : Nat := x + twice\r\n";
++        let parsed = parse_definition(text.as_bytes()).unwrap();
++        assert_eq!(parsed.reconstruct_original(), text.as_bytes());
++        assert_eq!(
++            parsed.reconstruct_normalized().unwrap(),
++            text.replace("\r\n", "\n").as_bytes()
++        );
++        assert!(parse_nat_definition(text.as_bytes()).is_err());
++    }
++    #[test]
++    fn malformed_defaults_are_not_silently_dropped() {
++        for text in [
++            "structure Config where\n  x : Nat :=",
++            "structure Config where\n  x : Nat := 1 := 2",
++            "structure Config where\n  x : Nat := let y := 1",
++            "structure Config where\n  x : Nat := { value := 2",
++        ] {
++            assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
++        }
++    }
+ }
+diff --git a/crates/fln/src/source_records.rs b/crates/fln/src/source_records.rs
+index 9b764df12b22a26b6bd44ca7b5d8a93700b874a1..2f18616a0906bf5c2b950b13a534e12a78904367 100644
+--- a/crates/fln/src/source_records.rs
++++ b/crates/fln/src/source_records.rs
+@@ -42,6 +42,17 @@ impl Engine {
+             .map_err(EngineExecutionError::from)?;
+         Ok(match result {
+             Outcome::Complete(mut batch) => {
++                batch.engine.environment = fln_elab::records::defaults::register_defaults(
++                    batch.engine.environment(),
++                    &record.defaults,
++                )
++                .map_err(|error| {
++                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
++                        fln_elab::NatDefinitionElabError::Inference(
++                            fln_elab::source::SourceInferenceError::Record(error),
++                        ),
++                    ))
++                })?;
+                 if record.is_class {
+                     batch.engine.environment = fln_elab::instances::register_class(
+                         batch.engine.environment(),
+@@ -54,8 +65,8 @@ impl Engine {
+                             ),
+                         ))
+                     })?;
+-                    batch.result_logical_root = batch.engine.logical_root(options);
+                 }
++                batch.result_logical_root = batch.engine.logical_root(options);
+                 Outcome::Complete(batch)
+             }
+             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+diff --git a/crates/fln/tests/source_record_defaults.rs b/crates/fln/tests/source_record_defaults.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe0c0dd252548bd9cdcb7d68dacd4dc858a6df7d
+--- /dev/null
++++ b/crates/fln/tests/source_record_defaults.rs
+@@ -0,0 +1,220 @@
++//! Defaults produce ordinary helper applications checked by K1 and the council.
++#![forbid(unsafe_code)]
++use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Outcome, SourceCheckLimits};
++use fln_core::name::Name;
++use fln_elab::records::defaults::{RecordDefault, RecordDefaults, helper_name, register_defaults};
++
++fn limits() -> EngineAdmissionLimits {
++    EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024))
++}
++fn engine() -> Engine {
++    Engine::with_source_seed(limits())
++        .unwrap()
++        .into_complete()
++        .unwrap()
++}
++fn check(e: &Engine, text: &str) -> fln::SourceFileCheck {
++    let result = e.check_source_files(
++        &[text.as_bytes()],
++        &KVMap::new(),
++        SourceCheckLimits::new(limits()),
++    );
++    assert!(
++        matches!(result, Ok(Outcome::Complete(_))),
++        "{text}\n{result:?}"
++    );
++    result.unwrap().into_complete().unwrap()
++}
++
++#[test]
++fn omitted_defaults_use_actual_preceding_values_and_updates_preserve_copies() {
++    check(
++        &engine(),
++        "structure Config where\n  base : Nat := 3\n  twice : Nat := base + base\n  transform (x : Nat) : Nat := x + twice\ndef standard : Config := {}\ndef custom : Config := { base := 7 }\ndef copied := { custom with base := 20 }\ntheorem a : standard.twice = 6 := by rfl\ntheorem b : custom.twice = 14 := by rfl\ntheorem c : copied.twice = 14 := by rfl\ntheorem d : custom.transform 2 = 16 := by rfl\ntheorem e : copied.transform 2 = 16 := by rfl",
++    );
++}
++#[test]
++fn dependent_types_proofs_and_method_parameters_are_closed_in_order() {
++    check(
++        &engine(),
++        "structure Package where\n  carrier : Type := Nat\n  value : carrier\n  copy : carrier := value\n  proof : value = value := rfl\n  ident (x : carrier) : carrier := x\ndef p : Package := { value := 9 }\ndef q : Package := { carrier := String, value := \"hi\" }\ntheorem p_ok : p.copy = 9 := by rfl\ntheorem q_ok : q.ident q.copy = \"hi\" := by rfl",
++    );
++}
++#[test]
++fn defaults_use_explicit_record_instance_parameters() {
++    check(
++        &engine(),
++        "structure Box (A : Type) [Inhabited A] where\n  value : A := default\ndef make {A : Type} [Inhabited A] : Box A := {}\ninstance chosen : Inhabited Nat := Inhabited.mk 17\ndef b : Box Nat := {}\ntheorem ok : b.value = 17 := by rfl",
++    );
++}
++#[test]
++fn class_dictionaries_can_be_constructed_entirely_from_defaults() {
++    check(
++        &engine(),
++        "class Config where\n  value : Nat := 7\n  twice : Nat := value + value\ninstance automatic : Config := {}\ndef result : Nat := Config.twice\ntheorem ok : result = 14 := by rfl\ndef explicit : Config := { value := 11 }\ntheorem other : explicit.twice = 22 := by rfl",
++    );
++}
++#[test]
++fn nested_record_literals_and_let_defaults_are_elaborated_natively() {
++    check(
++        &engine(),
++        "structure Inner where\n  value : Nat := 8\nstructure Outer where\n  inner : Inner := {}\n  num : Nat := let n := inner.value; n + 1\ndef result : Outer := {}\ntheorem ok : result.num = 9 := by rfl",
++    );
++}
++#[test]
++fn invalid_defaults_are_rejected_even_when_never_used() {
++    let e = engine();
++    let root = e.logical_root(&KVMap::new());
++    for text in [
++        "structure Bad where\n  value : Nat := \"wrong\"",
++        "structure Bad where\n  carrier : Type\n  value : carrier := 7",
++        "structure Bad where\n  value : Nat := (1 : String)",
++        "structure Bad where\n  value : Nat := let unused := (1 : String); 0",
++    ] {
++        let refusal = e
++            .check_source_files(
++                &[text.as_bytes()],
++                &KVMap::new(),
++                SourceCheckLimits::new(limits()),
++            )
++            .expect_err("invalid default is not optional evidence");
++        assert_eq!(
++            refusal.disposition(),
++            ("kernel-rejection", true, 1),
++            "{text}: {refusal:?}"
++        );
++        assert_eq!(e.logical_root(&KVMap::new()), root);
++    }
++}
++#[test]
++fn forward_defaults_missing_required_fields_and_unresolved_values_refuse() {
++    let e = engine();
++    let root = e.logical_root(&KVMap::new());
++    for text in [
++        "structure Bad where\n  x : Nat := later\n  later : Nat := 3",
++        "structure Bad where\n  x : Nat := _",
++        "structure Bad where\n  x : Nat := x",
++        "structure Needs where\n  first : Nat\n  second : Nat := first\ndef incomplete : Needs := {}",
++    ] {
++        assert!(
++            e.check_source_files(
++                &[text.as_bytes()],
++                &KVMap::new(),
++                SourceCheckLimits::new(limits())
++            )
++            .is_err(),
++            "{text}"
++        );
++        assert_eq!(e.logical_root(&KVMap::new()), root);
++    }
++}
++#[test]
++fn helper_like_names_do_not_register_defaults() {
++    let e = check(
++        &engine(),
++        "structure Plain where\n  value : Nat\ndef Plain.value._default : Nat := 91",
++    )
++    .engine;
++    assert!(
++        e.check_source_files(
++            &[b"def absent : Plain := {}"],
++            &KVMap::new(),
++            SourceCheckLimits::new(limits())
++        )
++        .is_err()
++    );
++    check(&e, "def explicit : Plain := { value := 4 }");
++}
++#[test]
++fn helper_collision_leaves_no_record_projection_or_registration_prefix() {
++    let e = check(&engine(), "def Clash.value._default : Nat := 5").engine;
++    let root = e.logical_root(&KVMap::new());
++    assert!(
++        e.check_source_files(
++            &[b"structure Clash where\n  value : Nat := 7"],
++            &KVMap::new(),
++            SourceCheckLimits::new(limits())
++        )
++        .is_err()
++    );
++    assert_eq!(e.logical_root(&KVMap::new()), root);
++    assert!(!e.environment().contains(&Name::from_components(["Clash"])));
++    assert!(
++        RecordDefaults::read(e.environment())
++            .unwrap()
++            .helper(&Name::from_components(["Clash"]), 0)
++            .is_none()
++    );
++}
++#[test]
++fn registration_checks_helper_signatures_and_rejects_duplicates_atomically() {
++    let e = check(&engine(), "structure Good where\n  value : Nat := 8\nstructure Wrong where\n  value : Nat\ndef Wrong.value._default : String := \"not Nat\"").engine;
++    let root = e.logical_root(&KVMap::new());
++    let row = |name: &str| {
++        let record = Name::from_components([name]);
++        RecordDefault {
++            helper: helper_name(&record, &Name::from_components(["value"])),
++            record,
++            field: 0,
++        }
++    };
++    assert!(register_defaults(e.environment(), &[row("Good")]).is_err());
++    assert!(register_defaults(e.environment(), &[row("Wrong")]).is_err());
++    assert_eq!(e.logical_root(&KVMap::new()), root);
++}
++#[test]
++fn ordered_files_share_only_successful_default_registrations() {
++    let e = engine();
++    let prefix = b"structure Count where\n  value : Nat := 23";
++    let good = b"def n : Count := {}\ntheorem ok : n.value = 23 := by rfl";
++    let bad = b"def n : Count := {}\ntheorem wrong : n.value = 24 := by rfl";
++    for (suffix, success) in [
++        (good.as_slice(), true),
++        (bad.as_slice(), false),
++        (good.as_slice(), true),
++    ] {
++        let result = e.check_source_files(
++            &[prefix, suffix],
++            &KVMap::new(),
++            SourceCheckLimits::new(limits()),
++        );
++        assert_eq!(
++            matches!(result, Ok(Outcome::Complete(_))),
++            success,
++            "{result:?}"
++        );
++    }
++}
++
++#[test]
++fn admission_root_includes_the_default_registration_and_helpers() {
++    let e = engine();
++    let result = e
++        .admit_source_command(
++            b"structure Count where\n  value : Nat := 23",
++            &KVMap::new(),
++            limits(),
++        )
++        .unwrap()
++        .into_complete()
++        .unwrap();
++    assert_eq!(result.base_logical_root, e.logical_root(&KVMap::new()));
++    assert_eq!(
++        result.result_logical_root,
++        result.engine.logical_root(&KVMap::new())
++    );
++    assert_ne!(
++        result.result_logical_root,
++        result.admissions.last().unwrap().result_logical_root
++    );
++    let record = Name::from_components(["Count"]);
++    let helper = helper_name(&record, &Name::from_components(["value"]));
++    assert_eq!(
++        RecordDefaults::read(result.engine.environment())
++            .unwrap()
++            .helper(&record, 0),
++        Some(&helper)
++    );
++    assert!(result.engine.environment().contains(&helper));
++    assert_eq!(result.admissions.len(), 3);
++}
+diff --git a/docs/NATIVE_RECORDS.md b/docs/NATIVE_RECORDS.md
+index 31be85b337badf19f30bcc32b95a111e4e497f77..9199c600a2549b87fd2a2338cb2d8f5f967374df 100644
+--- a/docs/NATIVE_RECORDS.md
++++ b/docs/NATIVE_RECORDS.md
+@@ -55,8 +55,8 @@ unsupported syntax are refused. Resource stops remain distinct from rejection.
+ 
+ Current scope: simple named fields, typed method arguments, empty records,
+ nonrecursive Type-valued records, and named class/instance declarations. Source
+-inheritance, custom constructor names, grouped fields, field defaults, deriving,
+-explicit universe-polymorphic headers, record updates, field defaults, numeric
++inheritance, custom constructor names, grouped fields, deriving,
++explicit universe-polymorphic headers, numeric
+ projections and general extended field notation remain outside this increment. Core `RecordSpec` generation supports universe
+ parameters separately; this is not evidence for full source-level universe or
+ Reference record elaboration parity. Built-in-name checker specializations may
+@@ -85,8 +85,8 @@ Values are elaborated in constructor-field order, even when written in a differe
+ order, so each dependent field receives the actual earlier values in its expected
+ type. Nested literals, method lambdas, proof terms, punned fields (`{ value }`),
+ empty records and a trailing comma are supported. Either `{ value := 7 : Box Nat }`
+-or `({ value := 7 } : Box Nat)` supplies an explicit type. Every field must be
+-present exactly once; unknown, duplicate, missing, ill-typed or unresolved fields
++or `({ value := 7 } : Box Nat)` supplies an explicit type. Fields without registered defaults must be
++present exactly once; unknown, duplicate, missing required, ill-typed or unresolved fields
+ are refused. No record type is guessed from field labels.
+ 
+ Field access supports both `receiver.field` and `(expression).field`, including
+@@ -122,11 +122,61 @@ the supported top-level let chain retains its local dictionaries.
+ This bounded field notation selects actual named fields of admitted single-
+ constructor records. It does not search arbitrary namespace functions, base
+ structures or numeric fields. Literal fields currently require comma separators;
+-record updates, omitted defaults and inheritance remain explicit unsupported
+-cases. Parsing and elaboration use heap worklists, including nested literals and
++inheritance and omitted required fields remain explicit unsupported cases. Parsing and elaboration use heap worklists, including nested literals and
+ parenthesized type ascriptions.
+ 
+ `examples/native_record_values.lean` exercises dependent fields and explicit versus
+ inferred class receivers through the installed `fln check-source --json` command.
+ The `fln::source_record_literals` tests cover failure atomicity as well as positive
+ kernel/checker acceptance; installed CLI tests verify the same code path.
++
++## Checked field defaults
++
++A typed field or method can provide `:= value`. Defaults elaborate in the real
++context of the record parameters, earlier fields and that method's arguments:
++
++```lean
++structure Config where
++  base : Nat := 3
++  twice : Nat := base + base
++  transform (x : Nat) : Nat := x + twice
++
++def standard : Config := {}
++def custom : Config := { base := 7 }
++def copied := { custom with base := 20 }
++
++theorem standard_ok : standard.twice = 6 := by rfl
++theorem custom_ok : custom.twice = 14 := by rfl
++theorem copied_ok : copied.twice = 14 := by rfl
++```
++
++Explicit fields take precedence, then ordered update sources, then registered
++defaults. Each default receives the actual preceding values, not their original
++default expressions. Updates therefore preserve copied fields and do not
++recompute them when an earlier field changes. Dependent types, function fields,
++nested record literals, local lets, and class instance parameters use the same
++elaborator as ordinary source terms. Class dictionaries can be built from `{}`
++when every field has a default.
++
++The elaborator emits ordinary safe helper definitions named
++`Record.field._default`, closed over the parameters and preceding fields. Every
++helper passes K1 and the independent checker as part of the complete record
++batch, even when a later literal would override its field. A native versioned
++journal registers references only after the full batch succeeds; registration
++validates each helper against the constructor field's complete telescope. The
++successor logical root includes this journal. A similarly named definition with
++no registration is never selected as a default. Malformed metadata, signature
++mismatches, duplicate registrations, and resource exhaustion are visible failures.
++There is no separate default-value admission authority.
++
++Defaults must type-check for the declared preceding fields: a proof default
++cannot assume that an overridable preceding value equals its default expression.
++Forward references, implicit field-type inference, inheritance and field-level
++`tactic` defaults remain outside this bounded increment. This native journal is
++not Reference `.olean` structure-extension parity.
++
++Run `fln check-source --json examples/native_record_defaults.lean` to exercise the
++checked example. Regressions live in `fln::source_record_defaults`, the parser's
++record tests, the default registry's malformed-input tests, and the installed
++CLI `source_check` tests. These are scoped execution checks, not a full Lean
++compatibility claim.
+diff --git a/examples/native_record_defaults.lean b/examples/native_record_defaults.lean
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7036a6aa8ab246a8b7c3215effce4d86e07f569
+--- /dev/null
++++ b/examples/native_record_defaults.lean
+@@ -0,0 +1,20 @@
++structure Config where
++  base : Nat := 3
++  twice : Nat := base + base
++  transform (x : Nat) : Nat := x + twice
++
++def standard : Config := {}
++def custom : Config := { base := 7 }
++def copied := { custom with base := 20 }
++
++theorem standard_ok : standard.twice = 6 := by rfl
++theorem custom_ok : custom.twice = 14 := by rfl
++theorem copied_ok : copied.twice = 14 := by rfl
++theorem method_ok : custom.transform 2 = 16 := by rfl
++
++class Choice where
++  value : Nat := 11
++
++instance nativeChoice : Choice := {}
++def selected : Nat := Choice.value
++theorem selected_ok : selected = 11 := by rfl
