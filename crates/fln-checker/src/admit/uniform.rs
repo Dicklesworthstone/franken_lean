@@ -2,8 +2,9 @@
 //!
 //! Every expected minor and iota rule is rebuilt from the family and constructor
 //! telescopes, never copied from the recursor being checked. Recursive fields
-//! must be the family at exactly the original parameters and universes. All
-//! other occurrences (including higher-order and nested recursion) defer.
+//! must use the original parameters and universes; indices may change. Their
+//! actual index expressions determine every induction hypothesis and recursive
+//! call. Higher-order and nested recursion remain separate support boundaries.
 use super::*;
 use crate::infer::LocalDeclaration;
 use crate::term::{
@@ -21,12 +22,16 @@ struct Binder {
 struct Constructor<'a> {
     entry: &'a ConstantEntry,
     fields: Vec<Binder>,
-    recursive: Vec<usize>,
+    /// Each index expression is scoped over parameters and fields BEFORE this
+    /// recursive field, not the complete constructor telescope.
+    recursive: Vec<(usize, Vec<WireExpr>)>,
+    result_indices: Vec<WireExpr>,
 }
 struct Shape<'a> {
     name: &'a WireName,
     levels: &'a [WireName],
     parameters: Vec<Binder>,
+    indices: Vec<Binder>,
     constructors: Vec<Constructor<'a>>,
     motive_universe: &'a WireName,
 }
@@ -187,6 +192,72 @@ impl Audit<'_> {
         ))?;
         self.import(builder, &term)
     }
+    /// Insert recursor binders between parameters and a constructor's fields,
+    /// then append the later fields/hypotheses. Separate cutoffs preserve
+    /// dependencies within the original constructor telescope.
+    fn relocated(
+        &mut self,
+        builder: &mut StructuralTermBuilder,
+        term: &WireExpr,
+        fields: usize,
+        recursor_binders: usize,
+        later: usize,
+    ) -> Result<ExprId, InductiveVerdict> {
+        self.tick()?;
+        let term = Self::term(raise_external_bounds_with(
+            term,
+            recursor_binders as u32,
+            fields as u32,
+            self.term_budget(),
+            &mut *self.cancelled,
+        ))?;
+        self.shifted(builder, &term, later, 0)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn family_indices(
+        &mut self,
+        term: &WireExpr,
+        name: &WireName,
+        levels: &[WireName],
+        parameters: usize,
+        fields: usize,
+        indices: usize,
+    ) -> Result<Option<Vec<WireExpr>>, InductiveVerdict> {
+        let mut root = term.root();
+        let mut arguments = Vec::with_capacity(indices);
+        for _ in 0..indices {
+            self.tick()?;
+            while let Some(ExprNode::Metadata { expression, .. }) = term.node(root) {
+                self.tick()?;
+                root = *expression;
+            }
+            let Some(ExprNode::Apply { function, argument }) = term.node(root) else {
+                return Ok(None);
+            };
+            arguments.push(self.piece(term, *argument)?);
+            root = *function;
+        }
+        let mut builder = StructuralTermBuilder::new();
+        let expected = application(&mut builder, name, levels, parameters, fields);
+        let expected = self.finish(builder, expected)?;
+        let prefix = self.piece(term, root)?;
+        if !self.equal(&prefix, &expected)? {
+            return Ok(None);
+        }
+        for argument in &arguments {
+            let probe = ConstructorField {
+                source: argument,
+                name,
+                style: BinderStyle::Default,
+                type_root: argument.root(),
+            };
+            if field_mentions_inductive(&probe, name, self.comparison, self.cancelled)? {
+                return Ok(None);
+            }
+        }
+        arguments.reverse();
+        Ok(Some(arguments))
+    }
     fn open(
         &mut self,
         term: &WireExpr,
@@ -253,10 +324,24 @@ fn application(
 }
 
 impl Shape<'_> {
-    fn motive(&self, builder: &mut StructuralTermBuilder) -> ExprId {
-        let family = application(builder, self.name, self.levels, self.parameters.len(), 0);
+    fn motive(
+        &self,
+        audit: &mut Audit<'_>,
+        builder: &mut StructuralTermBuilder,
+    ) -> Result<ExprId, InductiveVerdict> {
+        let q = self.indices.len();
+        let mut family = application(builder, self.name, self.levels, self.parameters.len(), q);
+        for index in 0..q {
+            let value = builder.bvar((q - index - 1) as u32);
+            family = builder.apply(family, value);
+        }
         let sort = builder.sort_parameter(self.motive_universe);
-        builder.forall("major", BinderStyle::Default, family, sort)
+        let mut body = builder.forall("major", BinderStyle::Default, family, sort);
+        for index in self.indices.iter().rev() {
+            let domain = audit.import(builder, &index.domain)?;
+            body = builder.forall_name(&index.name, index.style, domain, body);
+        }
+        Ok(body)
     }
     fn minor(
         &self,
@@ -278,10 +363,19 @@ impl Shape<'_> {
             let value = builder.bvar((f + r - field - 1) as u32);
             constructed = builder.apply(constructed, value);
         }
-        let motive = builder.bvar((index + f + r) as u32);
+        let mut motive = builder.bvar((index + f + r) as u32);
+        for result in &ctor.result_indices {
+            let value = audit.relocated(builder, result, f, 1 + index, r)?;
+            motive = builder.apply(motive, value);
+        }
         let mut body = builder.apply(motive, constructed);
-        for (ih, field) in ctor.recursive.iter().enumerate().rev() {
-            let motive = builder.bvar((index + f + ih) as u32);
+        for (ih, (field, indices)) in ctor.recursive.iter().enumerate().rev() {
+            let mut motive = builder.bvar((index + f + ih) as u32);
+            for child_index in indices {
+                let value =
+                    audit.relocated(builder, child_index, *field, 1 + index, f - field + ih)?;
+                motive = builder.apply(motive, value);
+            }
             let value = builder.bvar((f + ih - field - 1) as u32);
             let domain = builder.apply(motive, value);
             body = builder.forall("ih", BinderStyle::Default, domain, body);
@@ -302,16 +396,29 @@ impl Shape<'_> {
         let mut builder = StructuralTermBuilder::new();
         let n = self.constructors.len();
         let p = self.parameters.len();
-        let motive = builder.bvar((n + 1) as u32);
+        let q = self.indices.len();
+        let mut motive = builder.bvar((n + q + 1) as u32);
+        for index in 0..q {
+            let value = builder.bvar((q - index) as u32);
+            motive = builder.apply(motive, value);
+        }
         let major = builder.bvar(0);
         let body = builder.apply(motive, major);
-        let major_type = application(&mut builder, self.name, self.levels, p, 1 + n);
-        let mut body = builder.forall("major", styles[p + n + 1], major_type, body);
+        let mut major_type = application(&mut builder, self.name, self.levels, p, 1 + n + q);
+        for index in 0..q {
+            let value = builder.bvar((q - index - 1) as u32);
+            major_type = builder.apply(major_type, value);
+        }
+        let mut body = builder.forall("major", styles[p + n + q + 1], major_type, body);
+        for (index, binder) in self.indices.iter().enumerate().rev() {
+            let domain = audit.shifted(&mut builder, &binder.domain, n + 1, index)?;
+            body = builder.forall_name(&binder.name, styles[p + n + 1 + index], domain, body);
+        }
         for index in (0..n).rev() {
             let domain = self.minor(audit, &mut builder, index)?;
             body = builder.forall("minor", styles[p + 1 + index], domain, body);
         }
-        let motive_type = self.motive(&mut builder);
+        let motive_type = self.motive(audit, &mut builder)?;
         body = builder.forall("motive", styles[p], motive_type, body);
         for (index, parameter) in self.parameters.iter().enumerate().rev() {
             let domain = audit.import(&mut builder, &parameter.domain)?;
@@ -336,7 +443,7 @@ impl Shape<'_> {
         }
         let mut levels = vec![self.motive_universe.clone()];
         levels.extend_from_slice(self.levels);
-        for field in &ctor.recursive {
+        for (field, indices) in &ctor.recursive {
             let mut call = application(
                 &mut builder,
                 recursor_name,
@@ -348,6 +455,10 @@ impl Shape<'_> {
             call = builder.apply(call, motive);
             for minor in 0..n {
                 let value = builder.bvar((f + n - minor - 1) as u32);
+                call = builder.apply(call, value);
+            }
+            for child_index in indices {
+                let value = audit.relocated(&mut builder, child_index, *field, n + 1, f - field)?;
                 call = builder.apply(call, value);
             }
             let value = builder.bvar((f - field - 1) as u32);
@@ -362,7 +473,7 @@ impl Shape<'_> {
             let domain = self.minor(audit, &mut builder, minor)?;
             body = builder.lambda("minor", BinderStyle::Default, domain, body);
         }
-        let motive = self.motive(&mut builder);
+        let motive = self.motive(audit, &mut builder)?;
         body = builder.lambda("motive", BinderStyle::Default, motive, body);
         for parameter in self.parameters.iter().rev() {
             let domain = audit.import(&mut builder, &parameter.domain)?;
@@ -487,11 +598,6 @@ fn check(
             InductiveSupportLimit::MutualMetadata,
         ));
     }
-    if metadata.num_indices() != 0 {
-        return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
-            observed: metadata.num_indices(),
-        }));
-    }
     if metadata.num_nested() != 0 {
         return Err(InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
             observed: metadata.num_nested(),
@@ -509,6 +615,15 @@ fn check(
         ));
     }
     let p = metadata.num_parameters() as usize;
+    let q = metadata.num_indices() as usize;
+    if p.saturating_add(q) > MAX_NONRECURSIVE_FIELDS {
+        return Err(InductiveVerdict::Deferred(
+            InductiveSupportLimit::FieldCount {
+                observed: p.saturating_add(q),
+                limit: MAX_NONRECURSIVE_FIELDS,
+            },
+        ));
+    }
     let n = metadata.constructors().len();
     if n > MAX_NONRECURSIVE_CONSTRUCTORS {
         return Err(InductiveVerdict::Deferred(
@@ -567,7 +682,8 @@ fn check(
         audit.cancelled,
     )
     .map_err(|v| map_member_preamble(name, v))?;
-    let (parameters, result_sort) = audit.peel(declaration.type_(), p)?;
+    let (parameters, index_tail) = audit.peel(declaration.type_(), p)?;
+    let (indices, result_sort) = audit.peel(&index_tail, q)?;
     let Some(ExprNode::Sort { level }) = result_sort.node(result_sort.root()) else {
         return Err(overflow());
     };
@@ -634,20 +750,16 @@ fn check(
             return Err(constructor_error(ctor_name));
         }
         let (fields, result) = audit.peel(&field_tail, f)?;
-        let mut builder = StructuralTermBuilder::new();
-        let root = application(&mut builder, name, levels, p, f);
-        let expected = audit.finish(builder, root)?;
-        if !audit.equal(&result, &expected)? {
-            return Err(constructor_error(ctor_name));
-        }
+        let result_indices = audit
+            .family_indices(&result, name, levels, p, f, q)?
+            .ok_or_else(|| constructor_error(ctor_name))?;
         let mut field_locals = locals.clone();
         let mut recursive = Vec::new();
         for (field_index, field) in fields.iter().enumerate() {
-            let mut builder = StructuralTermBuilder::new();
-            let root = application(&mut builder, name, levels, p, field_index);
-            let expected = audit.finish(builder, root)?;
-            if audit.equal(&field.domain, &expected)? {
-                recursive.push(field_index);
+            if let Some(child_indices) =
+                audit.family_indices(&field.domain, name, levels, p, field_index, q)?
+            {
+                recursive.push((field_index, child_indices));
             } else {
                 let probe = ConstructorField {
                     source: &field.domain,
@@ -694,6 +806,7 @@ fn check(
             entry,
             fields,
             recursive,
+            result_indices,
         });
     }
     if metadata.is_recursive() != constructors.iter().any(|c| !c.recursive.is_empty()) {
@@ -719,7 +832,7 @@ fn check(
         || levels.contains(&rec_levels[0])
         || rec.mutual() != std::slice::from_ref(name)
         || rec.num_parameters() as usize != p
-        || rec.num_indices() != 0
+        || rec.num_indices() as usize != q
         || rec.num_motives() != 1
         || rec.num_minors() as usize != n
         || rec.rules().len() != n
@@ -727,13 +840,14 @@ fn check(
     {
         return Err(recursor_error(&rec_name));
     }
-    let (binders, _) = peel_binders_at(rec_decl.type_(), rec_decl.type_().root(), p + n + 2)
+    let (binders, _) = peel_binders_at(rec_decl.type_(), rec_decl.type_().root(), p + n + q + 2)
         .ok_or_else(|| recursor_error(&rec_name))?;
     let styles: Vec<_> = binders.iter().map(|b| b.1).collect();
     let shape = Shape {
         name,
         levels,
         parameters,
+        indices,
         constructors,
         motive_universe: &rec_levels[0],
     };
