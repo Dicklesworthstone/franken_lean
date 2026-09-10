@@ -100,6 +100,15 @@ inaccessible patterns remain unsupported. Indexed structural recursion also
 remains unsupported. These are bounded source capabilities, not generated-matcher
 name parity or full Lean match elaboration.
 
+Constructor result indices that reduce directly to a constructor field are also
+refused, including wildcard and mixed patterns. Those fields can require keeping
+an index fixed rather than generalizing it. Some such patterns are valid Lean;
+this lane reports its missing refinement explicitly. Constructor-shaped indices
+such as a vector's successor length, and fixed family-parameter indices, are
+supported. Before generalizing dependent arguments, the original index motive is
+retained as a checked typing obligation, so generalization cannot hide an
+ill-typed captured dependency.
+
 Prop-valued indexed family
 admission, mutual/nested families, inaccessible patterns, index-equation solving
 and explicit source universe declarations remain incomplete. Quantifier syntax
