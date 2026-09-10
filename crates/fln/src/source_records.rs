@@ -3,7 +3,7 @@
 use super::*;
 
 impl Engine {
-    /// Admit one definition, theorem, instance, structure or class command.
+    /// Admit one definition, theorem, instance, structure, class or inductive command.
     /// A record's block and projections all pass K1 and the independent checker
     /// before class metadata is registered. No failed prefix is exposed.
     pub fn admit_source_command(
@@ -15,6 +15,19 @@ impl Engine {
         let parsed = fln_parse::parse_definition(source)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
+        if fln_elab::source::is_inductive(parsed.syntax()) {
+            let candidate = fln_elab::source::elaborate_inductive(
+                parsed.syntax(),
+                self.environment(),
+                limits.kernel,
+                fln_elab::records::RecordBudget::default(),
+            )
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+            return self
+                .admit_declarations(&[candidate], options, limits)
+                .map_err(EngineExecutionError::from);
+        }
         if !fln_elab::source::is_record(parsed.syntax()) {
             return Ok(
                 match self.admit_source_declaration(source, options, limits)? {

@@ -87,9 +87,17 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         )) => match reason {
             SourceInferenceError::ResourceLimit
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
+            | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)
             | SourceInferenceError::InstanceRegistry(
                 fln_elab::instances::InstanceRegistryError::Limit,
             ) => ("resource", false, 3),
+            SourceInferenceError::TypeObligation(outcome) => match outcome.as_ref() {
+                Outcome::Complete(fln_kernel::verdict::Verdict::Rejected { .. }) => {
+                    ("kernel-rejection", true, 1)
+                }
+                Outcome::Inconclusive(_) => ("inconclusive", false, 3),
+                _ => ("internal-fault", false, 4),
+            },
             SourceInferenceError::Universe(
                 UniverseInstantiationError::VisitLimit { .. }
                 | UniverseInstantiationError::LevelTooDeep(_),
