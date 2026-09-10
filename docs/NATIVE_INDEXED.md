@@ -46,7 +46,7 @@ wrong index types, forged recursor indices, field-universe violations and false
 proofs do not publish a successor environment. Resource exhaustion and cancellation
 remain nonanswers. No axiom, external dependency or admission authority is added.
 
-## Current boundaries
+## Cases and induction
 
 The source `cases` and `induction` tactics support indexed families when their
 actual indices are distinct parameter locals, including dependent index
@@ -67,8 +67,39 @@ unfolding policy or checking authority is widened.
 
 This is not complete indexed elimination. Fixed expressions, repeated indices
 and let-bound indices require index-equation refinement and currently refuse
-instead of becoming independent variables. The source match and structural
-recursion compilers still restrict their own lanes to non-indexed families.
+instead of becoming independent variables.
+
+## Constructor matches
+
+Ordinary source matches support indexed families whose actual indices are distinct
+parameter locals with independent domains. Constructor branches receive the
+refined expected type, so a vector can be reconstructed at its original length:
+
+```lean
+def rebuild {A : Type} (n : Nat) (xs : Vec A n) : Vec A n := match xs with
+  | .nil => Vec.nil
+  | .cons k x tail => Vec.cons k x tail
+```
+
+Dependent ordinary parameters are generalized and specialized in each branch.
+Instance-implicit parameters and local lets remain captured. A generalized local's
+old version is cleared only when no retained type or let value needs it; this
+matters to `assumption` and dictionary search. Pattern names shadow generalized
+names without changing their core variable identities. The original discriminant
+is still captured at its original type, so returning it directly from a branch
+requiring another index is refused.
+
+A final catch-all binds that branch's actual constructor value. A sole catch-all
+performs no index refinement and becomes a checked let binding; this also permits
+`match xs with | rest => rest` at a fixed index. Its discriminant remains in the
+core term even when unused. Ordinary matches keep recursor hypotheses out of proof
+and instance search. Every resulting term still crosses both checking engines.
+
+Constructor matches with fixed/repeated indices, dependent index domains or
+inaccessible patterns remain unsupported. Indexed structural recursion also
+remains unsupported. These are bounded source capabilities, not generated-matcher
+name parity or full Lean match elaboration.
+
 Prop-valued indexed family
 admission, mutual/nested families, inaccessible patterns, index-equation solving
 and explicit source universe declarations remain incomplete. Quantifier syntax
