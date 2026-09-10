@@ -29,6 +29,11 @@ jobs:
           (out/'input-manifest.json').write_bytes(raw)
           blob=lambda data: hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
           repaired=False
+          if blob(raw)=='95a7c5b4233650eba4265d147814bec60545f648':
+              assert raw.count(b'8BnrB/c39w')==1
+              raw=raw.replace(b'8BnrB/c39w',b'8BnrB/c09w')
+              assert blob(raw)=='94e29a360604c8985b4b3b80d399d4eb8726fa4f'
+              repaired=True
           if blob(raw)=='d771a212fc5955d23868044c8ad8d0a7391a632d':
               assert raw.count(b'EXtuci5PD6UgNdI')==1
               assert raw.count(b'S4p3clqd9d15TWl')==1
