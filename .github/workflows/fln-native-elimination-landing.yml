@@ -36,6 +36,12 @@ jobs:
               raw=raw.replace(b'S4p3clqd9d15TWl',b'S4p3clqd15TWl')
               assert blob(raw)=='fc0aa886a0c61cce309f32aa52daf8f16cdcc281'
               repaired=True
+          if blob(raw)=='32bfa32c16979fed4860ae9c97e9dcc9f8e5644c':
+              assert raw.count(b'HBcAHcAHgi')==1
+              assert raw.count(b'ZYSB5HMut')==1
+              raw=raw.replace(b'HBcAHcAHgi',b'HBcAHgi').replace(b'ZYSB5HMut',b'ZYSB5Mut')
+              assert blob(raw)=='e3e04f5f972a192dd9a8adf7a2f0e728f4ceb5dd'
+              repaired=True
           plan=json.loads(raw)
           encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
           with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as stream:
@@ -77,7 +83,7 @@ jobs:
           rust=sorted(p for p in plan['paths'] if p.endswith('.rs'))
           subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
           PY
-          for example in native_pattern_matching native_recursion; do
+          for example in native_pattern_matching native_recursion native_induction; do
             if test -f "examples/$example.lean"; then
               cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/elimination-landing/$example.json"
             fi
