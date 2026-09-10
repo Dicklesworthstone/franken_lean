@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture indexed match and induction together before integrating structural recursion.
+# Capture the current checked frontend before propositional family integration.
 on:
   push:
     branches: [main]
