@@ -2120,3 +2120,122 @@ fn nat_literal_recursor_work_exhaustion_and_cancellation_are_nonanswers() {
         WhnfOutcome::Inconclusive(_)
     ));
 }
+
+fn two_eliminate(major: Expr, yes: Expr, no: Expr) -> Expr {
+    [constant("MotiveStub"), yes, no, major].into_iter().fold(
+        Expr::const_(Name::from_components(["Two", "rec"]), vec![Level::one()]),
+        Expr::app,
+    )
+}
+
+#[test]
+fn defeq_normalizes_saturated_recursor_spines_before_application_congruence() {
+    let tt = Expr::const_(Name::from_components(["Two", "tt"]), Vec::new());
+    let yes = Expr::app(constant("Result"), constant("payload"));
+    let call = two_eliminate(tt.clone(), yes.clone(), constant("other"));
+    let context = definition_context(two_family_entries());
+    let left = decoded(&Expr::app(constant("Wrap"), call));
+    let right = decoded(&Expr::app(constant("Wrap"), yes));
+    assert!(matches!(
+        def_eq(&left, &right, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+
+    // Extra arguments apply to the selected minor's function result, not to
+    // the recursor head or the inactive minor. The complete spine is needed.
+    let minor = Expr::lam(
+        primary_name("x"),
+        constant("Domain"),
+        Expr::app(constant("Result"), Expr::bvar(0).unwrap()),
+        BinderInfo::Default,
+    );
+    let left = decoded(&Expr::app(
+        two_eliminate(tt, minor, constant("unused")),
+        constant("payload"),
+    ));
+    let right = decoded(&Expr::app(constant("Result"), constant("payload")));
+    assert!(matches!(
+        def_eq(&left, &right, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn stuck_recursor_majors_retain_their_reduction_progress() {
+    let mut entries = two_family_entries();
+    entries.push(definition_entry(
+        "alias",
+        Vec::new(),
+        decoded(&constant("opaque_major")),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let input = decoded(&two_eliminate(
+        constant("alias"),
+        constant("yes"),
+        constant("no"),
+    ));
+    let first = complete(whnf(&input, &context, WhnfBudget::unlimited()));
+    let expected = decoded(&two_eliminate(
+        constant("opaque_major"),
+        constant("yes"),
+        constant("no"),
+    ));
+    assert!(matches!(
+        fln_checker::defeq::quick_def_eq(
+            &first.term,
+            &expected,
+            fln_checker::defeq::QuickDefEqBudget::unlimited()
+        ),
+        fln_checker::defeq::QuickDefEqOutcome::Equal(_)
+    ));
+    assert_eq!(first.delta_reductions, 1);
+    let second = complete(whnf(&first.term, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        second.reductions, 0,
+        "a stable major must not report phantom progress"
+    );
+}
+
+#[test]
+fn stuck_recursor_inputs_can_still_be_compared_by_congruence() {
+    let mut entries = two_family_entries();
+    entries.push(definition_entry(
+        "alias",
+        Vec::new(),
+        decoded(&constant("opaque_major")),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+    ));
+    let context = definition_context(entries);
+    let beta = Expr::app(
+        Expr::lam(
+            primary_name("x"),
+            constant("Domain"),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        ),
+        constant("yes"),
+    );
+    let left = decoded(&two_eliminate(constant("alias"), beta, constant("no")));
+    let right = decoded(&two_eliminate(
+        constant("opaque_major"),
+        constant("yes"),
+        constant("no"),
+    ));
+    let mut budget = DefEqBudget::unlimited();
+    budget.max_materialized_arena_nodes = 10_000;
+    budget.max_slow_comparisons = 1_000;
+    assert!(matches!(
+        def_eq(&left, &right, &context, budget),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(
+        !matches!(
+            def_eq(&left, &decoded(&constant("yes")), &context, budget),
+            DefEqOutcome::Equal(_)
+        ),
+        "an unknown major cannot select the first constructor"
+    );
+}

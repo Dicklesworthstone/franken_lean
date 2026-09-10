@@ -1483,12 +1483,17 @@ impl<'a, 'c> Reducer<'a, 'c> {
         level_parameters: &[WireName],
         current: &Cursor,
         levels: &[LevelId],
-        arguments: &VecDeque<Cursor>,
+        arguments: &mut VecDeque<Cursor>,
         major_index: usize,
         major: &Cursor,
         prefix: usize,
     ) -> Result<Option<Cursor>, Halt> {
         let reduced_major = self.whnf_recursor_major(major)?;
+        // Even when iota stays stuck, retain reductions performed inside the
+        // major premise. Dropping them would report progress while returning
+        // the original recursor, causing defeq to unfold the same definition
+        // forever instead of reaching a stable stuck spine.
+        arguments[major_index] = reduced_major.clone();
         let (constructor_name, major_args) =
             if let Some(parts) = self.nat_literal_constructor(metadata, &reduced_major)? {
                 parts

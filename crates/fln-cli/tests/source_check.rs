@@ -761,3 +761,66 @@ fn failed_induction_branches_never_publish_a_multi_file_success_prefix() {
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_generic_collection_laws_through_both_checkers() {
+    let path = file(include_str!(
+        "../../../examples/native_parameterized_recursion.lean"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "\"commands\":14",
+        "\"theorems\":7",
+        "\"authority\":true",
+        "\"executed\":false",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn failed_generic_collection_proofs_do_not_publish_a_multi_file_prefix() {
+    let prefix = file("inductive Seq (A : Type) where | nil | cons (head : A) (tail : Seq A)");
+    let good = file("theorem valid : (Seq.nil : Seq Nat) = Seq.nil := by rfl");
+    let bad = file("theorem invalid : Seq.cons 1 Seq.nil = Seq.cons 2 Seq.nil := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":2",
+                "\"theorems\":1",
+                "\"files\":2",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}

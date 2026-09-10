@@ -140,19 +140,26 @@ fn scoped_scripts_refuse_missing_extra_or_leaked_branch_work() {
     }
 }
 #[test]
-fn unsupported_parameterized_recursive_families_do_not_bypass_the_checker() {
+fn parameterized_recursive_families_receive_independent_induction_checks() {
     let base = engine();
     let before = base.logical_root(&KVMap::new());
-    let error = base
-        .check_source_files(
-            &[b"inductive Chain (A : Type) where | nil | cons (head : A) (tail : Chain A)"],
-            &KVMap::new(),
-            SourceCheckLimits::new(limits()),
-        )
-        .expect_err(
-            "the independent checker does not yet admit this parameterized recursive shape",
-        );
-    assert_eq!(error.disposition(), ("inconclusive", false, 3));
+    base.check_source_files(
+        &[
+            br"inductive Chain (A : Type) where | nil | cons (head : A) (tail : Chain A)
+def copy {A : Type} (xs : Chain A) : Chain A := match xs with
+  | .nil => Chain.nil
+  | .cons x tail => Chain.cons x (copy tail)
+theorem copy_ok {A : Type} (xs : Chain A) : copy xs = xs := by
+  induction xs with
+  | nil => rfl
+  | cons x tail ih => simp only [copy, ih]",
+        ],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    )
+    .expect("uniform parameters and direct recursion pass both checking engines")
+    .into_complete()
+    .expect("not a resource stop");
     assert_eq!(base.logical_root(&KVMap::new()), before);
 }
 #[test]

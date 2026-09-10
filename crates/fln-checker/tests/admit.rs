@@ -1010,10 +1010,28 @@ fn init_option_entries() -> Vec<ConstantEntry> {
 /// family. The `cons` minor premise must carry the recursive hypothesis and
 /// the second rule must rebuild the recursive recursor call.
 fn init_list_entries() -> Vec<ConstantEntry> {
-    let list = checker_name("List");
-    let nil = checker_qualified(&["List", "nil"]);
-    let cons = checker_qualified(&["List", "cons"]);
-    let rec = checker_qualified(&["List", "rec"]);
+    named_list_entries("List", UniformMutation::None)
+}
+
+#[derive(Clone, Copy)]
+enum UniformMutation {
+    None,
+    RecursiveOnHead,
+    RecursiveOnWholeConstructor,
+    SwapRecursiveMinors,
+    SwapRecursiveUniverses,
+    WrongMinorFieldType,
+    TooLargeFieldUniverse,
+    FalseRecursiveFlag,
+}
+
+// This hand-written universe-polymorphic fixture does not call the primary
+// inductive generator. Its variable name must not select a checker special case.
+fn named_list_entries(family: &str, mutation: UniformMutation) -> Vec<ConstantEntry> {
+    let list = checker_name(family);
+    let nil = checker_qualified(&[family, "nil"]);
+    let cons = checker_qualified(&[family, "cons"]);
+    let rec = checker_qualified(&[family, "rec"]);
     let u_name = checker_name("u");
     let v_name = checker_name("v");
     let u = Level::param(primary_name("u"));
@@ -1021,13 +1039,13 @@ fn init_list_entries() -> Vec<ConstantEntry> {
     let parameter_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
     let list_expr = |parameter: Expr| {
         Expr::app(
-            Expr::const_(primary_name("List"), vec![u.clone()]),
+            Expr::const_(primary_name(family), vec![u.clone()]),
             parameter,
         )
     };
     let nil_expr = |parameter: Expr| {
         Expr::app(
-            Expr::const_(Name::from_components(["List", "nil"]), vec![u.clone()]),
+            Expr::const_(Name::from_components([family, "nil"]), vec![u.clone()]),
             parameter,
         )
     };
@@ -1035,7 +1053,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
         Expr::app(
             Expr::app(
                 Expr::app(
-                    Expr::const_(Name::from_components(["List", "cons"]), vec![u.clone()]),
+                    Expr::const_(Name::from_components([family, "cons"]), vec![u.clone()]),
                     parameter,
                 ),
                 head,
@@ -1057,7 +1075,11 @@ fn init_list_entries() -> Vec<ConstantEntry> {
         primary_pi(
             "head",
             BinderInfo::Default,
-            bv(2),
+            if matches!(mutation, UniformMutation::WrongMinorFieldType) {
+                Expr::sort(Level::zero())
+            } else {
+                bv(2)
+            },
             primary_pi(
                 "tail",
                 BinderInfo::Default,
@@ -1120,10 +1142,24 @@ fn init_list_entries() -> Vec<ConstantEntry> {
     );
     let recursive_call = {
         let recursor = Expr::const_(
-            Name::from_components(["List", "rec"]),
-            vec![v.clone(), u.clone()],
+            Name::from_components([family, "rec"]),
+            if matches!(mutation, UniformMutation::SwapRecursiveUniverses) {
+                vec![u.clone(), v.clone()]
+            } else {
+                vec![v.clone(), u.clone()]
+            },
         );
-        [bv(5), bv(4), bv(3), bv(2), bv(0)]
+        let smaller = match mutation {
+            UniformMutation::RecursiveOnHead => bv(1),
+            UniformMutation::RecursiveOnWholeConstructor => cons_expr(bv(5), bv(1), bv(0)),
+            _ => bv(0),
+        };
+        let (nil, cons) = if matches!(mutation, UniformMutation::SwapRecursiveMinors) {
+            (bv(2), bv(3))
+        } else {
+            (bv(3), bv(2))
+        };
+        [bv(5), bv(4), nil, cons, smaller]
             .into_iter()
             .fold(recursor, Expr::app)
     };
@@ -1176,7 +1212,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                     vec![list.clone()],
                     vec![nil.clone(), cons.clone()],
                     0,
-                    true,
+                    !matches!(mutation, UniformMutation::FalseRecursiveFlag),
                     false,
                 ),
             ),
@@ -1206,7 +1242,11 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                     primary_pi(
                         "head",
                         BinderInfo::Default,
-                        bv(0),
+                        if matches!(mutation, UniformMutation::TooLargeFieldUniverse) {
+                            parameter_type()
+                        } else {
+                            bv(0)
+                        },
                         primary_pi(
                             "tail",
                             BinderInfo::Default,
@@ -13696,6 +13736,10 @@ fn the_admission_module_contains_no_panicking_construct() {
 /// Depths mirror the real pin data (see the `fln olean inspect --constants`
 /// sketch of `Init/Prelude.olean`).
 fn class_add_entries() -> Vec<ConstantEntry> {
+    class_add_entries_with_rule_domain(false)
+}
+
+fn class_add_entries_with_rule_domain(forged: bool) -> Vec<ConstantEntry> {
     let add = checker_qualified(&["Add"]);
     let mk = checker_qualified(&["Add", "mk"]);
     let rec = checker_qualified(&["Add", "rec"]);
@@ -13784,7 +13828,17 @@ fn class_add_entries() -> Vec<ConstantEntry> {
                 minor_type(),
                 Expr::lam(
                     primary_name("add"),
-                    arrow_alpha(),
+                    // Scope includes motive and minor before this field.
+                    if forged {
+                        arrow_alpha()
+                    } else {
+                        primary_pi(
+                            "a",
+                            BinderInfo::Default,
+                            bv(2),
+                            primary_pi("b", BinderInfo::Default, bv(3), bv(4)),
+                        )
+                    },
                     Expr::app(bv(1), bv(0)),
                     BinderInfo::Default,
                 ),
@@ -14552,6 +14606,10 @@ fn kr600_803_class_block_refuses_a_motive_head_iota_rule() {
 /// and the minor rebuild hardcoded `Default`, and a block like this deferred
 /// at `constructor-compare` no matter how well formed.
 fn class_wrap_entries() -> Vec<ConstantEntry> {
+    class_wrap_entries_with_rule_domain(false)
+}
+
+fn class_wrap_entries_with_rule_domain(forged: bool) -> Vec<ConstantEntry> {
     let wrap = checker_qualified(&["WrapInst"]);
     let mk = checker_qualified(&["WrapInst", "mk"]);
     let rec = checker_qualified(&["WrapInst", "rec"]);
@@ -14628,7 +14686,12 @@ fn class_wrap_entries() -> Vec<ConstantEntry> {
                 minor_type(),
                 Expr::lam(
                     primary_name("field"),
-                    arrow_alpha(),
+                    // Scope includes motive and minor before this field.
+                    if forged {
+                        arrow_alpha()
+                    } else {
+                        primary_pi("x", BinderInfo::Default, bv(2), bv(3))
+                    },
                     Expr::app(bv(1), bv(0)),
                     BinderInfo::InstImplicit,
                 ),
@@ -14760,6 +14823,231 @@ fn higher_universe_record_cancellation_is_not_a_shape_verdict() {
     );
     assert!(
         matches!(result, InductiveVerdict::Inconclusive(_)),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn arbitrary_named_uniform_recursive_families_are_checked_at_symbolic_universes() {
+    for family in ["Sequence", "CustomChain", "UserDefinedList"] {
+        let entries = named_list_entries(family, UniformMutation::None);
+        let environment = ConstantEnvironment::empty();
+        let before = environment.clone();
+        let result = admit_inductive(
+            &environment,
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            matches!(result, fln_checker::admit::InductiveVerdict::Admitted(_)),
+            "{family}: {result:?}"
+        );
+        assert_eq!(
+            environment, before,
+            "the checker only observes, it does not publish"
+        );
+    }
+}
+
+#[test]
+fn uniform_recursor_rules_cannot_forge_structural_decrease_or_recursive_arguments() {
+    for mutation in [
+        UniformMutation::RecursiveOnHead,
+        UniformMutation::RecursiveOnWholeConstructor,
+        UniformMutation::SwapRecursiveMinors,
+        UniformMutation::SwapRecursiveUniverses,
+    ] {
+        let entries = named_list_entries("Sequence", mutation);
+        let result = admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                result,
+                fln_checker::admit::InductiveVerdict::Rejected(
+                    fln_checker::admit::InductiveRejection::RecursorShape { .. }
+                )
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn uniform_constructor_domains_are_not_borrowed_from_the_claimed_recursor() {
+    // Both the claimed recursor type and all its rule lambda domains use the
+    // same forged field domain. Only constructor-derived reconstruction exposes
+    // that mutually consistent lie; comparing the rules against that claimed
+    // type alone would miss it.
+    let entries = named_list_entries("Sequence", UniformMutation::WrongMinorFieldType);
+    let result = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            result,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_false_nonrecursive_flag_cannot_skip_the_uniform_recursion_audit() {
+    let entries = named_list_entries("Sequence", UniformMutation::FalseRecursiveFlag);
+    let result = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            result,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn uniform_fields_cannot_exceed_the_familys_universe() {
+    let entries = named_list_entries("Sequence", UniformMutation::TooLargeFieldUniverse);
+    let result = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            result,
+            fln_checker::admit::InductiveVerdict::Deferred(
+                fln_checker::admit::InductiveSupportLimit::ResultUniverse
+            )
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn uniform_family_cancellation_and_materialization_exhaustion_do_not_publish_or_reject() {
+    let entries = named_list_entries("Sequence", UniformMutation::None);
+    let environment = ConstantEnvironment::empty();
+    let before = environment.clone();
+    let result = admit_inductive_with(
+        &environment,
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+        || true,
+    );
+    assert!(
+        matches!(
+            result,
+            fln_checker::admit::InductiveVerdict::Inconclusive(_)
+        ),
+        "{result:?}"
+    );
+    let mut budget = AdmissionBudget::unlimited();
+    budget.inference.materialization.max_arena_nodes = 0;
+    let result = admit_inductive(
+        &environment,
+        &entries,
+        budget,
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            result,
+            fln_checker::admit::InductiveVerdict::Inconclusive(_)
+        ),
+        "{result:?}"
+    );
+    assert_eq!(environment, before);
+    assert!(matches!(
+        admit_inductive(
+            &environment,
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited()
+        ),
+        fln_checker::admit::InductiveVerdict::Admitted(_)
+    ));
+}
+
+#[test]
+fn class_rule_domains_cannot_capture_motive_or_minor_in_place_of_a_parameter() {
+    for entries in [
+        class_add_entries_with_rule_domain(true),
+        class_wrap_entries_with_rule_domain(true),
+    ] {
+        let result = admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                result,
+                fln_checker::admit::InductiveVerdict::Rejected(
+                    fln_checker::admit::InductiveRejection::RecursorShape { .. }
+                )
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn uniform_rule_table_cardinality_is_checked_before_untrusted_rule_traversal() {
+    let mut entries = named_list_entries("Sequence", UniformMutation::None);
+    let decl = entries[3].declaration();
+    let rec = decl.recursor_metadata().unwrap();
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Sequence", "rec"]),
+        ConstantDeclaration::recursor(
+            decl.level_parameters().to_vec(),
+            decl.type_().clone(),
+            ConstantSafety::Safe,
+            RecursorDeclaration::new(
+                rec.mutual().to_vec(),
+                rec.num_parameters(),
+                rec.num_indices(),
+                rec.num_motives(),
+                rec.num_minors(),
+                vec![rec.rules()[0].clone(); 1_000],
+                rec.k(),
+            ),
+        ),
+    );
+    let mut budget = AdmissionBudget::unlimited();
+    budget.conversion.quick.max_comparisons = 32;
+    let result = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        budget,
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            result,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
         "{result:?}"
     );
 }

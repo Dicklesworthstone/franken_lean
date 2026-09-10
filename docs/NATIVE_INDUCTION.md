@@ -94,7 +94,8 @@ branch syntax on a small thread stack.
 This is not full Lean elimination elaboration. Indexed and mutual families,
 non-local discriminants, `cases h : expression`, `using` recursors, `case`/bullet
 selectors, inaccessible patterns and higher-order/nested recursive fields are not
-supported by this tactic lane. Some parameterized recursive families still lie
-outside the independent checker's admission support and remain explicit vetoes.
-A parameterized nonrecursive family is supported when its admission succeeds.
+supported by this tactic lane. Uniformly parameterized families with direct
+recursive fields now have constructor-derived independent admission support;
+see [Native parameterized recursion](NATIVE_PARAMETERIZED_RECURSION.md). Shapes
+outside that documented lane remain explicit checker vetoes.
 The source proof state is not yet a complete interactive MCP/LSP tactic service.

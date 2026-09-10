@@ -95,9 +95,10 @@ conversion procedure or support for indexed/K/quotient elaboration rules.
 This is not complete Lean termination elaboration. Course-of-values recursion
 on grandchildren, indexed or mutual families,
 well-founded measures, recursive `where`/`let rec`, equation-style definitions
-and `termination_by` clauses are not implemented here. A parameterized recursive
-family may additionally be outside the independent checker's supported shapes;
-that checker is never bypassed to make a recursive source example pass.
+and `termination_by` clauses are not implemented here. Generic lists and trees
+with uniform parameters and direct recursive fields now have independent
+admission support; see [Native parameterized recursion](NATIVE_PARAMETERIZED_RECURSION.md).
+Other unsupported family shapes remain vetoes, never checker bypasses.
 
 Regression coverage lives in `crates/fln/tests/source_recursion.rs`; it exercises
 real source parsing, inference, recursor construction and both checking engines.

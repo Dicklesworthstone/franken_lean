@@ -95,6 +95,8 @@
 //! *outside* the engine: it calls the public [`infer_with`] and [`whnf_with`]
 //! entry points and never joins their recursion.
 
+mod uniform;
+
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
     QuickDefEqBudget, QuickDefEqFault, QuickDefEqLimit, QuickDefEqSide, QuickDefEqStop,
@@ -571,6 +573,7 @@ struct DeclaredTypeFacts {
     /// zero — i.e. the declared type is a `Prop`.
     is_proposition: bool,
     explicit_universe: Option<u32>,
+    universe: WireLevel,
 }
 
 fn stopped(name: &WireName, phase: AdmissionPhase) -> Verdict {
@@ -630,11 +633,29 @@ fn declared_type_is_a_type(
         }
     };
 
-    let type_of_type = match infer_with(
+    type_is_type_in_context(
+        name,
         declaration.type_(),
         &context,
+        declaration.safety(),
+        budget,
+        cancelled,
+    )
+}
+
+fn type_is_type_in_context(
+    name: &WireName,
+    type_: &WireExpr,
+    context: &InferenceContext,
+    safety: ConstantSafety,
+    budget: &AdmissionBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DeclaredTypeFacts, Verdict> {
+    let type_of_type = match infer_with(
+        type_,
+        context,
         InferenceMode::Checking {
-            declaration_safety: declaration.safety(),
+            declaration_safety: safety,
         },
         budget.inference,
         &mut *cancelled,
@@ -672,7 +693,7 @@ fn declared_type_is_a_type(
         }
     };
 
-    reduces_to_a_sort(name, &type_of_type, &context, budget, cancelled)
+    reduces_to_a_sort(name, &type_of_type, context, budget, cancelled)
 }
 
 fn reduces_to_a_sort(
@@ -739,6 +760,7 @@ fn reduces_to_a_sort(
                         Some(NormalNode::Zero)
                     ),
                     explicit_universe: explicit_normal_universe(&normal),
+                    universe: carrier,
                 }),
                 Err(_) => Err(Verdict::InternalFault(
                     AdmissionFault::UniverseNotNormalizable { name: name.clone() },
@@ -2021,6 +2043,7 @@ pub enum InductiveRejection {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InductiveFault {
+    Term(crate::term::TermFault),
     Structural(QuickDefEqFault),
     MemberPreamble {
         name: WireName,
@@ -2038,6 +2061,7 @@ pub enum InductiveFault {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InductiveStop {
+    Term(crate::term::TermStop),
     Structural(QuickDefEqStop),
     MemberPreamble {
         name: WireName,
@@ -7773,6 +7797,22 @@ pub fn admit_inductive_with(
         && metadata.num_parameters() == 2
     {
         return admit_init_prod(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
+    // Positive parameterized families share one constructor-derived judgment,
+    // independently of the claimed recursive flag. In particular a false flag
+    // cannot hide a recursive occurrence in a class-shaped declaration.
+    if metadata.num_parameters() > 0
+        && uniform::positive_result(declaration, metadata.num_parameters())
+    {
+        return uniform::admit(
             environment,
             declarations,
             inductive,
