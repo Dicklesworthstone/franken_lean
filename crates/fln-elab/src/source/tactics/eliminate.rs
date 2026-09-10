@@ -39,7 +39,7 @@ fn add_local(context: &mut LocalContext, local: &LocalDecl) {
     }
 }
 impl Context {
-    fn elimination_reads(
+    pub(in crate::source) fn elimination_reads(
         &mut self,
         expr: &Expr,
     ) -> Result<HashSet<FVarId>, NatDefinitionElabError> {

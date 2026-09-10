@@ -53,13 +53,20 @@ struct Branch<'a> {
     whole: Option<Name>,
     syntax: &'a Syntax,
 }
+struct DirectMatch<'a> {
+    syntax: Option<&'a Syntax>,
+    whole: Option<Name>,
+}
 pub(super) struct MatchBuild<'a> {
+    direct: Option<DirectMatch<'a>>,
     recursive: bool,
     saved: LocalContext,
     target: Expr,
     major: Typed,
     family: Name,
     parameters: Vec<Expr>,
+    indices: Vec<LocalDecl>,
+    generalized: Vec<LocalDecl>,
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
@@ -234,10 +241,9 @@ impl Context {
             return Err(error(MatchError::ExpectedInductive));
         };
         if family.is_unsafe
-            || family.num_indices != 0
             || family.num_nested != 0
             || family.all != [name.clone()]
-            || parameters.len() != family.num_params as usize
+            || parameters.len() != family.num_params as usize + family.num_indices as usize
             || levels.len() != family.base.level_params.len()
         {
             return Err(error(MatchError::UnsupportedFamily));
@@ -250,7 +256,7 @@ impl Context {
             return Err(error(MatchError::UnsupportedFamily));
         };
         if rec.is_unsafe
-            || rec.num_indices != 0
+            || rec.num_indices != family.num_indices
             || rec.num_params != family.num_params
             || rec.num_motives != 1
             || rec.num_minors as usize != family.ctors.len()
@@ -261,6 +267,7 @@ impl Context {
         {
             return Err(error(MatchError::UnsupportedFamily));
         }
+        let index_values = parameters.split_off(family.num_params as usize);
         let target = match expected {
             Some(target) => self.instantiate(&target)?,
             None => {
@@ -269,11 +276,105 @@ impl Context {
             }
         };
         let recursive = self.recursive_match(&major.value);
-        let motive_target = if recursive {
+        // A sole variable/wildcard pattern does not refine any index. Lower it
+        // to a checked local binding, retaining the original discriminant type.
+        // In particular, `match xs with | _ => xs` must not force `xs` to have
+        // every constructor's result type.
+        if !recursive && parts.alternatives.len() == 1 {
+            let alt = expect_node(
+                &parts.alternatives[0],
+                &parser_kind(&["Term", "matchAlt"]),
+                4,
+                "match alternative",
+            )?;
+            expect_atom(&alt[0], "|", "alternative separator")?;
+            if !matches!(&alt[2], Syntax::Atom { val, .. } if val == "=>" || val == "↦") {
+                return Err(error(MatchError::InvalidPattern));
+            }
+            if let [sequence] = expect_null_args(&alt[1], "single pattern sequence")?
+                && let [pattern] = expect_null_args(sequence, "single pattern")?
+                && let Ok(whole) = pattern_name(pattern)
+                && !whole.as_ref().is_some_and(|name| {
+                    matches!(self.txn.env.find(name), Some(ConstantInfo::Ctor(_)))
+                        || (family.base.name == Name::from_components(["Bool"])
+                            && matches!(name.to_display_string().as_str(), "true" | "false"))
+                })
+            {
+                return Ok(MatchBuild {
+                    direct: Some(DirectMatch {
+                        syntax: Some(&alt[3]),
+                        whole,
+                    }),
+                    recursive,
+                    saved: self.txn.lctx.clone(),
+                    target,
+                    major: major.clone(),
+                    family: name.clone(),
+                    parameters,
+                    indices: Vec::new(),
+                    generalized: Vec::new(),
+                    levels: levels.clone(),
+                    // Replaced by the checked body before completion.
+                    recursor: major,
+                    branches: std::collections::VecDeque::new(),
+                });
+            }
+        }
+        if recursive && !index_values.is_empty() {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
+        let indices = self.elimination_index_locals(&index_values)?;
+        let mut generalized = Vec::new();
+        if !indices.is_empty() {
+            let mut dependencies: HashSet<_> =
+                indices.iter().map(|index| index.id.clone()).collect();
+            // Generalization may not change the fixed family parameters or an
+            // earlier index's domain. Dependent index pattern equations belong
+            // to the refinement compiler, not this constructor-variable lane.
+            for value in parameters
+                .iter()
+                .chain(indices.iter().map(|index| &index.type_))
+            {
+                if !self.elimination_reads(value)?.is_disjoint(&dependencies) {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+            }
+            let major_id = if let ExprNode::FVar { id } = major.value.node() {
+                dependencies.insert(id.clone());
+                Some(id)
+            } else {
+                None
+            };
+            for local in self.txn.lctx.clone().decls() {
+                if local.value.is_none()
+                    && local.binder_info != BinderInfo::InstImplicit
+                    && major_id != Some(&local.id)
+                    && !indices.iter().any(|index| index.id == local.id)
+                    && !self
+                        .elimination_reads(&local.type_)?
+                        .is_disjoint(&dependencies)
+                {
+                    dependencies.insert(local.id.clone());
+                    generalized.push(local.clone());
+                }
+            }
+        }
+        let mut motive_target = if recursive {
             self.recursive_target(&target)?
         } else {
             target.clone()
         };
+        for local in generalized.iter().rev() {
+            self.tick()?;
+            motive_target = Expr::forall_e(
+                local.user_name.clone(),
+                self.instantiate(&local.type_)?,
+                motive_target
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                local.binder_info,
+            );
+        }
         let target_type = self
             .known_type(&motive_target)?
             .ok_or_else(|| error(MatchError::ExpectedInductive))?;
@@ -291,12 +392,23 @@ impl Context {
         } else {
             motive_target.clone()
         };
-        let motive = Expr::lam(
+        let mut motive = Expr::lam(
             Name::anonymous(),
             family_type.clone(),
             body,
             BinderInfo::Default,
         );
+        for index in indices.iter().rev() {
+            self.tick()?;
+            motive = Expr::lam(
+                index.user_name.clone(),
+                self.instantiate(&index.type_)?,
+                motive
+                    .abstract_fvar(&index.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                index.binder_info,
+            );
+        }
         let motive_type = self
             .known_type(&motive)?
             .ok_or_else(|| error(MatchError::ExpectedInductive))?;
@@ -453,12 +565,15 @@ impl Context {
             });
         }
         Ok(MatchBuild {
+            direct: None,
             recursive,
             saved: self.txn.lctx.clone(),
             target,
             major,
             family: name.clone(),
             parameters,
+            indices,
+            generalized,
             levels: levels.clone(),
             recursor,
             branches,
@@ -545,8 +660,53 @@ impl Context {
         state: &mut MatchBuild<'a>,
     ) -> Result<MatchStep<'a>, NatDefinitionElabError> {
         self.txn.lctx = state.saved.clone();
+        if let Some(direct) = &mut state.direct {
+            let Some(syntax) = direct.syntax.take() else {
+                return Ok(MatchStep::Complete(
+                    self.finish_term(state.recursor.clone(), Some(&state.target))?,
+                ));
+            };
+            // Bind even a wildcard: the original value and its type remain in
+            // the core term, so an unused malformed argument cannot disappear.
+            let id = FVarId(self.fresh_name()?);
+            self.txn.lctx.add_let(
+                id.clone(),
+                direct.whole.clone().unwrap_or_else(Name::anonymous),
+                state.major.type_.clone(),
+                state.major.value.clone(),
+            );
+            return Ok(MatchStep::Branch {
+                syntax,
+                expected: state.target.clone(),
+                binders: BranchBinders {
+                    hypotheses: Vec::new(),
+                    locals: vec![self.txn.lctx.find(&id).expect("whole-match binder").clone()],
+                    type_: state.target.clone(),
+                },
+            });
+        }
         let Some(branch) = state.branches.pop_front() else {
-            let mut result = self.match_apply(state.recursor.clone(), state.major.clone())?;
+            let mut result = state.recursor.clone();
+            for index in &state.indices {
+                result = self.match_apply(
+                    result,
+                    Typed {
+                        value: Expr::fvar(index.id.clone()),
+                        type_: index.type_.clone(),
+                    },
+                )?;
+            }
+            result = self.match_apply(result, state.major.clone())?;
+            for local in &state.generalized {
+                let type_ = self.instantiate(&local.type_)?;
+                result = self.match_apply(
+                    result,
+                    Typed {
+                        value: Expr::fvar(local.id.clone()),
+                        type_,
+                    },
+                )?;
+            }
             if state.recursive {
                 for argument in self.recursive_arguments() {
                     let type_ = self
@@ -652,19 +812,14 @@ impl Context {
             };
             let id = FVarId(self.fresh_name()?);
             hypotheses.push((field, id.clone()));
-            self.txn.lctx.add_param(
-                id.clone(),
-                Name::anonymous(),
-                binder_type.clone(),
-                *binder_info,
-            );
-            locals.push(
-                self.txn
-                    .lctx
-                    .find(&id)
-                    .expect("recursive branch binder")
-                    .clone(),
-            );
+            locals.push(LocalDecl {
+                id: id.clone(),
+                user_name: Name::anonymous(),
+                type_: binder_type.clone(),
+                value: None,
+                binder_info: *binder_info,
+                index: self.txn.lctx.len(),
+            });
             target = self.substitute(body, &Expr::fvar(id))?;
         }
         if state.recursive {
@@ -672,9 +827,10 @@ impl Context {
         }
         if let Some(whole) = branch.whole {
             let id = FVarId(self.fresh_name()?);
-            self.txn
-                .lctx
-                .add_let(id.clone(), whole, family_type, constructor);
+            let type_ = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            self.txn.lctx.add_let(id.clone(), whole, type_, constructor);
             locals.push(
                 self.txn
                     .lctx
@@ -683,10 +839,97 @@ impl Context {
                     .clone(),
             );
         }
+        for local in &state.generalized {
+            self.tick()?;
+            target = self.whnf(&target)?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = target.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let name = if locals
+                .iter()
+                .any(|binder| binder.user_name == local.user_name)
+            {
+                Name::anonymous()
+            } else {
+                local.user_name.clone()
+            };
+            let id = FVarId(self.fresh_name()?);
+            self.txn
+                .lctx
+                .add_param(id.clone(), name, binder_type.clone(), *binder_info);
+            locals.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("generalized match binder")
+                    .clone(),
+            );
+            target = self.substitute(body, &Expr::fvar(id))?;
+        }
         if state.recursive {
             target = self.recursive_parameters(&mut locals, target)?;
         }
         let expected = self.whnf(&target)?;
+        // Fresh generalized parameters shadow their old source names. Clear
+        // the old locals only when no retained type or let value needs them;
+        // otherwise a captured let would lose its actual free-variable scope.
+        // In particular, obsolete dictionaries must not stay searchable merely
+        // because their replacement was given the same name.
+        if !state.generalized.is_empty() {
+            let candidates: HashSet<_> = state
+                .generalized
+                .iter()
+                .map(|local| local.id.clone())
+                .collect();
+            let context = self.txn.lctx.clone();
+            let target_reads = self.elimination_reads(&expected)?;
+            let mut reads = Vec::new();
+            for local in context.decls() {
+                let mut dependencies = self.elimination_reads(&local.type_)?;
+                if let Some(value) = &local.value {
+                    dependencies.extend(self.elimination_reads(value)?);
+                }
+                reads.push(dependencies);
+            }
+            let mut retained = vec![true; context.len()];
+            for (index, local) in context.decls().iter().enumerate().rev() {
+                self.tick()?;
+                if candidates.contains(&local.id)
+                    && !target_reads.contains(&local.id)
+                    && !reads.iter().enumerate().any(|(other, dependencies)| {
+                        other != index && retained[other] && dependencies.contains(&local.id)
+                    })
+                {
+                    retained[index] = false;
+                }
+            }
+            self.txn.lctx = LocalContext::new();
+            for (local, keep) in context.decls().iter().zip(retained) {
+                if keep {
+                    if let Some(value) = &local.value {
+                        self.txn.lctx.add_let(
+                            local.id.clone(),
+                            local.user_name.clone(),
+                            local.type_.clone(),
+                            value.clone(),
+                        );
+                    } else {
+                        self.txn.lctx.add_param(
+                            local.id.clone(),
+                            local.user_name.clone(),
+                            local.type_.clone(),
+                            local.binder_info,
+                        );
+                    }
+                }
+            }
+        }
         Ok(MatchStep::Branch {
             syntax: branch.syntax,
             expected,
@@ -729,6 +972,13 @@ impl Context {
             };
         }
         self.txn.lctx = state.saved.clone();
+        if state.direct.is_some() {
+            state.recursor = Typed {
+                value,
+                type_: binders.type_,
+            };
+            return Ok(());
+        }
         state.recursor = self.match_apply(
             state.recursor.clone(),
             Typed {
