@@ -496,6 +496,69 @@ fn indexed_match_resource_stop_preserves_the_source_environment() {
             .check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits()))
             .unwrap()
             .into_complete()
-            .is_some()
+            .is_ok()
     );
+}
+
+#[test]
+fn indexed_generalization_cannot_rescue_an_ill_typed_original_motive() {
+    check(&format!(
+        "{VEC}def valid (n : Nat) (xs : Vec Nat n) (P : Vec Nat n -> Type) (f : P xs) : Nat := match xs with | .nil => 0 | .cons k x tail => k"
+    ));
+    for body in [
+        "def invalid (n : Nat) (xs : Vec Nat n) (P : Vec Nat n -> Type) (f : P xs) : P xs := match xs with | .nil => f | .cons k x tail => f",
+        "theorem invalid (n : Nat) (xs ys : Vec Nat n) : ys = ys := match xs with | .nil => rfl | .cons k x tail => rfl",
+    ] {
+        let source = format!("{VEC}{body}");
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        let error = e
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("original motive must be type-correct");
+        assert_eq!(
+            error.disposition(),
+            ("kernel-rejection", true, 1),
+            "{error:?}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn indexed_matches_preserve_index_order_and_refuse_unimplemented_pattern_refinement() {
+    check(
+        "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell (Nat.succ x) (Nat.succ y)\ndef digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 4 8 (Cell.make 3 7) = 37 := by rfl",
+    );
+    check(
+        "inductive Mark (a : Nat) : Nat -> Type where | mk : Mark a a\ndef point (a n : Nat) (x : Mark a n) : Nat := match x with | .mk => a\ntheorem checked : point 7 7 Mark.mk = 7 := by rfl",
+    );
+    for fields in ["x y", "_ _"] {
+        let source = format!(
+            "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef inspect (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make {fields} => n"
+        );
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        let error = e
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("unrefined index patterns are outside this lane");
+        assert!(
+            error
+                .to_string()
+                .contains("direct constructor-field indices require index-pattern refinement"),
+            "{error:?}"
+        );
+        assert!(
+            !error.disposition().1,
+            "a capability refusal is not a kernel rejection"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
 }
