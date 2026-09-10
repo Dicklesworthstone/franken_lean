@@ -152,3 +152,99 @@ fn lexical_self_name_shadowing_stays_nonrecursive() {
 fn a_bad_unreachable_recursive_branch_still_reaches_kernel_checking() {
     assert!(engine().check_source_files(&[b"def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => let bad : String := count k; 1\ndef zero : Nat := count 0"], &KVMap::new(), SourceCheckLimits::new(limits())).is_err());
 }
+
+#[test]
+fn changing_accumulators_are_generalized_in_the_induction_motive() {
+    check(
+        "def sumAcc (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => sumAcc k (acc + n)\ntheorem zero : sumAcc 0 7 = 7 := by rfl\ntheorem total : sumAcc 4 0 = 10 := by rfl\ntheorem shifted : sumAcc 4 7 = 17 := by rfl",
+    );
+    check(
+        "def walk (step : Nat -> Nat) (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => walk step k (step acc)\ntheorem ok : walk (fun x => x + 3) 4 1 = 13 := by rfl",
+    );
+}
+
+#[test]
+fn changing_trailing_types_and_values_preserve_dependent_telescope_order() {
+    check(
+        "def repeat (n : Nat) {A : Type} (step : A -> A) (acc : A) : A := match n with | .zero => acc | .succ k => repeat k step (step acc)\ntheorem ok : repeat 3 (fun x => x + 2) 1 = 7 := by rfl",
+    );
+    check(
+        "def switch (n : Nat) (A : Type) (x : A) : Nat := match n with | .zero => 0 | .succ k => switch k Nat 5 + 1\ntheorem ok : switch 4 String \"initial\" = 4 := by rfl",
+    );
+}
+
+#[test]
+fn trailing_proof_domains_are_specialized_to_the_smaller_major() {
+    check(
+        "def steps (n : Nat) (h : n = n) : Nat := match n with | .zero => 0 | .succ k => steps k rfl + 1\ntheorem ok : steps 4 rfl = 4 := by rfl",
+    );
+}
+
+#[test]
+fn trailing_instances_remain_actual_recursive_call_arguments() {
+    check(
+        "def choose (n : Nat) [Inhabited Nat] : Nat := match n with | .zero => default | .succ k => choose k + 1\ntheorem ok : choose 3 = 3 := by rfl",
+    );
+}
+
+#[test]
+fn partial_recursive_values_are_safe_after_the_structural_child_is_supplied() {
+    check(
+        "def add (n : Nat) (m : Nat) : Nat := match n with | .zero => m | .succ k => let smaller := add k; smaller (m + 1)\ntheorem ok : add 3 5 = 8 := by rfl",
+    );
+}
+
+#[test]
+fn constructor_pattern_names_shadow_trailing_parameter_names() {
+    check(
+        "def shadow (n : Nat) (k : Nat) : Nat := match n with | .zero => k | .succ k => shadow k 1\ntheorem base : shadow 0 9 = 9 := by rfl\ntheorem step : shadow 3 9 = 1 := by rfl",
+    );
+}
+
+#[test]
+fn nested_recursive_calls_in_changed_arguments_are_lowered_too() {
+    check(
+        "def nested (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => nested k (nested k acc + 1)\ntheorem ok : nested 3 0 = 7 := by rfl",
+    );
+}
+
+#[test]
+fn invalid_changed_arguments_are_not_erased_by_termination_lowering() {
+    let base = engine();
+    let before = base.environment().clone();
+    for text in [
+        "def bad (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => bad k (bad n acc)",
+        "def bad (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => let unused := bad k (1 : String); 0",
+        "def bad (fixed : Nat) (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => bad 7 k acc",
+        "def bad (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => let escaped := bad; escaped k acc",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[text.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{text}"
+        );
+        assert_eq!(base.environment(), &before);
+    }
+}
+
+#[test]
+fn recursive_results_can_be_types_and_proofs_not_only_natural_values() {
+    check(
+        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ntheorem type_ok : Tower 1 = (Nat -> Nat) := by rfl",
+    );
+    check(
+        "theorem proofChain (n : Nat) : 0 = 0 := match n with | .zero => rfl | .succ k => proofChain k",
+    );
+    assert!(engine().check_source_files(&[b"theorem falseChain (n : Nat) : 0 = 1 := match n with | .zero => falseChain n | .succ k => falseChain k"], &KVMap::new(), SourceCheckLimits::new(limits())).is_err());
+}
+
+#[test]
+fn different_tree_children_receive_independent_changing_accumulators() {
+    check(
+        "inductive Tree where | leaf (value : Nat) | fork (left right : Tree)\ndef sumInto (tree : Tree) (acc : Nat) : Nat := match tree with | .leaf value => value + acc | .fork left right => sumInto right (sumInto left acc)\ntheorem ok : sumInto (Tree.fork (Tree.leaf 3) (Tree.fork (Tree.leaf 7) (Tree.leaf 11))) 5 = 26 := by rfl",
+    );
+}

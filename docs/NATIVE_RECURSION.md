@@ -21,9 +21,9 @@ def treeSum (tree : Tree) : Nat := match tree with
 ```
 
 The decreasing argument is inferred from the match at the root of the function
-body. In this increment it must be the final explicit header parameter, and the
-result type must be explicit. Earlier parameters, including implicit type
-parameters and instance dictionaries, remain fixed. Recursive calls may occur
+body. It must be an explicit header parameter, and the result type must be
+explicit. Earlier parameters, including implicit type parameters and instance
+dictionaries, remain fixed. Later parameters may vary at each call. Recursive calls may occur
 inside branch expressions, lets, lambdas and nested matches, provided they use
 an immediate recursive constructor field of that root match.
 
@@ -32,8 +32,33 @@ permitted call is replaced by the corresponding recursor hypothesis. The final
 candidate has no self-reference, unresolved hole or escaping free variable.
 Every constructor branch and every retained argument is checked by the ordinary
 kernel and independent checker. Nondecreasing calls, changed fixed parameters,
-partial self-applications and recursive names stored as arbitrary values refuse;
+recursive names escaping without a structural child refuse;
 unused lets and type annotations cannot hide them.
+
+Trailing arguments are universally quantified in the recursor motive. Each
+induction hypothesis is therefore a function of their new values, not a result
+capturing the outer arguments. This supports accumulators, changing type
+arguments, implicit binders, dictionaries and proof arguments whose types depend
+on the decreasing input:
+
+```lean
+def sumAcc (n : Nat) (acc : Nat) : Nat := match n with
+  | .zero => acc
+  | .succ k => sumAcc k (acc + n)
+
+theorem acc_ok : sumAcc 4 7 = 17 := by rfl
+
+def checkedSteps (n : Nat) (h : n = n) : Nat := match n with
+  | .zero => 0
+  | .succ k => checkedSteps k rfl + 1
+```
+
+After supplying the fixed prefix and a direct child, a recursive call may be
+partially applied: `let smaller := add k; smaller (m + 1)` retains the actual
+function-valued induction hypothesis. A bare `add` remains unsupported. All
+varying and extra result-function arguments are retained and checked, including
+nested recursive calls within them. Pattern names shadow same-named header
+parameters without deleting the generalized argument's binder.
 
 The original major is removed from the recursive branch context and its source
 name is rebound to that branch's constructor value unless shadowed by a pattern
@@ -42,8 +67,8 @@ binder. Capturing the original major instead would miscompile functions such as
 Failed nonrecursive attempts and termination failures retain spent work, but
 never publish a speculative environment.
 
-This is not complete Lean termination elaboration. Varying extra arguments,
-course-of-values recursion on grandchildren, indexed or mutual families,
+This is not complete Lean termination elaboration. Course-of-values recursion
+on grandchildren, indexed or mutual families,
 well-founded measures, recursive `where`/`let rec`, equation-style definitions
 and `termination_by` clauses are not implemented here. A parameterized recursive
 family may additionally be outside the independent checker's supported shapes;
@@ -51,3 +76,7 @@ that checker is never bypassed to make a recursive source example pass.
 
 Regression coverage lives in `crates/fln/tests/source_recursion.rs`; it exercises
 real source parsing, inference, recursor construction and both checking engines.
+The installed CLI checks `examples/native_recursion.lean` with
+`fln check-source --json examples/native_recursion.lean`. This is admission and
+kernel conversion, not a claim that the native execution backend now supports
+every recursive definition.

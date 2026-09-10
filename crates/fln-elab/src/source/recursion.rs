@@ -12,7 +12,7 @@ use std::collections::HashMap;
 pub enum RecursionError {
     ResultTypeRequired,
     RootMatchRequired,
-    FinalParameterRequired,
+    ExplicitParameterRequired,
     NotDecreasing,
     ChangedParameter,
     PartialApplication,
@@ -24,8 +24,8 @@ impl std::fmt::Display for RecursionError {
             Self::RootMatchRequired => {
                 "structural recursion requires a body matching a function parameter"
             }
-            Self::FinalParameterRequired => {
-                "structural recursion currently requires the final explicit parameter"
+            Self::ExplicitParameterRequired => {
+                "structural recursion requires an explicit decreasing parameter"
             }
             Self::NotDecreasing => {
                 "recursive call is not on an immediate recursive constructor field"
@@ -104,10 +104,8 @@ impl Context {
             .iter()
             .rposition(|local| &local.user_name == val)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
-        if decreasing + 1 != parameters.len()
-            || parameters[decreasing].binder_info != BinderInfo::Default
-        {
-            return Err(error(RecursionError::FinalParameterRequired));
+        if parameters[decreasing].binder_info != BinderInfo::Default {
+            return Err(error(RecursionError::ExplicitParameterRequired));
         }
         let mut full_type = self.instantiate(expected)?;
         for local in parameters.iter().rev() {
@@ -155,6 +153,95 @@ impl Context {
         } else {
             false
         }
+    }
+
+    /// Abstract trailing arguments into the motive, so the induction hypothesis
+    /// is a function of their *new* values, rather than a result at captured
+    /// values from the original call. Domains may depend on the major and on
+    /// preceding trailing arguments.
+    pub(super) fn recursive_target(
+        &mut self,
+        target: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let recursion = self
+            .recursion
+            .clone()
+            .expect("recursive target specification");
+        let mut target = self.instantiate(target)?;
+        for local in recursion.parameters[recursion.decreasing + 1..]
+            .iter()
+            .rev()
+        {
+            self.tick()?;
+            target = target
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            target = Expr::forall_e(
+                local.user_name.clone(),
+                self.instantiate(&local.type_)?,
+                target,
+                local.binder_info,
+            );
+        }
+        Ok(target)
+    }
+
+    pub(super) fn recursive_arguments(&self) -> Vec<Expr> {
+        let recursion = self
+            .recursion
+            .as_ref()
+            .expect("recursive result specification");
+        recursion.parameters[recursion.decreasing + 1..]
+            .iter()
+            .map(|local| Expr::fvar(local.id.clone()))
+            .collect()
+    }
+
+    pub(super) fn recursive_parameters(
+        &mut self,
+        locals: &mut Vec<LocalDecl>,
+        mut target: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let recursion = self
+            .recursion
+            .clone()
+            .expect("recursive branch specification");
+        for parameter in &recursion.parameters[recursion.decreasing + 1..] {
+            self.tick()?;
+            target = self.whnf(&target)?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = target.node()
+            else {
+                return Err(failure(SourceInferenceError::ExpectedFunction));
+            };
+            // A pattern binder shadows an equally named header parameter. The
+            // generalized parameter still exists but is not name-resolvable.
+            let name = if locals
+                .iter()
+                .any(|local| local.user_name == parameter.user_name)
+            {
+                Name::anonymous()
+            } else {
+                parameter.user_name.clone()
+            };
+            let id = FVarId(self.fresh_name()?);
+            self.txn
+                .lctx
+                .add_param(id.clone(), name, binder_type.clone(), *binder_info);
+            locals.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("generalized argument")
+                    .clone(),
+            );
+            target = self.substitute(body, &Expr::fvar(id))?;
+        }
+        Ok(target)
     }
 
     /// The original major must not remain captured in a recursive minor: its
@@ -237,7 +324,7 @@ impl Context {
                     }
                     if matches!(head.node(), ExprNode::FVar { id } if id == &recursion.marker) {
                         arguments.reverse();
-                        if arguments.len() < recursion.parameters.len() {
+                        if arguments.len() <= recursion.decreasing {
                             return Err(error(RecursionError::PartialApplication));
                         }
                         for (argument, parameter) in arguments
@@ -258,7 +345,7 @@ impl Context {
                             .find(|(field, _)| field == child)
                             .map(|(_, ih)| Expr::fvar(ih.clone()))
                             .ok_or_else(|| error(RecursionError::NotDecreasing))?;
-                        let extra = arguments[recursion.parameters.len()..].to_vec();
+                        let extra = arguments[recursion.decreasing + 1..].to_vec();
                         tasks.push(Task::Call(expr, hypothesis, extra.clone()));
                         tasks.extend(extra.into_iter().rev().map(Task::Visit));
                     } else {

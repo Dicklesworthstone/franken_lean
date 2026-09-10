@@ -41,8 +41,9 @@ matches in tactic terms are supported. Nested matches are parenthesized or their
 alternatives use distinct indentation; multiline alternatives at one level align.
 
 Direct uniform recursive fields receive the recursor's real induction-hypothesis
-binders, hidden from ordinary match syntax. Matching a recursive datatype does not
-yet implement recursive source functions or a termination checker. Cases return
+binders, hidden from ordinary match syntax. Primitive recursive source functions
+can now use those hypotheses under the rules in [Native structural recursion](NATIVE_RECURSION.md).
+Cases return
 ordinary core terms and **every written branch remains checked**, including a bad
 branch unreachable for a literal discriminant. No branch is dropped based on
 executing the scrutinee in the elaborator.
@@ -61,7 +62,7 @@ This is a bounded constructor-match compiler, not complete Lean match elaboratio
 Multiple discriminants, nested constructor patterns in a single alternative,
 numeric patterns, guards, indexed/mutual/nested families, inaccessible patterns,
 explicit motives, `match h : ...`, dependent generalization of other hypotheses,
-equation-compiler recursive definitions and structural/well-founded termination
+general equation-compiler recursive definitions and well-founded termination
 checking remain outside this increment. Numeric Nat values can be scrutinized
 with `.zero` and `.succ previous`; decimal-pattern syntax is not implemented.
 

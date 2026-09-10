@@ -559,3 +559,51 @@ fn installed_binary_checks_constructor_matches_and_refuses_an_invalid_unused_bra
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_recursive_functions_and_never_publishes_a_bad_suffix() {
+    let prefix = file(
+        "def sumAcc (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => sumAcc k (acc + n)\ndef add (n : Nat) (m : Nat) : Nat := match n with | .zero => m | .succ k => let smaller := add k; smaller (m + 1)",
+    );
+    let good =
+        file("theorem sum_ok : sumAcc 4 7 = 17 := by rfl\ntheorem add_ok : add 3 5 = 8 := by rfl");
+    let bad = file(
+        "def loop (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => let unused := loop n acc; 0",
+    );
+    let false_proof = file("theorem bad_sum : sumAcc 4 7 = 18 := by rfl");
+    for (suffix, success) in [
+        (&good, true),
+        (&bad, false),
+        (&false_proof, false),
+        (&good, true),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":4",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}

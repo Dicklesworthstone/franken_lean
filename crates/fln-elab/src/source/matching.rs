@@ -211,22 +211,28 @@ impl Context {
                 self.hole(sort)?
             }
         };
+        let recursive = self.recursive_match(&major.value);
+        let motive_target = if recursive {
+            self.recursive_target(&target)?
+        } else {
+            target.clone()
+        };
         let target_type = self
-            .known_type(&target)?
+            .known_type(&motive_target)?
             .ok_or_else(|| error(MatchError::ExpectedInductive))?;
         let universe = self.sort_level(&Typed {
-            value: target.clone(),
+            value: motive_target.clone(),
             type_: target_type,
         })?;
         // A local discriminant is generalized in the expected result, producing
         // genuinely dependent branches. Other expressions use a constant motive;
         // no equality is fabricated to refine unrelated local hypotheses.
         let body = if let ExprNode::FVar { id } = major.value.node() {
-            target
+            motive_target
                 .abstract_fvar(id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?
         } else {
-            target.clone()
+            motive_target.clone()
         };
         let motive = Expr::lam(
             Name::anonymous(),
@@ -390,7 +396,7 @@ impl Context {
             });
         }
         Ok(MatchBuild {
-            recursive: self.recursive_match(&major.value),
+            recursive,
             saved: self.txn.lctx.clone(),
             target,
             major,
@@ -456,7 +462,21 @@ impl Context {
     ) -> Result<MatchStep<'a>, NatDefinitionElabError> {
         self.txn.lctx = state.saved.clone();
         let Some(branch) = state.branches.pop_front() else {
-            let result = self.match_apply(state.recursor.clone(), state.major.clone())?;
+            let mut result = self.match_apply(state.recursor.clone(), state.major.clone())?;
+            if state.recursive {
+                for argument in self.recursive_arguments() {
+                    let type_ = self
+                        .known_type(&argument)?
+                        .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+                    result = self.match_apply(
+                        result,
+                        Typed {
+                            value: argument,
+                            type_,
+                        },
+                    )?;
+                }
+            }
             return Ok(MatchStep::Complete(
                 self.finish_term(result, Some(&state.target))?,
             ));
@@ -578,6 +598,9 @@ impl Context {
                     .expect("whole-pattern binder")
                     .clone(),
             );
+        }
+        if state.recursive {
+            target = self.recursive_parameters(&mut locals, target)?;
         }
         let expected = self.whnf(&target)?;
         Ok(MatchStep::Branch {
