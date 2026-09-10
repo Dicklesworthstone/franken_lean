@@ -14,6 +14,7 @@ mod matching;
 mod record;
 mod record_terms;
 mod recursion;
+mod reduce;
 mod tactics;
 
 use super::*;
@@ -309,108 +310,7 @@ impl Context {
         transparency: UnificationTransparency,
         zeta_delta: bool,
     ) -> Result<Expr, NatDefinitionElabError> {
-        let mut head = self.instantiate(expr)?;
-        let mut arguments = Vec::new();
-        let mut projections: Vec<(Name, u64, Vec<Expr>)> = Vec::new();
-        loop {
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr,
-                    } => {
-                        projections.push((
-                            struct_name.clone(),
-                            *idx,
-                            std::mem::take(&mut arguments),
-                        ));
-                        head = expr.clone();
-                    }
-                    ExprNode::MData { expr, .. } => head = expr.clone(),
-                    ExprNode::App { f, a } => {
-                        arguments.push(a.clone());
-                        head = f.clone();
-                    }
-                    ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
-                    ExprNode::Lam { body, .. } if !arguments.is_empty() => {
-                        let value = arguments.pop().expect("guarded application");
-                        head = self.substitute(body, &value)?;
-                    }
-                    ExprNode::FVar { id } if zeta_delta => {
-                        let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
-                        match value {
-                            Some(value) => head = value,
-                            None => break,
-                        }
-                    }
-                    ExprNode::Const { name, levels } => {
-                        let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
-                            self.txn.env.find(name).cloned()
-                        else {
-                            break;
-                        };
-                        if definition.safety != DefinitionSafety::Safe
-                            || !match transparency {
-                                UnificationTransparency::None => false,
-                                UnificationTransparency::Abbreviations => {
-                                    definition.hints == ReducibilityHints::Abbrev
-                                }
-                                UnificationTransparency::SafeDefinitions => true,
-                            }
-                        {
-                            break;
-                        }
-                        if definition.base.level_params.len() != levels.len() {
-                            return Err(failure(SourceInferenceError::Scope));
-                        }
-                        head = self.instantiate_params(
-                            &definition.value,
-                            &definition.base.level_params,
-                            levels,
-                        )?;
-                    }
-                    _ => break,
-                }
-            }
-            if let Some((structure, index, outer)) = projections.pop() {
-                self.tick()?;
-                if let Some(field) = crate::records::constructor_field(
-                    &self.txn.env,
-                    &structure,
-                    index,
-                    &head,
-                    &arguments,
-                ) {
-                    head = field;
-                    arguments = outer;
-                    continue;
-                }
-                for argument in arguments.into_iter().rev() {
-                    self.tick()?;
-                    head = Expr::app(head, argument);
-                }
-                head = Expr::proj(structure, index, head);
-                arguments = outer;
-                // A stuck major cannot unlock an outer projection. Unwind without
-                // feeding that same blocked projection back into the reduction loop.
-                while let Some((structure, index, outer)) = projections.pop() {
-                    self.tick()?;
-                    for argument in arguments.into_iter().rev() {
-                        self.tick()?;
-                        head = Expr::app(head, argument);
-                    }
-                    head = Expr::proj(structure, index, head);
-                    arguments = outer;
-                }
-            }
-            for argument in arguments.into_iter().rev() {
-                self.tick()?;
-                head = Expr::app(head, argument);
-            }
-            return Ok(head);
-        }
+        self.reduce_source_head(expr, transparency, zeta_delta)
     }
 
     /// Enough type reconstruction to generate the universe side of an implicit

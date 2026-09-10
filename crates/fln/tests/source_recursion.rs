@@ -248,3 +248,55 @@ fn different_tree_children_receive_independent_changing_accumulators() {
         "inductive Tree where | leaf (value : Nat) | fork (left right : Tree)\ndef sumInto (tree : Tree) (acc : Nat) : Nat := match tree with | .leaf value => value + acc | .fork left right => sumInto right (sumInto left acc)\ntheorem ok : sumInto (Tree.fork (Tree.leaf 3) (Tree.fork (Tree.leaf 7) (Tree.leaf 11))) 5 = 26 := by rfl",
     );
 }
+
+#[test]
+fn recursive_type_computations_supply_source_lambda_domains() {
+    check(
+        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k\ndef idTower : Tower 1 := fun n => n\ndef higher : Tower 2 := fun f => f\ntheorem type_ok : idTower 9 = 9 := by rfl\ntheorem higher_ok : higher idTower 12 = 12 := by rfl",
+    );
+}
+
+#[test]
+fn nested_recursor_and_projection_continuations_expose_function_types() {
+    check(
+        "structure Shape where\n  carrier : Type\ndef shape (flag : Bool) : Shape := match flag with | true => { carrier := Nat -> Nat } | false => { carrier := String -> String }\ndef yes : (shape true).carrier := fun x => x\ndef no : (shape false).carrier := fun x => x\ntheorem yes_ok : yes 7 = 7 := by rfl\ntheorem no_ok : no \"ok\" = \"ok\" := by rfl",
+    );
+    check(
+        "def choose (flag : Bool) : Type := match flag with | true => Nat -> Nat | false => String -> String\ndef id : choose (match false with | true => false | false => true) := fun x => x\ntheorem ok : id 9 = 9 := by rfl",
+    );
+}
+
+#[test]
+fn parameterized_constructor_types_reduce_without_losing_their_payload() {
+    check(
+        "inductive Maybe (A : Type) where | none | some (value : A)\ndef shape (m : Maybe Nat) : Type := match m with | .none => String -> String | .some n => Nat -> Nat\ndef someId : shape (Maybe.some 7) := fun x => x\ndef noneId : shape Maybe.none := fun x => x\ntheorem some_ok : someId 11 = 11 := by rfl\ntheorem none_ok : noneId \"ok\" = \"ok\" := by rfl",
+    );
+}
+
+#[test]
+fn huge_literal_type_selection_reduces_only_one_constructor_layer() {
+    check(
+        "def shape (n : Nat) : Type := match n with | .zero => String -> String | .succ k => Nat -> Nat\ndef id : shape 340282366920938463463374607431768211456 := fun x => x\ntheorem ok : id 5 = 5 := by rfl",
+    );
+}
+
+#[test]
+fn a_stuck_discriminant_does_not_guess_a_branch_or_erase_an_invalid_one() {
+    let base = engine();
+    let before = base.environment().clone();
+    for text in [
+        "def shape (flag : Bool) : Type := match flag with | true => Nat -> Nat | false => String\ndef bad (flag : Bool) : shape flag := fun x => x",
+        "def bad : Nat := match true with | true => 1 | false => (1 : String)",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[text.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{text}"
+        );
+        assert_eq!(base.environment(), &before);
+    }
+}

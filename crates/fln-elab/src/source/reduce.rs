@@ -1,0 +1,426 @@
+//! Metered source weak-head reduction, with heap continuations for eliminators.
+//!
+//! This is an elaboration aid, not a checker. Constructor reduction uses only
+//! admitted recursor rules. Stuck majors are rebuilt once and unwound, never
+//! resubmitted in an unproductive loop. Neither reduction nor transparency can
+//! publish a declaration or eliminate an original source typing obligation.
+use super::*;
+use fln_env::constants::{ConstantInfo, RecursorVal};
+
+enum Continuation {
+    Projection {
+        structure: Name,
+        index: u64,
+        arguments: Vec<Expr>,
+    },
+    Recursor {
+        head: Expr,
+        recursor: RecursorVal,
+        arguments: Vec<Expr>,
+    },
+}
+
+fn recursor_prefix(recursor: &RecursorVal) -> Result<usize, NatDefinitionElabError> {
+    (recursor.num_params as usize)
+        .checked_add(recursor.num_motives as usize)
+        .and_then(|n| n.checked_add(recursor.num_minors as usize))
+        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))
+}
+
+impl Context {
+    pub(super) fn reduce_source_head(
+        &mut self,
+        expr: &Expr,
+        transparency: UnificationTransparency,
+        zeta_delta: bool,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut head = self.instantiate(expr)?;
+        let mut arguments = Vec::new();
+        let mut continuations = Vec::new();
+        'reduce: loop {
+            loop {
+                self.tick()?;
+                match head.node() {
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => {
+                        continuations.push(Continuation::Projection {
+                            structure: struct_name.clone(),
+                            index: *idx,
+                            arguments: std::mem::take(&mut arguments),
+                        });
+                        head = expr.clone();
+                    }
+                    ExprNode::MData { expr, .. } => head = expr.clone(),
+                    ExprNode::App { f, a } => {
+                        arguments.push(a.clone());
+                        head = f.clone();
+                    }
+                    ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
+                    ExprNode::Lam { body, .. } if !arguments.is_empty() => {
+                        let value = arguments.pop().expect("guarded application");
+                        head = self.substitute(body, &value)?;
+                    }
+                    ExprNode::FVar { id } if zeta_delta => {
+                        let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
+                        match value {
+                            Some(value) => head = value,
+                            None => break,
+                        }
+                    }
+                    ExprNode::Const { name, levels } => match self.txn.env.find(name).cloned() {
+                        Some(ConstantInfo::Defn(definition)) => {
+                            if definition.safety != DefinitionSafety::Safe
+                                || !match transparency {
+                                    UnificationTransparency::None => false,
+                                    UnificationTransparency::Abbreviations => {
+                                        definition.hints == ReducibilityHints::Abbrev
+                                    }
+                                    UnificationTransparency::SafeDefinitions => true,
+                                }
+                            {
+                                break;
+                            }
+                            if definition.base.level_params.len() != levels.len() {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            head = self.instantiate_params(
+                                &definition.value,
+                                &definition.base.level_params,
+                                levels,
+                            )?;
+                        }
+                        Some(ConstantInfo::Rec(recursor)) => {
+                            let major = recursor_prefix(&recursor)?;
+                            if recursor.is_unsafe
+                                || recursor.num_indices != 0
+                                || recursor.num_motives != 1
+                                || recursor.all.len() != 1
+                                || levels.len() != recursor.base.level_params.len()
+                                || major >= arguments.len()
+                            {
+                                break;
+                            }
+                            let major_value = arguments[arguments.len() - major - 1].clone();
+                            continuations.push(Continuation::Recursor {
+                                head,
+                                recursor,
+                                arguments: std::mem::take(&mut arguments),
+                            });
+                            head = major_value;
+                        }
+                        _ => break,
+                    },
+                    _ => break,
+                }
+            }
+            while let Some(continuation) = continuations.pop() {
+                self.tick()?;
+                match continuation {
+                    Continuation::Projection {
+                        structure,
+                        index,
+                        arguments: outer,
+                    } => {
+                        if let Some(field) = crate::records::constructor_field(
+                            &self.txn.env,
+                            &structure,
+                            index,
+                            &head,
+                            &arguments,
+                        ) {
+                            head = field;
+                            arguments = outer;
+                            continue 'reduce;
+                        }
+                        head = self.rebuild_application(head, arguments)?;
+                        head = Expr::proj(structure, index, head);
+                        arguments = outer;
+                    }
+                    Continuation::Recursor {
+                        head: rec_head,
+                        recursor,
+                        arguments: mut outer,
+                    } => {
+                        if let Some(reduced) =
+                            self.source_iota(&rec_head, &recursor, &outer, &head, &arguments)?
+                        {
+                            let prefix = recursor_prefix(&recursor)?;
+                            outer.truncate(outer.len() - prefix - 1);
+                            head = reduced;
+                            arguments = outer;
+                            continue 'reduce;
+                        }
+                        let major = recursor_prefix(&recursor)?;
+                        let position = outer.len() - major - 1;
+                        outer[position] = self.rebuild_application(head, arguments)?;
+                        head = rec_head;
+                        arguments = outer;
+                    }
+                }
+            }
+            return self.rebuild_application(head, arguments);
+        }
+    }
+
+    fn rebuild_application(
+        &mut self,
+        mut head: Expr,
+        arguments: Vec<Expr>,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        for argument in arguments.into_iter().rev() {
+            self.tick()?;
+            head = Expr::app(head, argument);
+        }
+        Ok(head)
+    }
+
+    /// Only the non-indexed, single-family lane is selected here. Equality/K
+    /// corners, quotients and other unsupported reductions stay with the kernel.
+    fn source_iota(
+        &mut self,
+        rec_head: &Expr,
+        recursor: &RecursorVal,
+        arguments: &[Expr],
+        major_head: &Expr,
+        major_arguments: &[Expr],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let ExprNode::Const { levels, .. } = rec_head.node() else {
+            return Ok(None);
+        };
+        let family_name = &recursor.all[0];
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(family_name).cloned() else {
+            return Ok(None);
+        };
+        if family.is_unsafe
+            || family.num_indices != 0
+            || family.num_nested != 0
+            || family.num_params != recursor.num_params
+            || family.all != recursor.all
+            || recursor.num_minors as usize != family.ctors.len()
+            || recursor.rules.len() != family.ctors.len()
+        {
+            return Ok(None);
+        }
+        let (constructor_name, constructor_levels, fields) = match major_head.node() {
+            ExprNode::Const { name, levels } => {
+                let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(name).cloned() else {
+                    return Ok(None);
+                };
+                if ctor.is_unsafe
+                    || &ctor.induct != family_name
+                    || ctor.num_params != family.num_params
+                    || !family.ctors.contains(name)
+                    || ctor.base.level_params.len() != levels.len()
+                    || Some(major_arguments.len())
+                        != (ctor.num_params as usize).checked_add(ctor.num_fields as usize)
+                {
+                    return Ok(None);
+                }
+                let fields = major_arguments
+                    .iter()
+                    .rev()
+                    .skip(ctor.num_params as usize)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (name.clone(), levels.clone(), fields)
+            }
+            ExprNode::Lit {
+                literal: Literal::Nat(value),
+            } if major_arguments.is_empty()
+                && family_name == &Name::from_components(["Nat"])
+                && family.num_params == 0
+                && family.base.level_params.is_empty() =>
+            {
+                // Retain the predecessor as a compact literal. Charge all input
+                // limbs before the arithmetic module allocates proportional data.
+                let zero = Name::from_components(["Nat", "zero"]);
+                let successor = Name::from_components(["Nat", "succ"]);
+                if family.ctors != [zero.clone(), successor.clone()] || !family.is_rec {
+                    return Ok(None);
+                }
+                if value.limbs_le().is_empty() {
+                    (zero, Vec::new(), Vec::new())
+                } else {
+                    for _ in value.limbs_le() {
+                        self.tick()?;
+                    }
+                    let previous = fln_bignum::nat::BigNatView::from_limbs_le(value.limbs_le())
+                        .sub(fln_bignum::nat::BigNatView::from_limbs_le(&[1]));
+                    let literal = fln_bignum::interop::literal_from_bignat(&previous);
+                    (
+                        successor,
+                        Vec::new(),
+                        vec![Expr::lit(Literal::Nat(literal))],
+                    )
+                }
+            }
+            _ => return Ok(None),
+        };
+        let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(&constructor_name) else {
+            return Ok(None);
+        };
+        if ctor.is_unsafe
+            || &ctor.induct != family_name
+            || ctor.num_fields as usize != fields.len()
+            || ctor.num_params != family.num_params
+        {
+            return Ok(None);
+        }
+        if levels.len() != constructor_levels.len() + 1 || levels[1..] != constructor_levels {
+            return Ok(None);
+        }
+        let Some(rule) = recursor
+            .rules
+            .iter()
+            .find(|rule| rule.ctor == constructor_name)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if rule.nfields as usize != fields.len() {
+            return Ok(None);
+        }
+        let mut result = self.instantiate_params(&rule.rhs, &recursor.base.level_params, levels)?;
+        let prefix = recursor_prefix(recursor)?;
+        for argument in arguments.iter().rev().take(prefix).chain(fields.iter()) {
+            self.tick()?;
+            result = Expr::app(result, argument.clone());
+        }
+        Ok(Some(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fln_core::expr::NatLit;
+    use fln_core::outcome::Outcome;
+    use fln_env::environment::DeclarationBudget;
+    use fln_env::pmap::CollisionBudget;
+    use fln_kernel::capability::{Published, admit};
+    use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+    fn environment() -> Environment {
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let mut env = Environment::new();
+        for declaration in [
+            crate::seed::nat_inductive_seed_declaration(),
+            crate::seed::bool_seed_declaration(),
+        ] {
+            let Outcome::Complete(admitted) = admit(&env, declaration, budget) else {
+                panic!("kernel nonanswer");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("kernel rejection");
+            };
+            let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            ) else {
+                panic!("publication refused");
+            };
+            env = publication.environment;
+        }
+        env
+    }
+    fn bool_() -> Expr {
+        Expr::const_(Name::from_components(["Bool"]), Vec::new())
+    }
+    fn truth() -> Expr {
+        Expr::const_(Name::from_components(["Bool", "true"]), Vec::new())
+    }
+    fn select(major: Expr) -> Expr {
+        let motive = Expr::lam(Name::anonymous(), bool_(), bool_(), BinderInfo::Default);
+        let mut expr = Expr::const_(Name::from_components(["Bool", "rec"]), vec![Level::one()]);
+        for value in [
+            motive,
+            Expr::const_(Name::from_components(["Bool", "false"]), Vec::new()),
+            truth(),
+            major,
+        ] {
+            expr = Expr::app(expr, value);
+        }
+        expr
+    }
+    #[test]
+    fn source_iota_budget_exhaustion_is_typed_and_does_not_publish_state() {
+        let env = environment();
+        let input = select(select(truth()));
+        let mut control = Context::new(&env, Budget::DEFAULT);
+        assert_eq!(control.whnf(&input).unwrap(), truth());
+        let spent = control.txn.budget.heartbeats_consumed;
+        let mut limited = Context::new(&env, Budget::DEFAULT);
+        limited.txn.budget.max_heartbeats = spent - 1;
+        assert!(matches!(
+            limited.whnf(&input),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(limited.txn.env, env);
+        assert!(limited.txn.mvars.is_empty());
+        assert_eq!(
+            Context::new(&env, Budget::DEFAULT).whnf(&input).unwrap(),
+            truth()
+        );
+    }
+    #[test]
+    fn variable_and_foreign_constructor_majors_stay_stuck() {
+        let env = environment();
+        let mut ctx = Context::new(&env, Budget::DEFAULT);
+        let local = FVarId(Name::from_components(["flag"]));
+        ctx.txn
+            .lctx
+            .add_param(local.clone(), local.0.clone(), bool_(), BinderInfo::Default);
+        for major in [
+            Expr::fvar(local),
+            Expr::const_(Name::from_components(["Nat", "zero"]), Vec::new()),
+            Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+        ] {
+            let input = select(major);
+            assert_eq!(ctx.whnf(&input).unwrap(), input);
+        }
+    }
+    #[test]
+    fn recursor_normalization_respects_local_let_unfolding_policy() {
+        let env = environment();
+        let mut ctx = Context::new(&env, Budget::DEFAULT);
+        let local = FVarId(Name::from_components(["flag"]));
+        ctx.txn
+            .lctx
+            .add_let(local.clone(), local.0.clone(), bool_(), truth());
+        let input = select(Expr::fvar(local));
+        assert_eq!(
+            ctx.whnf_with_transparency(&input, UnificationTransparency::None, false)
+                .unwrap(),
+            input
+        );
+        assert_eq!(
+            ctx.whnf_with_transparency(&input, UnificationTransparency::None, true)
+                .unwrap(),
+            truth()
+        );
+    }
+    #[test]
+    fn deeply_nested_recursors_use_heap_continuations() {
+        let env = environment();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut input = truth();
+                for _ in 0..10_000 {
+                    input = select(input);
+                }
+                let mut ctx = Context::new(&env, Budget::for_stack_bytes(64 * 1024));
+                assert_eq!(ctx.whnf(&input).unwrap(), truth());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}

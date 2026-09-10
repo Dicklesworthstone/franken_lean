@@ -607,3 +607,36 @@ fn installed_binary_checks_recursive_functions_and_never_publishes_a_bad_suffix(
         }
     }
 }
+
+#[test]
+fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors() {
+    let prefix = file(
+        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k",
+    );
+    let good = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    let bad = file("def ambiguous (n : Nat) : Tower n := fun x => x");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in ["\"commands\":3", "\"theorems\":1", "\"executed\":false"] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}

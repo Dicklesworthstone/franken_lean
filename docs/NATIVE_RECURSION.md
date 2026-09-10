@@ -67,6 +67,31 @@ binder. Capturing the original major instead would miscompile functions such as
 Failed nonrecursive attempts and termination failures retain spent work, but
 never publish a speculative environment.
 
+## Computed types during source elaboration
+
+The source weak-head reducer now follows admitted non-indexed recursor rules,
+not only beta, let, definition and projection reductions. Recursive type-valued
+definitions can therefore supply the actual function domains needed by lambdas:
+
+```lean
+def Tower (n : Nat) : Type := match n with
+  | .zero => Nat
+  | .succ k => Tower k -> Tower k
+
+def identity : Tower 1 := fun x => x
+def higherIdentity : Tower 2 := fun f => f
+theorem higher_ok : higherIdentity identity 12 = 12 := by rfl
+```
+
+Projection and recursor continuations use a heap worklist. Stuck discriminants
+stay stuck; the reducer does not guess a constructor or widen definition/local
+let transparency. A Nat literal exposes one constructor layer and keeps its
+predecessor compact, using the existing bignum module. The reduction is metered
+by the same source heartbeat budget, and exhaustion remains a resource stop.
+Original source branch terms and their typing obligations are still checked
+by the final checking engines. This is not the full independent unifier's
+conversion procedure or support for indexed/K/quotient elaboration rules.
+
 This is not complete Lean termination elaboration. Course-of-values recursion
 on grandchildren, indexed or mutual families,
 well-founded measures, recursive `where`/`let rec`, equation-style definitions
