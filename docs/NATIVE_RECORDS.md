@@ -130,3 +130,31 @@ parenthesized type ascriptions.
 inferred class receivers through the installed `fln check-source --json` command.
 The `fln::source_record_literals` tests cover failure atomicity as well as positive
 kernel/checker acceptance; installed CLI tests verify the same code path.
+
+The source command path also supports a single `inductive` family with uniform
+parameters, multiple constructors, dependent constructor fields and direct
+recursive fields. Empty families are supported, including families with
+parameters. For example:
+
+```lean
+inductive Chain where
+  | nil
+  | cons (head : Nat) (tail : Chain)
+def chain : Chain := Chain.cons 3 Chain.nil
+theorem count : Chain.rec 0 (fun n tail ih => ih + 1) chain = 1 := by rfl
+```
+
+Constructors and the generated dependent recursor pass K1 and the independent
+checker before a successor environment is returned. Source result annotations
+retain their obligations: unresolved arguments and invalid type assertions are
+refused even when reduction could erase them. Constructor annotations are checked
+against the family's final inferred universe, including constructors with no
+fields. The final constructor result must directly name the family with its
+uniform parameters; ordinary aliases and beta wrappers are not substituted for it.
+
+This is source checking, including kernel computation in proofs. It does not
+establish VM execution of arbitrary algebraic values or recursors. Indexed,
+mutual, nested and higher-order recursive families, Prop-valued families,
+deriving and explicit universe syntax such as `Type 1` remain outside this
+bounded source surface. `source_inductive` and the installed CLI tests cover
+usable constructors, recursor computation, refusal and recovery.
