@@ -1239,35 +1239,66 @@ fn init_list_entries() -> Vec<ConstantEntry> {
     ]
 }
 
-/// `Init.Empty` has no constructor rows, but its recursor still must be
+/// An empty family has no constructor rows, but its recursor still must be
 /// reconstructed rather than treated as an empty success.
-fn init_empty_entries() -> Vec<ConstantEntry> {
-    let empty = checker_name("Empty");
-    let rec = checker_qualified(&["Empty", "rec"]);
+fn empty_entries(family: &str, parameterized: bool) -> Vec<ConstantEntry> {
+    let empty = checker_name(family);
+    let rec = checker_qualified(&[family, "rec"]);
     let u_name = checker_name("u");
     let u = Level::param(primary_name("u"));
-    let empty_expr = || Expr::const_(primary_name("Empty"), Vec::new());
     let bv = |index| Expr::bvar(index).expect("packs");
-    let motive_type = primary_pi("t", BinderInfo::Default, empty_expr(), Expr::sort(u));
-    let recursor_type = primary_pi(
+    let empty_expr = |parameter_depth| {
+        let head = Expr::const_(primary_name(family), Vec::new());
+        if parameterized {
+            Expr::app(head, bv(parameter_depth))
+        } else {
+            head
+        }
+    };
+    let motive_type = primary_pi("t", BinderInfo::Default, empty_expr(0), Expr::sort(u));
+    let mut recursor_type = primary_pi(
         "motive",
         BinderInfo::Default,
         motive_type.clone(),
         primary_pi(
             "t",
             BinderInfo::Default,
-            empty_expr(),
+            empty_expr(1),
             Expr::app(bv(1), bv(0)),
         ),
     );
+    let mut family_type = Expr::sort(Level::one());
+    if parameterized {
+        family_type = primary_pi(
+            "A",
+            BinderInfo::Default,
+            Expr::sort(Level::one()),
+            family_type,
+        );
+        recursor_type = primary_pi(
+            "A",
+            BinderInfo::Implicit,
+            Expr::sort(Level::one()),
+            recursor_type,
+        );
+    }
+    let parameters = u32::from(parameterized);
     vec![
         ConstantEntry::new(
             empty.clone(),
             ConstantDeclaration::inductive(
                 Vec::new(),
-                decoded(&Expr::sort(Level::one())),
+                decoded(&family_type),
                 ConstantSafety::Safe,
-                InductiveDeclaration::new(0, 0, vec![empty.clone()], Vec::new(), 0, false, false),
+                InductiveDeclaration::new(
+                    parameters,
+                    0,
+                    vec![empty.clone()],
+                    Vec::new(),
+                    0,
+                    false,
+                    false,
+                ),
             ),
         ),
         ConstantEntry::new(
@@ -1276,7 +1307,7 @@ fn init_empty_entries() -> Vec<ConstantEntry> {
                 vec![u_name],
                 decoded(&recursor_type),
                 ConstantSafety::Safe,
-                RecursorDeclaration::new(vec![empty], 0, 0, 1, 0, Vec::new(), false),
+                RecursorDeclaration::new(vec![empty], parameters, 0, 1, 0, Vec::new(), false),
             ),
         ),
     ]
@@ -10177,8 +10208,88 @@ fn kr600_803_init_list_fixture_pins_iota_rhs_closure() {
 }
 
 #[test]
+fn generic_empty_families_check_their_recursor_and_preserve_resource_stops() {
+    for (family, parameterized) in [("Vacant", false), ("VacantParameter", true)] {
+        let entries = empty_entries(family, parameterized);
+        let environment = ConstantEnvironment::empty();
+        let run = |rows: &[ConstantEntry], budget| {
+            admit_inductive(&environment, rows, budget, EnvironmentBudget::unlimited())
+        };
+        let mut limited = AdmissionBudget::unlimited();
+        limited.conversion.quick.max_comparisons = 0;
+        assert!(matches!(
+            run(&entries, limited),
+            fln_checker::admit::InductiveVerdict::Inconclusive(
+                fln_checker::admit::InductiveStop::Structural(_)
+            )
+        ));
+        let recovered = run(&entries, AdmissionBudget::unlimited());
+        assert!(recovered.is_admitted(), "{family}: {recovered:?}");
+        for mutation in 0..6 {
+            let recursor = entries[1].declaration();
+            let metadata = recursor.recursor_metadata().expect("fixture recursor");
+            let mut forged = entries.clone();
+            forged[1] = ConstantEntry::new(
+                entries[1].name().clone(),
+                ConstantDeclaration::recursor(
+                    recursor.level_parameters().to_vec(),
+                    recursor.type_().clone(),
+                    recursor.safety(),
+                    RecursorDeclaration::new(
+                        metadata.mutual().to_vec(),
+                        metadata.num_parameters() + u32::from(mutation == 3),
+                        u32::from(mutation == 4),
+                        1 + u32::from(mutation == 1),
+                        u32::from(mutation == 2),
+                        if mutation == 0 {
+                            vec![RecursorRule::new(
+                                checker_qualified(&[family, "forged"]),
+                                0,
+                                decoded(&Expr::bvar(0).expect("packs")),
+                            )]
+                        } else {
+                            Vec::new()
+                        },
+                        mutation == 5,
+                    ),
+                ),
+            );
+            let verdict = run(&forged, AdmissionBudget::unlimited());
+            assert!(
+                matches!(
+                    verdict,
+                    fln_checker::admit::InductiveVerdict::Rejected(
+                        fln_checker::admit::InductiveRejection::RecursorShape { .. }
+                    )
+                ),
+                "{family}, mutation {mutation}: {verdict:?}"
+            );
+        }
+        let mut wrong_type = entries.clone();
+        let recursor = entries[1].declaration();
+        wrong_type[1] = ConstantEntry::new(
+            entries[1].name().clone(),
+            ConstantDeclaration::recursor(
+                recursor.level_parameters().to_vec(),
+                decoded(&Expr::sort(Level::one())),
+                recursor.safety(),
+                recursor
+                    .recursor_metadata()
+                    .expect("fixture recursor")
+                    .clone(),
+            ),
+        );
+        assert!(matches!(
+            run(&wrong_type, AdmissionBudget::unlimited()),
+            fln_checker::admit::InductiveVerdict::Rejected(_)
+                | fln_checker::admit::InductiveVerdict::Deferred(_)
+        ));
+    }
+}
+
+#[test]
 fn kr600_803_init_empty_eliminator_is_reconstructed_independently() {
-    let entries = init_empty_entries();
+    let entries = empty_entries("Empty", false);
     let verdict = admit_inductive(
         &ConstantEnvironment::empty(),
         &entries,
@@ -10194,7 +10305,7 @@ fn kr600_803_init_empty_eliminator_is_reconstructed_independently() {
 
 #[test]
 fn kr600_803_init_empty_refuses_a_forged_recursor_rule() {
-    let mut entries = init_empty_entries();
+    let mut entries = empty_entries("Empty", false);
     let recursor = entries[1].declaration();
     let metadata = recursor
         .recursor_metadata()
@@ -10235,7 +10346,7 @@ fn kr600_803_init_empty_refuses_a_forged_recursor_rule() {
 
 #[test]
 fn kr600_803_init_empty_refuses_a_forged_num_motives_count() {
-    let mut entries = init_empty_entries();
+    let mut entries = empty_entries("Empty", false);
     let declaration = entries[1].declaration();
     let metadata = declaration
         .recursor_metadata()
@@ -10272,7 +10383,7 @@ fn kr600_803_init_empty_refuses_a_forged_num_motives_count() {
 
 #[test]
 fn kr600_803_init_empty_refuses_a_forged_num_minors_count() {
-    let mut entries = init_empty_entries();
+    let mut entries = empty_entries("Empty", false);
     let declaration = entries[1].declaration();
     let metadata = declaration
         .recursor_metadata()
@@ -10309,7 +10420,7 @@ fn kr600_803_init_empty_refuses_a_forged_num_minors_count() {
 
 #[test]
 fn kr600_803_init_empty_refuses_a_forged_num_parameters_count() {
-    let mut entries = init_empty_entries();
+    let mut entries = empty_entries("Empty", false);
     let declaration = entries[1].declaration();
     let metadata = declaration
         .recursor_metadata()
@@ -10346,7 +10457,7 @@ fn kr600_803_init_empty_refuses_a_forged_num_parameters_count() {
 
 #[test]
 fn kr600_803_init_empty_refuses_a_forged_k() {
-    let mut entries = init_empty_entries();
+    let mut entries = empty_entries("Empty", false);
     let declaration = entries[1].declaration();
     let metadata = declaration
         .recursor_metadata()
@@ -10387,7 +10498,7 @@ fn kr600_803_init_empty_refuses_a_forged_k() {
 
 #[test]
 fn kr600_803_init_empty_fixture_pins_recursor_levels_motives_minors_and_rules() {
-    let entries = init_empty_entries();
+    let entries = empty_entries("Empty", false);
     let recursor = entries[1].declaration();
     let metadata = recursor
         .recursor_metadata()
@@ -10402,7 +10513,7 @@ fn kr600_803_init_empty_fixture_pins_recursor_levels_motives_minors_and_rules() 
 
 #[test]
 fn kr600_803_init_empty_fixture_pins_recursor_mutual_family_and_k() {
-    let entries = init_empty_entries();
+    let entries = empty_entries("Empty", false);
     let metadata = entries[1]
         .declaration()
         .recursor_metadata()
@@ -10413,7 +10524,7 @@ fn kr600_803_init_empty_fixture_pins_recursor_mutual_family_and_k() {
 
 #[test]
 fn kr600_803_init_empty_fixture_pins_eliminator_bvar_closure() {
-    let entries = init_empty_entries();
+    let entries = empty_entries("Empty", false);
     let facts = match inspect(entries[1].declaration().type_(), TermBudget::unlimited()) {
         TermOutcome::Complete(facts) => facts,
         other => panic!("fixture eliminator inspection must complete: {other:?}"),

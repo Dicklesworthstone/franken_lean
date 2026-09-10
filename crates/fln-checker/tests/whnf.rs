@@ -2,6 +2,7 @@
 
 use std::process::Command;
 
+use fln_checker::defeq::{DefEqBudget, DefEqOutcome, DefEqStop, def_eq};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
     ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
@@ -1679,6 +1680,76 @@ fn recursor_iota_stays_stuck_on_a_variable_major() {
         ),
         "the stuck application is returned unreduced"
     );
+}
+
+#[test]
+fn defeq_unfolds_only_the_demanded_recursor_major_with_global_reduction_budget() {
+    let tt = Expr::const_(Name::from_components(["Two", "tt"]), Vec::new());
+    let mut entries = two_family_entries();
+    for (name, value, safety) in [
+        ("alias1", tt.clone(), DefinitionSafety::Safe),
+        ("alias2", constant("alias1"), DefinitionSafety::Safe),
+        ("unsafe_major", tt, DefinitionSafety::Unsafe),
+        ("MinorFf", constant("unused_body"), DefinitionSafety::Safe),
+    ] {
+        entries.push(definition_entry(
+            name,
+            Vec::new(),
+            decoded(&value),
+            ReducibilityHint::Regular(1),
+            safety,
+        ));
+    }
+    let context = definition_context(entries);
+    let application = |major| {
+        decoded(&Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(
+                        Expr::const_(
+                            Name::from_components(["Two", "rec"]),
+                            vec![Level::param(primary_name("v"))],
+                        ),
+                        constant("MotiveStub"),
+                    ),
+                    constant("MinorTt"),
+                ),
+                constant("MinorFf"),
+            ),
+            major,
+        ))
+    };
+    let expected = decoded(&constant("MinorTt"));
+    let aliases = application(constant("alias2"));
+    let mut limited = DefEqBudget::unlimited();
+    limited.whnf.max_reductions = 1;
+    assert!(matches!(
+        def_eq(&aliases, &expected, &context, limited),
+        DefEqOutcome::Inconclusive(DefEqStop::Whnf {
+            stop: WhnfStop::Resource {
+                limit: WhnfLimit::Reductions,
+                ..
+            },
+            ..
+        })
+    ));
+    let recovered = def_eq(&aliases, &expected, &context, DefEqBudget::unlimited());
+    let DefEqOutcome::Equal(progress) = recovered else {
+        panic!("recursor conversion must recover through both aliases: {recovered:?}");
+    };
+    assert_eq!(progress.delta_unfolds, 2, "the unused minor stays folded");
+    for major in [constant("unknown_major"), constant("unsafe_major")] {
+        let outcome = def_eq(
+            &application(major),
+            &expected,
+            &context,
+            DefEqBudget::unlimited(),
+        );
+        assert!(
+            matches!(outcome, DefEqOutcome::Deferred { .. }),
+            "an unavailable major cannot select a constructor rule: {outcome:?}"
+        );
+    }
 }
 
 #[test]

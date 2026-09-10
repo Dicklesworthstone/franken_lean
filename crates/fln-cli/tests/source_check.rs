@@ -475,3 +475,51 @@ fn installed_binary_checks_type_position_instances_and_header_refusal_with_recov
         );
     }
 }
+
+#[test]
+fn installed_binary_checks_inductive_constructors_and_recursor_computation_atomically() {
+    let prefix = file("inductive Chain where | nil | cons (head : Nat) (tail : Chain)");
+    let good = file(
+        "def chain : Chain := Chain.cons 3 Chain.nil\n\
+                     theorem count : Chain.rec 0 (fun n tail ih => ih + 1) chain = 1 := by rfl",
+    );
+    let bad = file(
+        "theorem wrong : Chain.rec 0 (fun n tail ih => ih + 1) (Chain.cons 3 Chain.nil) = 2 := by rfl",
+    );
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let before = std::fs::read(suffix).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for required in [
+                "\"commands\":3",
+                "\"theorems\":1",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(required), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+        assert_eq!(std::fs::read(suffix).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(suffix.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+}
