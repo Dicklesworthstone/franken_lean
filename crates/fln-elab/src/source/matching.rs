@@ -320,12 +320,11 @@ impl Context {
                 });
             }
         }
-        if recursive && !index_values.is_empty() {
-            return Err(error(MatchError::UnsupportedFamily));
-        }
         let indices = self.elimination_index_locals(&index_values)?;
         let mut generalized = Vec::new();
-        if !indices.is_empty() {
+        if recursive {
+            self.recursive_indices(name, &parameters, &indices)?;
+        } else if !indices.is_empty() {
             let mut dependencies: HashSet<_> =
                 indices.iter().map(|index| index.id.clone()).collect();
             // Generalization may not change the fixed family parameters or an
@@ -726,7 +725,7 @@ impl Context {
             ));
         };
         if state.recursive {
-            self.recursive_branch_context();
+            self.recursive_branch_context()?;
         }
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
@@ -823,7 +822,11 @@ impl Context {
             target = self.substitute(body, &Expr::fvar(id))?;
         }
         if state.recursive {
-            self.recursive_major_alias(&mut locals, &constructor, &family_type)?;
+            let constructor_type = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            self.recursive_index_aliases(&mut locals, &constructor_type)?;
+            self.recursive_major_alias(&mut locals, &constructor, &constructor_type)?;
         }
         if let Some(whole) = branch.whole {
             let id = FVarId(self.fresh_name()?);

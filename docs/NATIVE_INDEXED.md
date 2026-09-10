@@ -96,9 +96,34 @@ core term even when unused. Ordinary matches keep recursor hypotheses out of pro
 and instance search. Every resulting term still crosses both checking engines.
 
 Constructor matches with fixed/repeated indices, dependent index domains or
-inaccessible patterns remain unsupported. Indexed structural recursion also
-remains unsupported. These are bounded source capabilities, not generated-matcher
+inaccessible patterns remain unsupported. These are bounded source capabilities, not generated-matcher
 name parity or full Lean match elaboration.
+
+## Structural recursive functions
+
+Root constructor matches can now elaborate structurally recursive definitions of
+indexed data. For example, `copyVec n xs` may recursively call `copyVec k tail`
+when `tail : Vec A k` is a direct recursive field. The recursor owns that child's
+indices; source calls must supply those actual index expressions, not the outer
+length or a guessed conversion. No recursive constant or axiom enters the environment.
+
+Fixed family parameters remain fixed. Index-dependent ordinary arguments before
+the decreasing input, and all trailing arguments, are generalized into the motive.
+This supports changing accumulators and earlier proof or data arguments whose
+types depend on the length. Implicit indices can be inferred. Each branch rebinds
+the original index names to its constructor's result indices and the original
+input name to the actual constructor, unless shadowed by a pattern binder.
+
+The checked example `examples/native_indexed_recursion.lean` defines vector copy,
+map, accumulation, and a computation using the current branch's length; it proves
+copy and map identity for every vector. Run it with `fln check-source --json`.
+Recursive calls lower to real induction hypotheses and retain every varying
+argument, including unused values and annotations. Wrong indices, changed fixed
+parameters, nondecreasing calls, and escaping recursive names are refused.
+
+The current recursive source lane uses distinct header-parameter indices and an
+explicit result type. Fixed/repeated indices, grandchildren, mutual recursion,
+well-founded measures and equation-style definitions remain outside this lane.
 
 Prop-valued indexed family
 admission, mutual/nested families, inaccessible patterns, index-equation solving

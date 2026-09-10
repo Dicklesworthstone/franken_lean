@@ -1,5 +1,37 @@
 //! Installed and library CLI source-proof checking. No fake compiler or checker.
 #![forbid(unsafe_code)]
+
+#[test]
+fn indexed_recursive_functions_are_checked_without_publishing_a_bad_suffix() {
+    let prefix = file(include_str!(
+        "../../../examples/native_indexed_recursion.lean"
+    ));
+    let bad = file("theorem bad : indexSum 2 two = 4 := by rfl");
+    for success in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !success {
+            command.arg(&bad);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for expected in ["\"commands\":12", "\"theorems\":6", "\"executed\":false"] {
+                assert!(json.contains(expected), "{json}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
 use std::{
     ffi::OsString,
     path::PathBuf,

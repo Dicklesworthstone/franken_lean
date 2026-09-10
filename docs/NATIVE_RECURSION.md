@@ -92,8 +92,15 @@ Original source branch terms and their typing obligations are still checked
 by the final checking engines. This is not the full independent unifier's
 conversion procedure or support for indexed/K/quotient elaboration rules.
 
+Indexed families whose indices are distinct header parameters are also supported:
+the indices change with each recursive child while fixed family parameters do not.
+Earlier index-dependent arguments are generalized, just like trailing arguments.
+Original index names are rebound to the constructor's result indices at each step.
+See `NATIVE_INDEXED.md` and `examples/native_indexed_recursion.lean` for vector copy,
+map, accumulation and universally quantified induction proofs.
+
 This is not complete Lean termination elaboration. Course-of-values recursion
-on grandchildren, indexed or mutual families,
+on grandchildren, fixed/repeated index refinement, mutual families,
 well-founded measures, recursive `where`/`let rec`, equation-style definitions
 and `termination_by` clauses are not implemented here. Generic lists and trees
 with uniform parameters and direct recursive fields now have independent

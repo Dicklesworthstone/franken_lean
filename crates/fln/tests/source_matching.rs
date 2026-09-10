@@ -434,6 +434,20 @@ fn ordinary_matches_never_offer_recursive_hypotheses_to_proof_search() {
 fn indexed_match_failures_are_atomic_and_recoverable() {
     let e = engine();
     let root = e.logical_root(&KVMap::new());
+    // Direct-child indexed recursion has moved out of the unsupported set.
+    // Retain the old boundary input as a checked computation; nondecreasing
+    // recursion below must still fail rather than becoming an unchecked fixpoint.
+    let recursive = "def bad (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad k tail\ntheorem computed : bad 1 (Vec.cons 0 7 Vec.nil) = 0 := by rfl";
+    assert!(
+        e.check_source_files(
+            &[VEC.as_bytes(), recursive.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .unwrap()
+        .into_complete()
+        .is_ok()
+    );
     let good = "def get (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => x\ntheorem good : get 1 (Vec.cons 0 7 Vec.nil) = 7 := by rfl";
     for bad in [
         "def bad (n : Nat) (xs : Vec Nat n) : Vec Nat n := match xs with | .nil => xs | .cons k x tail => xs",
@@ -441,7 +455,7 @@ fn indexed_match_failures_are_atomic_and_recoverable() {
         "def bad (xs : Vec Nat 0) : Nat := match xs with | .nil => 0 | .cons k x tail => 1",
         "def bad (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => (x : String)",
         "theorem bad (n : Nat) (xs : Vec Nat n) : n = 0 := match xs with | .nil => rfl | .cons k x tail => rfl",
-        "def bad (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad k tail",
+        "def bad (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad n xs",
         "def bad : Nat := match (Vec.nil : Vec Nat 1) with | _ => 0",
     ] {
         let result = e.check_source_files(
@@ -496,6 +510,6 @@ fn indexed_match_resource_stop_preserves_the_source_environment() {
             .check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits()))
             .unwrap()
             .into_complete()
-            .is_some()
+            .is_ok()
     );
 }
