@@ -4,7 +4,8 @@
 //! Only calls on an immediate recursive constructor field may replace that marker.
 //! The entire body must be the selected match: an induction hypothesis for an
 //! inner subexpression cannot stand for the whole function. Fixed arguments must
-//! be the original locals, not arbitrary terms that conversion could erase.
+//! be the original locals or their domain-checked eta expansions, not arbitrary
+//! terms that conversion could erase.
 use super::*;
 use std::collections::{HashMap, HashSet};
 
@@ -58,6 +59,56 @@ pub(super) struct Recursion {
     family: Option<(Name, usize)>,
 }
 impl Context {
+    /// Implicit higher-order inference can produce `fun x => P x` for the fixed
+    /// parameter `P`. Recognize only that exact eta shape, checking every domain
+    /// against P's dependent function telescope. Unlike general conversion this
+    /// cannot erase a let, application argument, annotation, or recursive call.
+    fn fixed_recursive_argument(
+        &mut self,
+        argument: &Expr,
+        parameter: &LocalDecl,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut body = argument;
+        let type_ = self.instantiate(&parameter.type_)?;
+        let mut domain = &type_;
+        let mut arity = 0u32;
+        while let ExprNode::Lam {
+            binder_type,
+            body: inner,
+            ..
+        } = body.node()
+        {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type: expected,
+                body: result,
+                ..
+            } = domain.node()
+            else {
+                return Ok(false);
+            };
+            if binder_type != expected {
+                return Ok(false);
+            }
+            arity = arity
+                .checked_add(1)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+            body = inner;
+            domain = result;
+        }
+        for index in 0..arity {
+            self.tick()?;
+            let ExprNode::App { f, a } = body.node() else {
+                return Ok(false);
+            };
+            if !matches!(a.node(), ExprNode::BVar { idx } if *idx == index) {
+                return Ok(false);
+            }
+            body = f;
+        }
+        Ok(matches!(body.node(), ExprNode::FVar { id } if id == &parameter.id))
+    }
+
     /// Retry only an actual unresolved self-reference. Lexical shadowing and
     /// nonrecursive definitions follow their ordinary path, including errors.
     pub(super) fn definition_body(
@@ -493,7 +544,7 @@ impl Context {
                         {
                             if !recursion.indices.contains(&position)
                                 && !recursion.varying.contains(&position)
-                                && **argument != Expr::fvar(parameter.id.clone())
+                                && !self.fixed_recursive_argument(argument, parameter)?
                             {
                                 return Err(error(RecursionError::ChangedParameter));
                             }
@@ -623,5 +674,115 @@ fn children(expr: &Expr) -> [Option<&Expr>; 3] {
         } => [Some(type_), Some(value), Some(body)],
         ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
         _ => [None, None, None],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_parameter_eta_checks_dependent_domains_and_variable_order() {
+        let mut context = Context::new(&Environment::new(), Budget::DEFAULT);
+        let f = FVarId(Name::from_components(["polymorphic_identity"]));
+        let type_ = Expr::forall_e(
+            Name::anonymous(),
+            Expr::sort(Level::one()),
+            Expr::forall_e(
+                Name::anonymous(),
+                Expr::bvar(0).unwrap(),
+                Expr::bvar(1).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let parameter = LocalDecl {
+            id: f.clone(),
+            user_name: f.0.clone(),
+            type_,
+            value: None,
+            binder_info: BinderInfo::Default,
+            index: 0,
+        };
+        let expanded = |domain: Expr, first: u32, second: u32| {
+            Expr::lam(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                Expr::lam(
+                    Name::anonymous(),
+                    domain,
+                    Expr::app(
+                        Expr::app(Expr::fvar(f.clone()), Expr::bvar(first).unwrap()),
+                        Expr::bvar(second).unwrap(),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            )
+        };
+        assert!(
+            context
+                .fixed_recursive_argument(&expanded(Expr::bvar(0).unwrap(), 1, 0), &parameter)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&expanded(Expr::sort(Level::zero()), 1, 0), &parameter)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&expanded(Expr::bvar(0).unwrap(), 0, 1), &parameter)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&expanded(Expr::bvar(0).unwrap(), 1, 1), &parameter)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn fixed_parameter_eta_refusal_does_not_reduce_discardable_annotations() {
+        let mut context = Context::new(&Environment::new(), Budget::DEFAULT);
+        let f = FVarId(Name::from_components(["fixed"]));
+        let parameter = LocalDecl {
+            id: f.clone(),
+            user_name: f.0.clone(),
+            type_: Expr::forall_e(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                Expr::sort(Level::one()),
+                BinderInfo::Default,
+            ),
+            value: None,
+            binder_info: BinderInfo::Default,
+            index: 0,
+        };
+        let body = Expr::let_e(
+            Name::anonymous(),
+            Expr::sort(Level::zero()),
+            Expr::sort(Level::one()),
+            Expr::app(Expr::fvar(f), Expr::bvar(1).unwrap()),
+            false,
+        );
+        let value = Expr::lam(
+            Name::anonymous(),
+            Expr::sort(Level::one()),
+            body,
+            BinderInfo::Default,
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&value, &parameter)
+                .unwrap()
+        );
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed;
+        assert!(matches!(
+            context.fixed_recursive_argument(&value, &parameter),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
     }
 }

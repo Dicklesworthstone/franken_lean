@@ -2180,3 +2180,133 @@ fn a_local_definition_can_erase_different_arguments_without_false_mismatch() {
         DefEqOutcome::Equal(_)
     ));
 }
+
+#[test]
+fn nested_eta_expansions_compare_symmetrically_without_delta_unfolding() {
+    for layers in [2, 8, 256] {
+        let outside = Expr::fvar(FVarId(name("eta_repeated_function")));
+        let mut inside = outside.clone();
+        for _ in 0..layers {
+            inside = eta(inside);
+        }
+        let inside = decoded(&inside);
+        let outside = decoded(&outside);
+        let left = slow_equal(&inside, &outside, &WhnfContext::default());
+        let right = slow_equal(&outside, &inside, &WhnfContext::default());
+        assert_eq!(left, right);
+        assert_eq!(left.delta_unfolds, 0);
+        assert!(left.slow_comparisons >= layers * 2);
+    }
+}
+
+#[test]
+fn nested_eta_virtual_shift_rejects_capture_of_every_removed_binder() {
+    let outside = decoded(&Expr::bvar(0).unwrap());
+    for innermost in 0..=4 {
+        let mut inside = Expr::bvar(innermost).unwrap();
+        for _ in 0..4 {
+            inside = eta(inside);
+        }
+        let outcome = def_eq(
+            &decoded(&inside),
+            &outside,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        );
+        if innermost == 4 {
+            assert!(matches!(outcome, DefEqOutcome::Equal(_)), "{outcome:?}");
+        } else {
+            assert!(
+                matches!(outcome, DefEqOutcome::Deferred { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_non_eta_inner_layer_is_not_assumed_to_contract() {
+    let function = constant("eta_fixed_function");
+    let bad = Expr::lam(
+        name("inner"),
+        Expr::sort(Level::zero()),
+        Expr::app(function.clone(), Expr::bvar(1).unwrap()),
+        BinderInfo::Default,
+    );
+    assert!(matches!(
+        def_eq(
+            &decoded(&eta(bad)),
+            &decoded(&function),
+            &WhnfContext::default(),
+            DefEqBudget::unlimited()
+        ),
+        DefEqOutcome::Deferred { .. }
+    ));
+}
+
+#[test]
+fn nested_eta_work_is_bounded_and_cancellation_preserves_recovery() {
+    let mut input = constant("eta_stopping_function");
+    for _ in 0..64 {
+        input = eta(input);
+    }
+    let left = decoded(&input);
+    let right = decoded(&constant("eta_stopping_function"));
+    let full = slow_equal(&left, &right, &WhnfContext::default());
+    let budget = DefEqBudget::new(
+        QuickDefEqBudget::unlimited(),
+        full.slow_comparisons - 1,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        WhnfBudget::unlimited(),
+    );
+    assert!(matches!(
+        def_eq(&left, &right, &WhnfContext::default(), budget),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::SlowComparisons,
+            ..
+        })
+    ));
+    assert!(matches!(
+        def_eq_with(
+            &left,
+            &right,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+            || true
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Quick(QuickDefEqStop::Cancelled { .. }))
+    ));
+    let mut completed_polls = 0;
+    assert!(matches!(
+        def_eq_with(
+            &left,
+            &right,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+            || {
+                completed_polls += 1;
+                false
+            }
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+    let mut polls = 0;
+    let interrupted = def_eq_with(
+        &left,
+        &right,
+        &WhnfContext::default(),
+        DefEqBudget::unlimited(),
+        || {
+            polls += 1;
+            polls == completed_polls - 1
+        },
+    );
+    assert!(
+        matches!(interrupted, DefEqOutcome::Inconclusive(DefEqStop::Cancelled { progress, .. })
+        if progress.slow_comparisons > 16 && progress.slow_comparisons < full.slow_comparisons),
+        "cancellation must reach nested eta contraction: {interrupted:?}"
+    );
+    assert_eq!(slow_equal(&left, &right, &WhnfContext::default()), full);
+}

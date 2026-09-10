@@ -113,3 +113,11 @@ The installed CLI checks `examples/native_recursion.lean` with
 `fln check-source --json examples/native_recursion.lean`. This is admission and
 kernel conversion, not a claim that the native execution backend now supports
 every recursive definition.
+
+Indexed matching and recursion also accept dependent index telescopes in family
+order. See `examples/native_dependent_indices.lean` and
+`crates/fln/tests/source_dependent_index_recursion.rs` for checked child-index
+specialization, dependent source-name rebinding, prefix generalization and
+failure-isolation tests. A fixed higher-order argument may be an exact,
+domain-checked eta expansion of its original local; arbitrary source conversion
+is not used to discard fixed arguments or their annotations.

@@ -72,7 +72,9 @@ instead of becoming independent variables.
 ## Constructor matches
 
 Ordinary source matches support indexed families whose actual indices are distinct
-parameter locals with independent domains. Constructor branches receive the
+parameter locals. Later index domains may depend on preceding indices in family
+order; the motive closes that telescope without inventing index equations.
+Constructor branches receive the
 refined expected type, so a vector can be reconstructed at its original length:
 
 ```lean
@@ -95,8 +97,8 @@ performs no index refinement and becomes a checked let binding; this also permit
 core term even when unused. Ordinary matches keep recursor hypotheses out of proof
 and instance search. Every resulting term still crosses both checking engines.
 
-Constructor matches with fixed/repeated indices, dependent index domains or
-inaccessible patterns remain unsupported. These are bounded source capabilities, not generated-matcher
+Constructor matches with fixed/repeated indices or inaccessible patterns remain
+unsupported. These are bounded source capabilities, not generated-matcher
 name parity or full Lean match elaboration.
 
 ## Structural recursive functions
@@ -120,6 +122,26 @@ copy and map identity for every vector. Run it with `fln check-source --json`.
 Recursive calls lower to real induction hypotheses and retain every varying
 argument, including unused values and annotations. Wrong indices, changed fixed
 parameters, nondecreasing calls, and escaping recursive names are refused.
+
+Dependent index domains are supported by both matching and recursive functions.
+For `Trace A P a v` with `v : P a`, a child at `x, vx : P x` has a hypothesis at
+those indices, not the outer `a, v`. Branch-local aliases for the original indices
+have their domains specialized in telescope order. Prefix proofs or data depending
+on these indices generalize together with trailing accumulators.
+
+Fixed higher-order parameters can be supplied as exact eta expansions, such as
+`fun x => P x`, which implicit inference commonly produces. Each lambda domain
+must match the original function's dependent telescope, and every argument must
+be its corresponding bound variable. This test does not beta-reduce arbitrary
+source expressions or erase annotations. More elaborate inferred fixed arguments
+can still require explicit parameter applications. The independent checker also
+handles repeated exact eta layers with metered virtual shifts, rejecting capture
+of any removed binder; this is not general Pi-driven extensionality.
+
+`examples/native_dependent_indices.lean` checks copying and rebuilding a family
+whose second index has type `P a`, with a generic copy-identity induction proof.
+The final `rfl` performs ordinary checked conversion after selected simplification.
+Run it with `fln check-source --json examples/native_dependent_indices.lean`.
 
 The current recursive source lane uses distinct header-parameter indices and an
 explicit result type. Fixed/repeated indices, grandchildren, mutual recursion,

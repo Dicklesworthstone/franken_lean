@@ -327,16 +327,25 @@ impl Context {
         } else if !indices.is_empty() {
             let mut dependencies: HashSet<_> =
                 indices.iter().map(|index| index.id.clone()).collect();
-            // Generalization may not change the fixed family parameters or an
-            // earlier index's domain. Dependent index pattern equations belong
-            // to the refinement compiler, not this constructor-variable lane.
-            for value in parameters
-                .iter()
-                .chain(indices.iter().map(|index| &index.type_))
-            {
+            // Parameters stay fixed. Index domains, however, form a telescope:
+            // a later domain may refer to preceding indices. Closing the motive
+            // in family order captures those dependencies without inventing an
+            // equality between a fixed expression and a constructor result.
+            for value in &parameters {
                 if !self.elimination_reads(value)?.is_disjoint(&dependencies) {
                     return Err(error(MatchError::UnrefinedIndices));
                 }
+            }
+            let mut preceding = HashSet::new();
+            for index in &indices {
+                if self
+                    .elimination_reads(&index.type_)?
+                    .iter()
+                    .any(|id| dependencies.contains(id) && !preceding.contains(id))
+                {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+                preceding.insert(index.id.clone());
             }
             let major_id = if let ExprNode::FVar { id } = major.value.node() {
                 dependencies.insert(id.clone());

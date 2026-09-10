@@ -1029,3 +1029,35 @@ fn installed_binary_refuses_hidden_match_hypotheses_and_checks_real_assumptions(
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_dependent_index_recursion_and_retains_failure_isolation() {
+    let prefix = file(include_str!(
+        "../../../examples/native_dependent_indices.lean"
+    ));
+    let bad = file("theorem bad : depth 2 false trace = 0 := by rfl");
+    for success in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !success {
+            command.arg(&bad);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for required in ["\"commands\":9", "\"theorems\":4", "\"executed\":false"] {
+                assert!(json.contains(required), "{json}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
