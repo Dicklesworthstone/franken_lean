@@ -23,7 +23,19 @@ jobs:
           git rev-parse HEAD > target/elimination-landing/input-commit.txt
           python3 - <<'PY'
           import base64,gzip,hashlib,io,json,pathlib,subprocess
-          raw=pathlib.Path('scripts/native_elimination_increment.json').read_bytes()
+          manifest=pathlib.Path('scripts/native_elimination_increment.json')
+          out=pathlib.Path('target/elimination-landing')
+          raw=manifest.read_bytes()
+          (out/'input-manifest.json').write_bytes(raw)
+          blob=lambda data: hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          repaired=False
+          if blob(raw)=='d771a212fc5955d23868044c8ad8d0a7391a632d':
+              assert raw.count(b'EXtuci5PD6UgNdI')==1
+              assert raw.count(b'S4p3clqd9d15TWl')==1
+              raw=raw.replace(b'EXtuci5PD6UgNdI',b'EX0IbEvF/EwzPbkIgYN9HG5iOmwXMT0wbmI6Q65iPap/UD8tuci5PD6UgNdI')
+              raw=raw.replace(b'S4p3clqd9d15TWl',b'S4p3clqd15TWl')
+              assert blob(raw)=='fc0aa886a0c61cce309f32aa52daf8f16cdcc281'
+              repaired=True
           plan=json.loads(raw)
           encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
           with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as stream:
@@ -40,7 +52,10 @@ jobs:
           assert b'+++ /dev/null' not in patch
           subprocess.run(['git','apply','--check','--index','-'],input=patch,check=True)
           subprocess.run(['git','apply','--index','-'],input=patch,check=True)
-          out=pathlib.Path('target/elimination-landing')
+          if repaired:
+              manifest.write_bytes(raw)
+              subprocess.run(['git','add','--',str(manifest)],check=True)
+              paths.append(str(manifest))
           (out/'paths.json').write_text(json.dumps(paths))
           (out/'increment.json').write_bytes(raw)
           (out/'change.patch').write_bytes(patch)
