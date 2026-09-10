@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod inductive;
 mod infer;
 mod instance_command;
 mod instances;
@@ -26,6 +27,8 @@ pub enum SourceInferenceError {
     ExpectedType,
     RecordTerm(record_terms::RecordTermError),
     Record(crate::records::RecordError),
+    Inductive(crate::inductive::InductiveError),
+    TypeObligation(Box<Outcome<Verdict>>),
     Tactic(tactics::TacticError),
     UnresolvedHoles { count: usize },
     UnresolvedUniverses,
@@ -47,6 +50,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
             Self::Tactic(error) => write!(f, "{error}"),
             Self::Record(error) => write!(f, "{error}"),
+            Self::Inductive(error) => write!(f, "{error}"),
+            Self::TypeObligation(outcome) => {
+                write!(f, "source type obligation failed: {outcome:?}")
+            }
             Self::RecordTerm(error) => write!(f, "{error}"),
             Self::ExpectedType => write!(f, "source annotation requires a type"),
             Self::UnresolvedHoles { count } => write!(
@@ -1512,6 +1519,7 @@ pub fn instance_registration(
     instance_command::registration(syntax)
 }
 
+pub use inductive::{elaborate_inductive, is_inductive};
 /// A source record/class expands to a block and projections, not one definition.
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.

@@ -256,7 +256,14 @@ pub fn inductive_declaration(
         false,
     )?;
     let rec_type = builder.close(&minors, rec_type, false, false)?;
-    let rec_type = builder.close(std::slice::from_ref(&motive), rec_type, false, true)?;
+    // With no minor premises, no later binder domain mentions the motive.
+    // It stays explicit under the Reference's strict implicit inference rule.
+    let rec_type = builder.close(
+        std::slice::from_ref(&motive),
+        rec_type,
+        false,
+        !minors.is_empty(),
+    )?;
     let rec_type = builder.close(&spec.parameters, rec_type, false, true)?;
     let mut lparams = vec![elim];
     lparams.extend(spec.level_params.iter().cloned());
