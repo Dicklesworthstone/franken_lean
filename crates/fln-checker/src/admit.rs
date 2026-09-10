@@ -2259,7 +2259,12 @@ fn nonrecursive_recursor_type(
         let minor_type = expected_minor_type(&mut builder, constructor, index)?;
         result = builder.forall("minor", BinderStyle::Default, minor_type, result);
     }
-    let root = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
+    let motive_style = if constructors.is_empty() {
+        BinderStyle::Default
+    } else {
+        BinderStyle::Implicit
+    };
+    let root = builder.forall("motive", motive_style, motive_type, result);
     builder.finish(root)
 }
 
@@ -6004,8 +6009,8 @@ fn admit_init_prod(
     })
 }
 
-/// Reconstruct one **class-shaped** block: exactly one constructor, zero
-/// indices, non-recursive, non-nested, non-reflexive, one family universe,
+/// Reconstruct one **class-shaped** block: a bounded constructor list, zero
+/// indices, non-recursive, non-nested, non-reflexive, bounded family universes,
 /// and an arbitrary parameter telescope (`Init.Add`, `Init.Sub`,
 /// `Init.Inhabited`, …). Unlike the named-family reconstructions above, this
 /// judgment is keyed on SHAPE rather than on a name, because Prelude carries
@@ -6093,9 +6098,7 @@ fn admit_class_block(
     // An unsupported constructor count is a typed DEFERRAL, not a rejection:
     // the block may be perfectly well formed and merely wider than this route
     // reconstructs (FL-INV-07).
-    if metadata.constructors().is_empty()
-        || metadata.constructors().len() > MAX_NONRECURSIVE_CONSTRUCTORS
-    {
+    if metadata.constructors().len() > MAX_NONRECURSIVE_CONSTRUCTORS {
         return InductiveVerdict::Deferred(InductiveSupportLimit::ConstructorCount {
             observed: metadata.constructors().len(),
             limit: MAX_NONRECURSIVE_CONSTRUCTORS,
@@ -6404,7 +6407,7 @@ fn admit_class_block(
         return defer("recursor-tail-peel");
     };
     let motive_binder = recursor_tail_binders[0];
-    let minor_binders = &recursor_tail_binders[1..=constructor_count];
+    let minor_binders = &recursor_tail_binders[1..1 + constructor_count];
     let major_binder = recursor_tail_binders[constructor_count + 1];
 
     let mut builder = StructuralTermBuilder::new();
@@ -6535,7 +6538,8 @@ fn admit_class_block(
     };
     match compare_inductive_expression(recursor_type, &expected_recursor, comparison, cancelled) {
         Ok(true) => {}
-        Ok(false) | Err(_) => return defer("recursor-compare"),
+        Ok(false) => return defer("recursor-compare"),
+        Err(verdict) => return verdict,
     }
     if let Err(verdict) = declared_type_is_a_type(
         &staged,
@@ -7792,7 +7796,7 @@ pub fn admit_inductive_with(
         && !metadata.is_recursive()
         && !metadata.is_reflexive()
         && metadata.num_parameters() >= 1
-        && (1..=MAX_NONRECURSIVE_CONSTRUCTORS).contains(&metadata.constructors().len())
+        && metadata.constructors().len() <= MAX_NONRECURSIVE_CONSTRUCTORS
         && declarations.len() == metadata.constructors().len() + 2
         && declaration.safety() == ConstantSafety::Safe
     {
@@ -7852,9 +7856,7 @@ pub fn admit_inductive_with(
     if metadata.is_reflexive() {
         return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
     }
-    if metadata.constructors().is_empty()
-        || metadata.constructors().len() > MAX_NONRECURSIVE_CONSTRUCTORS
-    {
+    if metadata.constructors().len() > MAX_NONRECURSIVE_CONSTRUCTORS {
         return InductiveVerdict::Deferred(InductiveSupportLimit::ConstructorCount {
             observed: metadata.constructors().len(),
             limit: MAX_NONRECURSIVE_CONSTRUCTORS,

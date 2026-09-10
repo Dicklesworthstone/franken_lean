@@ -914,10 +914,11 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
     }
 
-    /// Weak-head-normalize a cursor inside this reduction's remaining budget,
-    /// absorbing the sub-run's measured work back into this control so the
-    /// budget accounting stays global.
-    fn whnf_subterm(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
+    /// Normalize the demanded recursor major, including its definitions even
+    /// when outer conversion delays delta reduction. The pin likewise uses
+    /// full WHNF for ordinary recursor majors (`type_checker.cpp`,
+    /// `reduce_recursor`). Absorb the sub-run's work into the remaining budget.
+    fn whnf_recursor_major(&mut self, cursor: &Cursor) -> Result<Cursor, Halt> {
         let context = self.context.source;
         let budget = WhnfBudget::new(
             self.control
@@ -936,7 +937,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             cursor.root,
             context,
             budget,
-            self.delta_mode,
+            DeltaMode::Eager,
             &mut *self.cancelled,
         ) {
             WhnfOutcome::Complete(result) => {
@@ -1362,7 +1363,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         major: &Cursor,
         prefix: usize,
     ) -> Result<Option<Cursor>, Halt> {
-        let reduced_major = self.whnf_subterm(major)?;
+        let reduced_major = self.whnf_recursor_major(major)?;
         let (major_head, major_args) = self.peel_application(&reduced_major)?;
         let constructor_name = match self.node(&major_head)? {
             ExprNode::Constant { name, .. } => name.clone(),
