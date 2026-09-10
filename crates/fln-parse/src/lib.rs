@@ -70,7 +70,6 @@ pub enum NatDefinitionExpectation {
     Tactic,
     TheoremType,
     RecordField,
-    InductiveConstructor,
     NaturalType,
     ScalarType,
     ClosingParenthesis,

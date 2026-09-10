@@ -33,7 +33,6 @@ pub enum SourceInferenceError {
     ExpectedType,
     RecordTerm(record_terms::RecordTermError),
     Record(crate::records::RecordError),
-    Inductive(crate::inductive::InductiveError),
     TypeObligation(Box<Outcome<Verdict>>),
     Tactic(tactics::TacticError),
     UnresolvedHoles { count: usize },
@@ -59,7 +58,6 @@ impl std::fmt::Display for SourceInferenceError {
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
             Self::Tactic(error) => write!(f, "{error}"),
             Self::Record(error) => write!(f, "{error}"),
-            Self::Inductive(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
                 write!(f, "source type obligation failed: {outcome:?}")
             }
@@ -1469,5 +1467,3 @@ pub use inductive::{elaborate_inductive, is_inductive};
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.
 pub use record::{SourceRecord, elaborate_record, is_record};
-
-pub use inductive::{elaborate_inductive, is_inductive};
