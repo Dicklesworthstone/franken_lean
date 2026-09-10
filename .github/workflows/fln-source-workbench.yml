@@ -18,7 +18,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/source-workbench
+          mkdir -p target/source-workbench target/source-frontend
           git rev-parse HEAD > target/source-workbench/commit.txt
           git rev-parse 'HEAD^{tree}' > target/source-workbench/tree.txt
           git show -s --format=fuller HEAD > target/source-workbench/commit-metadata.txt
@@ -26,6 +26,15 @@ jobs:
           git status --porcelain=v1 > target/source-workbench/checkout-status.txt
           git archive --format=tar.gz HEAD > target/source-workbench/source.tar.gz
           sha256sum target/source-workbench/source.tar.gz > target/source-workbench/SHA256SUMS
+          git archive --format=tar.gz HEAD crates/fln-elab crates/fln-parse crates/fln-checker crates/fln crates/fln-cli docs examples AGENTS.md README.md COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md .beads > target/source-frontend/frontend.tar.gz
+          cp target/source-workbench/commit.txt target/source-workbench/tracked-files.txt target/source-frontend/
+          sha256sum target/source-frontend/frontend.tar.gz > target/source-frontend/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-frontend-${{ github.sha }}
+          path: target/source-frontend
+          compression-level: 0
+          retention-days: 2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: source-workbench-${{ github.sha }}
