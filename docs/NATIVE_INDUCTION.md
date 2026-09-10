@@ -1,7 +1,10 @@
 # Native cases and induction
 
 The import-free source proof checker supports case analysis and structural
-induction on a named local of an admitted, single, non-indexed inductive family.
+induction on a named local of an admitted single inductive family. Indexed
+families require distinct parameter locals as their actual indices; dependent
+index telescopes are supported. See `NATIVE_INDEXED.md` and the runnable
+`examples/native_indexed_elimination.lean` example.
 These tactics construct applications of that family's ordinary recursor. They
 never add an axiom, accept a proof, or bypass K1 or the independent checker.
 
@@ -91,7 +94,7 @@ branch syntax on a small thread stack.
 
 ## Remaining scope
 
-This is not full Lean elimination elaboration. Indexed and mutual families,
+This is not full Lean elimination elaboration. Fixed/repeated indices, mutual families,
 non-local discriminants, `cases h : expression`, `using` recursors, `case`/bullet
 selectors, inaccessible patterns and higher-order/nested recursive fields are not
 supported by this tactic lane. Uniformly parameterized families with direct

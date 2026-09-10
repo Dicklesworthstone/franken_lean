@@ -27,6 +27,12 @@ fn recursor_prefix(recursor: &RecursorVal) -> Result<usize, NatDefinitionElabErr
         .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))
 }
 
+fn recursor_major(recursor: &RecursorVal) -> Result<usize, NatDefinitionElabError> {
+    recursor_prefix(recursor)?
+        .checked_add(recursor.num_indices as usize)
+        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))
+}
+
 impl Context {
     pub(super) fn reduce_source_head(
         &mut self,
@@ -106,9 +112,8 @@ impl Context {
                             )?;
                         }
                         Some(ConstantInfo::Rec(recursor)) => {
-                            let major = recursor_prefix(&recursor)?;
+                            let major = recursor_major(&recursor)?;
                             if recursor.is_unsafe
-                                || recursor.num_indices != 0
                                 || recursor.num_motives != 1
                                 || recursor.all.len() != 1
                                 || levels.len() != recursor.base.level_params.len()
@@ -162,13 +167,13 @@ impl Context {
                             self.source_iota(&rec_head, &recursor, &outer, &head, &arguments)?
                         {
                             changed = true;
-                            let prefix = recursor_prefix(&recursor)?;
+                            let prefix = recursor_major(&recursor)?;
                             outer.truncate(outer.len() - prefix - 1);
                             head = reduced;
                             arguments = outer;
                             continue 'reduce;
                         }
-                        let major = recursor_prefix(&recursor)?;
+                        let major = recursor_major(&recursor)?;
                         let position = outer.len() - major - 1;
                         outer[position] = self.rebuild_application(head, arguments)?;
                         head = rec_head;
@@ -216,7 +221,7 @@ impl Context {
             return Ok(None);
         };
         if family.is_unsafe
-            || family.num_indices != 0
+            || family.num_indices != recursor.num_indices
             || family.num_nested != 0
             || family.num_params != recursor.num_params
             || family.all != recursor.all

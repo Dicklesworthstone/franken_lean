@@ -854,3 +854,63 @@ fn installed_binary_checks_indexed_declarations_and_refuses_wrong_lengths() {
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_indexed_induction_and_dependent_cases() {
+    let path = file(include_str!(
+        "../../../examples/native_indexed_elimination.lean"
+    ));
+    let before = std::fs::read(&path).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    for field in ["\"commands\":11", "\"theorems\":5", "\"executed\":false"] {
+        assert!(text.contains(field), "{text}");
+    }
+    assert!(output.stderr.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn indexed_proof_failure_emits_no_success_and_does_not_poison_the_next_check() {
+    let prefix = file(
+        "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)",
+    );
+    let good = file(
+        "theorem same {A : Type} (n : Nat) (xs : Vec A n) : n = n := by cases xs with | nil => rfl | cons k x tail => rfl",
+    );
+    let bad = file(
+        "theorem false (n : Nat) (xs : Vec Nat n) : n = 0 := by cases xs with | nil => rfl | cons k x tail => rfl",
+    );
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("\"outcome\":\"kernel-rejection\"")
+            );
+        }
+    }
+}

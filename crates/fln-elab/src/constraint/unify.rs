@@ -19,7 +19,7 @@ use crate::lctx::LocalContext;
 use crate::mvar::{AssignmentJustification, MetavarError, MetavarKind};
 use crate::txn::ElabTxn;
 use crate::universe::UniverseInstantiationError;
-use fln_core::expr::{Expr, ExprNode, FVarId, MVarId};
+use fln_core::expr::{Expr, ExprNode, FVarId, Literal, MVarId};
 use fln_core::level::{LMVarId, Level, LevelView};
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
@@ -452,6 +452,11 @@ fn same_terms(left: &Expr, right: &Expr, meter: &mut Meter<'_>) -> Result<bool, 
 
 type Equation = (Expr, Expr, LocalContext);
 
+enum LiteralStep {
+    Equal,
+    Compare(Expr, Expr),
+}
+
 struct Engine<'a> {
     work: ElabTxn,
     budget: UnificationBudget,
@@ -792,6 +797,68 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// One constructor layer of the canonical admitted Nat family. A literal
+    /// stays compact, and solving `succ ?n = 2^128` creates one predecessor,
+    /// not an enormous unary term. No delta transparency is added here.
+    fn literal_constructor_equation(
+        &mut self,
+        literal: &Expr,
+        constructor: &Expr,
+    ) -> Result<Option<LiteralStep>, UnificationError> {
+        let ExprNode::Lit {
+            literal: Literal::Nat(value),
+        } = literal.node()
+        else {
+            return Ok(None);
+        };
+        let (head, argument) = match constructor.node() {
+            ExprNode::App { f, a } => (f, Some(a)),
+            _ => (constructor, None),
+        };
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        let index = if name == &Name::from_components(["Nat", "zero"])
+            && argument.is_none()
+            && value.limbs_le().is_empty()
+        {
+            0
+        } else if name == &Name::from_components(["Nat", "succ"])
+            && argument.is_some()
+            && !value.limbs_le().is_empty()
+        {
+            1
+        } else {
+            return Ok(None);
+        };
+        self.meter.tick()?;
+        let Declaration::Inductive(seed) = crate::seed::nat_inductive_seed_declaration() else {
+            unreachable!("the canonical Nat seed is inductive");
+        };
+        if self.work.env.find(&seed.types[0].base.name)
+            != Some(&ConstantInfo::Induct(seed.types[0].clone()))
+            || self.work.env.find(&seed.ctors[index].base.name)
+                != Some(&ConstantInfo::Ctor(seed.ctors[index].clone()))
+        {
+            return Ok(None);
+        }
+        let Some(argument) = argument else {
+            return Ok(Some(LiteralStep::Equal));
+        };
+        for _ in value.limbs_le() {
+            self.meter.node()?;
+        }
+        let previous = fln_bignum::nat::BigNatView::from_limbs_le(value.limbs_le())
+            .sub(fln_bignum::nat::BigNatView::from_limbs_le(&[1]));
+        let previous = Expr::lit(Literal::Nat(fln_bignum::interop::literal_from_bignat(
+            &previous,
+        )));
+        Ok(Some(LiteralStep::Compare(previous, argument.clone())))
+    }
+
     fn compare(
         &mut self,
         equation: &Equation,
@@ -805,6 +872,15 @@ impl Engine<'_> {
         let left = self.whnf(left, locals)?;
         let right = self.whnf(right, locals)?;
         if same_terms(&left, &right, &mut self.meter)? {
+            return Ok(());
+        }
+        if let Some(child) = self
+            .literal_constructor_equation(&left, &right)?
+            .or(self.literal_constructor_equation(&right, &left)?)
+        {
+            if let LiteralStep::Compare(left, right) = child {
+                pending.push_front((left, right, locals.clone()));
+            }
             return Ok(());
         }
         let mut reason = UnificationDeferred::UnsupportedEquation;

@@ -580,3 +580,116 @@ fn universe_simplification_stays_inside_the_unifier_work_budget() {
     ));
     assert_semantics_unchanged(&txn, &before);
 }
+
+fn inductive_nat_transaction() -> ElabTxn {
+    use fln_env::environment::DeclarationBudget;
+    use fln_env::pmap::CollisionBudget;
+    use fln_kernel::capability::{Published, admit};
+    use fln_kernel::council::{Council, CouncilOutcome, convene};
+    let env = fln_env::environment::Environment::new();
+    let candidate = fln_elab::seed::nat_inductive_seed_declaration();
+    let admitted = admit(&env, candidate, budget().kernel)
+        .into_complete()
+        .unwrap();
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("canonical Nat must check");
+    };
+    let Published::BlockCommitted(publication) = checked
+        .publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        )
+        .into_complete()
+        .unwrap()
+    else {
+        panic!("expected an inductive block");
+    };
+    ElabTxn::new(publication.environment, KVMap::new(), 17)
+}
+fn successor(value: Expr) -> Expr {
+    Expr::app(
+        Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new()),
+        value,
+    )
+}
+
+#[test]
+fn nat_index_literals_and_constructors_unify_in_both_orientations() {
+    let base = inductive_nat_transaction();
+    let zero = Expr::const_(Name::from_components(["Nat", "zero"]), Vec::new());
+    for (literal, ctor) in [
+        (numeral(0), zero.clone()),
+        (numeral(2), successor(successor(zero))),
+    ] {
+        for (left, right) in [(&literal, &ctor), (&ctor, &literal)] {
+            let mut txn = base.clone();
+            let mut limits = budget();
+            limits.transparency = fln_elab::constraint::unify::UnificationTransparency::None;
+            assert!(
+                txn.unify(left, right, limits)
+                    .unwrap()
+                    .expression_assignments
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn enormous_nat_index_infers_one_compact_predecessor() {
+    let mut txn = inductive_nat_transaction();
+    let id = natural(&mut txn, "predecessor", nat());
+    let huge = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 0, 1])));
+    let report = txn
+        .unify(&successor(Expr::mvar(id.clone())), &huge, budget())
+        .unwrap();
+    assert_eq!(report.kernel_checks, 1);
+    assert!(report.unifier_steps < 1000);
+    assert_eq!(
+        txn.mvars.get_assigned_expr(&id),
+        Some(&Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![
+            u64::MAX,
+            u64::MAX
+        ]),)))
+    );
+}
+
+#[test]
+fn nat_literal_refinement_does_not_accept_impostors_or_publish_failed_batches() {
+    let mut opaque = transaction();
+    assert!(
+        opaque
+            .unify(&numeral(1), &successor(numeral(0)), budget())
+            .is_err()
+    );
+    let mut txn = inductive_nat_transaction();
+    let id = natural(&mut txn, "n", nat());
+    let before = txn.clone();
+    assert!(
+        txn.unify_many_with(
+            &[
+                (successor(Expr::mvar(id)), numeral(2)),
+                (successor(numeral(0)), numeral(0)),
+            ],
+            budget(),
+            &|| false
+        )
+        .is_err()
+    );
+    assert_semantics_unchanged(&txn, &before);
+}
+
+#[test]
+fn nat_literal_refinement_budget_stops_are_not_mismatches() {
+    let mut txn = inductive_nat_transaction();
+    let id = natural(&mut txn, "n", nat());
+    let before = txn.clone();
+    let mut limits = budget();
+    limits.max_steps = 1;
+    assert!(matches!(
+        txn.unify(&successor(Expr::mvar(id)), &numeral(2), limits),
+        Err(UnificationError::StepLimit { .. })
+    ));
+    assert_semantics_unchanged(&txn, &before);
+}

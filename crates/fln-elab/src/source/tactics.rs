@@ -53,7 +53,7 @@ impl std::fmt::Display for TacticError {
             }
             Self::UnsupportedEliminator => write!(
                 f,
-                "elimination requires an admitted single non-indexed recursor"
+                "elimination requires a supported admitted single-family recursor"
             ),
             Self::InvalidGeneralization => {
                 write!(f, "invalid or dependent elimination generalization")

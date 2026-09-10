@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub enum MatchError {
     ExpectedInductive,
     UnsupportedFamily,
+    UnrefinedIndices,
     InvalidPattern,
     DuplicateConstructor,
     MissingConstructor,
@@ -23,7 +24,10 @@ impl std::fmt::Display for MatchError {
         f.write_str(match self {
             Self::ExpectedInductive => "match discriminant requires a known inductive type",
             Self::UnsupportedFamily => {
-                "match requires a single non-indexed family with direct recursion"
+                "elimination requires a supported single family with direct recursion"
+            }
+            Self::UnrefinedIndices => {
+                "indexed elimination currently requires distinct parameter locals as indices"
             }
             Self::InvalidPattern => {
                 "match requires a constructor with variable fields or a final catch-all"
@@ -91,6 +95,59 @@ fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError>
     Ok(None)
 }
 impl Context {
+    /// Independent local indices can be generalized without inventing index
+    /// equalities. Repeated, fixed and let-bound indices need an equation
+    /// refinement compiler, so they are not silently treated as independent.
+    pub(super) fn elimination_index_locals(
+        &mut self,
+        values: &[Expr],
+    ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
+        let mut seen = HashSet::new();
+        let mut indices = Vec::new();
+        for value in values {
+            self.tick()?;
+            let value = self.instantiate(value)?;
+            let ExprNode::FVar { id } = value.node() else {
+                return Err(error(MatchError::UnrefinedIndices));
+            };
+            let local = self
+                .txn
+                .lctx
+                .find(id)
+                .cloned()
+                .ok_or_else(|| error(MatchError::UnrefinedIndices))?;
+            if local.value.is_some() || !seen.insert(id.clone()) {
+                return Err(error(MatchError::UnrefinedIndices));
+            }
+            indices.push(local);
+        }
+        Ok(indices)
+    }
+
+    pub(super) fn elimination_result_indices(
+        &mut self,
+        type_: &Expr,
+        family: &Name,
+        parameters: usize,
+        indices: usize,
+    ) -> Result<Vec<Expr>, NatDefinitionElabError> {
+        let type_ = self.whnf(type_)?;
+        let mut head = &type_;
+        let mut values = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            values.push(a.clone());
+            head = f;
+        }
+        if !matches!(head.node(), ExprNode::Const { name, .. } if name == family)
+            || values.len() != parameters + indices
+        {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
+        values.reverse();
+        Ok(values.split_off(parameters))
+    }
+
     pub(super) fn match_parts<'a>(
         &mut self,
         syntax: &'a Syntax,
@@ -417,6 +474,33 @@ impl Context {
         let domain = self.whnf(domain)?;
         if domain == *family_type {
             return Ok(true);
+        }
+        if let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name)
+            && family.num_indices > 0
+        {
+            let count = family.num_indices as usize;
+            let mut actual = &domain;
+            let mut expected = family_type;
+            let mut complete = true;
+            for _ in 0..count {
+                self.tick()?;
+                match (actual.node(), expected.node()) {
+                    (ExprNode::App { f: a, .. }, ExprNode::App { f: b, .. }) => {
+                        actual = a;
+                        expected = b;
+                    }
+                    _ => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            // The admitted constructor/recursor owns positivity and index
+            // typing. Here only the fixed family prefix must match; the child
+            // may live at different indices from the outer discriminant.
+            if complete && actual == expected {
+                return Ok(true);
+            }
         }
         let mut pending = vec![&domain];
         let mut seen = HashSet::new();

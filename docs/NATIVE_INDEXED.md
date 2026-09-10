@@ -48,9 +48,28 @@ remain nonanswers. No axiom, external dependency or admission authority is added
 
 ## Current boundaries
 
-This increment admits and constructs indexed data. The match, structural-recursion
-and induction frontends still have their earlier non-indexed-family restriction;
-it does not claim complete indexed elimination. Prop-valued indexed family
+The source `cases` and `induction` tactics support indexed families when their
+actual indices are distinct parameter locals, including dependent index
+telescopes. They abstract those indices in family order, refine them to each
+constructor's result indices, and generalize/reintroduce dependent locals and
+lets. Induction hypotheses have the actual child's indices, not the original
+discriminant's indices. Fixed family parameters cannot be generalized through
+this path, and `cases` still hides recursive hypotheses.
+
+`examples/native_indexed_elimination.lean` computes vector length and proves it
+equals the type-level length for every vector. It also proves vector copy
+identity and extracts a dependently indexed witness. Indexed iota reduction
+preserves the distinction between the major's position (after indices) and the
+rule's parameter/motive/minor prefix (without indices). Nat literals unify with
+the canonical admitted zero/successor constructors one compact layer at a time,
+including inference of a large literal's predecessor. No ordinary definition
+unfolding policy or checking authority is widened.
+
+This is not complete indexed elimination. Fixed expressions, repeated indices
+and let-bound indices require index-equation refinement and currently refuse
+instead of becoming independent variables. The source match and structural
+recursion compilers still restrict their own lanes to non-indexed families.
+Prop-valued indexed family
 admission, mutual/nested families, inaccessible patterns, index-equation solving
 and explicit source universe declarations remain incomplete. Quantifier syntax
 currently requires explicit unparenthesized typed names; grouped binder forms and

@@ -16,6 +16,7 @@ struct EliminationContext<'a> {
     parameters: &'a [Expr],
     levels: &'a [Level],
     major: &'a LocalDecl,
+    indices: &'a [LocalDecl],
     original_target: &'a Expr,
     reverted: &'a [LocalDecl],
     induction: bool,
@@ -139,6 +140,7 @@ impl Context {
             parameters,
             levels,
             major,
+            indices,
             original_target,
             reverted,
             induction,
@@ -177,7 +179,21 @@ impl Context {
         }
         // Reintroduce the exact dependent telescope, including let definitions.
         // Rebuilding from original declarations avoids whnf erasing those lets.
-        let mut replacements = vec![(major.id.clone(), ctor)];
+        let ctor_type = self
+            .known_type(&ctor)?
+            .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
+        let result_indices = self.elimination_result_indices(
+            &ctor_type,
+            &constructor.induct,
+            parameters.len(),
+            indices.len(),
+        )?;
+        let mut replacements: Vec<_> = indices
+            .iter()
+            .zip(result_indices)
+            .map(|(local, value)| (local.id.clone(), value))
+            .collect();
+        replacements.push((major.id.clone(), ctor));
         for old in reverted {
             self.tick()?;
             let type_ = self.specialize_locals(&old.type_, &replacements)?;
@@ -258,14 +274,13 @@ impl Context {
             return Err(error(TacticError::UnsupportedEliminator));
         };
         if family.is_unsafe
-            || family.num_indices != 0
             || family.num_nested != 0
             || family.all != [name.clone()]
-            || parameters.len() != family.num_params as usize
+            || parameters.len() != family.num_params as usize + family.num_indices as usize
             || levels.len() != family.base.level_params.len()
             || rec.is_unsafe
             || rec.num_params != family.num_params
-            || rec.num_indices != 0
+            || rec.num_indices != family.num_indices
             || rec.num_motives != 1
             || rec.num_minors as usize != family.ctors.len()
             || rec.rules.len() != family.ctors.len()
@@ -276,8 +291,11 @@ impl Context {
         if family.ctors.len() > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-
+        let index_values = parameters.split_off(family.num_params as usize);
+        let indices = self.elimination_index_locals(&index_values)?;
+        let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         let mut removed = HashSet::from([major.id.clone()]);
+        removed.extend(index_ids.iter().cloned());
         let explicit = expect_null_args(generalizing, "generalized locals")?;
         if !explicit.is_empty() {
             if !induction {
@@ -315,15 +333,39 @@ impl Context {
         if self
             .elimination_reads(&major.type_)?
             .iter()
-            .any(|id| removed.contains(id))
+            .any(|id| removed.contains(id) && !index_ids.contains(id))
         {
             return Err(error(TacticError::InvalidGeneralization));
+        }
+        for parameter in &parameters {
+            if self
+                .elimination_reads(parameter)?
+                .iter()
+                .any(|id| removed.contains(id))
+            {
+                return Err(error(TacticError::InvalidGeneralization));
+            }
+        }
+        let mut preceding_indices = HashSet::new();
+        for index in &indices {
+            if self
+                .elimination_reads(&index.type_)?
+                .iter()
+                .any(|id| removed.contains(id) && !preceding_indices.contains(id))
+            {
+                return Err(error(TacticError::InvalidGeneralization));
+            }
+            preceding_indices.insert(index.id.clone());
         }
         let reverted: Vec<_> = goal
             .lctx
             .decls()
             .iter()
-            .filter(|local| local.id != major.id && removed.contains(&local.id))
+            .filter(|local| {
+                local.id != major.id
+                    && !index_ids.contains(&local.id)
+                    && removed.contains(&local.id)
+            })
             .cloned()
             .collect();
         let mut retained = LocalContext::new();
@@ -363,7 +405,7 @@ impl Context {
             value: generalized.clone(),
             type_: target_type,
         })?;
-        let motive = Expr::lam(
+        let mut motive = Expr::lam(
             Name::anonymous(),
             family_type.clone(),
             generalized
@@ -371,6 +413,18 @@ impl Context {
                 .map_err(|_| failure(SourceInferenceError::Scope))?,
             BinderInfo::Default,
         );
+        for index in indices.iter().rev() {
+            self.tick()?;
+            let body = motive
+                .abstract_fvar(&index.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            motive = Expr::lam(
+                index.user_name.clone(),
+                self.instantiate(&index.type_)?,
+                body,
+                index.binder_info,
+            );
+        }
         let motive_type = self
             .known_type(&motive)?
             .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
@@ -512,6 +566,7 @@ impl Context {
                     parameters: &parameters,
                     levels,
                     major: &major,
+                    indices: &indices,
                     original_target: &goal.target,
                     reverted: &reverted,
                     induction,
@@ -532,6 +587,16 @@ impl Context {
             )?;
         }
         self.txn.lctx = goal.lctx.clone();
+        for index in &indices {
+            let type_ = self.instantiate(&index.type_)?;
+            recursor = self.match_apply(
+                recursor,
+                Typed {
+                    value: Expr::fvar(index.id.clone()),
+                    type_,
+                },
+            )?;
+        }
         recursor = self.match_apply(
             recursor,
             Typed {
