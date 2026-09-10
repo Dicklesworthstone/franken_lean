@@ -1,4 +1,5 @@
 //! Conversion regressions using independently admitted recursor metadata.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_checker::defeq::{DefEqOutcome, def_eq, def_eq_with};
 use fln_checker::whnf::{FreeBinding, WhnfContext};

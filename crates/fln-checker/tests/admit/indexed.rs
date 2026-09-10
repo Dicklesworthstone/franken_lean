@@ -1,4 +1,5 @@
 //! Indexed recursor reconstruction uses constructor-derived index expressions.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_checker::admit::{InductiveRejection, InductiveVerdict};
 use fln_core::expr::FVarId;
