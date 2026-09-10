@@ -36,6 +36,13 @@ jobs:
                   raw=raw.replace(old,new)
               assert blob(raw)=='c8a6252613dd68e48175591bbcb8aab27827c172'
               repaired=True
+          if blob(raw)=='0e9eb263ff56bbbe0c7024f598d883ea3e4319dd':
+              repairs=[(b'jS8gU0wEhR4eHR2cifl6dHoUm7tECob2',b'jS8gU0wEhR4eHR2cXnifl6dHoUm7tECob2'),(b'nGd+3QmEaHJph4ph5lOeaSMhVKbgwTGh',b'nGd+3QmEaHJph4phzzQ4E7ph5lOeaSMhVKbgwTGh')]
+              for old,new in repairs:
+                  assert raw.count(old)==1
+                  raw=raw.replace(old,new)
+              assert blob(raw)=='6faaf4f5a4a2c3aaf5cfce7f7e769d1c1e1d0be9'
+              repaired=True
           plan=json.loads(raw)
           encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
           with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as stream:
@@ -76,7 +83,7 @@ jobs:
           rust=sorted(p for p in plan['paths'] if p.endswith('.rs'))
           subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
           PY
-          for example in native_pattern_matching native_recursion native_induction native_indexed; do
+          for example in native_pattern_matching native_recursion native_induction native_indexed native_indexed_elimination; do
             if test -f "examples/$example.lean"; then
               cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/elimination-landing/$example.json"
             fi
