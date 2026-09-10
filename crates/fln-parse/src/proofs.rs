@@ -7,6 +7,7 @@
 
 use super::*;
 use std::ops::Range;
+mod elimination;
 
 fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {
     NatDefinitionParseError::OutsideSeedGrammar {
@@ -61,54 +62,7 @@ pub(super) fn parse(
             return Err(refusal(view, tokens, first));
         }
     }
-    let mut sequence = Vec::new();
-    let mut start = first;
-    depth = 0;
-    for index in first..end {
-        let token = &tokens[index];
-        let line = source.line_of(token.extent.start());
-        let column = token.extent.start().0 - source.line_start(line).expect("token line exists").0;
-        let previous_line = if index > start {
-            source.line_of(tokens[index - 1].extent.end())
-        } else {
-            line
-        };
-        let separator =
-            depth == 0 && matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == ";");
-        let newline = depth == 0 && index > start && line > previous_line && column <= first_column;
-        if newline {
-            if column != first_column {
-                return Err(refusal(view, tokens, index));
-            }
-            sequence.push(tactic(leaves, view, tokens, start..index)?);
-            // Parser.semicolonOrLinebreak's linebreak branch consumes no leaf.
-            sequence.push(Syntax::Missing);
-            start = index;
-        }
-        if separator {
-            if start == index {
-                return Err(refusal(view, tokens, index));
-            }
-            sequence.push(tactic(leaves, view, tokens, start..index)?);
-            sequence.push(leaves.leaf(index)?);
-            start = index + 1;
-        }
-        match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "(" || symbol == "[" => depth += 1,
-            TokenKind::Symbol(symbol) if symbol == ")" || symbol == "]" => depth -= 1,
-            _ => {}
-        }
-    }
-    if start < end {
-        sequence.push(tactic(leaves, view, tokens, start..end)?);
-    }
-    let sequence = Syntax::node(
-        parser_kind(&["Tactic", "tacticSeq"]),
-        vec![Syntax::node(
-            parser_kind(&["Tactic", "tacticSeq1Indented"]),
-            vec![null_node(sequence)],
-        )],
-    );
+    let sequence = elimination::sequence(leaves, view, tokens, first..end)?;
     Ok((
         Syntax::node(
             parser_kind(&["Term", "byTactic"]),

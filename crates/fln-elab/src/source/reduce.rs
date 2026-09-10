@@ -35,6 +35,8 @@ impl Context {
         zeta_delta: bool,
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut head = self.instantiate(expr)?;
+        let original = head.clone();
+        let mut changed = false;
         let mut arguments = Vec::new();
         let mut continuations = Vec::new();
         'reduce: loop {
@@ -53,20 +55,30 @@ impl Context {
                         });
                         head = expr.clone();
                     }
-                    ExprNode::MData { expr, .. } => head = expr.clone(),
+                    ExprNode::MData { expr, .. } => {
+                        changed = true;
+                        head = expr.clone();
+                    }
                     ExprNode::App { f, a } => {
                         arguments.push(a.clone());
                         head = f.clone();
                     }
-                    ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
+                    ExprNode::LetE { body, value, .. } => {
+                        changed = true;
+                        head = self.substitute(body, value)?;
+                    }
                     ExprNode::Lam { body, .. } if !arguments.is_empty() => {
+                        changed = true;
                         let value = arguments.pop().expect("guarded application");
                         head = self.substitute(body, &value)?;
                     }
                     ExprNode::FVar { id } if zeta_delta => {
                         let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
                         match value {
-                            Some(value) => head = value,
+                            Some(value) => {
+                                changed = true;
+                                head = value;
+                            }
                             None => break,
                         }
                     }
@@ -86,6 +98,7 @@ impl Context {
                             if definition.base.level_params.len() != levels.len() {
                                 return Err(failure(SourceInferenceError::Scope));
                             }
+                            changed = true;
                             head = self.instantiate_params(
                                 &definition.value,
                                 &definition.base.level_params,
@@ -131,6 +144,7 @@ impl Context {
                             &head,
                             &arguments,
                         ) {
+                            changed = true;
                             head = field;
                             arguments = outer;
                             continue 'reduce;
@@ -147,6 +161,7 @@ impl Context {
                         if let Some(reduced) =
                             self.source_iota(&rec_head, &recursor, &outer, &head, &arguments)?
                         {
+                            changed = true;
                             let prefix = recursor_prefix(&recursor)?;
                             outer.truncate(outer.len() - prefix - 1);
                             head = reduced;
@@ -161,7 +176,13 @@ impl Context {
                     }
                 }
             }
-            return self.rebuild_application(head, arguments);
+            // A no-op query must not split sharing by rebuilding an unchanged
+            // application spine. This matters when simp visits a shared DAG.
+            return if changed {
+                self.rebuild_application(head, arguments)
+            } else {
+                Ok(original)
+            };
         }
     }
 

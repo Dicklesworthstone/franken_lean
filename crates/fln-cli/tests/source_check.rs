@@ -688,3 +688,76 @@ fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors(
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_real_induction_and_dependent_case_proofs() {
+    let path = file(include_str!("../../../examples/native_induction.lean"));
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "\"commands\":12",
+        "\"theorems\":5",
+        "\"authority\":true",
+        "\"executed\":false",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn failed_induction_branches_never_publish_a_multi_file_success_prefix() {
+    let prefix = file("def zero (n : Nat) : Nat := match n with | .zero => 0 | .succ k => zero k");
+    let good = file(
+        "theorem zero_ok (n : Nat) : zero n = 0 := by induction n with | zero => rfl | succ k ih => exact ih",
+    );
+    let unfinished = file(
+        "theorem zero_ok (n : Nat) : zero n = 0 := by cases n with | zero => rfl | succ k => assumption",
+    );
+    let false_proof = file(
+        "theorem false_proof (n : Nat) : 0 = 1 := by cases n with | zero => rfl | succ k => rfl",
+    );
+    for (suffix, success) in [
+        (&good, true),
+        (&unfinished, false),
+        (&false_proof, false),
+        (&good, true),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":2",
+                "\"theorems\":1",
+                "\"files\":2",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}

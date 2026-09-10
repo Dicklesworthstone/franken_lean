@@ -232,7 +232,11 @@ impl Context {
             }
             UnfoldResult::NotDefinition => {
                 // Re-elaboration gives each polymorphic use fresh universes.
-                let term = self.term(rule.syntax, None)?;
+                let mut term = self.term(rule.syntax, None)?;
+                // Selected definitions normalize the lemma's type as well as
+                // the goal. Keep its actual proof term: conversion is checked
+                // by the final kernel, never replaced by an equality axiom.
+                term.type_ = self.simp_premise_target(&term.type_, premise_rules)?;
                 let Some(RewriteMatch {
                     rule: term,
                     occurrence,

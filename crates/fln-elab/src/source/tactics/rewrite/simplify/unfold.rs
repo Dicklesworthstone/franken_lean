@@ -152,40 +152,11 @@ impl Context {
             .expect("selected unfolding finishes the root"))
     }
 
-    /// No delta or local-context lookup here. In particular, calling the source
-    /// elaborator's general whnf would unfold definitions absent from the list.
+    /// Pure reduction only: no global delta or local-context lookup. Admitted
+    /// recursors must reduce here so unfolding a selected recursive definition
+    /// exposes the recursive calls to its induction hypotheses.
     fn simp_beta_zeta(&mut self, root: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        let mut head = root.clone();
-        let mut arguments = Vec::new();
-        let mut reduced = false;
-        loop {
-            self.tick()?;
-            match head.node() {
-                ExprNode::App { f, a } => {
-                    arguments.push(a.clone());
-                    head = f.clone();
-                }
-                ExprNode::LetE { body, value, .. } => {
-                    reduced = true;
-                    head = self.substitute(body, value)?;
-                }
-                ExprNode::Lam { body, .. } if !arguments.is_empty() => {
-                    reduced = true;
-                    let argument = arguments.pop().expect("nonempty beta application");
-                    head = self.substitute(body, &argument)?;
-                }
-                ExprNode::MData { expr, .. } if !arguments.is_empty() => head = expr.clone(),
-                _ => break,
-            }
-        }
-        if !reduced {
-            return Ok(root.clone());
-        }
-        for argument in arguments.into_iter().rev() {
-            self.tick()?;
-            head = Expr::app(head, argument);
-        }
-        Ok(head)
+        self.whnf_with_transparency(root, UnificationTransparency::None, false)
     }
 }
 

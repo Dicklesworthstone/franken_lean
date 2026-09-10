@@ -134,7 +134,7 @@ impl Context {
         })
     }
 
-    fn match_apply(
+    pub(super) fn match_apply(
         &mut self,
         mut function: Typed,
         argument: Typed,
@@ -408,7 +408,7 @@ impl Context {
         })
     }
 
-    fn direct_match_field(
+    pub(super) fn direct_match_field(
         &mut self,
         domain: &Expr,
         family_type: &Expr,

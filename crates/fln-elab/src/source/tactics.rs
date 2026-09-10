@@ -6,6 +6,7 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+mod eliminate;
 mod rewrite;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,11 @@ pub enum TacticError {
     RewriteMetavariablePattern,
     SimplificationNoProgress,
     SimplificationCycle,
+    EliminationLocal,
+    EliminationCoverage,
+    EliminationArity,
+    UnsupportedEliminator,
+    InvalidGeneralization,
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,6 +43,21 @@ impl std::fmt::Display for TacticError {
             }
             Self::SimplificationNoProgress => write!(f, "simp only made no progress"),
             Self::SimplificationCycle => write!(f, "simp only encountered a rewrite cycle"),
+            Self::EliminationLocal => write!(f, "elimination requires a local variable"),
+            Self::EliminationCoverage => write!(
+                f,
+                "elimination alternatives must cover each constructor exactly once"
+            ),
+            Self::EliminationArity => {
+                write!(f, "elimination has duplicate or excessive binder names")
+            }
+            Self::UnsupportedEliminator => write!(
+                f,
+                "elimination requires an admitted single non-indexed recursor"
+            ),
+            Self::InvalidGeneralization => {
+                write!(f, "invalid or dependent elimination generalization")
+            }
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
         }
     }
@@ -55,6 +76,8 @@ enum Work<'a> {
     Rewrite(ProofGoal, std::collections::VecDeque<RewriteRule<'a>>, bool),
     Goal(ProofGoal),
     Close(ProofGoal, Expr),
+    Script(ProofGoal, Vec<&'a Syntax>),
+    EndScript(Vec<&'a Syntax>, usize),
 }
 pub(super) struct ProofState<'a> {
     saved: LocalContext,
@@ -107,8 +130,24 @@ impl Context {
         let target = expected.ok_or_else(|| error(TacticError::ExpectedGoal))?;
         let parts = expect_node(syntax, &parser_kind(&["Term", "byTactic"]), 2, "by proof")?;
         expect_atom(&parts[0], "by", "by keyword")?;
+        let instructions = self.proof_instructions(&parts[1])?;
+        let (root, goal) = self.proof_goal(target.clone())?;
+        Ok(ProofState {
+            saved: self.txn.lctx.clone(),
+            target,
+            root,
+            instructions,
+            cursor: 0,
+            work: vec![Work::Goal(goal)],
+        })
+    }
+
+    fn proof_instructions<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Vec<&'a Syntax>, NatDefinitionElabError> {
         let sequence = expect_node(
-            &parts[1],
+            syntax,
             &parser_kind(&["Tactic", "tacticSeq"]),
             1,
             "tactic sequence",
@@ -129,15 +168,7 @@ impl Context {
                 return Err(error(TacticError::MalformedScript));
             }
         }
-        let (root, goal) = self.proof_goal(target.clone())?;
-        Ok(ProofState {
-            saved: self.txn.lctx.clone(),
-            target,
-            root,
-            instructions,
-            cursor: 0,
-            work: vec![Work::Goal(goal)],
-        })
+        Ok(instructions)
     }
 
     /// Try equality transactionally; a failed candidate retains no assignment.
@@ -187,7 +218,17 @@ impl Context {
             value = value
                 .abstract_fvar(&local.id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
-            value = Expr::lam(local.user_name, domain, value, local.binder_info);
+            value = if let Some(local_value) = local.value {
+                Expr::let_e(
+                    local.user_name,
+                    domain,
+                    self.instantiate(&local_value)?,
+                    value,
+                    false,
+                )
+            } else {
+                Expr::lam(local.user_name, domain, value, local.binder_info)
+            };
         }
         // This is candidate construction in a private transaction, not a
         // kernel acceptance. The complete command still goes through K1.
@@ -225,6 +266,20 @@ impl Context {
                 }));
             };
             let mut goal = match work {
+                Work::Script(goal, instructions) => {
+                    let parent = std::mem::replace(&mut proof.instructions, instructions);
+                    let cursor = std::mem::replace(&mut proof.cursor, 0);
+                    proof.work.push(Work::EndScript(parent, cursor));
+                    goal
+                }
+                Work::EndScript(instructions, cursor) => {
+                    if proof.cursor != proof.instructions.len() {
+                        return Err(error(TacticError::NoGoals));
+                    }
+                    proof.instructions = instructions;
+                    proof.cursor = cursor;
+                    continue;
+                }
                 Work::Rewrite(goal, mut remaining, close) => {
                     self.txn.lctx = goal.lctx.clone();
                     if let Some(rule) = remaining.pop_front() {
@@ -251,7 +306,7 @@ impl Context {
             }
             self.txn.lctx = goal.lctx.clone();
             goal.target = self.instantiate(&goal.target)?;
-            let Some(instruction) = proof.instructions.get(proof.cursor) else {
+            let Some(&instruction) = proof.instructions.get(proof.cursor) else {
                 let count = 1 + proof.work.iter().filter(|row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id))).count();
                 return Err(error(TacticError::UnsolvedGoals { count }));
             };
@@ -259,7 +314,16 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "simp"]) {
+            if kind == &parser_kind(&["Tactic", "cases"])
+                || kind == &parser_kind(&["Tactic", "induction"])
+            {
+                self.eliminate_proof_goal(
+                    proof,
+                    goal,
+                    args,
+                    kind == &parser_kind(&["Tactic", "induction"]),
+                )?;
+            } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rwSeq"])
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
