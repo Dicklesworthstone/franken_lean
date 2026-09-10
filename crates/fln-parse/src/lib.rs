@@ -31,6 +31,7 @@ pub mod registry;
 pub mod state;
 
 mod inductive;
+mod matching;
 mod proofs;
 mod record_terms;
 mod records;
@@ -56,6 +57,8 @@ pub struct ParseDiagnostic {
 /// The next form required by the first command grammar slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatDefinitionExpectation {
+    InductiveConstructor,
+    MatchAlternative,
     ImportOrCommand,
     ImportedModule,
     EndOfImportCommand,
@@ -484,6 +487,9 @@ fn nat_definition_token_table() -> TokenTable {
         "inductive",
         "|",
         "structure",
+        "inductive",
+        "match",
+        "|",
         "class",
         "where",
         "with",
@@ -542,6 +548,9 @@ fn source_module_token_table() -> TokenTable {
         "inductive",
         "|",
         "structure",
+        "inductive",
+        "match",
+        "|",
         "class",
         "where",
         "with",
@@ -680,24 +689,32 @@ fn bounded_term_leaf(
     }
 }
 
-/// The let-body separator is the first `;` at parenthesis depth 0.
-/// Scanning for the first `;` anywhere splits `let x := (1; 2); x` at the
-/// inner semicolon, leaving `(1` as the value — fail-closed with the wrong
-/// cut. Nested `let` in parens is outside the seed term grammar either way;
-/// the depth walk makes the refusal land on the leftover token, not an
-/// unclosed `(`.
+/// Find the separator belonging to this let, not one in a nested let or a
+/// delimited subexpression. The term parser still validates the resulting ranges.
 fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for index in from..tokens.len() {
-        match tokens.get(index).map(|token| &token.kind) {
-            Some(TokenKind::Symbol(symbol)) if symbol == "(" => depth += 1,
-            Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
-                depth = depth.saturating_sub(1);
+    let mut delimiters = Vec::new();
+    let mut nested_lets = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(from) {
+        if let TokenKind::Symbol(symbol) = &token.kind {
+            match symbol.as_str() {
+                "(" => delimiters.push(")"),
+                "{" => delimiters.push("}"),
+                "[" => delimiters.push("]"),
+                "⦃" => delimiters.push("⦄"),
+                ")" | "}" | "]" | "⦄" => {
+                    if delimiters.pop() != Some(symbol.as_str()) {
+                        return None;
+                    }
+                }
+                "let" if delimiters.is_empty() => nested_lets += 1,
+                ";" if delimiters.is_empty() => {
+                    if nested_lets == 0 {
+                        return Some(index);
+                    }
+                    nested_lets -= 1;
+                }
+                _ => {}
             }
-            Some(TokenKind::Symbol(symbol)) if symbol == ";" && depth == 0 => {
-                return Some(index);
-            }
-            _ => {}
         }
     }
     None
@@ -1074,6 +1091,19 @@ fn bounded_term(
     range: std::ops::Range<usize>,
     grammar: DefinitionGrammar,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    matching::parse(leaves, view, tokens, range, grammar)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_term_spliced(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut matching::Splices,
+    updates: &std::collections::HashSet<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
     let mut frames = vec![BoundedTermFrame {
         record: None,
         ascription: None,
@@ -1083,16 +1113,34 @@ fn bounded_term(
         operands: Vec::new(),
         operators: Vec::new(),
     }];
-    let updates = record_terms::update_openers(tokens, range.clone());
     let mut cursor = range.start;
     while cursor < range.end {
         let index = cursor;
         cursor += 1;
+        if let Some((end, syntax)) = splices.remove(&index) {
+            if end > range.end {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: NatDefinitionExpectation::MatchAlternative,
+                });
+            }
+            frames
+                .last_mut()
+                .expect("root term frame")
+                .application
+                .push((syntax, index));
+            cursor = end;
+            continue;
+        }
         match tokens.get(index).map(|token| &token.kind) {
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
             {
                 let (proof, end) = proofs::parse(leaves, view, tokens, index, range.end)?;
+                // Tactic arguments are parsed by their own bounded term call.
+                // Its returned syntax already owns these matches. Nested by
+                // blocks are forbidden by that parser, bounding re-entry depth.
+                splices.retain(|start, _| *start < index || *start >= end);
                 frames
                     .last_mut()
                     .expect("root term frame")
@@ -1610,11 +1658,11 @@ fn parse_definition_with_grammar(
         .collect::<Vec<_>>();
 
     if grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.first().map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "inductive")
+        && matches!(tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == "inductive")
     {
         return inductive::parse(view, tokens);
     }
-
     if grammar == DefinitionGrammar::Scalar
         && matches!(tokens.first().map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
     {

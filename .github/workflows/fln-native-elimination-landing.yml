@@ -1,0 +1,112 @@
+name: Native elimination integration
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/native_elimination_increment.json', '.github/workflows/fln-native-elimination-landing.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-native-elimination-landing
+  cancel-in-progress: false
+jobs:
+  elimination:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Apply the exact checksum-bound source increment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/elimination-landing
+          git rev-parse HEAD > target/elimination-landing/input-commit.txt
+          python3 - <<'PY'
+          import base64,gzip,hashlib,io,json,pathlib,subprocess
+          manifest=pathlib.Path('scripts/native_elimination_increment.json')
+          out=pathlib.Path('target/elimination-landing')
+          raw=manifest.read_bytes()
+          (out/'input-manifest.json').write_bytes(raw)
+          blob=lambda data: hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          repaired=False
+          if blob(raw)=='d771a212fc5955d23868044c8ad8d0a7391a632d':
+              assert raw.count(b'EXtuci5PD6UgNdI')==1
+              assert raw.count(b'S4p3clqd9d15TWl')==1
+              raw=raw.replace(b'EXtuci5PD6UgNdI',b'EX0IbEvF/EwzPbkIgYN9HG5iOmwXMT0wbmI6Q65iPap/UD8tuci5PD6UgNdI')
+              raw=raw.replace(b'S4p3clqd9d15TWl',b'S4p3clqd15TWl')
+              assert blob(raw)=='fc0aa886a0c61cce309f32aa52daf8f16cdcc281'
+              repaired=True
+          plan=json.loads(raw)
+          encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
+          with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as stream:
+              patch=stream.read(2_000_001)
+          assert len(patch)<=2_000_000
+          assert hashlib.sha256(patch).hexdigest()==plan['sha256']
+          paths=plan['paths']
+          assert paths and len(paths)==len(set(paths))
+          for p in paths:
+              assert p.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
+              assert '..' not in pathlib.PurePosixPath(p).parts
+          patch_paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
+          assert set(paths)==set(patch_paths)
+          assert b'+++ /dev/null' not in patch
+          subprocess.run(['git','apply','--check','--index','-'],input=patch,check=True)
+          subprocess.run(['git','apply','--index','-'],input=patch,check=True)
+          if repaired:
+              manifest.write_bytes(raw)
+              subprocess.run(['git','add','--',str(manifest)],check=True)
+              paths.append(str(manifest))
+          (out/'paths.json').write_text(json.dumps(paths))
+          (out/'increment.json').write_bytes(raw)
+          (out/'change.patch').write_bytes(patch)
+          (out/'source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths},indent=2))
+          PY
+      - name: Test both checking engines and the real frontend and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv | tee target/elimination-landing/compiler.txt
+          cargo test --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --no-fail-fast 2>&1 | tee target/elimination-landing/tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/elimination-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/elimination-landing/workspace.log
+          python3 - <<'PY'
+          import json,subprocess
+          plan=json.load(open('target/elimination-landing/increment.json'))
+          rust=sorted(p for p in plan['paths'] if p.endswith('.rs'))
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
+          PY
+          for example in native_pattern_matching native_recursion; do
+            if test -f "examples/$example.lean"; then
+              cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/elimination-landing/$example.json"
+            fi
+          done
+          git diff --check
+          git diff --cached --check
+      - name: Publish only the tested changes without a force push
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,pathlib,subprocess
+          out=pathlib.Path('target/elimination-landing')
+          paths=json.loads((out/'paths.json').read_text())
+          plan=json.loads((out/'increment.json').read_text())
+          digests=json.loads((out/'source-digests.json').read_text())
+          assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==digest for p,digest in digests.items())
+          assert not subprocess.check_output(['git','diff','--name-only']).strip()
+          assert set(subprocess.check_output(['git','diff','--cached','--name-only']).decode().splitlines())==set(paths)
+          subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+          subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+          (out/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
+          subprocess.run(['git','commit','-m',plan['message']],check=True)
+          subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          (out/'published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-elimination-${{ github.sha }}
+          path: target/elimination-landing
+          retention-days: 7

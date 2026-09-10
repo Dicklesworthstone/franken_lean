@@ -1,6 +1,6 @@
 //! Bounded record/class declarations using the ordinary token leaves and types.
 //! No source rewriting or fabricated definitions: field scopes survive as syntax.
-//! Inheritance, custom constructors, field defaults and deriving remain explicit
+//! Inheritance, custom constructors and deriving remain explicit
 //! refusals rather than ignored command suffixes.
 use super::*;
 use std::ops::Range;
@@ -70,6 +70,27 @@ fn field(
     }
     let parameters =
         bounded_binder_syntax(leaves, view, tokens, groups, DefinitionGrammar::Scalar)?;
+    let type_limit = type_end(&tokens[..range.end], colon, ":=");
+    let default = if type_limit < range.end {
+        let bounded_tokens = &tokens[..range.end];
+        let (bindings, body_start) = bounded_let_bindings(view, bounded_tokens, type_limit + 1)?;
+        null_node(vec![Syntax::node(
+            parser_kind(&["Term", "binderDefault"]),
+            vec![
+                leaves.leaf(type_limit)?,
+                bounded_value_syntax(
+                    leaves,
+                    view,
+                    bounded_tokens,
+                    bindings,
+                    body_start,
+                    DefinitionGrammar::Scalar,
+                )?,
+            ],
+        )])
+    } else {
+        null_node(Vec::new())
+    };
     Ok(Syntax::node(
         parser_kind(&["Command", "structSimpleBinder"]),
         vec![
@@ -79,10 +100,10 @@ fn field(
                 parser_kind(&["Command", "optDeclSig"]),
                 vec![
                     null_node(parameters),
-                    optional_type(leaves, view, tokens, colon..range.end)?,
+                    optional_type(leaves, view, tokens, colon..type_limit)?,
                 ],
             ),
-            null_node(Vec::new()),
+            default,
         ],
     ))
 }
@@ -135,7 +156,7 @@ fn fields(
                         return Err(refuse(view, tokens, index));
                     }
                 }
-                "where" | "extends" | "deriving" | ":=" => return Err(refuse(view, tokens, index)),
+                "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
                 _ => {}
             }
         }
@@ -248,7 +269,7 @@ mod tests {
             "structure A extends B where x : Nat",
             "structure A where\nx : Nat",
             "structure A where\n  x : Nat\n y : Nat",
-            "structure A where\n  x : Nat := 0",
+            "structure A where\n  x : Nat :=",
             "structure A where\n  x : Nat\nderiving Inhabited",
             "structure A where\n  x Nat",
             "class A where\n  x : (Nat",
@@ -266,6 +287,28 @@ mod tests {
             "structure Empty : Type where",
         ] {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
+        }
+    }
+    #[test]
+    fn default_bodies_preserve_crlf_comments_nested_literals_and_method_bindings() {
+        let text = "structure Config where\r\n  -- header\r\n  inner : Inner := { value := 7 }\r\n  twice : Nat := let x := inner.value; x + x\r\n  apply (x : Nat) : Nat := x + twice\r\n";
+        let parsed = parse_definition(text.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            text.replace("\r\n", "\n").as_bytes()
+        );
+        assert!(parse_nat_definition(text.as_bytes()).is_err());
+    }
+    #[test]
+    fn malformed_defaults_are_not_silently_dropped() {
+        for text in [
+            "structure Config where\n  x : Nat :=",
+            "structure Config where\n  x : Nat := 1 := 2",
+            "structure Config where\n  x : Nat := let y := 1",
+            "structure Config where\n  x : Nat := { value := 2",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
         }
     }
 }

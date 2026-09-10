@@ -10,8 +10,11 @@ mod infer;
 mod instance_command;
 mod instances;
 mod levels;
+mod matching;
 mod record;
 mod record_terms;
+mod recursion;
+mod reduce;
 mod tactics;
 
 use super::*;
@@ -22,6 +25,9 @@ use fln_core::options::KVMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
+    Recursion(recursion::RecursionError),
+    Match(matching::MatchError),
+    Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
     ExpectedFunction,
     ExpectedType,
@@ -44,6 +50,9 @@ pub enum SourceInferenceError {
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Recursion(reason) => write!(f, "{reason}"),
+            Self::Match(reason) => write!(f, "{reason}"),
+            Self::Inductive(error) => write!(f, "{error}"),
             Self::UnknownConstant(_) => {
                 write!(f, "source reference does not name a known constant")
             }
@@ -103,6 +112,7 @@ struct Context {
     next: u64,
     equations: Vec<(Expr, Expr)>,
     instance_goals: Vec<MVarId>,
+    recursion: Option<recursion::Recursion>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -119,6 +129,7 @@ impl Context {
             next: 0,
             equations: Vec::new(),
             instance_goals: Vec::new(),
+            recursion: None,
         }
     }
 
@@ -263,6 +274,11 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
+            if let Some(recursion) = &self.recursion
+                && &recursion.name == name
+            {
+                return Ok(recursion.reference.clone());
+            }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
                 if let Some(term) = self.qualified_record_field(name)? {
@@ -300,108 +316,7 @@ impl Context {
         transparency: UnificationTransparency,
         zeta_delta: bool,
     ) -> Result<Expr, NatDefinitionElabError> {
-        let mut head = self.instantiate(expr)?;
-        let mut arguments = Vec::new();
-        let mut projections: Vec<(Name, u64, Vec<Expr>)> = Vec::new();
-        loop {
-            loop {
-                self.tick()?;
-                match head.node() {
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr,
-                    } => {
-                        projections.push((
-                            struct_name.clone(),
-                            *idx,
-                            std::mem::take(&mut arguments),
-                        ));
-                        head = expr.clone();
-                    }
-                    ExprNode::MData { expr, .. } => head = expr.clone(),
-                    ExprNode::App { f, a } => {
-                        arguments.push(a.clone());
-                        head = f.clone();
-                    }
-                    ExprNode::LetE { body, value, .. } => head = self.substitute(body, value)?,
-                    ExprNode::Lam { body, .. } if !arguments.is_empty() => {
-                        let value = arguments.pop().expect("guarded application");
-                        head = self.substitute(body, &value)?;
-                    }
-                    ExprNode::FVar { id } if zeta_delta => {
-                        let value = self.txn.lctx.find(id).and_then(|local| local.value.clone());
-                        match value {
-                            Some(value) => head = value,
-                            None => break,
-                        }
-                    }
-                    ExprNode::Const { name, levels } => {
-                        let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
-                            self.txn.env.find(name).cloned()
-                        else {
-                            break;
-                        };
-                        if definition.safety != DefinitionSafety::Safe
-                            || !match transparency {
-                                UnificationTransparency::None => false,
-                                UnificationTransparency::Abbreviations => {
-                                    definition.hints == ReducibilityHints::Abbrev
-                                }
-                                UnificationTransparency::SafeDefinitions => true,
-                            }
-                        {
-                            break;
-                        }
-                        if definition.base.level_params.len() != levels.len() {
-                            return Err(failure(SourceInferenceError::Scope));
-                        }
-                        head = self.instantiate_params(
-                            &definition.value,
-                            &definition.base.level_params,
-                            levels,
-                        )?;
-                    }
-                    _ => break,
-                }
-            }
-            if let Some((structure, index, outer)) = projections.pop() {
-                self.tick()?;
-                if let Some(field) = crate::records::constructor_field(
-                    &self.txn.env,
-                    &structure,
-                    index,
-                    &head,
-                    &arguments,
-                ) {
-                    head = field;
-                    arguments = outer;
-                    continue;
-                }
-                for argument in arguments.into_iter().rev() {
-                    self.tick()?;
-                    head = Expr::app(head, argument);
-                }
-                head = Expr::proj(structure, index, head);
-                arguments = outer;
-                // A stuck major cannot unlock an outer projection. Unwind without
-                // feeding that same blocked projection back into the reduction loop.
-                while let Some((structure, index, outer)) = projections.pop() {
-                    self.tick()?;
-                    for argument in arguments.into_iter().rev() {
-                        self.tick()?;
-                        head = Expr::app(head, argument);
-                    }
-                    head = Expr::proj(structure, index, head);
-                    arguments = outer;
-                }
-            }
-            for argument in arguments.into_iter().rev() {
-                self.tick()?;
-                head = Expr::app(head, argument);
-            }
-            return Ok(head);
-        }
+        self.reduce_source_head(expr, transparency, zeta_delta)
     }
 
     /// Enough type reconstruction to generate the universe side of an implicit
@@ -584,6 +499,9 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            MatchNext(matching::MatchBuild<'a>),
+            MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>),
             AscribedValue(Expr, Option<Expr>),
             Projection(Name, Option<Expr>, bool),
@@ -623,6 +541,13 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "match"]) {
+                            let parts = self.match_parts(syntax)?;
+                            let discriminant = parts.discriminant;
+                            tasks.push(Task::MatchDiscriminant(parts, expected));
+                            tasks.push(Task::Visit(discriminant, None, true));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "proj"]) {
                             let parts = expect_node(syntax, kind, 3, "field projection")?;
                             expect_atom(&parts[1], ".", "field dot")?;
@@ -796,6 +721,26 @@ impl Context {
                     } else {
                         term
                     });
+                }
+                Task::MatchDiscriminant(parts, expected) => {
+                    let major = values.pop().expect("match discriminant visit");
+                    tasks.push(Task::MatchNext(self.start_match(parts, major, expected)?));
+                }
+                Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
+                    matching::MatchStep::Branch {
+                        syntax,
+                        expected,
+                        binders,
+                    } => {
+                        tasks.push(Task::MatchBranch(state, binders));
+                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                    }
+                    matching::MatchStep::Complete(term) => values.push(term),
+                },
+                Task::MatchBranch(mut state, binders) => {
+                    let branch = values.pop().expect("match branch visit");
+                    self.accept_match_branch(&mut state, binders, branch)?;
+                    tasks.push(Task::MatchNext(state));
                 }
                 Task::Ascription(syntax, expected) => {
                     let type_ = values.pop().expect("ascription type visit");
@@ -1407,7 +1352,7 @@ pub(super) fn definition(
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
         )?;
     }
-    let mut term = context.term(&parts[1], expected.clone())?;
+    let mut term = context.definition_body(name, &parameters, &parts[1], expected.clone())?;
     if let Some(expected) = expected {
         term.type_ = expected;
     }
@@ -1524,3 +1469,5 @@ pub use inductive::{elaborate_inductive, is_inductive};
 /// These are untrusted candidates. The caller must admit the whole sequence
 /// before registering the class or exposing any successor.
 pub use record::{SourceRecord, elaborate_record, is_record};
+
+pub use inductive::{elaborate_inductive, is_inductive};

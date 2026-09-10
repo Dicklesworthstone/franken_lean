@@ -523,3 +523,168 @@ fn installed_binary_checks_inductive_constructors_and_recursor_computation_atomi
         );
     }
 }
+
+#[test]
+fn installed_binary_checks_defaults_updates_and_late_failure_without_partial_success() {
+    let prefix = file(
+        "structure Config where\n  base : Nat := 3\n  twice : Nat := base + base\ndef custom : Config := { base := 7 }\ndef copied := { custom with base := 20 }",
+    );
+    let good = file(
+        "theorem ok : custom.twice = 14 := by rfl\ntheorem retained : copied.twice = 14 := by rfl",
+    );
+    let bad = file("theorem wrong : copied.twice = 40 := by rfl");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":5",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+    }
+}
+
+#[test]
+fn installed_binary_checks_constructor_matches_and_refuses_an_invalid_unused_branch() {
+    let prefix = file(
+        "inductive Item (A : Type) where | none | some (value : A)\n\
+         def get (item : Item Nat) : Nat := match item with | .none => 0 | .some n => n\n\
+         def predecessor (n : Nat) : Nat := match n with | .zero => 0 | .succ k => k",
+    );
+    let good = file(
+        "theorem payload : get (Item.some 12) = 12 := by rfl\ntheorem pred : predecessor 6 = 5 := by rfl",
+    );
+    let bad = file("def invalid : Nat := match true with | true => 0 | false => (0 : String)");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":5",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("kernel-rejection"));
+        }
+    }
+}
+
+#[test]
+fn installed_binary_checks_recursive_functions_and_never_publishes_a_bad_suffix() {
+    let prefix = file(
+        "def sumAcc (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => sumAcc k (acc + n)\ndef add (n : Nat) (m : Nat) : Nat := match n with | .zero => m | .succ k => let smaller := add k; smaller (m + 1)",
+    );
+    let good =
+        file("theorem sum_ok : sumAcc 4 7 = 17 := by rfl\ntheorem add_ok : add 3 5 = 8 := by rfl");
+    let bad = file(
+        "def loop (n : Nat) (acc : Nat) : Nat := match n with | .zero => acc | .succ k => let unused := loop n acc; 0",
+    );
+    let false_proof = file("theorem bad_sum : sumAcc 4 7 = 18 := by rfl");
+    for (suffix, success) in [
+        (&good, true),
+        (&bad, false),
+        (&false_proof, false),
+        (&good, true),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":4",
+                "\"theorems\":2",
+                "\"files\":2",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn installed_binary_uses_recursive_computed_types_without_guessing_stuck_majors() {
+    let prefix = file(
+        "def Tower (n : Nat) : Type := match n with | .zero => Nat | .succ k => Tower k -> Tower k",
+    );
+    let good = file("def identity : Tower 1 := fun x => x\ntheorem ok : identity 9 = 9 := by rfl");
+    let bad = file("def ambiguous (n : Nat) : Tower n := fun x => x");
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in ["\"commands\":3", "\"theorems\":1", "\"executed\":false"] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}

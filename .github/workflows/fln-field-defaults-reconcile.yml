@@ -1,0 +1,161 @@
+name: Reconcile checked field defaults
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/field_defaults_reconcile.patch
+      - .github/workflows/fln-field-defaults-reconcile.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-field-defaults-reconcile
+  cancel-in-progress: false
+jobs:
+  defaults:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install the configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/defaults-reconciliation
+          git rev-parse HEAD > target/defaults-reconciliation/input-commit.txt
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv > target/defaults-reconciliation/compiler.txt
+      - name: Measure the pre-existing staged inductive-source failures
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          CARGO_TARGET_DIR="$RUNNER_TEMP/defaults-baseline-target" cargo test --locked -p fln --test source_inductive --no-fail-fast > target/defaults-reconciliation/baseline.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > target/defaults-reconciliation/baseline.exit
+          cat target/defaults-reconciliation/baseline.log
+          python3 - <<'PY'
+          import pathlib,re,json
+          root=pathlib.Path('target/defaults-reconciliation')
+          text=(root/'baseline.log').read_text()
+          known=sorted(['constructor_collision_and_late_failure_leave_the_base_snapshot_unchanged','source_dependent_constructor_fields_infer_the_required_universe','source_direct_recursion_reaches_regenerated_induction_rules','source_enumerations_and_payload_variants_are_usable_by_later_commands','source_uniform_parameters_and_result_annotations_are_preserved'])
+          observed=sorted(re.findall(r'^test (.+) \.\.\. FAILED$',text,re.M))
+          assert int((root/'baseline.exit').read_text())==101
+          assert observed==known, 'baseline changed; reconcile before publication'
+          assert '1 passed; 5 failed; 0 ignored' in text
+          assert not re.search(r'error\[E\d+\]',text)
+          (root/'baseline-failures.json').write_text(json.dumps(known,indent=2)+'\n')
+          PY
+      - name: Apply only the exact reviewed source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib,hashlib,subprocess,json
+          root=pathlib.Path('target/defaults-reconciliation')
+          patch=pathlib.Path('scripts/field_defaults_reconcile.patch').read_bytes()
+          assert hashlib.sha256(patch).hexdigest()=='2dba9357112ae34213f8d7db089f4cf20c6d4bcb52358f0a2ece84ec94c9a3b5'
+          expected={
+          'crates/fln-cli/tests/source_check.rs':'3c570f63df0a309f9ac73d859f88cdf37d51b75d2c32c1277bbb65534e0040f4',
+          'crates/fln-elab/src/instances.rs':'e8e15985e5ed7c6ef7add7f381c4a2950967ace19cbd38b1cf71d573db7529f0',
+          'crates/fln-elab/src/records.rs':'5eeffb5c3846ba1388c9520fb5234ce10ed17d8408fa9e50bf5051f3adb84dd8',
+          'crates/fln-elab/src/records/defaults.rs':'11c882eebe7e60df85e82e45cd9cfc7f77d5b6a34dd67b59884a5088aa6a7111',
+          'crates/fln-elab/src/source/record.rs':'e3165075558bed0e88d49abce75980977f3b6f9e26bc0f19b88c17d570f60f93',
+          'crates/fln-elab/src/source/record_terms.rs':'4e8a47c792be446a964ca28403cdda1d5f6aef35eeda2ea8e45ad73b30e97e76',
+          'crates/fln-parse/src/records.rs':'6d21e8a35b834e2fadbea95bf4e1327f440dd372bd4bdc29dbd94f0f3d141e1d',
+          'crates/fln/src/source_records.rs':'7eaa588119ccecb2429d9327133ef3c352558910d7c0247081ff5f1bb1b69d7f',
+          'crates/fln/tests/source_record_defaults.rs':'0dafff45d22611138bda089448b52aa43d3350225a2e06566b7299080f3efc2b',
+          'docs/NATIVE_RECORDS.md':'78ddc016ba999bfde59b612d787a01fed8fdd82830f89da7a570da4736fc28c9',
+          'examples/native_record_defaults.lean':'5951de827cc722f614a884748fd77a942fd0146ad089593e5ad5ea91af4b5917'}
+          paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
+          assert sorted(paths)==sorted(expected)
+          assert '+++ /dev/null' not in patch.decode().splitlines()
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          for path,digest in expected.items():
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==digest, path+' changed; do not overwrite concurrent work'
+          (root/'source-digests.json').write_text(json.dumps(expected,indent=2)+'\n')
+          (root/'implementation.patch').write_bytes(patch)
+          PY
+      - name: Execute all five affected package suites and compare the baseline
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target/defaults-implementation
+        run: |
+          set -uo pipefail
+          set +e
+          cargo test --locked -p fln-elab -p fln-parse -p fln -p fln-cli -p fln-checker --no-fail-fast > target/defaults-reconciliation/tests.log 2>&1
+          printf '%s\n' "$?" > target/defaults-reconciliation/tests.exit
+          cat target/defaults-reconciliation/tests.log
+          python3 - <<'PY'
+          import pathlib,re,json
+          root=pathlib.Path('target/defaults-reconciliation')
+          text=(root/'tests.log').read_text()
+          known=json.loads((root/'baseline-failures.json').read_text())
+          observed=sorted(re.findall(r'^test (.+) \.\.\. FAILED$',text,re.M))
+          assert observed==known, 'new test failures prevent publication'
+          assert int((root/'tests.exit').read_text())==101
+          assert re.findall(r'error: test failed, to rerun pass `(.*?)`',text)==['-p fln --test source_inductive']
+          assert not re.search(r'error\[E\d+\]',text)
+          summaries=re.findall(r'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored',text)
+          totals=[sum(int(row[i]) for row in summaries) for i in range(3)]
+          assert totals[0]>=1305 and totals[1:]==[5,0], totals
+          for name in ['admission_root_includes_the_default_registration_and_helpers','invalid_defaults_are_rejected_even_when_never_used','installed_binary_checks_defaults_updates_and_late_failure_without_partial_success','default_bodies_preserve_crlf_comments_nested_literals_and_method_bindings']:
+              assert re.search(r'^test (?:[^\n]*::)?'+name+r' \.\.\. ok$',text,re.M), name
+          report={'scope':'five affected packages; not whole-workspace tests','passed':totals[0],'failed':totals[1],'ignored':totals[2],'baseline_failures':known,'new_failures':[],'full_test_gate_passed':False}
+          (root/'test-summary.json').write_text(json.dumps(report,indent=2)+'\n')
+          print(json.dumps(report,indent=2))
+          PY
+      - name: Verify the new feature, lint, formatting, workspace and actual CLI
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target/defaults-implementation
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --test source_record_defaults --no-fail-fast 2>&1 | tee target/defaults-reconciliation/feature-tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli -p fln-checker --all-targets -- -D warnings 2>&1 | tee target/defaults-reconciliation/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/defaults-reconciliation/workspace.log
+          python3 - <<'PY'
+          import pathlib,json,subprocess
+          paths=json.loads(pathlib.Path('target/defaults-reconciliation/source-digests.json').read_text())
+          for path in paths:
+              if path.endswith('.rs'):
+                  subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',path],check=True)
+          PY
+          cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_record_defaults.lean > target/defaults-reconciliation/example.json
+          python3 - <<'PY'
+          import json,pathlib
+          result=json.loads(pathlib.Path('target/defaults-reconciliation/example.json').read_text())
+          assert result['outcome']=='complete' and result['authority'] is True
+          assert result['commands']==12 and result['theorems']==5 and result['executed'] is False
+          PY
+          git diff --check
+      - name: Publish only tested source changes by a non-forced fast-forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib,json,hashlib,subprocess
+          root=pathlib.Path('target/defaults-reconciliation')
+          expected=json.loads((root/'source-digests.json').read_text())
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          untracked=set(subprocess.check_output(['git','ls-files','--others','--exclude-standard'],text=True).splitlines())
+          assert changed|untracked==set(expected), 'unexpected checkout changes'
+          for path,digest in expected.items():
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==digest
+          subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+          subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+          subprocess.run(['git','add','--',*expected],check=True)
+          (root/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary','--full-index']))
+          message='feat(elab): admit checked field defaults and preserve dependent record update values\n\nReconcile defaults against current main without replacing the shared ADT\nstaging manifest. Defaults are ordinary checked helpers registered only\nafter complete record admission. Preserve actual parameters, earlier\nvalues, instance dictionaries, and update-source precedence.\n\nObserved: 12 defaults tests, installed CLI example and regressions, scoped\nClippy, formatting and workspace compilation passed. Five-package tests\nretain exactly the five source_inductive failures independently observed\nbefore applying this patch; this is no-regression evidence, not a full\ntest-gate pass. Full logs and baseline comparison are retained by Actions.'
+          subprocess.run(['git','commit','-m',message],check=True)
+          subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          (root/'published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: field-defaults-reconciled-${{ github.sha }}
+          path: target/defaults-reconciliation
+          retention-days: 7

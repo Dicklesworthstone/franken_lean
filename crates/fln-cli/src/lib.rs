@@ -13796,9 +13796,13 @@ mod tests {
         assert!(robot.stdout.contains("\"schema\":\"fln.audit-tcb/1\""));
         assert!(robot.stdout.contains("\"modules\":1"));
         assert!(
-            robot.stdout.contains("\"name\":\"Nat\""),
-            "the seed Nat axiom must appear in the inventory: {}",
+            robot.stdout.contains("\"name\":\"Nat.add\""),
+            "the remaining primitive addition axiom must appear in the inventory: {}",
             robot.stdout
+        );
+        assert!(
+            !robot.stdout.contains("\"name\":\"Nat\""),
+            "the checked Nat inductive must not be inventoried as an axiom"
         );
         assert!(!robot.stdout.contains("\"unsafe\":true"));
 
@@ -13809,7 +13813,8 @@ mod tests {
         ]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stdout.contains("trust surface inventory: complete"));
-        assert!(human.stdout.contains("axiom Nat"));
+        assert!(human.stdout.contains("axiom Nat.add"));
+        assert!(!human.stdout.lines().any(|line| line.trim() == "axiom Nat"));
         assert!(human.stdout.contains("scope: decoded declarations only"));
 
         let missing_flag = run([
@@ -13835,8 +13840,8 @@ mod tests {
         assert!(robot.stdout.contains("\"target\":\"answer\""));
         assert!(robot.stdout.contains("\"kind\":\"definition\""));
         assert!(
-            robot.stdout.contains("\"axioms\":[\"Nat\",\"Nat.add\"]"),
-            "answer's trust closure must reach the seed Nat axioms: {}",
+            robot.stdout.contains("\"axioms\":[\"Nat.add\"]"),
+            "the trust closure must reach addition without inventing a Nat axiom: {}",
             robot.stdout
         );
         assert!(robot.stdout.contains("\"truncated\":false"));
@@ -13848,7 +13853,7 @@ mod tests {
         ]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stdout.contains("why-trusts: answer"));
-        assert!(human.stdout.contains("axioms: Nat, Nat.add"));
+        assert!(human.stdout.contains("axioms: Nat.add\n"));
         assert!(human.stdout.contains(
             "recursor rules, instance selections, and rewrite provenance are not traversed"
         ));

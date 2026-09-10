@@ -69,7 +69,7 @@ def parser(text):
         for value, pos, _ in lex(body[:target]):
             if value == 'if' and depth == 0:
                 anchor = pos
-            depth += (value == '{') - (value == '}')
+            depth += (value in ('{', '(', '[')) - (value in ('}', ')', ']'))
         if anchor is None:
             raise RuntimeError('Record dispatch is not a top-level conditional')
         line = body.rfind('\n', 0, anchor) + 1
@@ -151,6 +151,12 @@ def main():
     edit('crates/fln-parse/src/records.rs', records)
     edit('crates/fln-elab/src/source.rs', elaborator)
     edit('crates/fln/src/source_records.rs', engine)
+    edit('crates/fln/src/source_check.rs', lambda text: once(
+        text,
+        '            | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)',
+        '            | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)\n'
+        '            | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)',
+    ))
     output = ROOT / 'target' / 'source-inductive-integration'
     output.mkdir(parents=True, exist_ok=True)
     paths = CHANGED + ['crates/fln-parse/src/inductive.rs',

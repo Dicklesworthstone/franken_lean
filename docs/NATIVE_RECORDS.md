@@ -55,8 +55,8 @@ unsupported syntax are refused. Resource stops remain distinct from rejection.
 
 Current scope: simple named fields, typed method arguments, empty records,
 nonrecursive Type-valued records, and named class/instance declarations. Source
-inheritance, custom constructor names, grouped fields, field defaults, deriving,
-explicit universe-polymorphic headers, record updates, field defaults, numeric
+inheritance, custom constructor names, grouped fields, deriving,
+explicit universe-polymorphic headers, numeric
 projections and general extended field notation remain outside this increment. Core `RecordSpec` generation supports universe
 parameters separately; this is not evidence for full source-level universe or
 Reference record elaboration parity. Built-in-name checker specializations may
@@ -85,8 +85,8 @@ Values are elaborated in constructor-field order, even when written in a differe
 order, so each dependent field receives the actual earlier values in its expected
 type. Nested literals, method lambdas, proof terms, punned fields (`{ value }`),
 empty records and a trailing comma are supported. Either `{ value := 7 : Box Nat }`
-or `({ value := 7 } : Box Nat)` supplies an explicit type. Every field must be
-present exactly once; unknown, duplicate, missing, ill-typed or unresolved fields
+or `({ value := 7 } : Box Nat)` supplies an explicit type. Fields without registered defaults must be
+present exactly once; unknown, duplicate, missing required, ill-typed or unresolved fields
 are refused. No record type is guessed from field labels.
 
 Field access supports both `receiver.field` and `(expression).field`, including
@@ -122,8 +122,7 @@ the supported top-level let chain retains its local dictionaries.
 This bounded field notation selects actual named fields of admitted single-
 constructor records. It does not search arbitrary namespace functions, base
 structures or numeric fields. Literal fields currently require comma separators;
-record updates, omitted defaults and inheritance remain explicit unsupported
-cases. Parsing and elaboration use heap worklists, including nested literals and
+inheritance and omitted required fields remain explicit unsupported cases. Parsing and elaboration use heap worklists, including nested literals and
 parenthesized type ascriptions.
 
 `examples/native_record_values.lean` exercises dependent fields and explicit versus
@@ -158,3 +157,54 @@ mutual, nested and higher-order recursive families, Prop-valued families,
 deriving and explicit universe syntax such as `Type 1` remain outside this
 bounded source surface. `source_inductive` and the installed CLI tests cover
 usable constructors, recursor computation, refusal and recovery.
+
+## Checked field defaults
+
+A typed field or method can provide `:= value`. Defaults elaborate in the real
+context of the record parameters, earlier fields and that method's arguments:
+
+```lean
+structure Config where
+  base : Nat := 3
+  twice : Nat := base + base
+  transform (x : Nat) : Nat := x + twice
+
+def standard : Config := {}
+def custom : Config := { base := 7 }
+def copied := { custom with base := 20 }
+
+theorem standard_ok : standard.twice = 6 := by rfl
+theorem custom_ok : custom.twice = 14 := by rfl
+theorem copied_ok : copied.twice = 14 := by rfl
+```
+
+Explicit fields take precedence, then ordered update sources, then registered
+defaults. Each default receives the actual preceding values, not their original
+default expressions. Updates therefore preserve copied fields and do not
+recompute them when an earlier field changes. Dependent types, function fields,
+nested record literals, local lets, and class instance parameters use the same
+elaborator as ordinary source terms. Class dictionaries can be built from `{}`
+when every field has a default.
+
+The elaborator emits ordinary safe helper definitions named
+`Record.field._default`, closed over the parameters and preceding fields. Every
+helper passes K1 and the independent checker as part of the complete record
+batch, even when a later literal would override its field. A native versioned
+journal registers references only after the full batch succeeds; registration
+validates each helper against the constructor field's complete telescope. The
+successor logical root includes this journal. A similarly named definition with
+no registration is never selected as a default. Malformed metadata, signature
+mismatches, duplicate registrations, and resource exhaustion are visible failures.
+There is no separate default-value admission authority.
+
+Defaults must type-check for the declared preceding fields: a proof default
+cannot assume that an overridable preceding value equals its default expression.
+Forward references, implicit field-type inference, inheritance and field-level
+`tactic` defaults remain outside this bounded increment. This native journal is
+not Reference `.olean` structure-extension parity.
+
+Run `fln check-source --json examples/native_record_defaults.lean` to exercise the
+checked example. Regressions live in `fln::source_record_defaults`, the parser's
+record tests, the default registry's malformed-input tests, and the installed
+CLI `source_check` tests. These are scoped execution checks, not a full Lean
+compatibility claim.

@@ -6,8 +6,8 @@
 //! beta, let-zeta, supplied let-bound free unfolding, and explicit-constructor
 //! projection — plus recursor reduction: iota (KR-316) with the K-flagged
 //! corner (KR-317, `to_cnstr_when_K`). Unsafe and partial definitions stay
-//! stuck. Native extensions and numeric/string literal majors remain outside
-//! this layer.
+//! stuck. Nat literal majors are exposed one constructor layer at a time;
+//! string literal majors and native extensions remain outside this layer.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -295,6 +295,9 @@ pub enum WhnfFault {
     StringExpansion {
         at: usize,
         fault: StringExpansionFault,
+    },
+    NonCanonicalNatLiteral {
+        at: usize,
     },
 }
 
@@ -1343,14 +1346,136 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }))
     }
 
+    /// Expose one layer of an admitted Nat constructor for a literal major.
+    /// Never build a unary numeral: successor fields remain compact literals.
+    /// The family and constructors must be present with the expected metadata;
+    /// a same-shaped recursor for another family cannot consume a Nat literal.
+    fn nat_literal_constructor(
+        &mut self,
+        metadata: &RecursorDeclaration,
+        major: &Cursor,
+    ) -> Result<Option<(WireName, VecDeque<Cursor>)>, Halt> {
+        let ExprNode::NatLiteral { limbs_le } = self.node(major)? else {
+            return Ok(None);
+        };
+        let nat = WireName::from_parts(vec![NamePart::Text("Nat".to_owned())]);
+        let zero = WireName::from_parts(vec![
+            NamePart::Text("Nat".to_owned()),
+            NamePart::Text("zero".to_owned()),
+        ]);
+        let succ = WireName::from_parts(vec![
+            NamePart::Text("Nat".to_owned()),
+            NamePart::Text("succ".to_owned()),
+        ]);
+        if metadata.mutual() != std::slice::from_ref(&nat)
+            || metadata.num_parameters() != 0
+            || metadata.num_indices() != 0
+            || metadata.num_motives() != 1
+            || metadata.num_minors() != 2
+            || metadata.k()
+        {
+            return Ok(None);
+        }
+        let constants = self.context.source.constants();
+        let Some(entry) = constants.find(&nat) else {
+            return Ok(None);
+        };
+        let Some(family) = entry.inductive_metadata() else {
+            return Ok(None);
+        };
+        if entry.safety() != crate::environment::ConstantSafety::Safe
+            || !entry.level_parameters().is_empty()
+            || family.num_parameters() != 0
+            || family.num_indices() != 0
+            || family.constructors() != [zero.clone(), succ.clone()]
+            || family.mutual() != std::slice::from_ref(&nat)
+        {
+            return Ok(None);
+        }
+        for (index, name) in [&zero, &succ].into_iter().enumerate() {
+            let Some(entry) = constants.find(name) else {
+                return Ok(None);
+            };
+            let Some(constructor) = entry.constructor_metadata() else {
+                return Ok(None);
+            };
+            if entry.safety() != crate::environment::ConstantSafety::Safe
+                || !entry.level_parameters().is_empty()
+                || constructor.inductive() != &nat
+                || constructor.index() != index as u32
+                || constructor.num_parameters() != 0
+                || constructor.num_fields() != index as u32
+            {
+                return Ok(None);
+            }
+        }
+        if limbs_le.last() == Some(&0) {
+            return Err(Halt::Fault(WhnfFault::NonCanonicalNatLiteral {
+                at: major.root.index(),
+            }));
+        }
+        if limbs_le.is_empty() {
+            return Ok(Some((zero, VecDeque::new())));
+        }
+        let mut composer = Composer::new(
+            self.control.budget.materialization,
+            WhnfPhase::Iota,
+            self.control.steps,
+            self.control.reductions,
+            &mut *self.cancelled,
+        );
+        // Admit the largest output before allocating its limb storage.
+        composer
+            .control
+            .output(
+                1_u64.saturating_add(usize_units(limbs_le.len())),
+                major.root.index(),
+            )
+            .map_err(|halt| composer.map_halt(halt))?;
+        composer
+            .control
+            .admit_arena_node(1, major.root.index())
+            .map_err(|halt| composer.map_halt(halt))?;
+        let mut predecessor = Vec::with_capacity(limbs_le.len());
+        let mut borrow = true;
+        for limb in limbs_le {
+            composer
+                .control
+                .step(major.root.index())
+                .map_err(|halt| composer.map_halt(halt))?;
+            let (value, next) = limb.overflowing_sub(u64::from(borrow));
+            predecessor.push(value);
+            borrow = next;
+        }
+        if predecessor.last() == Some(&0) {
+            predecessor.pop();
+        }
+        let root = composer
+            .push_expression_charged(
+                ExprNode::NatLiteral {
+                    limbs_le: predecessor,
+                },
+                major.root.index(),
+            )
+            .map_err(|halt| composer.map_halt(halt))?;
+        let term = composer.finish(root);
+        Ok(Some((
+            succ,
+            VecDeque::from([Cursor {
+                root,
+                arena: Arc::new(term),
+            }]),
+        )))
+    }
+
     /// KR-316 (`inductive_reduce_rec`, inductive.h:76): a recursor application
     /// fires when its major premise reduces to a constructor of the recursor's
     /// inductive. The matching rule's right-hand side is instantiated with the
     /// recursor's levels and applied to the spine's parameters, motives, and
     /// minor premises (the indices are consumed by the motive, never applied
     /// to the rule), then the constructor's fields, then the trailing
-    /// arguments. Nat/String literal majors and structure-eta coercion remain
-    /// outside this layer for now.
+    /// arguments. Nat literal majors expose one compact constructor layer;
+    /// String literal majors and structure-eta coercion remain unsupported.
     #[allow(clippy::too_many_arguments)]
     fn finish_recursor_reduction(
         &mut self,
@@ -1364,11 +1489,16 @@ impl<'a, 'c> Reducer<'a, 'c> {
         prefix: usize,
     ) -> Result<Option<Cursor>, Halt> {
         let reduced_major = self.whnf_recursor_major(major)?;
-        let (major_head, major_args) = self.peel_application(&reduced_major)?;
-        let constructor_name = match self.node(&major_head)? {
-            ExprNode::Constant { name, .. } => name.clone(),
-            _ => return Ok(None),
-        };
+        let (constructor_name, major_args) =
+            if let Some(parts) = self.nat_literal_constructor(metadata, &reduced_major)? {
+                parts
+            } else {
+                let (major_head, major_args) = self.peel_application(&reduced_major)?;
+                let ExprNode::Constant { name, .. } = self.node(&major_head)? else {
+                    return Ok(None);
+                };
+                (name.clone(), major_args)
+            };
         let Some(rule) = metadata
             .rules()
             .iter()

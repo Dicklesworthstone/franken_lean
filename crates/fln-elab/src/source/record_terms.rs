@@ -48,6 +48,8 @@ pub(super) struct RecordBuild<'a> {
     sources: Vec<Typed>,
     source_bindings: Vec<LocalDecl>,
     saved_lctx: LocalContext,
+    defaults: Vec<Option<Name>>,
+    levels: Vec<Level>,
 }
 pub(super) enum RecordStep<'a> {
     Field {
@@ -417,6 +419,12 @@ impl Context {
                 return Err(error(RecordTermError::UnknownField(label.clone())));
             }
         }
+        let registry = crate::records::defaults::RecordDefaults::read(&self.txn.env)
+            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+        let defaults = (0..ctor.num_fields)
+            .map(|field| registry.helper(name, field).cloned())
+            .collect();
+        let levels = levels.clone();
         // Bind update sources exactly once. Even an unused source remains a
         // checked let value, so an ill-typed update source cannot disappear.
         let saved_lctx = self.txn.lctx.clone();
@@ -471,6 +479,8 @@ impl Context {
             sources: bound_sources,
             source_bindings,
             saved_lctx,
+            defaults,
+            levels,
         })
     }
 
@@ -538,6 +548,48 @@ impl Context {
                     ))) => {}
                     Err(error) => return Err(error),
                 }
+            }
+            let index = state
+                .defaults
+                .len()
+                .checked_sub(state.remaining as usize)
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            if let Some(helper) = &state.defaults[index] {
+                let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(helper).cloned()
+                else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                let mut value = Typed {
+                    value: Expr::const_(helper.clone(), state.levels.clone()),
+                    type_: self.instantiate_params(
+                        &definition.base.type_,
+                        &definition.base.level_params,
+                        &state.levels,
+                    )?,
+                };
+                // Explicitly supply the actual parameters and preceding values,
+                // including instance parameters. Never re-search a dictionary.
+                let mut arguments = Vec::new();
+                let mut head = &state.constructor.value;
+                while let ExprNode::App { f, a } = head.node() {
+                    self.tick()?;
+                    arguments.push(a.clone());
+                    head = f;
+                }
+                for argument in arguments.into_iter().rev() {
+                    self.tick()?;
+                    let type_ = self.whnf(&value.type_)?;
+                    let ExprNode::ForallE { body, .. } = type_.node() else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    value.type_ = self.substitute(body, &argument)?;
+                    value.value = Expr::app(value.value, argument);
+                }
+                let value = self.finish_term(value, Some(binder_type))?;
+                return Ok(RecordStep::Copy {
+                    value,
+                    codomain: body.clone(),
+                });
             }
             return Err(error(RecordTermError::MissingField(binder_name.clone())));
         };

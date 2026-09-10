@@ -267,7 +267,7 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], InstanceRegistry
     *bytes = tail;
     Ok(head)
 }
-fn write_name(name: &Name, out: &mut Vec<u8>) -> Result<(), InstanceRegistryError> {
+pub(crate) fn write_name(name: &Name, out: &mut Vec<u8>) -> Result<(), InstanceRegistryError> {
     let mut parts = Vec::new();
     let mut cursor = name.clone();
     while !cursor.is_anonymous() {
@@ -311,7 +311,7 @@ fn write_name(name: &Name, out: &mut Vec<u8>) -> Result<(), InstanceRegistryErro
     }
     Ok(())
 }
-fn read_name(bytes: &mut &[u8]) -> Result<Name, InstanceRegistryError> {
+pub(crate) fn read_name(bytes: &mut &[u8]) -> Result<Name, InstanceRegistryError> {
     let count = usize::from(u16::from_le_bytes(
         take(bytes, 2)?
             .try_into()
