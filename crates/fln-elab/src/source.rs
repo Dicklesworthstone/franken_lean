@@ -514,6 +514,8 @@ impl Context {
             Apply(Typed, &'a [Syntax], Option<Expr>),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
             Arrow(Option<Expr>),
+            ForallDomain(&'a [Syntax], &'a Syntax, Option<Expr>),
+            ForallBody(LocalContext, Vec<LocalDecl>, Level, Option<Expr>),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
@@ -539,6 +541,23 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "forall"]) {
+                            let parts = expect_node(syntax, kind, 5, "universal quantifier")?;
+                            if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "forall" || val == "∀")
+                            {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            let names = expect_null_args(&parts[1], "quantified names")?;
+                            if names.is_empty() {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            let annotation = optional_type_syntax(&parts[2])?
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            expect_atom(&parts[3], ",", "quantifier separator")?;
+                            tasks.push(Task::ForallDomain(names, &parts[4], expected));
+                            tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "match"]) {
                             let parts = self.match_parts(syntax)?;
                             let discriminant = parts.discriminant;
@@ -963,6 +982,58 @@ impl Context {
                         function.value = Expr::app(function.value, argument.value);
                     }
                     values.push(self.finish_term(function, expected.as_ref())?);
+                }
+                Task::ForallDomain(names, body, expected) => {
+                    let domain = values.pop().expect("quantifier domain visit");
+                    let universe = self.sort_level(&domain)?;
+                    let saved = self.txn.lctx.clone();
+                    let mut locals = Vec::new();
+                    for name in names {
+                        self.tick()?;
+                        let Syntax::Ident { val, .. } = name else {
+                            return Err(failure(SourceInferenceError::Scope));
+                        };
+                        if val.is_anonymous() {
+                            return Err(failure(SourceInferenceError::Scope));
+                        }
+                        let id = FVarId(self.fresh_name()?);
+                        self.txn.lctx.add_param(
+                            id.clone(),
+                            val.clone(),
+                            domain.value.clone(),
+                            BinderInfo::Default,
+                        );
+                        locals.push(self.txn.lctx.find(&id).expect("quantified local").clone());
+                    }
+                    tasks.push(Task::ForallBody(saved, locals, universe, expected));
+                    tasks.push(Task::Visit(body, Some(self.type_expected()?), true));
+                }
+                Task::ForallBody(saved, locals, domain_universe, expected) => {
+                    let body = values.pop().expect("quantifier body visit");
+                    let mut universe = self.sort_level(&body)?;
+                    let mut value = body.value;
+                    for local in locals.iter().rev() {
+                        self.tick()?;
+                        value = value
+                            .abstract_fvar(&local.id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?;
+                        value = Expr::forall_e(
+                            local.user_name.clone(),
+                            local.type_.clone(),
+                            value,
+                            local.binder_info,
+                        );
+                        universe = Level::imax(domain_universe.clone(), universe)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    }
+                    self.txn.lctx = saved;
+                    values.push(self.finish_term(
+                        Typed {
+                            value,
+                            type_: Expr::sort(universe),
+                        },
+                        expected.as_ref(),
+                    )?);
                 }
                 Task::Arrow(expected) => {
                     let right = values.pop().expect("arrow codomain visit");

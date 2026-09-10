@@ -824,3 +824,33 @@ fn failed_generic_collection_proofs_do_not_publish_a_multi_file_prefix() {
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_indexed_declarations_and_refuses_wrong_lengths() {
+    let prefix = file(include_str!("../../../examples/native_indexed.lean"));
+    let bad = file("def wrong : Vec Nat 0 := two");
+    for success in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !success {
+            command.arg(&bad);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for required in ["\"commands\":8", "\"theorems\":3", "\"executed\":false"] {
+                assert!(json.contains(required), "{json}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}

@@ -118,10 +118,12 @@ pub fn nat_inductive_seed_declaration() -> Declaration {
             name: name.clone(),
             level_params: Vec::new(),
             parameters: Vec::new(),
+            indices: Vec::new(),
             constructors: vec![
                 ConstructorSpec {
                     name: Name::from_components(["zero"]),
                     fields: Vec::new(),
+                    result_indices: Vec::new(),
                 },
                 ConstructorSpec {
                     name: Name::from_components(["succ"]),
@@ -133,6 +135,7 @@ pub fn nat_inductive_seed_declaration() -> Declaration {
                         binder_info: BinderInfo::Default,
                         index: 0,
                     }],
+                    result_indices: Vec::new(),
                 },
             ],
             result_level: Level::one(),

@@ -37,6 +37,7 @@ fn spec(s: &str, constructors: Vec<ConstructorSpec>) -> InductiveSpec {
     InductiveSpec {
         name: name(s),
         parameters: vec![],
+        indices: vec![],
         level_params: vec![],
         constructors,
         result_level: Level::one(),
@@ -46,6 +47,7 @@ fn ctor(s: &str, fields: Vec<LocalDecl>) -> ConstructorSpec {
     ConstructorSpec {
         name: name(s),
         fields,
+        result_indices: vec![],
     }
 }
 fn admit(spec: &InductiveSpec) -> Engine {

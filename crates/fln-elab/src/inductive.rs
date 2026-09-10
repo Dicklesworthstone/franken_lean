@@ -1,4 +1,4 @@
-//! Candidate construction for a single, non-indexed algebraic data type.
+//! Candidate construction for a single algebraic or indexed data family.
 //!
 //! Both checking engines must validate the block. This generator handles
 //! dependent constructor fields and direct uniform recursive fields; it never
@@ -18,6 +18,8 @@ pub struct ConstructorSpec {
     pub name: Name,
     /// Domains may read parameters and preceding fields of this constructor.
     pub fields: Vec<LocalDecl>,
+    /// Constructor result indices, scoped over parameters and its own fields.
+    pub result_indices: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,8 @@ pub struct InductiveSpec {
     pub name: Name,
     pub level_params: Vec<Name>,
     pub parameters: Vec<LocalDecl>,
+    /// The family index telescope, scoped over parameters and earlier indices.
+    pub indices: Vec<LocalDecl>,
     pub constructors: Vec<ConstructorSpec>,
     pub result_level: Level,
 }
@@ -72,6 +76,45 @@ fn append_ih(name: &Name) -> Name {
     }
 }
 
+/// A direct recursive occurrence may change indices, but not parameters or
+/// universes. Index terms themselves must not mention the family.
+fn recursive_indices(
+    builder: &mut Builder,
+    domain: &Expr,
+    spec: &InductiveSpec,
+    levels: &[Level],
+    allowed: &HashSet<FVarId>,
+) -> Result<Option<Vec<Expr>>, InductiveError> {
+    let mut head = domain;
+    let mut args = Vec::new();
+    loop {
+        builder.tick()?;
+        match head.node() {
+            ExprNode::MData { expr, .. } => head = expr,
+            ExprNode::App { f, a } => {
+                args.push(a.clone());
+                head = f;
+            }
+            _ => break,
+        }
+    }
+    args.reverse();
+    if !matches!(head.node(), ExprNode::Const { name, levels: us } if name == &spec.name && us == levels)
+        || args.len() != spec.parameters.len() + spec.indices.len()
+        || args
+            .iter()
+            .zip(&spec.parameters)
+            .any(|(arg, param)| *arg != fv(param))
+    {
+        return Ok(None);
+    }
+    let indices = args[spec.parameters.len()..].to_vec();
+    for index in &indices {
+        builder.scan(index, allowed, &spec.name)?;
+    }
+    Ok(Some(indices))
+}
+
 /// Construct a proposed family, constructors and its dependent recursor. The
 /// result is untrusted; kernel regeneration and the independent veto still run.
 pub fn inductive_declaration(
@@ -84,10 +127,14 @@ pub fn inductive_declaration(
     let count = spec
         .constructors
         .iter()
-        .try_fold(spec.parameters.len(), |sum, ctor| {
-            sum.checked_add(ctor.fields.len())
-                .and_then(|n| n.checked_add(1))
-        })
+        .try_fold(
+            spec.parameters.len().saturating_add(spec.indices.len()),
+            |sum, ctor| {
+                sum.checked_add(ctor.fields.len())
+                    .and_then(|n| n.checked_add(ctor.result_indices.len()))
+                    .and_then(|n| n.checked_add(1))
+            },
+        )
         .ok_or(InductiveError::ResourceLimit)?;
     if count > budget.max_binders || spec.level_params.len() > budget.max_binders {
         return Err(InductiveError::ResourceLimit);
@@ -107,16 +154,25 @@ pub fn inductive_declaration(
         builder.scan(&param.type_, &used, &spec.name)?;
         used.insert(param.id.clone());
     }
+    for index in &spec.indices {
+        builder.tick()?;
+        if index.is_let() || used.contains(&index.id) {
+            return Err(InductiveError::InvalidTelescope);
+        }
+        builder.scan(&index.type_, &used, &spec.name)?;
+        used.insert(index.id.clone());
+    }
     let levels: Vec<_> = spec
         .level_params
         .iter()
         .cloned()
         .map(Level::param)
         .collect();
-    let family = app(
+    let family_prefix = app(
         Expr::const_(spec.name.clone(), levels.clone()),
         spec.parameters.iter().map(fv),
     );
+    let family = app(family_prefix.clone(), spec.indices.iter().map(fv));
     let mut names = HashSet::new();
     let mut recursive = Vec::new();
     for constructor in &spec.constructors {
@@ -137,13 +193,8 @@ pub fn inductive_declaration(
                 return Err(InductiveError::InvalidTelescope);
             }
             allowed.remove(&field.id);
-            let mut domain = &field.type_;
-            while let ExprNode::MData { expr, .. } = domain.node() {
-                builder.tick()?;
-                domain = expr;
-            }
-            let direct = domain == &family;
-            if !direct {
+            let direct = recursive_indices(&mut builder, &field.type_, spec, &levels, &allowed)?;
+            if direct.is_none() {
                 // This scan forbids every occurrence of the family. In
                 // particular negative, nested, changed-parameter and higher-
                 // order recursion never slips through as a nonrecursive field.
@@ -152,6 +203,12 @@ pub fn inductive_declaration(
             allowed.insert(field.id.clone());
             used.insert(field.id.clone());
             fields.push(direct);
+        }
+        if constructor.result_indices.len() != spec.indices.len() {
+            return Err(InductiveError::InvalidTelescope);
+        }
+        for index in &constructor.result_indices {
+            builder.scan(index, &allowed, &spec.name)?;
         }
         recursive.push(fields);
     }
@@ -169,6 +226,7 @@ pub fn inductive_declaration(
         false,
         false,
     )?;
+    let motive_type = builder.close(&spec.indices, motive_type, false, false)?;
     let motive = fresh(&mut used, "motive", motive_type, BinderInfo::Default);
     let ctor_names: Vec<_> = spec
         .constructors
@@ -185,24 +243,28 @@ pub fn inductive_declaration(
         );
         let mut ihs = Vec::new();
         for (field, direct) in ctor.fields.iter().zip(&recursive[index]) {
-            if *direct {
+            if let Some(indices) = direct {
                 let mut ih = fresh(
                     &mut used,
                     "ih",
-                    Expr::app(fv(&motive), fv(field)),
+                    Expr::app(app(fv(&motive), indices.iter().cloned()), fv(field)),
                     BinderInfo::Default,
                 );
                 ih.user_name = append_ih(&field.user_name);
                 ihs.push(ih);
             }
         }
-        let body = Expr::app(fv(&motive), constructor);
+        let body = Expr::app(
+            app(fv(&motive), ctor.result_indices.iter().cloned()),
+            constructor,
+        );
         let body = builder.close(&ihs, body, false, false)?;
         let minor_type = builder.close(&ctor.fields, body, false, false)?;
         let mut minor = fresh(&mut used, "minor", minor_type, BinderInfo::Default);
         minor.user_name = ctor.name.clone();
         minors.push(minor);
-        let type_ = builder.close(&ctor.fields, family.clone(), false, false)?;
+        let result = app(family_prefix.clone(), ctor.result_indices.iter().cloned());
+        let type_ = builder.close(&ctor.fields, result, false, false)?;
         let type_ = builder.close(&spec.parameters, type_, false, true)?;
         constructors.push(ConstructorVal {
             base: ConstantVal {
@@ -235,8 +297,9 @@ pub fn inductive_declaration(
         builder.tick()?;
         let mut rhs = app(fv(&minors[index]), ctor.fields.iter().map(fv));
         for (field, direct) in ctor.fields.iter().zip(&recursive[index]) {
-            if *direct {
-                rhs = Expr::app(rhs, Expr::app(rec_prefix.clone(), fv(field)));
+            if let Some(indices) = direct {
+                let call = app(rec_prefix.clone(), indices.iter().cloned());
+                rhs = Expr::app(rhs, Expr::app(call, fv(field)));
             }
         }
         rhs = builder.close(&ctor.fields, rhs, true, false)?;
@@ -251,10 +314,11 @@ pub fn inductive_declaration(
     }
     let rec_type = builder.close(
         std::slice::from_ref(&major),
-        Expr::app(fv(&motive), fv(&major)),
+        Expr::app(app(fv(&motive), spec.indices.iter().map(fv)), fv(&major)),
         false,
         false,
     )?;
+    let rec_type = builder.close(&spec.indices, rec_type, false, true)?;
     let rec_type = builder.close(&minors, rec_type, false, false)?;
     // With no minor premises, no later binder domain mentions the motive.
     // It stays explicit under the Reference's strict implicit inference rule.
@@ -268,24 +332,26 @@ pub fn inductive_declaration(
     let mut lparams = vec![elim];
     lparams.extend(spec.level_params.iter().cloned());
     let params = u32::try_from(spec.parameters.len()).map_err(|_| InductiveError::ResourceLimit)?;
+    let indices = u32::try_from(spec.indices.len()).map_err(|_| InductiveError::ResourceLimit)?;
+    let family_result = builder.close(
+        &spec.indices,
+        Expr::sort(spec.result_level.clone()),
+        false,
+        false,
+    )?;
     Ok(Declaration::Inductive(InductiveBlock {
         types: vec![InductiveVal {
             base: ConstantVal {
                 name: spec.name.clone(),
                 level_params: spec.level_params.clone(),
-                type_: builder.close(
-                    &spec.parameters,
-                    Expr::sort(spec.result_level.clone()),
-                    false,
-                    false,
-                )?,
+                type_: builder.close(&spec.parameters, family_result, false, false)?,
             },
             num_params: params,
-            num_indices: 0,
+            num_indices: indices,
             all: vec![spec.name.clone()],
             ctors: ctor_names,
             num_nested: 0,
-            is_rec: recursive.iter().flatten().any(|x| *x),
+            is_rec: recursive.iter().flatten().any(Option::is_some),
             is_unsafe: false,
             is_reflexive: false,
         }],
@@ -298,7 +364,7 @@ pub fn inductive_declaration(
             },
             all: vec![spec.name.clone()],
             num_params: params,
-            num_indices: 0,
+            num_indices: indices,
             num_motives: 1,
             num_minors: u32::try_from(minors.len()).map_err(|_| InductiveError::ResourceLimit)?,
             rules,

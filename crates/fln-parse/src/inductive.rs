@@ -1,5 +1,6 @@
 //! Native single-family inductive syntax, retaining every original token leaf.
-//! Unsupported indices, mutual blocks and deriving are not dropped or repaired.
+//! Index telescopes and constructor results are retained; unsupported mutual
+//! blocks and deriving are not dropped or repaired.
 use super::*;
 use std::ops::Range;
 

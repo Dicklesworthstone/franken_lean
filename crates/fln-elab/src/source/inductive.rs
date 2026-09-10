@@ -145,10 +145,41 @@ pub fn elaborate_inductive(
     if parameters.iter().any(|p| &p.user_name == name) {
         return Err(invalid());
     }
+    let parameter_context = context.txn.lctx.clone();
+    let mut indices = Vec::new();
     let explicit = if let Some(annotation) = optional_type_syntax(&sig[1])? {
         let value = context.type_term(annotation)?;
         let value = checked_type(&mut context, value, budget)?;
-        let value = context.whnf(&value)?;
+        let mut value = context.whnf(&value)?;
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = value.node()
+        {
+            context.tick()?;
+            if parameters.len().saturating_add(indices.len()) >= budget.max_binders {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            let id = FVarId(context.fresh_name()?);
+            context.txn.lctx.add_param(
+                id.clone(),
+                binder_name.clone(),
+                binder_type.clone(),
+                *binder_info,
+            );
+            indices.push(
+                context
+                    .txn
+                    .lctx
+                    .find(&id)
+                    .expect("new family index")
+                    .clone(),
+            );
+            let body = context.substitute(body, &Expr::fvar(id))?;
+            value = context.whnf(&body)?;
+        }
         let ExprNode::Sort { level } = value.node() else {
             return Err(invalid());
         };
@@ -156,6 +187,7 @@ pub fn elaborate_inductive(
     } else {
         None
     };
+    context.txn.lctx = parameter_context;
     let provisional = explicit.clone().unwrap_or_else(Level::one);
     if !provisional.is_never_zero() || provisional.has_mvar() {
         return Err(failure(SourceInferenceError::Inductive(
@@ -165,8 +197,11 @@ pub fn elaborate_inductive(
     let mut closer = Builder {
         remaining: budget.max_nodes,
     };
+    let indexed_result = closer
+        .close(&indices, Expr::sort(provisional), false, false)
+        .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
     let family_type = closer
-        .close(&parameters, Expr::sort(provisional), false, false)
+        .close(&parameters, indexed_result, false, false)
         .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
     let self_id = FVarId(context.fresh_name()?);
     context.txn.lctx.add_param(
@@ -182,7 +217,7 @@ pub fn elaborate_inductive(
     let mut constructors = Vec::new();
     let mut annotations = Vec::new();
     let mut inferred = Level::one();
-    let mut count = parameters.len();
+    let mut count = parameters.len().saturating_add(indices.len());
     for ctor in ctors {
         context.tick()?;
         context.txn.lctx = base.clone();
@@ -213,6 +248,7 @@ pub fn elaborate_inductive(
             "constructor signature",
         )?;
         let mut fields = context.bind_parameters(&sig[0])?;
+        let mut result_indices = Vec::new();
         if let Some(result) = optional_type_syntax(&sig[1])? {
             let annotation = context.type_term(result)?;
             let annotation_context = context.txn.lctx.clone();
@@ -253,25 +289,40 @@ pub fn elaborate_inductive(
             // discard. This is the same local family and uniform parameters.
             let result = without_ascription(context.instantiate(&result)?);
             let mut head = result.clone();
+            let mut arguments = Vec::new();
             loop {
                 context.tick()?;
                 head = without_ascription(head);
-                let ExprNode::App { f, .. } = head.node() else {
+                let ExprNode::App { f, a } = head.node() else {
                     break;
                 };
+                arguments.push(a.clone());
                 head = f.clone();
             }
             if !matches!(head.node(), ExprNode::FVar { id } if id == &self_id) {
                 return Err(invalid());
             }
+            arguments.reverse();
+            if arguments.len() != parameters.len() + indices.len() {
+                return Err(invalid());
+            }
+            result_indices = arguments[parameters.len()..].to_vec();
+            let result_prefix = arguments[..parameters.len()]
+                .iter()
+                .cloned()
+                .fold(head, Expr::app);
             let family = context.instantiate(&family)?;
             context
                 .txn
-                .unify(&result, &family, UnificationBudget::new(kernel))
+                .unify(&result_prefix, &family, UnificationBudget::new(kernel))
                 .map_err(|e| failure(SourceInferenceError::Unification(Box::new(e))))?;
             // Later constructors can raise the family's universe. Keep the raw
             // annotation and its original telescope until that universe is final.
             annotations.push((annotation, annotation_context));
+        } else if !indices.is_empty() {
+            // There is no determined result index to infer from an omitted
+            // result signature. Never invent an index or silently add a field.
+            return Err(invalid());
         }
         context.resolve_instances(true)?;
         context.flush(true)?;
@@ -300,20 +351,37 @@ pub fn elaborate_inductive(
                 .subst_loose(0, &[Expr::const_(name.clone(), vec![])])
                 .map_err(|_| invalid())?;
         }
+        for index in &mut result_indices {
+            *index = context.instantiate(index)?;
+            context.require_resolved(std::slice::from_ref(index))?;
+            *index = index
+                .abstract_fvar(&self_id, 0)
+                .map_err(|_| invalid())?
+                .subst_loose(0, &[Expr::const_(name.clone(), vec![])])
+                .map_err(|_| invalid())?;
+        }
         constructors.push(ConstructorSpec {
             name: ctor_name.clone(),
             fields,
+            result_indices,
         });
     }
     for parameter in &mut parameters {
         parameter.type_ = context.instantiate(&parameter.type_)?;
         context.require_resolved(std::slice::from_ref(&parameter.type_))?;
     }
+    for index in &mut indices {
+        index.type_ = context.instantiate(&index.type_)?;
+        context.require_resolved(std::slice::from_ref(&index.type_))?;
+    }
     context.resolve_instances(true)?;
     context.flush(true)?;
     let result_level = explicit.unwrap_or(inferred);
+    let indexed_result = closer
+        .close(&indices, Expr::sort(result_level.clone()), false, false)
+        .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
     let family_type = closer
-        .close(&parameters, Expr::sort(result_level.clone()), false, false)
+        .close(&parameters, indexed_result, false, false)
         .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
     for (annotation, locals) in annotations {
         let mut final_context = LocalContext::new();
@@ -346,6 +414,7 @@ pub fn elaborate_inductive(
         name: name.clone(),
         level_params: vec![],
         parameters,
+        indices,
         constructors,
         result_level,
     };

@@ -251,11 +251,19 @@ struct LambdaTokens {
     arrow: usize,
 }
 
+struct QuantifierTokens {
+    keyword: usize,
+    names: std::ops::Range<usize>,
+    colon: usize,
+    domain: Option<(Syntax, usize)>,
+}
+
 struct BoundedTermFrame {
     record: Option<record_terms::RecordFrame>,
     ascription: Option<(Syntax, usize)>,
     open: Option<usize>,
     lambda: Option<LambdaTokens>,
+    quantifier: Option<QuantifierTokens>,
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
     operators: Vec<BoundedInfixToken>,
@@ -529,6 +537,8 @@ fn nat_definition_token_table() -> TokenTable {
         "→",
         "fun",
         "λ",
+        "forall",
+        "∀",
         "=>",
         "↦",
         "theorem",
@@ -593,6 +603,8 @@ fn source_module_token_table() -> TokenTable {
         "→",
         "fun",
         "λ",
+        "forall",
+        "∀",
         "=>",
         "↦",
         "theorem",
@@ -1053,8 +1065,41 @@ fn finish_lambda_frames(
     grammar: DefinitionGrammar,
     at: usize,
 ) -> Result<(), NatDefinitionParseError> {
-    while frames.last().is_some_and(|frame| frame.lambda.is_some()) {
+    while frames.last().is_some_and(|frame| {
+        frame.lambda.is_some()
+            || frame
+                .quantifier
+                .as_ref()
+                .is_some_and(|prefix| prefix.domain.is_some())
+    }) {
         let mut frame = frames.pop().expect("guarded lambda frame");
+        if let Some(prefix) = frame.quantifier.take() {
+            let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
+            let (domain, comma) = prefix.domain.expect("completed quantifier domain");
+            let names = prefix
+                .names
+                .map(|index| leaves.leaf(index))
+                .collect::<Result<Vec<_>, _>>()?;
+            let quantified = Syntax::node(
+                parser_kind(&["Term", "forall"]),
+                vec![
+                    leaves.leaf(prefix.keyword)?,
+                    null_node(names),
+                    null_node(vec![Syntax::node(
+                        parser_kind(&["Term", "typeSpec"]),
+                        vec![leaves.leaf(prefix.colon)?, domain],
+                    )]),
+                    leaves.leaf(comma)?,
+                    body,
+                ],
+            );
+            frames
+                .last_mut()
+                .expect("quantifier frame has a parent")
+                .application
+                .push((quantified, prefix.keyword));
+            continue;
+        }
         let prefix = frame.lambda.take().expect("guarded lambda prefix");
         let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
         let names = prefix
@@ -1108,6 +1153,7 @@ fn bounded_term_spliced(
         ascription: None,
         open: None,
         lambda: None,
+        quantifier: None,
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
@@ -1156,6 +1202,40 @@ fn bounded_term_spliced(
                     .push((term, index));
             }
             Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar
+                    && (symbol == "forall" || symbol == "∀") =>
+            {
+                let start = cursor;
+                while cursor < range.end && matches!(tokens[cursor].kind, TokenKind::Ident(_)) {
+                    cursor += 1;
+                }
+                if cursor == start
+                    || cursor >= range.end
+                    || !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":")
+                {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, cursor),
+                        expected: NatDefinitionExpectation::ParameterTypeAscription,
+                    });
+                }
+                frames.push(BoundedTermFrame {
+                    record: None,
+                    ascription: None,
+                    open: None,
+                    lambda: None,
+                    quantifier: Some(QuantifierTokens {
+                        keyword: index,
+                        names: start..cursor,
+                        colon: cursor,
+                        domain: None,
+                    }),
+                    application: Vec::new(),
+                    operands: Vec::new(),
+                    operators: Vec::new(),
+                });
+                cursor += 1;
+            }
+            Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && (symbol == "fun" || symbol == "λ") =>
             {
                 let names_start = cursor;
@@ -1186,6 +1266,7 @@ fn bounded_term_spliced(
                         names: names_start..cursor,
                         arrow: cursor,
                     }),
+                    quantifier: None,
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
@@ -1236,6 +1317,30 @@ fn bounded_term_spliced(
                     && matches!(symbol.as_str(), "," | "}" | ":" | "with") =>
             {
                 finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+                if symbol == ","
+                    && frames.last().is_some_and(|frame| {
+                        frame
+                            .quantifier
+                            .as_ref()
+                            .is_some_and(|prefix| prefix.domain.is_none())
+                    })
+                {
+                    let mut frame = frames.pop().expect("quantifier domain frame");
+                    let mut prefix = frame.quantifier.take().expect("quantifier prefix");
+                    let domain = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+                    prefix.domain = Some((domain, index));
+                    frames.push(BoundedTermFrame {
+                        record: None,
+                        ascription: None,
+                        open: None,
+                        lambda: None,
+                        quantifier: Some(prefix),
+                        application: Vec::new(),
+                        operands: Vec::new(),
+                        operators: Vec::new(),
+                    });
+                    continue;
+                }
                 if frames.last().is_some_and(|frame| frame.record.is_some()) {
                     record_terms::delimiter(
                         leaves,
@@ -1259,6 +1364,7 @@ fn bounded_term_spliced(
                         ascription: Some((value, index)),
                         open,
                         lambda: None,
+                        quantifier: None,
                         application: Vec::new(),
                         operands: Vec::new(),
                         operators: Vec::new(),
@@ -1276,6 +1382,7 @@ fn bounded_term_spliced(
                     ascription: None,
                     open: Some(index),
                     lambda: None,
+                    quantifier: None,
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
@@ -3175,5 +3282,50 @@ mod nat_definition_tests {
         let literal = parse_definition(b"def message : String := \"line\\nheart \\u2665\"")
             .expect("the lexer-approved String literal reaches the canonical source tree");
         assert!(literal.reconstruct_normalized().is_some());
+    }
+}
+
+#[cfg(test)]
+mod quantified_source_tests {
+    use super::*;
+
+    #[test]
+    fn quantifiers_preserve_domains_delimiters_comments_and_crlf() {
+        let source = b"theorem all : forall x : Nat, /- body -/ x = x := by intro x; rfl\r\n";
+        let parsed = parse_source_command(source).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source);
+        for text in [
+            "def f : forall x : Nat, Nat := fun x => x",
+            "def f : (forall x : Nat, Nat) -> Nat := fun f => f 0",
+            "def f : forall f : (forall x : Nat, Nat), Nat := fun f => f 0",
+            "def f : ∀ x y : Nat, Nat := fun x y => y",
+        ] {
+            parse_source_command(text.as_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn incomplete_quantifiers_are_not_accepted_as_applications() {
+        for text in [
+            "def f : forall x : Nat := 0",
+            "def f : forall x : Nat, := 0",
+            "def f : forall : Nat, Nat := 0",
+            "def f : forall x Nat, Nat := 0",
+        ] {
+            assert!(parse_source_command(text.as_bytes()).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn deep_quantifier_bodies_use_heap_frames() {
+        std::thread::Builder::new()
+            .stack_size(96 * 1024)
+            .spawn(|| {
+                let source = format!("def f : {}Nat := 0", "forall x : Nat, ".repeat(3000));
+                assert!(parse_source_command(source.as_bytes()).is_ok());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
