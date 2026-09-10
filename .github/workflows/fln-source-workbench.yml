@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture admitted indexed-family support before extending elimination.
+# Capture indexed match and induction together before integrating structural recursion.
 on:
   push:
     branches: [main]
