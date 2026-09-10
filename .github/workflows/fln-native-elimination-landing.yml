@@ -29,23 +29,12 @@ jobs:
           (out/'input-manifest.json').write_bytes(raw)
           blob=lambda data: hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
           repaired=False
-          if blob(raw)=='95a7c5b4233650eba4265d147814bec60545f648':
-              assert raw.count(b'8BnrB/c39w')==1
-              raw=raw.replace(b'8BnrB/c39w',b'8BnrB/c09w')
-              assert blob(raw)=='94e29a360604c8985b4b3b80d399d4eb8726fa4f'
-              repaired=True
-          if blob(raw)=='d771a212fc5955d23868044c8ad8d0a7391a632d':
-              assert raw.count(b'EXtuci5PD6UgNdI')==1
-              assert raw.count(b'S4p3clqd9d15TWl')==1
-              raw=raw.replace(b'EXtuci5PD6UgNdI',b'EX0IbEvF/EwzPbkIgYN9HG5iOmwXMT0wbmI6Q65iPap/UD8tuci5PD6UgNdI')
-              raw=raw.replace(b'S4p3clqd9d15TWl',b'S4p3clqd15TWl')
-              assert blob(raw)=='fc0aa886a0c61cce309f32aa52daf8f16cdcc281'
-              repaired=True
-          if blob(raw)=='32bfa32c16979fed4860ae9c97e9dcc9f8e5644c':
-              assert raw.count(b'HBcAHcAHgi')==1
-              assert raw.count(b'ZYSB5HMut')==1
-              raw=raw.replace(b'HBcAHcAHgi',b'HBcAHgi').replace(b'ZYSB5HMut',b'ZYSB5Mut')
-              assert blob(raw)=='e3e04f5f972a192dd9a8adf7a2f0e728f4ceb5dd'
+          if blob(raw)=='15d02dfd3362aa52d440a7cafe1a3c2df54ffd8d':
+              repairs=[(b'sksk/L+NMRsQinvZ97inL5z73',b'sksk/L+NMRsQnvZ97inL5z73'),(b'HXeEOqwi750iDd1V4g/hUnFaU0',b'HXeEOqwi750i1V4g/hUnFaU0')]
+              for old,new in repairs:
+                  assert raw.count(old)==1
+                  raw=raw.replace(old,new)
+              assert blob(raw)=='c8a6252613dd68e48175591bbcb8aab27827c172'
               repaired=True
           plan=json.loads(raw)
           encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
@@ -58,8 +47,7 @@ jobs:
           for p in paths:
               assert p.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
               assert '..' not in pathlib.PurePosixPath(p).parts
-          patch_paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
-          assert set(paths)==set(patch_paths)
+          assert set(paths)=={line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')}
           assert b'+++ /dev/null' not in patch
           subprocess.run(['git','apply','--check','--index','-'],input=patch,check=True)
           subprocess.run(['git','apply','--index','-'],input=patch,check=True)
@@ -88,7 +76,7 @@ jobs:
           rust=sorted(p for p in plan['paths'] if p.endswith('.rs'))
           subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
           PY
-          for example in native_pattern_matching native_recursion native_induction; do
+          for example in native_pattern_matching native_recursion native_induction native_indexed; do
             if test -f "examples/$example.lean"; then
               cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/elimination-landing/$example.json"
             fi
