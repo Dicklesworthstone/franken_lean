@@ -13,6 +13,7 @@ mod levels;
 mod matching;
 mod record;
 mod record_terms;
+mod recursion;
 mod tactics;
 
 use super::*;
@@ -23,6 +24,7 @@ use fln_core::options::KVMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
+    Recursion(recursion::RecursionError),
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
@@ -45,6 +47,7 @@ pub enum SourceInferenceError {
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
             Self::UnknownConstant(_) => {
@@ -102,6 +105,7 @@ struct Context {
     next: u64,
     equations: Vec<(Expr, Expr)>,
     instance_goals: Vec<MVarId>,
+    recursion: Option<recursion::Recursion>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -118,6 +122,7 @@ impl Context {
             next: 0,
             equations: Vec::new(),
             instance_goals: Vec::new(),
+            recursion: None,
         }
     }
 
@@ -261,6 +266,11 @@ impl Context {
                     value: Expr::fvar(local.id.clone()),
                     type_: local.type_.clone(),
                 });
+            }
+            if let Some(recursion) = &self.recursion
+                && &recursion.name == name
+            {
+                return Ok(recursion.reference.clone());
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
@@ -1436,7 +1446,7 @@ pub(super) fn definition(
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
         )?;
     }
-    let mut term = context.term(&parts[1], expected.clone())?;
+    let mut term = context.definition_body(name, &parameters, &parts[1], expected.clone())?;
     if let Some(expected) = expected {
         term.type_ = expected;
     }

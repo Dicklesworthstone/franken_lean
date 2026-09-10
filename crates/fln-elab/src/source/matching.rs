@@ -50,6 +50,7 @@ struct Branch<'a> {
     syntax: &'a Syntax,
 }
 pub(super) struct MatchBuild<'a> {
+    recursive: bool,
     saved: LocalContext,
     target: Expr,
     major: Typed,
@@ -60,6 +61,7 @@ pub(super) struct MatchBuild<'a> {
     branches: std::collections::VecDeque<Branch<'a>>,
 }
 pub(super) struct BranchBinders {
+    hypotheses: Vec<(FVarId, FVarId)>,
     locals: Vec<LocalDecl>,
     type_: Expr,
 }
@@ -388,6 +390,7 @@ impl Context {
             });
         }
         Ok(MatchBuild {
+            recursive: self.recursive_match(&major.value),
             saved: self.txn.lctx.clone(),
             target,
             major,
@@ -458,6 +461,9 @@ impl Context {
                 self.finish_term(result, Some(&state.target))?,
             ));
         };
+        if state.recursive {
+            self.recursive_branch_context();
+        }
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
@@ -477,7 +483,7 @@ impl Context {
             constructor = Expr::app(constructor, parameter.clone());
         }
         let family_type = self.whnf(&state.major.type_)?;
-        let mut hypotheses = 0;
+        let mut recursive_fields = Vec::new();
         let mut consumed = 0;
         for _ in 0..branch.constructor.num_fields {
             self.tick()?;
@@ -491,9 +497,8 @@ impl Context {
             else {
                 return Err(error(MatchError::UnsupportedFamily));
             };
-            if self.direct_match_field(binder_type, &family_type, &state.family)? {
-                hypotheses += 1;
-            }
+            let recursive_field =
+                self.direct_match_field(binder_type, &family_type, &state.family)?;
             let name = if *binder_info == BinderInfo::Default {
                 if let Some(fields) = &branch.fields {
                     let field = fields
@@ -508,6 +513,9 @@ impl Context {
                 Name::anonymous()
             };
             let id = FVarId(self.fresh_name()?);
+            if recursive_field {
+                recursive_fields.push(id.clone());
+            }
             self.txn
                 .lctx
                 .add_param(id.clone(), name, binder_type.clone(), *binder_info);
@@ -525,7 +533,8 @@ impl Context {
         }
         // Recursion hypotheses are actual recursor arguments, but ordinary
         // match syntax does not expose them as names to its branch program.
-        for _ in 0..hypotheses {
+        let mut hypotheses = Vec::new();
+        for field in recursive_fields {
             self.tick()?;
             target = self.whnf(&target)?;
             let ExprNode::ForallE {
@@ -538,6 +547,7 @@ impl Context {
                 return Err(error(MatchError::UnsupportedFamily));
             };
             let id = FVarId(self.fresh_name()?);
+            hypotheses.push((field, id.clone()));
             self.txn.lctx.add_param(
                 id.clone(),
                 Name::anonymous(),
@@ -552,6 +562,9 @@ impl Context {
                     .clone(),
             );
             target = self.substitute(body, &Expr::fvar(id))?;
+        }
+        if state.recursive {
+            self.recursive_major_alias(&mut locals, &constructor, &family_type)?;
         }
         if let Some(whole) = branch.whole {
             let id = FVarId(self.fresh_name()?);
@@ -571,6 +584,7 @@ impl Context {
             syntax: branch.syntax,
             expected,
             binders: BranchBinders {
+                hypotheses,
                 locals,
                 type_: minor_type.clone(),
             },
@@ -586,6 +600,9 @@ impl Context {
         self.resolve_instances(false)?;
         self.flush(false)?;
         let mut value = self.instantiate(&branch.value)?;
+        if state.recursive {
+            value = self.lower_recursive_calls(&value, &binders.hypotheses)?;
+        }
         for local in binders.locals.into_iter().rev() {
             self.tick()?;
             let domain = self.instantiate(&local.type_)?;
