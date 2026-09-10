@@ -1,0 +1,46 @@
+{
+  "message": "feat(source): check dependent-index recursion and repeated function eta\n\nClose dependent index telescopes in family order for source matches and\nrecursive definitions. Recognize only domain-checked exact eta expansions\nof fixed recursive arguments, retaining all source typing obligations.\n\nExtend independent KR-312 conversion to repeated exact eta layers using\nmetered virtual shifts which reject captures of every removed binder.\nNo general unfolding, equality axiom or admission authority is added.\n\nAdd 8 dependent source tests, 2 fixed-argument tests, 4 independent eta\nregressions and an installed CLI regression. Local five-package verification\nreports 1492 top-level tests passing, zero failed or ignored; Clippy,\nworkspace compilation and format checks pass. Remote gates repeat before\npublication. Example checks 9 commands and 4 theorems. Related: fln-qb5.",
+  "sha256": "30fa676e2a8debed7c9cd3106b80797aab0bd25e3b73a0f2afb71cf8de8504c9",
+  "length": 35140,
+  "parts": [
+    {"path":"scripts/dependent-index-transfer/0.gz-part","blob":"d70b85f074250e7455c1d527f9b64354b853e3e7"},
+    {"path":"scripts/dependent-index-transfer/1.gz-part","blob":"30f8d5c5be86260c7794501be48fe2e781c058f8"},
+    {"path":"scripts/dependent-index-transfer/2.gz-part","blob":"5cc35c98de95deeda3067c1b41cab11dbbcb585a"},
+    {"path":"scripts/dependent-index-transfer/3.gz-part","blob":"4e166a256ebc7db55c3305b7a43b4f61773afeeb"},
+    {"path":"scripts/dependent-index-transfer/4.gz-part","blob":"3e82cf1f7cb00a592e703c3068f1a9da123309ae"},
+    {"path":"scripts/dependent-index-transfer/5.gz-part","blob":"a894dfc45587ef28cb710086bc15deeb13a3f678"}
+  ],
+  "paths": [
+    "crates/fln-checker/src/defeq.rs",
+    "crates/fln-checker/tests/defeq.rs",
+    "crates/fln-cli/tests/source_check.rs",
+    "crates/fln-elab/src/source/matching.rs",
+    "crates/fln-elab/src/source/recursion.rs",
+    "crates/fln/tests/source_dependent_index_recursion.rs",
+    "docs/NATIVE_INDEXED.md",
+    "docs/NATIVE_RECURSION.md",
+    "examples/native_dependent_indices.lean"
+  ],
+  "base_blobs": {
+    "crates/fln-checker/src/defeq.rs":"ae7dfbf35f80bfa695841b3ffefc051d0d81f209",
+    "crates/fln-checker/tests/defeq.rs":"8588de05344e5eb71e1acf56f9a83009430e0f9c",
+    "crates/fln-cli/tests/source_check.rs":"dff76f4a72379cc7cda6a3e8a68fbfb271dbbc42",
+    "crates/fln-elab/src/source/matching.rs":"8106a6b288664d7d94b3d20c0b7ab9cd82bd60d2",
+    "crates/fln-elab/src/source/recursion.rs":"3c6e3d8c864febb8b11a1203857f50eeb9d0fdc0",
+    "crates/fln/tests/source_dependent_index_recursion.rs":null,
+    "docs/NATIVE_INDEXED.md":"0901328f892e9774bc269e89d8c7b783f577ff22",
+    "docs/NATIVE_RECURSION.md":"31c618d4dbce7dfc345175f9910d04760bf15113",
+    "examples/native_dependent_indices.lean":null
+  },
+  "source_sha256": {
+    "crates/fln-checker/src/defeq.rs":"726d5c7b574a052d7e8193abfd4b1a70d01337231aa64ae55b6f44ec916b9660",
+    "crates/fln-checker/tests/defeq.rs":"52b08493aec2e8a8955a9020257c547c6ab25767956f182c52f091b100b0bb99",
+    "crates/fln-cli/tests/source_check.rs":"b12f9d9154b752ee162c57f5d444fa46715b290909fc2c92477ace8450cae5a9",
+    "crates/fln-elab/src/source/matching.rs":"a677252cd5e8847b11e0b0e474713674ae0c03c8dc52cf2733ec41fe52949e00",
+    "crates/fln-elab/src/source/recursion.rs":"b71c7043738880bc0b8525a3e6e5b1caa753df374cdb0f87a51967d1154a4736",
+    "crates/fln/tests/source_dependent_index_recursion.rs":"2bf672b59db4c2f6f8f91cf5d476d47434500dd3bc2a04331a7ca89c51559959",
+    "docs/NATIVE_INDEXED.md":"656711ad041f63e16e7e2a8ad487b43581c7045f940a996988a5c90eb0864918",
+    "docs/NATIVE_RECURSION.md":"4771b9063056f32ac6ecbc05876bfe58fb5799a12217addd41e94fce100f76c8",
+    "examples/native_dependent_indices.lean":"8e98a1b047ae0968b072267a3effe261669682feac787f10763b7201147c64ed"
+  }
+}
