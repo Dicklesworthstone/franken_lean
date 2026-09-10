@@ -1268,7 +1268,8 @@ fn defer_pair(
 }
 
 /// Whether this application spine exposes a beta/zeta redex or a safe delta
-/// body. Application arguments are not injective through such a head: a
+/// body, or a saturated recursor with a demanded major. Application arguments
+/// are not injective through such a head: a
 /// definition may discard or duplicate them before producing its weak head.
 /// The slow worklist must route such a side through
 /// normalization BEFORE congruence decomposition: decomposing first would
@@ -1276,11 +1277,20 @@ fn defer_pair(
 /// constant), even though weak-head-normalizing it dissolves the redex and
 /// lets the spines meet. The real pinned `Init.instTransEq_1` body deferred on
 /// exactly that exposure (fln-51y8 item 120).
-fn spine_head_reduces(term: &WireExpr, root: ExprId, context: &WhnfContext) -> bool {
+fn spine_head_reduces(
+    term: &WireExpr,
+    root: ExprId,
+    context: &WhnfContext,
+    include_recursors: bool,
+) -> bool {
     let mut current = root;
+    let mut arguments = 0usize;
     loop {
         match term.node(current) {
-            Some(ExprNode::Apply { function, .. }) => current = *function,
+            Some(ExprNode::Apply { function, .. }) => {
+                arguments = arguments.saturating_add(1);
+                current = *function;
+            }
             Some(ExprNode::Metadata { expression, .. }) => current = *expression,
             Some(ExprNode::Lambda { .. } | ExprNode::Let { .. }) => return true,
             Some(ExprNode::Free { name }) => {
@@ -1290,10 +1300,17 @@ fn spine_head_reduces(term: &WireExpr, root: ExprId, context: &WhnfContext) -> b
                     .any(|binding| binding.name() == name);
             }
             Some(ExprNode::Constant { name, .. }) => {
-                return context
-                    .constants()
-                    .find(name)
-                    .is_some_and(|entry| entry.delta_body().is_some());
+                return context.constants().find(name).is_some_and(|entry| {
+                    entry.delta_body().is_some()
+                        || (include_recursors
+                            && entry.recursor_metadata().is_some_and(|rec| {
+                                let major = u64::from(rec.num_parameters())
+                                    + u64::from(rec.num_motives())
+                                    + u64::from(rec.num_minors())
+                                    + u64::from(rec.num_indices());
+                                (arguments as u64) > major
+                            }))
+                });
             }
             _ => return false,
         }
@@ -1343,6 +1360,7 @@ fn compare_pair(
     right: &WireExpr,
     generated: &[WireExpr],
     context: &WhnfContext,
+    after_core: bool,
 ) -> Result<PairAction, SlowHalt> {
     let (left_term, left_node) = slow_node(left_reference, left, right, generated)?;
     let (right_term, right_node) = slow_node(right_reference, left, right, generated)?;
@@ -1468,8 +1486,8 @@ fn compare_pair(
                 argument: right_argument,
             },
         ) => {
-            if spine_head_reduces(left_term, left_reference.root, context)
-                || spine_head_reduces(right_term, right_reference.root, context)
+            if spine_head_reduces(left_term, left_reference.root, context, !after_core)
+                || spine_head_reduces(right_term, right_reference.root, context, !after_core)
             {
                 return Ok(defer_pair(
                     left_reference,
@@ -2544,6 +2562,7 @@ fn run_slow(
             right,
             &generated,
             context,
+            false,
         )? {
             PairAction::Done => {}
             PairAction::Push1((next_left, next_right)) => {
@@ -2618,6 +2637,24 @@ fn run_slow(
                         right_reference
                     };
                     pending.push((next_left, next_right, offset_context, string_context));
+                    continue;
+                }
+
+                // A saturated recursor must keep its major until iota has
+                // had an opportunity to fire. If both weak heads stayed stuck,
+                // congruence is still a valid sufficient proof; do not turn
+                // equal arguments beneath a neutral recursor into a deferral.
+                if let PairAction::Push2(first, second) = compare_pair(
+                    left_reference,
+                    right_reference,
+                    left,
+                    right,
+                    &generated,
+                    context,
+                    true,
+                )? {
+                    pending.push((second.0, second.1, offset_context, string_context));
+                    pending.push((first.0, first.1, offset_context, string_context));
                     continue;
                 }
 

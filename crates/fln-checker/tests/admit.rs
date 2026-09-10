@@ -7,6 +7,9 @@
 //! `matches!(v, Verdict::Rejected(_))` passes when the wrong law refused, which
 //! is how a rule stops being tested without any test going red.
 
+#[path = "admit/recursor_conversion.rs"]
+mod recursor_conversion;
+
 use std::cell::Cell;
 use std::path::PathBuf;
 
