@@ -1,0 +1,134 @@
+name: Parameterized recursion verified publication
+
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/native_parameterized_recursion.patch.b64']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-parameterized-recursion-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify the recovered patch and exact source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/parameterized-publication
+          git rev-parse HEAD > target/parameterized-publication/input-commit.txt
+          python3 - <<'PY'
+          import base64,gzip,hashlib,io,json,pathlib,subprocess
+          out=pathlib.Path('target/parameterized-publication')
+          expected={
+            'crates/fln-checker/src/admit.rs': ('ab248bb2036e16e64b1b4fcec04276279b2945bc35da8e6e780885f77ac80b3d','90cdc1af91cbadd3ee388bc91f8176584a23c58d609e4d393b7e5c75aff7052b'),
+            'crates/fln-checker/src/admit/uniform.rs': (None,'1678a6c5b8d7f35b8c76480efafcb2f6e12ed115aa52d8aba7c700108d4e91d3'),
+            'crates/fln-checker/src/whnf.rs': ('476d675d0c8a0d838c468d93f23c31a3ead3c554f8f0b0eb755aebdd1d2cee89','e5b074d3ec7a330db91aa6e2a75ee79aba4109caf342bd4f412ac829df0ab610'),
+            'crates/fln-checker/tests/admit.rs': ('deef51c5d6b49ef9d427f35f44da5e1a28fda870703bd619a405243a134a716c','594f6c14261a5704251d5177770b2c7aca76b85cfdb72844b77791e84cb50390'),
+            'crates/fln-checker/tests/whnf.rs': ('8c9c93c08fc63aba65796926a7083a2046f109c4a96b63775f317cb17898229a','8859b611e868231e95941fc2423bc9200f3a7e5109c417c37c9e09d0b68fe5f9'),
+            'crates/fln-cli/tests/source_check.rs': ('158c9f90d52bf745c08962dc6b4c7c0c2551af5c82ff0459459f3d22092969dd','ddc918706a9f1d49afc41a60158c700435dba60352829cbaec574339d94b70f6'),
+            'crates/fln/tests/source_induction.rs': ('acc035085be32a859a23349b21bb42aec647e6b366ce9040a3172cfc9253e612','7b22197bb54fa6134c563e3f4167524cf62f66e0da5b6346238cc9c07129927f'),
+            'crates/fln/tests/source_parameterized_recursion.rs': (None,'d2f11e7136eeda490f844e764c6a5977bb9d4ace9b8618554a3a6179cfcb76ad'),
+            'docs/NATIVE_INDUCTION.md': ('83b3b7274aad09863f0f1b05afc0923b3b7e30d875c7e1f7fc7c89b79be1837f','6030e12b306057aae2956515c3c89dd2e185107543a982ba5d9fdba54e2c1ea0'),
+            'docs/NATIVE_PARAMETERIZED_RECURSION.md': (None,'728bbc36c988a42dad1e66af54a73be521ecc9033230b88ebed614b77d8b9ed8'),
+            'docs/NATIVE_RECURSION.md': ('263e24e165d26f6134024b12f6e7b4bbd8f34a21b9a940d54585224357cc6bfe','76df8521a546219ca49fc549d19508dcbc584b4c970dade559e2d0c6925d6942'),
+            'examples/native_parameterized_recursion.lean': (None,'46fa6db9a046afc5090af46cf60135942472c71a1218a1f5e0a27bea44c8651e'),
+          }
+          def digest(path):
+              p=pathlib.Path(path)
+              assert not p.is_symlink(),path
+              return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+          raw=pathlib.Path('scripts/native_parameterized_recursion.patch.b64').read_bytes()
+          assert len(raw)<=200_000
+          packed=base64.b64decode(b''.join(raw.split()),validate=True)
+          with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
+              patch=stream.read(2_000_001)
+          assert len(patch)==75207
+          assert hashlib.sha256(patch).hexdigest()=='d8e77ae9223055a50e607bded449b857ef392baa15842a44f768aacbd8fc6ede'
+          paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
+          assert len(paths)==len(expected) and set(paths)==set(expected)
+          assert b'+++ /dev/null' not in patch
+          already=all(digest(p)==after for p,(_,after) in expected.items())
+          if not already:
+              for p,(before,_) in expected.items():
+                  assert digest(p)==before, f'Concurrent source change: {p}'
+              subprocess.run(['git','apply','--check','--index','-'],input=patch,check=True)
+              subprocess.run(['git','apply','--index','-'],input=patch,check=True)
+          for p,(_,after) in expected.items():
+              assert digest(p)==after, f'Unexpected applied bytes: {p}'
+          preserved={p:subprocess.check_output(['git','rev-parse','HEAD:'+p]).decode().strip() for p in [
+              'crates/fln-checker/src/defeq.rs',
+              'crates/fln-checker/tests/admit/recursor_conversion.rs',
+              'scripts/native_elimination_increment.json',
+          ]}
+          (out/'preserved-blobs.json').write_text(json.dumps(preserved,indent=2))
+          (out/'paths.json').write_text(json.dumps(paths))
+          (out/'source-digests.json').write_text(json.dumps({p:v[1] for p,v in expected.items()},indent=2))
+          (out/'change.patch').write_bytes(patch)
+          (out/'already-applied.json').write_text(json.dumps(already))
+          PY
+      - name: Test the checker frontend engine and installed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv | tee target/parameterized-publication/compiler.txt
+          cargo test --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --no-fail-fast 2>&1 | tee target/parameterized-publication/tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/parameterized-publication/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/parameterized-publication/workspace.log
+          python3 - <<'PY'
+          import json,subprocess
+          paths=json.load(open('target/parameterized-publication/paths.json'))
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*[p for p in paths if p.endswith('.rs')]],check=True)
+          PY
+          cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_parameterized_recursion.lean > target/parameterized-publication/example.json
+          python3 - <<'PY'
+          import json
+          result=json.load(open('target/parameterized-publication/example.json'))
+          assert result['outcome']=='complete' and result['authority'] is True
+          assert result['commands']==14 and result['theorems']==7 and result['executed'] is False
+          PY
+          git diff --check
+          git diff --cached --check
+      - name: Publish exactly the tested implementation to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,pathlib,subprocess
+          out=pathlib.Path('target/parameterized-publication')
+          paths=json.loads((out/'paths.json').read_text())
+          hashes=json.loads((out/'source-digests.json').read_text())
+          assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==h for p,h in hashes.items())
+          preserved=json.loads((out/'preserved-blobs.json').read_text())
+          for p,blob in preserved.items():
+              assert subprocess.check_output(['git','hash-object',p]).decode().strip()==blob,p
+          assert not subprocess.check_output(['git','diff','--name-only']).strip()
+          staged=set(subprocess.check_output(['git','diff','--cached','--name-only']).decode().splitlines())
+          already=json.loads((out/'already-applied.json').read_text())
+          assert staged==(set() if already else set(paths))
+          (out/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
+          if not already:
+              subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+              subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+              message='feat(checker): independently verify parameterized recursion and generic induction\n\nDerive dependent constructor minors and complete recursor rules using\nchecker-owned arenas. Validate uniform parameters, field universe bounds\nand every supplied recursive argument. Retain reduced neutral majors.\n\nEnable checked generic map composition, append associativity and tree\nmirror involution. Preserve concurrent recursor conversion and the shared\nelimination manifest. Add 22 regressions without a new admission authority,\nexternal dependency or unsafe code.\n\nBefore publication: all five affected packages pass tests and Clippy with\nwarnings denied; workspace all-target compilation and changed-file format\nchecks pass. Installed CLI checks 14 commands and 7 theorems. Local baseline\nevidence reports 1425 passing tests. Remote command logs are retained by\nthis workflow. No full-workspace test or full Lean compatibility claim.'
+              subprocess.run(['git','commit','-m',message],check=True)
+              subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          (out/'published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: parameterized-recursion-${{ github.sha }}
+          path: target/parameterized-publication
+          retention-days: 7
+          if-no-files-found: error
