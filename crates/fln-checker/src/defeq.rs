@@ -10,7 +10,8 @@
 //! descending definitional-height order. At the exact `String.ofList` comparison gate,
 //! Unicode String literals expand through the checker-owned KR-314 reducer.
 //! Once both heads are stable, the exact `fun x => f x` KR-312 subset contracts
-//! through a virtual binder when `f` does not depend on `x`. Pi-driven eta,
+//! through virtual binders, including nested eta-expanded functions, when `f`
+//! does not depend on any of the removed binders. Pi-driven eta,
 //! typing, proof irrelevance, recursors, and native computation still produce
 //! a typed deferral. A deferral is not a rejection and this module is not a
 //! declaration-admission authority.
@@ -2121,13 +2122,14 @@ fn virtual_binder_bound_equal(
     inside_index: u32,
     outside_index: u32,
     cutoff: u64,
+    removed: u64,
     control: &SlowControl,
 ) -> Result<bool, SlowHalt> {
     let outside = u64::from(outside_index);
     if outside < cutoff {
         return Ok(inside_index == outside_index);
     }
-    let observed = outside.saturating_add(1);
+    let observed = outside.saturating_add(removed);
     if observed > u64::from(MAX_BVAR_INDEX) {
         return Err(control.bound_index(observed));
     }
@@ -2137,6 +2139,7 @@ fn virtual_binder_bound_equal(
 fn eta_structurally_equal(
     inside: DefEqTerm,
     outside: DefEqTerm,
+    removed: u64,
     sources: TermSources<'_>,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
@@ -2220,7 +2223,13 @@ fn eta_structurally_equal(
                     index: outside_index,
                 },
             ) => {
-                if !virtual_binder_bound_equal(*inside_index, *outside_index, cutoff, control)? {
+                if !virtual_binder_bound_equal(
+                    *inside_index,
+                    *outside_index,
+                    cutoff,
+                    removed,
+                    control,
+                )? {
                     return Ok(false);
                 }
             }
@@ -2417,36 +2426,57 @@ fn eta_structurally_equal(
 }
 
 fn eta_candidate(
-    lambda: DefEqTerm,
-    body: ExprId,
+    mut lambda: DefEqTerm,
+    mut body: ExprId,
     outside: DefEqTerm,
     sources: TermSources<'_>,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, SlowHalt> {
-    let body_reference = child(lambda, body)?;
-    control.comparison(cancelled)?;
-    let term = sources.source(body_reference)?;
-    let body_node = term
-        .node(body)
-        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
-            location: body_reference.location(),
-        }))?;
-    let ExprNode::Apply { function, argument } = body_node else {
-        return Ok(false);
-    };
-    let function_reference = child(body_reference, *function)?;
-    let argument_reference = child(body_reference, *argument)?;
-    control.comparison(cancelled)?;
-    let argument_node =
-        term.node(*argument)
+    let mut removed = 0u64;
+    loop {
+        let body_reference = child(lambda, body)?;
+        control.comparison(cancelled)?;
+        let term = sources.source(body_reference)?;
+        let body_node = term
+            .node(body)
             .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
-                location: argument_reference.location(),
+                location: body_reference.location(),
             }))?;
-    if !matches!(argument_node, ExprNode::Bound { index: 0 }) {
-        return Ok(false);
+        let ExprNode::Apply { function, argument } = body_node else {
+            return Ok(false);
+        };
+        let function_reference = child(body_reference, *function)?;
+        let argument_reference = child(body_reference, *argument)?;
+        control.comparison(cancelled)?;
+        let argument_node =
+            term.node(*argument)
+                .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                    location: argument_reference.location(),
+                }))?;
+        if !matches!(argument_node, ExprNode::Bound { index: 0 }) {
+            return Ok(false);
+        }
+        removed = removed
+            .checked_add(1)
+            .ok_or_else(|| control.bound_index(u64::MAX))?;
+        // Inference may eta-expand a function which was already eta-expanded.
+        // Contract each exact layer on a worklist, not by recursive conversion.
+        // The final virtual shift proves that no removed binder is captured.
+        if let Some(ExprNode::Lambda { body: inner, .. }) = term.node(*function) {
+            lambda = function_reference;
+            body = *inner;
+            continue;
+        }
+        return eta_structurally_equal(
+            function_reference,
+            outside,
+            removed,
+            sources,
+            control,
+            cancelled,
+        );
     }
-    eta_structurally_equal(function_reference, outside, sources, control, cancelled)
 }
 
 fn exact_function_eta(

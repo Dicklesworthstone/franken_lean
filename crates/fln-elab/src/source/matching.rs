@@ -360,9 +360,6 @@ impl Context {
                 });
             }
         }
-        if recursive && !index_values.is_empty() {
-            return Err(error(MatchError::UnsupportedFamily));
-        }
         let indices = self.elimination_index_locals(&index_values)?;
         // Generalizing later parameters must not rescue an ill-typed original
         // index motive (for example a captured P : Vec A n -> Type). Preserve
@@ -379,19 +376,30 @@ impl Context {
             Some(Typed { value, type_ })
         };
         let mut generalized = Vec::new();
-        if !indices.is_empty() {
+        if recursive {
+            self.recursive_indices(name, &parameters, &indices)?;
+        } else if !indices.is_empty() {
             let mut dependencies: HashSet<_> =
                 indices.iter().map(|index| index.id.clone()).collect();
-            // Generalization may not change the fixed family parameters or an
-            // earlier index's domain. Dependent index pattern equations belong
-            // to the refinement compiler, not this constructor-variable lane.
-            for value in parameters
-                .iter()
-                .chain(indices.iter().map(|index| &index.type_))
-            {
+            // Parameters stay fixed. Index domains, however, form a telescope:
+            // a later domain may refer to preceding indices. Closing the motive
+            // in family order captures those dependencies without inventing an
+            // equality between a fixed expression and a constructor result.
+            for value in &parameters {
                 if !self.elimination_reads(value)?.is_disjoint(&dependencies) {
                     return Err(error(MatchError::UnrefinedIndices));
                 }
+            }
+            let mut preceding = HashSet::new();
+            for index in &indices {
+                if self
+                    .elimination_reads(&index.type_)?
+                    .iter()
+                    .any(|id| dependencies.contains(id) && !preceding.contains(id))
+                {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+                preceding.insert(index.id.clone());
             }
             let major_id = if let ExprNode::FVar { id } = major.value.node() {
                 dependencies.insert(id.clone());
@@ -764,7 +772,7 @@ impl Context {
             ));
         };
         if state.recursive {
-            self.recursive_branch_context();
+            self.recursive_branch_context()?;
         }
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
@@ -885,7 +893,11 @@ impl Context {
             target = self.substitute(body, &Expr::fvar(id))?;
         }
         if state.recursive {
-            self.recursive_major_alias(&mut locals, &constructor, &family_type)?;
+            let constructor_type = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            self.recursive_index_aliases(&mut locals, &constructor_type)?;
+            self.recursive_major_alias(&mut locals, &constructor, &constructor_type)?;
         }
         if let Some(whole) = branch.whole {
             let id = FVarId(self.fresh_name()?);

@@ -62,6 +62,192 @@ fn constants(expr: &Expr) -> HashSet<Name> {
     }
     found
 }
+
+const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where\n\
+  | nil : Vec A 0\n\
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n\
+def two : Vec Nat 2 := Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)\n";
+
+#[test]
+fn indexed_structural_copy_preserves_lengths_and_has_no_recursive_axiom() {
+    let checked = check(&format!(
+        "{VEC}
+def copyVec {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with
+  | .nil => Vec.nil
+  | .cons k x tail => Vec.cons k x (copyVec k tail)
+theorem compute : copyVec 2 two = two := by rfl
+theorem identity {{A : Type}} (n : Nat) (xs : Vec A n) : copyVec n xs = xs := by
+  induction xs with
+  | nil => rfl
+  | cons k x tail ih => simp only [copyVec, ih]"
+    ));
+    let Some(ConstantInfo::Defn(definition)) = checked
+        .engine
+        .environment()
+        .find(&Name::from_components(["copyVec"]))
+    else {
+        panic!("definition");
+    };
+    let dependencies = constants(&definition.value);
+    assert!(dependencies.contains(&Name::from_components(["Vec", "rec"])));
+    assert!(!dependencies.contains(&Name::from_components(["copyVec"])));
+    assert!(!definition.value.has_fvar());
+    assert!(!definition.value.has_expr_mvar());
+}
+
+#[test]
+fn indexed_recursive_map_changes_the_output_family_parameter() {
+    check(&format!(
+        "{VEC}
+def mapVec {{A B : Type}} (f : A -> B) (n : Nat) (xs : Vec A n) : Vec B n := match xs with
+  | .nil => Vec.nil
+  | .cons k x tail => Vec.cons k (f x) (mapVec f k tail)
+theorem ok : mapVec (fun x => x + 1) 2 two = Vec.cons 1 8 (Vec.cons 0 10 Vec.nil) := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_root_names_are_rebound_to_the_current_constructor_indices() {
+    check(&format!(
+        "{VEC}
+def indexSum {{A : Type}} (n : Nat) (xs : Vec A n) : Nat := match xs with
+  | .nil => n
+  | .cons k x tail => indexSum k tail + n
+theorem ok : indexSum 2 two = 3 := by rfl
+def retain {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with
+  | .nil => xs
+  | .cons k x tail => let used := retain k tail; xs
+theorem retained : retain 2 two = two := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_recursion_generalizes_earlier_index_dependent_proof_arguments() {
+    check(&format!(
+        "{VEC}
+def depth {{A : Type}} (n : Nat) (h : n = n) (xs : Vec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons k x tail => depth k rfl tail + 1
+theorem ok : depth 2 rfl two = 2 := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_recursion_generalizes_earlier_data_and_changing_accumulators() {
+    check(&format!(
+        "{VEC}
+def walk {{A : Type}} (n : Nat) (other : Vec A n) (xs : Vec A n) (acc : Nat) : Nat := match xs with
+  | .nil => acc
+  | .cons k x tail => walk k tail tail (acc + n)
+theorem ok : walk 2 two two 10 = 13 := by rfl
+def walkPartial {{A : Type}} (n : Nat) (xs : Vec A n) (acc : Nat) : Nat := match xs with
+  | .nil => acc
+  | .cons k x tail => let smaller := walkPartial k tail; smaller (acc + n)
+theorem partial_ok : walkPartial 2 two 10 = 13 := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_recursion_keeps_implicit_indices_and_pattern_shadowing_distinct() {
+    check(&format!(
+        "{VEC}
+def copyImplicit {{A : Type}} {{n : Nat}} (xs : Vec A n) : Vec A n := match xs with
+  | .nil => Vec.nil
+  | .cons n x xs => Vec.cons n x (copyImplicit xs)
+theorem ok : copyImplicit two = two := by rfl
+def count {{A : Type}} (n : Nat) (xs : Vec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons n x xs => count n xs + 1
+theorem shadowed : count 2 two = 2 := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_recursion_tracks_each_childs_distinct_multiple_indices() {
+    check(
+        "inductive Path (A : Type) : A -> A -> Type where
+  | refl (a : A) : Path A a a
+  | step (a b c : A) (left : Path A a b) (right : Path A b c) : Path A a c
+def weight {A : Type} (from to : A) (path : Path A from to) : Nat := match path with
+  | .refl a => 1
+  | .step a b c left right => weight a b left + weight b c right
+def example : Path Nat 7 7 := Path.step 7 7 7 (Path.refl 7) (Path.refl 7)
+theorem ok : weight 7 7 example = 2 := by rfl",
+    );
+}
+
+#[test]
+fn indexed_recursion_does_not_confuse_family_index_order_with_header_order() {
+    check(
+        "inductive PairIndex : Nat -> Nat -> Type where
+  | stop (a b : Nat) : PairIndex a b
+  | step (a b : Nat) (child : PairIndex a b) : PairIndex (Nat.succ a) b
+def count (b a : Nat) (input : PairIndex a b) : Nat := match input with
+  | .stop x y => a + b
+  | .step x y child => count y x child + 1
+theorem ok : count 5 3 (PairIndex.step 2 5 (PairIndex.stop 2 5)) = 8 := by rfl",
+    );
+}
+
+#[test]
+fn indexed_recursion_cannot_discard_wrong_indices_or_nondecreasing_calls() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad n xs",
+        "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad n tail",
+        "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => let unused := bad (Nat.succ k) tail; 1",
+        "def bad {A : Type} (fixed : Nat) (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => fixed | .cons k x tail => bad 7 k tail",
+        "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => let escaped := bad; escaped k tail",
+        "def bad {A : Type} (n : Nat) (xs : Vec A n) : Nat := match xs with | .nil => 0 | .cons k x tail => let unused := bad (let invalid : String := k; k) tail; 1",
+        "def bad {A : Type} (n : Nat) (xs : Vec A n) (acc : Nat) : Nat := match xs with | .nil => acc | .cons k x tail => bad k tail (1 : String)",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[VEC.as_bytes(), source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&Name::from_components(["Vec"])));
+    }
+    assert!(
+        base.check_source_files(
+            &[VEC.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn indexed_recursive_proofs_cannot_hide_a_false_base_case() {
+    let base = engine();
+    let bad = format!(
+        "{VEC}
+theorem falseChain {{A : Type}} (n : Nat) (xs : Vec A n) : 0 = 1 := match xs with
+  | .nil => rfl
+  | .cons k x tail => falseChain k tail"
+    );
+    assert!(
+        base.check_source_files(
+            &[bad.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_err()
+    );
+    check(&format!(
+        "{VEC}
+theorem reflexiveChain {{A : Type}} (n : Nat) (xs : Vec A n) : 0 = 0 := match xs with
+  | .nil => rfl
+  | .cons k x tail => reflexiveChain k tail"
+    ));
+}
 #[test]
 fn primitive_nat_recursion_computes_through_both_checkers() {
     let checked = check(

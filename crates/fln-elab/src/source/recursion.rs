@@ -4,9 +4,10 @@
 //! Only calls on an immediate recursive constructor field may replace that marker.
 //! The entire body must be the selected match: an induction hypothesis for an
 //! inner subexpression cannot stand for the whole function. Fixed arguments must
-//! be the original locals, not arbitrary terms that conversion could erase.
+//! be the original locals or their domain-checked eta expansions, not arbitrary
+//! terms that conversion could erase.
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -15,6 +16,7 @@ pub enum RecursionError {
     ExplicitParameterRequired,
     NotDecreasing,
     ChangedParameter,
+    ChangedIndex,
     PartialApplication,
 }
 impl std::fmt::Display for RecursionError {
@@ -31,6 +33,7 @@ impl std::fmt::Display for RecursionError {
                 "recursive call is not on an immediate recursive constructor field"
             }
             Self::ChangedParameter => "recursive call changes a fixed parameter",
+            Self::ChangedIndex => "recursive call indices do not match its structural child's type",
             Self::PartialApplication => {
                 "recursive function escapes without its structural argument"
             }
@@ -49,8 +52,63 @@ pub(super) struct Recursion {
     pub(super) parameters: Vec<LocalDecl>,
     pub(super) decreasing: usize,
     pub(super) pending: bool,
+    /// Family-ordered index binders, each pointing into the source telescope.
+    indices: Vec<usize>,
+    /// Source-ordered arguments universally quantified in each hypothesis.
+    varying: Vec<usize>,
+    family: Option<(Name, usize)>,
 }
 impl Context {
+    /// Implicit higher-order inference can produce `fun x => P x` for the fixed
+    /// parameter `P`. Recognize only that exact eta shape, checking every domain
+    /// against P's dependent function telescope. Unlike general conversion this
+    /// cannot erase a let, application argument, annotation, or recursive call.
+    fn fixed_recursive_argument(
+        &mut self,
+        argument: &Expr,
+        parameter: &LocalDecl,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut body = argument;
+        let type_ = self.instantiate(&parameter.type_)?;
+        let mut domain = &type_;
+        let mut arity = 0u32;
+        while let ExprNode::Lam {
+            binder_type,
+            body: inner,
+            ..
+        } = body.node()
+        {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type: expected,
+                body: result,
+                ..
+            } = domain.node()
+            else {
+                return Ok(false);
+            };
+            if binder_type != expected {
+                return Ok(false);
+            }
+            arity = arity
+                .checked_add(1)
+                .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+            body = inner;
+            domain = result;
+        }
+        for index in 0..arity {
+            self.tick()?;
+            let ExprNode::App { f, a } = body.node() else {
+                return Ok(false);
+            };
+            if !matches!(a.node(), ExprNode::BVar { idx } if *idx == index) {
+                return Ok(false);
+            }
+            body = f;
+        }
+        Ok(matches!(body.node(), ExprNode::FVar { id } if id == &parameter.id))
+    }
+
     /// Retry only an actual unresolved self-reference. Lexical shadowing and
     /// nonrecursive definitions follow their ordinary path, including errors.
     pub(super) fn definition_body(
@@ -137,7 +195,82 @@ impl Context {
             parameters: parameters.to_vec(),
             decreasing,
             pending: true,
+            indices: Vec::new(),
+            varying: (decreasing + 1..parameters.len()).collect(),
+            family: None,
         });
+        Ok(())
+    }
+
+    /// Separate fixed family parameters from indices that change at each child.
+    /// Earlier arguments depending on an index must vary too; capturing them
+    /// would give a recursive hypothesis a value at the *outer* index. Index
+    /// domains may depend on preceding indices, but never on a generalized
+    /// ordinary argument or a later index.
+    pub(super) fn recursive_indices(
+        &mut self,
+        family: &Name,
+        parameters: &[Expr],
+        indices: &[LocalDecl],
+    ) -> Result<(), NatDefinitionElabError> {
+        let recursion = self
+            .recursion
+            .clone()
+            .expect("recursive match specification");
+        let mut positions = Vec::new();
+        let mut removed: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
+        for local in indices {
+            self.tick()?;
+            let position = recursion
+                .parameters
+                .iter()
+                .position(|param| param.id == local.id)
+                .filter(|position| *position < recursion.decreasing)
+                .ok_or_else(|| {
+                    failure(SourceInferenceError::Match(
+                        matching::MatchError::UnrefinedIndices,
+                    ))
+                })?;
+            positions.push(position);
+        }
+        removed.insert(recursion.parameters[recursion.decreasing].id.clone());
+        let mut varying = Vec::new();
+        for (position, local) in recursion.parameters.iter().enumerate() {
+            self.tick()?;
+            if position != recursion.decreasing
+                && !positions.contains(&position)
+                && (position > recursion.decreasing
+                    || !self.elimination_reads(&local.type_)?.is_disjoint(&removed))
+            {
+                varying.push(position);
+                removed.insert(local.id.clone());
+            }
+        }
+        for parameter in parameters {
+            if !self.elimination_reads(parameter)?.is_disjoint(&removed) {
+                return Err(error(RecursionError::ChangedParameter));
+            }
+        }
+        let mut preceding = HashSet::new();
+        for index in indices {
+            if self
+                .elimination_reads(&index.type_)?
+                .iter()
+                .any(|id| removed.contains(id) && !preceding.contains(id))
+            {
+                return Err(failure(SourceInferenceError::Match(
+                    matching::MatchError::UnrefinedIndices,
+                )));
+            }
+            preceding.insert(index.id.clone());
+        }
+        let recursion = self
+            .recursion
+            .as_mut()
+            .expect("recursive match specification");
+        recursion.indices = positions;
+        recursion.varying = varying;
+        recursion.family = Some((family.clone(), parameters.len()));
         Ok(())
     }
 
@@ -168,10 +301,8 @@ impl Context {
             .clone()
             .expect("recursive target specification");
         let mut target = self.instantiate(target)?;
-        for local in recursion.parameters[recursion.decreasing + 1..]
-            .iter()
-            .rev()
-        {
+        for position in recursion.varying.iter().rev() {
+            let local = &recursion.parameters[*position];
             self.tick()?;
             target = target
                 .abstract_fvar(&local.id, 0)
@@ -191,9 +322,10 @@ impl Context {
             .recursion
             .as_ref()
             .expect("recursive result specification");
-        recursion.parameters[recursion.decreasing + 1..]
+        recursion
+            .varying
             .iter()
-            .map(|local| Expr::fvar(local.id.clone()))
+            .map(|position| Expr::fvar(recursion.parameters[*position].id.clone()))
             .collect()
     }
 
@@ -206,7 +338,8 @@ impl Context {
             .recursion
             .clone()
             .expect("recursive branch specification");
-        for parameter in &recursion.parameters[recursion.decreasing + 1..] {
+        for position in &recursion.varying {
+            let parameter = &recursion.parameters[*position];
             self.tick()?;
             target = self.whnf(&target)?;
             let ExprNode::ForallE {
@@ -246,20 +379,96 @@ impl Context {
 
     /// The original major must not remain captured in a recursive minor: its
     /// value at smaller arguments is the constructor currently being inspected.
-    pub(super) fn recursive_branch_context(&mut self) {
+    pub(super) fn recursive_branch_context(&mut self) -> Result<(), NatDefinitionElabError> {
         let recursion = self
             .recursion
-            .as_ref()
+            .clone()
             .expect("recursive match has a specification");
-        self.txn
-            .lctx
-            .truncate(recursion.parameters[recursion.decreasing].index);
+        let removed: HashSet<_> = recursion
+            .indices
+            .iter()
+            .chain(&recursion.varying)
+            .map(|position| recursion.parameters[*position].id.clone())
+            .chain([
+                recursion.parameters[recursion.decreasing].id.clone(),
+                recursion.marker.clone(),
+            ])
+            .collect();
+        let previous = self.txn.lctx.clone();
+        self.txn.lctx = LocalContext::new();
+        for local in previous.decls() {
+            self.tick()?;
+            if !removed.contains(&local.id) {
+                if let Some(value) = &local.value {
+                    self.txn.lctx.add_let(
+                        local.id.clone(),
+                        local.user_name.clone(),
+                        local.type_.clone(),
+                        value.clone(),
+                    );
+                } else {
+                    self.txn.lctx.add_param(
+                        local.id.clone(),
+                        local.user_name.clone(),
+                        local.type_.clone(),
+                        local.binder_info,
+                    );
+                }
+            }
+        }
         self.txn.lctx.add_param(
             recursion.marker.clone(),
             Name::anonymous(),
             recursion.reference.type_.clone(),
             BinderInfo::Default,
         );
+        Ok(())
+    }
+
+    /// Rebind source index names to this branch's constructor result, just as
+    /// the original major is rebound to the constructor. Pattern names shadow
+    /// these aliases, but core identities never do. Domains are specialized in
+    /// family order for genuinely dependent index telescopes.
+    pub(super) fn recursive_index_aliases(
+        &mut self,
+        locals: &mut Vec<LocalDecl>,
+        constructor_type: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let recursion = self
+            .recursion
+            .clone()
+            .expect("recursive match specification");
+        let (family, parameters) = recursion
+            .family
+            .as_ref()
+            .expect("recursive family classified");
+        let values = self.elimination_result_indices(
+            constructor_type,
+            family,
+            *parameters,
+            recursion.indices.len(),
+        )?;
+        let mut replacements = Vec::new();
+        for (position, value) in recursion.indices.iter().zip(values) {
+            let old = &recursion.parameters[*position];
+            let mut type_ = self.instantiate(&old.type_)?;
+            for (id, replacement) in &replacements {
+                self.tick()?;
+                type_ = type_
+                    .abstract_fvar(id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                type_ = self.substitute(&type_, replacement)?;
+            }
+            if !locals.iter().any(|local| local.user_name == old.user_name) {
+                let id = FVarId(self.fresh_name()?);
+                self.txn
+                    .lctx
+                    .add_let(id.clone(), old.user_name.clone(), type_, value.clone());
+                locals.push(self.txn.lctx.find(&id).expect("branch index alias").clone());
+            }
+            replacements.push((old.id.clone(), value));
+        }
+        Ok(())
     }
 
     pub(super) fn recursive_major_alias(
@@ -327,12 +536,16 @@ impl Context {
                         if arguments.len() <= recursion.decreasing {
                             return Err(error(RecursionError::PartialApplication));
                         }
-                        for (argument, parameter) in arguments
+                        for (position, (argument, parameter)) in arguments
                             .iter()
                             .zip(&recursion.parameters)
                             .take(recursion.decreasing)
+                            .enumerate()
                         {
-                            if **argument != Expr::fvar(parameter.id.clone()) {
+                            if !recursion.indices.contains(&position)
+                                && !recursion.varying.contains(&position)
+                                && !self.fixed_recursive_argument(argument, parameter)?
+                            {
                                 return Err(error(RecursionError::ChangedParameter));
                             }
                         }
@@ -345,7 +558,38 @@ impl Context {
                             .find(|(field, _)| field == child)
                             .map(|(_, ih)| Expr::fvar(ih.clone()))
                             .ok_or_else(|| error(RecursionError::NotDecreasing))?;
-                        let extra = arguments[recursion.decreasing + 1..].to_vec();
+                        if !recursion.indices.is_empty() {
+                            let child_type = self
+                                .txn
+                                .lctx
+                                .find(child)
+                                .map(|local| local.type_.clone())
+                                .ok_or_else(|| error(RecursionError::NotDecreasing))?;
+                            let (family, parameters) = recursion
+                                .family
+                                .as_ref()
+                                .expect("recursive family classified");
+                            let indices = self.elimination_result_indices(
+                                &child_type,
+                                family,
+                                *parameters,
+                                recursion.indices.len(),
+                            )?;
+                            for (position, index) in recursion.indices.iter().zip(indices) {
+                                // These arguments disappear into the recursor's
+                                // own indices. Require the actual child index,
+                                // not conversion which could erase a bad term.
+                                if *arguments[*position] != index {
+                                    return Err(error(RecursionError::ChangedIndex));
+                                }
+                            }
+                        }
+                        let mut extra: Vec<_> = recursion
+                            .varying
+                            .iter()
+                            .filter_map(|position| arguments.get(*position).copied())
+                            .collect();
+                        extra.extend(arguments.iter().skip(recursion.parameters.len()).copied());
                         tasks.push(Task::Call(expr, hypothesis, extra.clone()));
                         tasks.extend(extra.into_iter().rev().map(Task::Visit));
                     } else {
@@ -430,5 +674,115 @@ fn children(expr: &Expr) -> [Option<&Expr>; 3] {
         } => [Some(type_), Some(value), Some(body)],
         ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
         _ => [None, None, None],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_parameter_eta_checks_dependent_domains_and_variable_order() {
+        let mut context = Context::new(&Environment::new(), Budget::DEFAULT);
+        let f = FVarId(Name::from_components(["polymorphic_identity"]));
+        let type_ = Expr::forall_e(
+            Name::anonymous(),
+            Expr::sort(Level::one()),
+            Expr::forall_e(
+                Name::anonymous(),
+                Expr::bvar(0).unwrap(),
+                Expr::bvar(1).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let parameter = LocalDecl {
+            id: f.clone(),
+            user_name: f.0.clone(),
+            type_,
+            value: None,
+            binder_info: BinderInfo::Default,
+            index: 0,
+        };
+        let expanded = |domain: Expr, first: u32, second: u32| {
+            Expr::lam(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                Expr::lam(
+                    Name::anonymous(),
+                    domain,
+                    Expr::app(
+                        Expr::app(Expr::fvar(f.clone()), Expr::bvar(first).unwrap()),
+                        Expr::bvar(second).unwrap(),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            )
+        };
+        assert!(
+            context
+                .fixed_recursive_argument(&expanded(Expr::bvar(0).unwrap(), 1, 0), &parameter)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&expanded(Expr::sort(Level::zero()), 1, 0), &parameter)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&expanded(Expr::bvar(0).unwrap(), 0, 1), &parameter)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&expanded(Expr::bvar(0).unwrap(), 1, 1), &parameter)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn fixed_parameter_eta_refusal_does_not_reduce_discardable_annotations() {
+        let mut context = Context::new(&Environment::new(), Budget::DEFAULT);
+        let f = FVarId(Name::from_components(["fixed"]));
+        let parameter = LocalDecl {
+            id: f.clone(),
+            user_name: f.0.clone(),
+            type_: Expr::forall_e(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                Expr::sort(Level::one()),
+                BinderInfo::Default,
+            ),
+            value: None,
+            binder_info: BinderInfo::Default,
+            index: 0,
+        };
+        let body = Expr::let_e(
+            Name::anonymous(),
+            Expr::sort(Level::zero()),
+            Expr::sort(Level::one()),
+            Expr::app(Expr::fvar(f), Expr::bvar(1).unwrap()),
+            false,
+        );
+        let value = Expr::lam(
+            Name::anonymous(),
+            Expr::sort(Level::one()),
+            body,
+            BinderInfo::Default,
+        );
+        assert!(
+            !context
+                .fixed_recursive_argument(&value, &parameter)
+                .unwrap()
+        );
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed;
+        assert!(matches!(
+            context.fixed_recursive_argument(&value, &parameter),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
     }
 }

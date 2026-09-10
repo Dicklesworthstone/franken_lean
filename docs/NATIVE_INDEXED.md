@@ -72,7 +72,9 @@ instead of becoming independent variables.
 ## Constructor matches
 
 Ordinary source matches support indexed families whose actual indices are distinct
-parameter locals with independent domains. Constructor branches receive the
+parameter locals. Later index domains may depend on preceding indices in family
+order; the motive closes that telescope without inventing index equations.
+Constructor branches receive the
 refined expected type, so a vector can be reconstructed at its original length:
 
 ```lean
@@ -95,9 +97,8 @@ performs no index refinement and becomes a checked let binding; this also permit
 core term even when unused. Ordinary matches keep recursor hypotheses out of proof
 and instance search. Every resulting term still crosses both checking engines.
 
-Constructor matches with fixed/repeated indices, dependent index domains or
-inaccessible patterns remain unsupported. Indexed structural recursion also
-remains unsupported. These are bounded source capabilities, not generated-matcher
+Constructor matches with fixed/repeated indices or inaccessible patterns remain
+unsupported. These are bounded source capabilities, not generated-matcher
 name parity or full Lean match elaboration.
 
 Constructor result indices that reduce directly to a constructor field are also
@@ -108,6 +109,52 @@ such as a vector's successor length, and fixed family-parameter indices, are
 supported. Before generalizing dependent arguments, the original index motive is
 retained as a checked typing obligation, so generalization cannot hide an
 ill-typed captured dependency.
+
+## Structural recursive functions
+
+Root constructor matches can now elaborate structurally recursive definitions of
+indexed data. For example, `copyVec n xs` may recursively call `copyVec k tail`
+when `tail : Vec A k` is a direct recursive field. The recursor owns that child's
+indices; source calls must supply those actual index expressions, not the outer
+length or a guessed conversion. No recursive constant or axiom enters the environment.
+
+Fixed family parameters remain fixed. Index-dependent ordinary arguments before
+the decreasing input, and all trailing arguments, are generalized into the motive.
+This supports changing accumulators and earlier proof or data arguments whose
+types depend on the length. Implicit indices can be inferred. Each branch rebinds
+the original index names to its constructor's result indices and the original
+input name to the actual constructor, unless shadowed by a pattern binder.
+
+The checked example `examples/native_indexed_recursion.lean` defines vector copy,
+map, accumulation, and a computation using the current branch's length; it proves
+copy and map identity for every vector. Run it with `fln check-source --json`.
+Recursive calls lower to real induction hypotheses and retain every varying
+argument, including unused values and annotations. Wrong indices, changed fixed
+parameters, nondecreasing calls, and escaping recursive names are refused.
+
+Dependent index domains are supported by both matching and recursive functions.
+For `Trace A P a v` with `v : P a`, a child at `x, vx : P x` has a hypothesis at
+those indices, not the outer `a, v`. Branch-local aliases for the original indices
+have their domains specialized in telescope order. Prefix proofs or data depending
+on these indices generalize together with trailing accumulators.
+
+Fixed higher-order parameters can be supplied as exact eta expansions, such as
+`fun x => P x`, which implicit inference commonly produces. Each lambda domain
+must match the original function's dependent telescope, and every argument must
+be its corresponding bound variable. This test does not beta-reduce arbitrary
+source expressions or erase annotations. More elaborate inferred fixed arguments
+can still require explicit parameter applications. The independent checker also
+handles repeated exact eta layers with metered virtual shifts, rejecting capture
+of any removed binder; this is not general Pi-driven extensionality.
+
+`examples/native_dependent_indices.lean` checks copying and rebuilding a family
+whose second index has type `P a`, with a generic copy-identity induction proof.
+The final `rfl` performs ordinary checked conversion after selected simplification.
+Run it with `fln check-source --json examples/native_dependent_indices.lean`.
+
+The current recursive source lane uses distinct header-parameter indices and an
+explicit result type. Fixed/repeated indices, grandchildren, mutual recursion,
+well-founded measures and equation-style definitions remain outside this lane.
 
 Prop-valued indexed family
 admission, mutual/nested families, inaccessible patterns, index-equation solving
