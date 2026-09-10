@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture the complete current main tree before implementing the next capability.
+# Capture admitted indexed-family support before extending elimination.
 on:
   push:
     branches: [main]
