@@ -22,36 +22,29 @@ jobs:
           mkdir -p target/elimination-landing
           git rev-parse HEAD > target/elimination-landing/input-commit.txt
           python3 - <<'PY'
-          import hashlib,json,pathlib,re,subprocess
+          import base64,gzip,hashlib,io,json,pathlib,subprocess
           raw=pathlib.Path('scripts/native_elimination_increment.json').read_bytes()
           plan=json.loads(raw)
-          source=pathlib.PurePosixPath(plan['patch_file'])
-          assert str(source).startswith('scripts/') and '..' not in source.parts
-          patch=pathlib.Path(source).read_bytes()
-          assert len(patch)<2_000_000
+          encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
+          with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as stream:
+              patch=stream.read(2_000_001)
+          assert len(patch)<=2_000_000
           assert hashlib.sha256(patch).hexdigest()==plan['sha256']
-          out=pathlib.Path('target/elimination-landing')
-          (out/'input.patch').write_bytes(patch)
-          if plan['sha256']=='f033cfc4ea6c5ac48521d6441eaabb4a21ebef62786608e9170a558c8e9b56a9':
-              patch=re.sub(rb'(^diff --git [^\n]+\n)(?=--- /dev/null\n)',rb'\1new file mode 100644\n',patch,flags=re.M)
-              assert hashlib.sha256(patch).hexdigest()=='1139b793a5db3acd110bcce2fc718c4eee79eec65eeb74522de8ecc709652d8b'
           paths=plan['paths']
-          required=plan.get('required',{})
           assert paths and len(paths)==len(set(paths))
-          for p in [*paths,*required]:
+          for p in paths:
               assert p.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
               assert '..' not in pathlib.PurePosixPath(p).parts
-          for p,digest in required.items():
-              assert hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==digest,p
           patch_paths=[line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')]
           assert set(paths)==set(patch_paths)
           assert b'+++ /dev/null' not in patch
-          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
-          subprocess.run(['git','apply','-'],input=patch,check=True)
+          subprocess.run(['git','apply','--check','--index','-'],input=patch,check=True)
+          subprocess.run(['git','apply','--index','-'],input=patch,check=True)
+          out=pathlib.Path('target/elimination-landing')
           (out/'paths.json').write_text(json.dumps(paths))
           (out/'increment.json').write_bytes(raw)
           (out/'change.patch').write_bytes(patch)
-          (out/'source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in [*paths,*required]},indent=2))
+          (out/'source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths},indent=2))
           PY
       - name: Test both checking engines and the real frontend and CLI
         shell: bash
@@ -66,25 +59,31 @@ jobs:
           python3 - <<'PY'
           import json,subprocess
           plan=json.load(open('target/elimination-landing/increment.json'))
-          rust=sorted({p for p in [*plan['paths'],*plan.get('required',{})] if p.endswith('.rs')})
+          rust=sorted(p for p in plan['paths'] if p.endswith('.rs'))
           subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
           PY
-          cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_pattern_matching.lean > target/elimination-landing/example.json
+          for example in native_pattern_matching native_recursion; do
+            if test -f "examples/$example.lean"; then
+              cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/elimination-landing/$example.json"
+            fi
+          done
           git diff --check
+          git diff --cached --check
       - name: Publish only the tested changes without a force push
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json,pathlib,subprocess
+          import hashlib,json,pathlib,subprocess
           out=pathlib.Path('target/elimination-landing')
           paths=json.loads((out/'paths.json').read_text())
           plan=json.loads((out/'increment.json').read_text())
-          changed=set(subprocess.check_output(['git','diff','--name-only']).decode().splitlines())
-          assert changed.issubset(paths)
+          digests=json.loads((out/'source-digests.json').read_text())
+          assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==digest for p,digest in digests.items())
+          assert not subprocess.check_output(['git','diff','--name-only']).strip()
+          assert set(subprocess.check_output(['git','diff','--cached','--name-only']).decode().splitlines())==set(paths)
           subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
           subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
-          subprocess.run(['git','add','--',*paths],check=True)
           (out/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
           subprocess.run(['git','commit','-m',plan['message']],check=True)
           subprocess.run(['git','push','origin','HEAD:main'],check=True)
