@@ -300,3 +300,202 @@ fn a_match_resource_stop_is_not_a_kernel_rejection_or_partial_success() {
     }
     assert_eq!(e.logical_root(&KVMap::new()), root);
 }
+
+const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n";
+
+#[test]
+fn indexed_matches_compute_with_refined_constructor_results() {
+    let result = check(&format!(
+        "{VEC}def get {{A : Type}} (n : Nat) (xs : Vec A n) (fallback : A) : A := match xs with | .nil => fallback | .cons k x tail => x
+def rebuild {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with | .nil => Vec.nil | .cons k x tail => Vec.cons k x tail
+theorem head_ok : get 1 (Vec.cons 0 7 Vec.nil) 9 = 7 := by rfl
+theorem empty_ok : get 0 Vec.nil 9 = 9 := by rfl
+theorem rebuild_ok : rebuild 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl"
+    ));
+    let Some(ConstantInfo::Defn(def)) = result
+        .engine
+        .environment()
+        .find(&Name::from_components(["rebuild"]))
+    else {
+        panic!("checked indexed match");
+    };
+    assert!(constants(&def.value).contains(&Name::from_components(["Vec", "rec"])));
+    assert_eq!(result.theorems, 3);
+}
+
+#[test]
+fn indexed_matches_generalize_dependent_parameters_and_preserve_shadowing() {
+    check(&format!(
+        "{VEC}def select {{A : Type}} (n : Nat) (xs ys : Vec A n) : Vec A n := match xs with | .nil => ys | .cons k x tail => ys
+theorem same (n : Nat) (xs : Vec Nat n) (h : n = n) : n = n := match xs with | .nil => h | .cons k h tail => by assumption
+theorem self (n : Nat) (xs : Vec Nat n) (h : xs = xs) : xs = xs := match xs with | .nil => h | .cons k x tail => h
+theorem selected : select 1 (Vec.cons 0 7 Vec.nil) (Vec.cons 0 9 Vec.nil) = Vec.cons 0 9 Vec.nil := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_match_captures_and_whole_patterns_keep_their_actual_types() {
+    check(&format!(
+        "{VEC}def original (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => n | .cons k x tail => n
+def patternShadow (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => n | .cons n x tail => n
+def whole {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with | .nil => Vec.nil | rest => rest
+def captured (xs : Vec Nat 0) : Vec Nat 0 := match xs with | _ => xs
+def bound (xs : Vec Nat 1) : Vec Nat 1 := match xs with | rest => rest
+theorem original_ok : original 1 (Vec.cons 0 7 Vec.nil) = 1 := by rfl
+theorem shadow_ok : patternShadow 1 (Vec.cons 0 7 Vec.nil) = 0 := by rfl
+theorem whole_ok : whole 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl
+theorem captured_ok : captured Vec.nil = Vec.nil := by rfl
+theorem bound_ok : bound (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl"
+    ));
+}
+
+#[test]
+fn indexed_match_generalization_clears_only_unneeded_old_locals() {
+    let declarations = "def useProof (n : Nat) (h : n = n) : Nat := 0\nclass Choice (n : Nat) where\n value : Nat\ndef readChoice (n : Nat) [d : Choice n] : Nat := d.value\n";
+    for (local, body) in [
+        ("h : n = n", "useProof n (by assumption)"),
+        ("d : Choice n", "readChoice n"),
+    ] {
+        let name = local.split_whitespace().next().unwrap();
+        for keep in [false, true] {
+            let binding = if keep {
+                format!("let held := {name}; ")
+            } else {
+                String::new()
+            };
+            let source = format!(
+                "{VEC}{declarations}def probe (n : Nat) (xs : Vec Nat n) ({local}) : Nat := {binding}match xs with | .nil => {body} | .cons k x tail => 0"
+            );
+            if keep {
+                check(&source);
+            } else {
+                let e = engine();
+                let root = e.logical_root(&KVMap::new());
+                assert!(
+                    e.check_source_files(
+                        &[source.as_bytes()],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(limits())
+                    )
+                    .is_err(),
+                    "old local leaked: {source}"
+                );
+                assert_eq!(e.logical_root(&KVMap::new()), root);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_dictionaries_generalize_but_instance_binders_remain_fixed() {
+    let declarations = "class Choice (n : Nat) where\n value : Nat\n";
+    check(&format!(
+        "{VEC}{declarations}def select (n : Nat) (xs : Vec Nat n) (d : Choice n) : Choice n := match xs with | .nil => inferInstance | .cons k x tail => inferInstance"
+    ));
+    let bad = format!(
+        "{VEC}{declarations}def select (n : Nat) (xs : Vec Nat n) [d : Choice n] : Choice n := match xs with | .nil => inferInstance | .cons k x tail => inferInstance"
+    );
+    let e = engine();
+    assert!(
+        e.check_source_files(
+            &[bad.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits())
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn ordinary_matches_never_offer_recursive_hypotheses_to_proof_search() {
+    check(
+        "theorem real (n : Nat) (h : 0 = 0) : 0 = 0 := match n with | .zero => rfl | .succ k => by assumption",
+    );
+    for source in [
+        "theorem hidden (n : Nat) : 0 = 0 := match n with | .zero => rfl | .succ k => by assumption",
+        "class Choice where\n value : Nat\ndef hidden (n : Nat) : Choice := match n with | .zero => { value := 7 } | .succ k => inferInstance",
+    ] {
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        assert!(
+            e.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "anonymous induction hypothesis leaked: {source}"
+        );
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn indexed_match_failures_are_atomic_and_recoverable() {
+    let e = engine();
+    let root = e.logical_root(&KVMap::new());
+    let good = "def get (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => x\ntheorem good : get 1 (Vec.cons 0 7 Vec.nil) = 7 := by rfl";
+    for bad in [
+        "def bad (n : Nat) (xs : Vec Nat n) : Vec Nat n := match xs with | .nil => xs | .cons k x tail => xs",
+        "def bad (n : Nat) (xs : Vec Nat n) : Vec Nat n := let saved := xs; match xs with | .nil => saved | .cons k x tail => saved",
+        "def bad (xs : Vec Nat 0) : Nat := match xs with | .nil => 0 | .cons k x tail => 1",
+        "def bad (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => (x : String)",
+        "theorem bad (n : Nat) (xs : Vec Nat n) : n = 0 := match xs with | .nil => rfl | .cons k x tail => rfl",
+        "def bad (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => bad k tail",
+        "def bad : Nat := match (Vec.nil : Vec Nat 1) with | _ => 0",
+    ] {
+        let result = e.check_source_files(
+            &[VEC.as_bytes(), bad.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        assert!(result.is_err(), "{bad}\n{result:?}");
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+        let recovered = e
+            .check_source_files(
+                &[VEC.as_bytes(), good.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(recovered.theorems, 1);
+        assert!(!e.environment().contains(&Name::from_components(["Vec"])));
+    }
+}
+
+#[test]
+fn indexed_match_resource_stop_preserves_the_source_environment() {
+    let e = engine();
+    let prepared = e
+        .check_source_files(
+            &[VEC.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = prepared.logical_root(&KVMap::new());
+    let source = b"def get (n : Nat) (xs : Vec Nat n) : Nat := match xs with | .nil => 0 | .cons k x tail => x";
+    let mut bound = limits();
+    bound.kernel.steps = 1;
+    match prepared.check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(bound)) {
+        Ok(Outcome::Inconclusive(_)) => {}
+        Err(error) => assert!(
+            matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+            "{error:?}"
+        ),
+        other => panic!("expected a typed nonanswer: {other:?}"),
+    }
+    assert_eq!(prepared.logical_root(&KVMap::new()), root);
+    assert!(
+        prepared
+            .check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits()))
+            .unwrap()
+            .into_complete()
+            .is_some()
+    );
+}

@@ -914,3 +914,86 @@ fn indexed_proof_failure_emits_no_success_and_does_not_poison_the_next_check() {
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_indexed_matches_without_publishing_failed_prefixes() {
+    let prefix = file(
+        "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\ndef rebuild {A : Type} (n : Nat) (xs : Vec A n) : Vec A n := match xs with | .nil => Vec.nil | .cons k x tail => Vec.cons k x tail",
+    );
+    let good =
+        file("theorem checked : rebuild 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl");
+    let bad =
+        file("theorem wrong : rebuild 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 9 Vec.nil := by rfl");
+    let before = std::fs::read(&prefix).unwrap();
+    for (suffix, success) in [(&good, true), (&bad, false), (&good, true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&prefix)
+            .arg(suffix)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            assert!(output.stderr.is_empty());
+            let json = String::from_utf8(output.stdout).unwrap();
+            for required in [
+                "\"commands\":3",
+                "\"theorems\":1",
+                "\"files\":2",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(required), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("\"outcome\":\"kernel-rejection\"")
+            );
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(prefix.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn installed_binary_refuses_hidden_match_hypotheses_and_checks_real_assumptions() {
+    for (source, success) in [
+        (
+            "theorem hidden (n : Nat) : 0 = 0 := match n with | .zero => rfl | .succ k => by assumption",
+            false,
+        ),
+        (
+            "theorem real (n : Nat) (h : 0 = 0) : 0 = 0 := match n with | .zero => rfl | .succ k => by assumption",
+            true,
+        ),
+    ] {
+        let path = file(source);
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
