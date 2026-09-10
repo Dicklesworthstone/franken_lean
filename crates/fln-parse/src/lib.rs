@@ -30,6 +30,7 @@ pub mod recovery;
 pub mod registry;
 pub mod state;
 
+mod inductive;
 mod proofs;
 mod record_terms;
 mod records;
@@ -66,6 +67,7 @@ pub enum NatDefinitionExpectation {
     Tactic,
     TheoremType,
     RecordField,
+    InductiveConstructor,
     NaturalType,
     ScalarType,
     ClosingParenthesis,
@@ -479,6 +481,8 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
+        "inductive",
+        "|",
         "structure",
         "class",
         "where",
@@ -535,6 +539,8 @@ fn nat_definition_token_table() -> TokenTable {
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
+        "inductive",
+        "|",
         "structure",
         "class",
         "where",
@@ -1355,7 +1361,10 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
     match first {
         Some(token) => match &token.kind {
             TokenKind::Symbol(symbol)
-                if matches!(symbol.as_str(), "def" | "theorem" | "structure" | "class") =>
+                if matches!(
+                    symbol.as_str(),
+                    "def" | "theorem" | "structure" | "class" | "inductive"
+                ) =>
             {
                 let parsed = parse_definition(source)?;
                 Ok(ParsedSourceCommand {
@@ -1599,6 +1608,12 @@ fn parse_definition_with_grammar(
             Event::Trivia(_) | Event::Refused { .. } => None,
         })
         .collect::<Vec<_>>();
+
+    if grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.first().map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "inductive")
+    {
+        return inductive::parse(view, tokens);
+    }
 
     if grammar == DefinitionGrammar::Scalar
         && matches!(tokens.first().map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == "structure" || s == "class")
@@ -1851,7 +1866,7 @@ pub fn partition_definition_commands(
             Event::Token(LexedToken {
                 kind: TokenKind::Symbol(symbol),
                 extent,
-            }) if matches!(symbol.as_str(), "def" | "structure" | "class")
+            }) if matches!(symbol.as_str(), "def" | "structure" | "class" | "inductive")
                 || symbol == "theorem"
                 || symbol == "instance"
                 || symbol == "#eval"
