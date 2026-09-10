@@ -13,6 +13,7 @@ pub enum MatchError {
     ExpectedInductive,
     UnsupportedFamily,
     UnrefinedIndices,
+    UnrefinedIndexPattern,
     InvalidPattern,
     DuplicateConstructor,
     MissingConstructor,
@@ -28,6 +29,9 @@ impl std::fmt::Display for MatchError {
             }
             Self::UnrefinedIndices => {
                 "indexed elimination currently requires distinct parameter locals as indices"
+            }
+            Self::UnrefinedIndexPattern => {
+                "direct constructor-field indices require index-pattern refinement"
             }
             Self::InvalidPattern => {
                 "match requires a constructor with variable fields or a final catch-all"
@@ -67,6 +71,7 @@ pub(super) struct MatchBuild<'a> {
     parameters: Vec<Expr>,
     indices: Vec<LocalDecl>,
     generalized: Vec<LocalDecl>,
+    motive_obligation: Option<Typed>,
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
@@ -217,6 +222,40 @@ impl Context {
         Ok(function)
     }
 
+    fn indexed_match_motive(
+        &mut self,
+        target: &Expr,
+        major: &Typed,
+        family_type: &Expr,
+        indices: &[LocalDecl],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let body = if let ExprNode::FVar { id } = major.value.node() {
+            target
+                .abstract_fvar(id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?
+        } else {
+            target.clone()
+        };
+        let mut motive = Expr::lam(
+            Name::anonymous(),
+            family_type.clone(),
+            body,
+            BinderInfo::Default,
+        );
+        for index in indices.iter().rev() {
+            self.tick()?;
+            motive = Expr::lam(
+                index.user_name.clone(),
+                self.instantiate(&index.type_)?,
+                motive
+                    .abstract_fvar(&index.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                index.binder_info,
+            );
+        }
+        Ok(motive)
+    }
+
     pub(super) fn start_match<'a>(
         &mut self,
         parts: MatchParts<'a>,
@@ -313,6 +352,7 @@ impl Context {
                     parameters,
                     indices: Vec::new(),
                     generalized: Vec::new(),
+                    motive_obligation: None,
                     levels: levels.clone(),
                     // Replaced by the checked body before completion.
                     recursor: major,
@@ -324,6 +364,20 @@ impl Context {
             return Err(error(MatchError::UnsupportedFamily));
         }
         let indices = self.elimination_index_locals(&index_values)?;
+        // Generalizing later parameters must not rescue an ill-typed original
+        // index motive (for example a captured P : Vec A n -> Type). Preserve
+        // that original lambda as an ordinary checked let obligation. Its type
+        // reconstruction is untrusted; both final checking engines check the
+        // lambda's actual applications, including an unused ill-typed value.
+        let motive_obligation = if indices.is_empty() {
+            None
+        } else {
+            let value = self.indexed_match_motive(&target, &major, &family_type, &indices)?;
+            let type_ = self
+                .known_type(&value)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            Some(Typed { value, type_ })
+        };
         let mut generalized = Vec::new();
         if !indices.is_empty() {
             let mut dependencies: HashSet<_> =
@@ -382,33 +436,7 @@ impl Context {
             value: motive_target.clone(),
             type_: target_type,
         })?;
-        // A local discriminant is generalized in the expected result, producing
-        // genuinely dependent branches. Other expressions use a constant motive;
-        // no equality is fabricated to refine unrelated local hypotheses.
-        let body = if let ExprNode::FVar { id } = major.value.node() {
-            motive_target
-                .abstract_fvar(id, 0)
-                .map_err(|_| failure(SourceInferenceError::Scope))?
-        } else {
-            motive_target.clone()
-        };
-        let mut motive = Expr::lam(
-            Name::anonymous(),
-            family_type.clone(),
-            body,
-            BinderInfo::Default,
-        );
-        for index in indices.iter().rev() {
-            self.tick()?;
-            motive = Expr::lam(
-                index.user_name.clone(),
-                self.instantiate(&index.type_)?,
-                motive
-                    .abstract_fvar(&index.id, 0)
-                    .map_err(|_| failure(SourceInferenceError::Scope))?,
-                index.binder_info,
-            );
-        }
+        let motive = self.indexed_match_motive(&motive_target, &major, &family_type, &indices)?;
         let motive_type = self
             .known_type(&motive)?
             .ok_or_else(|| error(MatchError::ExpectedInductive))?;
@@ -574,6 +602,7 @@ impl Context {
             parameters,
             indices,
             generalized,
+            motive_obligation,
             levels: levels.clone(),
             recursor,
             branches,
@@ -721,6 +750,15 @@ impl Context {
                     )?;
                 }
             }
+            if let Some(obligation) = &state.motive_obligation {
+                result.value = Expr::let_e(
+                    Name::anonymous(),
+                    obligation.type_.clone(),
+                    obligation.value.clone(),
+                    result.value,
+                    false,
+                );
+            }
             return Ok(MatchStep::Complete(
                 self.finish_term(result, Some(&state.target))?,
             ));
@@ -794,6 +832,30 @@ impl Context {
             .is_some_and(|fields| fields.len() != consumed)
         {
             return Err(error(MatchError::WrongArity));
+        }
+        if !state.indices.is_empty() {
+            let constructor_type = self
+                .known_type(&constructor)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+            for index in self.elimination_result_indices(
+                &constructor_type,
+                &state.family,
+                state.parameters.len(),
+                state.indices.len(),
+            )? {
+                let index = self.whnf(&index)?;
+                // A bare field index may stay fixed during pattern inference;
+                // its wildcard does not authorize generalizing the old context.
+                // Until that refinement state is tracked, refuse this shape
+                // for named and wildcard patterns alike. This also deliberately
+                // refuses some valid mixed/alias patterns rather than guessing
+                // which indices the Reference generalized.
+                if let ExprNode::FVar { id } = index.node()
+                    && locals.iter().any(|local| &local.id == id)
+                {
+                    return Err(error(MatchError::UnrefinedIndexPattern));
+                }
+            }
         }
         // Recursion hypotheses are actual recursor arguments, but ordinary
         // match syntax does not expose them as names to its branch program.
@@ -900,12 +962,18 @@ impl Context {
             let mut retained = vec![true; context.len()];
             for (index, local) in context.decls().iter().enumerate().rev() {
                 self.tick()?;
-                if candidates.contains(&local.id)
-                    && !target_reads.contains(&local.id)
-                    && !reads.iter().enumerate().any(|(other, dependencies)| {
-                        other != index && retained[other] && dependencies.contains(&local.id)
-                    })
-                {
+                if !candidates.contains(&local.id) || target_reads.contains(&local.id) {
+                    continue;
+                }
+                let mut needed = false;
+                for (other, dependencies) in reads.iter().enumerate() {
+                    self.tick()?;
+                    if other != index && retained[other] && dependencies.contains(&local.id) {
+                        needed = true;
+                        break;
+                    }
+                }
+                if !needed {
                     retained[index] = false;
                 }
             }
