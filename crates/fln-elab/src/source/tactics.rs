@@ -7,6 +7,7 @@
 
 use super::*;
 mod eliminate;
+mod equality;
 mod rewrite;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub enum TacticError {
     EliminationArity,
     UnsupportedEliminator,
     InvalidGeneralization,
+    SubstitutionLocal,
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -57,6 +59,9 @@ impl std::fmt::Display for TacticError {
             ),
             Self::InvalidGeneralization => {
                 write!(f, "invalid or dependent elimination generalization")
+            }
+            Self::SubstitutionLocal => {
+                write!(f, "subst requires an acyclic local-variable equality")
             }
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
         }
@@ -314,7 +319,13 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "cases"])
+            if kind == &parser_kind(&["Tactic", "subst"]) {
+                let [keyword, Syntax::Ident { val, .. }] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "subst", "substitution tactic")?;
+                self.substitute_proof_goal(proof, goal, val)?;
+            } else if kind == &parser_kind(&["Tactic", "cases"])
                 || kind == &parser_kind(&["Tactic", "induction"])
             {
                 self.eliminate_proof_goal(

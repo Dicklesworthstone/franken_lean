@@ -89,6 +89,7 @@ fn tactic(
             "rw",
             "rewrite",
             "simp",
+            "subst",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word]))
@@ -125,6 +126,11 @@ fn tactic(
                 }
             }
             args.push(null_node(names));
+        }
+        "subst"
+            if range.end == start + 2 && matches!(&tokens[start + 1].kind, TokenKind::Ident(_)) =>
+        {
+            args.push(leaves.leaf(start + 1)?);
         }
         "assumption" | "rfl" if range.end == start + 1 => {}
         "exact" | "apply" if range.end > start + 1 => args.push(bounded_term(
@@ -335,6 +341,7 @@ mod simp_tests {
     fn unsupported_simp_features_are_not_silently_ignored() {
         for tail in [
             "simp",
+            "subst",
             "simp [h]",
             "simp only [h] at h",
             "simp only [*]",
@@ -348,5 +355,38 @@ mod simp_tests {
             assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
         }
         assert!(parse_definition(b"def simp (only : Nat) := only").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod equality_tests {
+    use super::*;
+    #[test]
+    fn substitution_is_contextual_and_requires_a_single_local_name() {
+        assert!(parse_definition(b"def subst (x : Nat) := x").is_ok());
+        for tail in ["subst h", "subst x"] {
+            assert!(
+                parse_source_command(
+                    format!("theorem t (x y : Nat) (h : x = y) : x = y := by {tail}; rfl")
+                        .as_bytes()
+                )
+                .is_ok()
+            );
+        }
+        for tail in [
+            "subst",
+            "subst 2",
+            "subst (h)",
+            "subst h at x",
+            "subst h, x",
+        ] {
+            assert!(
+                parse_source_command(
+                    format!("theorem t (x : Nat) : x = x := by {tail}").as_bytes()
+                )
+                .is_err(),
+                "{tail}"
+            );
+        }
     }
 }

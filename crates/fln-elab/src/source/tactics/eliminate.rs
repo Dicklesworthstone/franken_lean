@@ -21,7 +21,7 @@ struct EliminationContext<'a> {
     reverted: &'a [LocalDecl],
     induction: bool,
 }
-fn add_local(context: &mut LocalContext, local: &LocalDecl) {
+pub(super) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
     if let Some(value) = &local.value {
         context.add_let(
             local.id.clone(),
@@ -82,7 +82,7 @@ impl Context {
         }
         Ok(found)
     }
-    fn specialize_locals(
+    pub(super) fn specialize_locals(
         &mut self,
         expr: &Expr,
         replacements: &[(FVarId, Expr)],
