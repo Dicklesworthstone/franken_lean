@@ -1,0 +1,121 @@
+name: Heterogeneous equality verified publication
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/heterogeneous-increment.json', '.github/workflows/fln-heterogeneous-landing.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-heterogeneous-landing
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Validate exact input blobs and apply the recovered source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/heq-landing
+          git rev-parse HEAD > target/heq-landing/input-commit.txt
+          python3 - <<'PY'
+          import base64,gzip,hashlib,io,json,pathlib,subprocess
+          out=pathlib.Path('target/heq-landing')
+          manifest=pathlib.Path('scripts/heterogeneous-increment.json')
+          raw=manifest.read_bytes()
+          blob=lambda data: hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          repaired=False
+          if blob(raw)=='8b550224fc31b8c3fd5990d4f91da1fcf71dfe1d':
+              assert raw.count(b'RTZZST')==1
+              raw=raw.replace(b'RTZZST',b'RTZST')
+              assert blob(raw)=='7b765cfe8303eb62e70ea4c01659bfd4287ddbab'
+              repaired=True
+          plan=json.loads(raw)
+          packed=base64.b64decode(plan['patch_gzip_base64'],validate=True)
+          with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
+              patch=stream.read(2_000_001)
+          assert len(patch)==plan['length']<=2_000_000
+          assert hashlib.sha256(patch).hexdigest()==plan['sha256']
+          paths=list(plan['base_blobs'])
+          assert paths and set(paths)==set(plan['source_sha256'])
+          assert set(paths)=={line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')}
+          assert b'+++ /dev/null' not in patch
+          for name,expected in plan['base_blobs'].items():
+              p=pathlib.Path(name)
+              assert name.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
+              assert '..' not in p.parts and not p.is_symlink()
+              if expected is None:
+                  assert not p.exists(),name
+              else:
+                  assert blob(p.read_bytes())==expected,name
+          subprocess.run(['git','apply','--check','--index','-'],input=patch,check=True)
+          subprocess.run(['git','apply','--index','-'],input=patch,check=True)
+          for name,digest in plan['source_sha256'].items():
+              assert hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()==digest,name
+          if repaired:
+              manifest.write_bytes(raw)
+              subprocess.run(['git','add','--',str(manifest)],check=True)
+              paths.append(str(manifest))
+          (out/'paths.json').write_text(json.dumps(paths))
+          (out/'manifest.json').write_bytes(raw)
+          (out/'change.patch').write_bytes(patch)
+          (out/'source-digests.json').write_text(json.dumps(plan['source_sha256'],indent=2)+'\n')
+          PY
+      - name: Test both checking engines and every affected frontend target
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc -Vv | tee target/heq-landing/compiler.txt
+          cargo test --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --no-fail-fast 2>&1 | tee target/heq-landing/tests.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/heq-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/heq-landing/workspace.log
+          python3 - <<'PY'
+          import json,pathlib,subprocess
+          out=pathlib.Path('target/heq-landing')
+          plan=json.loads((out/'manifest.json').read_text())
+          rust=sorted(p for p in plan['source_sha256'] if p.endswith('.rs'))
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true','--check',*rust],check=True)
+          for example,commands,theorems in plan['examples']:
+              assert example.startswith('examples/') and '..' not in pathlib.Path(example).parts
+              data=subprocess.check_output(['cargo','run','--locked','-p','fln-cli','--bin','fln','--','check-source','--json',example])
+              result=json.loads(data)
+              assert result['commands']==commands and result['theorems']==theorems
+              assert result['outcome']=='complete' and result['authority'] is True and result['executed'] is False
+              (out/(pathlib.Path(example).stem+'.json')).write_bytes(data)
+          PY
+          git diff --check
+          git diff --cached --check
+      - name: Publish only tested bytes without overwriting concurrent main changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,pathlib,subprocess
+          out=pathlib.Path('target/heq-landing')
+          plan=json.loads((out/'manifest.json').read_text())
+          for p,digest in plan['source_sha256'].items():
+              assert hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==digest,p
+          assert not subprocess.check_output(['git','diff','--name-only']).strip()
+          assert set(subprocess.check_output(['git','diff','--cached','--name-only']).decode().splitlines())==set(json.loads((out/'paths.json').read_text()))
+          (out/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
+          subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
+          subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
+          subprocess.run(['git','commit','-m',plan['message']],check=True)
+          subprocess.run(['git','push','origin','HEAD:main'],check=True)
+          (out/'published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: heterogeneous-equality-${{ github.sha }}
+          path: target/heq-landing
+          retention-days: 7
