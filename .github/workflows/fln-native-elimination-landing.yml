@@ -44,7 +44,21 @@ jobs:
               assert blob(raw)=='6faaf4f5a4a2c3aaf5cfce7f7e769d1c1e1d0be9'
               repaired=True
           plan=json.loads(raw)
-          encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
+          if 'patch_gzip_parts' in plan:
+              specs=plan['patch_gzip_parts']
+              assert isinstance(specs,list) and 1<=len(specs)<=256
+              parts=[]
+              for i,spec in enumerate(specs):
+                  expected=f'scripts/native-constructor-transfer/{i}.part'
+                  assert spec['path']==expected
+                  path=pathlib.Path(expected)
+                  assert not path.is_symlink() and path.is_file()
+                  data=path.read_bytes()
+                  assert 0<len(data)<=4096 and blob(data)==spec['blob']
+                  parts.append(data)
+              encoded=base64.b64decode(b''.join(parts),validate=True)
+          else:
+              encoded=base64.b64decode(plan['patch_gzip_base64'],validate=True)
           with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as stream:
               patch=stream.read(2_000_001)
           assert len(patch)<=2_000_000
