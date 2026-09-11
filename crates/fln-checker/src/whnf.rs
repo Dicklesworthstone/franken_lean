@@ -307,6 +307,9 @@ pub struct WhnfResult {
     pub steps: u64,
     pub reductions: u64,
     pub delta_reductions: u64,
+    /// Some reductions were spent checking a K gate rather than rewriting the
+    /// returned term. A nonzero reduction count alone then need not mean change.
+    pub has_auxiliary_work: bool,
     pub string_progress: StringExpansionProgress,
 }
 
@@ -492,6 +495,7 @@ struct Reducer<'a, 'c> {
     unfolded_bindings: BTreeSet<usize>,
     delta_mode: DeltaMode,
     delta_reductions: u64,
+    has_auxiliary_work: bool,
     string_progress: StringExpansionProgress,
     force_string_delta: bool,
 }
@@ -949,6 +953,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 self.delta_reductions = self
                     .delta_reductions
                     .saturating_add(result.delta_reductions);
+                self.has_auxiliary_work |= result.has_auxiliary_work;
                 self.absorb_string(result.string_progress);
                 let root = result.term.root();
                 Ok(Cursor {
@@ -1094,6 +1099,123 @@ impl<'a, 'c> Reducer<'a, 'c> {
         Ok(true)
     }
 
+    /// A sufficient conversion gate for KR-317. Compare demanded application
+    /// arguments after checker-owned WHNF instead of requiring identical syntax.
+    /// This permits equal types computed by recursors/projections without making
+    /// a cast across distinct types disappear. No proof irrelevance is assumed.
+    /// Binder bodies stay on the structural path: reducing them here would need
+    /// a shifted local context which this cursor-only reducer does not carry.
+    fn k_constructor_types_equal(&mut self, left: &Cursor, right: &Cursor) -> Result<bool, Halt> {
+        let mut pending = vec![(left.clone(), right.clone())];
+        let mut seen = BTreeSet::new();
+        // Keep arenas behind request-local address keys alive until the walk ends.
+        let mut roots = Vec::new();
+        while let Some((left, right)) = pending.pop() {
+            let key = (
+                Arc::as_ptr(&left.arena),
+                left.root,
+                Arc::as_ptr(&right.arena),
+                right.root,
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            roots.push((left.arena.clone(), right.arena.clone()));
+            if self.structural_cursors_equal(&left, &right)? {
+                continue;
+            }
+            self.has_auxiliary_work = true;
+            let left = self.whnf_recursor_major(&left)?;
+            let right = self.whnf_recursor_major(&right)?;
+            if self.structural_cursors_equal(&left, &right)? {
+                continue;
+            }
+            match (self.node(&left)?, self.node(&right)?) {
+                (
+                    ExprNode::Apply {
+                        function: lf,
+                        argument: la,
+                    },
+                    ExprNode::Apply {
+                        function: rf,
+                        argument: ra,
+                    },
+                ) => {
+                    for (l, r) in [(*lf, *rf), (*la, *ra)] {
+                        Self::validate_child(left.root, l)?;
+                        Self::validate_child(right.root, r)?;
+                        pending.push((
+                            Cursor {
+                                arena: left.arena.clone(),
+                                root: l,
+                            },
+                            Cursor {
+                                arena: right.arena.clone(),
+                                root: r,
+                            },
+                        ));
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Consume a peeled telescope from the inside out. Each replacement lives
+    /// outside all remaining slots, so lift its external indices before insertion.
+    /// Without that lift a later substitution rewrites the replacement's own
+    /// outer locals, silently changing the type used to decide K reduction.
+    fn instantiate_k_slots(
+        &mut self,
+        mut term: WireExpr,
+        arguments: &VecDeque<Cursor>,
+        end: usize,
+    ) -> Result<Option<WireExpr>, Halt> {
+        let facts = self.control.term_halt(
+            WhnfPhase::Iota,
+            inspect_with(
+                &term,
+                self.control.budget.materialization,
+                &mut *self.cancelled,
+            ),
+        )?;
+        let needed = usize::try_from(facts.external_bound_span).unwrap_or(usize::MAX);
+        if needed > end || end > arguments.len() {
+            return Ok(None);
+        }
+        for (position, replacement) in arguments.range(end - needed..end).rev().enumerate() {
+            self.control.step(term.root().index(), self.cancelled)?;
+            let replacement =
+                self.materialize_wire(&replacement.arena, replacement.root, WhnfPhase::Iota)?;
+            // `needed` originated in a u32, and position is strictly below it.
+            let amount = u32::try_from(needed - position - 1).unwrap_or(u32::MAX);
+            let replacement = self.control.term_halt(
+                WhnfPhase::Iota,
+                crate::term::raise_external_bounds_with(
+                    &replacement,
+                    amount,
+                    0,
+                    self.control.budget.materialization,
+                    &mut *self.cancelled,
+                ),
+            )?;
+            term = self.control.term_halt(
+                WhnfPhase::Iota,
+                substitute_bound_subterms_with(
+                    &term,
+                    term.root(),
+                    0,
+                    &replacement,
+                    replacement.root(),
+                    self.control.budget.materialization,
+                    &mut *self.cancelled,
+                ),
+            )?;
+        }
+        Ok(Some(term))
+    }
+
     /// KR-317 (`to_cnstr_when_K`, inductive.h:31): a K-flagged recursor
     /// replaces a stuck major premise with the inductive's nullary
     /// constructor so the ordinary iota rule can fire. The pin gates the
@@ -1102,8 +1224,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// the gate derives the major's domain from the recursor's own telescope
     /// instantiated by the spine (the same place K1's `recursor_major_induct`
     /// reads, tc.rs:3409) and requires the constructor's result type to match
-    /// it structurally. Fail-closed: a gate miss leaves the major stuck,
-    /// never produces a wrong reduction. This is what closes
+    /// it by budgeted structural/applicative WHNF conversion. A gate miss leaves
+    /// the major stuck, never produces a wrong reduction. This is what closes
     /// `cast h a ≡ a` with the proof h a variable (fln-51y8 item 126).
     #[allow(clippy::too_many_arguments)]
     fn recursor_major_to_nullary_constructor(
@@ -1166,39 +1288,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
             return Ok(None);
         };
         Self::validate_child(root, *binder_type)?;
-        let mut domain =
-            self.materialize_wire(&instantiated_type, *binder_type, WhnfPhase::Iota)?;
-        // Substitute the spine's earlier arguments for the dangling binders,
-        // innermost first — the same reverse-substitution discipline as
-        // infer.rs's `materialize_function_subterm`.
-        let facts = self.control.term_halt(
-            WhnfPhase::Iota,
-            inspect_with(
-                &domain,
-                self.control.budget.materialization,
-                &mut *self.cancelled,
-            ),
-        )?;
-        let needed = usize::try_from(facts.external_bound_span).unwrap_or(usize::MAX);
-        if needed > major_index {
+        let domain = self.materialize_wire(&instantiated_type, *binder_type, WhnfPhase::Iota)?;
+        let Some(domain) = self.instantiate_k_slots(domain, arguments, major_index)? else {
             return Ok(None);
-        }
-        let first = major_index - needed;
-        for replacement in arguments.range(first..major_index).rev() {
-            let domain_root = domain.root();
-            domain = self.control.term_halt(
-                WhnfPhase::Iota,
-                substitute_bound_subterms_with(
-                    &domain,
-                    domain_root,
-                    0,
-                    &replacement.arena,
-                    replacement.root,
-                    self.control.budget.materialization,
-                    &mut *self.cancelled,
-                ),
-            )?;
-        }
+        };
         let domain = Arc::new(domain);
         let domain_cursor = Cursor {
             root: domain.root(),
@@ -1269,42 +1362,19 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
         constructor_result =
             self.materialize_wire(&constructor_result, result_root, WhnfPhase::Iota)?;
-        let facts = self.control.term_halt(
-            WhnfPhase::Iota,
-            inspect_with(
-                &constructor_result,
-                self.control.budget.materialization,
-                &mut *self.cancelled,
-            ),
-        )?;
-        let needed = usize::try_from(facts.external_bound_span).unwrap_or(usize::MAX);
-        if needed > parameter_count || needed > domain_args.len() {
+        let Some(constructor_result) =
+            self.instantiate_k_slots(constructor_result, &domain_args, parameter_count)?
+        else {
             return Ok(None);
-        }
-        let first = parameter_count - needed;
-        for replacement in domain_args.range(first..parameter_count).rev() {
-            let result_root = constructor_result.root();
-            constructor_result = self.control.term_halt(
-                WhnfPhase::Iota,
-                substitute_bound_subterms_with(
-                    &constructor_result,
-                    result_root,
-                    0,
-                    &replacement.arena,
-                    replacement.root,
-                    self.control.budget.materialization,
-                    &mut *self.cancelled,
-                ),
-            )?;
-        }
+        };
         let result_cursor = Cursor {
             root: constructor_result.root(),
             arena: Arc::new(constructor_result),
         };
         // The pin's gate: the constructed constructor's type must be defeq to
         // the major's type. Here: the reconstructed result type must match
-        // the spine-derived domain structurally.
-        if !self.structural_cursors_equal(&domain_cursor, &result_cursor)? {
+        // the spine-derived domain by a sufficient checker-owned conversion.
+        if !self.k_constructor_types_equal(&domain_cursor, &result_cursor)? {
             return Ok(None);
         }
         // Build the nullary constructor applied to the domain's parameters.
@@ -1879,6 +1949,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 steps: self.control.steps,
                 reductions: self.control.reductions,
                 delta_reductions: self.delta_reductions,
+                has_auxiliary_work: self.has_auxiliary_work,
                 string_progress: self.string_progress,
             });
         }
@@ -2483,6 +2554,7 @@ fn whnf_at_mode_with(
         unfolded_bindings: BTreeSet::new(),
         delta_mode,
         delta_reductions: 0,
+        has_auxiliary_work: false,
         string_progress: StringExpansionProgress::default(),
         force_string_delta: false,
     };

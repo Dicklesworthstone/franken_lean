@@ -2239,3 +2239,176 @@ fn stuck_recursor_inputs_can_still_be_compared_by_congruence() {
         "an unknown major cannot select the first constructor"
     );
 }
+
+fn k_application(alpha: Expr, left: Expr, right: Expr) -> Expr {
+    [
+        alpha,
+        left,
+        constant("KTestMotive"),
+        constant("KTestMinor"),
+        right,
+        Expr::fvar(FVarId(primary_name("KTestEvidence"))),
+    ]
+    .into_iter()
+    .fold(
+        Expr::const_(Name::from_components(["EqS", "rec"]), vec![Level::one()]),
+        Expr::app,
+    )
+}
+
+#[test]
+fn k_gate_preserves_external_locals_while_consuming_its_telescope() {
+    let context = definition_context(eqs_family_entries());
+    for left in 0..6 {
+        for right in 0..6 {
+            let application = k_application(
+                Expr::bvar(6).unwrap(),
+                Expr::bvar(left).unwrap(),
+                Expr::bvar(right).unwrap(),
+            );
+            let WhnfOutcome::Complete(result) =
+                whnf(&decoded(&application), &context, WhnfBudget::unlimited())
+            else {
+                panic!("K gate must complete for open endpoint pair {left}, {right}");
+            };
+            assert_eq!(
+                root_constant_name(&result.term) == Some(&checker_name("KTestMinor")),
+                left == right,
+                "outer endpoint pair {left}, {right} was captured"
+            );
+        }
+    }
+}
+
+#[test]
+fn k_gate_compares_computed_endpoints_without_capturing_nested_binders() {
+    let context = definition_context(eqs_family_entries());
+    let identity = Expr::lam(
+        primary_name("x"),
+        constant("A"),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let applied = |x| Expr::app(identity.clone(), x);
+    let function = Expr::lam(
+        primary_name("z"),
+        constant("B"),
+        Expr::bvar(2).unwrap(),
+        BinderInfo::Default,
+    );
+    for point in [Expr::bvar(0).unwrap(), Expr::bvar(3).unwrap(), function] {
+        let call = k_application(constant("A"), applied(point.clone()), point);
+        let WhnfOutcome::Complete(result) =
+            whnf(&decoded(&call), &context, WhnfBudget::unlimited())
+        else {
+            panic!("definitionally equal endpoints must finish");
+        };
+        assert_eq!(
+            root_constant_name(&result.term),
+            Some(&checker_name("KTestMinor"))
+        );
+    }
+    let left = applied(Expr::bvar(0).unwrap());
+    let right = applied(Expr::bvar(1).unwrap());
+    let WhnfOutcome::Complete(result) = whnf(
+        &decoded(&k_application(constant("A"), left, right)),
+        &context,
+        WhnfBudget::unlimited(),
+    ) else {
+        panic!("distinct endpoints must remain a completed stuck expression");
+    };
+    assert!(matches!(
+        result.term.node(result.term.root()),
+        Some(ExprNode::Apply { .. })
+    ));
+}
+
+#[test]
+fn k_gate_does_not_unfold_unsafe_or_partial_endpoint_definitions() {
+    for safety in [DefinitionSafety::Unsafe, DefinitionSafety::Partial] {
+        let mut entries = eqs_family_entries();
+        entries.push(definition_entry(
+            "restricted_endpoint",
+            Vec::new(),
+            decoded(&constant("point")),
+            ReducibilityHint::Regular(1),
+            safety,
+        ));
+        let context = definition_context(entries);
+        let call = decoded(&k_application(
+            constant("A"),
+            constant("restricted_endpoint"),
+            constant("point"),
+        ));
+        let WhnfOutcome::Complete(result) = whnf(&call, &context, WhnfBudget::unlimited()) else {
+            panic!("restricted endpoint must remain stuck");
+        };
+        assert!(matches!(
+            result.term.node(result.term.root()),
+            Some(ExprNode::Apply { .. })
+        ));
+    }
+}
+
+#[test]
+fn k_gate_conversion_resource_stops_are_recoverable_nonanswers() {
+    let context = definition_context(eqs_family_entries());
+    let point = Expr::bvar(0).unwrap();
+    let identity = Expr::lam(
+        primary_name("x"),
+        constant("A"),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let call = decoded(&k_application(
+        constant("A"),
+        Expr::app(identity, point.clone()),
+        point,
+    ));
+    let mut small = WhnfBudget::unlimited();
+    small.max_reductions = 0;
+    assert!(matches!(
+        whnf(&call, &context, small),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        whnf_with(&call, &context, WhnfBudget::unlimited(), || true),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    let WhnfOutcome::Complete(result) = whnf(&call, &context, WhnfBudget::unlimited()) else {
+        panic!("fresh budget must recover");
+    };
+    assert_eq!(
+        root_constant_name(&result.term),
+        Some(&checker_name("KTestMinor"))
+    );
+}
+
+#[test]
+fn failed_k_gate_work_does_not_resubmit_an_unchanged_conversion_pair() {
+    let context = definition_context(eqs_family_entries());
+    let identity = Expr::lam(
+        primary_name("x"),
+        constant("A"),
+        Expr::bvar(0).unwrap(),
+        BinderInfo::Default,
+    );
+    let call = decoded(&k_application(
+        constant("A"),
+        Expr::app(identity, Expr::fvar(FVarId(primary_name("pointA")))),
+        Expr::fvar(FVarId(primary_name("pointB"))),
+    ));
+    let mut budget = DefEqBudget::unlimited();
+    budget.max_normalizations = 8;
+    let outcome = def_eq(&call, &decoded(&constant("KTestMinor")), &context, budget);
+    let DefEqOutcome::Deferred { progress, .. } = outcome else {
+        panic!(
+            "an unchanged stuck cast must defer without exhausting the normalization budget: {outcome:?}"
+        );
+    };
+    assert!(
+        progress.whnf_reductions > 0,
+        "the failed gate still accounts for its work"
+    );
+    assert!(progress.normalizations < 8);
+}

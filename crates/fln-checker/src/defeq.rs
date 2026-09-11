@@ -2653,19 +2653,34 @@ fn run_slow(
                     &mut control,
                     cancelled,
                 )?;
-                let left_changed = left_result.reductions != 0;
-                let right_changed = right_result.reductions != 0;
-                if left_changed || right_changed {
-                    let next_left = if left_changed {
-                        retain_generated(&mut generated, DefEqSide::Left, left_result.term)
-                    } else {
-                        left_reference
-                    };
-                    let next_right = if right_changed {
-                        retain_generated(&mut generated, DefEqSide::Right, right_result.term)
-                    } else {
-                        right_reference
-                    };
+                // Auxiliary K-gate reductions count as work, but a failed gate
+                // can leave the compared term unchanged. Do not resubmit that
+                // same pair forever merely because the gate spent reductions.
+                // The zero-shift structural comparison is metered by this query.
+                let mut next_left = left_reference;
+                let mut next_right = right_reference;
+                for (reference, result, next) in [
+                    (left_reference, left_result, &mut next_left),
+                    (right_reference, right_result, &mut next_right),
+                ] {
+                    if result.reductions != 0 {
+                        let candidate =
+                            retain_generated(&mut generated, reference.side(), result.term);
+                        if !result.has_auxiliary_work
+                            || !eta_structurally_equal(
+                                candidate,
+                                reference,
+                                0,
+                                TermSources::new(left, right, &generated),
+                                &mut control,
+                                cancelled,
+                            )?
+                        {
+                            *next = candidate;
+                        }
+                    }
+                }
+                if next_left != left_reference || next_right != right_reference {
                     pending.push((next_left, next_right, offset_context, string_context));
                     continue;
                 }
