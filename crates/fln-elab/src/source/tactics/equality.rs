@@ -103,6 +103,52 @@ impl Context {
         ))
     }
 
+    /// Expose the endpoint of a generated equality cast once its two types
+    /// coincide. This is only a tactic orientation aid: the original equality
+    /// witness and its type remain in the parent transport/checking obligation.
+    /// In particular this does not authorize deleting an ill-typed cast from
+    /// source. K1 and the independent checker still validate the complete term.
+    fn substitution_endpoint(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
+        let rec_name = Name::from_components(["Eq", "rec"]);
+        let Some(fln_env::constants::ConstantInfo::Rec(rec)) = self.txn.env.find(&rec_name) else {
+            return self.whnf(expr);
+        };
+        if !rec.k
+            || rec.is_unsafe
+            || rec.num_params != 2
+            || rec.num_indices != 1
+            || rec.num_motives != 1
+            || rec.num_minors != 1
+            || rec.rules.len() != 1
+            || rec.rules[0].nfields != 0
+        {
+            return self.whnf(expr);
+        }
+        let mut value = self.whnf(expr)?;
+        loop {
+            self.tick()?;
+            let mut head = &value;
+            let mut args = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.tick()?;
+                args.push(a.clone());
+                head = f;
+            }
+            if !matches!(head.node(), ExprNode::Const { name, levels } if name == &rec_name && levels.len() == 2)
+                || args.len() < 6
+            {
+                return Ok(value);
+            }
+            args.reverse();
+            let left = self.whnf(&args[1])?;
+            let right = self.whnf(&args[4])?;
+            if !self.proof_types_match(&left, &right)? {
+                return Ok(value);
+            }
+            value = self.whnf(&args[6..].iter().cloned().fold(args[3].clone(), Expr::app))?;
+        }
+    }
+
     /// Validate an orientation before changing any context. Dependencies hidden
     /// by local let aliases count as occurrences, just like visible occurrences.
     fn substitution_orientation(
@@ -174,6 +220,8 @@ impl Context {
             let Some((level, alpha, left, right)) = equality_target(&type_) else {
                 continue;
             };
+            let left = self.substitution_endpoint(&left)?;
+            let right = self.substitution_endpoint(&right)?;
             for (candidate, replacement, reverse) in [(&left, &right, true), (&right, &left, false)]
             {
                 let ExprNode::FVar { id } = candidate.node() else {

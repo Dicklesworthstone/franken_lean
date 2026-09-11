@@ -28,3 +28,20 @@ theorem transport (A : Type) (P : A -> Prop) (x y : A)
   injection h with same
   subst same
   exact hx
+
+structure Package where
+  carrier : Type
+  value : carrier
+
+theorem package_value (A : Type) (x y : A)
+    (h : Package.mk A x = Package.mk A y) : x = y := by
+  injection h with sameType sameValue
+  exact sameValue
+
+theorem package_transport (P : forall A : Type, A -> Prop)
+    (A B : Type) (x : A) (y : B) (hx : P A x)
+    (h : Package.mk A x = Package.mk B y) : P B y := by
+  injection h with sameType sameValue
+  subst sameType
+  subst sameValue
+  exact hx

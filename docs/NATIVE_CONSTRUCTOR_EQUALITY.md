@@ -21,8 +21,8 @@ def impossible (x : Nat) (h : 0 = Nat.succ x) : String := by
 
 ## Proof construction
 
-There is no new axiom, no trusted no-confusion primitive, and no semantic change
-in either checker. The tactic constructs an ordinary admitted recursor whose
+There is no new axiom, trusted no-confusion primitive, or admission authority.
+The tactic constructs an ordinary admitted recursor whose
 branches select a field, using the actual left field as the other branches'
 fallback. Applying `Eq.rec` to the supplied equality proves equality of those
 selected values. Recursive hypotheses in the selector are bound but not used.
@@ -39,16 +39,56 @@ existential witnesses or distinguish disjunction evidence. Only the admitted
 single-family, non-nested, direct-recursion lane is selected. Malformed source,
 unsupported operations and failed files publish no successful environment prefix.
 
-## Scope
+## Dependent fields and equality transport
 
-A selector must have a fixed result type under its whole constructor telescope.
-Fields depending on another constructor field cannot in general use such a
-selector. They are not silently cast or assigned a homogeneous equality. The
-current tactic returns only independently selectable, same-typed fields, in
-original order. For example, vector indices and element payloads can be selected,
-while the length-dependent tail generally cannot. Full heterogeneous dependent
-injection, index-equation refinement and generated `noConfusion` declarations
-remain separate work.
+A field whose type depends on preceding fields is selected with two recursors:
+a type selector `D : F -> Sort u` and a value selector `d : (x : F) -> D x`,
+both generalized over the family's indices. Equality induction produces
+`cast (congrArg D h) (d left) = d right`. This is a homogeneous equality at the
+right-hand field's type, with the actual type-equality transport retained in its
+proof. It is not an unchecked heterogeneous comparison.
+
+When the field domains are already convertible, the admitted equality K rule
+makes the cast the identity and the tactic exposes the ordinary field equality.
+This includes vector tails and data payloads of dependent records. Otherwise the
+cast remains explicit. After substituting the preceding type equation, `subst`
+can recognize a now-reflexive cast and solve the payload equation while retaining
+the original witness in the parent proof:
+
+```lean
+structure Package where
+  carrier : Type
+  value : carrier
+
+theorem package_transport (P : forall A : Type, A -> Prop)
+    (A B : Type) (x : A) (y : B) (hx : P A x)
+    (h : Package.mk A x = Package.mk B y) : P B y := by
+  injection h with sameType sameValue
+  subst sameType
+  subst sameValue
+  exact hx
+```
+
+Dependent proof-valued fields which need this selector construction are omitted;
+they are not data injectivity goals. Families in `Prop` remain excluded entirely.
+This does not introduce general heterogeneous-equality syntax, generated
+`noConfusion` declarations, or full fixed/repeated-index elimination.
+
+## Independent cast conversion
+
+The checker's existing equality K reduction now consumes telescope arguments
+capture-avoidantly: replacements are lifted over the remaining slots before
+substitution. Open variables inside inserted arguments cannot be rewritten by a
+later slot substitution. A metered application-congruence check can reduce
+computed endpoint types by checker-owned weak-head reduction. Binder bodies which
+would require a shifted context stay on the structural-only path. Unsafe and
+partial definitions remain closed.
+
+Work spent by a failed K gate remains charged, but is no longer mistaken for a
+change to the compared term. The conversion worklist detects a zero-shift
+structurally unchanged result instead of retrying the same stuck cast until the
+budget expires. Distinct endpoints still remain stuck; neither resource
+exhaustion nor failure of the sufficient conversion check implies equality.
 
 ## Automatic contradiction
 
@@ -72,6 +112,7 @@ registered in the environment.
 fln check-source --json examples/native_constructor_equality.lean
 ```
 
-The example includes dependent transport obtained by combining `injection` and
-`subst`, as well as record fields, nested clashes and a 129-bit Nat contradiction.
+The example includes dependent transport across differing payload types, obtained
+by combining `injection` and `subst`, as well as record fields, nested clashes and
+a 129-bit Nat contradiction.
 This is bounded constructive reasoning, not a complete contradiction solver.

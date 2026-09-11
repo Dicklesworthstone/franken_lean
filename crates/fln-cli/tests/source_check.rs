@@ -1123,7 +1123,7 @@ fn installed_constructor_equality_checks_real_proofs_and_failure_isolation() {
         );
         if success {
             let json = String::from_utf8(output.stdout).unwrap();
-            for required in ["\"commands\":8", "\"theorems\":5", "\"executed\":false"] {
+            for required in ["\"commands\":11", "\"theorems\":7", "\"executed\":false"] {
                 assert!(json.contains(required), "{json}");
             }
         } else {

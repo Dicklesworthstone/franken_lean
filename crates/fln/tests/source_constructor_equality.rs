@@ -157,3 +157,51 @@ fn injected_equalities_feed_dependent_substitution() {
         "theorem transported (A : Type) (P : A -> Prop) (x y : A) (hx : P x) (h : Inhabited.mk x = Inhabited.mk y) : P y := by injection h with same; subst same; exact hx",
     );
 }
+
+#[test]
+fn dependent_record_payloads_are_injected_through_checked_type_transport() {
+    check(
+        "structure Package where\n  carrier : Type\n  value : carrier\n theorem values (A : Type) (x y : A) (h : Package.mk A x = Package.mk A y) : x = y := by injection h with types values; exact values",
+    );
+}
+#[test]
+fn indexed_recursive_payloads_retain_their_dependent_field_domains() {
+    check(
+        "inductive Vec (A : Type) : Nat -> Type where\n  | nil : Vec A 0\n  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n theorem tails (A : Type) (n : Nat) (a b : A) (xs ys : Vec A n) (h : Vec.cons n a xs = Vec.cons n b ys) : xs = ys := by injection h with lengths heads tails; exact tails",
+    );
+}
+#[test]
+fn dependent_fields_support_other_constructor_fallbacks() {
+    check(
+        "inductive Package where\n  | none\n  | pack (carrier : Type) (value : carrier)\n theorem values (A : Type) (x y : A) (h : Package.pack A x = Package.pack A y) : x = y := by injection h with types values; exact values",
+    );
+}
+
+#[test]
+fn dependent_payload_equalities_survive_substitution_of_their_type_equation() {
+    check(
+        "structure Package where\n  carrier : Type\n  value : carrier\n theorem transport (P : forall A : Type, A -> Prop) (A B : Type) (x : A) (y : B) (hx : P A x) (h : Package.mk A x = Package.mk B y) : P B y := by injection h with sameType sameValue; subst sameType; subst sameValue; exact hx",
+    );
+}
+#[test]
+fn dependent_field_casts_cannot_equate_unrelated_values_or_erase_obligations() {
+    for source in [
+        "structure Package where\n  carrier : Type\n  value : carrier\n theorem bad (A : Type) (x y : A) (h : Package.mk A x = Package.mk A y) : 0 = 1 := by injection h with types values; rfl",
+        "structure Package where\n  carrier : Type\n  value : carrier\n theorem bad (A : Type) (x y : A) (h : Package.mk A x = Package.mk A y) : x = y := by injection h with types values; exact (fun ignored => values) (0 : String)",
+        "structure Package where\n  carrier : Type\n  value : carrier\n theorem bad (h : Package.mk Nat 0 = Package.mk Nat 0) : 0 = 1 := by contradiction",
+    ] {
+        refuse(source);
+    }
+}
+#[test]
+fn contradiction_can_reach_a_dependent_payload_after_checked_cast_reduction() {
+    check(
+        "structure Package where\n  carrier : Type\n  value : carrier\n theorem impossible (h : Package.mk Nat 0 = Package.mk Nat 1) : 7 = 9 := by contradiction",
+    );
+}
+#[test]
+fn proof_fields_of_data_records_remain_typed_during_injection() {
+    check(
+        "structure Evidence (A : Type) (P : A -> Prop) where\n  value : A\n  witness : P value\n theorem values (A : Type) (P : A -> Prop) (x y : A) (px : P x) (py : P y) (h : Evidence.mk x px = Evidence.mk y py) : x = y := by injection h with same; exact same",
+    );
+}

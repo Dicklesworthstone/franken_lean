@@ -28,6 +28,11 @@ enum Selection<'a> {
         index: usize,
         fallback: &'a Expr,
     },
+    FieldType {
+        ctor: &'a Name,
+        index: usize,
+        fallback: &'a Expr,
+    },
     Tag {
         ctor: &'a Name,
         selected: &'a Expr,
@@ -230,8 +235,22 @@ impl Context {
         codomain: &Expr,
         selection: Selection<'_>,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        Ok(self
+            .equality_selector_general(family, codomain, selection, None)?
+            .map(|function| family.indices.iter().cloned().fold(function, Expr::app)))
+    }
+
+    /// Return a selector still generalized over its indices. The value selector
+    /// can use a separately constructed type selector as its dependent motive.
+    fn equality_selector_general(
+        &mut self,
+        family: &Family,
+        codomain: &Expr,
+        selection: Selection<'_>,
+        motive: Option<Expr>,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let saved = self.txn.lctx.clone();
-        let result = self.equality_selector_inner(family, codomain, selection);
+        let result = self.equality_selector_inner(family, codomain, selection, motive);
         self.txn.lctx = saved;
         result
     }
@@ -241,6 +260,7 @@ impl Context {
         family: &Family,
         codomain: &Expr,
         selection: Selection<'_>,
+        dependent_motive: Option<Expr>,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let Some(type_) = self.known_type(codomain)? else {
             return Ok(None);
@@ -264,15 +284,20 @@ impl Context {
             return Ok(None);
         };
         let saved = self.txn.lctx.clone();
-        let mut motive_type = binder_type.clone();
-        let mut binders = Vec::new();
-        for _ in 0..=family.family.num_indices {
-            binders.push(self.equality_open(&mut motive_type)?);
-        }
-        let mut motive = codomain.clone();
-        for binder in binders.iter().rev() {
-            motive = self.close_equality_binder(binder, motive, true)?;
-        }
+        let motive = if let Some(motive) = dependent_motive {
+            motive
+        } else {
+            let mut motive_type = binder_type.clone();
+            let mut binders = Vec::new();
+            for _ in 0..=family.family.num_indices {
+                binders.push(self.equality_open(&mut motive_type)?);
+            }
+            let mut motive = codomain.clone();
+            for binder in binders.iter().rev() {
+                motive = self.close_equality_binder(binder, motive, true)?;
+            }
+            motive
+        };
         self.txn.lctx = saved.clone();
         function = self.equality_apply(function, motive)?;
         let mut seen = HashSet::new();
@@ -311,12 +336,17 @@ impl Context {
                     let Some(field) = binders.get(*index) else {
                         return Ok(None);
                     };
-                    if !self.proof_types_match(&field.type_, codomain)? {
-                        return Ok(None);
-                    }
                     Expr::fvar(field.id.clone())
                 }
-                Selection::Field { fallback, .. } => (*fallback).clone(),
+                Selection::FieldType { ctor, index, .. } if *ctor == &rule.ctor => {
+                    let Some(field) = binders.get(*index) else {
+                        return Ok(None);
+                    };
+                    field.type_.clone()
+                }
+                Selection::Field { fallback, .. } | Selection::FieldType { fallback, .. } => {
+                    (*fallback).clone()
+                }
                 Selection::Tag {
                     ctor,
                     selected,
@@ -332,15 +362,22 @@ impl Context {
             for _ in 0..recursive {
                 binders.push(self.equality_open(&mut minor_type)?);
             }
+            // Compare only after opening the hypotheses: the minor result can
+            // be a computation of the type selector on this constructor.
+            let Some(actual_type) = self.known_type(&value)? else {
+                return Ok(None);
+            };
+            let actual_type = self.whnf(&actual_type)?;
+            let expected_type = self.whnf(&minor_type)?;
+            if !self.proof_types_match(&actual_type, &expected_type)? {
+                return Ok(None);
+            }
             let mut minor = value;
             for binder in binders.iter().rev() {
                 minor = self.close_equality_binder(binder, minor, true)?;
             }
             self.txn.lctx = saved.clone();
             function = self.equality_apply(function, minor)?;
-        }
-        for index in &family.indices {
-            function = self.equality_apply(function, index.clone())?;
         }
         Ok(Some(function.value))
     }
@@ -420,7 +457,7 @@ impl Context {
         let field = &left.fields[index];
         let other = &right.fields[index];
         if !self.proof_types_match(&field.type_, &other.type_)? {
-            return Ok(None);
+            return self.dependent_constructor_field_equality(equality, family, left, right, index);
         }
         let Some(selector) = self.equality_selector(
             family,
@@ -432,7 +469,28 @@ impl Context {
             },
         )?
         else {
-            return Ok(None);
+            let Some(mut derived) =
+                self.dependent_constructor_field_equality(equality, family, left, right, index)?
+            else {
+                return Ok(None);
+            };
+            // The domains were checked convertible above. Eq's admitted K rule
+            // makes this cast the identity; keep its evidence in the value and
+            // expose the useful homogeneous equation to later tactics.
+            let Some(type_) = self.known_type(&field.type_)? else {
+                return Ok(None);
+            };
+            let level = self.sort_level(&Typed {
+                value: field.type_.clone(),
+                type_,
+            })?;
+            derived.type_ = equality::equation(
+                level,
+                field.type_.clone(),
+                field.value.clone(),
+                other.value.clone(),
+            );
+            return Ok(Some(derived));
         };
         let Some(type_) = self.known_type(&field.type_)? else {
             return Ok(None);
@@ -457,6 +515,193 @@ impl Context {
                 universe,
                 field.type_.clone(),
                 field.value.clone(),
+                other.value.clone(),
+            ),
+        }))
+    }
+
+    /// Congruence under a nondependent function, retaining the supplied evidence.
+    fn selector_congruence(
+        &mut self,
+        equality: &Typed,
+        codomain: &Expr,
+        universe: &Level,
+        selector: &Expr,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let type_ = self.whnf(&equality.type_)?;
+        let (_, alpha, left, right) =
+            equality_target(&type_).ok_or_else(|| error(TacticError::ExpectedEquality))?;
+        let selected_left = Expr::app(selector.clone(), left);
+        let selected_right = Expr::app(selector.clone(), right);
+        let endpoint = self.equality_local(alpha)?;
+        let result = equality::equation(
+            universe.clone(),
+            codomain.clone(),
+            selected_left.clone(),
+            Expr::app(selector.clone(), Expr::fvar(endpoint.id.clone())),
+        );
+        let motive = self.close_equality_binder(&endpoint, result, true)?;
+        let base = equality::reflexivity(universe.clone(), codomain.clone(), selected_left.clone());
+        Ok(Typed {
+            value: self.equality_transport(equality, &motive, base, Level::zero())?,
+            type_: equality::equation(
+                universe.clone(),
+                codomain.clone(),
+                selected_left,
+                selected_right,
+            ),
+        })
+    }
+
+    /// Cast through an equality of types using the identity type family. This
+    /// is an ordinary Eq.rec, including its actual type-equality evidence.
+    fn cast_constructor_field(
+        &mut self,
+        type_equality: &Typed,
+        value: Expr,
+        universe: &Level,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let type_local = self.equality_local(Expr::sort(universe.clone()))?;
+        let motive =
+            self.close_equality_binder(&type_local, Expr::fvar(type_local.id.clone()), true)?;
+        self.equality_transport(type_equality, &motive, value, universe.clone())
+    }
+
+    /// A dependent field cannot be extracted with a constant-codomain selector.
+    /// Instead construct a type selector D and a value selector d : (x : F) -> D x.
+    /// Equality induction gives cast (congrArg D h) (d left) = d right. The cast
+    /// remains in the hypothesis unless checked conversion can eliminate it;
+    /// in particular, values of unrelated types are never compared directly.
+    fn dependent_constructor_field_equality(
+        &mut self,
+        equality: &Typed,
+        family: &Family,
+        left: &Constructor,
+        right: &Constructor,
+        index: usize,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let field = &left.fields[index];
+        let other = &right.fields[index];
+        let Some(type_) = self.known_type(&field.type_)? else {
+            return Ok(None);
+        };
+        let universe = self.sort_level(&Typed {
+            value: field.type_.clone(),
+            type_,
+        })?;
+        if universe == Level::zero() {
+            return Ok(None);
+        }
+        let Some(type_) = self.known_type(&other.type_)? else {
+            return Ok(None);
+        };
+        if self.sort_level(&Typed {
+            value: other.type_.clone(),
+            type_,
+        })? != universe
+        {
+            return Ok(None);
+        }
+        let sort = Expr::sort(universe.clone());
+        let Some(general_type_selector) = self.equality_selector_general(
+            family,
+            &sort,
+            Selection::FieldType {
+                ctor: &left.name,
+                index,
+                fallback: &field.type_,
+            },
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(general_value_selector) = self.equality_selector_general(
+            family,
+            &field.type_,
+            Selection::Field {
+                ctor: &left.name,
+                index,
+                fallback: &field.value,
+            },
+            Some(general_type_selector.clone()),
+        )?
+        else {
+            return Ok(None);
+        };
+        let type_selector = family
+            .indices
+            .iter()
+            .cloned()
+            .fold(general_type_selector, Expr::app);
+        let value_selector = family
+            .indices
+            .iter()
+            .cloned()
+            .fold(general_value_selector, Expr::app);
+        let target = self.whnf(&equality.type_)?;
+        let (family_level, _, left_endpoint, right_endpoint) =
+            equality_target(&target).ok_or_else(|| error(TacticError::ExpectedEquality))?;
+        let endpoint = self.equality_local(family.type_.clone())?;
+        let endpoint_value = Expr::fvar(endpoint.id.clone());
+        let witness = self.equality_local(equality::equation(
+            family_level.clone(),
+            family.type_.clone(),
+            left_endpoint.clone(),
+            endpoint_value.clone(),
+        ))?;
+        let abstract_equality = Typed {
+            value: Expr::fvar(witness.id.clone()),
+            type_: witness.type_.clone(),
+        };
+        let sort_universe = universe
+            .clone()
+            .succ()
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let type_equality =
+            self.selector_congruence(&abstract_equality, &sort, &sort_universe, &type_selector)?;
+        let selected_left = Expr::app(value_selector.clone(), left_endpoint.clone());
+        let transported =
+            self.cast_constructor_field(&type_equality, selected_left.clone(), &universe)?;
+        let motive_result = equality::equation(
+            universe.clone(),
+            Expr::app(type_selector.clone(), endpoint_value.clone()),
+            transported,
+            Expr::app(value_selector.clone(), endpoint_value),
+        );
+        let motive = self.close_equality_binder(&witness, motive_result, true)?;
+        let motive = self.close_equality_binder(&endpoint, motive, true)?;
+        let base = equality::reflexivity(
+            universe.clone(),
+            Expr::app(type_selector.clone(), left_endpoint.clone()),
+            selected_left.clone(),
+        );
+        let value = [
+            family.type_.clone(),
+            left_endpoint,
+            motive,
+            base,
+            right_endpoint,
+            equality.value.clone(),
+        ]
+        .into_iter()
+        .fold(
+            Expr::const_(
+                Name::from_components(["Eq", "rec"]),
+                vec![Level::zero(), family_level],
+            ),
+            Expr::app,
+        );
+        let actual_type_equality =
+            self.selector_congruence(equality, &sort, &sort_universe, &type_selector)?;
+        let transported =
+            self.cast_constructor_field(&actual_type_equality, selected_left, &universe)?;
+        Ok(Some(Typed {
+            value,
+            type_: equality::equation(
+                universe,
+                other.type_.clone(),
+                transported,
                 other.value.clone(),
             ),
         }))
