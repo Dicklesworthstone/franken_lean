@@ -64,6 +64,7 @@ struct DirectMatch<'a> {
 pub(super) struct MatchBuild<'a> {
     direct: Option<DirectMatch<'a>>,
     recursive: bool,
+    unrefined_capture: bool,
     saved: LocalContext,
     target: Expr,
     major: Typed,
@@ -77,6 +78,10 @@ pub(super) struct MatchBuild<'a> {
     branches: std::collections::VecDeque<Branch<'a>>,
 }
 pub(super) struct BranchBinders {
+    // Old indices whose direct field patterns lack an index-equation witness.
+    // A branch may use the fresh constructor fields, but not capture these
+    // original locals (including transitively through retained lets/types).
+    unrefined: HashSet<FVarId>,
     hypotheses: Vec<(FVarId, FVarId)>,
     locals: Vec<LocalDecl>,
     type_: Expr,
@@ -345,6 +350,7 @@ impl Context {
                         whole,
                     }),
                     recursive,
+                    unrefined_capture: false,
                     saved: self.txn.lctx.clone(),
                     target,
                     major: major.clone(),
@@ -603,6 +609,7 @@ impl Context {
         Ok(MatchBuild {
             direct: None,
             recursive,
+            unrefined_capture: false,
             saved: self.txn.lctx.clone(),
             target,
             major,
@@ -716,6 +723,7 @@ impl Context {
                 syntax,
                 expected: state.target.clone(),
                 binders: BranchBinders {
+                    unrefined: HashSet::new(),
                     hypotheses: Vec::new(),
                     locals: vec![self.txn.lctx.find(&id).expect("whole-match binder").clone()],
                     type_: state.target.clone(),
@@ -723,6 +731,9 @@ impl Context {
             });
         }
         let Some(branch) = state.branches.pop_front() else {
+            if state.unrefined_capture {
+                return Err(error(MatchError::UnrefinedIndexPattern));
+            }
             let mut result = state.recursor.clone();
             for index in &state.indices {
                 result = self.match_apply(
@@ -841,27 +852,26 @@ impl Context {
         {
             return Err(error(MatchError::WrongArity));
         }
+        let mut unrefined = HashSet::new();
         if !state.indices.is_empty() {
             let constructor_type = self
                 .known_type(&constructor)?
                 .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
-            for index in self.elimination_result_indices(
+            for (original, index) in state.indices.iter().zip(self.elimination_result_indices(
                 &constructor_type,
                 &state.family,
                 state.parameters.len(),
                 state.indices.len(),
-            )? {
+            )?) {
                 let index = self.whnf(&index)?;
-                // A bare field index may stay fixed during pattern inference;
-                // its wildcard does not authorize generalizing the old context.
-                // Until that refinement state is tracked, refuse this shape
-                // for named and wildcard patterns alike. This also deliberately
-                // refuses some valid mixed/alias patterns rather than guessing
-                // which indices the Reference generalized.
+                // No equation relates this fresh field to the outer index.
+                // Preserve that boundary by checking what the elaborated branch
+                // actually captures, instead of refusing every branch of the
+                // family (which also blocked correctly refined recursion).
                 if let ExprNode::FVar { id } = index.node()
                     && locals.iter().any(|local| &local.id == id)
                 {
-                    return Err(error(MatchError::UnrefinedIndexPattern));
+                    unrefined.insert(original.id.clone());
                 }
             }
         }
@@ -1014,6 +1024,7 @@ impl Context {
             syntax: branch.syntax,
             expected,
             binders: BranchBinders {
+                unrefined,
                 hypotheses,
                 locals,
                 type_: minor_type.clone(),
@@ -1050,6 +1061,30 @@ impl Context {
             } else {
                 Expr::lam(local.user_name, domain, value, local.binder_info)
             };
+        }
+        if !binders.unrefined.is_empty() {
+            let mut pending: Vec<_> = self.elimination_reads(&value)?.into_iter().collect();
+            let mut seen = HashSet::new();
+            while let Some(id) = pending.pop() {
+                self.tick()?;
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if binders.unrefined.contains(&id) {
+                    // Finish the other branches first. An actual unresolved
+                    // self-reference there must still select the existing
+                    // recursive elaboration retry, which rebinds the indices.
+                    // A nonrecursive match still refuses before completion.
+                    state.unrefined_capture = true;
+                    break;
+                }
+                if let Some(local) = state.saved.find(&id) {
+                    pending.extend(self.elimination_reads(&local.type_)?);
+                    if let Some(value) = &local.value {
+                        pending.extend(self.elimination_reads(value)?);
+                    }
+                }
+            }
         }
         self.txn.lctx = state.saved.clone();
         if state.direct.is_some() {

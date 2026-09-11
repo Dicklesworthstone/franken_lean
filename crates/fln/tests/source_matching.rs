@@ -576,3 +576,41 @@ fn indexed_matches_preserve_index_order_and_refuse_unimplemented_pattern_refinem
         assert_eq!(e.logical_root(&KVMap::new()), root);
     }
 }
+
+#[test]
+fn direct_field_index_branches_can_use_only_the_refined_fields() {
+    check(
+        "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 3 7 (Cell.make 3 7) = 37 := by rfl",
+    );
+    check(
+        "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\ndef shadow (n : Nat) (cell : Cell n) : Nat := match cell with | .make n => n\ntheorem checked : shadow 9 (Cell.make 9) = 9 := by rfl",
+    );
+}
+
+#[test]
+fn unrefined_field_indices_cannot_escape_through_aliases_or_unused_arguments() {
+    for body in [
+        "let captured := n; match cell with | .make x => captured",
+        "let identity : Nat -> Nat := fun z => z; match cell with | .make x => identity n",
+        "match cell with | .make x => let unused := n; x",
+    ] {
+        let source = format!(
+            "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\ndef bad (n : Nat) (cell : Cell n) : Nat := {body}"
+        );
+        let e = engine();
+        let root = e.logical_root(&KVMap::new());
+        let error = e
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .expect_err("old index capture requires an equation witness");
+        assert!(
+            error.to_string().contains("index-pattern refinement"),
+            "{error:?}"
+        );
+        assert!(!error.disposition().1);
+        assert_eq!(e.logical_root(&KVMap::new()), root);
+    }
+}
