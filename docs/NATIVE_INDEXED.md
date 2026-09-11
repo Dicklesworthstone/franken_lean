@@ -16,7 +16,7 @@ def two : Vec Nat 2 := Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)
 ```
 
 The expression after the colon in the family declaration is an index telescope
-ending in a positive sort. Constructor result signatures must supply exactly its
+ending in a positive sort or `Prop`. Constructor result signatures must supply exactly its
 indices. A constructor field is a recursive child only when its head is the same
 family applied to the unchanged parameters and its own index expressions. Negative,
 nested, higher-order and nonuniform recursion are refused. A recursive occurrence
@@ -101,12 +101,15 @@ Constructor matches with fixed/repeated indices or inaccessible patterns remain
 unsupported. These are bounded source capabilities, not generated-matcher
 name parity or full Lean match elaboration.
 
-Constructor result indices that reduce directly to a constructor field are also
-refused, including wildcard and mixed patterns. Those fields can require keeping
-an index fixed rather than generalizing it. Some such patterns are valid Lean;
-this lane reports its missing refinement explicitly. Constructor-shaped indices
-such as a vector's successor length, and fixed family-parameter indices, are
-supported. Before generalizing dependent arguments, the original index motive is
+Constructor result indices that reduce directly to fields permit branches using
+those fresh fields. Reading a corresponding original index without an equation
+witness remains a typed refusal, including through retained aliases, local types
+and unused arguments. This capture audit finishes all branches before refusing so
+an actual unresolved recursive self-reference can select the existing structural
+recursion retry, which rebinds the index names to constructor results. It does not
+invent index equations or expose ordinary-match induction hypotheses.
+Constructor-shaped indices such as a vector's successor length, and fixed
+family-parameter indices, remain supported. Before generalizing dependent arguments, the original index motive is
 retained as a checked typing obligation, so generalization cannot hide an
 ill-typed captured dependency.
 
@@ -156,9 +159,10 @@ The current recursive source lane uses distinct header-parameter indices and an
 explicit result type. Fixed/repeated indices, grandchildren, mutual recursion,
 well-founded measures and equation-style definitions remain outside this lane.
 
-Prop-valued indexed family
-admission, mutual/nested families, inaccessible patterns, index-equation solving
-and explicit source universe declarations remain incomplete. Quantifier syntax
+Prop-valued indexed families with direct recursion are supported with independently
+checked small/singleton elimination; see [NATIVE_PROPOSITIONS.md](NATIVE_PROPOSITIONS.md).
+Mutual/nested families, inaccessible patterns, index-equation solving and explicit
+source universe declarations remain incomplete. Quantifier syntax
 currently requires explicit unparenthesized typed names; grouped binder forms and
 inferred-domain quantifiers remain unsupported.
 

@@ -70,7 +70,7 @@ fn wrong_results_negative_recursion_and_unresolved_domains_do_not_publish() {
         "inductive Bad : Type where | package (A : Type)",
         "inductive Bad where | constructor (x : Missing)",
         "inductive Bad where | constructor (x : _)",
-        "inductive Bad : Prop where | constructor",
+        "inductive Bad : Prop where | constructor (f : Bad -> Nat)",
         "inductive Bad (A : Type) where | constructor : Bad Nat",
     ] {
         assert!(

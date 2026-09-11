@@ -7809,11 +7809,14 @@ pub fn admit_inductive_with(
     // Positive parameterized families share one constructor-derived judgment,
     // independently of the claimed recursive flag. In particular a false flag
     // cannot hide a recursive occurrence in a class-shaped declaration.
-    if (metadata.num_parameters() > 0 || metadata.num_indices() > 0)
-        && metadata
-            .num_parameters()
-            .checked_add(metadata.num_indices())
-            .is_some_and(|count| uniform::positive_result(declaration, count))
+    if metadata
+        .num_parameters()
+        .checked_add(metadata.num_indices())
+        .is_some_and(|count| {
+            uniform::proposition_result(declaration, count)
+                || ((metadata.num_parameters() > 0 || metadata.num_indices() > 0)
+                    && uniform::positive_result(declaration, count))
+        })
     {
         return uniform::admit(
             environment,

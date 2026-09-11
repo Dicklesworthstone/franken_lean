@@ -1,7 +1,9 @@
 //! Source constructor telescopes are elaborated in isolated local contexts.
 //! The provisional family is a local type parameter, never an unchecked global.
 use super::*;
-use crate::inductive::{ConstructorSpec, InductiveError, InductiveSpec, inductive_declaration};
+use crate::inductive::{
+    ConstructorSpec, InductiveError, InductiveSpec, inductive_with_field_universes,
+};
 use crate::records::{Builder, RecordBudget};
 
 pub fn is_inductive(syntax: &Syntax) -> bool {
@@ -189,7 +191,9 @@ pub fn elaborate_inductive(
     };
     context.txn.lctx = parameter_context;
     let provisional = explicit.clone().unwrap_or_else(Level::one);
-    if !provisional.is_never_zero() || provisional.has_mvar() {
+    if (!provisional.is_never_zero() && !provisional.normalize_fixpoint().is_zero())
+        || provisional.has_mvar()
+    {
         return Err(failure(SourceInferenceError::Inductive(
             InductiveError::UnsupportedSort,
         )));
@@ -215,6 +219,7 @@ pub fn elaborate_inductive(
         Expr::app(f, Expr::fvar(p.id.clone()))
     });
     let mut constructors = Vec::new();
+    let mut field_universes = Vec::new();
     let mut annotations = Vec::new();
     let mut inferred = Level::one();
     let mut count = parameters.len().saturating_add(indices.len());
@@ -333,6 +338,7 @@ pub fn elaborate_inductive(
         if count > budget.max_binders {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
+        let mut universes = Vec::with_capacity(fields.len());
         for field in &mut fields {
             let domain = context.instantiate(&field.type_)?;
             let ty = context.known_type(&domain)?.ok_or_else(invalid)?;
@@ -341,6 +347,7 @@ pub fn elaborate_inductive(
                 type_: ty,
             })?;
             let universe = context.sort_level(&completed)?;
+            universes.push(universe.clone());
             inferred = Level::max(inferred, universe).map_err(|_| invalid())?;
             // Replace only the provisional family identity. Parameter and field
             // locals stay available for the candidate builder to close exactly.
@@ -360,6 +367,7 @@ pub fn elaborate_inductive(
                 .subst_loose(0, &[Expr::const_(name.clone(), vec![])])
                 .map_err(|_| invalid())?;
         }
+        field_universes.push(universes);
         constructors.push(ConstructorSpec {
             name: ctor_name.clone(),
             fields,
@@ -418,6 +426,6 @@ pub fn elaborate_inductive(
         constructors,
         result_level,
     };
-    inductive_declaration(&specification, budget)
+    inductive_with_field_universes(&specification, budget, &field_universes)
         .map_err(|e| failure(SourceInferenceError::Inductive(e)))
 }

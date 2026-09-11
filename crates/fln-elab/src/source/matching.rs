@@ -306,8 +306,9 @@ impl Context {
             || rec.num_minors as usize != family.ctors.len()
             || rec.rules.len() != family.ctors.len()
             || rec.all != family.all
-            || rec.base.level_params.len() != levels.len() + 1
-            || rec.base.level_params[1..] != family.base.level_params
+            || !(rec.base.level_params == family.base.level_params
+                || (rec.base.level_params.len() == levels.len() + 1
+                    && rec.base.level_params[1..] == family.base.level_params))
         {
             return Err(error(MatchError::UnsupportedFamily));
         }
@@ -454,7 +455,11 @@ impl Context {
         let motive_type = self
             .known_type(&motive)?
             .ok_or_else(|| error(MatchError::ExpectedInductive))?;
-        let mut rec_levels = vec![universe];
+        let mut rec_levels = if rec.base.level_params == family.base.level_params {
+            Vec::new()
+        } else {
+            vec![universe]
+        };
         rec_levels.extend(levels.iter().cloned());
         let mut recursor = Typed {
             value: Expr::const_(recursor_name, rec_levels.clone()),

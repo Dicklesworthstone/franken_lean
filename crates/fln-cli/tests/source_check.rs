@@ -1061,3 +1061,43 @@ fn installed_binary_checks_dependent_index_recursion_and_retains_failure_isolati
         }
     }
 }
+
+#[test]
+fn installed_binary_checks_inductive_propositions_and_atomic_refusals() {
+    let prefix = file(include_str!("../../../examples/native_propositions.lean"));
+    let before = std::fs::read(&prefix).unwrap();
+    let bad = file("theorem impossible : Below 3 0 := Below.refl");
+    let extract = file(
+        "def witness (A : Type) (P : A -> Prop) (h : HasWitness A P) : A := by cases h with | intro a hp => exact a",
+    );
+    for suffix in [None, Some(&bad), Some(&extract), None] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if let Some(path) = suffix {
+            command.arg(path);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            suffix.is_none(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if suffix.is_none() {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":15",
+                "\"theorems\":7",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}

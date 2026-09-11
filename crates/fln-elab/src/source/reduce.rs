@@ -295,7 +295,15 @@ impl Context {
         {
             return Ok(None);
         }
-        if levels.len() != constructor_levels.len() + 1 || levels[1..] != constructor_levels {
+        let compatible = if recursor.base.level_params == family.base.level_params {
+            *levels == constructor_levels
+        } else {
+            recursor.base.level_params.len() == family.base.level_params.len() + 1
+                && recursor.base.level_params[1..] == family.base.level_params
+                && levels.len() == constructor_levels.len() + 1
+                && levels[1..] == constructor_levels
+        };
+        if !compatible {
             return Ok(None);
         }
         let Some(rule) = recursor

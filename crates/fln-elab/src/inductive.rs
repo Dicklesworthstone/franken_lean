@@ -48,7 +48,9 @@ impl std::fmt::Display for InductiveError {
             Self::InvalidName => "invalid algebraic data type or constructor name",
             Self::DuplicateConstructor => "duplicate constructor name",
             Self::InvalidTelescope => "constructor escapes its telescope or has unresolved types",
-            Self::UnsupportedSort => "algebraic data type requires a positive result universe",
+            Self::UnsupportedSort => {
+                "inductive result sort or field elimination universes are unresolved"
+            }
             Self::UnsupportedRecursion => {
                 "only direct uniform recursive constructor fields are supported"
             }
@@ -121,6 +123,25 @@ pub fn inductive_declaration(
     spec: &InductiveSpec,
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
+    build_inductive(spec, budget, None)
+}
+
+/// Field universes inform candidate generation only. Both admission engines
+/// independently infer them and reconstruct the permitted elimination level.
+/// Source elaboration supplies these before replacing its provisional family.
+pub(crate) fn inductive_with_field_universes(
+    spec: &InductiveSpec,
+    budget: RecordBudget,
+    field_universes: &[Vec<Level>],
+) -> Result<Declaration, InductiveError> {
+    build_inductive(spec, budget, Some(field_universes))
+}
+
+fn build_inductive(
+    spec: &InductiveSpec,
+    budget: RecordBudget,
+    field_universes: Option<&[Vec<Level>]>,
+) -> Result<Declaration, InductiveError> {
     if spec.name.is_anonymous() {
         return Err(InductiveError::InvalidName);
     }
@@ -139,9 +160,43 @@ pub fn inductive_declaration(
     if count > budget.max_binders || spec.level_params.len() > budget.max_binders {
         return Err(InductiveError::ResourceLimit);
     }
-    if spec.result_level.has_mvar() || !spec.result_level.is_never_zero() {
+    let proposition = spec.result_level.normalize_fixpoint().is_zero();
+    if spec.result_level.has_mvar() || (!proposition && !spec.result_level.is_never_zero()) {
         return Err(InductiveError::UnsupportedSort);
     }
+    if let Some(universes) = field_universes
+        && (universes.len() != spec.constructors.len()
+            || universes
+                .iter()
+                .zip(&spec.constructors)
+                .any(|(us, ctor)| us.len() != ctor.fields.len() || us.iter().any(Level::has_mvar)))
+    {
+        return Err(InductiveError::InvalidTelescope);
+    }
+    // KR-700/701: data and empty predicates eliminate large. A singleton
+    // predicate does too iff every data field occurs verbatim in its indices.
+    // Proof fields need not appear there; an existential witness cannot be
+    // recovered merely because it occurs inside a compound index expression.
+    let large = if !proposition || spec.constructors.is_empty() {
+        true
+    } else if let [ctor] = spec.constructors.as_slice() {
+        let mut allowed = true;
+        for (i, field) in ctor.fields.iter().enumerate() {
+            if ctor.result_indices.iter().any(|index| *index == fv(field)) {
+                continue;
+            }
+            let universe = field_universes
+                .and_then(|us| us.first())
+                .and_then(|us| us.get(i))
+                .ok_or(InductiveError::UnsupportedSort)?;
+            allowed &= universe.normalize_fixpoint().is_zero();
+        }
+        allowed
+    } else {
+        false
+    };
+    let k_target =
+        proposition && spec.constructors.len() == 1 && spec.constructors[0].fields.is_empty();
     let mut builder = Builder {
         remaining: budget.max_nodes,
     };
@@ -222,7 +277,11 @@ pub fn inductive_declaration(
     let major = fresh(&mut used, "t", family.clone(), BinderInfo::Default);
     let motive_type = builder.close(
         std::slice::from_ref(&major),
-        Expr::sort(Level::param(elim.clone())),
+        Expr::sort(if large {
+            Level::param(elim.clone())
+        } else {
+            Level::zero()
+        }),
         false,
         false,
     )?;
@@ -281,7 +340,11 @@ pub fn inductive_declaration(
             is_unsafe: false,
         });
     }
-    let mut rec_levels = vec![Level::param(elim.clone())];
+    let mut rec_levels = if large {
+        vec![Level::param(elim.clone())]
+    } else {
+        Vec::new()
+    };
     rec_levels.extend(levels);
     let rec_name = Name::str(spec.name.clone(), "rec");
     let rec_prefix = app(
@@ -329,7 +392,7 @@ pub fn inductive_declaration(
         !minors.is_empty(),
     )?;
     let rec_type = builder.close(&spec.parameters, rec_type, false, true)?;
-    let mut lparams = vec![elim];
+    let mut lparams = if large { vec![elim] } else { Vec::new() };
     lparams.extend(spec.level_params.iter().cloned());
     let params = u32::try_from(spec.parameters.len()).map_err(|_| InductiveError::ResourceLimit)?;
     let indices = u32::try_from(spec.indices.len()).map_err(|_| InductiveError::ResourceLimit)?;
@@ -368,7 +431,7 @@ pub fn inductive_declaration(
             num_motives: 1,
             num_minors: u32::try_from(minors.len()).map_err(|_| InductiveError::ResourceLimit)?,
             rules,
-            k: false,
+            k: k_target,
             is_unsafe: false,
         }],
     }))

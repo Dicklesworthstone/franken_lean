@@ -1,4 +1,4 @@
-//! Constructor-derived checking of positive, uniformly parameterized families.
+//! Constructor-derived checking of data and propositional inductive families.
 //!
 //! Every expected minor and iota rule is rebuilt from the family and constructor
 //! telescopes, never copied from the recursor being checked. Recursive fields
@@ -33,7 +33,7 @@ struct Shape<'a> {
     parameters: Vec<Binder>,
     indices: Vec<Binder>,
     constructors: Vec<Constructor<'a>>,
-    motive_universe: &'a WireName,
+    motive_universe: Option<&'a WireName>,
 }
 struct Audit<'a> {
     budget: AdmissionBudget,
@@ -87,6 +87,25 @@ pub(super) fn positive_result(declaration: &ConstantDeclaration, count: u32) -> 
         positive.push(yes);
     }
     positive[normal.root().index()]
+}
+
+/// The generic predicate route is selected only at a definitely zero sort.
+/// Sort u, whose proposition/data status can vary, keeps its existing routes.
+pub(super) fn proposition_result(declaration: &ConstantDeclaration, count: u32) -> bool {
+    let term = declaration.type_();
+    if count as usize > MAX_NONRECURSIVE_FIELDS || size(term) > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
+        return false;
+    }
+    let Some((_, tail)) = peel_binders_at(term, term.root(), count as usize) else {
+        return false;
+    };
+    let Some(ExprNode::Sort { level }) = term.node(tail) else {
+        return false;
+    };
+    normalize(&WireLevel::from_parts(term.levels().to_vec(), *level))
+        .ok()
+        .and_then(|n| explicit_normal_universe(&n))
+        == Some(0)
 }
 
 impl Audit<'_> {
@@ -335,7 +354,10 @@ impl Shape<'_> {
             let value = builder.bvar((q - index - 1) as u32);
             family = builder.apply(family, value);
         }
-        let sort = builder.sort_parameter(self.motive_universe);
+        let sort = match self.motive_universe {
+            Some(level) => builder.sort_parameter(level),
+            None => builder.sort_zero(),
+        };
         let mut body = builder.forall("major", BinderStyle::Default, family, sort);
         for index in self.indices.iter().rev() {
             let domain = audit.import(builder, &index.domain)?;
@@ -441,7 +463,7 @@ impl Shape<'_> {
             let value = builder.bvar((f - field - 1) as u32);
             body = builder.apply(body, value);
         }
-        let mut levels = vec![self.motive_universe.clone()];
+        let mut levels: Vec<_> = self.motive_universe.into_iter().cloned().collect();
         levels.extend_from_slice(self.levels);
         for (field, indices) in &ctor.recursive {
             let mut call = application(
@@ -688,6 +710,11 @@ fn check(
         return Err(overflow());
     };
     let result_level = WireLevel::from_parts(result_sort.levels().to_vec(), *level);
+    let proposition = normalize(&result_level)
+        .ok()
+        .and_then(|n| explicit_normal_universe(&n))
+        == Some(0);
+    let mut large_elimination = !proposition || n <= 1;
     let mut staged =
         stage_inductive_member(environment, inductive, environment_budget, audit.cancelled)?;
     let mut locals = Vec::new();
@@ -784,7 +811,21 @@ fn check(
                 audit.cancelled,
             )
             .map_err(|v| map_member_preamble(ctor_name, v))?;
-            if !universe_within(&facts.universe, &result_level, audit)? {
+            // Prop is impredicative: the witness field itself may live at any
+            // universe. This never licenses eliminating that witness into data.
+            if proposition && n == 1 && facts.explicit_universe != Some(0) {
+                let mut exposed = false;
+                for index in &result_indices {
+                    audit.tick()?;
+                    if matches!(index.node(index.root()), Some(ExprNode::Bound { index })
+                        if *index as usize == f - field_index - 1)
+                    {
+                        exposed = true;
+                    }
+                }
+                large_elimination &= exposed;
+            }
+            if !proposition && !universe_within(&facts.universe, &result_level, audit)? {
                 // The independent normalizer is deliberately incomplete. A
                 // symbolic inequality it cannot establish is not a rejection.
                 if facts.explicit_universe.is_some()
@@ -826,17 +867,23 @@ fn check(
         .recursor_metadata()
         .ok_or_else(|| recursor_error(&rec_name))?;
     let rec_levels = rec_decl.level_parameters();
+    let level_policy = if large_elimination {
+        rec_levels.len() == levels.len() + 1
+            && &rec_levels[1..] == levels
+            && !levels.contains(&rec_levels[0])
+    } else {
+        rec_levels == levels
+    };
+    let k_target = proposition && n == 1 && constructors[0].fields.is_empty();
     if rec_decl.safety() != ConstantSafety::Safe
-        || rec_levels.len() != levels.len() + 1
-        || &rec_levels[1..] != levels
-        || levels.contains(&rec_levels[0])
+        || !level_policy
         || rec.mutual() != std::slice::from_ref(name)
         || rec.num_parameters() as usize != p
         || rec.num_indices() as usize != q
         || rec.num_motives() != 1
         || rec.num_minors() as usize != n
         || rec.rules().len() != n
-        || rec.k()
+        || rec.k() != k_target
     {
         return Err(recursor_error(&rec_name));
     }
@@ -849,7 +896,11 @@ fn check(
         parameters,
         indices,
         constructors,
-        motive_universe: &rec_levels[0],
+        motive_universe: if large_elimination {
+            Some(&rec_levels[0])
+        } else {
+            None
+        },
     };
     let expected = shape.recursor_type(audit, &styles)?;
     if !audit.equal(rec_decl.type_(), &expected)? {
