@@ -90,6 +90,7 @@ fn tactic(
             "rewrite",
             "simp",
             "subst",
+            "injection",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word]))
@@ -126,6 +127,31 @@ fn tactic(
                 }
             }
             args.push(null_node(names));
+        }
+        "injection"
+            if range.end >= start + 2 && matches!(&tokens[start + 1].kind, TokenKind::Ident(_)) =>
+        {
+            args.push(leaves.leaf(start + 1)?);
+            let mut names = Vec::new();
+            if range.end > start + 2 {
+                if !matches!(&tokens[start + 2].kind, TokenKind::Symbol(s) if s == "with")
+                    || range.end == start + 3
+                {
+                    return Err(refusal(view, tokens, start + 2));
+                }
+                for at in start + 3..range.end {
+                    if !matches!(&tokens[at].kind, TokenKind::Ident(_))
+                        && !matches!(&tokens[at].kind, TokenKind::Symbol(s) if s == "_")
+                    {
+                        return Err(refusal(view, tokens, at));
+                    }
+                    names.push(leaves.leaf(at)?);
+                }
+                // Keep the actual `with` leaf for lossless syntax reconstruction.
+                args.push(null_node(vec![leaves.leaf(start + 2)?, null_node(names)]));
+            } else {
+                args.push(null_node(Vec::new()));
+            }
         }
         "subst"
             if range.end == start + 2 && matches!(&tokens[start + 1].kind, TokenKind::Ident(_)) =>
@@ -385,6 +411,39 @@ mod equality_tests {
                     format!("theorem t (x : Nat) : x = x := by {tail}").as_bytes()
                 )
                 .is_err(),
+                "{tail}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod constructor_equality_tests {
+    use super::*;
+    #[test]
+    fn injection_is_contextual_and_preserves_original_syntax() {
+        for source in [
+            "def injection (x : Nat) := x",
+            "theorem t (h : 0 = 1) : 0 = 1 := by injection h",
+            "theorem t (h : 0 = 1) : 0 = 1 := by\r\n  injection h /- names -/ with p _ q\r\n  exact p",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+    }
+    #[test]
+    fn malformed_injections_do_not_drop_extra_tokens() {
+        for tail in [
+            "injection",
+            "injection 1",
+            "injection (h)",
+            "injection h with",
+            "injection h at x",
+            "injection h with x, y",
+            "injection h with 2",
+        ] {
+            assert!(
+                parse_definition(format!("theorem t := by {tail}").as_bytes()).is_err(),
                 "{tail}"
             );
         }

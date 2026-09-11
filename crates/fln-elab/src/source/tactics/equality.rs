@@ -23,7 +23,7 @@ pub(super) fn reflexivity(level: Level, alpha: Expr, value: Expr) -> Expr {
 }
 
 impl Context {
-    fn close_equality_binder(
+    pub(super) fn close_equality_binder(
         &mut self,
         local: &LocalDecl,
         body: Expr,
@@ -49,7 +49,10 @@ impl Context {
         })
     }
 
-    fn equality_local(&mut self, type_: Expr) -> Result<LocalDecl, NatDefinitionElabError> {
+    pub(super) fn equality_local(
+        &mut self,
+        type_: Expr,
+    ) -> Result<LocalDecl, NatDefinitionElabError> {
         let name = self.fresh_name()?;
         Ok(LocalDecl {
             id: FVarId(name.clone()),

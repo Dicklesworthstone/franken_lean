@@ -6,6 +6,7 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+mod constructors;
 mod eliminate;
 mod equality;
 mod rewrite;
@@ -29,6 +30,7 @@ pub enum TacticError {
     UnsupportedEliminator,
     InvalidGeneralization,
     SubstitutionLocal,
+    ConstructorEquality,
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +65,10 @@ impl std::fmt::Display for TacticError {
             Self::SubstitutionLocal => {
                 write!(f, "subst requires an acyclic local-variable equality")
             }
+            Self::ConstructorEquality => write!(
+                f,
+                "constructor equality has no supported injective fields or contradiction"
+            ),
             Self::MalformedScript => write!(f, "unsupported or malformed native proof script"),
         }
     }
@@ -319,7 +325,9 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "subst"]) {
+            if kind == &parser_kind(&["Tactic", "injection"]) {
+                self.inject_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "subst"]) {
                 let [keyword, Syntax::Ident { val, .. }] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
