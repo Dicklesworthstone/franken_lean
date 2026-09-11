@@ -30,7 +30,21 @@ jobs:
           out=pathlib.Path('target/propositional-landing')
           raw=pathlib.Path('scripts/propositional-family-transfer/manifest.json').read_bytes()
           plan=json.loads(raw)
-          compressed=base64.b64decode(plan['patch_gzip_base64'],validate=True)
+          blob=lambda data:hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          if 'parts' in plan:
+              assert 1<=len(plan['parts'])<=32
+              pieces=[]
+              for part in plan['parts']:
+                  name=part['path']
+                  p=pathlib.Path(name)
+                  assert name.startswith('scripts/propositional-family-transfer/')
+                  assert '..' not in p.parts and not p.is_symlink()
+                  data=p.read_bytes()
+                  assert len(data)<=8192 and blob(data)==part['sha'],name
+                  pieces.append(data)
+              compressed=b''.join(pieces)
+          else:
+              compressed=base64.b64decode(plan['patch_gzip_base64'],validate=True)
           with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
               patch=stream.read(2_000_001)
           assert len(patch)<=2_000_000
@@ -38,7 +52,6 @@ jobs:
           paths=plan['paths']
           assert paths and len(paths)==len(set(paths))
           assert set(paths)==set(plan['base_blobs'])==set(plan['source_sha256'])
-          blob=lambda data:hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
           for name,expected in plan['base_blobs'].items():
               p=pathlib.Path(name)
               assert name.startswith(('crates/fln-elab/','crates/fln-parse/','crates/fln-checker/','crates/fln/','crates/fln-cli/','docs/','examples/'))
