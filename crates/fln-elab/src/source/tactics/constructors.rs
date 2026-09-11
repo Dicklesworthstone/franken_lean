@@ -22,6 +22,7 @@ struct Constructor {
     fields: Vec<Typed>,
 }
 enum Selection<'a> {
+    Empty,
     Field {
         ctor: &'a Name,
         index: usize,
@@ -53,7 +54,11 @@ impl Context {
         Ok((head, arguments))
     }
 
-    fn equality_family(&mut self, alpha: &Expr) -> Result<Option<Family>, NatDefinitionElabError> {
+    fn reasoning_family(
+        &mut self,
+        alpha: &Expr,
+        data_only: bool,
+    ) -> Result<Option<Family>, NatDefinitionElabError> {
         let type_ = self.whnf(alpha)?;
         let (head, mut arguments) = self.equality_spine(&type_)?;
         let ExprNode::Const { name, levels } = head.node() else {
@@ -74,10 +79,11 @@ impl Context {
         let Some(sort) = self.known_type(&type_)? else {
             return Ok(None);
         };
-        if self.sort_level(&Typed {
-            value: type_.clone(),
-            type_: sort,
-        })? == Level::zero()
+        if data_only
+            && self.sort_level(&Typed {
+                value: type_.clone(),
+                type_: sort,
+            })? == Level::zero()
         {
             return Ok(None);
         }
@@ -300,6 +306,7 @@ impl Context {
                 binders.push(field);
             }
             let value = match &selection {
+                Selection::Empty => return Ok(None),
                 Selection::Field { ctor, index, .. } if *ctor == &rule.ctor => {
                     let Some(field) = binders.get(*index) else {
                         return Ok(None);
@@ -495,7 +502,7 @@ impl Context {
         let (_, alpha, lhs, rhs) =
             equality_target(&type_).ok_or_else(|| error(TacticError::ExpectedEquality))?;
         let family = self
-            .equality_family(&alpha)?
+            .reasoning_family(&alpha, true)?
             .ok_or_else(|| error(TacticError::ConstructorEquality))?;
         let left = self
             .equality_constructor(&lhs, &family)?
@@ -540,5 +547,190 @@ impl Context {
         goal.lctx = self.txn.lctx.clone();
         proof.work.push(Work::Goal(goal));
         Ok(())
+    }
+}
+
+impl Context {
+    fn empty_evidence(
+        &mut self,
+        evidence: &Typed,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let Some(family) = self.reasoning_family(&evidence.type_, false)? else {
+            return Ok(None);
+        };
+        if !family.family.ctors.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .equality_selector(&family, target, Selection::Empty)?
+            .map(|function| Expr::app(function, evidence.value.clone())))
+    }
+
+    /// Unequal compact literals use the already admitted Nat.beq computation,
+    /// rather than peeling an astronomically large chain of successor nodes.
+    /// The resulting Bool equality is justified by Eq.rec and checked conversion.
+    fn unequal_nat_literals(
+        &mut self,
+        equality: &Typed,
+        alpha: &Expr,
+        left: &Expr,
+        right: &Expr,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let (
+            ExprNode::Lit {
+                literal: Literal::Nat(a),
+            },
+            ExprNode::Lit {
+                literal: Literal::Nat(b),
+            },
+        ) = (left.node(), right.node())
+        else {
+            return Ok(None);
+        };
+        for _ in a.limbs_le().iter().chain(b.limbs_le()) {
+            self.tick()?;
+        }
+        if a == b || alpha != &Expr::const_(Name::from_components(["Nat"]), Vec::new()) {
+            return Ok(None);
+        }
+        let bool_type = Expr::const_(Name::from_components(["Bool"]), Vec::new());
+        let yes = Expr::const_(Name::from_components(["Bool", "true"]), Vec::new());
+        let no = Expr::const_(Name::from_components(["Bool", "false"]), Vec::new());
+        let compare = Expr::app(
+            Expr::const_(Name::from_components(["Nat", "beq"]), Vec::new()),
+            left.clone(),
+        );
+        let endpoint = self.equality_local(alpha.clone())?;
+        let eq = equality::equation(
+            Level::one(),
+            bool_type.clone(),
+            yes.clone(),
+            Expr::app(compare, Expr::fvar(endpoint.id.clone())),
+        );
+        let motive = self.close_equality_binder(&endpoint, eq, true)?;
+        let base = equality::reflexivity(Level::one(), bool_type.clone(), yes.clone());
+        let proof = self.equality_transport(equality, &motive, base, Level::zero())?;
+        let equation = Typed {
+            value: proof,
+            type_: equality::equation(Level::one(), bool_type.clone(), yes, no),
+        };
+        let Some(family) = self.reasoning_family(&bool_type, true)? else {
+            return Ok(None);
+        };
+        self.constructor_clash(
+            &equation,
+            &family,
+            &Name::from_components(["Bool", "false"]),
+            target,
+        )
+    }
+
+    pub(super) fn contradict_proof_goal(
+        &mut self,
+        goal: ProofGoal,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let original: Vec<_> = goal
+            .lctx
+            .decls()
+            .iter()
+            .map(|local| Typed {
+                value: Expr::fvar(local.id.clone()),
+                type_: local.type_.clone(),
+            })
+            .collect();
+        let mut pending: std::collections::VecDeque<_> = original.iter().cloned().collect();
+        let mut negative = Vec::new();
+        for local in &original {
+            self.tick()?;
+            let ty = self.whnf(&local.type_)?;
+            if let ExprNode::ForallE {
+                binder_type, body, ..
+            } = ty.node()
+            {
+                negative.push((local.value.clone(), binder_type.clone(), body.clone()));
+                // Reflexive equality is useful evidence even without a named
+                // proof local. A failed conversion does not mutate the store.
+                if let Some((level, alpha, left, right)) = equality_target(binder_type)
+                    && self.proof_types_match(&left, &right)?
+                {
+                    let proof = equality::reflexivity(level, alpha, left);
+                    let applied = Typed {
+                        value: Expr::app(local.value.clone(), proof.clone()),
+                        type_: self.substitute(body, &proof)?,
+                    };
+                    if let Some(result) = self.empty_evidence(&applied, &goal.target)? {
+                        return self.close_proof_goal(goal, result);
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        // Pin every pair whose identities are memoized for this request. A
+        // dropped temporary allocation can never be reused as an existing key.
+        let mut roots = Vec::new();
+        while let Some(evidence) = pending.pop_front() {
+            self.tick()?;
+            if let Some(result) = self.empty_evidence(&evidence, &goal.target)? {
+                return self.close_proof_goal(goal, result);
+            }
+            for (function, domain, body) in &negative {
+                self.tick()?;
+                if self.proof_types_match(&evidence.type_, domain)? {
+                    let application = Typed {
+                        value: Expr::app(function.clone(), evidence.value.clone()),
+                        type_: self.substitute(body, &evidence.value)?,
+                    };
+                    if let Some(result) = self.empty_evidence(&application, &goal.target)? {
+                        return self.close_proof_goal(goal, result);
+                    }
+                }
+            }
+            let type_ = self.whnf(&evidence.type_)?;
+            let Some((_, alpha, left, right)) = equality_target(&type_) else {
+                continue;
+            };
+            let alpha = self.whnf(&alpha)?;
+            let left = self.whnf(&left)?;
+            let right = self.whnf(&right)?;
+            if !seen.insert((left.allocation_identity(), right.allocation_identity())) {
+                continue;
+            }
+            roots.push((left.clone(), right.clone()));
+            if let Some(result) =
+                self.unequal_nat_literals(&evidence, &alpha, &left, &right, &goal.target)?
+            {
+                return self.close_proof_goal(goal, result);
+            }
+            let Some(family) = self.reasoning_family(&alpha, true)? else {
+                continue;
+            };
+            let Some(left) = self.equality_constructor(&left, &family)? else {
+                continue;
+            };
+            let Some(right) = self.equality_constructor(&right, &family)? else {
+                continue;
+            };
+            if left.name != right.name {
+                if let Some(result) =
+                    self.constructor_clash(&evidence, &family, &right.name, &goal.target)?
+                {
+                    return self.close_proof_goal(goal, result);
+                }
+            } else {
+                for index in 0..left.fields.len() {
+                    self.tick()?;
+                    if let Some(proof) =
+                        self.constructor_field_equality(&evidence, &family, &left, &right, index)?
+                    {
+                        pending.push_back(proof);
+                    }
+                }
+            }
+        }
+        Err(error(TacticError::NoContradiction))
     }
 }

@@ -49,3 +49,29 @@ original order. For example, vector indices and element payloads can be selected
 while the length-dependent tail generally cannot. Full heterogeneous dependent
 injection, index-equation refinement and generated `noConfusion` declarations
 remain separate work.
+
+## Automatic contradiction
+
+`contradiction` searches local evidence in deterministic order. It eliminates
+proofs of admitted empty families, combines a proof with a local function from
+that proposition into an empty family, and detects constructor clashes under
+nested constructor equalities using the same proof-producing selectors as
+`injection`. Injected equalities can also discharge the domain of a negation.
+Reflexive equality supplies evidence for a negation even without a named proof.
+
+Unequal arbitrary-precision Nat literals are mapped by the admitted `Nat.beq`
+primitive to a Bool constructor clash, with `Eq.rec` retaining the original
+equality proof. Both checkers validate the arithmetic conversion. This avoids a
+unary traversal even for adjacent numbers above 2^128. Consistent literal
+identities and equalities between proposition constructors do not close goals.
+Work is metered and repeated endpoint pairs are memoized with their allocations
+pinned for the request. No temporary selector, axiom or unproved declaration is
+registered in the environment.
+
+```bash
+fln check-source --json examples/native_constructor_equality.lean
+```
+
+The example includes dependent transport obtained by combining `injection` and
+`subst`, as well as record fields, nested clashes and a 129-bit Nat contradiction.
+This is bounded constructive reasoning, not a complete contradiction solver.

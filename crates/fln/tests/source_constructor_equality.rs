@@ -95,3 +95,65 @@ fn proof_constructor_equalities_do_not_expose_existential_data() {
         "inductive Either (P Q : Prop) : Prop where\n  | left (p : P)\n  | right (q : Q)\n theorem invalid (P Q : Prop) (p : P) (q : Q) (h : Either.left p = Either.right q) : 0 = 1 := by injection h",
     );
 }
+
+#[test]
+fn contradiction_descends_nested_constructor_equalities() {
+    check(
+        "theorem impossible (h : Nat.succ (Nat.succ 0) = Nat.succ 0) : 7 = 9 := by contradiction",
+    );
+    check(
+        "inductive Tree where\n  | leaf (n : Nat)\n  | branch (a b : Tree)\n theorem impossible (t : Tree) (h : Tree.branch t (Tree.leaf 7) = Tree.branch t (Tree.branch t t)) : 1 = 0 := by contradiction",
+    );
+}
+#[test]
+fn contradictory_huge_literals_use_compact_computation() {
+    check(
+        "theorem impossible (h : 340282366920938463463374607431768211456 = 340282366920938463463374607431768211455) : 0 = 1 := by contradiction",
+    );
+    check(
+        "def impossible (h : 340282366920938463463374607431768211455 = 340282366920938463463374607431768211456) : Nat := by contradiction",
+    );
+}
+#[test]
+fn contradiction_uses_empty_evidence_and_negated_assumptions() {
+    check("inductive Void : Prop where\n def impossible (h : Void) : Nat := by contradiction");
+    check(
+        "inductive Void : Prop where\n theorem impossible (P : Prop) (p : P) (np : P -> Void) : 1 = 0 := by contradiction",
+    );
+    check(
+        "inductive Void : Prop where\n theorem impossible (n : Nat) (h : (n = n) -> Void) : 1 = 0 := by contradiction",
+    );
+}
+#[test]
+fn contradiction_can_use_an_injected_equality_against_a_negation() {
+    check(
+        "inductive Void : Prop where\n theorem impossible (x y : Nat) (h : Nat.succ x = Nat.succ y) (ne : (x = y) -> Void) : 1 = 0 := by contradiction",
+    );
+}
+#[test]
+fn consistent_or_proof_irrelevant_contexts_are_not_contradictions() {
+    for source in [
+        "theorem bad (h : 7 = 7) : 0 = 1 := by contradiction",
+        "theorem bad (x y : Nat) (h : Nat.succ x = Nat.succ y) : 0 = 1 := by contradiction",
+        "inductive Witness (A : Type) : Prop where\n  | intro (a : A)\n theorem bad (h : Witness.intro 0 = Witness.intro 1) : 0 = 1 := by contradiction",
+        "inductive Or (P Q : Prop) : Prop where\n  | left (p : P)\n  | right (q : Q)\n theorem bad (P Q : Prop) (p : P) (q : Q) (h : Or.left p = Or.right q) : 0 = 1 := by contradiction",
+    ] {
+        refuse(source);
+    }
+}
+#[test]
+fn contradiction_keeps_lexical_scopes_and_all_source_obligations() {
+    check(
+        "theorem contradictionInBranch (b : Bool) (h : true = false) : 0 = 1 := by\n  cases b with\n  | false => contradiction\n  | true => contradiction",
+    );
+    refuse(
+        "theorem bad (h : true = false) : 0 = 1 := let ignored : Nat := (1 : String); by contradiction",
+    );
+}
+
+#[test]
+fn injected_equalities_feed_dependent_substitution() {
+    check(
+        "theorem transported (A : Type) (P : A -> Prop) (x y : A) (hx : P x) (h : Inhabited.mk x = Inhabited.mk y) : P y := by injection h with same; subst same; exact hx",
+    );
+}

@@ -91,6 +91,7 @@ fn tactic(
             "simp",
             "subst",
             "injection",
+            "contradiction",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word]))
@@ -158,7 +159,7 @@ fn tactic(
         {
             args.push(leaves.leaf(start + 1)?);
         }
-        "assumption" | "rfl" if range.end == start + 1 => {}
+        "assumption" | "rfl" | "contradiction" if range.end == start + 1 => {}
         "exact" | "apply" if range.end > start + 1 => args.push(bounded_term(
             leaves,
             view,
@@ -424,6 +425,8 @@ mod constructor_equality_tests {
     fn injection_is_contextual_and_preserves_original_syntax() {
         for source in [
             "def injection (x : Nat) := x",
+            "def contradiction (x : Nat) := x",
+            "theorem t (h : 0 = 1) : 0 = 1 := by contradiction",
             "theorem t (h : 0 = 1) : 0 = 1 := by injection h",
             "theorem t (h : 0 = 1) : 0 = 1 := by\r\n  injection h /- names -/ with p _ q\r\n  exact p",
         ] {
@@ -434,6 +437,8 @@ mod constructor_equality_tests {
     #[test]
     fn malformed_injections_do_not_drop_extra_tokens() {
         for tail in [
+            "contradiction h",
+            "contradiction with h",
             "injection",
             "injection 1",
             "injection (h)",

@@ -1101,3 +1101,34 @@ fn installed_binary_checks_inductive_propositions_and_atomic_refusals() {
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
     }
 }
+
+#[test]
+fn installed_constructor_equality_checks_real_proofs_and_failure_isolation() {
+    let prefix = file(include_str!(
+        "../../../examples/native_constructor_equality.lean"
+    ));
+    let invalid = file("theorem bad (h : 7 = 7) : 0 = 1 := by contradiction");
+    for success in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !success {
+            command.arg(&invalid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for required in ["\"commands\":8", "\"theorems\":5", "\"executed\":false"] {
+                assert!(json.contains(required), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
