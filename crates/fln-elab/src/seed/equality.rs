@@ -6,6 +6,83 @@
 
 use super::*;
 
+/// Ordinary heterogeneous equality, needed when constructor fields have
+/// dependent domains. The shared candidate generator is untrusted: both
+/// checking engines independently reconstruct this indexed proposition.
+pub fn heq_seed_declaration() -> Declaration {
+    use crate::inductive::{ConstructorSpec, InductiveSpec, inductive_declaration};
+    use crate::lctx::LocalDecl;
+    use crate::records::RecordBudget;
+    use fln_core::expr::FVarId;
+
+    let universe_name = Name::from_components(["u_1"]);
+    let universe = Level::param(universe_name.clone());
+    let local = |label: &str, type_: Expr, binder_info| LocalDecl {
+        id: FVarId(Name::from_components(["_fln_heq_seed", label])),
+        user_name: Name::from_components([label]),
+        type_,
+        value: None,
+        binder_info,
+        index: 0,
+    };
+    let alpha = local("α", Expr::sort(universe.clone()), BinderInfo::Implicit);
+    let a = local("a", Expr::fvar(alpha.id.clone()), BinderInfo::Default);
+    let beta = local("β", Expr::sort(universe), BinderInfo::Implicit);
+    let b = local("b", Expr::fvar(beta.id.clone()), BinderInfo::Default);
+    let result_indices = vec![Expr::fvar(alpha.id.clone()), Expr::fvar(a.id.clone())];
+    let Declaration::Inductive(mut block) = inductive_declaration(
+        &InductiveSpec {
+            name: Name::from_components(["HEq"]),
+            level_params: vec![universe_name],
+            parameters: vec![alpha, a],
+            indices: vec![beta, b],
+            constructors: vec![ConstructorSpec {
+                name: Name::from_components(["refl"]),
+                fields: Vec::new(),
+                result_indices,
+            }],
+            result_level: Level::zero(),
+        },
+        RecordBudget::default(),
+    )
+    .expect("the fixed heterogeneous equality telescope is valid") else {
+        unreachable!()
+    };
+    // The native source generator infers constructor parameters. The canonical
+    // HEq.refl API instead takes its value parameter explicitly.
+    use fln_core::expr::ExprNode;
+    let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        binder_info,
+    } = block.ctors[0].base.type_.node()
+    else {
+        unreachable!()
+    };
+    let ExprNode::ForallE {
+        binder_name: value_name,
+        binder_type: value_type,
+        body: result,
+        ..
+    } = body.node()
+    else {
+        unreachable!()
+    };
+    block.ctors[0].base.type_ = Expr::forall_e(
+        binder_name.clone(),
+        binder_type.clone(),
+        Expr::forall_e(
+            value_name.clone(),
+            value_type.clone(),
+            result.clone(),
+            BinderInfo::Default,
+        ),
+        *binder_info,
+    );
+    Declaration::Inductive(block)
+}
+
 pub fn eq_seed_declaration() -> Declaration {
     let name = |s: &str| Name::from_components(s.split('.'));
     let eq = name("Eq");
@@ -206,6 +283,27 @@ pub fn rfl_seed_declaration() -> Declaration {
 mod tests {
     use super::*;
     use fln_kernel::{check, verdict::Verdict};
+
+    #[test]
+    fn heterogeneous_equality_is_regenerated_not_axiomatic() {
+        let declaration = heq_seed_declaration();
+        let result = check(
+            &Environment::new(),
+            &declaration,
+            Budget::for_stack_bytes(1024 * 1024),
+        );
+        assert!(
+            matches!(result, Outcome::Complete(Verdict::Accepted { .. })),
+            "{result:?}"
+        );
+        let Declaration::Inductive(block) = declaration else {
+            unreachable!()
+        };
+        assert_eq!(block.types[0].num_params, 2);
+        assert_eq!(block.types[0].num_indices, 2);
+        assert_eq!(block.ctors[0].num_fields, 0);
+        assert!(block.recursors[0].k);
+    }
 
     #[test]
     fn equality_is_an_ordinary_kernel_checked_indexed_inductive() {

@@ -21,8 +21,9 @@
 //! kernel rejection (FL-INV-07).
 
 pub mod equality;
+mod heterogeneous;
 pub mod inhabited;
-pub use equality::{eq_seed_declaration, rfl_seed_declaration};
+pub use equality::{eq_seed_declaration, heq_seed_declaration, rfl_seed_declaration};
 
 use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
@@ -609,7 +610,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 34] {
+pub fn source_seed_declarations() -> [Declaration; 40] {
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -645,6 +646,12 @@ pub fn source_seed_declarations() -> [Declaration; 34] {
         inhabited::scalar_inhabited_seed_declaration("String"),
         inhabited::scalar_inhabited_seed_declaration("Bool"),
         inhabited::infer_instance_seed_declaration(),
+        heq_seed_declaration(),
+        heterogeneous::type_eq_seed_declaration(),
+        heterogeneous::heq_of_eq_seed_declaration(),
+        heterogeneous::eq_of_heq_seed_declaration(),
+        heterogeneous::symmetry_seed_declaration(),
+        heterogeneous::transitivity_seed_declaration(),
     ]
 }
 

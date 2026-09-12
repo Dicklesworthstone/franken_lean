@@ -106,3 +106,87 @@ fn substitution_follows_alias_dependencies_and_refuses_unused_ill_typed_terms() 
         );
     }
 }
+
+#[test]
+fn heterogeneous_seed_and_conversion_bridges_cross_both_checkers() {
+    for source in [
+        "theorem reflected (A : Type) (a : A) : HEq a a := HEq.refl a",
+        "theorem same (A : Type) (a b : A) (h : HEq a b) : a = b := eq_of_heq h",
+        "theorem same (A : Type) (a b : A) (h : a = b) : HEq a b := heq_of_eq h",
+        "theorem types (A B : Type) (a : A) (b : B) (h : HEq a b) : A = B := type_eq_of_heq h",
+    ] {
+        check(source);
+    }
+}
+
+#[test]
+fn heterogeneous_symmetry_and_transitivity_keep_distinct_endpoint_types() {
+    check("theorem symmetric (A B : Type) (a : A) (b : B) (h : HEq a b) : HEq b a := HEq.symm h");
+    check(
+        "theorem transitive (A B C : Type) (a : A) (b : B) (c : C) (h : HEq a b) (k : HEq b c) : HEq a c := HEq.trans h k",
+    );
+    check(
+        "theorem roundTrip (A : Type) (a b : A) (h : a = b) : b = a := eq_of_heq (HEq.symm (heq_of_eq h))",
+    );
+}
+
+#[test]
+fn heterogeneous_bridges_respect_sort_levels_and_proof_values() {
+    check("theorem proofValues (P : Prop) (p q : P) (h : HEq p q) : p = q := eq_of_heq h");
+    check("theorem typeValues (A B : Type) (h : HEq A B) : A = B := eq_of_heq h");
+    check("theorem functionValues (A : Type) (f g : A -> A) (h : HEq f g) : f = g := eq_of_heq h");
+}
+
+#[test]
+fn invalid_heterogeneous_evidence_never_becomes_homogeneous_equality() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "theorem bad : HEq 0 1 := HEq.refl 0",
+        "theorem bad (h : HEq 0 0) : 0 = 1 := eq_of_heq h",
+        "theorem bad (A B : Type) (a : A) (b : B) (h : HEq a b) : HEq a 0 := HEq.symm h",
+        "theorem bad (A : Type) (a b : A) (h : HEq a b) : a = b := eq_of_heq ((fun ignored => h) (1 : String))",
+    ] {
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits())
+            )
+            .is_err(),
+            "{source}"
+        );
+        assert_eq!(root, base.logical_root(&KVMap::new()));
+    }
+}
+
+#[test]
+fn heterogeneous_bridges_are_theorems_over_inductives_not_axioms() {
+    use fln_env::constants::ConstantInfo;
+    let base = engine();
+    for name in ["HEq", "HEq.refl", "HEq.rec"] {
+        assert!(matches!(
+            base.environment()
+                .find(&fln::Name::from_components(name.split('.'))),
+            Some(ConstantInfo::Induct(_) | ConstantInfo::Ctor(_) | ConstantInfo::Rec(_))
+        ));
+    }
+    for name in [
+        "eq_of_heq",
+        "heq_of_eq",
+        "type_eq_of_heq",
+        "HEq.symm",
+        "HEq.trans",
+    ] {
+        let Some(ConstantInfo::Thm(decl)) = base
+            .environment()
+            .find(&fln::Name::from_components(name.split('.')))
+        else {
+            panic!("{name} must be a checked theorem");
+        };
+        assert!(!decl.value.has_fvar());
+        assert!(!decl.value.has_expr_mvar());
+        assert!(!decl.value.has_level_mvar());
+        assert!(!decl.value.has_loose_bvars());
+    }
+}
