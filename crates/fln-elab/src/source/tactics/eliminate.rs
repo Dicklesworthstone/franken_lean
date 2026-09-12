@@ -23,6 +23,7 @@ struct Alternative<'a> {
 pub(super) enum EliminationSyntax<'a> {
     Tactic(&'a [Syntax]),
     Match(matching::MatchParts<'a>),
+    RecursiveMatch(matching::MatchParts<'a>),
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -33,8 +34,9 @@ struct EliminationContext<'a> {
     reverted: &'a [LocalDecl],
     induction: bool,
     equations: Option<&'a index_equations::IndexEquations>,
+    recursive_source: bool,
 }
-pub(super) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
+pub(in crate::source) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
     if let Some(value) = &local.value {
         context.add_let(
             local.id.clone(),
@@ -159,6 +161,7 @@ impl Context {
             reverted,
             induction,
             equations,
+            recursive_source,
         } = context;
         let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
@@ -170,7 +173,7 @@ impl Context {
             ctor = Expr::app(ctor, param.clone());
         }
         let mut used = 0;
-        let mut recursive_fields = 0;
+        let mut recursive_fields = Vec::new();
         for _ in 0..constructor.num_fields {
             self.tick()?;
             let consumes_name = !explicit_fields
@@ -193,11 +196,11 @@ impl Context {
             };
             let local = self.elimination_binder(&mut branch, name, true)?;
             if self.direct_match_field(&local.type_, &family_type, &constructor.induct)? {
-                recursive_fields += 1;
+                recursive_fields.push(local.clone());
             }
             ctor = Expr::app(ctor, Expr::fvar(local.id));
         }
-        for _ in 0..recursive_fields {
+        for child in recursive_fields {
             self.tick()?;
             let mut name = if induction {
                 let name = names.get(used).cloned().unwrap_or_else(Name::anonymous);
@@ -207,7 +210,11 @@ impl Context {
                 Name::anonymous()
             };
             if induction && equations.is_some() {
-                let public = name;
+                let public = if recursive_source {
+                    self.recursive_child_alias(&mut branch, &child)?
+                } else {
+                    name
+                };
                 name = self.fresh_name()?;
                 hypotheses.push((name.clone(), public));
             }
@@ -301,6 +308,7 @@ impl Context {
         parts: matching::MatchParts<'a>,
         major: Typed,
         expected: Option<Expr>,
+        recursive: bool,
     ) -> Result<ProofState<'a>, NatDefinitionElabError> {
         let saved = self.txn.lctx.clone();
         let target = match expected {
@@ -311,17 +319,30 @@ impl Context {
             }
         };
         let (root, mut goal) = self.proof_goal(target.clone())?;
-        let local = LocalDecl {
-            id: FVarId(self.fresh_name()?),
-            user_name: Name::anonymous(),
-            type_: major.type_,
-            value: Some(major.value),
-            binder_info: BinderInfo::Default,
-            index: self.txn.lctx.len(),
+        let local = if recursive {
+            self.recursive_match(&major.value);
+            let ExprNode::FVar { id } = major.value.node() else {
+                return Err(error(TacticError::EliminationLocal));
+            };
+            self.txn
+                .lctx
+                .find(id)
+                .cloned()
+                .ok_or_else(|| error(TacticError::EliminationLocal))?
+        } else {
+            let local = LocalDecl {
+                id: FVarId(self.fresh_name()?),
+                user_name: Name::anonymous(),
+                type_: major.type_,
+                value: Some(major.value),
+                binder_info: BinderInfo::Default,
+                index: self.txn.lctx.len(),
+            };
+            add_local(&mut self.txn.lctx, &local);
+            goal.lctx = self.txn.lctx.clone();
+            goal.introduced.push(local.clone());
+            local
         };
-        add_local(&mut self.txn.lctx, &local);
-        goal.lctx = self.txn.lctx.clone();
-        goal.introduced.push(local.clone());
         let mut proof = ProofState {
             saved,
             target,
@@ -333,8 +354,12 @@ impl Context {
         self.eliminate_proof_goal_with_indices(
             &mut proof,
             goal,
-            &EliminationSyntax::Match(parts),
-            false,
+            &if recursive {
+                EliminationSyntax::RecursiveMatch(parts)
+            } else {
+                EliminationSyntax::Match(parts)
+            },
+            recursive,
             Some(&local.id),
             None,
         )?;
@@ -379,7 +404,9 @@ impl Context {
                     rows,
                 )
             }
-            EliminationSyntax::Match(_) => (Name::anonymous(), &[][..], true, &[][..]),
+            EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
+                (Name::anonymous(), &[][..], true, &[][..])
+            }
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -446,6 +473,20 @@ impl Context {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
         let index_values = parameters.split_off(family.num_params as usize);
+        let recursive_source = matches!(input, EliminationSyntax::RecursiveMatch(_));
+        if recursive_source && equations.is_none() {
+            return self.eliminate_constrained_indices(
+                proof,
+                goal,
+                input,
+                true,
+                &major,
+                &family,
+                levels,
+                &parameters,
+                &index_values,
+            );
+        }
         let indices = match self.elimination_index_locals(&index_values) {
             Ok(indices) => indices,
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
@@ -499,6 +540,9 @@ impl Context {
             }
         }
         let mut removed = HashSet::from([major.id.clone()]);
+        if recursive_source {
+            removed.extend(self.constrained_recursive_parameters(&parameters)?);
+        }
         removed.extend(index_ids.iter().cloned());
         let generalized_major = equations.and_then(|equations| equations.induction_major.as_ref());
         if let Some(original) = generalized_major {
@@ -680,7 +724,7 @@ impl Context {
 
         let mut scripts = HashMap::new();
         let mut fallback = None;
-        if let EliminationSyntax::Match(parts) = input {
+        if let EliminationSyntax::Match(parts) | EliminationSyntax::RecursiveMatch(parts) = input {
             let patterns = self.match_patterns(*parts, name, &family.ctors)?;
             for (ctor, (fields, syntax)) in patterns.constructors {
                 scripts.insert(
@@ -809,6 +853,7 @@ impl Context {
                     reverted: &reverted,
                     induction,
                     equations,
+                    recursive_source,
                 },
                 alternative,
                 &mut hypotheses,
@@ -820,7 +865,16 @@ impl Context {
                 Some(branch)
             };
             if let Some(mut branch) = branch {
-                if let Some(equations) = equations {
+                if recursive_source {
+                    self.register_constrained_recursive_branch(
+                        &mut branch,
+                        &hypotheses,
+                        &reverted,
+                        &equations
+                            .ok_or_else(|| error(TacticError::UnsupportedEliminator))?
+                            .names,
+                    )?;
+                } else if let Some(equations) = equations {
                     for (internal, public) in hypotheses {
                         self.specialize_index_hypothesis(
                             &mut branch,

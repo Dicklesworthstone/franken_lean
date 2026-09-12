@@ -286,11 +286,11 @@ impl Context {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
                 MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
-            ))) if !recursive => {
+            ))) => {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = saved;
                 self.txn.budget.heartbeats_consumed = spent;
-                self.start_refined_match(parts, major, expected)
+                self.start_refined_match(parts, major, expected, recursive)
                     .map(MatchStart::Refined)
             }
             Err(error) => Err(error),
@@ -414,6 +414,14 @@ impl Context {
             return Err(error(MatchError::UnrefinedIndexPattern));
         }
         let indices = self.elimination_index_locals(&index_values)?;
+        if recursive {
+            let changing: HashSet<_> = indices.iter().map(|index| index.id.clone()).collect();
+            for parameter in &parameters {
+                if !self.elimination_reads(parameter)?.is_disjoint(&changing) {
+                    return Err(error(MatchError::UnrefinedIndices));
+                }
+            }
+        }
         // Generalizing later parameters must not rescue an ill-typed original
         // index motive (for example a captured P : Vec A n -> Type). Preserve
         // that original lambda as an ordinary checked let obligation. Its type

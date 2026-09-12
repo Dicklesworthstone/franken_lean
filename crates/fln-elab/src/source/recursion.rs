@@ -7,6 +7,8 @@
 //! be the original locals or their domain-checked eta expansions, not arbitrary
 //! terms that conversion could erase.
 use super::*;
+mod constrained;
+pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,7 @@ pub(super) struct Recursion {
     /// Source-ordered arguments universally quantified in each hypothesis.
     varying: Vec<usize>,
     family: Option<(Name, usize)>,
+    pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
     /// Implicit higher-order inference can produce `fun x => P x` for the fixed
@@ -198,6 +201,7 @@ impl Context {
             indices: Vec::new(),
             varying: (decreasing + 1..parameters.len()).collect(),
             family: None,
+            equation_goals: HashMap::new(),
         });
         Ok(())
     }

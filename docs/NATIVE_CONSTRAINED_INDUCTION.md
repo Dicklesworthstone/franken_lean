@@ -124,7 +124,11 @@ indices, multiple recursive children, proposition elimination, bad branches,
 shadowing, resource stops and failure recovery; installed CLI tests check complete
 multi-file acceptance versus a false suffix without modifying the input files.
 
-Remaining limits include mutual/nested/higher-order families, constrained-index
-structural function definitions, inferred measures and arbitrary well-founded
-recursion. Scope-specific tests are not full Lean conformance or a pinned Prelude
+Remaining limits include mutual/nested/higher-order families, recursion beyond
+the supported root-match direct-child construction, inferred measures and
+arbitrary well-founded recursion. Scope-specific tests are not full Lean conformance or a pinned Prelude
 council pass.
+
+Source functions can use the same conditional hypotheses through the bounded
+[constrained-recursion compiler](NATIVE_CONSTRAINED_RECURSION.md). Its explicit
+result, root-match, and immediate-child requirements are documented separately.

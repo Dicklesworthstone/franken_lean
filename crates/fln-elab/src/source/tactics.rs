@@ -8,7 +8,7 @@
 use super::*;
 mod constructor_transport;
 mod constructors;
-mod eliminate;
+pub(in crate::source) mod eliminate;
 mod equality;
 mod index_equations;
 mod rewrite;
@@ -83,10 +83,10 @@ fn error(reason: TacticError) -> NatDefinitionElabError {
 
 #[derive(Clone)]
 pub(super) struct ProofGoal {
-    id: MVarId,
+    pub(in crate::source) id: MVarId,
     pub(super) target: Expr,
     pub(super) lctx: LocalContext,
-    introduced: Vec<LocalDecl>,
+    pub(in crate::source) introduced: Vec<LocalDecl>,
 }
 enum Work<'a> {
     Rewrite(ProofGoal, std::collections::VecDeque<RewriteRule<'a>>, bool),
@@ -190,7 +190,7 @@ impl Context {
 
     /// Try equality transactionally; a failed candidate retains no assignment.
     /// Inconclusive/resource/internal outcomes never mean "try another proof".
-    fn proof_types_match(
+    pub(in crate::source) fn proof_types_match(
         &mut self,
         left: &Expr,
         right: &Expr,
@@ -229,6 +229,13 @@ impl Context {
         self.resolve_instances(false)?;
         self.flush(false)?;
         let mut value = self.instantiate(&value)?;
+        if let Some(plan) = self
+            .recursion
+            .as_mut()
+            .and_then(|recursion| recursion.equation_goals.remove(&goal.id))
+        {
+            value = self.lower_constrained_recursive_calls(&value, &plan)?;
+        }
         for local in goal.introduced.into_iter().rev() {
             self.tick()?;
             let domain = self.instantiate(&local.type_)?;
