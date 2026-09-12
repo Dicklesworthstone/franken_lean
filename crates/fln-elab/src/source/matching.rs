@@ -1039,6 +1039,9 @@ impl Context {
             });
             target = self.substitute(body, &Expr::fvar(id))?;
         }
+        if state.recursive && self.recursion.as_ref().is_some_and(|r| r.matrix) {
+            self.register_matrix_hypotheses(&mut locals, &hypotheses)?;
+        }
         if state.recursive {
             let constructor_type = self
                 .known_type(&constructor)?

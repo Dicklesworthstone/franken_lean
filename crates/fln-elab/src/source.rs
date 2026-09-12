@@ -115,6 +115,8 @@ struct Context {
     // declarations in the local context decide visibility, including rollback.
     induction_specializations: Vec<(Name, Name)>,
     matrix_rows: std::collections::HashSet<Name>,
+    // Only compiler-generated aliases may expose their already checked referent.
+    matrix_aliases: std::collections::HashMap<FVarId, Expr>,
     recursion: Option<recursion::Recursion>,
 }
 
@@ -134,6 +136,7 @@ impl Context {
             instance_goals: Vec::new(),
             induction_specializations: Vec::new(),
             matrix_rows: std::collections::HashSet::new(),
+            matrix_aliases: std::collections::HashMap::new(),
             recursion: None,
         }
     }
@@ -275,7 +278,11 @@ impl Context {
                 .find(|local| &local.user_name == name)
             {
                 return Ok(Typed {
-                    value: Expr::fvar(local.id.clone()),
+                    value: self
+                        .matrix_aliases
+                        .get(&local.id)
+                        .cloned()
+                        .unwrap_or_else(|| Expr::fvar(local.id.clone())),
                     type_: local.type_.clone(),
                 });
             }
@@ -487,7 +494,7 @@ impl Context {
         term: Typed,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
+        let mut term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
         // Resolve known dictionaries before their dependent result types enter
         // unification. Unknown class inputs still wait for the expected type.
         self.resolve_instances(false)?;
@@ -495,6 +502,7 @@ impl Context {
             self.constrain_type(&term.type_, expected)?;
         }
         self.resolve_instances(false)?;
+        term.value = self.lower_matrix_call(&term.value)?;
         Ok(term)
     }
 
@@ -579,6 +587,28 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "matrixAlias"]) {
+                            let [Syntax::Ident { val: name, .. }, subject, body] = args.as_slice()
+                            else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            let value = self.atom(subject, None)?;
+                            if !matches!(value.value.node(), ExprNode::FVar { .. }) {
+                                return Err(failure(SourceInferenceError::Scope));
+                            }
+                            let saved = self.txn.lctx.clone();
+                            let id = FVarId(self.fresh_name()?);
+                            self.txn.lctx.add_let(
+                                id.clone(),
+                                name.clone(),
+                                value.type_.clone(),
+                                value.value.clone(),
+                            );
+                            self.matrix_aliases.insert(id.clone(), value.value.clone());
+                            tasks.push(Task::LetBody(saved, id, name.clone(), value));
+                            tasks.push(Task::Visit(body, expected, finish));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "matrixBranch"]) {
                             let [Syntax::Ident { val, .. }, body] = args.as_slice() else {
                                 return Err(failure(SourceInferenceError::Scope));
@@ -1172,6 +1202,7 @@ impl Context {
                     tasks.push(Task::Visit(body, expected, true));
                 }
                 Task::LetBody(saved, id, name, value) => {
+                    self.matrix_aliases.remove(&id);
                     let mut body = values.pop().expect("let body visit");
                     body.value = self.instantiate(&body.value)?;
                     body.type_ = self.instantiate(&body.type_)?;

@@ -230,7 +230,7 @@ impl Context {
             // Target binders give candidate terms their scope, but do not
             // extend the local-instance population of this search. This also
             // holds for recursive prerequisites under those binders.
-            if !ambient.contains(&local.id) {
+            if !ambient.contains(&local.id) || self.is_matrix_hypothesis(local) {
                 continue;
             }
             let eligible = if local.binder_info == BinderInfo::InstImplicit {

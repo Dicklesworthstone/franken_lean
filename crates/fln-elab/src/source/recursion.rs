@@ -8,6 +8,7 @@
 //! terms that conversion could erase.
 use super::*;
 mod constrained;
+mod matrix;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
 
@@ -54,6 +55,9 @@ pub(super) struct Recursion {
     pub(super) parameters: Vec<LocalDecl>,
     pub(super) decreasing: usize,
     pub(super) pending: bool,
+    pub(super) matrix: bool,
+    matrix_hypotheses: Vec<(Name, Name)>,
+    matrix_hidden: HashSet<Name>,
     /// Family-ordered index binders, each pointing into the source telescope.
     indices: Vec<usize>,
     /// Source-ordered arguments universally quantified in each hypothesis.
@@ -152,8 +156,23 @@ impl Context {
         {
             return Err(error(RecursionError::RootMatchRequired));
         }
-        let parts = self.match_parts(syntax)?;
-        let mut discriminant = parts.discriminant;
+        let parts = expect_node(
+            syntax,
+            &parser_kind(&["Term", "match"]),
+            6,
+            "recursive root match",
+        )?;
+        let discriminants = expect_null_args(&parts[3], "recursive discriminants")?;
+        let first = discriminants
+            .first()
+            .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
+        let first = expect_node(
+            first,
+            &parser_kind(&["Term", "matchDiscr"]),
+            2,
+            "recursive discriminant",
+        )?;
+        let mut discriminant = &first[1];
         while let Some(inner) = parenthesized_inner(discriminant)? {
             self.tick()?;
             discriminant = inner;
@@ -198,6 +217,9 @@ impl Context {
             parameters: parameters.to_vec(),
             decreasing,
             pending: true,
+            matrix: false,
+            matrix_hypotheses: Vec::new(),
+            matrix_hidden: HashSet::new(),
             indices: Vec::new(),
             varying: (decreasing + 1..parameters.len()).collect(),
             family: None,

@@ -489,6 +489,9 @@ impl Context {
                 let mut matched = None;
                 for local in goal.lctx.decls().iter().rev() {
                     self.tick()?;
+                    if self.is_matrix_hypothesis(local) {
+                        continue;
+                    }
                     if self.proof_types_match(&local.type_, &goal.target)? {
                         matched = Some(Expr::fvar(local.id.clone()));
                         break;

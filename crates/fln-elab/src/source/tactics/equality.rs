@@ -393,7 +393,13 @@ impl Context {
         let candidates: Vec<_> = if selected_is_eq {
             vec![selected]
         } else {
-            goal.lctx.decls().iter().rev().cloned().collect()
+            goal.lctx
+                .decls()
+                .iter()
+                .rev()
+                .filter(|local| !self.is_matrix_hypothesis(local))
+                .cloned()
+                .collect()
         };
         let mut solution = None;
         for witness in candidates {

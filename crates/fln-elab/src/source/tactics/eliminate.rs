@@ -35,6 +35,7 @@ struct EliminationContext<'a> {
     induction: bool,
     equations: Option<&'a index_equations::IndexEquations>,
     recursive_source: bool,
+    source_match: bool,
 }
 pub(in crate::source) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
     if let Some(value) = &local.value {
@@ -162,6 +163,7 @@ impl Context {
             induction,
             equations,
             recursive_source,
+            source_match,
         } = context;
         let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
@@ -266,6 +268,22 @@ impl Context {
             replacements.push((old.id.clone(), Expr::fvar(id)));
         }
         branch.target = self.specialize_locals(original_target, &replacements)?;
+        // A source expression can refer to its original discriminant in every
+        // branch, unlike a tactic which deliberately removes the selected local.
+        // Reintroduce that name as the actual constructor, never the outer input.
+        // Source field binders take precedence when they shadow the old name.
+        if source_match && !major.user_name.is_anonymous() && !names.contains(&major.user_name) {
+            let local = LocalDecl {
+                id: FVarId(self.fresh_name()?),
+                user_name: major.user_name.clone(),
+                type_: ctor_type.clone(),
+                value: Some(ctor.clone()),
+                binder_info: BinderInfo::Default,
+                index: self.txn.lctx.len(),
+            };
+            add_local(&mut self.txn.lctx, &local);
+            branch.introduced.push(local);
+        }
         if let Some(whole) = alternative.and_then(|alt| alt.whole.as_ref()) {
             let local = LocalDecl {
                 id: FVarId(self.fresh_name()?),
@@ -878,6 +896,7 @@ impl Context {
                     induction,
                     equations,
                     recursive_source,
+                    source_match: !matches!(input, EliminationSyntax::Tactic(_)),
                 },
                 alternative,
                 &mut hypotheses,

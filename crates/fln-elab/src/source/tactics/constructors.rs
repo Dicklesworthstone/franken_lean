@@ -942,6 +942,7 @@ impl Context {
             .lctx
             .decls()
             .iter()
+            .filter(|local| !self.is_matrix_hypothesis(local))
             .map(|local| Typed {
                 value: Expr::fvar(local.id.clone()),
                 type_: local.type_.clone(),

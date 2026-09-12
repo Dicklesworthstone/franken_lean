@@ -33,6 +33,7 @@ struct Row<'a> {
     witness: Name,
 }
 struct Matrix<'a> {
+    recursive_root: bool,
     subjects: Vec<Name>,
     rows: Vec<Row<'a>>,
 }
@@ -262,7 +263,14 @@ impl Context {
         &mut self,
         syntax: &Syntax,
         required: &mut Vec<Name>,
+        recursive_root: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if recursive_root {
+            self.recursion
+                .as_mut()
+                .expect("recursive matrix root")
+                .matrix = true;
+        }
         let parts = expect_node(
             syntax,
             &parser_kind(&["Term", "match"]),
@@ -338,20 +346,33 @@ impl Context {
         }
         enum Task<'a> {
             Build(Matrix<'a>),
-            Finish(Name, Vec<Alternative>, usize),
+            Finish(Name, Vec<Alternative>, usize, bool),
         }
-        let mut pending = vec![Task::Build(Matrix { subjects, rows })];
+        let mut pending = vec![Task::Build(Matrix {
+            subjects,
+            rows,
+            recursive_root,
+        })];
         let mut built = Vec::new();
         while let Some(task) = pending.pop() {
             self.tick()?;
             match task {
-                Task::Finish(subject, alternatives, start) => {
+                Task::Finish(subject, alternatives, start, root) => {
                     let bodies = built.split_off(start);
                     let alternatives = alternatives
                         .into_iter()
                         .zip(bodies)
-                        .map(|(alt, body)| {
-                            Syntax::node(
+                        .map(|(alt, mut body)| {
+                            self.tick()?;
+                            if root {
+                                // Re-evaluate other columns in the generalized
+                                // recursive branch, not in the captured caller.
+                                for (name, value) in inputs.iter().rev() {
+                                    body =
+                                        bind(name.clone(), self.copy_pattern_syntax(value)?, body);
+                                }
+                            }
+                            Ok(Syntax::node(
                                 parser_kind(&["Term", "matchAlt"]),
                                 vec![
                                     atom("|"),
@@ -359,9 +380,14 @@ impl Context {
                                     atom("=>"),
                                     body,
                                 ],
-                            )
+                            ))
                         })
-                        .collect();
+                        .collect::<Result<_, NatDefinitionElabError>>()?;
+                    let discriminant = if root {
+                        inputs[0].1.clone()
+                    } else {
+                        identifier(subject)
+                    };
                     built.push(Syntax::node(
                         parser_kind(&["Term", "matchMatrix"]),
                         vec![
@@ -370,7 +396,7 @@ impl Context {
                             null(vec![]),
                             null(vec![Syntax::node(
                                 parser_kind(&["Term", "matchDiscr"]),
-                                vec![null(vec![]), identifier(subject)],
+                                vec![null(vec![]), discriminant],
                             )]),
                             atom("with"),
                             Syntax::node(
@@ -395,7 +421,10 @@ impl Context {
                         // source aliases is simultaneous even for swapped names.
                         for (name, subject) in row.bindings.into_iter().rev() {
                             self.tick()?;
-                            body = bind(name, identifier(subject), body);
+                            body = Syntax::node(
+                                parser_kind(&["Term", "matrixAlias"]),
+                                vec![identifier(name), identifier(subject), body],
+                            );
                         }
                         built.push(body);
                         continue;
@@ -451,6 +480,11 @@ impl Context {
                         { heads.push(row.patterns[0]); }
                     }
                     if heads.is_empty() {
+                        if matrix.recursive_root {
+                            return Err(failure(SourceInferenceError::Recursion(
+                                recursion::RecursionError::RootMatchRequired,
+                            )));
+                        }
                         for row in &mut matrix.rows {
                             if let Pattern::Bind(Some(name)) = &arena[row.patterns.remove(0)] {
                                 row.bindings.push((name.clone(), subject.clone()));
@@ -509,7 +543,11 @@ impl Context {
                             )
                         };
                         alternatives.push(Alternative { pattern });
-                        branches.push(Matrix { subjects, rows });
+                        branches.push(Matrix {
+                            subjects,
+                            rows,
+                            recursive_root: false,
+                        });
                     }
                     let mut fallback = Vec::new();
                     for row in matrix.rows {
@@ -527,18 +565,26 @@ impl Context {
                             pattern: wildcard(),
                         });
                         branches.push(Matrix {
+                            recursive_root: false,
                             subjects: matrix.subjects,
                             rows: fallback,
                         });
                     }
-                    pending.push(Task::Finish(subject, alternatives, built.len()));
+                    pending.push(Task::Finish(
+                        subject,
+                        alternatives,
+                        built.len(),
+                        matrix.recursive_root,
+                    ));
                     pending.extend(branches.into_iter().rev().map(Task::Build));
                 }
             }
         }
         let mut result = built.pop().ok_or_else(invalid)?;
-        for (name, value) in inputs.into_iter().rev() {
-            result = bind(name, value, result);
+        if !recursive_root {
+            for (name, value) in inputs.into_iter().rev() {
+                result = bind(name, value, result);
+            }
         }
         Ok(result)
     }
@@ -560,6 +606,11 @@ impl Context {
         if !needed {
             return Ok((Cow::Borrowed(syntax), Vec::new()));
         }
+        let mut root = syntax;
+        while let Some(inner) = parenthesized_inner(root)? {
+            self.tick()?;
+            root = inner;
+        }
         enum Task<'a> {
             Visit(&'a Syntax),
             Node(&'a Syntax, usize),
@@ -575,14 +626,19 @@ impl Context {
                     tasks.extend(args.iter().rev().map(Task::Visit));
                 }
                 Task::Visit(leaf) => built.push(leaf.clone()),
-                Task::Node(Syntax::Node { info, kind, .. }, start) => {
+                Task::Node(original @ Syntax::Node { info, kind, .. }, start) => {
                     let node = Syntax::Node {
                         info: *info,
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
                     built.push(if complex(&node) {
-                        self.compile_pattern_matrix(&node, &mut required)?
+                        self.compile_pattern_matrix(
+                            &node,
+                            &mut required,
+                            std::ptr::eq(original, root)
+                                && self.recursion.as_ref().is_some_and(|r| r.pending),
+                        )?
                     } else {
                         node
                     });

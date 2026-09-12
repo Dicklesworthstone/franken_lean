@@ -79,3 +79,10 @@ injectivity of an index function is assumed. Multi-discriminant or nested-patter
 compilation and full equation-lemma/name parity are not established by this path.
 The tests cover source admission and checked conversion, not execution-backend
 parity or a complete pinned Prelude/corpus conformance run.
+
+## Multiple input patterns
+
+A constrained structural input can also be the first discriminant of a root
+pattern matrix. Other columns are elaborated in the generalized recursive
+context. See [Native matrix recursion](NATIVE_MATRIX_RECURSION.md) for the
+checked alias/hypothesis tracking and the immediate-child restriction.

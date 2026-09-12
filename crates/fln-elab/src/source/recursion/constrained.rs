@@ -74,7 +74,10 @@ impl Context {
         Ok(name)
     }
 
-    fn recursive_alias_value(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(super) fn recursive_alias_value(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let mut value = expr.clone();
         let mut seen = HashSet::new();
         while let ExprNode::FVar { id } = value.node() {

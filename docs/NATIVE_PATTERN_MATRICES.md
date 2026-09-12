@@ -73,11 +73,13 @@ kernel rejection. Failed files publish no successor environment.
 Supported patterns are variables, wildcards and constructors, including nested
 constructor patterns. Numeric/string literal patterns, alternative-pattern bars,
 pattern guards, inaccessible patterns, named discriminant equations and explicit
-motive syntax are not added here. Existing structural-recursion definitions with
-flat root patterns remain supported; recursive calls introduced through a matrix
-root or a nested constructor pattern are a separate lowering task. This does not
-implement general well-founded recursion, mutual/nested inductive admission,
-execution-backend parity or full Reference matcher compatibility.
+motive syntax are not added here. Structural recursion through a matrix root is
+implemented for the first decreasing column and immediate recursive children;
+see [Native matrix recursion](NATIVE_MATRIX_RECURSION.md). Nested payload patterns
+and other inputs are supported without treating grandchildren as immediate
+children. General well-founded recursion, mutual/nested inductive admission,
+execution-backend parity and full Reference matcher compatibility remain separate
+capabilities.
 
 Run the checked example through the installed binary:
 
