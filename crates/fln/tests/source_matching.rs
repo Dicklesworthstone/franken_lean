@@ -543,7 +543,7 @@ fn indexed_generalization_cannot_rescue_an_ill_typed_original_motive() {
 }
 
 #[test]
-fn indexed_matches_preserve_index_order_and_refuse_unimplemented_pattern_refinement() {
+fn indexed_matches_preserve_index_order_with_checked_field_refinement() {
     check(
         "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell (Nat.succ x) (Nat.succ y)\ndef digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 4 8 (Cell.make 3 7) = 37 := by rfl",
     );
@@ -552,33 +552,14 @@ fn indexed_matches_preserve_index_order_and_refuse_unimplemented_pattern_refinem
     );
     for fields in ["x y", "_ _"] {
         let source = format!(
-            "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef inspect (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make {fields} => n"
+            "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef inspect (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make {fields} => n\ntheorem inspected : inspect 3 7 (Cell.make 3 7) = 3 := by rfl"
         );
-        let e = engine();
-        let root = e.logical_root(&KVMap::new());
-        let error = e
-            .check_source_files(
-                &[source.as_bytes()],
-                &KVMap::new(),
-                SourceCheckLimits::new(limits()),
-            )
-            .expect_err("unrefined index patterns are outside this lane");
-        assert!(
-            error
-                .to_string()
-                .contains("direct constructor-field indices require index-pattern refinement"),
-            "{error:?}"
-        );
-        assert!(
-            !error.disposition().1,
-            "a capability refusal is not a kernel rejection"
-        );
-        assert_eq!(e.logical_root(&KVMap::new()), root);
+        check(&source);
     }
 }
 
 #[test]
-fn direct_field_index_branches_can_use_only_the_refined_fields() {
+fn direct_field_index_branches_keep_refined_fields_and_shadowed_names() {
     check(
         "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\ndef digits (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => x * 10 + y\ntheorem checked : digits 3 7 (Cell.make 3 7) = 37 := by rfl",
     );
@@ -588,29 +569,102 @@ fn direct_field_index_branches_can_use_only_the_refined_fields() {
 }
 
 #[test]
-fn unrefined_field_indices_cannot_escape_through_aliases_or_unused_arguments() {
+fn field_index_captures_are_related_through_checked_aliases() {
     for body in [
         "let captured := n; match cell with | .make x => captured",
         "let identity : Nat -> Nat := fun z => z; match cell with | .make x => identity n",
         "match cell with | .make x => let unused := n; x",
     ] {
         let source = format!(
-            "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\ndef bad (n : Nat) (cell : Cell n) : Nat := {body}"
+            "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\ndef read (n : Nat) (cell : Cell n) : Nat := {body}\ntheorem checked : read 9 (Cell.make 9) = 9 := by rfl"
+        );
+        check(&source);
+    }
+}
+
+#[test]
+fn refined_field_index_equations_are_retained_in_the_proof_term() {
+    let result = check(
+        "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\n\
+        theorem relation (n : Nat) (cell : Cell n) : cell = Cell.make n := match cell with | .make x => (rfl : cell = Cell.make x)",
+    );
+    let Some(ConstantInfo::Thm(theorem)) = result
+        .engine
+        .environment()
+        .find(&Name::from_components(["relation"]))
+    else {
+        panic!("checked source theorem");
+    };
+    let names = constants(&theorem.value);
+    assert!(names.contains(&Name::from_components(["Cell", "rec"])));
+    assert!(names.contains(&Name::from_components(["Eq", "rec"])));
+}
+
+#[test]
+fn generic_field_indices_transport_the_original_dependent_scope() {
+    check(
+        "inductive Cell : Nat -> Type where | make (x : Nat) : Cell x\n\
+        def reconstruct (n : Nat) (cell : Cell n) : Cell n := match cell with | .make x => Cell.make n\n\
+        theorem restored (n : Nat) (cell : Cell n) (h : cell = cell) (P : cell = cell -> Prop) (hp : P h) : P h := match cell with | .make x => hp\n\
+        theorem reconstruct_ok : reconstruct 4 (Cell.make 4) = Cell.make 4 := by rfl",
+    );
+    check(
+        "inductive Witness (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | intro (a : A) (v : P a) : Witness A P a v\n\
+        def retain (A : Type) (P : A -> Type) (a : A) (v : P a) (w : Witness A P a v) : P a := match w with | .intro x value => v\n\
+        theorem keep_ok : retain Nat (fun x => Bool) 7 true (Witness.intro 7 true) = true := by rfl",
+    );
+}
+
+#[test]
+fn refined_field_indices_do_not_equate_distinct_inputs_or_drop_bad_annotations() {
+    for body in [
+        "theorem bad (n m : Nat) (cell : Cell n m) : n = m := match cell with | .make x y => rfl",
+        "def bad (n m : Nat) (cell : Cell n m) : Cell n m := match cell with | .make x y => Cell.make y x",
+        "def bad (n m : Nat) (cell : Cell n m) : Nat := match cell with | .make x y => let unused := (n : String); x",
+        "def bad (n m : Nat) (cell : Cell n m) : Nat := let saved := (n : String); match cell with | .make x y => x",
+    ] {
+        let source = format!(
+            "inductive Cell : Nat -> Nat -> Type where | make (x y : Nat) : Cell x y\n{body}"
         );
         let e = engine();
         let root = e.logical_root(&KVMap::new());
-        let error = e
+        let rejected = e
             .check_source_files(
                 &[source.as_bytes()],
                 &KVMap::new(),
                 SourceCheckLimits::new(limits()),
             )
-            .expect_err("old index capture requires an equation witness");
-        assert!(
-            error.to_string().contains("index-pattern refinement"),
-            "{error:?}"
-        );
-        assert!(!error.disposition().1);
+            .expect_err("refinement must retain all checking obligations");
+        if body.contains("String") {
+            assert_eq!(
+                rejected.disposition(),
+                ("kernel-rejection", true, 1),
+                "{rejected:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    rejected.disposition(),
+                    ("elaboration", false, 1) | ("kernel-rejection", true, 1)
+                ),
+                "{rejected:?}"
+            );
+        }
         assert_eq!(e.logical_root(&KVMap::new()), root);
     }
+}
+
+#[test]
+fn field_index_refinement_does_not_make_arbitrary_functions_injective() {
+    let e = check(
+        "inductive Fiber (f : Nat -> Nat) : Nat -> Type where | point (x : Nat) : Fiber f (f x)\n\
+        def read (f : Nat -> Nat) (a : Nat) (w : Fiber f (f a)) : Nat := match w with | .point x => x",
+    ).engine;
+    let source = b"theorem bad (f : Nat -> Nat) (a b : Nat) (h : f a = f b) (w : Fiber f (f a)) : a = b := match w with | .point x => rfl";
+    let root = e.logical_root(&KVMap::new());
+    assert!(
+        e.check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits()))
+            .is_err()
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), root);
 }

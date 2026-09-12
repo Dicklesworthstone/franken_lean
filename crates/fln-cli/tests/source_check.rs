@@ -1295,7 +1295,7 @@ fn installed_fixed_index_matches_check_real_terms_and_recover_after_failure() {
         );
         if success {
             let json = String::from_utf8(output.stdout).unwrap();
-            for expected in ["\"commands\":16", "\"theorems\":6", "\"executed\":false"] {
+            for expected in ["\"commands\":20", "\"theorems\":8", "\"executed\":false"] {
                 assert!(json.contains(expected), "{json}");
             }
         } else {

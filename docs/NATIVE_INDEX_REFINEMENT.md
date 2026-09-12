@@ -81,6 +81,17 @@ and without refunding the work already spent. Other typing, conversion, and
 resource failures are not alternative-selection signals. Generated induction
 hypotheses remain invisible in both ordinary and constrained source matches.
 
+Direct constructor-field indices also use the equation backend even when the
+input indices are independent locals. This relates the original index names to
+the fresh fields by checked evidence rather than rejecting their use or changing
+their recorded types. The original names may occur in aliases, unused arguments,
+dependent results, and proof-dependent hypotheses. For `Cell n` with constructor
+`make (x : Nat) : Cell x`, both `n` and `x` remain usable, with a checked relation
+between them. A constructor with separate indices does not imply those indices
+are equal. Result indices containing arbitrary function applications do not
+license an injectivity assumption. The structural-recursion path retains its
+separate recursive-hypothesis lowering.
+
 ```bash
 fln check-source --json examples/native_constrained_matching.lean
 ```

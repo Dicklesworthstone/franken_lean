@@ -438,6 +438,20 @@ impl Context {
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
         if !induction && equations.is_none() {
+            if matches!(input, EliminationSyntax::Match(_))
+                && self.match_has_field_indices(&family)?
+            {
+                return self.eliminate_constrained_indices(
+                    proof,
+                    goal,
+                    input,
+                    &major,
+                    &family,
+                    levels,
+                    &parameters,
+                    &index_values,
+                );
+            }
             for parameter in &parameters {
                 if !self.elimination_reads(parameter)?.is_disjoint(&index_ids) {
                     return self.eliminate_constrained_indices(

@@ -134,7 +134,7 @@ fn dependent_index_failures_never_discard_a_branch_or_publish_a_prefix() {
     let root = base.logical_root(&KVMap::new());
     for source in [
         "def bad {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : P a := match t with | .stop x vx => vx | .step x y vx vy child => vx",
-        "def bad {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with | .stop x vx => t | .step x y vx vy child => t",
+        "def bad {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with | .stop x vx => t | .step x y vx vy child => child",
         "def bad {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : Nat := match t with | .stop x vx => 0 | .step x y vx vy child => bad y vy child",
         "def bad {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : Nat := match t with | .stop x vx => 0 | .step x y vx vy child => let unused := bad a v t; 0",
         "theorem bad {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : 0 = 0 := match t with | .stop x vx => rfl | .step x y vx vy child => by assumption",
@@ -161,6 +161,17 @@ fn dependent_index_failures_never_discard_a_branch_or_publish_a_prefix() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn field_index_equations_preserve_the_original_major_at_its_actual_type() {
+    check(&format!("{TRACE}
+        def original {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with
+          | .stop x vx => t
+          | .step x y vx vy child => t
+        theorem same : original 2 false trace = trace := by rfl
+        def terminal : Trace Nat (fun a => Bool) 1 true := Trace.stop 1 true
+        theorem stopped : original 1 true terminal = terminal := by rfl"));
 }
 
 #[test]

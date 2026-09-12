@@ -75,9 +75,10 @@ coverage policy, and examples. This is not complete indexed elimination:
 
 ## Constructor matches
 
-Ordinary source matches support indexed families whose actual indices are distinct
-parameter locals. Later index domains may depend on preceding indices in family
-order; the motive closes that telescope without inventing index equations.
+Ordinary source matches support both independent parameter indices and constrained
+indices. On the direct independent-index path, later domains may depend on
+preceding indices in family order; the motive closes that telescope without
+inventing index equations.
 Constructor branches receive the
 refined expected type, so a vector can be reconstructed at its original length:
 
@@ -101,21 +102,24 @@ performs no index refinement and becomes a checked let binding; this also permit
 core term even when unused. Ordinary matches keep recursor hypotheses out of proof
 and instance search. Every resulting term still crosses both checking engines.
 
-Constructor matches with fixed/repeated indices or inaccessible patterns remain
-unsupported. These are bounded source capabilities, not generated-matcher
-name parity or full Lean match elaboration.
+Fixed, repeated, let-bound, and parameter-shared indices select the checked
+equation-refinement backend described in
+[NATIVE_INDEX_REFINEMENT.md](NATIVE_INDEX_REFINEMENT.md). The same backend connects
+direct constructor-field indices to the caller's original names, including uses
+through aliases, dependent hypotheses and unused terms. Omitted constructors
+require retained contradiction proofs; reachable catch-all alternatives bind
+actual constructor values. Supplied impossible alternatives refuse rather than
+silently discarding their source. Neither arbitrary function injectivity nor
+guessed constructor assignments are used.
 
-Constructor result indices that reduce directly to fields permit branches using
-those fresh fields. Reading a corresponding original index without an equation
-witness remains a typed refusal, including through retained aliases, local types
-and unused arguments. This capture audit finishes all branches before refusing so
-an actual unresolved recursive self-reference can select the existing structural
-recursion retry, which rebinds the index names to constructor results. It does not
-invent index equations or expose ordinary-match induction hypotheses.
-Constructor-shaped indices such as a vector's successor length, and fixed
-family-parameter indices, remain supported. Before generalizing dependent arguments, the original index motive is
-retained as a checked typing obligation, so generalization cannot hide an
-ill-typed captured dependency.
+The existing structural-recursion path remains separate and retains its direct
+recursive-hypothesis lowering. Its capture audit still prevents unrefined locals
+from escaping before a genuine self-reference can select that path. On the direct
+independent-index path, the original motive remains a checked typing obligation,
+so generalizing arguments cannot hide an ill-typed captured dependency.
+Inaccessible patterns, multiple discriminants and complete Lean match elaboration
+remain unsupported. These capabilities do not establish generated-matcher name
+parity.
 
 ## Structural recursive functions
 

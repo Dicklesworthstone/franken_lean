@@ -42,3 +42,14 @@ def keep (x : Choice 1) : Choice 1 := match x with
   | rest => rest
 
 theorem keep_ok : keep (Choice.second 9) = Choice.second 9 := by rfl
+
+inductive Cell : Nat -> Type where
+  | make (x : Nat) : Cell x
+
+def readIndex (n : Nat) (cell : Cell n) : Nat := match cell with
+  | .make x => let retained := n; retained
+
+theorem cell_reconstructed (n : Nat) (cell : Cell n) : cell = Cell.make n := match cell with
+  | .make x => (rfl : cell = Cell.make x)
+
+theorem index_ok : readIndex 9 (Cell.make 9) = 9 := by rfl

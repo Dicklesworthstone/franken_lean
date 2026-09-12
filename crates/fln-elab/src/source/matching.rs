@@ -285,7 +285,7 @@ impl Context {
         match self.start_regular_match(parts, major.clone(), expected.clone()) {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
-                MatchError::UnrefinedIndices,
+                MatchError::UnrefinedIndices | MatchError::UnrefinedIndexPattern,
             ))) if !recursive => {
                 let spent = self.txn.budget.heartbeats_consumed;
                 *self = saved;
@@ -402,6 +402,16 @@ impl Context {
                     branches: std::collections::VecDeque::new(),
                 });
             }
+        }
+        // A constructor field used verbatim as a result index needs an actual
+        // equation connecting it to the caller's index. Without that witness
+        // the direct path must reject even valid captures of the original
+        // index through a local alias or dependent hypothesis. Select the
+        // checked-equation backend before elaborating any branch, so no source
+        // expression is dropped or replayed merely because it uses that name.
+        // Structural recursive roots keep their dedicated hypothesis lowering.
+        if !recursive && self.match_has_field_indices(&family)? {
+            return Err(error(MatchError::UnrefinedIndexPattern));
         }
         let indices = self.elimination_index_locals(&index_values)?;
         // Generalizing later parameters must not rescue an ill-typed original
@@ -579,6 +589,47 @@ impl Context {
     /// One pattern parser serves ordinary and equation-refining matches. Syntax
     /// is borrowed from the original source; no generated tactic script or
     /// reparsing can erase a branch's annotations, references, or provenance.
+    /// Read only admitted constructor signatures. A bound result index in the
+    /// innermost field slots denotes a field, while the higher slots are fixed
+    /// parameters. Compound indices are not assumed injective by this test.
+    pub(super) fn match_has_field_indices(
+        &mut self,
+        family: &fln_env::constants::InductiveVal,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if family.num_indices == 0 {
+            return Ok(false);
+        }
+        for name in &family.ctors {
+            self.tick()?;
+            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(name).cloned() else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if constructor.induct != family.base.name || constructor.num_params != family.num_params
+            {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            let mut result = &constructor.base.type_;
+            for _ in 0..u64::from(constructor.num_params) + u64::from(constructor.num_fields) {
+                self.tick()?;
+                let ExprNode::ForallE { body, .. } = result.node() else {
+                    return Err(error(MatchError::UnsupportedFamily));
+                };
+                result = body;
+            }
+            for _ in 0..family.num_indices {
+                self.tick()?;
+                let ExprNode::App { f, a } = result.node() else {
+                    return Err(error(MatchError::UnsupportedFamily));
+                };
+                if matches!(a.node(), ExprNode::BVar { idx } if *idx < constructor.num_fields) {
+                    return Ok(true);
+                }
+                result = f;
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn match_patterns<'a>(
         &mut self,
         parts: MatchParts<'a>,
