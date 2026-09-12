@@ -165,7 +165,74 @@ fn complex(syntax: &Syntax, environment: &Environment) -> bool {
     })
 }
 
+fn pattern_function(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node {kind,args,..}
+        if kind == &parser_kind(&["Term","fun"])
+        && matches!(args.get(1), Some(Syntax::Node {kind,..})
+            if kind == &parser_kind(&["Term","matchAlts"])))
+}
+
 impl Context {
+    /// Pattern lambdas are ordinary lambdas over fresh private names. Domain
+    /// inference/checking stays in the existing lambda elaborator. The body's
+    /// original alternatives go through the same matrix compiler as match.
+    fn compile_pattern_function(
+        &mut self,
+        mut syntax: Syntax,
+        required: &mut Vec<Name>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let Syntax::Node { args, .. } = &mut syntax else {
+            return Err(invalid());
+        };
+        if args.len() != 2 {
+            return Err(invalid());
+        }
+        let alternatives = args.pop().expect("validated pattern function");
+        let keyword = args.pop().expect("validated function keyword");
+        if !matches!(&keyword, Syntax::Atom {val,..} if val == "fun" || val == "λ") {
+            return Err(invalid());
+        }
+        let arity = self.equation_arity(&alternatives)?;
+        let mut names = Vec::new();
+        let mut discriminants = Vec::new();
+        for index in 0..arity {
+            self.tick()?;
+            let serial = self.next;
+            let _ = self.fresh_name()?;
+            let name = Name::num(Name::anonymous(), serial);
+            names.push(identifier(name.clone()));
+            if index != 0 {
+                discriminants.push(atom(","));
+            }
+            discriminants.push(Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), identifier(name)],
+            ));
+        }
+        let body = Syntax::node(
+            parser_kind(&["Term", "match"]),
+            vec![
+                atom("match"),
+                null(vec![]),
+                null(vec![]),
+                null(discriminants),
+                atom("with"),
+                alternatives,
+            ],
+        );
+        let body = self.compile_pattern_matrix(&body, required, false)?;
+        Ok(Syntax::node(
+            parser_kind(&["Term", "fun"]),
+            vec![
+                keyword,
+                Syntax::node(
+                    parser_kind(&["Term", "basicFun"]),
+                    vec![null(names), null(vec![]), atom("=>"), body],
+                ),
+            ],
+        ))
+    }
+
     fn matrix_name(&mut self) -> Result<Name, NatDefinitionElabError> {
         let id = self.next;
         self.fresh_name()?;
@@ -613,7 +680,7 @@ impl Context {
         let mut needed = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
-            needed |= complex(node, &self.txn.env);
+            needed |= complex(node, &self.txn.env) || pattern_function(node);
             if let Syntax::Node { args, .. } = node {
                 scan.extend(args);
             }
@@ -647,7 +714,9 @@ impl Context {
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
-                    built.push(if complex(&node, &self.txn.env) {
+                    built.push(if pattern_function(&node) {
+                        self.compile_pattern_function(node, &mut required)?
+                    } else if complex(&node, &self.txn.env) {
                         self.compile_pattern_matrix(
                             &node,
                             &mut required,

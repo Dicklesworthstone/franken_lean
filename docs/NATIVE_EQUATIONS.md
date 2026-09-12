@@ -50,7 +50,7 @@ add literal patterns, equation lemmas with Reference-compatible names, `where`,
 supplied automatically impossible alternatives retain the current matrix
 compiler's explicit refusal policy. To recurse on a later input, use the existing
 explicit root-match form until structural-candidate selection covers that case.
-Pattern lambdas are a separate surface. These are scoped source-checking results,
+Pattern lambdas are described in `NATIVE_PATTERN_FUNCTIONS.md`. These are scoped source-checking results,
 not a full Reference syntax/conformance or execution-backend claim.
 
 Run the installed source path:

@@ -15,6 +15,8 @@ struct Alternative {
     end: usize,
 }
 struct MatchPlan {
+    function: bool,
+    baseline: usize,
     start: usize,
     depth: usize,
     with: Option<usize>,
@@ -72,6 +74,8 @@ fn plan(
     let mut delimiters = Vec::new();
     let mut active: Vec<MatchPlan> = if equations {
         vec![MatchPlan {
+            function: false,
+            baseline: 0,
             start: range.start,
             depth: 0,
             with: Some(range.start),
@@ -84,6 +88,19 @@ fn plan(
     let mut lets = Vec::new();
     let mut done = Vec::new();
     for at in range.clone() {
+        // A function used in a tactic-local value must stop at the next outer
+        // statement, not consume it as the final branch's application argument.
+        // Use the enclosing line's indentation, not the inline `fun` column.
+        while active.last().is_some_and(|p| {
+            p.function
+                && p.depth == delimiters.len()
+                && later_line(view, tokens, at, p.start)
+                && column(view, tokens, at) <= p.baseline
+                && !is_symbol(tokens, at, "|")
+                && p.alternatives.last().is_some_and(|alt| alt.arrow.is_some())
+        }) {
+            close(view, tokens, &mut active, &mut done, at)?;
+        }
         let TokenKind::Symbol(symbol) = &tokens[at].kind else {
             continue;
         };
@@ -97,9 +114,30 @@ fn plan(
         });
         match symbol.as_str() {
             "match" => active.push(MatchPlan {
+                function: false,
+                baseline: 0,
                 start: at,
                 depth,
                 with: None,
+                alternatives: Vec::new(),
+                end: range.end,
+            }),
+            "fun" | "λ" if is_symbol(tokens, at + 1, "|") => active.push(MatchPlan {
+                function: true,
+                baseline: {
+                    let source = view.normalized();
+                    let begin = source
+                        .line_start(source.line_of(tokens[at].extent.start()))
+                        .expect("function line")
+                        .0;
+                    source.as_bytes()[begin..tokens[at].extent.start().0]
+                        .iter()
+                        .take_while(|&&byte| byte == b' ' || byte == b'\t')
+                        .count()
+                },
+                start: at,
+                depth,
+                with: Some(at),
                 alternatives: Vec::new(),
                 end: range.end,
             }),
@@ -469,18 +507,23 @@ fn parse_planned(
     let mut splices = Splices::new();
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     if grammar == DefinitionGrammar::Scalar
-        && (equations || range.clone().any(|at| is_symbol(tokens, at, "match")))
+        && (equations
+            || range.clone().any(|at| {
+                is_symbol(tokens, at, "match")
+                    || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
+                        && is_symbol(tokens, at + 1, "|"))
+            }))
     {
         for plan in plan(view, tokens, range.clone(), equations)? {
             let with = plan.with.expect("validated match header");
             let equation_root = equations && plan.start == range.start;
             let mut discriminators = Vec::new();
-            let discriminant_columns = if equation_root {
+            let discriminant_columns = if equation_root || plan.function {
                 Vec::new()
             } else {
                 columns(tokens, plan.start + 1..with)
             };
-            let arity = if equation_root {
+            let arity = if equation_root || plan.function {
                 let first = plan.alternatives.first().expect("validated equation row");
                 columns(
                     tokens,
@@ -551,17 +594,24 @@ fn parse_planned(
                 }
                 return Ok(alternatives);
             }
-            let syntax = Syntax::node(
-                parser_kind(&["Term", "match"]),
-                vec![
-                    leaves.leaf(plan.start)?,
-                    null_node(vec![]),
-                    null_node(vec![]),
-                    null_node(discriminators),
-                    leaves.leaf(with)?,
-                    alternatives,
-                ],
-            );
+            let syntax = if plan.function {
+                Syntax::node(
+                    parser_kind(&["Term", "fun"]),
+                    vec![leaves.leaf(plan.start)?, alternatives],
+                )
+            } else {
+                Syntax::node(
+                    parser_kind(&["Term", "match"]),
+                    vec![
+                        leaves.leaf(plan.start)?,
+                        null_node(vec![]),
+                        null_node(vec![]),
+                        null_node(discriminators),
+                        leaves.leaf(with)?,
+                        alternatives,
+                    ],
+                )
+            };
             splices.insert(plan.start, (plan.end, syntax));
         }
     }
@@ -754,5 +804,61 @@ mod equation_depth_tests {
         let parsed = parse_definition(source).unwrap();
         assert_eq!(parsed.reconstruct_original(), source);
         assert_eq!(parsed.reconstruct_normalized().unwrap(), source);
+    }
+}
+
+#[cfg(test)]
+mod pattern_function_tests {
+    use super::*;
+    #[test]
+    fn original_function_pipes_comments_and_scopes_round_trip() {
+        for source in [
+            "def f : Bool -> Nat := fun | true => 7 | false => 9",
+            "def f : Bool -> Nat := λ | true => 7 | false => 9",
+            "def f : Nat := apply (fun | .none => 0 | .some x => x) value",
+            "def f : Bool -> Bool -> Nat := fun | true, _ => 1 | _, _ => 0",
+            "-- before\r\ndef f : Bool -> Nat := fun\r\n | true /- pattern -/ => 7 -- result\r\n | false => 9\r\n",
+            "def f : Bool -> Nat := fun\n | true => by\n   have h : Nat := 7\n   exact h\n | false => 0",
+            "def f : Bool -> Nat\n | true => (fun | true => 1 | false => 2) true\n | false => 0",
+            "def f : Nat := let g : Bool -> Nat := fun | true => 1 | false => 0; g true",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn malformed_function_equations_cannot_drop_leaves() {
+        for source in [
+            "def f := fun |",
+            "def f := fun | true =>",
+            "def f := fun | true 7",
+            "def f := fun | => 1",
+            "def f := fun | true => 1 | false, true => 2",
+            "def f := (fun | true => 1 | false => 2",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn nested_pattern_functions_use_a_heap_plan() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!(
+                    "def f := {}0{}",
+                    "(fun | true => ".repeat(1000),
+                    " | false => 1)".repeat(1000)
+                );
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

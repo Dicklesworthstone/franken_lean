@@ -1573,3 +1573,43 @@ fn installed_equation_definitions_check_real_terms_and_reject_late_failures() {
         assert_eq!(std::fs::read(&prefix).unwrap(), original);
     }
 }
+
+#[test]
+fn installed_pattern_functions_check_callbacks_and_isolate_invalid_branches() {
+    let prefix = file(include_str!(
+        "../../../examples/native_pattern_functions.lean"
+    ));
+    let invalid = file(
+        "theorem bad : 0 = 0 := by\n  have ignored : Bool -> Nat := fun | true => 1 | false => (1 : String)\n  rfl",
+    );
+    let before = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for field in [
+                "\"commands\":14",
+                "\"theorems\":6",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(field), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}

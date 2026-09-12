@@ -24,14 +24,10 @@ fn ident(name: Name) -> Syntax {
 }
 
 impl Context {
-    /// Produce a typed header plus an ordinary source match, without source
-    /// reparsing or using constructors to guess missing argument types.
-    pub(super) fn equation_function(
+    pub(super) fn equation_arity(
         &mut self,
         alternatives: &Syntax,
-        declared_type: &Expr,
-        parameters: &mut Vec<LocalDecl>,
-    ) -> Result<(Syntax, Expr), NatDefinitionElabError> {
+    ) -> Result<usize, NatDefinitionElabError> {
         let parts = expect_node(
             alternatives,
             &parser_kind(&["Term", "matchAlts"]),
@@ -64,7 +60,18 @@ impl Context {
                 return Err(failure(SourceInferenceError::Scope));
             }
         }
-        let arity = arity.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        arity.ok_or_else(|| failure(SourceInferenceError::Scope))
+    }
+
+    /// Produce a typed header plus an ordinary source match, without source
+    /// reparsing or using constructors to guess missing argument types.
+    pub(super) fn equation_function(
+        &mut self,
+        alternatives: &Syntax,
+        declared_type: &Expr,
+        parameters: &mut Vec<LocalDecl>,
+    ) -> Result<(Syntax, Expr), NatDefinitionElabError> {
+        let arity = self.equation_arity(alternatives)?;
         let mut explicit = 0;
         let mut result_type = declared_type.clone();
         let mut discriminants = Vec::new();
