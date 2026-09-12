@@ -340,7 +340,7 @@ impl Context {
         input: &EliminationSyntax<'a>,
         induction: bool,
         selected: Option<&FVarId>,
-        equations: Option<&[Name]>,
+        equations: Option<&index_equations::IndexEquations>,
     ) -> Result<(), NatDefinitionElabError> {
         let (target_name, explicit, scoped, rows) = match input {
             EliminationSyntax::Tactic(args) => {
@@ -422,11 +422,12 @@ impl Context {
             Ok(indices) => indices,
             Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
                 matching::MatchError::UnrefinedIndices,
-            ))) if !induction && equations.is_none() => {
+            ))) if equations.is_none() => {
                 return self.eliminate_constrained_indices(
                     proof,
                     goal,
                     input,
+                    induction,
                     &major,
                     &family,
                     levels,
@@ -437,7 +438,7 @@ impl Context {
             Err(error) => return Err(error),
         };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
-        if !induction && equations.is_none() {
+        if equations.is_none() {
             if matches!(input, EliminationSyntax::Match(_))
                 && self.match_has_field_indices(&family)?
             {
@@ -445,6 +446,7 @@ impl Context {
                     proof,
                     goal,
                     input,
+                    induction,
                     &major,
                     &family,
                     levels,
@@ -458,6 +460,7 @@ impl Context {
                         proof,
                         goal,
                         input,
+                        induction,
                         &major,
                         &family,
                         levels,
@@ -469,6 +472,9 @@ impl Context {
         }
         let mut removed = HashSet::from([major.id.clone()]);
         removed.extend(index_ids.iter().cloned());
+        if let Some(original) = equations.and_then(|plan| plan.induction_major.as_ref()) {
+            removed.insert(original.clone());
+        }
         if !explicit.is_empty() {
             if !induction {
                 return Err(error(TacticError::InvalidGeneralization));
@@ -769,7 +775,7 @@ impl Context {
             )?;
             let work_start = proof.work.len();
             let branch = if let Some(equations) = equations {
-                self.refine_index_branch(proof, branch, equations)?
+                self.refine_index_branch(proof, branch, &equations.names)?
             } else {
                 Some(branch)
             };

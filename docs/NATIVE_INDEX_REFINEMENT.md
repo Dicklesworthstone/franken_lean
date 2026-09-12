@@ -96,8 +96,8 @@ separate recursive-hypothesis lowering.
 fln check-source --json examples/native_constrained_matching.lean
 ```
 
-This remains case analysis, not generalized constrained-index induction.
-The existing induction lane still requires distinct parameter indices. Recursive
+Constrained-index induction is now implemented with explicit conditional child
+hypotheses; see [NATIVE_CONSTRAINED_INDUCTION.md](NATIVE_CONSTRAINED_INDUCTION.md). Recursive
 definitions with constrained header indices, inaccessible patterns, multiple
 discriminants, and full Lean matcher/equation-compiler parity are separate work.
 Mutual, nested, and higher-order inductive families retain their existing limits.

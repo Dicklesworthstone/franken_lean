@@ -1,4 +1,4 @@
-//! Checked index-equation refinement for case analysis.
+//! Checked index-equation refinement for case analysis and induction.
 //!
 //! Generalize the discriminant's indices and value, retaining HEq premises which
 //! relate them to the original inputs. Instantiate that telescope with reflexive
@@ -8,6 +8,14 @@
 use super::*;
 use fln_env::constants::InductiveVal;
 use std::collections::{HashSet, VecDeque};
+
+/// Equation names survive branch telescope specialization. Constrained induction
+/// additionally generalizes the original major, so a child hypothesis does not
+/// capture the whole input value it is meant to reason about.
+pub(super) struct IndexEquations {
+    pub names: Vec<Name>,
+    pub induction_major: Option<FVarId>,
+}
 
 fn apply(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments.into_iter().fold(head, Expr::app)
@@ -60,6 +68,7 @@ impl Context {
         proof: &mut ProofState<'a>,
         goal: ProofGoal,
         input: &eliminate::EliminationSyntax<'a>,
+        induction: bool,
         major: &LocalDecl,
         family: &InductiveVal,
         levels: &[Level],
@@ -157,9 +166,12 @@ impl Context {
             proof,
             inner,
             input,
-            false,
+            induction,
             Some(&generic.id),
-            Some(&equations),
+            Some(&IndexEquations {
+                names: equations,
+                induction_major: induction.then(|| major.id.clone()),
+            }),
         )
     }
 
