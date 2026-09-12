@@ -741,7 +741,10 @@ impl Context {
                 }
                 Task::MatchDiscriminant(parts, expected) => {
                     let major = values.pop().expect("match discriminant visit");
-                    tasks.push(Task::MatchNext(self.start_match(parts, major, expected)?));
+                    tasks.push(match self.start_match(parts, major, expected)? {
+                        matching::MatchStart::Regular(state) => Task::MatchNext(*state),
+                        matching::MatchStart::Refined(proof) => Task::Proof(proof),
+                    });
                 }
                 Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
                     matching::MatchStep::Branch {

@@ -2,8 +2,9 @@
 //!
 //! The match compiler is untrusted. It neither evaluates the discriminant to
 //! choose a branch nor admits any declarations. Every branch remains an actual
-//! minor premise in the generated term, including branches unreachable for a
-//! concrete input. K1 and the independent checker validate the final program.
+//! minor premise in the generated term. Constrained indices may justify omitted
+//! constructors only through retained contradiction proofs; supplied impossible
+//! alternatives are refused rather than erased. Both checkers validate the term.
 use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet};
@@ -47,9 +48,18 @@ fn error(reason: MatchError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Match(reason))
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct MatchParts<'a> {
     pub(super) discriminant: &'a Syntax,
     alternatives: &'a [Syntax],
+}
+pub(super) struct MatchPatterns<'a> {
+    pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
+    pub(super) fallback: Option<(Option<Name>, &'a Syntax)>,
+}
+pub(super) enum MatchStart<'a> {
+    Regular(Box<MatchBuild<'a>>),
+    Refined(tactics::ProofState<'a>),
 }
 struct Branch<'a> {
     constructor: fln_env::constants::ConstructorVal,
@@ -262,6 +272,32 @@ impl Context {
     }
 
     pub(super) fn start_match<'a>(
+        &mut self,
+        parts: MatchParts<'a>,
+        major: Typed,
+        expected: Option<Expr>,
+    ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
+        // Keep the existing direct/index-polymorphic path, including recursive
+        // call lowering. Only the precise index-shape refusal selects the
+        // equation-refining backend; typing faults and resource stops propagate.
+        let recursive = self.is_recursive_match(&major.value);
+        let saved = self.clone();
+        match self.start_regular_match(parts, major.clone(), expected.clone()) {
+            Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                MatchError::UnrefinedIndices,
+            ))) if !recursive => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = saved;
+                self.txn.budget.heartbeats_consumed = spent;
+                self.start_refined_match(parts, major, expected)
+                    .map(MatchStart::Refined)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn start_regular_match<'a>(
         &mut self,
         parts: MatchParts<'a>,
         major: Typed,
@@ -484,6 +520,71 @@ impl Context {
                 type_: motive_type,
             },
         )?;
+        let MatchPatterns {
+            constructors: mut patterns,
+            fallback,
+        } = self.match_patterns(parts, name, &family.ctors)?;
+        let mut branches = std::collections::VecDeque::new();
+        let mut seen = HashSet::new();
+        for rule in &rec.rules {
+            self.tick()?;
+            if !family.ctors.contains(&rule.ctor) || !seen.insert(rule.ctor.clone()) {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&rule.ctor).cloned()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            if constructor.induct != *name
+                || constructor.is_unsafe
+                || constructor.num_params != family.num_params
+                || constructor.num_fields != rule.nfields
+                || constructor.base.level_params != family.base.level_params
+            {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            let (fields, whole, syntax) =
+                if let Some((fields, syntax)) = patterns.remove(&rule.ctor) {
+                    (Some(fields), None, syntax)
+                } else if let Some((whole, syntax)) = &fallback {
+                    (None, whole.clone(), *syntax)
+                } else {
+                    return Err(error(MatchError::MissingConstructor));
+                };
+            branches.push_back(Branch {
+                constructor,
+                fields,
+                whole,
+                syntax,
+            });
+        }
+        Ok(MatchBuild {
+            direct: None,
+            recursive,
+            unrefined_capture: false,
+            saved: self.txn.lctx.clone(),
+            target,
+            major,
+            family: name.clone(),
+            parameters,
+            indices,
+            generalized,
+            motive_obligation,
+            levels: levels.clone(),
+            recursor,
+            branches,
+        })
+    }
+
+    /// One pattern parser serves ordinary and equation-refining matches. Syntax
+    /// is borrowed from the original source; no generated tactic script or
+    /// reparsing can erase a branch's annotations, references, or provenance.
+    pub(super) fn match_patterns<'a>(
+        &mut self,
+        parts: MatchParts<'a>,
+        name: &Name,
+        constructors: &[Name],
+    ) -> Result<MatchPatterns<'a>, NatDefinitionElabError> {
         let mut patterns = HashMap::new();
         let mut fallback = None;
         for (index, syntax) in parts.alternatives.iter().enumerate() {
@@ -540,7 +641,7 @@ impl Context {
                 None
             };
             if let Some(constructor_name) = constructor_name {
-                if !family.ctors.contains(&constructor_name) {
+                if !constructors.contains(&constructor_name) {
                     return Err(error(MatchError::InvalidPattern));
                 }
                 let fields = arguments
@@ -574,58 +675,12 @@ impl Context {
         // Do not silently discard a written branch: even an unreachable bad
         // term must not vanish before checking. Redundant catch-alls are a
         // visible unsupported pattern in this exhaustive, disjoint profile.
-        if fallback.is_some() && patterns.len() == family.ctors.len() {
+        if fallback.is_some() && patterns.len() == constructors.len() {
             return Err(error(MatchError::DuplicateConstructor));
         }
-        let mut branches = std::collections::VecDeque::new();
-        let mut seen = HashSet::new();
-        for rule in &rec.rules {
-            self.tick()?;
-            if !family.ctors.contains(&rule.ctor) || !seen.insert(rule.ctor.clone()) {
-                return Err(error(MatchError::UnsupportedFamily));
-            }
-            let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(&rule.ctor).cloned()
-            else {
-                return Err(error(MatchError::UnsupportedFamily));
-            };
-            if constructor.induct != *name
-                || constructor.is_unsafe
-                || constructor.num_params != family.num_params
-                || constructor.num_fields != rule.nfields
-                || constructor.base.level_params != family.base.level_params
-            {
-                return Err(error(MatchError::UnsupportedFamily));
-            }
-            let (fields, whole, syntax) =
-                if let Some((fields, syntax)) = patterns.remove(&rule.ctor) {
-                    (Some(fields), None, syntax)
-                } else if let Some((whole, syntax)) = &fallback {
-                    (None, whole.clone(), *syntax)
-                } else {
-                    return Err(error(MatchError::MissingConstructor));
-                };
-            branches.push_back(Branch {
-                constructor,
-                fields,
-                whole,
-                syntax,
-            });
-        }
-        Ok(MatchBuild {
-            direct: None,
-            recursive,
-            unrefined_capture: false,
-            saved: self.txn.lctx.clone(),
-            target,
-            major,
-            family: name.clone(),
-            parameters,
-            indices,
-            generalized,
-            motive_obligation,
-            levels: levels.clone(),
-            recursor,
-            branches,
+        Ok(MatchPatterns {
+            constructors: patterns,
+            fallback,
         })
     }
 

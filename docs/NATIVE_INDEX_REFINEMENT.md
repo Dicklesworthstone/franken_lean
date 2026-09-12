@@ -54,10 +54,41 @@ refuses, rather than silently discarding that branch's source expressions and
 annotations. Omit that alternative. An entirely impossible input can be eliminated
 with `by cases h`, without a `with` block.
 
-This increment is case analysis, not generalized constrained-index induction.
-The existing induction lane still requires distinct parameter indices. Ordinary
-source `match`, recursive definitions with constrained header indices, inaccessible
-patterns, and full Lean matcher/equation-compiler parity are separate work.
+## Ordinary source matches
+
+The same checked equation-refining backend now serves source `match` expressions
+at fixed, repeated, let-bound, and parameter-shared indices. It preserves dependent
+index telescopes, infers result types when sufficient information is available,
+and supports nested matches, original dependent hypotheses, implicit constructor
+fields, and function-valued branches. For example:
+
+```lean
+def tail {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : Vec A n := match xs with
+  | .cons k x rest => rest
+```
+
+All original branch syntax is passed to the ordinary iterative term elaborator,
+not translated to source strings or evaluated to select a convenient constructor.
+The discriminant is retained in a checked let even if no branch uses it. Impossible
+omitted constructors receive the actual generated contradiction proofs. An
+explicitly supplied impossible alternative is still refused, rather than erasing
+its expressions or annotations. A final catch-all binds each reachable constructor
+value at its refined type; a catch-all with no reachable use is also refused.
+
+The existing independent-index matching and structural-recursion paths are kept.
+Only their precise index-shape refusal selects the new backend, transactionally
+and without refunding the work already spent. Other typing, conversion, and
+resource failures are not alternative-selection signals. Generated induction
+hypotheses remain invisible in both ordinary and constrained source matches.
+
+```bash
+fln check-source --json examples/native_constrained_matching.lean
+```
+
+This remains case analysis, not generalized constrained-index induction.
+The existing induction lane still requires distinct parameter indices. Recursive
+definitions with constrained header indices, inaccessible patterns, multiple
+discriminants, and full Lean matcher/equation-compiler parity are separate work.
 Mutual, nested, and higher-order inductive families retain their existing limits.
 
 The example includes fixed-length head/tail/second, repeated indices, dependent

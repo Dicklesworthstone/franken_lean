@@ -274,14 +274,19 @@ impl Context {
         Ok(())
     }
 
+    pub(super) fn is_recursive_match(&self, major: &Expr) -> bool {
+        self.recursion.as_ref().is_some_and(|recursion| {
+            recursion.pending
+                && *major == Expr::fvar(recursion.parameters[recursion.decreasing].id.clone())
+        })
+    }
+
     pub(super) fn recursive_match(&mut self, major: &Expr) -> bool {
-        let Some(recursion) = &mut self.recursion else {
-            return false;
-        };
-        if recursion.pending
-            && *major == Expr::fvar(recursion.parameters[recursion.decreasing].id.clone())
-        {
-            recursion.pending = false;
+        if self.is_recursive_match(major) {
+            self.recursion
+                .as_mut()
+                .expect("selected recursive match")
+                .pending = false;
             true
         } else {
             false

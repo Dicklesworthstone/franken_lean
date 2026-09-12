@@ -93,6 +93,7 @@ enum Work<'a> {
     Goal(ProofGoal),
     Close(ProofGoal, Expr),
     Script(ProofGoal, Vec<&'a Syntax>),
+    Term(ProofGoal, &'a Syntax),
     EndScript(Vec<&'a Syntax>, usize),
 }
 pub(super) struct ProofState<'a> {
@@ -282,6 +283,15 @@ impl Context {
                 }));
             };
             let mut goal = match work {
+                Work::Term(mut goal, syntax) => {
+                    self.txn.lctx = goal.lctx.clone();
+                    goal.target = self.instantiate(&goal.target)?;
+                    return Ok(ProofAction::Term {
+                        syntax,
+                        goal,
+                        apply: false,
+                    });
+                }
                 Work::Script(goal, instructions) => {
                     let parent = std::mem::replace(&mut proof.instructions, instructions);
                     let cursor = std::mem::replace(&mut proof.cursor, 0);

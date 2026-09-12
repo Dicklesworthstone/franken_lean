@@ -59,7 +59,7 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'a>,
         goal: ProofGoal,
-        args: &'a [Syntax],
+        input: &eliminate::EliminationSyntax<'a>,
         major: &LocalDecl,
         family: &InductiveVal,
         levels: &[Level],
@@ -156,7 +156,7 @@ impl Context {
         self.eliminate_proof_goal_with_indices(
             proof,
             inner,
-            args,
+            input,
             false,
             Some(&generic.id),
             Some(&equations),

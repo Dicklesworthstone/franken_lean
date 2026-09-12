@@ -1271,3 +1271,37 @@ fn installed_fixed_index_cases_preserve_checked_computation_and_batch_isolation(
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
     }
 }
+
+#[test]
+fn installed_fixed_index_matches_check_real_terms_and_recover_after_failure() {
+    let prefix = file(include_str!(
+        "../../../examples/native_constrained_matching.lean"
+    ));
+    let invalid =
+        file("theorem bad (xs : Vec Nat 1) : 0 = 1 := match xs with | .cons k x rest => rfl");
+    let bytes = std::fs::read(&prefix).unwrap();
+    for success in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !success {
+            command.arg(&invalid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for expected in ["\"commands\":16", "\"theorems\":6", "\"executed\":false"] {
+                assert!(json.contains(expected), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
+    }
+}
