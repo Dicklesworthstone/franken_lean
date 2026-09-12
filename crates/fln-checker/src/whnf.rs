@@ -1002,6 +1002,22 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 Ok(())
             };
             match (left_node, right_node) {
+                (ExprNode::NatLiteral { limbs_le: a }, ExprNode::NatLiteral { limbs_le: b }) => {
+                    if a.last() == Some(&0) || b.last() == Some(&0) {
+                        return Err(Halt::Fault(WhnfFault::NonCanonicalNatLiteral {
+                            at: left_id.index(),
+                        }));
+                    }
+                    if a.len() != b.len() {
+                        return Ok(false);
+                    }
+                    for (a, b) in a.iter().zip(b) {
+                        self.control.step(left_id.index(), self.cancelled)?;
+                        if a != b {
+                            return Ok(false);
+                        }
+                    }
+                }
                 (ExprNode::Bound { index: left }, ExprNode::Bound { index: right })
                     if left == right => {}
                 (ExprNode::Free { name: left }, ExprNode::Free { name: right })

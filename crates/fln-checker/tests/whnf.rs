@@ -2412,3 +2412,61 @@ fn failed_k_gate_work_does_not_resubmit_an_unchanged_conversion_pair() {
     );
     assert!(progress.normalizations < 8);
 }
+
+#[test]
+fn k_gate_compares_compact_literals_without_unary_expansion() {
+    use fln_core::expr::{Literal, NatLit};
+    let context = definition_context(eqs_family_entries());
+    let values = [
+        NatLit::from_u64(0),
+        NatLit::from_u64(7),
+        NatLit::from_u64(u64::MAX),
+        NatLit::from_limbs_le(vec![0, 0, 1]),
+    ];
+    for (i, left) in values.iter().enumerate() {
+        for (j, right) in values.iter().enumerate() {
+            let call = decoded(&k_application(
+                constant("Nat"),
+                Expr::lit(Literal::Nat(left.clone())),
+                Expr::lit(Literal::Nat(right.clone())),
+            ));
+            let WhnfOutcome::Complete(result) = whnf(&call, &context, WhnfBudget::unlimited())
+            else {
+                panic!("compact K gate pair {i}, {j} must terminate");
+            };
+            assert_eq!(
+                root_constant_name(&result.term) == Some(&checker_name("KTestMinor")),
+                i == j
+            );
+            assert!(
+                result.steps < 2000,
+                "literal size, not value, bounds this comparison"
+            );
+        }
+    }
+}
+
+#[test]
+fn literal_k_gate_preserves_cancellation_and_resource_boundaries() {
+    use fln_core::expr::{Literal, NatLit};
+    let context = definition_context(eqs_family_entries());
+    let point = Expr::lit(Literal::Nat(NatLit::from_u64(9)));
+    let call = decoded(&k_application(constant("Nat"), point.clone(), point));
+    let mut small = WhnfBudget::unlimited();
+    small.max_steps = 1;
+    assert!(matches!(
+        whnf(&call, &context, small),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        whnf_with(&call, &context, WhnfBudget::unlimited(), || true),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    let WhnfOutcome::Complete(result) = whnf(&call, &context, WhnfBudget::unlimited()) else {
+        panic!("fresh budget must recover");
+    };
+    assert_eq!(
+        root_constant_name(&result.term),
+        Some(&checker_name("KTestMinor"))
+    );
+}
