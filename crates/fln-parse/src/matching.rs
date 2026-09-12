@@ -67,9 +67,20 @@ fn plan(
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
+    equations: bool,
 ) -> Result<Vec<MatchPlan>, NatDefinitionParseError> {
     let mut delimiters = Vec::new();
-    let mut active: Vec<MatchPlan> = Vec::new();
+    let mut active: Vec<MatchPlan> = if equations {
+        vec![MatchPlan {
+            start: range.start,
+            depth: 0,
+            with: Some(range.start),
+            alternatives: Vec::new(),
+            end: range.end,
+        }]
+    } else {
+        Vec::new()
+    };
     let mut lets = Vec::new();
     let mut done = Vec::new();
     for at in range.clone() {
@@ -428,16 +439,57 @@ pub(super) fn parse(
     range: Range<usize>,
     grammar: DefinitionGrammar,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    parse_planned(leaves, view, tokens, range, grammar, false)
+}
+
+/// Declaration equations own their original pipes, patterns and bodies. The
+/// enclosing plan shares the same heap stack and scope rules as nested matches.
+/// No synthetic `match` text is lexed and no original token is discarded.
+pub(super) fn declaration_equations(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if grammar != DefinitionGrammar::Scalar || !is_symbol(tokens, range.start, "|") {
+        return Err(refuse(view, tokens, range.start));
+    }
+    parse_planned(leaves, view, tokens, range, grammar, true)
+}
+
+fn parse_planned(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    grammar: DefinitionGrammar,
+    equations: bool,
+) -> Result<Syntax, NatDefinitionParseError> {
     let mut splices = Splices::new();
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     if grammar == DefinitionGrammar::Scalar
-        && range.clone().any(|at| is_symbol(tokens, at, "match"))
+        && (equations || range.clone().any(|at| is_symbol(tokens, at, "match")))
     {
-        for plan in plan(view, tokens, range.clone())? {
+        for plan in plan(view, tokens, range.clone(), equations)? {
             let with = plan.with.expect("validated match header");
+            let equation_root = equations && plan.start == range.start;
             let mut discriminators = Vec::new();
-            let discriminant_columns = columns(tokens, plan.start + 1..with);
-            let arity = discriminant_columns.len();
+            let discriminant_columns = if equation_root {
+                Vec::new()
+            } else {
+                columns(tokens, plan.start + 1..with)
+            };
+            let arity = if equation_root {
+                let first = plan.alternatives.first().expect("validated equation row");
+                columns(
+                    tokens,
+                    first.pipe + 1..first.arrow.expect("validated arrow"),
+                )
+                .len()
+            } else {
+                discriminant_columns.len()
+            };
             for (range, comma) in discriminant_columns {
                 let discriminator = bounded_term_spliced(
                     leaves,
@@ -489,6 +541,16 @@ pub(super) fn parse(
                     ],
                 ));
             }
+            let alternatives = Syntax::node(
+                parser_kind(&["Term", "matchAlts"]),
+                vec![null_node(alternatives)],
+            );
+            if equation_root {
+                if !splices.is_empty() {
+                    return Err(refuse(view, tokens, range.start));
+                }
+                return Ok(alternatives);
+            }
             let syntax = Syntax::node(
                 parser_kind(&["Term", "match"]),
                 vec![
@@ -497,10 +559,7 @@ pub(super) fn parse(
                     null_node(vec![]),
                     null_node(discriminators),
                     leaves.leaf(with)?,
-                    Syntax::node(
-                        parser_kind(&["Term", "matchAlts"]),
-                        vec![null_node(alternatives)],
-                    ),
+                    alternatives,
                 ],
             );
             splices.insert(plan.start, (plan.end, syntax));
@@ -624,5 +683,76 @@ mod matrix_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod equation_tests {
+    use super::*;
+    #[test]
+    fn equations_retain_original_leaves_including_nested_proofs() {
+        for source in [
+            "def f : Bool -> Nat | true => 1 | false => 0",
+            "def f (x : Nat) : Bool -> Nat\r\n | true => x -- first\r\n | false => let y := x; y\r\n",
+            "def f : Bool -> Nat\n | true => match false with\n   | true => 1\n   | false => 2\n | false => 0",
+            "theorem t : forall b : Bool, b = b\n | true => by\n   have h : true = true := rfl\n   exact h\n | false => by rfl",
+            "def f : Maybe (Maybe Nat) -> Nat | .none => 0 | .some (.some n) => n | .some .none => 1",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn equation_syntax_never_ignores_missing_or_extra_tokens() {
+        for source in [
+            "def f : Bool -> Nat | true 1",
+            "def f : Bool -> Nat | true =>",
+            "def f : Bool -> Nat | true => 1 | false =>",
+            "def f : Bool -> Nat | true => 1 | false, true => 2",
+            "def f : Bool -> Nat | true => 1 := 2",
+            "def f : Bool -> Nat | true => 1\n   | false => 2",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        assert!(parse_nat_definition(b"def f : Nat -> Nat | n => n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod equation_depth_tests {
+    use super::*;
+    #[test]
+    fn nested_rhs_matches_in_equations_use_a_heap_plan() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut source = String::from("def nested : Bool -> Nat\n | true => ");
+                for _ in 0..300 {
+                    source.push_str("(match true with | true => ");
+                }
+                source.push('1');
+                for _ in 0..300 {
+                    source.push_str(" | false => 0)");
+                }
+                source.push_str("\n | false => 2\n");
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn result_type_match_is_not_confused_with_declaration_equations() {
+        let source = b"def value : match true with | true => Nat | false => Nat := 7";
+        let parsed = parse_definition(source).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source);
+        assert_eq!(parsed.reconstruct_normalized().unwrap(), source);
     }
 }

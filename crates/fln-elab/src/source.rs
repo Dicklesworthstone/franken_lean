@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod equations;
 mod inductive;
 mod infer;
 mod instance_command;
@@ -1484,8 +1485,8 @@ pub(super) fn definition(
         2,
         "declaration signature",
     )?;
-    let parameters = context.bind_parameters(&signature[0])?;
-    let expected = if is_theorem || is_instance {
+    let mut parameters = context.bind_parameters(&signature[0])?;
+    let mut expected = if is_theorem || is_instance {
         let parts = expect_node(
             &signature[1],
             &parser_kind(&["Term", "typeSpec"]),
@@ -1512,15 +1513,27 @@ pub(super) fn definition(
         types.push(context.instantiate(expected)?);
         context.require_resolved(&types)?;
     }
-    let parts = expect_node(
-        &definition[3],
-        &parser_kind(&["Command", "declValSimple"]),
-        4,
-        "definition value",
-    )?;
-    expect_atom(&parts[0], ":=", "definition assignment")?;
+    let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
+    let (body, termination, where_clause) = if equations {
+        let parts = expect_node(
+            &definition[3],
+            &parser_kind(&["Command", "declValEqns"]),
+            3,
+            "equation value",
+        )?;
+        (&parts[0], &parts[1], &parts[2])
+    } else {
+        let parts = expect_node(
+            &definition[3],
+            &parser_kind(&["Command", "declValSimple"]),
+            4,
+            "definition value",
+        )?;
+        expect_atom(&parts[0], ":=", "definition assignment")?;
+        (&parts[1], &parts[2], &parts[3])
+    };
     let termination = expect_node(
-        &parts[2],
+        termination,
         &parser_kind(&["Termination", "suffix"]),
         2,
         "termination suffix",
@@ -1528,7 +1541,7 @@ pub(super) fn definition(
     for part in termination {
         expect_empty_null(part, "absent termination clause")?;
     }
-    expect_empty_null(&parts[3], "absent where clause")?;
+    expect_empty_null(where_clause, "absent where clause")?;
     if !is_theorem && !is_instance {
         expect_empty_null(&definition[4], "absent definition clauses")?;
     }
@@ -1539,7 +1552,20 @@ pub(super) fn definition(
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
         )?;
     }
-    let mut term = context.definition_body(name, &parameters, &parts[1], expected.clone())?;
+    let generated;
+    let body = if equations {
+        let declared_type = expected
+            .as_ref()
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let (syntax, result_type) =
+            context.equation_function(body, declared_type, &mut parameters)?;
+        generated = syntax;
+        expected = Some(result_type);
+        &generated
+    } else {
+        body
+    };
+    let mut term = context.definition_body(name, &parameters, body, expected.clone())?;
     if let Some(expected) = expected {
         term.type_ = expected;
     }

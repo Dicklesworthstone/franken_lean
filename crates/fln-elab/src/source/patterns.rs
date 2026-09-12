@@ -111,7 +111,7 @@ fn flat(pattern: &Syntax) -> bool {
     }
     variable(pattern) || pattern.kind() == Some(&parser_kind(&["Term", "dotIdent"]))
 }
-fn complex(syntax: &Syntax) -> bool {
+fn complex(syntax: &Syntax, environment: &Environment) -> bool {
     let Syntax::Node { kind, args, .. } = syntax else {
         return false;
     };
@@ -146,7 +146,22 @@ fn complex(syntax: &Syntax) -> bool {
         let Ok([pattern]) = expect_null_args(row, "pattern") else {
             return true;
         };
-        !flat(pattern)
+        if !flat(pattern) {
+            return true;
+        }
+        // A catch-all can bind a value of an abstract type without any
+        // inductive-family lookup. Let the matrix compiler retain its checked
+        // input binding and detect redundant rows instead of demanding a
+        // constructor recursor for an otherwise ordinary function argument.
+        match pattern {
+            Syntax::Ident { val, .. } => {
+                !matches!(environment.find(val), Some(ConstantInfo::Ctor(_)))
+                    && val != &Name::from_components(["true"])
+                    && val != &Name::from_components(["false"])
+            }
+            Syntax::Node { kind, .. } => kind == &parser_kind(&["Term", "hole"]),
+            _ => false,
+        }
     })
 }
 
@@ -598,7 +613,7 @@ impl Context {
         let mut needed = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
-            needed |= complex(node);
+            needed |= complex(node, &self.txn.env);
             if let Syntax::Node { args, .. } = node {
                 scan.extend(args);
             }
@@ -632,7 +647,7 @@ impl Context {
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
-                    built.push(if complex(&node) {
+                    built.push(if complex(&node, &self.txn.env) {
                         self.compile_pattern_matrix(
                             &node,
                             &mut required,

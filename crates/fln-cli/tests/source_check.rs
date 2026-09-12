@@ -1537,3 +1537,39 @@ fn installed_recursive_matrices_compute_check_proofs_and_isolate_failed_suffixes
         assert_eq!(std::fs::read(&prefix).unwrap(), before);
     }
 }
+
+#[test]
+fn installed_equation_definitions_check_real_terms_and_reject_late_failures() {
+    let prefix = file(include_str!("../../../examples/native_equations.lean"));
+    let bad = file("def invalid : Bool -> Nat | true => 0 | false => let unused : String := 1; 0");
+    let original = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&bad);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(result.stdout).unwrap();
+            for expected in [
+                "\"commands\":15",
+                "\"theorems\":7",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+        } else {
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), original);
+    }
+}

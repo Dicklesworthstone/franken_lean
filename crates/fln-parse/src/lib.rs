@@ -1830,6 +1830,16 @@ fn parse_definition_with_grammar(
         cursor += 1;
         let start = cursor;
         cursor = type_end(&tokens, start, ":=");
+        if grammar == DefinitionGrammar::Scalar {
+            let pipe = type_end(&tokens, start, "|");
+            // A leading unparenthesized match belongs to the result type.
+            // Its alternatives are not declaration equations.
+            if !matches!(tokens.get(start).map(|token| &token.kind),
+                Some(TokenKind::Symbol(symbol)) if symbol == "match")
+            {
+                cursor = cursor.min(pipe);
+            }
+        }
         Some((colon, start..cursor))
     } else {
         None
@@ -1841,22 +1851,30 @@ fn parse_definition_with_grammar(
         });
     }
     let assignment_index = cursor;
-    if !matches!(
-        tokens.get(assignment_index).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == ":="
-    ) {
+    let equations = grammar == DefinitionGrammar::Scalar
+        && matches!(tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == "|");
+    if !equations
+        && !matches!(
+            tokens.get(assignment_index).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == ":="
+        )
+    {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, assignment_index),
             expected: NatDefinitionExpectation::Assignment,
         });
     }
     let value_index = assignment_index + 1;
-    let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, value_index)?;
+    let (let_bindings, body_start) = if equations {
+        (Vec::new(), assignment_index)
+    } else {
+        bounded_let_bindings(&view, &tokens, value_index)?
+    };
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
     let declaration_name = leaves.leaf(name_index)?;
-    let assignment = leaves.leaf(assignment_index)?;
 
     let modifiers = Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
@@ -1905,15 +1923,37 @@ fn parse_definition_with_grammar(
         ]),
         vec![null_node(parameters), result_type],
     );
-    let value = bounded_value_syntax(&leaves, &view, &tokens, let_bindings, body_start, grammar)?;
+    let value = if equations {
+        matching::declaration_equations(
+            &leaves,
+            &view,
+            &tokens,
+            assignment_index..tokens.len(),
+            grammar,
+        )?
+    } else {
+        bounded_value_syntax(&leaves, &view, &tokens, let_bindings, body_start, grammar)?
+    };
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let declaration_value = Syntax::node(
-        parser_kind(&["Command", "declValSimple"]),
-        vec![assignment, value, termination, null_node(Vec::new())],
-    );
+    let declaration_value = if equations {
+        Syntax::node(
+            parser_kind(&["Command", "declValEqns"]),
+            vec![value, termination, null_node(Vec::new())],
+        )
+    } else {
+        Syntax::node(
+            parser_kind(&["Command", "declValSimple"]),
+            vec![
+                leaves.leaf(assignment_index)?,
+                value,
+                termination,
+                null_node(Vec::new()),
+            ],
+        )
+    };
     let definition = if is_instance {
         let priority = match priority_range {
             None => null_node(Vec::new()),
