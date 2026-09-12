@@ -28,6 +28,12 @@ impl Context {
         let Syntax::Ident { val: name, .. } = syntax else {
             return Ok(UnfoldResult::NotDefinition);
         };
+        // The public IH remains a conditional parameter via a checked alias.
+        // It was never an unfolding request. Avoid reconstructing its entire
+        // dependent type just to rediscover that fact at every simp occurrence.
+        if self.specialized_induction_rule(syntax)?.is_some() {
+            return Ok(UnfoldResult::NotDefinition);
+        }
         let selection = if let Some(local) = self
             .txn
             .lctx
@@ -35,7 +41,19 @@ impl Context {
             .iter()
             .rev()
             .find(|l| &l.user_name == name)
+            .cloned()
         {
+            // A checked local theorem remains a rewrite rule even when its
+            // evidence is held in a let. Treating it as an unfolding request
+            // would never apply its equality to the goal (the goal need not
+            // contain the proof variable at all).
+            if let Some(sort) = self.known_type(&local.type_)?
+                && !sort.has_expr_mvar()
+                && !sort.has_level_mvar()
+                && self.proof_types_match(&sort, &Expr::sort(Level::zero()))?
+            {
+                return Ok(UnfoldResult::NotDefinition);
+            }
             match &local.value {
                 Some(value) => Selection::Local(local.id.clone(), value.clone()),
                 None => return Ok(UnfoldResult::NotDefinition),

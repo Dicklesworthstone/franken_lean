@@ -32,6 +32,7 @@ struct EliminationContext<'a> {
     original_target: &'a Expr,
     reverted: &'a [LocalDecl],
     induction: bool,
+    equations: Option<&'a index_equations::IndexEquations>,
 }
 pub(super) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
     if let Some(value) = &local.value {
@@ -147,6 +148,7 @@ impl Context {
         constructor: &ConstructorVal,
         context: &EliminationContext<'_>,
         alternative: Option<&Alternative<'_>>,
+        hypotheses: &mut Vec<(Name, Name)>,
     ) -> Result<ProofGoal, NatDefinitionElabError> {
         let &EliminationContext {
             parameters,
@@ -156,6 +158,7 @@ impl Context {
             original_target,
             reverted,
             induction,
+            equations,
         } = context;
         let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
@@ -196,13 +199,18 @@ impl Context {
         }
         for _ in 0..recursive_fields {
             self.tick()?;
-            let name = if induction {
+            let mut name = if induction {
                 let name = names.get(used).cloned().unwrap_or_else(Name::anonymous);
                 used += 1;
                 name
             } else {
                 Name::anonymous()
             };
+            if induction && equations.is_some() {
+                let public = name;
+                name = self.fresh_name()?;
+                hypotheses.push((name.clone(), public));
+            }
             self.elimination_binder(&mut branch, name, induction)?;
         }
         if names.len() > used {
@@ -375,11 +383,31 @@ impl Context {
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
-        let major = selected
+        let mut major = selected
             .and_then(|id| self.txn.lctx.find(id))
             .or_else(|| self.txn.lctx.find_by_user_name(&target_name))
             .cloned()
             .ok_or_else(|| error(TacticError::EliminationLocal))?;
+        // A transparent local alias names the same induction input. Keep its
+        // checked let in the dependency cone, but generalize the underlying
+        // local so occurrences of either name follow the constructor branch.
+        // Do not reduce arbitrary let values or discard their annotations.
+        if induction && equations.is_none() {
+            let mut aliases = HashSet::new();
+            while let Some(value) = &major.value {
+                self.tick()?;
+                let ExprNode::FVar { id } = value.node() else {
+                    break;
+                };
+                if !aliases.insert(major.id.clone()) {
+                    return Err(error(TacticError::EliminationLocal));
+                }
+                let Some(local) = self.txn.lctx.find(id) else {
+                    break;
+                };
+                major = local.clone();
+            }
+        }
         let family_type = self.whnf(&major.type_)?;
         let mut head = &family_type;
         let mut parameters = Vec::new();
@@ -472,7 +500,8 @@ impl Context {
         }
         let mut removed = HashSet::from([major.id.clone()]);
         removed.extend(index_ids.iter().cloned());
-        if let Some(original) = equations.and_then(|plan| plan.induction_major.as_ref()) {
+        let generalized_major = equations.and_then(|equations| equations.induction_major.as_ref());
+        if let Some(original) = generalized_major {
             removed.insert(original.clone());
         }
         if !explicit.is_empty() {
@@ -544,7 +573,15 @@ impl Context {
                     && !index_ids.contains(&local.id)
                     && removed.contains(&local.id)
             })
-            .cloned()
+            .map(|local| {
+                let mut local = local.clone();
+                if Some(&local.id) == generalized_major {
+                    // The selected input may itself be a let. The induction
+                    // motive quantifies a new value, not that fixed definition.
+                    local.value = None;
+                }
+                local
+            })
             .collect();
         let mut retained = LocalContext::new();
         for local in goal.lctx.decls() {
@@ -759,6 +796,7 @@ impl Context {
             let (hole, branch) = self.proof_goal(minor.clone())?;
             let script = scripts.remove(&rule.ctor);
             let alternative = script.as_ref().or(fallback.as_ref());
+            let mut hypotheses = Vec::new();
             let branch = self.elimination_branch(
                 branch,
                 &constructor,
@@ -770,8 +808,10 @@ impl Context {
                     original_target: &goal.target,
                     reverted: &reverted,
                     induction,
+                    equations,
                 },
                 alternative,
+                &mut hypotheses,
             )?;
             let work_start = proof.work.len();
             let branch = if let Some(equations) = equations {
@@ -779,7 +819,18 @@ impl Context {
             } else {
                 Some(branch)
             };
-            if let Some(branch) = branch {
+            if let Some(mut branch) = branch {
+                if let Some(equations) = equations {
+                    for (internal, public) in hypotheses {
+                        self.specialize_index_hypothesis(
+                            &mut branch,
+                            &internal,
+                            public,
+                            &reverted,
+                            equations,
+                        )?;
+                    }
+                }
                 if scoped && alternative.is_none() {
                     return Err(error(TacticError::EliminationCoverage));
                 }

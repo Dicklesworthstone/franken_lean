@@ -18,6 +18,281 @@ fn check(source: &str) {
         .unwrap();
 }
 const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n";
+
+#[test]
+fn constrained_induction_quantifies_the_child_not_the_original_major() {
+    check(
+        "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n\
+        def copy (n : Nat) (w : Walk n) : Walk n := match w with | .done k => Walk.done k | .step k child => Walk.step k (copy k child)\n\
+        theorem copied (w : Walk 3) : copy 3 w = w := by induction w with | done k => rfl | step k child ih => simp only [copy, ih]",
+    );
+}
+
+#[test]
+fn constrained_induction_prunes_only_proved_impossible_constructors() {
+    check(&format!(
+        "{VEC}\
+        def head {{A : Type}} (n : Nat) (xs : Vec A (Nat.succ n)) : A := by induction xs with | cons k value tail ih => exact value\n\
+        theorem checked : head 0 (Vec.cons 0 7 Vec.nil) = 7 := by rfl"
+    ));
+}
+
+#[test]
+fn repeated_index_induction_exposes_both_real_recursive_hypotheses() {
+    check(
+        "inductive TreeAt (A : Type) : Nat -> Nat -> Type where | leaf (n : Nat) (a : A) : TreeAt A n n | fork (n : Nat) (left right : TreeAt A n n) : TreeAt A n n\n\
+        def copy {A : Type} (n m : Nat) (t : TreeAt A n m) : TreeAt A n m := match t with | .leaf k a => TreeAt.leaf k a | .fork k l r => TreeAt.fork k (copy k k l) (copy k k r)\n\
+        theorem copied {A : Type} (n : Nat) (t : TreeAt A n n) : copy n n t = t := by induction t with | leaf k a => rfl | fork k l r ihl ihr => simp only [copy, ihl, ihr]",
+    );
+}
+
+#[test]
+fn constrained_induction_can_change_a_generalized_accumulator() {
+    check(
+        "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n\
+        def zero (n : Nat) (w : Walk n) (acc : Nat) : Nat := match w with | .done k => 0 | .step k child => zero k child (acc + 1)\n\
+        theorem zeroed (w : Walk 3) (acc : Nat) : zero 3 w acc = 0 := by induction w generalizing acc with | done k => rfl | step k child ih => simp only [zero, ih]",
+    );
+}
+
+#[test]
+fn constrained_induction_generalizes_proof_dependent_hypotheses() {
+    check(
+        "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n\
+        theorem preserve (w : Walk 3) (h : w = w) (P : w = w -> Prop) (hp : P h) : P h := by induction w with | done k => exact hp | step k child ih => exact hp\n\
+        theorem introduced : forall w : Walk 3, w = w := by intro w; induction w with | done k => rfl | step k child ih => rfl",
+    );
+}
+
+#[test]
+fn constrained_induction_allows_indices_shared_with_family_parameters() {
+    check(
+        "inductive Anchored (base : Nat) : Nat -> Type where | stop : Anchored base base | step (child : Anchored base base) : Anchored base base\n\
+        def copy (base index : Nat) (w : Anchored base index) : Anchored base index := match w with | .stop => Anchored.stop | .step child => Anchored.step (copy base base child)\n\
+        theorem copied (base : Nat) (w : Anchored base base) : copy base base w = w := by induction w with | stop => rfl | step child ih => simp only [copy, ih]",
+    );
+}
+
+#[test]
+fn dependent_index_induction_keeps_each_index_in_its_own_domain() {
+    check(
+        "inductive Trace (A : Type) (P : A -> Type) : forall a : A, P a -> Type where | stop (a : A) (v : P a) : Trace A P a v | step (a : A) (v : P a) (child : Trace A P a v) : Trace A P a v\n\
+        def copy {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : Trace A P a v := match t with | .stop x vx => Trace.stop x vx | .step x vx child => Trace.step x vx (copy x vx child)\n\
+        theorem copied (t : Trace Nat (fun x => Bool) 3 true) : copy 3 true t = t := by induction t with | stop a v => rfl | step a v child ih => simp only [copy, ih]",
+    );
+}
+
+#[test]
+fn induction_on_an_entirely_impossible_input_needs_no_alternatives() {
+    check(
+        "inductive Diagonal : Nat -> Nat -> Type where | mk (n : Nat) : Diagonal n n\n\
+        def impossible (d : Diagonal 0 1) : Nat := by induction d",
+    );
+}
+
+#[test]
+fn constrained_induction_keeps_recursive_evidence_out_of_cases() {
+    let prefix = "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n\
+        def zero (n : Nat) (w : Walk n) : Nat := match w with | .done k => 0 | .step k child => zero k child\n";
+    check(&format!(
+        "{prefix}theorem good (w : Walk 3) : zero 3 w = 0 := by induction w with | done k => rfl | step k child ih => simp only [zero, ih]"
+    ));
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = engine.logical_root(&KVMap::new());
+    for statement in [
+        "theorem bad (w : Walk 3) : zero 3 w = 0 := by cases w with | done k => rfl | step k child => assumption",
+        "theorem bad (w : Walk 3) : 0 = 1 := by induction w with | done k => rfl | step k child ih => exact ih",
+        "theorem bad (w : Walk 3) : zero 3 w = 0 := by induction w generalizing w with | done k => rfl | step k child ih => simp only [zero, ih]",
+        "theorem bad (w : Walk 3) : w = w := by induction w with | done k => rfl | step k child ih => let unused := (child : Nat); rfl",
+    ] {
+        let source = format!("{prefix}{statement}");
+        assert!(
+            engine
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits)
+                )
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn conditional_child_hypotheses_require_their_actual_index_evidence() {
+    check(&format!("{VEC}\
+        def copy {{A : Type}} (n : Nat) (xs : Vec A n) : Vec A n := match xs with
+          | .nil => Vec.nil
+          | .cons k x tail => Vec.cons k x (copy k tail)
+        theorem copied {{A : Type}} (n : Nat) (xs : Vec A (Nat.succ n)) : copy (Nat.succ n) xs = xs := by
+          induction xs generalizing n with
+          | cons k x tail ih =>
+            cases k with
+            | zero =>
+              cases tail with
+              | nil => rfl
+            | succ j => simp only [copy, ih j tail (HEq.refl (Nat.succ j)) (HEq.refl tail)]"));
+    // The child of a length-one vector has length zero. A conditional IH at
+    // length one cannot prove a false proposition just by naming that child.
+    reject(&format!(
+        "{VEC}\
+        theorem bad (xs : Vec Nat 1) : 0 = 1 := by induction xs with
+          | cons k x tail ih => exact ih tail (HEq.refl 0) (HEq.refl tail)"
+    ));
+}
+
+#[test]
+fn constrained_induction_keeps_local_aliases_and_pattern_name_shadowing() {
+    check("inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n
+        def copy (n : Nat) (w : Walk n) : Walk n := match w with | .done k => Walk.done k | .step k child => Walk.step k (copy k child)
+        theorem let_major (w : Walk 3) : copy 3 w = w := let saved := w; let second := saved; by
+          induction second with | done k => rfl | step k child ih => simp only [copy, ih]
+        theorem let_context (w : Walk 3) : copy 3 w = w := let saved := copy 3 w; by
+          induction w with | done k => rfl | step k child ih => simp only [copy, ih]
+        theorem shadows (w : Walk 3) : copy 3 w = w := by
+          induction w with | done w => rfl | step w child ih => simp only [copy, ih]");
+    reject("inductive Walk : Nat -> Type where | done (n : Nat) : Walk n
+        theorem bad (w : Walk 3) : w = w := let saved := (w : String); by induction w with | done k => rfl");
+}
+
+#[test]
+fn selected_induction_companions_follow_scope_transport_but_not_shadowing() {
+    let prefix = "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n\
+        def copy (n : Nat) (w : Walk n) : Walk n := match w with | .done k => Walk.done k | .step k child => Walk.step k (copy k child)\n";
+    check(&format!(
+        "{prefix}\
+        theorem nested (w : Walk 3) : copy 3 w = w := by induction w with
+          | done k => rfl
+          | step k child ih =>
+            cases child with
+            | done j => rfl
+            | step j grandchild => simp only [copy, ih]"
+    ));
+    reject(&format!(
+        "{prefix}theorem bad (w : Walk 3) : copy 3 w = w := by induction w with | done k => rfl | step k child ih => simp only [copy]"
+    ));
+    reject(&format!(
+        "{prefix}theorem bad (w : Walk 3) : forall ignored : Nat, copy 3 w = w := by induction w with | done k => intro ih; rfl | step k child ih => intro ih; simp only [copy, ih]"
+    ));
+}
+
+#[test]
+fn checked_proof_lets_are_rules_only_when_explicitly_selected() {
+    check("theorem forward (x y : Nat) (h : x = y) : x = y := let selected : x = y := h; by simp only [selected]
+        theorem reverse (x y : Nat) (h : x = y) : y = x := let selected : x = y := h; by simp only [selected]
+        theorem function_rule (f : Nat -> Nat) (h : forall n : Nat, f n = n) (n : Nat) : f n = n := let selected := h; by simp only [selected]");
+    reject("theorem bad (x y : Nat) (h : x = y) : x = y := let unselected := h; by simp only []");
+    reject(
+        "theorem bad (x y : Nat) (h : x = y) : x = y := let selected : x = y := (1 : String); by simp only [selected]",
+    );
+}
+
+#[test]
+fn automatic_heterogeneous_reflexivity_checks_types_and_respects_selection() {
+    check(
+        "theorem same {A : Type} (x : A) : HEq x x := by simp only []
+        def ident (x : Nat) : Nat := x
+        theorem selected (x : Nat) : HEq (ident x) x := by simp only [ident]",
+    );
+    for source in [
+        "theorem bad : HEq 1 2 := by simp only []",
+        "theorem bad : HEq 1 true := by simp only []",
+        "def ident (x : Nat) : Nat := x\ntheorem bad (x : Nat) : HEq (ident x) x := by simp only []",
+    ] {
+        reject(source);
+    }
+}
+
+#[test]
+fn constrained_induction_does_not_bypass_coverage_or_small_elimination() {
+    for source in [
+        "inductive Tag : Nat -> Type where | zero : Tag 0 | one : Tag 1\ndef bad (f : Nat -> Nat) (x : Tag (f 7)) : Nat := by induction x with | zero => exact 0",
+        "inductive ExistsAt (A : Type) : Nat -> Prop where | intro (n : Nat) (x : A) : ExistsAt A n\ndef bad {A : Type} (h : ExistsAt A 3) : A := by induction h with | intro n x => exact x",
+        "inductive Tagged (base : Nat) : Nat -> Type where | mk : Tagged base base\ntheorem bad (base : Nat) (x : Tagged base base) : x = x := by induction x generalizing base with | mk => rfl",
+    ] {
+        reject(source);
+    }
+    reject(&format!(
+        "{VEC}\
+        def bad (xs : Vec Nat 1) : Nat := by induction xs with
+          | nil => exact (1 : String)
+          | cons k x tail ih => exact x"
+    ));
+}
+
+#[test]
+fn constrained_induction_resource_stops_preserve_the_original_engine() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let engine = engine
+        .check_source_files(
+            &[VEC.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = engine.logical_root(&KVMap::new());
+    let source =
+        b"def head (xs : Vec Nat 1) : Nat := by induction xs with | cons k x tail ih => exact x";
+    let mut small = limits;
+    small.kernel.steps = 1;
+    match engine.check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(small)) {
+        Ok(fln::Outcome::Inconclusive(_)) => {}
+        Err(error) => assert!(
+            matches!(error.disposition(), ("resource" | "inconclusive", false, 3)),
+            "{error:?}"
+        ),
+        result => panic!("expected a resource nonanswer, got {result:?}"),
+    }
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+    assert!(matches!(
+        engine.check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits)),
+        Ok(fln::Outcome::Complete(_))
+    ));
+}
+
+#[test]
+fn induction_specialization_keeps_ignored_argument_annotations_kernel_checked() {
+    let prefix = "inductive Walk : Nat -> Type where | done (n : Nat) : Walk n | step (n : Nat) (child : Walk n) : Walk n\n\
+        def ignore (x : Nat) : 0 = 0 := rfl\n";
+    check(&format!(
+        "{prefix}theorem control (w : Walk 3) : 0 = 0 := by induction w with | done k => rfl | step k child ih => exact ignore 0"
+    ));
+    let source = format!(
+        "{prefix}theorem bad (w : Walk 3) : 0 = 0 := by induction w with | done k => rfl | step k child ih => exact ignore (child : Nat)"
+    );
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = engine.logical_root(&KVMap::new());
+    let error = engine
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .expect_err("the ignored value must remain in the checked branch");
+    assert_eq!(
+        error.disposition(),
+        ("kernel-rejection", true, 1),
+        "{error:?}"
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
 #[test]
 fn nonempty_vector_head_omits_only_the_impossible_branch() {
     check(&format!(

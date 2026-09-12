@@ -99,6 +99,24 @@ impl Context {
         self.flush(false)?;
         let transparency = UnificationTransparency::Abbreviations;
         let target = self.whnf_with_transparency(&goal.target, transparency, zeta_delta)?;
+        if let Some((level, alpha, left, beta, right)) = equality::heterogeneous_target(&target) {
+            let mut budget = UnificationBudget::new(self.kernel);
+            budget.zeta_delta = zeta_delta;
+            let alpha_nf = self.whnf_with_transparency(&alpha, transparency, zeta_delta)?;
+            let beta_nf = self.whnf_with_transparency(&beta, transparency, zeta_delta)?;
+            if !self.proof_types_match_with_budget(&alpha_nf, &beta_nf, budget)? {
+                return Ok(None);
+            }
+            let left = self.whnf_with_transparency(&left, transparency, zeta_delta)?;
+            let right = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
+            if !self.proof_types_match_with_budget(&left, &right, budget)? {
+                return Ok(None);
+            }
+            return Ok(Some(app(
+                Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+                [alpha, left],
+            )));
+        }
         let Some((level, alpha, left, right)) = equality_target(&target) else {
             return Ok(None);
         };

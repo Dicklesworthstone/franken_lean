@@ -110,6 +110,9 @@ struct Context {
     next: u64,
     equations: Vec<(Expr, Expr)>,
     instance_goals: Vec<MVarId>,
+    // Stable private names link raw IHs to checked specializations. Actual
+    // declarations in the local context decide visibility, including rollback.
+    induction_specializations: Vec<(Name, Name)>,
     recursion: Option<recursion::Recursion>,
 }
 
@@ -127,6 +130,7 @@ impl Context {
             next: 0,
             equations: Vec::new(),
             instance_goals: Vec::new(),
+            induction_specializations: Vec::new(),
             recursion: None,
         }
     }

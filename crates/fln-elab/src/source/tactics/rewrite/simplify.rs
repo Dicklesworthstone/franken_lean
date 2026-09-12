@@ -11,6 +11,51 @@ use unfold::UnfoldResult;
 const MAX_SIMPLIFICATION_STEPS: usize = 256;
 
 impl Context {
+    /// A bare, explicitly selected induction hypothesis can use its checked
+    /// companion without changing the public hypothesis's application API.
+    /// Both declarations must still be in this branch. Following only direct
+    /// local aliases preserves annotations and local shadowing; ordinary term
+    /// applications continue to elaborate the full conditional hypothesis.
+    fn simp_rule_term(&mut self, syntax: &Syntax) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(term) = self.specialized_induction_rule(syntax)? {
+            return Ok(term);
+        }
+        self.term(syntax, None)
+    }
+
+    fn specialized_induction_rule(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        if let Syntax::Ident { val, .. } = syntax {
+            let mut selected = self.txn.lctx.find_by_user_name(val).cloned();
+            let mut seen = std::collections::HashSet::new();
+            while let Some(local) = selected {
+                self.tick()?;
+                if !seen.insert(local.id.clone()) {
+                    break;
+                }
+                if let Some((_, specialized)) = self
+                    .induction_specializations
+                    .iter()
+                    .rev()
+                    .find(|(raw, _)| raw == &local.user_name)
+                    && let Some(companion) = self.txn.lctx.find_by_user_name(specialized)
+                {
+                    return Ok(Some(Typed {
+                        value: Expr::fvar(companion.id.clone()),
+                        type_: companion.type_.clone(),
+                    }));
+                }
+                selected = match local.value.as_ref().map(Expr::node) {
+                    Some(ExprNode::FVar { id }) => self.txn.lctx.find(id).cloned(),
+                    _ => None,
+                };
+            }
+        }
+        Ok(None)
+    }
+
     fn simp_rules<'a>(
         &mut self,
         args: &'a [Syntax],
@@ -109,7 +154,7 @@ impl Context {
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         for rule in rules {
             self.tick()?;
-            let selected = self.term(rule.syntax, None)?;
+            let selected = self.simp_rule_term(rule.syntax)?;
             let type_ = self.simp_premise_target(&selected.type_, rules)?;
             let Some(universe) = self.known_type(&type_)? else {
                 continue;
@@ -232,7 +277,7 @@ impl Context {
             }
             UnfoldResult::NotDefinition => {
                 // Re-elaboration gives each polymorphic use fresh universes.
-                let mut term = self.term(rule.syntax, None)?;
+                let mut term = self.simp_rule_term(rule.syntax)?;
                 // Selected definitions normalize the lemma's type as well as
                 // the goal. Keep its actual proof term: conversion is checked
                 // by the final kernel, never replaced by an equality axiom.

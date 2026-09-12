@@ -1307,6 +1307,46 @@ fn installed_fixed_index_matches_check_real_terms_and_recover_after_failure() {
 }
 
 #[test]
+fn installed_constrained_induction_checks_both_engines_without_partial_success() {
+    let prefix = file(include_str!(
+        "../../../examples/native_induction_specialization.lean"
+    ));
+    let invalid = file(
+        "theorem bad (w : Walk 3) : 0 = 1 := by induction w with | done k => rfl | step k child ih => exact ih",
+    );
+    let original = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":16",
+                "\"theorems\":6",
+                "\"executed\":false",
+                "\"authority\":true",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), original);
+    }
+}
+
+#[test]
 fn installed_constrained_induction_checks_proofs_and_rejects_a_false_suffix() {
     let prefix = file(include_str!(
         "../../../examples/native_constrained_induction.lean"

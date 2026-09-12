@@ -9,9 +9,9 @@ use super::*;
 use fln_env::constants::InductiveVal;
 use std::collections::{HashSet, VecDeque};
 
-/// Equation names survive branch telescope specialization. Constrained induction
-/// additionally generalizes the original major, so a child hypothesis does not
-/// capture the whole input value it is meant to reason about.
+/// Equations are returned parameters of the generalized motive. For induction
+/// the original major must also be quantified: an IH relates its own child to
+/// an arbitrary value at the constrained type, never to the original input.
 pub(super) struct IndexEquations {
     pub names: Vec<Name>,
     pub induction_major: Option<FVarId>,
@@ -22,6 +22,153 @@ fn apply(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
 }
 
 impl Context {
+    /// Specialize a conditional IH only using its generated reflexive index
+    /// equations. This chooses a child as a returned argument of the IH, never
+    /// identifies the child with the original major. Unsolved equations and
+    /// ordinary generalized parameters remain universally quantified.
+    pub(super) fn specialize_index_hypothesis(
+        &mut self,
+        branch: &mut ProofGoal,
+        internal: &Name,
+        public: Name,
+        reverted: &[LocalDecl],
+        equations: &IndexEquations,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = branch.lctx.clone();
+        let hypothesis = branch
+            .lctx
+            .find_by_user_name(internal)
+            .cloned()
+            .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
+        let result =
+            self.specialize_index_hypothesis_inner(hypothesis.clone(), reverted, equations);
+        // Temporary telescope binders never escape on a resource/type stop.
+        self.txn.lctx = branch.lctx.clone();
+        let (value, type_) = result?;
+        // Preserve the existing explicit IH application API. The public name
+        // still denotes the full conditional hypothesis, not its specialization.
+        let original = LocalDecl {
+            id: FVarId(self.fresh_name()?),
+            user_name: public,
+            type_: hypothesis.type_,
+            value: Some(Expr::fvar(hypothesis.id)),
+            binder_info: BinderInfo::Default,
+            index: self.txn.lctx.len(),
+        };
+        eliminate::add_local(&mut self.txn.lctx, &original);
+        branch.introduced.push(original);
+        let specialized = self.fresh_name()?;
+        let alias = LocalDecl {
+            id: FVarId(specialized.clone()),
+            user_name: specialized.clone(),
+            type_,
+            value: Some(value),
+            binder_info: BinderInfo::Default,
+            index: self.txn.lctx.len(),
+        };
+        eliminate::add_local(&mut self.txn.lctx, &alias);
+        branch.introduced.push(alias);
+        branch.lctx = self.txn.lctx.clone();
+        self.induction_specializations
+            .push((internal.clone(), specialized));
+        Ok(())
+    }
+
+    fn specialize_index_hypothesis_inner(
+        &mut self,
+        hypothesis: LocalDecl,
+        reverted: &[LocalDecl],
+        equations: &IndexEquations,
+    ) -> Result<(Expr, Expr), NatDefinitionElabError> {
+        let mut value = Expr::fvar(hypothesis.id);
+        let mut type_ = hypothesis.type_;
+        let mut opened = Vec::new();
+        // Reverted lets are definitions, not arguments. Weak-head reduction of
+        // the following telescope position substitutes their values as usual.
+        for original in reverted.iter().filter(|local| local.value.is_none()) {
+            self.tick()?;
+            let current = self.whnf(&type_)?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = current.node()
+            else {
+                return Err(error(TacticError::UnsupportedEliminator));
+            };
+            let mut local = self.equality_local(binder_type.clone())?;
+            local.binder_info = *binder_info;
+            local.index = self.txn.lctx.len();
+            eliminate::add_local(&mut self.txn.lctx, &local);
+            let argument = Expr::fvar(local.id.clone());
+            value = Expr::app(value, argument.clone());
+            type_ = self.substitute(body, &argument)?;
+            opened.push((local, equations.names.contains(&original.user_name)));
+        }
+        let temporary: HashSet<_> = opened.iter().map(|(local, _)| local.id.clone()).collect();
+        let mut replacements = Vec::new();
+        for (equation, generated) in &opened {
+            if !generated {
+                continue;
+            }
+            self.tick()?;
+            let target = self.specialize_locals(&equation.type_, &replacements)?;
+            let target = self.whnf(&target)?;
+            let (level, alpha, left, beta, right, heterogeneous) =
+                if let Some((level, alpha, left, beta, right)) =
+                    equality::heterogeneous_target(&target)
+                {
+                    (level, alpha, left, beta, right, true)
+                } else if let Some((level, alpha, left, right)) = equality_target(&target) {
+                    (level, alpha.clone(), left, alpha, right, false)
+                } else {
+                    continue;
+                };
+            if !self.proof_types_match(&alpha, &beta)? {
+                continue;
+            }
+            let mut left = self.whnf(&left)?;
+            let mut right = self.whnf(&right)?;
+            // Only these freshly opened parameters can be instantiated. The
+            // replacement must live in the existing branch, not depend on a
+            // later temporary binder or introduce a cyclic substitution.
+            for (endpoint, other) in [(&left, &right), (&right, &left)] {
+                if let ExprNode::FVar { id } = endpoint.node()
+                    && temporary.contains(id)
+                    && self.elimination_reads(other)?.is_disjoint(&temporary)
+                {
+                    replacements.push((id.clone(), other.clone()));
+                    break;
+                }
+            }
+            left = self.specialize_locals(&left, &replacements)?;
+            right = self.specialize_locals(&right, &replacements)?;
+            if self.proof_types_match(&left, &right)? {
+                let alpha = self.specialize_locals(&alpha, &replacements)?;
+                let proof = apply(
+                    Expr::const_(
+                        Name::from_components([if heterogeneous { "HEq" } else { "Eq" }, "refl"]),
+                        vec![level],
+                    ),
+                    [alpha, left],
+                );
+                replacements.push((equation.id.clone(), proof));
+            }
+        }
+        value = self.specialize_locals(&value, &replacements)?;
+        type_ = self.specialize_locals(&type_, &replacements)?;
+        for (mut local, _) in opened.into_iter().rev() {
+            if replacements.iter().any(|(id, _)| id == &local.id) {
+                continue;
+            }
+            local.type_ = self.specialize_locals(&local.type_, &replacements)?;
+            value = self.close_equality_binder(&local, value, true)?;
+            type_ = self.close_equality_binder(&local, type_, false)?;
+        }
+        Ok((value, type_))
+    }
+
     fn refinement_relation(
         &mut self,
         left: &Typed,
@@ -162,16 +309,17 @@ impl Context {
             .work
             .push(Work::Close(goal, apply(hole, applications)));
         self.txn.lctx = expanded;
+        let equations = IndexEquations {
+            names: equations,
+            induction_major: induction.then(|| major.id.clone()),
+        };
         self.eliminate_proof_goal_with_indices(
             proof,
             inner,
             input,
             induction,
             Some(&generic.id),
-            Some(&IndexEquations {
-                names: equations,
-                induction_major: induction.then(|| major.id.clone()),
-            }),
+            Some(&equations),
         )
     }
 
