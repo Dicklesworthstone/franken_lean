@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture the current checked frontend before propositional family integration.
+# Capture the current recursive matrix frontend before further pattern integration.
 on:
   push:
     branches: [main]
