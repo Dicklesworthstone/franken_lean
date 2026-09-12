@@ -97,9 +97,12 @@ fln check-source --json examples/native_constrained_matching.lean
 ```
 
 Constrained-index induction is now implemented with explicit conditional child
-hypotheses; see [NATIVE_CONSTRAINED_INDUCTION.md](NATIVE_CONSTRAINED_INDUCTION.md). Recursive
-definitions with constrained header indices, inaccessible patterns, multiple
-discriminants, and full Lean matcher/equation-compiler parity are separate work.
+hypotheses; see [NATIVE_CONSTRAINED_INDUCTION.md](NATIVE_CONSTRAINED_INDUCTION.md).
+Constrained recursive definitions are covered by
+[NATIVE_CONSTRAINED_RECURSION.md](NATIVE_CONSTRAINED_RECURSION.md). Multiple
+discriminants and nested constructor patterns use the checked
+[pattern-matrix compiler](NATIVE_PATTERN_MATRICES.md). Inaccessible patterns and
+full Lean matcher/equation-compiler parity remain separate work.
 Mutual, nested, and higher-order inductive families retain their existing limits.
 
 The example includes fixed-length head/tail/second, repeated indices, dependent

@@ -323,9 +323,9 @@ impl Context {
             let mut minor_type = binder_type.clone();
             let mut binders = Vec::new();
             let mut recursive = 0;
-            for _ in 0..ctor.num_fields {
+            for recursive_field in self.constructor_recursive_fields(&ctor)? {
                 let field = self.equality_open(&mut minor_type)?;
-                if self.direct_match_field(&field.type_, &family.type_, &ctor.induct)? {
+                if recursive_field {
                     recursive += 1;
                 }
                 binders.push(field);

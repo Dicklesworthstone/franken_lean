@@ -166,7 +166,6 @@ impl Context {
         let names = alternative.map_or(&[][..], |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
         let exact_fields = alternative.is_some_and(|alt| alt.exact_fields);
-        let family_type = self.whnf(&major.type_)?;
         let mut ctor = Expr::const_(constructor.base.name.clone(), levels.to_vec());
         for param in parameters {
             self.tick()?;
@@ -174,7 +173,7 @@ impl Context {
         }
         let mut used = 0;
         let mut recursive_fields = Vec::new();
-        for _ in 0..constructor.num_fields {
+        for recursive_field in self.constructor_recursive_fields(constructor)? {
             self.tick()?;
             let consumes_name = !explicit_fields
                 || matches!(
@@ -195,7 +194,7 @@ impl Context {
                 Name::anonymous()
             };
             let local = self.elimination_binder(&mut branch, name, true)?;
-            if self.direct_match_field(&local.type_, &family_type, &constructor.induct)? {
+            if recursive_field {
                 recursive_fields.push(local.clone());
             }
             ctor = Expr::app(ctor, Expr::fvar(local.id));
@@ -319,16 +318,41 @@ impl Context {
             }
         };
         let (root, mut goal) = self.proof_goal(target.clone())?;
-        let local = if recursive {
-            self.recursive_match(&major.value);
+        let local = if recursive
+            || parts.generated && matches!(major.value.node(), ExprNode::FVar { .. })
+        {
+            if recursive {
+                self.recursive_match(&major.value);
+            }
             let ExprNode::FVar { id } = major.value.node() else {
                 return Err(error(TacticError::EliminationLocal));
             };
-            self.txn
+            let mut local = self
+                .txn
                 .lctx
                 .find(id)
                 .cloned()
-                .ok_or_else(|| error(TacticError::EliminationLocal))?
+                .ok_or_else(|| error(TacticError::EliminationLocal))?;
+            if parts.generated && !recursive {
+                // Matrix columns are checked single-evaluation lets. Follow
+                // exact aliases, not arbitrary reduction, so abstraction also
+                // refines later inputs whose types mention the original local.
+                let mut visited = HashSet::new();
+                while let Some(value) = &local.value {
+                    self.tick()?;
+                    let ExprNode::FVar { id } = value.node() else {
+                        break;
+                    };
+                    if !visited.insert(local.id.clone()) {
+                        return Err(error(TacticError::EliminationLocal));
+                    }
+                    let Some(original) = self.txn.lctx.find(id) else {
+                        break;
+                    };
+                    local = original.clone();
+                }
+            }
+            local
         } else {
             let local = LocalDecl {
                 id: FVarId(self.fresh_name()?),

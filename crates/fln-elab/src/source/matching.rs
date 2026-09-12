@@ -7,6 +7,7 @@
 //! alternatives are refused rather than erased. Both checkers validate the term.
 use super::*;
 use fln_env::constants::ConstantInfo;
+use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub enum MatchError {
     MissingConstructor,
     WrongArity,
     DuplicateVariable,
+    UnreachableRow,
 }
 impl std::fmt::Display for MatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,6 +43,7 @@ impl std::fmt::Display for MatchError {
             Self::MissingConstructor => "match does not cover every constructor",
             Self::WrongArity => "constructor pattern has the wrong number of explicit fields",
             Self::DuplicateVariable => "constructor pattern repeats a variable",
+            Self::UnreachableRow => "pattern matrix contains a redundant or unreachable source row",
         })
     }
 }
@@ -52,6 +55,7 @@ fn error(reason: MatchError) -> NatDefinitionElabError {
 pub(super) struct MatchParts<'a> {
     pub(super) discriminant: &'a Syntax,
     alternatives: &'a [Syntax],
+    pub(super) generated: bool,
 }
 pub(super) struct MatchPatterns<'a> {
     pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
@@ -105,7 +109,7 @@ pub(super) enum MatchStep<'a> {
     Complete(Typed),
 }
 
-fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
+pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitionElabError> {
     if let Syntax::Ident { val, .. } = syntax {
         if val.is_anonymous() || !val.parent().is_anonymous() {
             return Err(error(MatchError::InvalidPattern));
@@ -179,9 +183,10 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<MatchParts<'a>, NatDefinitionElabError> {
+        let generated = syntax.kind() == Some(&parser_kind(&["Term", "matchMatrix"]));
         let parts = expect_node(
             syntax,
-            &parser_kind(&["Term", "match"]),
+            &parser_kind(&["Term", if generated { "matchMatrix" } else { "match" }]),
             6,
             "match expression",
         )?;
@@ -215,6 +220,7 @@ impl Context {
         Ok(MatchParts {
             discriminant: &discriminant[1],
             alternatives,
+            generated,
         })
     }
 
@@ -281,6 +287,14 @@ impl Context {
         // call lowering. Only the precise index-shape refusal selects the
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
+        if parts.generated && !recursive {
+            // Earlier columns may occur in later discriminant types. The
+            // shared elimination engine generalizes that entire dependency
+            // cone; treating each split as an independent case loses it.
+            return self
+                .start_refined_match(parts, major, expected, false)
+                .map(MatchStart::Refined);
+        }
         let saved = self.clone();
         match self.start_regular_match(parts, major.clone(), expected.clone()) {
             Ok(build) => Ok(MatchStart::Regular(Box::new(build))),
@@ -735,7 +749,11 @@ impl Context {
         // term must not vanish before checking. Redundant catch-alls are a
         // visible unsupported pattern in this exhaustive, disjoint profile.
         if fallback.is_some() && patterns.len() == constructors.len() {
-            return Err(error(MatchError::DuplicateConstructor));
+            if parts.generated {
+                fallback = None;
+            } else {
+                return Err(error(MatchError::DuplicateConstructor));
+            }
         }
         Ok(MatchPatterns {
             constructors: patterns,
@@ -743,79 +761,82 @@ impl Context {
         })
     }
 
-    pub(super) fn direct_match_field(
+    /// Recursion belongs to the admitted constructor's uninstantiated signature.
+    /// A parameter instantiated with this same family is still payload data, not
+    /// a recursive child (for example the head of List (List Nat)). Counting
+    /// occurrences after parameter substitution invents nonexistent hypotheses.
+    pub(super) fn constructor_recursive_fields(
         &mut self,
-        domain: &Expr,
-        family_type: &Expr,
-        name: &Name,
-    ) -> Result<bool, NatDefinitionElabError> {
-        let domain = self.whnf(domain)?;
-        if domain == *family_type {
-            return Ok(true);
-        }
-        if let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name)
-            && family.num_indices > 0
-        {
-            let count = family.num_indices as usize;
-            let mut actual = &domain;
-            let mut expected = family_type;
-            let mut complete = true;
-            for _ in 0..count {
-                self.tick()?;
-                match (actual.node(), expected.node()) {
-                    (ExprNode::App { f: a, .. }, ExprNode::App { f: b, .. }) => {
-                        actual = a;
-                        expected = b;
-                    }
-                    _ => {
-                        complete = false;
-                        break;
-                    }
-                }
-            }
-            // The admitted constructor/recursor owns positivity and index
-            // typing. Here only the fixed family prefix must match; the child
-            // may live at different indices from the outer discriminant.
-            if complete && actual == expected {
-                return Ok(true);
-            }
-        }
-        let mut pending = vec![&domain];
-        let mut seen = HashSet::new();
-        while let Some(expr) = pending.pop() {
+        constructor: &ConstructorVal,
+    ) -> Result<Vec<bool>, NatDefinitionElabError> {
+        let mut telescope = constructor.base.type_.clone();
+        for _ in 0..constructor.num_params {
             self.tick()?;
-            if !seen.insert(expr.allocation_identity()) {
-                continue;
-            }
-            match expr.node() {
-                ExprNode::Const { name: found, .. } if found == name => {
-                    return Err(error(MatchError::UnsupportedFamily));
-                }
-                ExprNode::App { f, a } => {
-                    pending.push(a);
-                    pending.push(f);
-                }
-                ExprNode::Lam {
-                    binder_type, body, ..
-                }
-                | ExprNode::ForallE {
-                    binder_type, body, ..
-                } => {
-                    pending.push(body);
-                    pending.push(binder_type);
-                }
-                ExprNode::LetE {
-                    type_, value, body, ..
-                } => {
-                    pending.push(body);
-                    pending.push(value);
-                    pending.push(type_);
-                }
-                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
-                _ => {}
-            }
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            telescope = body.clone();
         }
-        Ok(false)
+        let mut flags = Vec::new();
+        for _ in 0..constructor.num_fields {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = telescope.node()
+            else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let domain = self.whnf(binder_type)?;
+            let mut head = &domain;
+            while let ExprNode::App { f, .. } = head.node() {
+                self.tick()?;
+                head = f;
+            }
+            let recursive =
+                matches!(head.node(), ExprNode::Const { name, .. } if name == &constructor.induct);
+            if !recursive {
+                let mut pending = vec![&domain];
+                let mut seen = HashSet::new();
+                while let Some(expr) = pending.pop() {
+                    self.tick()?;
+                    if !seen.insert(expr.allocation_identity()) {
+                        continue;
+                    }
+                    match expr.node() {
+                        ExprNode::Const { name, .. } if name == &constructor.induct => {
+                            return Err(error(MatchError::UnsupportedFamily));
+                        }
+                        ExprNode::App { f, a } => {
+                            pending.push(a);
+                            pending.push(f);
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            pending.push(body);
+                            pending.push(binder_type);
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            pending.push(body);
+                            pending.push(value);
+                            pending.push(type_);
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            pending.push(expr)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            flags.push(recursive);
+            telescope = body.clone();
+        }
+        Ok(flags)
     }
 
     pub(super) fn next_match_branch<'a>(
@@ -922,10 +943,9 @@ impl Context {
         for parameter in &state.parameters {
             constructor = Expr::app(constructor, parameter.clone());
         }
-        let family_type = self.whnf(&state.major.type_)?;
         let mut recursive_fields = Vec::new();
         let mut consumed = 0;
-        for _ in 0..branch.constructor.num_fields {
+        for recursive_field in self.constructor_recursive_fields(&branch.constructor)? {
             self.tick()?;
             target = self.whnf(&target)?;
             let ExprNode::ForallE {
@@ -937,8 +957,6 @@ impl Context {
             else {
                 return Err(error(MatchError::UnsupportedFamily));
             };
-            let recursive_field =
-                self.direct_match_field(binder_type, &family_type, &state.family)?;
             let name = if *binder_info == BinderInfo::Default {
                 if let Some(fields) = &branch.fields {
                     let field = fields

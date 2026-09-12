@@ -59,7 +59,8 @@ primitive signatures still appear in the audit and are not hidden.
 ## Scope and evidence boundaries
 
 This is a bounded constructor-match compiler, not complete Lean match elaboration.
-Multiple discriminants, nested constructor patterns in a single alternative,
+The original flat lane does not handle multiple discriminants or nested
+constructor patterns; the pattern-matrix extension below supplies them. Other limits include
 numeric patterns, guards, indexed/mutual/nested families, inaccessible patterns,
 explicit motives, `match h : ...`, dependent generalization of other hypotheses,
 general equation-compiler recursive definitions and well-founded termination
@@ -79,3 +80,11 @@ branches of constructors, wrong branch types, invalid unused annotations, scope
 isolation, resource nonanswers, multi-file failure/recovery and actual recursor
 dependencies. Passing these tests is scoped evidence, not full language parity or
 a whole-workspace test/release-gate claim.
+
+## Pattern-matrix extension
+
+Multiple discriminants and nested constructor patterns now have a shared checked
+matrix-compilation path. See [Native pattern matrices](NATIVE_PATTERN_MATRICES.md)
+for row priority, correlated dependent inputs, source-row reachability and current
+recursion/literal-pattern limits. The original single-discriminant flat path
+remains available and its structural-recursion behavior is retained.

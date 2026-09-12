@@ -11,6 +11,7 @@ mod instance_command;
 mod instances;
 mod levels;
 mod matching;
+mod patterns;
 mod record;
 mod record_terms;
 mod recursion;
@@ -113,6 +114,7 @@ struct Context {
     // Stable private names link raw IHs to checked specializations. Actual
     // declarations in the local context decide visibility, including rollback.
     induction_specializations: Vec<(Name, Name)>,
+    matrix_rows: std::collections::HashSet<Name>,
     recursion: Option<recursion::Recursion>,
 }
 
@@ -131,6 +133,7 @@ impl Context {
             equations: Vec::new(),
             instance_goals: Vec::new(),
             induction_specializations: Vec::new(),
+            matrix_rows: std::collections::HashSet::new(),
             recursion: None,
         }
     }
@@ -500,6 +503,23 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        let (syntax, required) = self.lower_pattern_matrices(syntax)?;
+        let result = self.term_prepared(&syntax, expected)?;
+        for row in required {
+            if !self.matrix_rows.remove(&row) {
+                return Err(failure(SourceInferenceError::Match(
+                    matching::MatchError::UnreachableRow,
+                )));
+            }
+        }
+        Ok(result)
+    }
+
+    fn term_prepared(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
@@ -559,6 +579,14 @@ impl Context {
                         continue;
                     }
                     if let Syntax::Node { kind, args, .. } = syntax {
+                        if kind == &parser_kind(&["Term", "matrixBranch"]) {
+                            let [Syntax::Ident { val, .. }, body] = args.as_slice() else {
+                                return Err(failure(SourceInferenceError::Scope));
+                            };
+                            self.matrix_rows.insert(val.clone());
+                            tasks.push(Task::Visit(body, expected, finish));
+                            continue;
+                        }
                         if kind == &parser_kind(&["Term", "forall"]) {
                             let parts = expect_node(syntax, kind, 5, "universal quantifier")?;
                             if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "forall" || val == "∀")
@@ -576,7 +604,9 @@ impl Context {
                             tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
                             continue;
                         }
-                        if kind == &parser_kind(&["Term", "match"]) {
+                        if kind == &parser_kind(&["Term", "match"])
+                            || kind == &parser_kind(&["Term", "matchMatrix"])
+                        {
                             let parts = self.match_parts(syntax)?;
                             let discriminant = parts.discriminant;
                             tasks.push(Task::MatchDiscriminant(parts, expected));
