@@ -69,10 +69,18 @@ theorem package_transport (P : forall A : Type, A -> Prop)
   exact hx
 ```
 
-Dependent proof-valued fields which need this selector construction are omitted;
-they are not data injectivity goals. Families in `Prop` remain excluded entirely.
-This does not introduce general heterogeneous-equality syntax, generated
-`noConfusion` declarations, or full fixed/repeated-index elimination.
+When selectors cannot expose every field, a checked continuation built from the
+family recursor retains the complete field order, using `HEq` for dependent
+domains. This includes proof-valued fields of data records. Families in `Prop`
+remain excluded entirely: equality of existential proofs cannot extract their
+witnesses. Existing cast-based field equations remain unchanged whenever the
+selector path handles every field.
+
+The source seed now includes ordinary `HEq` and checked bridge theorems; see
+[`NATIVE_DEPENDENT_INJECTION.md`](NATIVE_DEPENDENT_INJECTION.md). `injection` and
+`contradiction` also accept HEq evidence when its endpoint domains are convertible,
+by applying the checked `eq_of_heq` theorem. This is not generated `noConfusion`
+name parity or full fixed/repeated-index elimination.
 
 ## Independent cast conversion
 

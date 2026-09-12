@@ -743,7 +743,13 @@ impl Context {
             .find_by_user_name(name)
             .cloned()
             .ok_or_else(|| error(TacticError::ConstructorEquality))?;
-        let type_ = self.whnf(&local.type_)?;
+        let equality = self
+            .homogeneous_equality_evidence(&Typed {
+                value: Expr::fvar(local.id),
+                type_: local.type_,
+            })?
+            .ok_or_else(|| error(TacticError::ExpectedEquality))?;
+        let type_ = equality.type_.clone();
         let (_, alpha, lhs, rhs) =
             equality_target(&type_).ok_or_else(|| error(TacticError::ExpectedEquality))?;
         let family = self
@@ -755,10 +761,6 @@ impl Context {
         let right = self
             .equality_constructor(&rhs, &family)?
             .ok_or_else(|| error(TacticError::ConstructorEquality))?;
-        let equality = Typed {
-            value: Expr::fvar(local.id),
-            type_,
-        };
         if left.name != right.name {
             if !names.is_empty() {
                 return Err(error(TacticError::ConstructorEquality));
@@ -776,6 +778,12 @@ impl Context {
             {
                 equalities.push(equality);
             }
+        }
+        if equalities.len() < left.fields.len() {
+            // A dependent field cannot in general be projected into one fixed
+            // result type. Retain every field in constructor order by passing
+            // typed heterogeneous equalities to a checked continuation instead.
+            return self.inject_dependent_proof_goal(proof, goal, &equality, &names);
         }
         if equalities.is_empty() || names.len() > equalities.len() {
             return Err(error(TacticError::ConstructorEquality));
@@ -934,7 +942,10 @@ impl Context {
                     }
                 }
             }
-            let type_ = self.whnf(&evidence.type_)?;
+            let Some(evidence) = self.homogeneous_equality_evidence(&evidence)? else {
+                continue;
+            };
+            let type_ = evidence.type_.clone();
             let Some((_, alpha, left, right)) = equality_target(&type_) else {
                 continue;
             };

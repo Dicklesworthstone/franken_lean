@@ -22,7 +22,70 @@ pub(super) fn reflexivity(level: Level, alpha: Expr, value: Expr) -> Expr {
     )
 }
 
+/// A bounded shape inspection, not a typing judgment. The supplied proof and
+/// every derived bridge application remain in the final kernel input.
+pub(super) fn heterogeneous_target(expr: &Expr) -> Option<(Level, Expr, Expr, Expr, Expr)> {
+    let mut head = expr;
+    let mut args = Vec::new();
+    while let ExprNode::App { f, a } = head.node() {
+        if args.len() == 4 {
+            return None;
+        }
+        args.push(a.clone());
+        head = f;
+    }
+    let ExprNode::Const { name, levels } = head.node() else {
+        return None;
+    };
+    if name != &Name::from_components(["HEq"]) || levels.len() != 1 || args.len() != 4 {
+        return None;
+    }
+    Some((
+        levels[0].clone(),
+        args[3].clone(),
+        args[2].clone(),
+        args[1].clone(),
+        args[0].clone(),
+    ))
+}
+
 impl Context {
+    /// Turn same-type HEq evidence into an ordinary Eq proof using the checked
+    /// seed theorem. Distinct domains are not identified by this operation.
+    pub(super) fn homogeneous_equality_evidence(
+        &mut self,
+        evidence: &Typed,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        self.tick()?;
+        let type_ = self.whnf(&evidence.type_)?;
+        if equality_target(&type_).is_some() {
+            return Ok(Some(Typed {
+                value: evidence.value.clone(),
+                type_,
+            }));
+        }
+        let Some((universe, alpha, left, beta, right)) = heterogeneous_target(&type_) else {
+            return Ok(None);
+        };
+        let alpha_whnf = self.whnf(&alpha)?;
+        let beta_whnf = self.whnf(&beta)?;
+        if !self.proof_types_match(&alpha_whnf, &beta_whnf)? {
+            return Ok(None);
+        }
+        Ok(Some(Typed {
+            value: app(
+                Expr::const_(Name::from_components(["eq_of_heq"]), vec![universe.clone()]),
+                [
+                    alpha.clone(),
+                    left.clone(),
+                    right.clone(),
+                    evidence.value.clone(),
+                ],
+            ),
+            type_: equation(universe, alpha, left, right),
+        }))
+    }
+
     pub(super) fn close_equality_binder(
         &mut self,
         local: &LocalDecl,
@@ -195,8 +258,115 @@ impl Context {
     pub(super) fn substitute_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        name: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let selected = goal
+            .lctx
+            .find_by_user_name(name)
+            .cloned()
+            .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
+        let type_ = self.whnf(&selected.type_)?;
+        if heterogeneous_target(&type_).is_none() {
+            return self.substitute_homogeneous_proof_goal(proof, goal, name, None);
+        }
+        // At most two dependent transports: first identify local endpoint
+        // types, then identify their values. Arbitrary equations between type
+        // applications are not assumed injective and remain unsupported.
+        for stage in 0..2 {
+            self.tick()?;
+            self.txn.lctx = goal.lctx.clone();
+            let selected = goal
+                .lctx
+                .find_by_user_name(name)
+                .cloned()
+                .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
+            let type_ = self.whnf(&selected.type_)?;
+            let (universe, alpha, left, beta, right) = heterogeneous_target(&type_)
+                .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
+            let alpha_whnf = self.whnf(&alpha)?;
+            let beta_whnf = self.whnf(&beta)?;
+            let same_type = self.proof_types_match(&alpha_whnf, &beta_whnf)?;
+            if !same_type && stage != 0 {
+                return Err(error(TacticError::SubstitutionLocal));
+            }
+            let derived = if same_type {
+                Typed {
+                    value: app(
+                        Expr::const_(Name::from_components(["eq_of_heq"]), vec![universe.clone()]),
+                        [
+                            alpha.clone(),
+                            left.clone(),
+                            right.clone(),
+                            Expr::fvar(selected.id.clone()),
+                        ],
+                    ),
+                    type_: equation(universe, alpha, left, right),
+                }
+            } else {
+                let type_universe = universe
+                    .clone()
+                    .succ()
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                Typed {
+                    value: app(
+                        Expr::const_(
+                            Name::from_components(["type_eq_of_heq"]),
+                            vec![universe.clone()],
+                        ),
+                        [
+                            alpha.clone(),
+                            left,
+                            beta.clone(),
+                            right,
+                            Expr::fvar(selected.id.clone()),
+                        ],
+                    ),
+                    type_: equation(type_universe, Expr::sort(universe), alpha, beta),
+                }
+            };
+            let id = FVarId(self.fresh_name()?);
+            let derived_name = id.0.clone();
+            self.txn.lctx.add_let(
+                id.clone(),
+                derived_name.clone(),
+                derived.type_,
+                derived.value,
+            );
+            goal.introduced.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("inserted bridge proof")
+                    .clone(),
+            );
+            goal.lctx = self.txn.lctx.clone();
+            self.substitute_homogeneous_proof_goal(
+                proof,
+                goal,
+                &derived_name,
+                same_type.then_some(&selected.id),
+            )?;
+            if same_type {
+                return Ok(());
+            }
+            let Some(Work::Goal(child)) = proof.work.pop() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            goal = child;
+        }
+        Err(error(TacticError::SubstitutionLocal))
+    }
+
+    fn substitute_homogeneous_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
         goal: ProofGoal,
         name: &Name,
+        hide: Option<&FVarId>,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
@@ -301,7 +471,7 @@ impl Context {
         self.txn.lctx = retained;
         let (hole, mut child) = self.proof_goal(target)?;
         for local in &reverted {
-            let name = if local.id == witness.id {
+            let name = if local.id == witness.id || hide == Some(&local.id) {
                 Name::anonymous()
             } else {
                 local.user_name.clone()

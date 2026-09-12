@@ -6,6 +6,7 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+mod constructor_transport;
 mod constructors;
 mod eliminate;
 mod equality;
@@ -403,6 +404,18 @@ impl Context {
                 };
                 expect_atom(keyword, "rfl", "reflexivity tactic")?;
                 let target = self.whnf(&goal.target)?;
+                if let Some((level, alpha, left, beta, right)) =
+                    equality::heterogeneous_target(&target)
+                {
+                    self.constrain(&alpha, &beta)?;
+                    self.constrain(&left, &right)?;
+                    let value = [alpha, left].into_iter().fold(
+                        Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+                        Expr::app,
+                    );
+                    self.close_proof_goal(goal, value)?;
+                    continue;
+                }
                 let (level, alpha, left, right) =
                     equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
                 self.constrain(&left, &right)?;

@@ -1132,3 +1132,102 @@ fn installed_constructor_equality_checks_real_proofs_and_failure_isolation() {
         }
     }
 }
+
+#[test]
+fn constructor_equality_example_crosses_the_installed_checker() {
+    let source = include_str!("../../../examples/native_constructor_equalities.lean");
+    let input = file(source);
+    let bytes = std::fs::read(&input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "\"commands\":9",
+        "\"theorems\":7",
+        "\"authority\":true",
+        "\"executed\":false",
+    ] {
+        assert!(json.contains(expected), "{json}");
+    }
+    assert!(output.stderr.is_empty());
+    assert_eq!(std::fs::read(&input).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read_dir(input.parent().unwrap()).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn failed_constructor_proofs_do_not_publish_or_poison_an_earlier_file() {
+    let prefix = file(include_str!(
+        "../../../examples/native_constructor_equalities.lean"
+    ));
+    let suffix = file(
+        "theorem falseProof (a b : Nat) (h : Nat.succ a = Nat.succ b) : 0 = 1 := by\n  injection h with field\n  rfl",
+    );
+    for good in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !good {
+            command.arg(&suffix);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            good,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if good {
+            assert!(output.stderr.is_empty());
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("\"commands\":9")
+            );
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn installed_heterogeneous_equality_checks_bridges_substitution_and_failure_isolation() {
+    let prefix = file(include_str!(
+        "../../../examples/native_heterogeneous_equality.lean"
+    ));
+    let bad = file("theorem invalid : HEq 0 1 := by rfl");
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&bad);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let result = String::from_utf8(output.stdout).unwrap();
+            for field in ["\"commands\":10", "\"theorems\":8", "\"executed\":false"] {
+                assert!(result.contains(field), "{result}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+}
