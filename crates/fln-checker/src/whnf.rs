@@ -1146,6 +1146,14 @@ impl<'a, 'c> Reducer<'a, 'c> {
             if self.structural_cursors_equal(&left, &right)? {
                 continue;
             }
+            let literal_fields = match self.k_literal_constructor_pair(&left, &right)? {
+                Some(fields) => Some(fields),
+                None => self.k_literal_constructor_pair(&right, &left)?,
+            };
+            if let Some(fields) = literal_fields {
+                pending.extend(fields);
+                continue;
+            }
             match (self.node(&left)?, self.node(&right)?) {
                 (
                     ExprNode::Apply {
@@ -1176,6 +1184,47 @@ impl<'a, 'c> Reducer<'a, 'c> {
             }
         }
         Ok(true)
+    }
+
+    /// Compare one compact literal layer with an explicitly written Nat
+    /// constructor. Reuse the ordinary admitted-family gate and predecessor
+    /// builder; never unfold a numeral into a complete unary constructor tree.
+    fn k_literal_constructor_pair(
+        &mut self,
+        literal: &Cursor,
+        constructor: &Cursor,
+    ) -> Result<Option<Vec<(Cursor, Cursor)>>, Halt> {
+        if !matches!(self.node(literal)?, ExprNode::NatLiteral { .. }) {
+            return Ok(None);
+        }
+        let (head, arguments) = self.peel_application(constructor)?;
+        let ExprNode::Constant { name, levels } = self.node(&head)? else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        let name = name.clone();
+        let rec = WireName::from_parts(vec![
+            NamePart::Text("Nat".into()),
+            NamePart::Text("rec".into()),
+        ]);
+        let Some(entry) = self.context.source.constants().find(&rec) else {
+            return Ok(None);
+        };
+        if entry.safety() != crate::environment::ConstantSafety::Safe {
+            return Ok(None);
+        }
+        let Some(metadata) = entry.recursor_metadata().cloned() else {
+            return Ok(None);
+        };
+        let Some((expected, fields)) = self.nat_literal_constructor(&metadata, literal)? else {
+            return Ok(None);
+        };
+        if name != expected || fields.len() != arguments.len() {
+            return Ok(None);
+        }
+        Ok(Some(fields.into_iter().zip(arguments).collect()))
     }
 
     /// Consume a peeled telescope from the inside out. Each replacement lives

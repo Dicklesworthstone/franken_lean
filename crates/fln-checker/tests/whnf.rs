@@ -2470,3 +2470,102 @@ fn literal_k_gate_preserves_cancellation_and_resource_boundaries() {
         Some(&checker_name("KTestMinor"))
     );
 }
+
+#[test]
+fn k_gate_compares_literal_and_explicit_nat_layers_symmetrically() {
+    use fln_core::expr::{Literal, NatLit};
+    let mut entries = eqs_family_entries();
+    entries.extend(nat_literal_family_entries());
+    let context = definition_context(entries);
+    let values: [Vec<u64>; 5] = [vec![], vec![1], vec![7], vec![0, 1], vec![0, 0, 1]];
+    for (i, value) in values.iter().enumerate() {
+        let explicit = if value.is_empty() {
+            Expr::const_(Name::from_components(["Nat", "zero"]), vec![])
+        } else {
+            let mut limbs = value.clone();
+            let mut borrow = true;
+            for limb in &mut limbs {
+                let (v, b) = limb.overflowing_sub(u64::from(borrow));
+                *limb = v;
+                borrow = b;
+            }
+            if limbs.last() == Some(&0) {
+                limbs.pop();
+            }
+            Expr::app(
+                Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+                Expr::lit(Literal::Nat(NatLit::from_limbs_le(limbs))),
+            )
+        };
+        for (j, other) in values.iter().enumerate() {
+            let other = Expr::lit(Literal::Nat(NatLit::from_limbs_le(other.clone())));
+            for (left, right) in [(other.clone(), explicit.clone()), (explicit.clone(), other)] {
+                let input = decoded(&k_application(constant("Nat"), left, right));
+                let result = complete(whnf(&input, &context, WhnfBudget::unlimited()));
+                assert_eq!(
+                    root_constant_name(&result.term) == Some(&checker_name("KTestMinor")),
+                    i == j
+                );
+                assert!(
+                    result.steps < 4000,
+                    "work must follow limb width, not numeral magnitude"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_constructor_k_gate_does_not_borrow_foreign_or_partial_constructors() {
+    use fln_core::expr::{Literal, NatLit};
+    let mut entries = eqs_family_entries();
+    entries.extend(nat_literal_family_entries());
+    let context = definition_context(entries);
+    let zero = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+    let one = Expr::lit(Literal::Nat(NatLit::from_u64(1)));
+    for constructor in [
+        Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "zero"]), vec![]),
+            zero.clone(),
+        ),
+        Expr::app(
+            Expr::const_(Name::from_components(["Other", "succ"]), vec![]),
+            zero.clone(),
+        ),
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![Level::one()]),
+            zero.clone(),
+        ),
+    ] {
+        let input = decoded(&k_application(constant("Nat"), one.clone(), constructor));
+        let result = complete(whnf(&input, &context, WhnfBudget::unlimited()));
+        assert_ne!(
+            root_constant_name(&result.term),
+            Some(&checker_name("KTestMinor"))
+        );
+    }
+    let input = decoded(&k_application(
+        constant("Nat"),
+        one,
+        Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            zero,
+        ),
+    ));
+    assert!(matches!(
+        whnf_with(&input, &context, WhnfBudget::unlimited(), || true),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    let mut limited = WhnfBudget::unlimited();
+    limited.max_steps = 2;
+    assert!(matches!(
+        whnf(&input, &context, limited),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    let recovered = complete(whnf(&input, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        root_constant_name(&recovered.term),
+        Some(&checker_name("KTestMinor"))
+    );
+}

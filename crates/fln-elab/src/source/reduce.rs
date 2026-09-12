@@ -163,9 +163,13 @@ impl Context {
                         recursor,
                         arguments: mut outer,
                     } => {
-                        if let Some(reduced) =
-                            self.source_iota(&rec_head, &recursor, &outer, &head, &arguments)?
-                        {
+                        let reduced =
+                            self.source_iota(&rec_head, &recursor, &outer, &head, &arguments)?;
+                        let reduced = match reduced {
+                            Some(reduced) => Some(reduced),
+                            None => self.source_k_iota(&rec_head, &recursor, &outer)?,
+                        };
+                        if let Some(reduced) = reduced {
                             changed = true;
                             let prefix = recursor_major(&recursor)?;
                             outer.truncate(outer.len() - prefix - 1);
@@ -191,6 +195,90 @@ impl Context {
         }
     }
 
+    /// An admitted nullary K recursor can reduce an unknown proof only when
+    /// its spine-derived major domain is exactly the constructor result. This
+    /// sufficient gate does not equate unknown indices or assign metavariables.
+    /// Telescope substitution is capture-avoiding, including under open binders.
+    fn source_k_iota(
+        &mut self,
+        head: &Expr,
+        recursor: &RecursorVal,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        if !recursor.k || recursor.rules.len() != 1 || recursor.num_minors != 1 {
+            return Ok(None);
+        }
+        let ExprNode::Const { levels, .. } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&recursor.all[0]).cloned()
+        else {
+            return Ok(None);
+        };
+        let rule = &recursor.rules[0];
+        let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(&rule.ctor).cloned() else {
+            return Ok(None);
+        };
+        if family.is_unsafe
+            || family.num_nested != 0
+            || family.ctors != [rule.ctor.clone()]
+            || family.all != recursor.all
+            || family.num_indices != recursor.num_indices
+            || family.num_params != recursor.num_params
+            || ctor.is_unsafe
+            || ctor.induct != family.base.name
+            || ctor.num_params != family.num_params
+            || ctor.num_fields != 0
+            || rule.nfields != 0
+        {
+            return Ok(None);
+        }
+        let family_levels = if recursor.base.level_params == family.base.level_params {
+            levels.as_slice()
+        } else if recursor.base.level_params.len() == family.base.level_params.len() + 1
+            && recursor.base.level_params[1..] == family.base.level_params
+        {
+            &levels[1..]
+        } else {
+            return Ok(None);
+        };
+        if ctor.base.level_params != family.base.level_params {
+            return Ok(None);
+        }
+        let major = recursor_major(recursor)?;
+        let mut domain =
+            self.instantiate_params(&recursor.base.type_, &recursor.base.level_params, levels)?;
+        for argument in arguments.iter().rev().take(major) {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = domain.node() else {
+                return Ok(None);
+            };
+            domain = self.substitute(body, argument)?;
+        }
+        let ExprNode::ForallE { binder_type, .. } = domain.node() else {
+            return Ok(None);
+        };
+        let mut result =
+            self.instantiate_params(&ctor.base.type_, &ctor.base.level_params, family_levels)?;
+        for parameter in arguments.iter().rev().take(recursor.num_params as usize) {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = result.node() else {
+                return Ok(None);
+            };
+            result = self.substitute(body, parameter)?;
+        }
+        self.tick()?;
+        if result != *binder_type {
+            return Ok(None);
+        }
+        let mut value = self.instantiate_params(&rule.rhs, &recursor.base.level_params, levels)?;
+        for argument in arguments.iter().rev().take(recursor_prefix(recursor)?) {
+            self.tick()?;
+            value = Expr::app(value, argument.clone());
+        }
+        Ok(Some(value))
+    }
+
     fn rebuild_application(
         &mut self,
         mut head: Expr,
@@ -203,8 +291,8 @@ impl Context {
         Ok(head)
     }
 
-    /// Only the non-indexed, single-family lane is selected here. Equality/K
-    /// corners, quotients and other unsupported reductions stay with the kernel.
+    /// Ordinary constructor reduction for the supported single-family lane.
+    /// Unknown majors use the separate, sufficient K gate or remain stuck.
     fn source_iota(
         &mut self,
         rec_head: &Expr,
@@ -452,6 +540,138 @@ mod tests {
                 }
                 let mut ctx = Context::new(&env, Budget::for_stack_bytes(64 * 1024));
                 assert_eq!(ctx.whnf(&input).unwrap(), truth());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod source_k_tests {
+    use super::*;
+    use fln_core::expr::NatLit;
+    use fln_core::outcome::Outcome;
+    use fln_env::environment::DeclarationBudget;
+    use fln_env::pmap::CollisionBudget;
+    use fln_kernel::capability::{Published, admit};
+    use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+    fn environment() -> Environment {
+        let budget = Budget::for_stack_bytes(1024 * 1024);
+        let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
+        let declaration = crate::seed::equality::eq_seed_declaration();
+        let Outcome::Complete(admitted) = admit(&env, declaration, budget) else {
+            panic!("Eq admission");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("Eq checking");
+        };
+        let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) else {
+            panic!("Eq publication");
+        };
+        publication.environment
+    }
+    fn nat() -> Expr {
+        Expr::const_(Name::from_components(["Nat"]), vec![])
+    }
+    fn number(value: u64) -> Expr {
+        Expr::lit(Literal::Nat(NatLit::from_u64(value)))
+    }
+    fn cast(left: Expr, right: Expr, value: Expr) -> Expr {
+        let equality = [nat(), left.clone(), Expr::bvar(0).unwrap()]
+            .into_iter()
+            .fold(
+                Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                Expr::app,
+            );
+        let motive = Expr::lam(
+            Name::anonymous(),
+            nat(),
+            Expr::lam(Name::anonymous(), equality, nat(), BinderInfo::Default),
+            BinderInfo::Default,
+        );
+        [
+            nat(),
+            left,
+            motive,
+            value,
+            right,
+            Expr::fvar(FVarId(Name::from_components(["unknown_evidence"]))),
+        ]
+        .into_iter()
+        .fold(
+            Expr::const_(
+                Name::from_components(["Eq", "rec"]),
+                vec![Level::one(), Level::one()],
+            ),
+            Expr::app,
+        )
+    }
+    #[test]
+    fn source_k_reduction_requires_the_actual_endpoint_equation() {
+        let env = environment();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        assert_eq!(
+            context
+                .whnf(&cast(number(7), number(7), number(9)))
+                .unwrap(),
+            number(9)
+        );
+        let different = cast(number(7), number(8), number(9));
+        assert_eq!(context.whnf(&different).unwrap(), different);
+    }
+    #[test]
+    fn source_k_telescope_substitution_preserves_all_external_binders() {
+        let env = environment();
+        for left in 0..5 {
+            for right in 0..5 {
+                let mut context = Context::new(&env, Budget::DEFAULT);
+                let input = cast(
+                    Expr::bvar(left).unwrap(),
+                    Expr::bvar(right).unwrap(),
+                    number(9),
+                );
+                let result = context.whnf(&input).unwrap();
+                assert_eq!(result == number(9), left == right);
+            }
+        }
+    }
+    #[test]
+    fn source_k_budget_failure_restores_no_semantic_state_and_can_recover() {
+        let env = environment();
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        let input = cast(number(7), number(7), number(9));
+        context.txn.budget.max_heartbeats = 1;
+        let before = context.txn.env.clone();
+        assert!(matches!(
+            context.whnf(&input),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(context.txn.env, before);
+        context.txn.budget.max_heartbeats = 200_000;
+        assert_eq!(context.whnf(&input).unwrap(), number(9));
+    }
+    #[test]
+    fn source_k_chains_use_the_heap_reduction_worklist() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let env = environment();
+                let mut context = Context::new(&env, Budget::for_stack_bytes(64 * 1024));
+                context.txn.budget.max_heartbeats = 5_000_000;
+                let mut input = number(9);
+                for _ in 0..512 {
+                    input = cast(number(7), number(7), input);
+                }
+                assert_eq!(context.whnf(&input).unwrap(), number(9));
             })
             .unwrap()
             .join()
