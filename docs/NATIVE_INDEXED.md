@@ -65,9 +65,13 @@ the canonical admitted zero/successor constructors one compact layer at a time,
 including inference of a large literal's predecessor. No ordinary definition
 unfolding policy or checking authority is widened.
 
-This is not complete indexed elimination. Fixed expressions, repeated indices
-and let-bound indices require index-equation refinement and currently refuse
-instead of becoming independent variables.
+`cases` additionally supports fixed expressions, repeated indices, let-bound
+indices, and indices also used as fixed parameters through explicit checked
+index equations. Constructor contradictions justify omitted branches; possible
+branches transport their dependent contexts. See
+[NATIVE_INDEX_REFINEMENT.md](NATIVE_INDEX_REFINEMENT.md) for the supported solver,
+coverage policy, and examples. This is not complete indexed elimination:
+`induction` still uses the distinct-parameter-index lane described above.
 
 ## Constructor matches
 
@@ -161,7 +165,7 @@ well-founded measures and equation-style definitions remain outside this lane.
 
 Prop-valued indexed families with direct recursion are supported with independently
 checked small/singleton elimination; see [NATIVE_PROPOSITIONS.md](NATIVE_PROPOSITIONS.md).
-Mutual/nested families, inaccessible patterns, index-equation solving and explicit
+Mutual/nested families, inaccessible patterns, general index-equation solving and explicit
 source universe declarations remain incomplete. Quantifier syntax
 currently requires explicit unparenthesized typed names; grouped binder forms and
 inferred-domain quantifiers remain unsupported.

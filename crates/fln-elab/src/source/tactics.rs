@@ -10,6 +10,7 @@ mod constructor_transport;
 mod constructors;
 mod eliminate;
 mod equality;
+mod index_equations;
 mod rewrite;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +81,7 @@ fn error(reason: TacticError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Tactic(reason))
 }
 
+#[derive(Clone)]
 pub(super) struct ProofGoal {
     id: MVarId,
     pub(super) target: Expr,

@@ -112,8 +112,8 @@ fn fixed_repeated_or_let_indices_do_not_become_unconstrained_variables() {
         assert_eq!(base.logical_root(&KVMap::new()), root);
     }
     for source in [
-        "inductive Same : Nat -> Nat -> Type where | mk (n : Nat) : Same n n\ndef bad (n : Nat) (x : Same n n) : Nat := by cases x with | mk k => exact k",
-        "inductive Tagged (tag : Nat) : Nat -> Type where | mk : Tagged tag tag\ndef bad (n : Nat) (x : Tagged n n) : Nat := by cases x with | mk => exact 0",
+        "inductive Same : Nat -> Nat -> Type where | mk (n : Nat) : Same n n\ntheorem bad (n : Nat) (x : Same n n) : n = 0 := by cases x with | mk k => rfl",
+        "inductive Tagged (tag : Nat) : Nat -> Type where | mk : Tagged tag tag\ntheorem bad (n : Nat) (x : Tagged n n) : n = 0 := by cases x with | mk => rfl",
     ] {
         assert!(
             !matches!(

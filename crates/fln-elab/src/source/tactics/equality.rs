@@ -258,8 +258,18 @@ impl Context {
     pub(super) fn substitute_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        name: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.substitute_proof_goal_preserving_names(proof, goal, name, false)
+    }
+
+    pub(super) fn substitute_proof_goal_preserving_names(
+        &mut self,
+        proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
         name: &Name,
+        aliases: bool,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
@@ -271,7 +281,7 @@ impl Context {
             .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
         let type_ = self.whnf(&selected.type_)?;
         if heterogeneous_target(&type_).is_none() {
-            return self.substitute_homogeneous_proof_goal(proof, goal, name, None);
+            return self.substitute_homogeneous_proof_goal(proof, goal, name, None, aliases);
         }
         // At most two dependent transports: first identify local endpoint
         // types, then identify their values. Arbitrary equations between type
@@ -349,6 +359,7 @@ impl Context {
                 goal,
                 &derived_name,
                 same_type.then_some(&selected.id),
+                aliases,
             )?;
             if same_type {
                 return Ok(());
@@ -367,6 +378,7 @@ impl Context {
         goal: ProofGoal,
         name: &Name,
         hide: Option<&FVarId>,
+        aliases: bool,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
@@ -471,7 +483,14 @@ impl Context {
         self.txn.lctx = retained;
         let (hole, mut child) = self.proof_goal(target)?;
         for local in &reverted {
-            let name = if local.id == witness.id || hide == Some(&local.id) {
+            let name = if local.id == witness.id
+                || hide == Some(&local.id)
+                || (aliases
+                    && goal
+                        .lctx
+                        .find_by_user_name(&local.user_name)
+                        .is_some_and(|active| active.id != local.id))
+            {
                 Name::anonymous()
             } else {
                 local.user_name.clone()
@@ -496,6 +515,33 @@ impl Context {
             replacements.push((local.id.clone(), Expr::fvar(id)));
         }
         child.target = self.specialize_locals(&goal.target, &replacements)?;
+        if aliases {
+            let old = goal
+                .lctx
+                .find(&variable)
+                .expect("selected substitution local");
+            if !old.user_name.is_anonymous()
+                && goal
+                    .lctx
+                    .find_by_user_name(&old.user_name)
+                    .is_some_and(|local| local.id == variable)
+            {
+                // Automatic index refinement must not make a user-named
+                // constructor field disappear. Its new name denotes the
+                // transported value through a checked let, never a retyped fvar.
+                let id = FVarId(self.fresh_name()?);
+                let alias = LocalDecl {
+                    id,
+                    user_name: old.user_name.clone(),
+                    type_: self.instantiate(&old.type_)?,
+                    value: Some(replacement.clone()),
+                    binder_info: old.binder_info,
+                    index: self.txn.lctx.len(),
+                };
+                eliminate::add_local(&mut self.txn.lctx, &alias);
+                child.introduced.push(alias);
+            }
+        }
         child.lctx = self.txn.lctx.clone();
         self.txn.lctx = goal.lctx.clone();
         let value = Expr::fvar(variable);

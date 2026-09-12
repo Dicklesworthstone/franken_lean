@@ -710,7 +710,7 @@ impl Context {
     pub(super) fn inject_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,
-        mut goal: ProofGoal,
+        goal: ProofGoal,
         args: &[Syntax],
     ) -> Result<(), NatDefinitionElabError> {
         let [keyword, Syntax::Ident { val: name, .. }, names] = args else {
@@ -736,6 +736,17 @@ impl Context {
             };
             names.push(name);
         }
+        self.inject_named_proof_goal(proof, goal, name, &names)
+    }
+
+    pub(super) fn inject_named_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        name: &Name,
+        names: &[Name],
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
         let local = goal
@@ -783,7 +794,7 @@ impl Context {
             // A dependent field cannot in general be projected into one fixed
             // result type. Retain every field in constructor order by passing
             // typed heterogeneous equalities to a checked continuation instead.
-            return self.inject_dependent_proof_goal(proof, goal, &equality, &names);
+            return self.inject_dependent_proof_goal(proof, goal, &equality, names);
         }
         if equalities.is_empty() || names.len() > equalities.len() {
             return Err(error(TacticError::ConstructorEquality));
@@ -804,6 +815,47 @@ impl Context {
 }
 
 impl Context {
+    /// Only the generated index equation is considered here, not arbitrary
+    /// assumptions in the user's context. Missing branches require explicit
+    /// constructor/literal inconsistency in their retained equation premises.
+    pub(super) fn refute_index_evidence(
+        &mut self,
+        evidence: &Typed,
+        target: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let type_ = self.whnf(&evidence.type_)?;
+        let Some((level, alpha, left, right)) = equality_target(&type_) else {
+            return Ok(None);
+        };
+        let alpha = self.whnf(&alpha)?;
+        let left = self.whnf(&left)?;
+        let right = self.whnf(&right)?;
+        // Preserve the actual proof as the recursor argument, but construct its
+        // motive at reduced endpoints. In particular, literal comparison at the
+        // reflexive base must stay closed even if the input was a local let.
+        // Both kernels still check conversion from the proof's original type.
+        let evidence = Typed {
+            value: evidence.value.clone(),
+            type_: equality::equation(level, alpha.clone(), left.clone(), right.clone()),
+        };
+        if let Some(term) = self.unequal_nat_literals(&evidence, &alpha, &left, &right, target)? {
+            return Ok(Some(term));
+        }
+        let Some(family) = self.reasoning_family(&alpha, true)? else {
+            return Ok(None);
+        };
+        let Some(left) = self.equality_constructor(&left, &family)? else {
+            return Ok(None);
+        };
+        let Some(right) = self.equality_constructor(&right, &family)? else {
+            return Ok(None);
+        };
+        if left.name == right.name {
+            return Ok(None);
+        }
+        self.constructor_clash(&evidence, &family, &right.name, target)
+    }
+
     fn empty_evidence(
         &mut self,
         evidence: &Typed,

@@ -232,6 +232,18 @@ impl Context {
         args: &'a [Syntax],
         induction: bool,
     ) -> Result<(), NatDefinitionElabError> {
+        self.eliminate_proof_goal_with_indices(proof, goal, args, induction, None, None)
+    }
+
+    pub(super) fn eliminate_proof_goal_with_indices<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        args: &'a [Syntax],
+        induction: bool,
+        selected: Option<&FVarId>,
+        equations: Option<&[Name]>,
+    ) -> Result<(), NatDefinitionElabError> {
         let [keyword, target, generalizing, with, alternatives] = args else {
             return Err(error(TacticError::MalformedScript));
         };
@@ -248,10 +260,9 @@ impl Context {
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
-        let major = self
-            .txn
-            .lctx
-            .find_by_user_name(target_name)
+        let major = selected
+            .and_then(|id| self.txn.lctx.find(id))
+            .or_else(|| self.txn.lctx.find_by_user_name(target_name))
             .cloned()
             .ok_or_else(|| error(TacticError::EliminationLocal))?;
         let family_type = self.whnf(&major.type_)?;
@@ -292,8 +303,41 @@ impl Context {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
         let index_values = parameters.split_off(family.num_params as usize);
-        let indices = self.elimination_index_locals(&index_values)?;
+        let indices = match self.elimination_index_locals(&index_values) {
+            Ok(indices) => indices,
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                matching::MatchError::UnrefinedIndices,
+            ))) if !induction && equations.is_none() => {
+                return self.eliminate_constrained_indices(
+                    proof,
+                    goal,
+                    args,
+                    &major,
+                    &family,
+                    levels,
+                    &parameters,
+                    &index_values,
+                );
+            }
+            Err(error) => return Err(error),
+        };
         let index_ids: HashSet<_> = indices.iter().map(|local| local.id.clone()).collect();
+        if !induction && equations.is_none() {
+            for parameter in &parameters {
+                if !self.elimination_reads(parameter)?.is_disjoint(&index_ids) {
+                    return self.eliminate_constrained_indices(
+                        proof,
+                        goal,
+                        args,
+                        &major,
+                        &family,
+                        levels,
+                        &parameters,
+                        &index_values,
+                    );
+                }
+            }
+        }
         let mut removed = HashSet::from([major.id.clone()]);
         removed.extend(index_ids.iter().cloned());
         let explicit = expect_null_args(generalizing, "generalized locals")?;
@@ -524,7 +568,7 @@ impl Context {
                 return Err(error(TacticError::EliminationCoverage));
             }
         }
-        if scoped && scripts.len() != family.ctors.len() {
+        if scoped && equations.is_none() && scripts.len() != family.ctors.len() {
             return Err(error(TacticError::EliminationCoverage));
         }
         let mut branches = Vec::new();
@@ -576,7 +620,26 @@ impl Context {
             let instructions = script
                 .map(|script| self.proof_instructions(script.script))
                 .transpose()?;
-            branches.push((branch, instructions));
+            let work_start = proof.work.len();
+            let branch = if let Some(equations) = equations {
+                self.refine_index_branch(proof, branch, equations)?
+            } else {
+                Some(branch)
+            };
+            if let Some(branch) = branch {
+                if scoped && instructions.is_none() {
+                    return Err(error(TacticError::EliminationCoverage));
+                }
+                proof.work.push(match instructions {
+                    Some(instructions) => Work::Script(branch, instructions),
+                    None => Work::Goal(branch),
+                });
+            } else if instructions.is_some() {
+                // Do not silently erase an unreachable source body, including
+                // its otherwise unobserved annotations or invalid references.
+                return Err(error(TacticError::EliminationCoverage));
+            }
+            branches.push(proof.work.split_off(work_start));
             self.txn.lctx = retained.clone();
             recursor = self.match_apply(
                 recursor,
@@ -617,11 +680,8 @@ impl Context {
             }
         }
         proof.work.push(Work::Close(goal, recursor.value));
-        for (branch, instructions) in branches.into_iter().rev() {
-            proof.work.push(match instructions {
-                Some(instructions) => Work::Script(branch, instructions),
-                None => Work::Goal(branch),
-            });
+        for branch in branches.into_iter().rev() {
+            proof.work.extend(branch);
         }
         Ok(())
     }

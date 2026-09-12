@@ -1231,3 +1231,43 @@ fn installed_heterogeneous_equality_checks_bridges_substitution_and_failure_isol
         }
     }
 }
+
+#[test]
+fn installed_fixed_index_cases_preserve_checked_computation_and_batch_isolation() {
+    let prefix = file(include_str!(
+        "../../../examples/native_index_refinement.lean"
+    ));
+    let bad =
+        file("theorem invalid (xs : Vec Nat 1) : 0 = 1 := by cases xs with | cons k x tail => rfl");
+    let before = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&bad);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let result = String::from_utf8(output.stdout).unwrap();
+            for field in [
+                "\"commands\":15",
+                "\"theorems\":5",
+                "\"executed\":false",
+                "\"authority\":true",
+            ] {
+                assert!(result.contains(field), "{result}");
+            }
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}
