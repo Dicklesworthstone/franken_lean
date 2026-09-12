@@ -1425,3 +1425,39 @@ fn installed_constrained_recursion_checks_computations_proofs_and_failure_recove
         assert_eq!(std::fs::read(&prefix).unwrap(), original);
     }
 }
+
+#[test]
+fn installed_local_proofs_are_checked_and_never_publish_a_false_suffix() {
+    let prefix = file(include_str!("../../../examples/native_local_proofs.lean"));
+    let false_suffix = file("theorem bad : 0 = 0 := by\n  have unused : String := 1\n  rfl");
+    let original = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&false_suffix);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "\"commands\":12",
+                "\"theorems\":8",
+                "\"executed\":false",
+                "\"authority\":true",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), original);
+    }
+}

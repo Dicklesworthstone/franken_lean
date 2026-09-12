@@ -16,8 +16,19 @@ struct Elimination {
     alternatives: Vec<Alternative>,
     end: usize,
 }
+struct Binding {
+    start: usize,
+    name: Option<usize>,
+    annotation: Option<(usize, Range<usize>)>,
+    assign: usize,
+    value: Range<usize>,
+    by: Option<usize>,
+    end: usize,
+    opaque: bool,
+}
 enum Plan {
     Plain(Range<usize>),
+    Bind(Binding),
     Eliminate(Elimination),
 }
 enum Task {
@@ -26,6 +37,8 @@ enum Task {
     Eliminate(Elimination),
     FinishSequence(Vec<Option<usize>>),
     FinishElimination(Elimination),
+    Bind(Binding),
+    FinishBinding(Binding),
 }
 fn word(tokens: &[LexedToken], at: usize, text: &str) -> bool {
     matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components([text]))
@@ -168,6 +181,143 @@ fn plan_elimination(
     result.end = end;
     Ok(result)
 }
+fn plan_binding(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    limit: usize,
+    baseline: usize,
+) -> Result<Binding, NatDefinitionParseError> {
+    let opaque = word(tokens, start, "have");
+    let preliminary_end = plain_end(view, tokens, start, limit, baseline);
+    let mut cursor = start + 1;
+    let name = if cursor < preliminary_end && matches!(&tokens[cursor].kind, TokenKind::Ident(_)) {
+        let at = cursor;
+        cursor += 1;
+        Some(at)
+    } else {
+        None
+    };
+    if !opaque && name.is_none() {
+        return Err(refusal(view, tokens, cursor));
+    }
+    let colon = if symbol(tokens, cursor, ":") {
+        let at = cursor;
+        cursor += 1;
+        Some(at)
+    } else {
+        None
+    };
+    let type_start = cursor;
+    let mut depth = 0;
+    while cursor < preliminary_end {
+        if depth == 0 && symbol(tokens, cursor, ":=") {
+            break;
+        }
+        if colon.is_none() {
+            return Err(refusal(view, tokens, cursor));
+        }
+        delimiter_depth(&tokens[cursor], &mut depth);
+        cursor += 1;
+    }
+    if cursor + 1 >= preliminary_end
+        || depth != 0
+        || !symbol(tokens, cursor, ":=")
+        || colon.is_some() && type_start == cursor
+    {
+        return Err(refusal(view, tokens, cursor));
+    }
+    let assign = cursor;
+    let by = symbol(tokens, assign + 1, "by").then_some(assign + 1);
+    let end = if by.is_some() {
+        // Semicolons inside the nested proof belong to that proof. A new line
+        // at the enclosing sequence's indentation closes it, not a guessed
+        // tactic count. Bracket delimiters are still respected.
+        let mut depth = 0;
+        let mut end = limit;
+        for at in assign + 2..limit {
+            if depth == 0 && newline(view, tokens, at) && column(view, tokens, at) <= baseline {
+                end = at;
+                break;
+            }
+            delimiter_depth(&tokens[at], &mut depth);
+        }
+        end
+    } else {
+        preliminary_end
+    };
+    let value = assign + 1 + usize::from(by.is_some())..end;
+    if value.is_empty() {
+        return Err(refusal(view, tokens, value.start));
+    }
+    Ok(Binding {
+        start,
+        name,
+        annotation: colon.map(|at| (at, type_start..assign)),
+        assign,
+        value,
+        by,
+        end,
+        opaque,
+    })
+}
+
+fn binding_term(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if let Some(at) = range.clone().find(|&at| symbol(tokens, at, "by")) {
+        return Err(refusal(view, tokens, at));
+    }
+    bounded_term(leaves, view, tokens, range, DefinitionGrammar::Scalar)
+}
+
+fn finish_binding(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    plan: Binding,
+    value: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let keyword = if plan.opaque { "have" } else { "let" };
+    let name = null_node(
+        plan.name
+            .map(|at| leaves.leaf(at))
+            .transpose()?
+            .into_iter()
+            .collect(),
+    );
+    let annotation = match plan.annotation {
+        Some((colon, range)) => null_node(vec![Syntax::node(
+            parser_kind(&["Term", "typeSpec"]),
+            vec![
+                leaves.leaf(colon)?,
+                binding_term(leaves, view, tokens, range)?,
+            ],
+        )]),
+        None => null_node(Vec::new()),
+    };
+    let value = match plan.by {
+        Some(at) => Syntax::node(
+            parser_kind(&["Term", "byTactic"]),
+            vec![leaves.leaf(at)?, value],
+        ),
+        None => value,
+    };
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", keyword]),
+        vec![
+            atom(leaves, plan.start, keyword)?,
+            name,
+            annotation,
+            leaves.leaf(plan.assign)?,
+            value,
+        ],
+    ))
+}
+
 fn split(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -181,7 +331,11 @@ fn split(
     let mut plans = Vec::new();
     let mut separators = Vec::new();
     while cursor < range.end {
-        let (plan, end) = if word(tokens, cursor, "cases") || word(tokens, cursor, "induction") {
+        let (plan, end) = if word(tokens, cursor, "have") || symbol(tokens, cursor, "let") {
+            let plan = plan_binding(view, tokens, cursor, range.end, baseline)?;
+            let end = plan.end;
+            (Plan::Bind(plan), end)
+        } else if word(tokens, cursor, "cases") || word(tokens, cursor, "induction") {
             let plan = plan_elimination(view, tokens, cursor, range.end, baseline)?;
             let end = plan.end;
             (Plan::Eliminate(plan), end)
@@ -227,10 +381,25 @@ pub(super) fn sequence(
                 tasks.push(Task::FinishSequence(separators));
                 tasks.extend(plans.into_iter().rev().map(|plan| match plan {
                     Plan::Plain(range) => Task::Plain(range),
+                    Plan::Bind(plan) => Task::Bind(plan),
                     Plan::Eliminate(plan) => Task::Eliminate(plan),
                 }));
             }
             Task::Plain(range) => values.push(tactic(leaves, view, tokens, range)?),
+            Task::Bind(plan) => {
+                if plan.by.is_some() {
+                    let range = plan.value.clone();
+                    tasks.push(Task::FinishBinding(plan));
+                    tasks.push(Task::Sequence(range));
+                } else {
+                    let value = binding_term(leaves, view, tokens, plan.value.clone())?;
+                    values.push(finish_binding(leaves, view, tokens, plan, value)?);
+                }
+            }
+            Task::FinishBinding(plan) => {
+                let value = values.pop().expect("nested local proof sequence");
+                values.push(finish_binding(leaves, view, tokens, plan, value)?);
+            }
             Task::Eliminate(plan) => {
                 let bodies: Vec<_> = plan
                     .alternatives

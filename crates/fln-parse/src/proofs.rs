@@ -1,9 +1,9 @@
 //! Bounded native proof scripts, preserving real token leaves and separators.
 //!
-//! The lane accepts flat intro/exact/assumption/apply sequences. Parentheses
-//! and lambdas in tactic arguments use the ordinary term driver. Nested `by`
-//! blocks are explicitly outside this lane, so this call into the term driver
-//! cannot become a recursive host-stack traversal over source-controlled depth.
+//! Tactic arguments use the ordinary term driver. Local declarations own their
+//! nested `by` blocks through the heap sequence planner; they never recursively
+//! call this parser on source-controlled nesting depth. Other nested proof-term
+//! positions remain outside the bounded grammar.
 
 use super::*;
 use std::ops::Range;
@@ -24,18 +24,30 @@ pub(super) fn parse(
     limit: usize,
 ) -> Result<(Syntax, usize), NatDefinitionParseError> {
     let mut depth = 0_usize;
+    let mut forall_commas = 0_usize;
     let mut end = by + 1;
     while end < limit {
         match &tokens[end].kind {
-            TokenKind::Symbol(symbol) if symbol == "by" => return Err(refusal(view, tokens, end)),
-            TokenKind::Symbol(symbol) if symbol == "(" || symbol == "[" => depth += 1,
-            TokenKind::Symbol(symbol) if symbol == ")" || symbol == "]" => {
+            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), "(" | "[" | "{" | "⦃") => {
+                depth += 1
+            }
+            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}" | "⦄") => {
                 if depth == 0 {
                     break;
                 }
                 depth -= 1;
             }
-            TokenKind::Symbol(symbol) if symbol == "," && depth == 0 => break,
+            TokenKind::Symbol(symbol)
+                if matches!(symbol.as_str(), "forall" | "∀") && depth == 0 =>
+            {
+                forall_commas += 1
+            }
+            TokenKind::Symbol(symbol) if symbol == "," && depth == 0 => {
+                if forall_commas == 0 {
+                    break;
+                }
+                forall_commas -= 1;
+            }
             _ => {}
         }
         end += 1;
@@ -79,6 +91,14 @@ fn tactic(
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
+    // Nested proof blocks are owned by the heap-planned local-declaration
+    // production. Other tactic arguments must not recursively reenter parse.
+    if let Some(at) = range
+        .clone()
+        .find(|&at| matches!(&tokens[at].kind, TokenKind::Symbol(s) if s == "by"))
+    {
+        return Err(refusal(view, tokens, at));
+    }
     let keyword = match &tokens[start].kind {
         TokenKind::Ident(name) => [
             "intro",
@@ -452,5 +472,75 @@ mod constructor_equality_tests {
                 "{tail}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod local_declaration_tests {
+    use super::*;
+
+    #[test]
+    fn local_declarations_preserve_comments_newlines_and_quantified_types() {
+        for source in [
+            "def have (n : Nat) : Nat := n",
+            "theorem t (n : Nat) : n = n := by\r\n  have /- local -/ h : forall x : Nat, x = x := by\r\n    intro x\r\n    rfl -- proof\r\n  exact h n\r\n",
+            "theorem t (n : Nat) : n = n := by have : n = n := rfl; exact this",
+            "theorem t (n : Nat) : n = n := by have := (rfl : n = n); exact this",
+            "def t : Nat := by let n : Nat := 7; exact n",
+            "def t : Package := by let p : Package := { value := 7, carrier := Nat }; exact p",
+            "theorem t : 0 = 0 := by\n  have h : 0 = 0 := by\n    cases flag with\n    | false => rfl\n    | true => rfl\n  exact h",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_local_declarations_never_drop_tokens() {
+        for tail in [
+            "have",
+            "have h",
+            "have h :",
+            "have h :=",
+            "have h : := rfl",
+            "have h : Nat := by",
+            "have 7 := 7",
+            "let := 7",
+            "let : Nat := 7",
+            "let n = 7",
+            "have h (x : Nat) := x",
+            "have h := (by rfl)",
+            "have h : 0 = 0 := by\n  exact h",
+        ] {
+            let source = format!("theorem t : 0 = 0 := by\n  {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn nested_local_proofs_use_heap_frames() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let depth = 300;
+                let mut source = String::from("theorem t : 0 = 0 := by\n");
+                for i in 0..depth {
+                    source.push_str(&format!("{}have h{i} : 0 = 0 := by\n", "  ".repeat(i + 1)));
+                }
+                source.push_str(&format!("{}rfl\n", "  ".repeat(depth + 1)));
+                for i in (0..depth).rev() {
+                    source.push_str(&format!("{}exact h{i}\n", "  ".repeat(i + 1)));
+                }
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

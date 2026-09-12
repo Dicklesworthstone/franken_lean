@@ -532,6 +532,20 @@ impl Context {
                 bool,
             ),
             Proof(tactics::ProofState<'a>),
+            ProofBindingType(
+                tactics::ProofState<'a>,
+                tactics::ProofGoal,
+                Name,
+                &'a Syntax,
+                bool,
+            ),
+            ProofBindingValue(
+                tactics::ProofState<'a>,
+                tactics::ProofGoal,
+                Name,
+                Option<Expr>,
+                bool,
+            ),
             ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, bool),
         }
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
@@ -838,6 +852,22 @@ impl Context {
                     tasks.push(Task::RecordNext(state));
                 }
                 Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                    tactics::ProofAction::Binding {
+                        goal,
+                        name,
+                        annotation,
+                        value,
+                        opaque,
+                    } => {
+                        self.txn.lctx = goal.lctx.clone();
+                        if let Some(annotation) = annotation {
+                            tasks.push(Task::ProofBindingType(proof, goal, name, value, opaque));
+                            tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
+                        } else {
+                            tasks.push(Task::ProofBindingValue(proof, goal, name, None, opaque));
+                            tasks.push(Task::Visit(value, None, true));
+                        }
+                    }
                     tactics::ProofAction::Rewrite {
                         goal,
                         rule,
@@ -870,6 +900,26 @@ impl Context {
                     }
                     tactics::ProofAction::Complete(term) => values.push(term),
                 },
+                Task::ProofBindingType(proof, goal, name, value, opaque) => {
+                    let annotation = values.pop().expect("local proof annotation visit");
+                    self.sort_level(&annotation)?;
+                    tasks.push(Task::ProofBindingValue(
+                        proof,
+                        goal,
+                        name,
+                        Some(annotation.value.clone()),
+                        opaque,
+                    ));
+                    tasks.push(Task::Visit(value, Some(annotation.value), true));
+                }
+                Task::ProofBindingValue(mut proof, goal, name, annotation, opaque) => {
+                    let mut value = values.pop().expect("local proof value visit");
+                    if let Some(annotation) = annotation {
+                        value.type_ = annotation;
+                    }
+                    self.bind_proof_value(&mut proof, goal, name, value, opaque)?;
+                    tasks.push(Task::Proof(proof));
+                }
                 Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
                     let term = values.pop().expect("rewrite rule visit");
                     self.rewrite_proof_term(&mut proof, goal, term, reverse, remaining, close)?;

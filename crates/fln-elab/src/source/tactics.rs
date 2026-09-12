@@ -110,6 +110,13 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Binding {
+        goal: ProofGoal,
+        name: Name,
+        annotation: Option<&'a Syntax>,
+        value: &'a Syntax,
+        opaque: bool,
+    },
     Rewrite {
         goal: ProofGoal,
         rule: RewriteRule<'a>,
@@ -347,7 +354,35 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "contradiction"]) {
+            if kind == &parser_kind(&["Tactic", "have"]) || kind == &parser_kind(&["Tactic", "let"])
+            {
+                let opaque = kind == &parser_kind(&["Tactic", "have"]);
+                let [keyword, name, annotation, assign, value] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(
+                    keyword,
+                    if opaque { "have" } else { "let" },
+                    "local tactic declaration",
+                )?;
+                expect_atom(assign, ":=", "local tactic assignment")?;
+                let name = match expect_null_args(name, "local tactic name")? {
+                    [] if opaque => Name::from_components(["this"]),
+                    [Syntax::Ident { val, .. }]
+                        if !val.is_anonymous() && val.parent().is_anonymous() =>
+                    {
+                        val.clone()
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                };
+                return Ok(ProofAction::Binding {
+                    goal,
+                    name,
+                    annotation: optional_type_syntax(annotation)?,
+                    value,
+                    opaque,
+                });
+            } else if kind == &parser_kind(&["Tactic", "contradiction"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
@@ -481,6 +516,47 @@ impl Context {
                 });
             }
         }
+    }
+
+    /// Introduce only a completed local value. The declaration is not in scope
+    /// during its own proof. Have hypotheses stay opaque during elaboration;
+    /// let declarations are unfoldable. Both retain checked let bindings in the
+    /// final term, including unused values and their written type annotations.
+    pub(super) fn bind_proof_value(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        name: Name,
+        value: Typed,
+        opaque: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let value = Typed {
+            value: self.instantiate(&value.value)?,
+            type_: self.instantiate(&value.type_)?,
+        };
+        let id = FVarId(self.fresh_name()?);
+        let local = LocalDecl {
+            id: id.clone(),
+            user_name: name.clone(),
+            type_: value.type_.clone(),
+            value: Some(value.value.clone()),
+            binder_info: BinderInfo::Default,
+            index: self.txn.lctx.len(),
+        };
+        if opaque {
+            self.txn
+                .lctx
+                .add_param(id, name, value.type_, BinderInfo::Default);
+        } else {
+            self.txn.lctx.add_let(id, name, value.type_, value.value);
+        }
+        goal.introduced.push(local);
+        goal.lctx = self.txn.lctx.clone();
+        proof.work.push(Work::Goal(goal));
+        Ok(())
     }
 
     pub(super) fn apply_proof_term(
