@@ -7,6 +7,9 @@
 //! inference with checker-owned right-associated `imax`. Later rule families
 //! are named by [`InferenceDeferred`] instead of being misreported as rejection.
 
+mod proof_conversion;
+pub(crate) use proof_conversion::{ProofConversionOutcome, proof_conversion_with};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -2254,6 +2257,7 @@ fn dispatch_reference(
 }
 
 struct InferenceEngine<'a> {
+    allow_proof_conversion: bool,
     // The initial context stays borrowed. Only a scoped let needs a private
     // reduction overlay; push/pop are amortized O(1), not a context clone per binder.
     reduction: Cow<'a, WhnfContext>,
@@ -2795,6 +2799,9 @@ impl<'a> InferenceEngine<'a> {
                 }))
             }
             DefEqOutcome::Deferred { need, .. } => {
+                if self.proof_conversion(actual, declared)? {
+                    return Ok(());
+                }
                 Err(LeafHalt::Deferred(InferenceDeferred::LetValueConversion {
                     binder,
                     need,
@@ -3837,6 +3844,65 @@ impl<'a> InferenceEngine<'a> {
         ))
     }
 
+    #[inline(never)]
+    fn proof_conversion(
+        &mut self,
+        actual: &WireExpr,
+        expected: &WireExpr,
+    ) -> Result<bool, LeafHalt> {
+        if !self.allow_proof_conversion {
+            return Ok(false);
+        }
+        let mut locals = self.context.locals().to_vec();
+        for (name, type_) in &self.scoped_locals {
+            self.control
+                .step(self.cancelled, InferencePhase::DomainComparison, 0)
+                .map_err(LeafHalt::stop)?;
+            let local = if let Some(binding) = self
+                .reduction
+                .free_bindings()
+                .iter()
+                .find(|b| b.name() == name)
+            {
+                LocalDeclaration::definition(
+                    name.clone(),
+                    type_.as_ref().clone(),
+                    binding.value().clone(),
+                )
+            } else {
+                LocalDeclaration::assumption(name.clone(), type_.as_ref().clone())
+            };
+            locals.push(local);
+        }
+        let context = InferenceContext::new_with_projection_rules(
+            locals,
+            self.context.level_parameters().to_vec(),
+            self.reduction.projection_rules().to_vec(),
+            self.context.constants().clone(),
+        )
+        .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        let mut budget = self.control.budget;
+        budget.max_steps = budget.max_steps.saturating_sub(self.control.progress.steps);
+        match proof_conversion_with(
+            actual,
+            expected,
+            &context,
+            self.mode,
+            budget,
+            &mut *self.cancelled,
+        ) {
+            ProofConversionOutcome::Complete { equal, polls } => {
+                self.control.progress.steps = self.control.progress.steps.saturating_add(polls);
+                Ok(equal)
+            }
+            ProofConversionOutcome::Halted(outcome) => match *outcome {
+                InferenceOutcome::Inconclusive(stop) => Err(LeafHalt::stop(stop)),
+                InferenceOutcome::InternalFault { fault, .. } => Err(LeafHalt::Fault(fault)),
+                _ => Ok(false),
+            },
+        }
+    }
+
     fn compare_domain(
         &mut self,
         argument: usize,
@@ -3870,6 +3936,11 @@ impl<'a> InferenceEngine<'a> {
                 InferenceRefusal::ApplicationTypeMismatch { argument, mismatch },
             )),
             DefEqOutcome::Deferred { need, .. } => {
+                if conversion == ConversionMode::Ordinary
+                    && self.proof_conversion(actual, expected)?
+                {
+                    return Ok(());
+                }
                 if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
                     eprintln!(
                         "INFER_DOMAIN_DEFER arg={argument} actual={:?} expected={:?}",
@@ -4090,14 +4161,36 @@ pub fn infer_with(
     budget: InferenceBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> InferenceOutcome {
+    infer_policy(term, context, mode, budget, true, &mut cancelled)
+}
+
+pub(super) fn infer_without_proof_conversion(
+    term: &WireExpr,
+    context: &InferenceContext,
+    mode: InferenceMode,
+    budget: InferenceBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InferenceOutcome {
+    infer_policy(term, context, mode, budget, false, cancelled)
+}
+
+fn infer_policy(
+    term: &WireExpr,
+    context: &InferenceContext,
+    mode: InferenceMode,
+    budget: InferenceBudget,
+    allow_proof_conversion: bool,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InferenceOutcome {
     let mut control = Control::new(budget);
     let result = InferenceEngine {
+        allow_proof_conversion,
         reduction: Cow::Borrowed(context.reduction()),
         input: term,
         context,
         mode,
         control: &mut control,
-        cancelled: &mut cancelled,
+        cancelled,
         generated: Vec::new(),
         scoped_locals: BTreeMap::new(),
         reserved_names: None,

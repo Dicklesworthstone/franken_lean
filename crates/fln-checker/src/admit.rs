@@ -980,6 +980,36 @@ fn body_matches_declared_type(
             },
         )),
         DefEqOutcome::Deferred { need, .. } => {
+            let mut probe_budget = budget.inference;
+            probe_budget.defeq = budget.conversion;
+            match crate::infer::proof_conversion_with(
+                &body_type,
+                declaration.type_(),
+                &context,
+                InferenceMode::Checking {
+                    declaration_safety: declaration.safety(),
+                },
+                probe_budget,
+                &mut *cancelled,
+            ) {
+                crate::infer::ProofConversionOutcome::Complete { equal: true, .. } => return Ok(()),
+                crate::infer::ProofConversionOutcome::Halted(outcome) => match *outcome {
+                    InferenceOutcome::Inconclusive(stop) => {
+                        return Err(Verdict::Inconclusive(AdmissionStop::BodyTypeInference {
+                            name: name.clone(),
+                            stop: Box::new(stop),
+                        }));
+                    }
+                    InferenceOutcome::InternalFault { fault, .. } => {
+                        return Err(Verdict::InternalFault(AdmissionFault::BodyTypeInference {
+                            name: name.clone(),
+                            fault: Box::new(fault),
+                        }));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
             Err(Verdict::Deferred(AdmissionDeferred::BodyConversion {
                 name: name.clone(),
                 need: Box::new(need),
