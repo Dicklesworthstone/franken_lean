@@ -7,6 +7,9 @@
 //! `matches!(v, Verdict::Rejected(_))` passes when the wrong law refused, which
 //! is how a rule stops being tested without any test going red.
 
+#[path = "admit/higher_order.rs"]
+mod higher_order;
+
 #[path = "admit/propositions.rs"]
 mod propositions;
 

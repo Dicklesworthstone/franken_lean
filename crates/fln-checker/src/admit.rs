@@ -7814,7 +7814,9 @@ pub fn admit_inductive_with(
         .checked_add(metadata.num_indices())
         .is_some_and(|count| {
             uniform::proposition_result(declaration, count)
-                || ((metadata.num_parameters() > 0 || metadata.num_indices() > 0)
+                || ((metadata.num_parameters() > 0
+                    || metadata.num_indices() > 0
+                    || metadata.is_reflexive())
                     && uniform::positive_result(declaration, count))
         })
     {

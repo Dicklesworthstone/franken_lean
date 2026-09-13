@@ -788,6 +788,12 @@ impl Context {
             };
             let domain = self.whnf(binder_type)?;
             let mut head = &domain;
+            // The admitted signature owns positivity. Count one hypothesis
+            // for a function-valued child, not one per function argument.
+            while let ExprNode::ForallE { body, .. } = head.node() {
+                self.tick()?;
+                head = body;
+            }
             while let ExprNode::App { f, .. } = head.node() {
                 self.tick()?;
                 head = f;

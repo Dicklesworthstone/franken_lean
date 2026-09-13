@@ -1690,3 +1690,41 @@ fn installed_literal_patterns_compute_and_preserve_failed_suffix_isolation() {
         assert_eq!(std::fs::read(&prefix).unwrap(), original);
     }
 }
+
+#[test]
+fn installed_function_children_check_real_recursors_and_preserve_failed_suffixes() {
+    let prefix = file(include_str!(
+        "../../../examples/native_function_children.lean"
+    ));
+    let invalid = file("theorem impossible : first (Branching.leaf 4) = 5 := by rfl");
+    let before = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(result.stdout).unwrap();
+            for field in [
+                "\"commands\":9",
+                "\"theorems\":3",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(field), "{json}");
+            }
+        } else {
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}

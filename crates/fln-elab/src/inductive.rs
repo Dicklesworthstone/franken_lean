@@ -1,7 +1,7 @@
 //! Candidate construction for a single algebraic or indexed data family.
 //!
 //! Both checking engines must validate the block. This generator handles
-//! dependent constructor fields and direct uniform recursive fields; it never
+//! dependent constructor fields and strictly positive uniform recursive fields; it never
 //! infers positivity from a flag or publishes a candidate into an environment.
 use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, app, fresh, fv};
@@ -52,7 +52,7 @@ impl std::fmt::Display for InductiveError {
                 "inductive result sort or field elimination universes are unresolved"
             }
             Self::UnsupportedRecursion => {
-                "only direct uniform recursive constructor fields are supported"
+                "recursive fields must be strictly positive functions returning the uniform family"
             }
             Self::ResourceLimit => "algebraic data type generation work limit reached",
         })
@@ -76,6 +76,52 @@ fn append_ih(name: &Name) -> Name {
         LeafView::Str(text) => Name::str(name.parent().clone(), format!("{text}_ih")),
         _ => Name::str(name.clone(), "_ih"),
     }
+}
+
+/// A recursive field can be a dependent function returning this family. Its
+/// domains cannot mention the family; result indices may use its arguments.
+struct RecursiveField {
+    arguments: Vec<LocalDecl>,
+    indices: Vec<Expr>,
+}
+
+fn recursive_field(
+    builder: &mut Builder,
+    domain: &Expr,
+    spec: &InductiveSpec,
+    levels: &[Level],
+    allowed: &HashSet<FVarId>,
+    used: &mut HashSet<FVarId>,
+) -> Result<Option<RecursiveField>, InductiveError> {
+    let mut current = domain.clone();
+    let mut scope = allowed.clone();
+    let mut arguments = Vec::new();
+    loop {
+        builder.tick()?;
+        match current.node() {
+            ExprNode::MData { expr, .. } => current = expr.clone(),
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                // Strict positivity is not inferred from metadata: an occurrence
+                // in even one argument domain prevents this construction.
+                builder.scan(binder_type, &scope, &spec.name)?;
+                let mut local = fresh(used, "arg", binder_type.clone(), *binder_info);
+                local.user_name = binder_name.clone();
+                current = body
+                    .subst_loose(0, &[fv(&local)])
+                    .map_err(|_| InductiveError::InvalidTelescope)?;
+                scope.insert(local.id.clone());
+                arguments.push(local);
+            }
+            _ => break,
+        }
+    }
+    Ok(recursive_indices(builder, &current, spec, levels, &scope)?
+        .map(|indices| RecursiveField { arguments, indices }))
 }
 
 /// A direct recursive occurrence may change indices, but not parameters or
@@ -223,6 +269,13 @@ fn build_inductive(
         .cloned()
         .map(Level::param)
         .collect();
+    // Reserve every caller-supplied identity before introducing function
+    // arguments, including fields of constructors visited later.
+    for constructor in &spec.constructors {
+        for field in &constructor.fields {
+            used.insert(field.id.clone());
+        }
+    }
     let family_prefix = app(
         Expr::const_(spec.name.clone(), levels.clone()),
         spec.parameters.iter().map(fv),
@@ -248,11 +301,18 @@ fn build_inductive(
                 return Err(InductiveError::InvalidTelescope);
             }
             allowed.remove(&field.id);
-            let direct = recursive_indices(&mut builder, &field.type_, spec, &levels, &allowed)?;
+            let direct = recursive_field(
+                &mut builder,
+                &field.type_,
+                spec,
+                &levels,
+                &allowed,
+                &mut used,
+            )?;
             if direct.is_none() {
                 // This scan forbids every occurrence of the family. In
-                // particular negative, nested, changed-parameter and higher-
-                // order recursion never slips through as a nonrecursive field.
+                // particular negative, nested and changed-parameter recursion
+                // never slips through as a nonrecursive field.
                 builder.scan(&field.type_, &allowed, &spec.name)?;
             }
             allowed.insert(field.id.clone());
@@ -302,13 +362,11 @@ fn build_inductive(
         );
         let mut ihs = Vec::new();
         for (field, direct) in ctor.fields.iter().zip(&recursive[index]) {
-            if let Some(indices) = direct {
-                let mut ih = fresh(
-                    &mut used,
-                    "ih",
-                    Expr::app(app(fv(&motive), indices.iter().cloned()), fv(field)),
-                    BinderInfo::Default,
-                );
+            if let Some(recursive) = direct {
+                let child = app(fv(field), recursive.arguments.iter().map(fv));
+                let result = Expr::app(app(fv(&motive), recursive.indices.iter().cloned()), child);
+                let type_ = builder.close(&recursive.arguments, result, false, false)?;
+                let mut ih = fresh(&mut used, "ih", type_, BinderInfo::Default);
                 ih.user_name = append_ih(&field.user_name);
                 ihs.push(ih);
             }
@@ -360,9 +418,12 @@ fn build_inductive(
         builder.tick()?;
         let mut rhs = app(fv(&minors[index]), ctor.fields.iter().map(fv));
         for (field, direct) in ctor.fields.iter().zip(&recursive[index]) {
-            if let Some(indices) = direct {
-                let call = app(rec_prefix.clone(), indices.iter().cloned());
-                rhs = Expr::app(rhs, Expr::app(call, fv(field)));
+            if let Some(recursive) = direct {
+                let call = app(rec_prefix.clone(), recursive.indices.iter().cloned());
+                let child = app(fv(field), recursive.arguments.iter().map(fv));
+                let call =
+                    builder.close(&recursive.arguments, Expr::app(call, child), true, false)?;
+                rhs = Expr::app(rhs, call);
             }
         }
         rhs = builder.close(&ctor.fields, rhs, true, false)?;
@@ -416,7 +477,11 @@ fn build_inductive(
             num_nested: 0,
             is_rec: recursive.iter().flatten().any(Option::is_some),
             is_unsafe: false,
-            is_reflexive: false,
+            is_reflexive: recursive
+                .iter()
+                .flatten()
+                .flatten()
+                .any(|field| !field.arguments.is_empty()),
         }],
         ctors: constructors,
         recursors: vec![RecursorVal {
