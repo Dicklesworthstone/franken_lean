@@ -222,7 +222,9 @@ fn plan(
                         break;
                     }
                 }
-                let current = active.last_mut().ok_or_else(|| refuse(view, tokens, at))?;
+                let Some(current) = active.last_mut() else {
+                    return Err(refuse(view, tokens, at));
+                };
                 if current.depth != depth || current.with.is_none() {
                     return Err(refuse(view, tokens, at));
                 }
@@ -517,6 +519,11 @@ fn parse_planned(
     let mut splices = Splices::new();
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     if grammar == DefinitionGrammar::Scalar
+        // A tactic block owns its statement and alternative boundaries. Its
+        // individual term arguments reenter this planner at bounded ranges;
+        // planning their matches across the whole proof confuses tactic pipes
+        // with constructor alternatives and swallows following instructions.
+        && !is_symbol(tokens, range.start, "by")
         && (equations
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "match")

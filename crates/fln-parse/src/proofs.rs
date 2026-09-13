@@ -116,6 +116,8 @@ fn tactic(
             "subst",
             "injection",
             "contradiction",
+            "skip",
+            "fail",
         ]
         .into_iter()
         .find(|word| name == &Name::from_components([*word]))
@@ -183,7 +185,17 @@ fn tactic(
         {
             args.push(leaves.leaf(start + 1)?);
         }
-        "assumption" | "rfl" | "contradiction" | "constructor" | "left" | "right"
+        "fail"
+            if range.end == start + 2
+                && matches!(
+                    &tokens[start + 1].kind,
+                    TokenKind::Literal(LiteralKind::Str)
+                ) =>
+        {
+            args.push(leaves.leaf(start + 1)?);
+        }
+        "assumption" | "rfl" | "contradiction" | "constructor" | "left" | "right" | "skip"
+        | "fail"
             if range.end == start + 1 => {}
         "exact" | "apply" | "refine" if range.end > start + 1 => args.push(bounded_term(
             leaves,

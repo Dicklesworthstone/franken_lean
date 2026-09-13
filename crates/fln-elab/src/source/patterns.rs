@@ -752,7 +752,7 @@ impl Context {
     pub(super) fn lower_pattern_matrices<'a>(
         &mut self,
         syntax: &'a Syntax,
-    ) -> Result<(Cow<'a, Syntax>, Vec<Name>), NatDefinitionElabError> {
+    ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
         let mut scan = vec![syntax];
         let mut needed = false;
         while let Some(node) = scan.pop() {
@@ -763,7 +763,7 @@ impl Context {
             }
         }
         if !needed {
-            return Ok((Cow::Borrowed(syntax), Vec::new()));
+            return Ok(Cow::Borrowed(syntax));
         }
         let mut root = syntax;
         while let Some(inner) = parenthesized_inner(root)? {
@@ -776,7 +776,6 @@ impl Context {
         }
         let mut tasks = vec![Task::Visit(syntax)];
         let mut built = Vec::new();
-        let mut required = Vec::new();
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
@@ -791,7 +790,8 @@ impl Context {
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
-                    built.push(if pattern_function(&node) {
+                    let mut required = Vec::new();
+                    let node = if pattern_function(&node) {
                         self.compile_pattern_function(node, &mut required)?
                     } else if complex(&node, &self.txn.env) {
                         self.compile_pattern_matrix(
@@ -802,11 +802,21 @@ impl Context {
                         )?
                     } else {
                         node
+                    };
+                    // Coverage belongs to this match's actual elaboration, not
+                    // to an unchosen tactic alternative elsewhere in the term.
+                    built.push(if required.is_empty() {
+                        node
+                    } else {
+                        Syntax::node(
+                            parser_kind(&["Term", "matrixScope"]),
+                            vec![null(required.into_iter().map(identifier).collect()), node],
+                        )
                     });
                 }
                 _ => unreachable!(),
             }
         }
-        Ok((Cow::Owned(built.pop().expect("rewritten root")), required))
+        Ok(Cow::Owned(built.pop().expect("rewritten root")))
     }
 }
