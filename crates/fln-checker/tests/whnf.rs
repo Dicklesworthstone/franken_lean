@@ -2569,3 +2569,151 @@ fn literal_constructor_k_gate_does_not_borrow_foreign_or_partial_constructors() 
         Some(&checker_name("KTestMinor"))
     );
 }
+
+fn natural_operation(name: &str, arguments: impl IntoIterator<Item = Expr>) -> Expr {
+    arguments.into_iter().fold(
+        Expr::const_(Name::from_components(["Nat", name]), vec![]),
+        Expr::app,
+    )
+}
+fn numeric_literal(n: u64) -> Expr {
+    Expr::lit(fln_core::expr::Literal::Nat(
+        fln_core::expr::NatLit::from_u64(n),
+    ))
+}
+#[test]
+fn recursors_demand_checker_owned_natural_computation() {
+    let context = definition_context(nat_literal_family_entries());
+    for (major, expected) in [
+        (
+            natural_operation("add", [numeric_literal(5), numeric_literal(7)]),
+            11,
+        ),
+        (
+            natural_operation(
+                "mul",
+                [
+                    natural_operation("add", [numeric_literal(1), numeric_literal(2)]),
+                    numeric_literal(4),
+                ],
+            ),
+            11,
+        ),
+        (
+            natural_operation("sub", [numeric_literal(5), numeric_literal(9)]),
+            0,
+        ),
+    ] {
+        let term = decoded(&nat_predecessor_application(major));
+        let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+        assert_eq!(result.term, decoded(&numeric_literal(expected)));
+        assert!(result.reductions > 0);
+    }
+}
+#[test]
+fn open_arithmetic_demands_do_not_turn_spent_work_into_false_progress() {
+    let context = definition_context(nat_literal_family_entries());
+    let term = decoded(&nat_predecessor_application(natural_operation(
+        "add",
+        [
+            Expr::fvar(FVarId(primary_name("unknown"))),
+            numeric_literal(7),
+        ],
+    )));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert!(result.has_auxiliary_work);
+    assert_eq!(
+        frozen(&result.term, result.term.root()),
+        frozen(&term, term.root())
+    );
+    let outcome = def_eq(
+        &term,
+        &decoded(&numeric_literal(7)),
+        &context,
+        DefEqBudget::new(
+            fln_checker::defeq::QuickDefEqBudget::unlimited(),
+            10_000,
+            1_000,
+            1_000_000,
+            10_000_000,
+            WhnfBudget::unlimited(),
+        ),
+    );
+    assert!(
+        matches!(outcome, DefEqOutcome::Deferred { .. }),
+        "{outcome:?}"
+    );
+}
+#[test]
+fn demanded_arithmetic_does_not_bypass_a_foreign_recursor_family() {
+    let major = natural_operation("beq", [numeric_literal(7), numeric_literal(7)]);
+    let term = decoded(&two_eliminate(
+        major,
+        numeric_literal(1),
+        numeric_literal(2),
+    ));
+    let result = complete(whnf(
+        &term,
+        &definition_context(two_family_entries()),
+        WhnfBudget::unlimited(),
+    ));
+    assert!(matches!(
+        result.term.node(result.term.root()),
+        Some(ExprNode::Apply { .. })
+    ));
+    assert_ne!(result.term, decoded(&numeric_literal(1)));
+    assert_ne!(result.term, decoded(&numeric_literal(2)));
+}
+#[test]
+fn demanded_arithmetic_cancellation_and_budgets_are_recoverable_nonanswers() {
+    let context = definition_context(nat_literal_family_entries());
+    let term = decoded(&nat_predecessor_application(natural_operation(
+        "add",
+        [numeric_literal(3), numeric_literal(4)],
+    )));
+    let complete_result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    for steps in [0, 20, complete_result.steps.saturating_sub(1)] {
+        assert!(matches!(
+            whnf(
+                &term,
+                &context,
+                WhnfBudget::new(steps, u64::MAX, TermBudget::unlimited())
+            ),
+            WhnfOutcome::Inconclusive(_)
+        ));
+    }
+    for cancel_after in [0, 10, 40] {
+        let mut count = 0;
+        assert!(matches!(
+            whnf_with(&term, &context, WhnfBudget::unlimited(), || {
+                count += 1;
+                count > cancel_after
+            }),
+            WhnfOutcome::Inconclusive(_)
+        ));
+    }
+    assert_eq!(
+        complete(whnf(&term, &context, WhnfBudget::unlimited())).term,
+        decoded(&numeric_literal(6))
+    );
+}
+#[test]
+fn nested_arithmetic_in_a_demanded_major_uses_heap_frames() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let mut major = numeric_literal(1);
+            for _ in 0..500 {
+                major = natural_operation("add", [major, numeric_literal(1)]);
+            }
+            let result = complete(whnf(
+                &decoded(&nat_predecessor_application(major)),
+                &definition_context(nat_literal_family_entries()),
+                WhnfBudget::unlimited(),
+            ));
+            assert_eq!(result.term, decoded(&numeric_literal(500)));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

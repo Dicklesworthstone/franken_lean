@@ -335,6 +335,16 @@ fn pattern(
                 }
                 let head = if is_symbol(tokens, cursor, "_") && !dot {
                     Syntax::node(parser_kind(&["Term", "hole"]), vec![leaves.leaf(cursor)?])
+                } else if !dot
+                    && matches!(
+                        tokens[cursor].kind,
+                        TokenKind::Literal(LiteralKind::Nat | LiteralKind::Str)
+                    )
+                {
+                    if cursor + 1 != range.end {
+                        return Err(refuse(view, tokens, cursor + 1));
+                    }
+                    bounded_term_leaf(leaves, view, tokens, cursor, DefinitionGrammar::Scalar)?
                 } else if matches!(tokens[cursor].kind, TokenKind::Ident(_)) {
                     if dot {
                         // dotIdent is the Reference's expected-type-driven constructor head.
@@ -860,5 +870,45 @@ mod pattern_function_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod literal_pattern_tests {
+    use super::*;
+    #[test]
+    fn literal_tokens_keep_original_spelling_and_trivia() {
+        for source in [
+            "def f : Nat -> Nat | 0x10 => 1 | _ => 2",
+            "-- before\r\ndef f : Nat -> Nat\r\n  | 0 /- zero -/ => 7\r\n  | .succ n => n\r\n",
+            r##"def f : String -> Nat | r#"\x61"# => 1 | "a" => 2 | _ => 3"##,
+            "def f : Nat := (fun | 1, true => 7 | _, _ => 9) 1 true",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn literals_cannot_be_applied_as_pattern_constructors() {
+        for source in [
+            "def f : Nat -> Nat | 0 x => 1 | _ => 2",
+            "def f : Nat -> Nat | .0 => 1 | _ => 2",
+            "def f : String -> Nat | \"a\" x => 1 | _ => 2",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn grouped_literal_patterns_are_heap_parsed() {
+        std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
+            let source = format!("def f : Nat -> Nat | {}340282366920938463463374607431768211456{} => 7 | _ => 9", "(".repeat(1000), ")".repeat(1000));
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+        }).unwrap().join().unwrap();
     }
 }

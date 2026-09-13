@@ -17,6 +17,12 @@ use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
     instantiate_term_parameters_from_level_roots_with,
 };
+use crate::nat_reduce::{
+    NatReductionBudget, NatReductionFault, NatReductionOutcome, NatReductionProgress,
+    NatReductionQuery, NatReductionScope, NatReductionStop, is_potential_nat_reduction,
+    reduce_nat_at_with,
+};
+use crate::numeric::NatBudget;
 use crate::string_reduce::{
     StringExpansionBudget, StringExpansionFault, StringExpansionOutcome, StringExpansionProgress,
     StringExpansionStop, expand_string_literal_with,
@@ -226,6 +232,12 @@ pub enum WhnfRefusal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhnfStop {
+    NatReduction {
+        at: usize,
+        stop: Box<NatReductionStop>,
+        completed_steps: u64,
+        completed_reductions: u64,
+    },
     Resource {
         limit: WhnfLimit,
         allowed: u64,
@@ -262,6 +274,10 @@ pub enum WhnfStop {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhnfFault {
+    NatReduction {
+        at: usize,
+        fault: Box<NatReductionFault>,
+    },
     Universe {
         at: usize,
         error: UniverseError,
@@ -955,16 +971,150 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     .saturating_add(result.delta_reductions);
                 self.has_auxiliary_work |= result.has_auxiliary_work;
                 self.absorb_string(result.string_progress);
-                let root = result.term.root();
-                Ok(Cursor {
-                    arena: Arc::new(result.term),
-                    root,
-                })
+                self.reduce_demanded_nat(result.term)
             }
             WhnfOutcome::Refused(refusal) => Err(Halt::Refusal(refusal)),
             WhnfOutcome::Inconclusive(stop) => Err(Halt::Stop(Box::new(stop))),
             WhnfOutcome::InternalFault(fault) => Err(Halt::Fault(fault)),
         }
+    }
+
+    /// KR-313 must also execute when a recursor demands a major such as
+    /// Nat.beq (Nat.add 2 3) 5. Reuse the checker-owned arithmetic evaluator,
+    /// never the primary kernel or an unchecked host Boolean decision. Ordinary
+    /// core WHNF stays unchanged: this is the explicitly demanded-major lane.
+    fn reduce_demanded_nat(&mut self, term: WireExpr) -> Result<Cursor, Halt> {
+        let at = term.root().index();
+        if !is_potential_nat_reduction(&term, term.root()) {
+            return Ok(Cursor {
+                root: term.root(),
+                arena: Arc::new(term),
+            });
+        }
+        let steps = self
+            .control
+            .budget
+            .max_steps
+            .saturating_sub(self.control.steps);
+        let reductions = self
+            .control
+            .budget
+            .max_reductions
+            .saturating_sub(self.control.reductions);
+        let materialization = self.control.budget.materialization;
+        let budget = NatReductionBudget::new(
+            steps,
+            steps,
+            reductions,
+            materialization.max_arena_nodes,
+            materialization.max_output_units,
+            materialization.max_output_units,
+            WhnfBudget::new(steps, reductions, materialization)
+                .with_string(self.remaining_string_budget()),
+            NatBudget::new(steps, materialization.max_output_units),
+        );
+        let result = reduce_nat_at_with(
+            NatReductionQuery::new(&term, term.root(), &term, term.root(), self.context.source),
+            budget,
+            NatReductionScope::DemandedMajor,
+            &mut *self.cancelled,
+        );
+        match result {
+            NatReductionOutcome::Reduced(result) => {
+                self.absorb_demanded_nat(result.progress, at)?;
+                Ok(Cursor {
+                    root: result.term.root(),
+                    arena: Arc::new(result.term),
+                })
+            }
+            NatReductionOutcome::NotReduced { progress, .. } => {
+                // Work in a failed arithmetic demand is not a changed outer term.
+                self.has_auxiliary_work = true;
+                self.absorb_demanded_nat(progress, at)?;
+                Ok(Cursor {
+                    root: term.root(),
+                    arena: Arc::new(term),
+                })
+            }
+            NatReductionOutcome::Refused {
+                refusal: crate::nat_reduce::NatReductionRefusal::Whnf { refusal, .. },
+                progress,
+            } => {
+                self.absorb_demanded_nat(progress, at)?;
+                Err(Halt::Refusal(refusal))
+            }
+            NatReductionOutcome::Inconclusive(stop) => {
+                // Preserve the complete nested reason, including cancellation.
+                let progress = stop.progress();
+                self.control.steps = self
+                    .control
+                    .steps
+                    .saturating_add(progress.steps)
+                    .saturating_add(progress.whnf_steps)
+                    .saturating_add(progress.numeric_steps);
+                self.control.reductions = self
+                    .control
+                    .reductions
+                    .saturating_add(progress.whnf_reductions)
+                    .saturating_add(progress.numeric_reductions);
+                Err(Halt::Stop(Box::new(WhnfStop::NatReduction {
+                    at,
+                    stop: Box::new(stop),
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                })))
+            }
+            NatReductionOutcome::InternalFault(fault) => {
+                Err(Halt::Fault(WhnfFault::NatReduction {
+                    at,
+                    fault: Box::new(fault),
+                }))
+            }
+        }
+    }
+
+    fn absorb_demanded_nat(
+        &mut self,
+        progress: NatReductionProgress,
+        at: usize,
+    ) -> Result<(), Halt> {
+        self.control.steps = self
+            .control
+            .steps
+            .saturating_add(progress.steps)
+            .saturating_add(progress.whnf_steps)
+            .saturating_add(progress.numeric_steps);
+        self.control.reductions = self
+            .control
+            .reductions
+            .saturating_add(progress.whnf_reductions)
+            .saturating_add(progress.numeric_reductions);
+        self.delta_reductions = self.delta_reductions.saturating_add(progress.delta_unfolds);
+        self.control.poll(at, self.cancelled)?;
+        for (limit, observed, allowed) in [
+            (
+                WhnfLimit::Steps,
+                self.control.steps,
+                self.control.budget.max_steps,
+            ),
+            (
+                WhnfLimit::Reductions,
+                self.control.reductions,
+                self.control.budget.max_reductions,
+            ),
+        ] {
+            if observed > allowed {
+                return Err(Halt::Stop(Box::new(WhnfStop::Resource {
+                    limit,
+                    allowed,
+                    observed,
+                    at,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                })));
+            }
+        }
+        Ok(())
     }
 
     /// Structural equality of two cursor roots across arenas, budgeted by the

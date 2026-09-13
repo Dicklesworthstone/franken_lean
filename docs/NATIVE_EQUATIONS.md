@@ -45,7 +45,7 @@ kernel typing obligation. Failed file suffixes expose no successor environment.
 An explicit result type is required for equation declarations. The number of
 explicit patterns is the same in every row, and it cannot exceed the declared
 function telescope. This does not infer missing argument types from constructors,
-add literal patterns, equation lemmas with Reference-compatible names, `where`,
+add equation lemmas with Reference-compatible names, `where`,
 `termination_by`, or well-founded recursion. Completely redundant rows and
 supplied automatically impossible alternatives retain the current matrix
 compiler's explicit refusal policy. Later explicit inputs can be selected structurally; see
@@ -64,3 +64,6 @@ Boolean equations, an accumulator, fixed-length vector tail, indexed recursive
 copy, and a theorem with nested local proofs. Source and parser tests cover
 malformed arities, resource stops, source round trips, deep nesting, scope errors,
 invalid annotations, and rejected recursive calls.
+
+Natural-literal patterns are supported; see `NATIVE_LITERAL_PATTERNS.md` for
+compact decisions, structural zero/successor clauses and dependent limits.

@@ -46,7 +46,7 @@ Pattern functions use explicit pattern columns. Known expected function domains
 are needed for constructor patterns; this feature does not guess an arbitrary
 input type from constructor names. Inference for an abstract catch-all remains
 subject to the ordinary unresolved-metavariable rules. Implicit lambda binders,
-literal patterns, guards, inaccessible patterns, arbitrary term-level recursion,
+non-Nat literal patterns, guards, inaccessible patterns, arbitrary term-level recursion,
 and full Lean equation-compiler parity are separate capabilities. Use the existing
 explicit signature with equation-style declarations for implicit signature binders.
 

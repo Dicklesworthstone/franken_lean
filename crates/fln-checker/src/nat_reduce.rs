@@ -775,6 +775,9 @@ pub(crate) fn is_potential_nat_reduction(term: &WireExpr, root: ExprId) -> bool 
 pub(crate) enum NatReductionScope {
     ClosedPair,
     EagerOpenPair,
+    /// A recursor is computing its discriminant, not comparing an arbitrary
+    /// open term pair. Operand normalization is demanded by iota reduction.
+    DemandedMajor,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -6,6 +6,7 @@
 //! elaborator. Every original row has an elaboration witness: a redundant row
 //! cannot hide an ill-typed body when a generated fallback is unnecessary.
 use super::*;
+mod literals;
 use fln_env::constants::ConstantInfo;
 use fln_syntax::source::{ByteSpan, SourceInfo};
 use std::borrow::Cow;
@@ -18,12 +19,13 @@ struct Head {
 }
 struct Constructor<'a> {
     head: Head,
-    syntax: &'a Syntax,
+    syntax: Cow<'a, Syntax>,
     fields: Vec<usize>,
 }
 enum Pattern<'a> {
     Bind(Option<Name>),
     Constructor(Constructor<'a>),
+    Literal(literals::LiteralPattern<'a>),
 }
 #[derive(Clone)]
 struct Row<'a> {
@@ -273,7 +275,7 @@ impl Context {
                     values.push(arena.len());
                     arena.push(Pattern::Constructor(Constructor {
                         head,
-                        syntax,
+                        syntax: Cow::Borrowed(syntax),
                         fields,
                     }));
                 }
@@ -292,6 +294,14 @@ impl Context {
                     } else {
                         (syntax, &[][..])
                     };
+                    if let Some(literal) = self.decode_pattern_literal(head)? {
+                        if !arguments.is_empty() {
+                            return Err(invalid());
+                        }
+                        values.push(arena.len());
+                        arena.push(Pattern::Literal(literal));
+                        continue;
+                    }
                     let constructor = match head {
                         Syntax::Node { kind, args, .. }
                             if kind == &parser_kind(&["Term", "dotIdent"]) =>
@@ -446,6 +456,7 @@ impl Context {
         enum Task<'a> {
             Build(Matrix<'a>),
             Finish(Name, Vec<Alternative>, usize, bool),
+            Literal(Syntax, usize),
         }
         let mut pending = vec![Task::Build(Matrix {
             subjects,
@@ -456,6 +467,46 @@ impl Context {
         while let Some(task) = pending.pop() {
             self.tick()?;
             match task {
+                Task::Literal(test, start) => {
+                    let bodies = built.split_off(start);
+                    if bodies.len() != 2 {
+                        return Err(invalid());
+                    }
+                    let alternatives = ["true", "false"]
+                        .into_iter()
+                        .zip(bodies)
+                        .map(|(name, body)| {
+                            Syntax::node(
+                                parser_kind(&["Term", "matchAlt"]),
+                                vec![
+                                    atom("|"),
+                                    null(vec![null(vec![identifier(Name::from_components([
+                                        "Bool", name,
+                                    ]))])]),
+                                    atom("=>"),
+                                    body,
+                                ],
+                            )
+                        })
+                        .collect();
+                    built.push(Syntax::node(
+                        parser_kind(&["Term", "matchMatrix"]),
+                        vec![
+                            atom("match"),
+                            null(vec![]),
+                            null(vec![]),
+                            null(vec![Syntax::node(
+                                parser_kind(&["Term", "matchDiscr"]),
+                                vec![null(vec![]), test],
+                            )]),
+                            atom("with"),
+                            Syntax::node(
+                                parser_kind(&["Term", "matchAlts"]),
+                                vec![null(alternatives)],
+                            ),
+                        ],
+                    ));
+                }
                 Task::Finish(subject, alternatives, start, root) => {
                     let bodies = built.split_off(start);
                     let alternatives = alternatives
@@ -529,6 +580,14 @@ impl Context {
                         continue;
                     }
                     let subject = matrix.subjects.remove(0);
+                    if let Some((test, hit, miss)) =
+                        self.literal_matrix_split(&mut matrix, &subject, &mut arena)?
+                    {
+                        pending.push(Task::Literal(test, built.len()));
+                        pending.push(Task::Build(miss));
+                        pending.push(Task::Build(hit));
+                        continue;
+                    }
                     // Relative and qualified spellings may denote one head.
                     // Resolve only against explicit admitted constructors in
                     // this column; use the qualified spelling in the generated
@@ -615,6 +674,7 @@ impl Context {
                                     copy.patterns.splice(..0, other.fields.iter().copied());
                                 }
                                 Pattern::Constructor(_) => continue,
+                                Pattern::Literal(_) => return Err(invalid()),
                                 Pattern::Bind(name) => {
                                     if let Some(name) = name {
                                         copy.bindings.push((name.clone(), subject.clone()));
@@ -629,7 +689,7 @@ impl Context {
                         subjects.extend(matrix.subjects.iter().cloned());
                         let resolved = &canonical[&constructor.head];
                         let head = if resolved.relative {
-                            self.copy_pattern_syntax(constructor.syntax)?
+                            self.copy_pattern_syntax(&constructor.syntax)?
                         } else {
                             identifier(resolved.name.clone())
                         };
