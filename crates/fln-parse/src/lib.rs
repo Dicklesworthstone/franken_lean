@@ -528,6 +528,7 @@ fn nat_definition_token_table() -> TokenTable {
         "Type",
         "Prop",
         "_",
+        "?",
         "{",
         ".",
         "}",
@@ -594,6 +595,7 @@ fn source_module_token_table() -> TokenTable {
         "Type",
         "Prop",
         "_",
+        "?",
         "{",
         ".",
         "}",
@@ -1192,6 +1194,30 @@ fn bounded_term_spliced(
                     .application
                     .push((proof, index));
                 cursor = end;
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "?" =>
+            {
+                let valid = cursor < range.end
+                    && tokens[index].extent.end() == tokens[cursor].extent.start()
+                    && (matches!(&tokens[cursor].kind, TokenKind::Ident(name) if !name.is_anonymous() && name.parent().is_anonymous())
+                        || matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == "_"));
+                if !valid {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, cursor),
+                        expected: grammar.value_expectation(),
+                    });
+                }
+                let term = Syntax::node(
+                    parser_kind(&["Term", "syntheticHole"]),
+                    vec![leaves.leaf(index)?, leaves.leaf(cursor)?],
+                );
+                cursor += 1;
+                frames
+                    .last_mut()
+                    .expect("root term frame")
+                    .application
+                    .push((term, index));
             }
             kind if is_bounded_term_atom(kind, grammar) => {
                 let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;

@@ -48,8 +48,12 @@ impl Context {
         };
         self.constrain(&type_, alpha)?;
         self.constrain(occurrence, pattern)?;
-        self.equations.push((type_, alpha.clone()));
-        self.equations.push((occurrence.clone(), pattern.clone()));
+        self.equations
+            .push(SourceEquation::selection(type_, alpha.clone()));
+        self.equations.push(SourceEquation::selection(
+            occurrence.clone(),
+            pattern.clone(),
+        ));
         self.flush(true)?;
         Ok(true)
     }

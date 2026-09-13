@@ -105,6 +105,10 @@ fn tactic(
             "exact",
             "assumption",
             "apply",
+            "refine",
+            "constructor",
+            "left",
+            "right",
             "rfl",
             "rw",
             "rewrite",
@@ -179,8 +183,9 @@ fn tactic(
         {
             args.push(leaves.leaf(start + 1)?);
         }
-        "assumption" | "rfl" | "contradiction" if range.end == start + 1 => {}
-        "exact" | "apply" if range.end > start + 1 => args.push(bounded_term(
+        "assumption" | "rfl" | "contradiction" | "constructor" | "left" | "right"
+            if range.end == start + 1 => {}
+        "exact" | "apply" | "refine" if range.end > start + 1 => args.push(bounded_term(
             leaves,
             view,
             tokens,
@@ -536,6 +541,67 @@ mod local_declaration_tests {
                 for i in (0..depth).rev() {
                     source.push_str(&format!("{}exact h{i}\n", "  ".repeat(i + 1)));
                 }
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod construction_refinement_tests {
+    use super::*;
+
+    #[test]
+    fn construction_and_holes_preserve_original_tokens_and_scopes() {
+        for source in [
+            "def refine (constructor left right : Nat) : Nat := constructor + left + right",
+            "theorem t : Both P Q := by\r\n  constructor /- fields -/\r\n  exact p\r\n  exact q\r\n",
+            "theorem t : Either P Q := by right; exact q",
+            "theorem t : P := by\r\n  refine /- explicit goals -/ f ?named ?_\r\n  exact p\r\n  exact q\r\n",
+            "theorem t : forall x : Nat, x = x := by refine fun x => ?_; rfl",
+            "def annotated : Nat := by refine (7 : ?type); exact Nat",
+        ] {
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_refinement_never_drops_trailing_tokens() {
+        for tail in [
+            "constructor 1",
+            "left h",
+            "right h",
+            "refine",
+            "refine ?",
+            "refine ? _",
+            "refine ?7",
+            "refine ?a.b",
+            "refine ?/-gap-/_",
+        ] {
+            let source = format!("theorem t : 0 = 0 := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn deeply_grouped_synthetic_holes_use_heap_parser_frames() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!(
+                    "theorem t : 0 = 0 := by refine {}?_{}; rfl",
+                    "(".repeat(1000),
+                    ")".repeat(1000)
+                );
                 let parsed = parse_definition(source.as_bytes()).unwrap();
                 assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
             })

@@ -105,12 +105,42 @@ enum ImplicitInsertion<'a> {
     FieldReceiver,
 }
 
+/// Source typing constraints survive in the eventual declaration. Selection
+/// constraints are different: an instance or rewrite occurrence may be chosen
+/// only after equality has actually been established, even for ground terms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EquationPolicy {
+    FinalAdmission,
+    BeforeSelection,
+}
+
+#[derive(Clone)]
+struct SourceEquation {
+    sides: (Expr, Expr),
+    policy: EquationPolicy,
+}
+
+impl SourceEquation {
+    fn inference(left: Expr, right: Expr) -> Self {
+        Self {
+            sides: (left, right),
+            policy: EquationPolicy::FinalAdmission,
+        }
+    }
+    fn selection(left: Expr, right: Expr) -> Self {
+        Self {
+            sides: (left, right),
+            policy: EquationPolicy::BeforeSelection,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Context {
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
-    equations: Vec<(Expr, Expr)>,
+    equations: Vec<SourceEquation>,
     instance_goals: Vec<MVarId>,
     // Stable private names link raw IHs to checked specializations. Actual
     // declarations in the local context decide visibility, including rollback.
@@ -118,6 +148,7 @@ struct Context {
     matrix_rows: std::collections::HashSet<Name>,
     // Only compiler-generated aliases may expose their already checked referent.
     matrix_aliases: std::collections::HashMap<FVarId, Expr>,
+    refinements: Vec<tactics::RefinementFrame>,
     recursion: Option<recursion::Recursion>,
 }
 
@@ -138,6 +169,7 @@ impl Context {
             induction_specializations: Vec::new(),
             matrix_rows: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
+            refinements: Vec::new(),
             recursion: None,
         }
     }
@@ -220,6 +252,22 @@ impl Context {
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         if let Syntax::Node { kind, args, .. } = syntax {
+            if kind == &parser_kind(&["Term", "syntheticHole"]) {
+                let [question, label] = args.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                expect_atom(question, "?", "synthetic hole")?;
+                let name = match label {
+                    Syntax::Atom { val, .. } if val == "_" => None,
+                    Syntax::Ident { val, .. }
+                        if !val.is_anonymous() && val.parent().is_anonymous() =>
+                    {
+                        Some(val.clone())
+                    }
+                    _ => return Err(failure(SourceInferenceError::Scope)),
+                };
+                return self.synthetic_proof_hole(name, expected);
+            }
             if kind == &parser_kind(&["Term", "hole"]) {
                 let [hole] = args.as_slice() else {
                     return Err(failure(SourceInferenceError::Scope));
@@ -411,32 +459,103 @@ impl Context {
         if let (Some(left), Some(right)) = (self.known_type(&actual)?, self.known_type(&expected)?)
             && (left.has_level_mvar() || right.has_level_mvar())
         {
-            self.equations.push((left, right));
+            self.equations.push(SourceEquation::inference(left, right));
         }
-        self.equations.push((actual, expected));
+        self.equations
+            .push(SourceEquation::inference(actual, expected));
         self.flush(false)
     }
 
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
-        if self.equations.is_empty() {
-            return Ok(());
-        }
-        self.tick()?;
-        match self.txn.unify_many_with(
-            &self.equations,
-            UnificationBudget::new(self.kernel),
-            &|| false,
-        ) {
-            Ok(report) => {
-                assert!(
-                    report.awakened.is_empty(),
-                    "this private source transaction has no queued consumer work"
-                );
-                self.equations.clear();
-                Ok(())
+        loop {
+            if self.equations.is_empty() {
+                return Ok(());
             }
-            Err(UnificationError::Deferred(_)) if !final_pass => Ok(()),
-            Err(error) => Err(failure(SourceInferenceError::Unification(Box::new(error)))),
+            self.tick()?;
+            let mut pairs = Vec::with_capacity(self.equations.len());
+            for index in 0..self.equations.len() {
+                self.tick()?;
+                pairs.push(self.equations[index].sides.clone());
+            }
+            let deferred =
+                match self
+                    .txn
+                    .unify_many_with(&pairs, UnificationBudget::new(self.kernel), &|| false)
+                {
+                    Ok(report) => {
+                        assert!(report.awakened.is_empty(), "private source queue");
+                        self.equations.clear();
+                        return Ok(());
+                    }
+                    Err(error @ UnificationError::Deferred(_)) => error,
+                    Err(error) => {
+                        return Err(failure(SourceInferenceError::Unification(Box::new(error))));
+                    }
+                };
+            // A failed selection query is a nonmatch, not a reason to replay
+            // all of its rigid subequations. Keep the original atomic matcher
+            // and its work cost; only ordinary source inference is resumed.
+            if self
+                .equations
+                .iter()
+                .any(|equation| equation.policy == EquationPolicy::BeforeSelection)
+            {
+                return if final_pass {
+                    Err(failure(SourceInferenceError::Unification(Box::new(
+                        deferred,
+                    ))))
+                } else {
+                    Ok(())
+                };
+            }
+            // An explicit opaque proof hole can postpone an entire batch, even
+            // when an independent equation determines its argument type. Keep
+            // the joint solver first (it handles interdependent assignments),
+            // then publish individually K1-checked progress only inside this
+            // private source transaction and retry the blocked obligations.
+            let generation = self.txn.mvars.assignments().len() + self.txn.universes.len();
+            let pending = std::mem::take(&mut self.equations);
+            for mut equation in pending {
+                self.tick()?;
+                let left = self.instantiate(&equation.sides.0)?;
+                let right = self.instantiate(&equation.sides.1)?;
+                if equation.policy == EquationPolicy::FinalAdmission
+                    && !left.has_expr_mvar()
+                    && !right.has_expr_mvar()
+                    && !left.has_level_mvar()
+                    && !right.has_level_mvar()
+                {
+                    // Exactly the same policy as `constrain`: once inference
+                    // has finished, the retained source terms and annotations
+                    // are obligations of the final ordinary K1 declaration.
+                    continue;
+                }
+                match self
+                    .txn
+                    .unify(&left, &right, UnificationBudget::new(self.kernel))
+                {
+                    Ok(report) => assert!(report.awakened.is_empty(), "private source queue"),
+                    Err(UnificationError::Deferred(_)) => {
+                        equation.sides = (left, right);
+                        self.equations.push(equation);
+                    }
+                    Err(error) => {
+                        return Err(failure(SourceInferenceError::Unification(Box::new(error))));
+                    }
+                }
+            }
+            if self.equations.is_empty() {
+                return Ok(());
+            }
+            if generation == self.txn.mvars.assignments().len() + self.txn.universes.len() {
+                return if final_pass {
+                    Err(failure(SourceInferenceError::Unification(Box::new(
+                        deferred,
+                    ))))
+                } else {
+                    Ok(())
+                };
+            }
         }
     }
 
@@ -576,6 +695,7 @@ impl Context {
                 bool,
             ),
             ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, bool),
+            RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
         let mut values: Vec<Typed> = Vec::new();
@@ -913,6 +1033,13 @@ impl Context {
                     tasks.push(Task::RecordNext(state));
                 }
                 Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                    tactics::ProofAction::Refine { syntax, goal } => {
+                        self.txn.lctx = goal.lctx.clone();
+                        let expected = goal.target.clone();
+                        let depth = self.begin_refinement();
+                        tasks.push(Task::RefineTerm(proof, goal, depth));
+                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                    }
                     tactics::ProofAction::Binding {
                         goal,
                         name,
@@ -984,6 +1111,11 @@ impl Context {
                 Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
                     let term = values.pop().expect("rewrite rule visit");
                     self.rewrite_proof_term(&mut proof, goal, term, reverse, remaining, close)?;
+                    tasks.push(Task::Proof(proof));
+                }
+                Task::RefineTerm(mut proof, goal, depth) => {
+                    let term = values.pop().expect("refinement term visit");
+                    self.finish_refinement(&mut proof, goal, term, depth)?;
                     tasks.push(Task::Proof(proof));
                 }
                 Task::ProofTerm(mut proof, goal, apply) => {

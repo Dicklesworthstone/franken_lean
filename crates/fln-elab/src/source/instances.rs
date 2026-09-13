@@ -160,10 +160,11 @@ impl Context {
                         trial.txn.lctx = saved;
                         // Resume with the now-available dictionary projections,
                         // without widening class-head matching transparency.
-                        for (left, right) in suspended {
-                            let left = trial.whnf(&left)?;
-                            let right = trial.whnf(&right)?;
-                            trial.equations.push((left, right));
+                        for mut equation in suspended {
+                            let left = trial.whnf(&equation.sides.0)?;
+                            let right = trial.whnf(&equation.sides.1)?;
+                            equation.sides = (left, right);
+                            trial.equations.push(equation);
                         }
                         *self = trial;
                     }
@@ -308,7 +309,8 @@ impl Context {
             term.value = Expr::app(term.value, arg);
         }
         self.constrain(&term.type_, target)?;
-        self.equations.push((term.type_, target.clone()));
+        self.equations
+            .push(SourceEquation::selection(term.type_, target.clone()));
         self.flush(true)?;
         Ok(Some(Expansion {
             value: term.value,

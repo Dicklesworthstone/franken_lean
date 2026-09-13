@@ -6,12 +6,15 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+mod construct;
 mod constructor_transport;
 mod constructors;
 pub(in crate::source) mod eliminate;
 mod equality;
 mod index_equations;
+mod refine;
 mod rewrite;
+pub(in crate::source) use refine::RefinementFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticError {
@@ -19,6 +22,10 @@ pub enum TacticError {
     NoGoals,
     UnsolvedGoals { count: usize },
     NoMatchingAssumption,
+    SyntheticHoleOutsideRefine,
+    IncompatibleSyntheticHole,
+    NoConstructor,
+    ExpectedTwoConstructors,
     ApplyMismatch,
     MalformedScript,
     ExpectedEquality,
@@ -41,6 +48,15 @@ impl std::fmt::Display for TacticError {
             Self::ExpectedGoal => write!(f, "by proof requires an expected type"),
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
+            Self::SyntheticHoleOutsideRefine => write!(f, "synthetic proof holes require refine"),
+            Self::IncompatibleSyntheticHole => {
+                write!(f, "named synthetic hole used at incompatible type or scope")
+            }
+            Self::NoConstructor => write!(f, "no constructor applies to the current goal"),
+            Self::ExpectedTwoConstructors => write!(
+                f,
+                "left/right require an inductive type with two constructors"
+            ),
             Self::NoMatchingAssumption => write!(f, "no local assumption matches the goal"),
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
             Self::ExpectedEquality => write!(f, "rewrite requires an instantiated equality proof"),
@@ -110,6 +126,10 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Refine {
+        syntax: &'a Syntax,
+        goal: ProofGoal,
+    },
     Binding {
         goal: ProofGoal,
         name: Name,
@@ -382,6 +402,28 @@ impl Context {
                     value,
                     opaque,
                 });
+            } else if kind == &parser_kind(&["Tactic", "refine"]) {
+                let [keyword, term] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "refine", "refinement tactic")?;
+                return Ok(ProofAction::Refine { syntax: term, goal });
+            } else if kind == &parser_kind(&["Tactic", "constructor"])
+                || kind == &parser_kind(&["Tactic", "left"])
+                || kind == &parser_kind(&["Tactic", "right"])
+            {
+                let (keyword, selected) = if kind == &parser_kind(&["Tactic", "left"]) {
+                    ("left", Some(0))
+                } else if kind == &parser_kind(&["Tactic", "right"]) {
+                    ("right", Some(1))
+                } else {
+                    ("constructor", None)
+                };
+                let [actual] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(actual, keyword, "constructor tactic")?;
+                self.construct_proof_goal(proof, goal, selected)?;
             } else if kind == &parser_kind(&["Tactic", "contradiction"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
