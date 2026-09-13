@@ -329,8 +329,13 @@ fn recursive_markers_cannot_escape_as_unapplied_or_nonroot_functions() {
     reject(
         "def bad (n : Nat) (b : Bool) : Nat := let saved := n; match saved, b with | .zero, _ => 0 | .succ k, _ => bad k b",
     );
+    // This formerly unsupported later-column recursion now has a genuine
+    // decreasing Nat argument. Keep a computation and the nondecreasing mutant.
+    check(
+        "def later (b : Bool) (n : Nat) : Nat := match b, n with | _, .zero => 0 | _, .succ k => Nat.succ (later b k)\n theorem checked : later true 4 = 4 := by rfl",
+    );
     reject(
-        "def bad (b : Bool) (n : Nat) : Nat := match b, n with | _, .zero => 0 | _, .succ k => bad b k",
+        "def bad (b : Bool) (n : Nat) : Nat := match b, n with | _, .zero => 0 | _, .succ k => bad b (Nat.succ k)",
     );
 }
 

@@ -426,6 +426,23 @@ impl Context {
             subjects.push(fresh.clone());
             inputs.push((fresh, self.copy_pattern_syntax(&parts[1])?));
         }
+        // Structural selection changes the decision-tree split, not argument
+        // order or row priority. Original inputs retain their checked bindings.
+        let root_column = if recursive_root {
+            self.recursion.as_ref().expect("recursive matrix").column
+        } else {
+            0
+        };
+        if root_column != 0 {
+            if root_column >= subjects.len() {
+                return Err(invalid());
+            }
+            subjects.swap(0, root_column);
+            for row in &mut rows {
+                self.tick()?;
+                row.patterns.swap(0, root_column);
+            }
+        }
         enum Task<'a> {
             Build(Matrix<'a>),
             Finish(Name, Vec<Alternative>, usize, bool),
@@ -466,7 +483,7 @@ impl Context {
                         })
                         .collect::<Result<_, NatDefinitionElabError>>()?;
                     let discriminant = if root {
-                        inputs[0].1.clone()
+                        inputs[root_column].1.clone()
                     } else {
                         identifier(subject)
                     };

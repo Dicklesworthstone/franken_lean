@@ -54,6 +54,12 @@ pub(super) struct Recursion {
     pub(super) marker: FVarId,
     pub(super) parameters: Vec<LocalDecl>,
     pub(super) decreasing: usize,
+    /// Source matrix column chosen for the structural split; arguments keep
+    /// their original function-telescope order.
+    pub(super) column: usize,
+    /// Other explicitly matched inputs may vary, even before the decreasing
+    /// parameter. Actual uniform family parameters remain fixed.
+    matched_parameters: HashSet<usize>,
     pub(super) pending: bool,
     pub(super) matrix: bool,
     matrix_hypotheses: Vec<(Name, Name)>,
@@ -116,8 +122,9 @@ impl Context {
         Ok(matches!(body.node(), ExprNode::FVar { id } if id == &parameter.id))
     }
 
-    /// Retry only an actual unresolved self-reference. Lexical shadowing and
-    /// nonrecursive definitions follow their ordinary path, including errors.
+    /// Retry only an actual unresolved self-reference. Candidate selection is
+    /// source-ordered and transactional. Failed candidates retain spent work,
+    /// but no assignments, generated identities, local facts or matrix state.
     pub(super) fn definition_body(
         &mut self,
         name: &Name,
@@ -129,15 +136,114 @@ impl Context {
         match self.term(syntax, expected.clone()) {
             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
                 found,
-            ))) if &found == name && !self.txn.env.contains(name) => {
-                let consumed = self.txn.budget.heartbeats_consumed;
-                *self = snapshot;
-                self.txn.budget.heartbeats_consumed = consumed;
-                self.prepare_recursion(name, parameters, syntax, expected.as_ref())?;
-                self.term(syntax, expected)
-            }
-            result => result,
+            ))) if &found == name && !self.txn.env.contains(name) => {}
+            result => return result,
         }
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot.clone();
+        self.txn.budget.heartbeats_consumed = spent;
+        let columns = self.recursion_columns(parameters, syntax)?;
+        let matched: Vec<_> = columns.iter().map(|(_, position)| *position).collect();
+        let mut first_error = None;
+        for (column, _) in columns {
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = snapshot.clone();
+            self.txn.budget.heartbeats_consumed = spent;
+            let result = self
+                .prepare_recursion(
+                    name,
+                    parameters,
+                    syntax,
+                    expected.as_ref(),
+                    column,
+                    &matched,
+                )
+                .and_then(|()| self.term(syntax, expected.clone()));
+            match result {
+                Ok(value) => return Ok(value),
+                Err(
+                    problem @ NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                        RecursionError::NotDecreasing
+                        | RecursionError::ChangedParameter
+                        | RecursionError::ChangedIndex
+                        | RecursionError::RootMatchRequired
+                        | RecursionError::ExplicitParameterRequired
+                        | RecursionError::PartialApplication,
+                    )),
+                ) => {
+                    first_error.get_or_insert(problem);
+                }
+                Err(problem) => {
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    *self = snapshot;
+                    self.txn.budget.heartbeats_consumed = spent;
+                    return Err(problem);
+                }
+            }
+        }
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        Err(first_error.unwrap_or_else(|| error(RecursionError::RootMatchRequired)))
+    }
+
+    /// A structural candidate must be an actual explicit header parameter, not
+    /// a computed expression. Each input identity is tried at most once. The
+    /// pattern matrix still checks every source discriminant and every row.
+    fn recursion_columns(
+        &mut self,
+        parameters: &[LocalDecl],
+        mut syntax: &Syntax,
+    ) -> Result<Vec<(usize, usize)>, NatDefinitionElabError> {
+        while let Some(inner) = parenthesized_inner(syntax)? {
+            self.tick()?;
+            syntax = inner;
+        }
+        if syntax.kind() != Some(&parser_kind(&["Term", "match"])) {
+            return Err(error(RecursionError::RootMatchRequired));
+        }
+        let parts = expect_node(
+            syntax,
+            &parser_kind(&["Term", "match"]),
+            6,
+            "recursive root match",
+        )?;
+        let discriminants = expect_null_args(&parts[3], "recursive discriminants")?;
+        if discriminants.is_empty() || discriminants.len() % 2 == 0 {
+            return Err(error(RecursionError::RootMatchRequired));
+        }
+        let mut columns = Vec::new();
+        let mut seen = HashSet::new();
+        for (position, discriminant) in discriminants.iter().enumerate() {
+            self.tick()?;
+            if position % 2 != 0 {
+                expect_atom(discriminant, ",", "recursive discriminant separator")?;
+                continue;
+            }
+            let parts = expect_node(
+                discriminant,
+                &parser_kind(&["Term", "matchDiscr"]),
+                2,
+                "recursive discriminant",
+            )?;
+            let mut value = &parts[1];
+            while let Some(inner) = parenthesized_inner(value)? {
+                self.tick()?;
+                value = inner;
+            }
+            if let Syntax::Ident { val, .. } = value
+                && let Some((position_in_header, parameter)) = parameters
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, p)| &p.user_name == val)
+                && parameter.binder_info == BinderInfo::Default
+                && seen.insert(parameter.id.clone())
+            {
+                columns.push((position / 2, position_in_header));
+            }
+        }
+        Ok(columns)
     }
 
     fn prepare_recursion(
@@ -146,6 +252,8 @@ impl Context {
         parameters: &[LocalDecl],
         mut syntax: &Syntax,
         expected: Option<&Expr>,
+        column: usize,
+        matched: &[usize],
     ) -> Result<(), NatDefinitionElabError> {
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
         while let Some(inner) = parenthesized_inner(syntax)? {
@@ -164,7 +272,7 @@ impl Context {
         )?;
         let discriminants = expect_null_args(&parts[3], "recursive discriminants")?;
         let first = discriminants
-            .first()
+            .get(column * 2)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
         let first = expect_node(
             first,
@@ -216,6 +324,8 @@ impl Context {
             marker,
             parameters: parameters.to_vec(),
             decreasing,
+            column,
+            matched_parameters: matched.iter().copied().collect(),
             pending: true,
             matrix: false,
             matrix_hypotheses: Vec::new(),
@@ -260,12 +370,26 @@ impl Context {
             positions.push(position);
         }
         removed.insert(recursion.parameters[recursion.decreasing].id.clone());
+        let mut uniform = HashSet::new();
+        for parameter in parameters {
+            uniform.extend(self.elimination_reads(parameter)?);
+        }
+        // Telescope domains may depend on earlier parameters. Keep that entire
+        // dependency closure fixed, not just the syntactically visible argument.
+        for local in recursion.parameters.iter().rev() {
+            self.tick()?;
+            if uniform.contains(&local.id) {
+                uniform.extend(self.elimination_reads(&local.type_)?);
+            }
+        }
         let mut varying = Vec::new();
         for (position, local) in recursion.parameters.iter().enumerate() {
             self.tick()?;
             if position != recursion.decreasing
                 && !positions.contains(&position)
                 && (position > recursion.decreasing
+                    || (recursion.matched_parameters.contains(&position)
+                        && !uniform.contains(&local.id))
                     || !self.elimination_reads(&local.type_)?.is_disjoint(&removed))
             {
                 varying.push(position);

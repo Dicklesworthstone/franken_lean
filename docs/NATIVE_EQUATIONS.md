@@ -27,7 +27,7 @@ ordered overlapping rows, dependent index equations, implicit arguments, and
 recursive-call lowering remain owned by their existing implementations.
 
 Recursive definitions have the same structural checks as explicit root matches.
-The first equation column is the structural candidate. A family index may appear
+Explicit equation columns are structural candidates, tried in source order. A family index may appear
 in the declaration header and change on a recursive call when the original
 recursor machinery generalizes it. Accumulators may change, while genuinely
 uniform parameters remain fixed. Nondecreasing calls in unused values and type
@@ -48,8 +48,8 @@ function telescope. This does not infer missing argument types from constructors
 add literal patterns, equation lemmas with Reference-compatible names, `where`,
 `termination_by`, or well-founded recursion. Completely redundant rows and
 supplied automatically impossible alternatives retain the current matrix
-compiler's explicit refusal policy. To recurse on a later input, use the existing
-explicit root-match form until structural-candidate selection covers that case.
+compiler's explicit refusal policy. Later explicit inputs can be selected structurally; see
+`NATIVE_STRUCTURAL_SELECTION.md` for the candidate and generalization rules.
 Pattern lambdas are described in `NATIVE_PATTERN_FUNCTIONS.md`. These are scoped source-checking results,
 not a full Reference syntax/conformance or execution-backend claim.
 
