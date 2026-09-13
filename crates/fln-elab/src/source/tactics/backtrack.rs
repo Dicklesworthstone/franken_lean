@@ -8,6 +8,7 @@ use super::*;
 pub(in crate::source) enum Mode {
     First,
     Try,
+    Repeat,
 }
 pub(in crate::source) struct Spec<'a> {
     pub mode: Mode,
@@ -81,7 +82,7 @@ impl<'a> Checkpoint<'a> {
         self.next < self.spec.branches.len()
     }
     pub fn optional(&self) -> bool {
-        self.spec.mode == Mode::Try
+        matches!(self.spec.mode, Mode::Try | Mode::Repeat)
     }
     pub fn finish(&self, context: &mut Context, proof: &mut ProofState<'a>) {
         context.attempt_depth = self.context.attempt_depth;
@@ -90,6 +91,13 @@ impl<'a> Checkpoint<'a> {
     }
     pub fn original(self) -> ProofState<'a> {
         self.proof
+    }
+    /// Commit this iteration, not the entire repetition. The next failure must
+    /// restore this successful state, including new goals and local binders.
+    /// No progress heuristic can turn `repeat skip` into a successful proof.
+    pub fn next_iteration(self, context: &Context, proof: &ProofState<'a>) -> Option<Self> {
+        (self.spec.mode == Mode::Repeat)
+            .then(|| Self::new(context, proof, self.spec, self.tasks, self.values))
     }
 }
 
@@ -160,6 +168,8 @@ impl Context {
             Mode::First
         } else if kind == &parser_kind(&["Tactic", "try"]) {
             Mode::Try
+        } else if kind == &parser_kind(&["Tactic", "repeat"]) {
+            Mode::Repeat
         } else {
             return Ok(None);
         };
@@ -168,7 +178,11 @@ impl Context {
         };
         expect_atom(
             keyword,
-            if mode == Mode::First { "first" } else { "try" },
+            match mode {
+                Mode::First => "first",
+                Mode::Try => "try",
+                Mode::Repeat => "repeat",
+            },
             "alternative keyword",
         )?;
         let mut branches = Vec::new();
@@ -243,5 +257,43 @@ mod tests {
             assert!(!recoverable(&failure(failure_kind)));
         }
         assert!(!recoverable(&error(TacticError::MalformedScript)));
+    }
+
+    #[test]
+    fn nonprogressing_repetitions_and_backtracking_cannot_refund_work() {
+        for body in [
+            "repeat skip",
+            "repeat try fail",
+            "try repeat skip",
+            "first | repeat skip | skip",
+            "repeat (first | fail | skip)",
+        ] {
+            let source = format!("theorem t : Prop := by {body}");
+            let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+            let mut pending = vec![parsed.syntax()];
+            let syntax = loop {
+                let node = pending.pop().expect("proof node");
+                if node.kind() == Some(&parser_kind(&["Term", "byTactic"])) {
+                    break node;
+                }
+                if let Syntax::Node { args, .. } = node {
+                    pending.extend(args.iter());
+                }
+            };
+            let mut context =
+                Context::new(&Environment::new(), Budget::for_stack_bytes(128 * 1024));
+            context.txn.budget.max_heartbeats = 400;
+            let result = context.term(syntax, Some(Expr::sort(Level::zero())));
+            assert!(
+                matches!(
+                    result,
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::ResourceLimit
+                    ))
+                ),
+                "{body}"
+            );
+            assert!(context.txn.budget.heartbeats_consumed > 400);
+        }
     }
 }

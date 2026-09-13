@@ -1131,6 +1131,10 @@ impl Context {
                                     return Err(failure(SourceInferenceError::Scope));
                                 }
                                 checkpoint.finish(self, &mut proof);
+                                if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
+                                    proof = next.begin(self, attempts.len())?;
+                                    attempts.push(next);
+                                }
                                 tasks.push(Task::Proof(proof));
                             }
                             tactics::ProofAction::Refine { syntax, goal } => {

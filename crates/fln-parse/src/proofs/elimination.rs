@@ -127,6 +127,8 @@ fn control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'sta
         Some(("all_goals", "allGoals"))
     } else if word(tokens, at, "try") {
         Some(("try", "try"))
+    } else if word(tokens, at, "repeat") {
+        Some(("repeat", "repeat"))
     } else {
         None
     }
@@ -1016,6 +1018,42 @@ mod backtracking_tests {
                     let parsed = parse_definition(source.as_bytes()).unwrap();
                     assert_eq!(parsed.reconstruct_original(), source.as_bytes());
                 }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::*;
+    #[test]
+    fn repetition_preserves_nested_choices_and_statement_boundaries() {
+        for source in [
+            "theorem t : 0 = 0 := by repeat (first | fail | rfl)",
+            "theorem t : 0 = 0 := by\r\n  repeat /- loop -/\r\n    first\r\n    | intro x\r\n    | rfl\r\n  skip\r\n",
+            "theorem t : 0 = 0 := by\n  constructor <;> repeat (intro x; rfl)",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for source in ["theorem t := by repeat", "theorem t := by repeat ()"] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn nested_repetition_uses_heap_parser_frames() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!(
+                    "theorem t : 0 = 0 := by {}fail{}",
+                    "repeat (".repeat(1000),
+                    ")".repeat(1000)
+                );
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
             })
             .unwrap()
             .join()

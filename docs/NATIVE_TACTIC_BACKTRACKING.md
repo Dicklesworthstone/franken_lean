@@ -42,7 +42,7 @@ Malformed source still fails parsing before any tactic can run.
 ## Bounds
 
 This is native `first` and `try`, not `first | ...` with global search over later
-instructions. Repetition and the other search combinators remain separate work.
+instructions. The other search combinators remain separate work.
 The literal text of `fail` is retained in syntax but its current diagnostic is the
 stable generic failure class. Unknown tactic grammar cannot be caught at runtime.
 This does not add goal tags, `case`, the complete metaprogram API, or a new checking
@@ -56,3 +56,33 @@ The example exercises actual dependent carrier rollback, scoped alternatives,
 proofs after failed introductions, and a nested local proof. The installed CLI
 checks the whole batch, refuses a bad suffix without reporting partial success,
 and successfully rechecks the original file afterward.
+
+## Transactional repetition
+
+`repeat tactic` checkpoints each iteration independently. Successful iterations
+retain their solved goals, introductions and dependent assignments. The final
+ordinary failure restores only that iteration and ends repetition successfully.
+An enclosing failed `first` or `try` can still roll back the whole repetition.
+
+```lean
+theorem identity (P : Prop) : P -> P -> P -> P := by
+  repeat (intro x; intro y)
+  intro last
+  exact last
+```
+
+The second attempted pair of introductions fails after its first `intro`; that
+partial work is rolled back, leaving the final argument for `intro last`. This is
+`repeat`, not `repeat'`: when the first goal rejects a tactic, repetition stops
+instead of skipping that goal and visiting its siblings. A sequence can of course
+use `all_goals` or `<;>` explicitly, with their existing isolation rules.
+
+No semantic-progress heuristic reports a nonprogressing loop as success.
+`repeat skip`, `repeat try fail`, and their enclosing `try`/`first` forms consume
+the shared work budget and return a resource nonanswer. The next checkpoint
+replaces the old one rather than retaining a growing chain of successful states.
+The finite-loop example also runs through the installed CLI:
+
+```bash
+fln check-source --json examples/native_tactic_repetition.lean
+```
