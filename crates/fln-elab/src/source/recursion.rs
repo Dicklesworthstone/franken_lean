@@ -1,7 +1,8 @@
 //! Primitive structural recursion, compiled into the match recursor's hypotheses.
 //!
 //! A recursive name is a private local marker, never an environment declaration.
-//! Only calls on an immediate recursive constructor field may replace that marker.
+//! Only calls on an immediate recursive constructor field, fully applied when
+//! function-valued, may replace that marker.
 //! The entire body must be the selected match: an induction hypothesis for an
 //! inner subexpression cannot stand for the whole function. Fixed arguments must
 //! be the original locals or their domain-checked eta expansions, not arbitrary
@@ -647,6 +648,48 @@ impl Context {
         Ok(())
     }
 
+    /// Recognize a constructor child or a fully applied function-valued child.
+    /// The field and its type come from an admitted constructor's recursive
+    /// slots, never from merely finding a function with a similar result type.
+    /// Only transparent variable aliases are followed. Every supplied argument
+    /// is returned to the caller and retained in the real hypothesis application,
+    /// including proof arguments, annotations and recursive calls inside them.
+    fn recursive_child_arguments<'a>(
+        &mut self,
+        argument: &'a Expr,
+        field: &Expr,
+        field_type: &Expr,
+    ) -> Result<Option<(Vec<&'a Expr>, Expr)>, NatDefinitionElabError> {
+        let mut head = argument;
+        let mut arguments = Vec::new();
+        loop {
+            self.tick()?;
+            if self.recursive_alias_value(head)? == *field {
+                break;
+            }
+            let ExprNode::App { f, a } = head.node() else {
+                return Ok(None);
+            };
+            arguments.push(a);
+            head = f;
+        }
+        arguments.reverse();
+        let mut type_ = self.instantiate(field_type)?;
+        for argument in &arguments {
+            self.tick()?;
+            let current = self.whnf(&type_)?;
+            let ExprNode::ForallE { body, .. } = current.node() else {
+                return Ok(None);
+            };
+            type_ = self.substitute(body, argument)?;
+        }
+        let type_ = self.whnf(&type_)?;
+        if matches!(type_.node(), ExprNode::ForallE { .. }) {
+            return Ok(None);
+        }
+        Ok(Some((arguments, type_)))
+    }
+
     /// Transform every node, including unused values and annotations. Only the
     /// original fixed local arguments and a direct child are discarded; every
     /// other argument remains in the checked term. No beta reduction is used to
@@ -704,22 +747,27 @@ impl Context {
                                 return Err(error(RecursionError::ChangedParameter));
                             }
                         }
-                        let ExprNode::FVar { id: child } = arguments[recursion.decreasing].node()
-                        else {
-                            return Err(error(RecursionError::NotDecreasing));
-                        };
-                        let hypothesis = hypotheses
-                            .iter()
-                            .find(|(field, _)| field == child)
-                            .map(|(_, ih)| Expr::fvar(ih.clone()))
-                            .ok_or_else(|| error(RecursionError::NotDecreasing))?;
+                        let mut selected = None;
+                        for (field, ih) in hypotheses {
+                            self.tick()?;
+                            let Some(local) = self.txn.lctx.find(field).cloned() else {
+                                continue;
+                            };
+                            if let Some((child_arguments, child_type)) = self
+                                .recursive_child_arguments(
+                                    arguments[recursion.decreasing],
+                                    &Expr::fvar(field.clone()),
+                                    &local.type_,
+                                )?
+                            {
+                                selected =
+                                    Some((Expr::fvar(ih.clone()), child_arguments, child_type));
+                                break;
+                            }
+                        }
+                        let (hypothesis, mut extra, child_type) =
+                            selected.ok_or_else(|| error(RecursionError::NotDecreasing))?;
                         if !recursion.indices.is_empty() {
-                            let child_type = self
-                                .txn
-                                .lctx
-                                .find(child)
-                                .map(|local| local.type_.clone())
-                                .ok_or_else(|| error(RecursionError::NotDecreasing))?;
                             let (family, parameters) = recursion
                                 .family
                                 .as_ref()
@@ -739,11 +787,12 @@ impl Context {
                                 }
                             }
                         }
-                        let mut extra: Vec<_> = recursion
-                            .varying
-                            .iter()
-                            .filter_map(|position| arguments.get(*position).copied())
-                            .collect();
+                        extra.extend(
+                            recursion
+                                .varying
+                                .iter()
+                                .filter_map(|position| arguments.get(*position).copied()),
+                        );
                         extra.extend(arguments.iter().skip(recursion.parameters.len()).copied());
                         tasks.push(Task::Call(expr, hypothesis, extra.clone()));
                         tasks.extend(extra.into_iter().rev().map(Task::Visit));

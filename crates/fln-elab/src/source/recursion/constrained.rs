@@ -16,7 +16,7 @@ enum Argument {
 #[derive(Clone)]
 pub(in crate::source) struct ConstrainedBranch {
     arguments: Vec<Argument>,
-    children: Vec<(Expr, LocalDecl)>,
+    children: Vec<(Typed, LocalDecl)>,
     hidden: Vec<LocalDecl>,
 }
 
@@ -137,7 +137,10 @@ impl Context {
                 .find_by_user_name(child)
                 .cloned()
                 .ok_or_else(|| error(RecursionError::NotDecreasing))?;
-            let child = self.recursive_alias_value(&Expr::fvar(child.id))?;
+            let child = Typed {
+                value: self.recursive_alias_value(&Expr::fvar(child.id))?,
+                type_: child.type_,
+            };
             hidden.push(ih.clone());
             children.push((child, ih));
         }
@@ -312,14 +315,29 @@ impl Context {
             }
         }
         let child = self.recursive_alias_value(&arguments[decreasing])?;
-        let hypothesis = plan
-            .children
-            .iter()
-            .find(|(field, _)| *field == child)
-            .map(|(_, ih)| ih)
-            .ok_or_else(|| error(RecursionError::NotDecreasing))?;
+        let mut selected = None;
+        for (field, ih) in &plan.children {
+            self.tick()?;
+            if let Some((arguments, _)) =
+                self.recursive_child_arguments(&child, &field.value, &field.type_)?
+            {
+                selected = Some((ih, arguments));
+                break;
+            }
+        }
+        let (hypothesis, child_arguments) =
+            selected.ok_or_else(|| error(RecursionError::NotDecreasing))?;
         let mut value = Expr::fvar(hypothesis.id.clone());
         let mut type_ = hypothesis.type_.clone();
+        for argument in child_arguments {
+            self.tick()?;
+            let current = self.whnf(&type_)?;
+            let ExprNode::ForallE { body, .. } = current.node() else {
+                return Err(error(RecursionError::NotDecreasing));
+            };
+            type_ = self.substitute(body, argument)?;
+            value = Expr::app(value, argument.clone());
+        }
         for argument in &plan.arguments {
             self.tick()?;
             let current = self.whnf(&type_)?;

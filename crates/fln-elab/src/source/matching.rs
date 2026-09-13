@@ -1045,7 +1045,11 @@ impl Context {
             });
             target = self.substitute(body, &Expr::fvar(id))?;
         }
-        if state.recursive && self.recursion.as_ref().is_some_and(|r| r.matrix) {
+        if state.recursive {
+            // Lower applications while local aliases and dependent function
+            // arguments are still open, even in a single-column root match.
+            // The same private registration used by matrices hides these
+            // hypotheses from ordinary proof and instance search.
             self.register_matrix_hypotheses(&mut locals, &hypotheses)?;
         }
         if state.recursive {

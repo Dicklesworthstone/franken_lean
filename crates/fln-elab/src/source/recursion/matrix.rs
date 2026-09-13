@@ -1,4 +1,4 @@
-//! Preserve the actual structural hypotheses across dependent matrix splits.
+//! Preserve the actual structural hypotheses across source scopes and splits.
 //!
 //! A later discriminant can force the first child's type and hypothesis into
 //! its generalized telescope. Private names survive that reconstruction; the
@@ -60,7 +60,7 @@ impl Context {
         &mut self,
         value: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
-        let Some(recursion) = self.recursion.as_ref().filter(|r| r.matrix && !r.pending) else {
+        let Some(recursion) = self.recursion.as_ref().filter(|r| !r.pending) else {
             return Ok(value.clone());
         };
         if recursion.matrix_hypotheses.is_empty() || !value.has_fvar() {

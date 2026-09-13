@@ -1696,7 +1696,9 @@ fn installed_function_children_check_real_recursors_and_preserve_failed_suffixes
     let prefix = file(include_str!(
         "../../../examples/native_function_children.lean"
     ));
-    let invalid = file("theorem impossible : first (Branching.leaf 4) = 5 := by rfl");
+    let invalid = file(
+        "def bad (t : Branching) : Nat := match t with | .leaf n => n | .node children => bad (children (bad t))",
+    );
     let before = std::fs::read(&prefix).unwrap();
     for valid in [true, false, true] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
@@ -1714,8 +1716,8 @@ fn installed_function_children_check_real_recursors_and_preserve_failed_suffixes
         if valid {
             let json = String::from_utf8(result.stdout).unwrap();
             for field in [
-                "\"commands\":9",
-                "\"theorems\":3",
+                "\"commands\":20",
+                "\"theorems\":6",
                 "\"authority\":true",
                 "\"executed\":false",
             ] {
