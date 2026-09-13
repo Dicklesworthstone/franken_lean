@@ -26,13 +26,35 @@ struct Binding {
     end: usize,
     opaque: bool,
 }
+struct Control {
+    start: usize,
+    body: Range<usize>,
+    end: usize,
+    keyword: &'static str,
+    kind: &'static str,
+    baseline: usize,
+}
+struct Chain {
+    left: Range<usize>,
+    separator: usize,
+    right: Range<usize>,
+}
 enum Plan {
+    Chain(Chain),
+    Group(Range<usize>),
+    Control(Control),
     Plain(Range<usize>),
     Bind(Binding),
     Eliminate(Elimination),
 }
 enum Task {
-    Sequence(Range<usize>),
+    Chain(Chain),
+    FinishChain(usize),
+    Group(Range<usize>),
+    FinishGroup(usize, usize),
+    Control(Control),
+    FinishControl(Control),
+    Sequence(Range<usize>, Option<usize>),
     Plain(Range<usize>),
     Eliminate(Elimination),
     FinishSequence(Vec<Option<usize>>),
@@ -87,6 +109,58 @@ fn plain_end(
         delimiter_depth(&tokens[at], &mut depth);
     }
     end
+}
+fn control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'static str)> {
+    if symbol(tokens, at, "·") {
+        Some(("·", "cdot"))
+    } else if word(tokens, at, "focus") {
+        Some(("focus", "focus"))
+    } else if word(tokens, at, "all_goals") {
+        Some(("all_goals", "allGoals"))
+    } else {
+        None
+    }
+}
+fn plan_control(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    limit: usize,
+    baseline: usize,
+    keyword: &'static str,
+    kind: &'static str,
+) -> Result<Control, NatDefinitionParseError> {
+    let body = start + 1;
+    let mut depth = 0;
+    let mut end = limit;
+    for at in body..limit {
+        if depth == 0 && newline(view, tokens, at) && column(view, tokens, at) <= baseline {
+            end = at;
+            break;
+        }
+        delimiter_depth(&tokens[at], &mut depth);
+    }
+    if body == end || depth != 0 {
+        return Err(refusal(view, tokens, body));
+    }
+    let mut body_baseline = column(view, tokens, body);
+    if !newline(view, tokens, body) {
+        let mut depth = 0;
+        for at in body..end {
+            if depth == 0 && newline(view, tokens, at) {
+                body_baseline = body_baseline.min(column(view, tokens, at));
+            }
+            delimiter_depth(&tokens[at], &mut depth);
+        }
+    }
+    Ok(Control {
+        start,
+        body: body..end,
+        end,
+        keyword,
+        kind,
+        baseline: body_baseline,
+    })
 }
 fn plan_elimination(
     view: &SourceView,
@@ -318,20 +392,75 @@ fn finish_binding(
     ))
 }
 
+/// Sequence-level combinators cannot capture operators inside term arguments,
+/// local proof values, or constructor alternatives. Those own their subranges.
+fn chain_at(tokens: &[LexedToken], range: Range<usize>) -> Option<usize> {
+    let mut depth = 0;
+    for at in range {
+        if depth == 0 {
+            if symbol(tokens, at, "<;>") {
+                return Some(at);
+            }
+            if symbol(tokens, at, ":=") || symbol(tokens, at, "with") {
+                return None;
+            }
+        }
+        delimiter_depth(&tokens[at], &mut depth);
+    }
+    None
+}
+
 fn split(
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
+    baseline: Option<usize>,
 ) -> Result<(Vec<Plan>, Vec<Option<usize>>), NatDefinitionParseError> {
     if range.is_empty() {
         return Err(refusal(view, tokens, range.start));
     }
-    let baseline = column(view, tokens, range.start);
+    let baseline = baseline.unwrap_or_else(|| column(view, tokens, range.start));
     let mut cursor = range.start;
     let mut plans = Vec::new();
     let mut separators = Vec::new();
     while cursor < range.end {
-        let (plan, end) = if word(tokens, cursor, "have") || symbol(tokens, cursor, "let") {
+        let (plan, end) = if let Some((keyword, kind)) = control_word(tokens, cursor) {
+            let plan = plan_control(view, tokens, cursor, range.end, baseline, keyword, kind)?;
+            let end = plan.end;
+            (Plan::Control(plan), end)
+        } else if let Some(separator) = chain_at(
+            tokens,
+            cursor..plain_end(view, tokens, cursor, range.end, baseline),
+        ) {
+            let end = plain_end(view, tokens, cursor, range.end, baseline);
+            if separator == cursor || separator + 1 == end {
+                return Err(refusal(view, tokens, separator));
+            }
+            (
+                Plan::Chain(Chain {
+                    left: cursor..separator,
+                    separator,
+                    right: separator + 1..end,
+                }),
+                end,
+            )
+        } else if symbol(tokens, cursor, "(") {
+            let end = plain_end(view, tokens, cursor, range.end, baseline);
+            if end <= cursor + 2 || !symbol(tokens, end - 1, ")") {
+                return Err(refusal(view, tokens, cursor));
+            }
+            let mut depth = 0;
+            for at in cursor..end {
+                delimiter_depth(&tokens[at], &mut depth);
+                if depth == 0 && at != end - 1 {
+                    return Err(refusal(view, tokens, at));
+                }
+            }
+            if depth != 0 {
+                return Err(refusal(view, tokens, end));
+            }
+            (Plan::Group(cursor..end), end)
+        } else if word(tokens, cursor, "have") || symbol(tokens, cursor, "let") {
             let plan = plan_binding(view, tokens, cursor, range.end, baseline)?;
             let end = plan.end;
             (Plan::Bind(plan), end)
@@ -372,25 +501,65 @@ pub(super) fn sequence(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let mut tasks = vec![Task::Sequence(range)];
+    let mut tasks = vec![Task::Sequence(range, None)];
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
-            Task::Sequence(range) => {
-                let (plans, separators) = split(view, tokens, range)?;
+            Task::Sequence(range, baseline) => {
+                let (plans, separators) = split(view, tokens, range, baseline)?;
                 tasks.push(Task::FinishSequence(separators));
                 tasks.extend(plans.into_iter().rev().map(|plan| match plan {
+                    Plan::Chain(plan) => Task::Chain(plan),
+                    Plan::Group(range) => Task::Group(range),
                     Plan::Plain(range) => Task::Plain(range),
+                    Plan::Control(plan) => Task::Control(plan),
                     Plan::Bind(plan) => Task::Bind(plan),
                     Plan::Eliminate(plan) => Task::Eliminate(plan),
                 }));
+            }
+            Task::Chain(plan) => {
+                tasks.push(Task::FinishChain(plan.separator));
+                tasks.push(Task::Sequence(plan.right, None));
+                tasks.push(Task::Sequence(plan.left, None));
+            }
+            Task::FinishChain(separator) => {
+                let right = values.pop().expect("sequenced tactic right operand");
+                let left = values.pop().expect("sequenced tactic left operand");
+                values.push(Syntax::node(
+                    parser_kind(&["Tactic", "andThen"]),
+                    vec![left, leaves.leaf(separator)?, right],
+                ));
+            }
+            Task::Group(range) => {
+                tasks.push(Task::FinishGroup(range.start, range.end - 1));
+                tasks.push(Task::Sequence(range.start + 1..range.end - 1, None));
+            }
+            Task::FinishGroup(open, close) => {
+                let body = values.pop().expect("parenthesized tactic sequence");
+                values.push(Syntax::node(
+                    parser_kind(&["Tactic", "paren"]),
+                    vec![leaves.leaf(open)?, body, leaves.leaf(close)?],
+                ));
+            }
+            Task::Control(plan) => {
+                let body = plan.body.clone();
+                let baseline = plan.baseline;
+                tasks.push(Task::FinishControl(plan));
+                tasks.push(Task::Sequence(body, Some(baseline)));
+            }
+            Task::FinishControl(plan) => {
+                let body = values.pop().expect("scoped tactic sequence");
+                values.push(Syntax::node(
+                    parser_kind(&["Tactic", plan.kind]),
+                    vec![atom(leaves, plan.start, plan.keyword)?, body],
+                ));
             }
             Task::Plain(range) => values.push(tactic(leaves, view, tokens, range)?),
             Task::Bind(plan) => {
                 if plan.by.is_some() {
                     let range = plan.value.clone();
                     tasks.push(Task::FinishBinding(plan));
-                    tasks.push(Task::Sequence(range));
+                    tasks.push(Task::Sequence(range, None));
                 } else {
                     let value = binding_term(leaves, view, tokens, plan.value.clone())?;
                     values.push(finish_binding(leaves, view, tokens, plan, value)?);
@@ -407,7 +576,12 @@ pub(super) fn sequence(
                     .map(|alt| alt.body.clone())
                     .collect();
                 tasks.push(Task::FinishElimination(plan));
-                tasks.extend(bodies.into_iter().rev().map(Task::Sequence));
+                tasks.extend(
+                    bodies
+                        .into_iter()
+                        .rev()
+                        .map(|range| Task::Sequence(range, None)),
+                );
             }
             Task::FinishSequence(separators) => {
                 let count = separators.len();
@@ -539,6 +713,119 @@ mod tests {
                 }
                 let parsed = parse_definition(source.as_bytes()).unwrap();
                 assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod goal_control_tests {
+    use super::*;
+    #[test]
+    fn goal_scopes_preserve_original_leaves_and_statement_boundaries() {
+        for source in [
+            "-- scope\r\ntheorem t : 0 = 0 := by\r\n  · have h : 0 = 0 := by rfl -- inner\r\n    exact h\r\n",
+            "theorem t : 0 = 0 := by\n  focus\n    all_goals rfl",
+            "theorem t : 0 = 0 := by\n  focus intro n\n  rfl",
+            "def focus (all_goals : Nat) : Nat := all_goals",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn missing_and_misindented_goal_scope_bodies_refuse() {
+        for body in [
+            "·",
+            "focus",
+            "all_goals",
+            "·\n  rfl",
+            "focus\n  rfl",
+            "all_goals\n  rfl",
+            "· ; rfl",
+            "focus unknownTactic",
+        ] {
+            let source = format!("theorem t : 0 = 0 := by\n  {body}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn deeply_nested_goal_scopes_are_heap_planned() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut source = String::from("theorem t : 0 = 0 := by\n");
+                for level in 0..500 {
+                    source.push_str(&" ".repeat(level + 2));
+                    source.push_str("focus\n");
+                }
+                source.push_str(&" ".repeat(502));
+                source.push_str("rfl\n");
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sequencing_tests {
+    use super::*;
+    #[test]
+    fn tactic_sequencing_preserves_original_parentheses_and_operator_leaves() {
+        for source in [
+            "theorem t : 0 = 0 := by constructor <;> rfl",
+            "theorem t : 0 = 0 := by\r\n  constructor <;> (intro x; rfl) -- trailing\r\n",
+            "theorem t : 0 = 0 := by\n  all_goals constructor <;> (have h := p; exact h)",
+            "theorem t : 0 = 0 := by\n  cases b with\n  | false => constructor <;> rfl\n  | true => constructor <;> rfl",
+            "theorem t : 0 = 0 := by ((constructor; rfl); rfl)",
+            "theorem t : 0 = 0 := by\n  have local : P := by\n    constructor <;> rfl\n  exact local",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn missing_sequencing_operands_and_malformed_groups_refuse() {
+        for body in [
+            "<;> rfl",
+            "rfl <;>",
+            "rfl <;> <;> rfl",
+            "()",
+            "(rfl) rfl",
+            "(rfl",
+            "rfl)",
+            "constructor <;> ()",
+        ] {
+            let source = format!("theorem bad : 0 = 0 := by {body}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn deep_sequencing_and_parentheses_use_the_heap_plan() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                for body in [
+                    format!("{}rfl{}", "(".repeat(1000), ")".repeat(1000)),
+                    format!("{}rfl", "rfl <;> ".repeat(1000)),
+                ] {
+                    let source = format!("theorem t : 0 = 0 := by {body}");
+                    let parsed = parse_definition(source.as_bytes()).unwrap();
+                    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                }
             })
             .unwrap()
             .join()

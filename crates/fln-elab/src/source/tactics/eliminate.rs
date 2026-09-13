@@ -392,6 +392,7 @@ impl Context {
             instructions: Vec::new(),
             cursor: 0,
             work: Vec::new(),
+            controls: Vec::new(),
         };
         self.eliminate_proof_goal_with_indices(
             &mut proof,

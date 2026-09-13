@@ -9,6 +9,7 @@ use super::*;
 mod construct;
 mod constructor_transport;
 mod constructors;
+mod control;
 pub(in crate::source) mod eliminate;
 mod equality;
 mod index_equations;
@@ -105,6 +106,7 @@ pub(super) struct ProofGoal {
     pub(in crate::source) introduced: Vec<LocalDecl>,
 }
 enum Work<'a> {
+    EndControl(usize),
     Rewrite(ProofGoal, std::collections::VecDeque<RewriteRule<'a>>, bool),
     Goal(ProofGoal),
     Close(ProofGoal, Expr),
@@ -119,6 +121,7 @@ pub(super) struct ProofState<'a> {
     instructions: Vec<&'a Syntax>,
     cursor: usize,
     work: Vec<Work<'a>>,
+    controls: Vec<control::Frame<'a>>,
 }
 pub(super) struct RewriteRule<'a> {
     pub(super) syntax: &'a Syntax,
@@ -183,6 +186,7 @@ impl Context {
             instructions,
             cursor: 0,
             work: vec![Work::Goal(goal)],
+            controls: Vec::new(),
         })
     }
 
@@ -190,26 +194,47 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Vec<&'a Syntax>, NatDefinitionElabError> {
-        let sequence = expect_node(
-            syntax,
-            &parser_kind(&["Tactic", "tacticSeq"]),
-            1,
-            "tactic sequence",
-        )?;
-        let sequence = expect_node(
-            &sequence[0],
-            &parser_kind(&["Tactic", "tacticSeq1Indented"]),
-            1,
-            "flat tactic sequence",
-        )?;
-        let rows = expect_null_args(&sequence[0], "tactic sequence rows")?;
         let mut instructions = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
+        let mut pending = vec![(syntax, true)];
+        while let Some((syntax, sequence)) = pending.pop() {
             self.tick()?;
-            if index % 2 == 0 {
-                instructions.push(row);
-            } else if !row.is_missing() && !matches!(row, Syntax::Atom { val, .. } if val == ";") {
-                return Err(error(TacticError::MalformedScript));
+            if !sequence {
+                if let Syntax::Node { kind, args, .. } = syntax
+                    && kind == &parser_kind(&["Tactic", "paren"])
+                {
+                    let [open, body, close] = args.as_slice() else {
+                        return Err(error(TacticError::MalformedScript));
+                    };
+                    expect_atom(open, "(", "tactic sequence opening")?;
+                    expect_atom(close, ")", "tactic sequence closing")?;
+                    pending.push((body, true));
+                } else {
+                    instructions.push(syntax);
+                }
+                continue;
+            }
+            let sequence = expect_node(
+                syntax,
+                &parser_kind(&["Tactic", "tacticSeq"]),
+                1,
+                "tactic sequence",
+            )?;
+            let sequence = expect_node(
+                &sequence[0],
+                &parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                1,
+                "flat tactic sequence",
+            )?;
+            let rows = expect_null_args(&sequence[0], "tactic sequence rows")?;
+            for (index, row) in rows.iter().enumerate().rev() {
+                self.tick()?;
+                if index % 2 == 0 {
+                    pending.push((row, false));
+                } else if !row.is_missing()
+                    && !matches!(row, Syntax::Atom { val, .. } if val == ";")
+                {
+                    return Err(error(TacticError::MalformedScript));
+                }
             }
         }
         Ok(instructions)
@@ -306,6 +331,7 @@ impl Context {
         loop {
             self.tick()?;
             let Some(work) = proof.work.pop() else {
+                self.skip_empty_goal_controls(proof)?;
                 if proof.cursor != proof.instructions.len() {
                     return Err(error(TacticError::NoGoals));
                 }
@@ -317,6 +343,10 @@ impl Context {
                 }));
             };
             let mut goal = match work {
+                Work::EndControl(index) => {
+                    self.finish_goal_control(proof, index, Vec::new())?;
+                    continue;
+                }
                 Work::Term(mut goal, syntax) => {
                     self.txn.lctx = goal.lctx.clone();
                     goal.target = self.instantiate(&goal.target)?;
@@ -333,6 +363,7 @@ impl Context {
                     goal
                 }
                 Work::EndScript(instructions, cursor) => {
+                    self.skip_empty_goal_controls(proof)?;
                     if proof.cursor != proof.instructions.len() {
                         return Err(error(TacticError::NoGoals));
                     }
@@ -367,6 +398,9 @@ impl Context {
             self.txn.lctx = goal.lctx.clone();
             goal.target = self.instantiate(&goal.target)?;
             let Some(&instruction) = proof.instructions.get(proof.cursor) else {
+                if self.suspend_goal_control(proof, &goal)? {
+                    continue;
+                }
                 let count = 1 + proof.work.iter().filter(|row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id))).count();
                 return Err(error(TacticError::UnsolvedGoals { count }));
             };
@@ -374,7 +408,20 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "have"]) || kind == &parser_kind(&["Tactic", "let"])
+            if kind == &parser_kind(&["Tactic", "andThen"]) {
+                let [left, separator, right] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(separator, "<;>", "goal sequencing operator")?;
+                self.start_goal_sequence(proof, goal, left, right)?;
+            } else if let Some(mode) = control::mode(kind) {
+                let [keyword, sequence] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, mode.keyword(), "goal control keyword")?;
+                self.start_goal_control(proof, goal, sequence, mode)?;
+            } else if kind == &parser_kind(&["Tactic", "have"])
+                || kind == &parser_kind(&["Tactic", "let"])
             {
                 let opaque = kind == &parser_kind(&["Tactic", "have"]);
                 let [keyword, name, annotation, assign, value] = args.as_slice() else {

@@ -1804,3 +1804,79 @@ fn installed_refinement_checks_scoped_holes_and_preserves_failure_isolation() {
         assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
     }
 }
+
+#[test]
+fn installed_goal_controls_check_scopes_and_isolate_failed_suffixes() {
+    let prefix = file(include_str!("../../../examples/native_goal_control.lean"));
+    let invalid = file(
+        "theorem bad (P : Prop) (p : P) : Both (P -> P) P := by\n  constructor\n  · intro h\n  · exact p\n  exact p",
+    );
+    let bytes = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(result.stdout).unwrap();
+            for expected in [
+                "\"commands\":12",
+                "\"theorems\":8",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+        } else {
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn installed_tactic_sequencing_preserves_checked_frontiers_and_failure_atomicity() {
+    let prefix = file(include_str!(
+        "../../../examples/native_tactic_sequencing.lean"
+    ));
+    let invalid = file("theorem bad : Both (0 = 0) (0 = 1) := by constructor <;> rfl");
+    let bytes = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(result.stdout).unwrap();
+            for expected in [
+                "\"commands\":12",
+                "\"theorems\":8",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+        } else {
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
+    }
+}

@@ -549,6 +549,8 @@ fn nat_definition_token_table() -> TokenTable {
         "]",
         ",",
         "←",
+        "·",
+        "<;>",
         "<-",
     ])
 }
@@ -616,6 +618,8 @@ fn source_module_token_table() -> TokenTable {
         "]",
         ",",
         "←",
+        "·",
+        "<;>",
         "<-",
     ])
 }
