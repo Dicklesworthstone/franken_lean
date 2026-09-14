@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture the checked backtracking baseline before the next proof-language increment.
+# Capture the reconciled instance-boundary and backtracking frontend for the next increment.
 on:
   push:
     branches: [main]
