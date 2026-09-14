@@ -107,7 +107,15 @@ fn plain_end(
     baseline: usize,
 ) -> usize {
     let mut depth = 0;
+    let mut nested_lets = 0usize;
     for at in start..end {
+        if depth == 0 && at > start && symbol(tokens, at, "let") {
+            nested_lets += 1;
+        }
+        if depth == 0 && symbol(tokens, at, ";") && nested_lets > 0 {
+            nested_lets -= 1;
+            continue;
+        }
         if depth == 0
             && (symbol(tokens, at, ";")
                 || at > start && newline(view, tokens, at) && column(view, tokens, at) <= baseline)
