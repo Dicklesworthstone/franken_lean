@@ -32,8 +32,8 @@ impl Context {
         let snapshot = self.clone();
         for constructor in candidates {
             // All application failures precede worklist publication. Inference
-            // changes from an inapplicable constructor must not contaminate the
-            // next one, and consumed work is never refunded.
+            // changes from an index mismatch or unavailable instance must not
+            // contaminate the next constructor, and work is never refunded.
             let spent = self.txn.budget.heartbeats_consumed;
             *self = snapshot.clone();
             self.txn.budget.heartbeats_consumed = spent;
@@ -44,8 +44,9 @@ impl Context {
             if info.induct != family.base.name || info.num_params != family.num_params {
                 return Err(error(TacticError::NoConstructor));
             }
+            let instance_start = self.instance_goals.len();
             let term = self.constant(&constructor)?;
-            match self.apply_proof_term(proof, goal.clone(), term) {
+            match self.apply_proof_term(proof, goal.clone(), term, instance_start) {
                 Ok(()) => return Ok(()),
                 Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
                     TacticError::ApplyMismatch,

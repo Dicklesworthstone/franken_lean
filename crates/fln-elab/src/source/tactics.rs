@@ -656,6 +656,7 @@ impl Context {
         proof: &mut ProofState<'_>,
         goal: ProofGoal,
         mut term: Typed,
+        instance_start: usize,
     ) -> Result<(), NatDefinitionElabError> {
         let mut arguments = Vec::new();
         loop {
@@ -686,6 +687,16 @@ impl Context {
             term.type_ = self.substitute(&body, &argument)?;
         }
         self.resolve_instances(false)?;
+        // Application must discharge its own instance arguments before it
+        // commits. Ordinary fields remain goals, but an unavailable dictionary
+        // makes this candidate inapplicable, including when its inputs are
+        // still unknown. Surrounding terms may have older deferred instances.
+        if self.instance_goals[instance_start..]
+            .iter()
+            .any(|id| !self.txn.mvars.is_assigned(id))
+        {
+            return Err(error(TacticError::ApplyMismatch));
+        }
         proof.work.push(Work::Close(goal, term.value));
         // Dependency-producing parameters precede later parameters. Metavariables
         // already inferred while matching the conclusion are skipped by advance.

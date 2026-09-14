@@ -694,7 +694,7 @@ impl Context {
                 Option<Expr>,
                 bool,
             ),
-            ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, bool),
+            ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, Option<usize>),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
@@ -1083,7 +1083,10 @@ impl Context {
                             Some(goal.target.clone())
                         };
                         self.txn.lctx = goal.lctx.clone();
-                        tasks.push(Task::ProofTerm(proof, goal, apply));
+                        // Written arguments can insert implicit dictionaries
+                        // before apply starts opening the remaining telescope.
+                        let instance_start = apply.then_some(self.instance_goals.len());
+                        tasks.push(Task::ProofTerm(proof, goal, instance_start));
                         tasks.push(Task::Visit(syntax, expected, true));
                     }
                     tactics::ProofAction::Complete(term) => values.push(term),
@@ -1118,10 +1121,10 @@ impl Context {
                     self.finish_refinement(&mut proof, goal, term, depth)?;
                     tasks.push(Task::Proof(proof));
                 }
-                Task::ProofTerm(mut proof, goal, apply) => {
+                Task::ProofTerm(mut proof, goal, instance_start) => {
                     let term = values.pop().expect("tactic term visit");
-                    if apply {
-                        self.apply_proof_term(&mut proof, goal, term)?;
+                    if let Some(instance_start) = instance_start {
+                        self.apply_proof_term(&mut proof, goal, term, instance_start)?;
                     } else {
                         self.close_proof_goal(goal, term.value)?;
                     }
