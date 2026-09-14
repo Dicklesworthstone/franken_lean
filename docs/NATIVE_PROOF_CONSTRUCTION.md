@@ -1,9 +1,10 @@
 # Native constructor proof construction
 
 `constructor` applies the first admitted constructor whose result can unify with
-the current target. `left` and `right` choose the first or second constructor of
-a family with exactly two constructors. They work for source-defined propositions
-and data types, including indexed families and dependent records.
+the current target and whose instance arguments can be synthesized. `left` and
+`right` choose the first or second constructor of a family with exactly two
+constructors. They work for source-defined propositions and data types, including
+indexed families and dependent records.
 
 ```lean
 theorem pair (P Q : Prop) (p : P) (q : Q) : Both P Q := by
@@ -15,10 +16,19 @@ theorem pair (P Q : Prop) (p : P) (q : Q) : Both P Q := by
 The tactics reuse ordinary application and instance search. Inferred parameters
 are skipped; unsolved fields become real proof-state goals. Fields are scheduled
 in telescope order so a witness or type can be provided before a later dependent
-field. A constructor whose index does not match is retried transactionally: no
-speculative metavariables, equations, generated identities, or goals survive,
+field. A constructor whose index does not match or whose required instance is
+unavailable is retried transactionally: no speculative metavariables, equations,
+generated identities, or goals survive,
 while spent work is retained. This is constructor selection, not proof search
 through the subsequent field goals.
+
+As with `apply`, the candidate's instance arguments must be resolved before its
+fields become goals, including instances inserted while elaborating written
+arguments in `apply f arg`. An unknown class input also makes the candidate
+inapplicable; supplying an ordinary field in a later tactic cannot rescue it.
+Older instance obligations in a surrounding term remain deferred and must still
+be discharged when that term is completed. `left` and `right` fail if their chosen
+constructor needs an unavailable instance; they never switch branches.
 
 Completed values contain the actual constructor application. Introduced local
 contexts close only after their descendants are solved, and unused annotations
