@@ -2031,3 +2031,39 @@ fn installed_boolean_conditionals_preserve_all_branch_obligations() {
         assert_eq!(std::fs::read(&prefix).unwrap(), original);
     }
 }
+
+#[test]
+fn installed_decision_instances_compute_and_isolate_failed_suffixes() {
+    let prefix = file(include_str!("../../../examples/native_decisions.lean"));
+    let invalid = file("def forged : Decidable False := Decidable.isTrue True.intro");
+    let before = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(result.stdout).unwrap();
+            for field in [
+                "\"commands\":10",
+                "\"theorems\":6",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(field), "{json}");
+            }
+        } else {
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}

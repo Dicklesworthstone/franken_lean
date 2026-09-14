@@ -20,6 +20,7 @@
 //! internal fault while constructing this environment is never rendered as a
 //! kernel rejection (FL-INV-07).
 
+mod decidable;
 pub mod equality;
 mod heterogeneous;
 pub mod inhabited;
@@ -610,7 +611,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 40] {
+pub fn source_seed_declarations() -> [Declaration; 50] {
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -652,6 +653,16 @@ pub fn source_seed_declarations() -> [Declaration; 40] {
         heterogeneous::eq_of_heq_seed_declaration(),
         heterogeneous::symmetry_seed_declaration(),
         heterogeneous::transitivity_seed_declaration(),
+        decidable::false_declaration(),
+        decidable::true_declaration(),
+        decidable::not_declaration(),
+        decidable::decidable_declaration(),
+        decidable::conditional_declaration(false),
+        decidable::conditional_declaration(true),
+        decidable::decide_declaration(),
+        decidable::true_instance(),
+        decidable::false_instance(),
+        decidable::not_instance(),
     ]
 }
 

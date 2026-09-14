@@ -2130,17 +2130,22 @@ impl Engine {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             }
         }
-        engine.environment = fln_elab::instances::register_class(
-            &engine.environment,
-            &Name::from_components(["Inhabited"]),
-        )
-        .map_err(|_| EngineAdmissionError::UnexpectedPublication {
-            detail: "source class registration failed",
-        })?;
+        for class in ["Inhabited", "Decidable"] {
+            engine.environment = fln_elab::instances::register_class(
+                &engine.environment,
+                &Name::from_components([class]),
+            )
+            .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                detail: "source class registration failed",
+            })?;
+        }
         for name in [
             "instInhabitedNat",
             "instInhabitedString",
             "instInhabitedBool",
+            "instDecidableTrue",
+            "instDecidableFalse",
+            "instDecidableNot",
         ] {
             engine.environment = fln_elab::instances::register_instance(
                 &engine.environment,
