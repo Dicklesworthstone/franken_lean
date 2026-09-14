@@ -1770,6 +1770,45 @@ fn installed_constructor_tactics_check_fields_and_isolate_a_failed_suffix() {
 }
 
 #[test]
+fn installed_constructor_fallback_preserves_instance_obligations_and_failed_suffixes() {
+    let prefix = file(
+        "class Missing where\n value : Nat\ninductive Pick where\n | needs (unused : Nat) [Missing] : Pick\n | ready (value : Nat) : Pick\ndef chosen : Pick := by constructor; exact 7\ntheorem checked : chosen = Pick.ready 7 := by rfl",
+    );
+    let invalid = file("def bad : Pick := by left; exact 7");
+    let bytes = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(result.stdout).unwrap();
+            for expected in [
+                "\"commands\":4",
+                "\"theorems\":1",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(expected), "{json}");
+            }
+            assert!(result.stderr.is_empty());
+        } else {
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn installed_refinement_checks_scoped_holes_and_preserves_failure_isolation() {
     let prefix = file(include_str!("../../../examples/native_refinement.lean"));
     let invalid = file("theorem invalid : 0 = 1 := by refine ?_; rfl");
