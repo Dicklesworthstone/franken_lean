@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture the current recursive matrix frontend before further pattern integration.
+# Capture the checked backtracking baseline before the next proof-language increment.
 on:
   push:
     branches: [main]

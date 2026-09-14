@@ -6,6 +6,7 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+pub(in crate::source) mod backtrack;
 mod construct;
 mod constructor_transport;
 mod constructors;
@@ -19,6 +20,7 @@ pub(in crate::source) use refine::RefinementFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticError {
+    ExplicitFailure,
     ExpectedGoal,
     NoGoals,
     UnsolvedGoals { count: usize },
@@ -46,6 +48,7 @@ pub enum TacticError {
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ExplicitFailure => write!(f, "explicit tactic failure"),
             Self::ExpectedGoal => write!(f, "by proof requires an expected type"),
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
@@ -105,7 +108,9 @@ pub(super) struct ProofGoal {
     pub(super) lctx: LocalContext,
     pub(in crate::source) introduced: Vec<LocalDecl>,
 }
+#[derive(Clone)]
 enum Work<'a> {
+    EndAttempt(usize),
     EndControl(usize),
     Rewrite(ProofGoal, std::collections::VecDeque<RewriteRule<'a>>, bool),
     Goal(ProofGoal),
@@ -114,6 +119,7 @@ enum Work<'a> {
     Term(ProofGoal, &'a Syntax),
     EndScript(Vec<&'a Syntax>, usize),
 }
+#[derive(Clone)]
 pub(super) struct ProofState<'a> {
     saved: LocalContext,
     target: Expr,
@@ -123,12 +129,15 @@ pub(super) struct ProofState<'a> {
     work: Vec<Work<'a>>,
     controls: Vec<control::Frame<'a>>,
 }
+#[derive(Clone)]
 pub(super) struct RewriteRule<'a> {
     pub(super) syntax: &'a Syntax,
     pub(super) reverse: bool,
 }
 
 pub(super) enum ProofAction<'a> {
+    Attempt(backtrack::Spec<'a>),
+    AttemptComplete(usize),
     Refine {
         syntax: &'a Syntax,
         goal: ProofGoal,
@@ -330,6 +339,25 @@ impl Context {
     ) -> Result<ProofAction<'a>, NatDefinitionElabError> {
         loop {
             self.tick()?;
+            if matches!(
+                proof.work.last(),
+                None | Some(Work::EndScript(..) | Work::EndControl(_) | Work::EndAttempt(_))
+            ) {
+                self.skip_empty_goal_controls(proof)?;
+                if let Some(&instruction) = proof.instructions.get(proof.cursor) {
+                    if let Some(spec) = self.backtrack_instruction(instruction)? {
+                        proof.cursor += 1;
+                        return Ok(ProofAction::Attempt(spec));
+                    }
+                    if instruction.kind() == Some(&parser_kind(&["Tactic", "skip"])) {
+                        proof.cursor += 1;
+                        continue;
+                    }
+                    if instruction.kind() == Some(&parser_kind(&["Tactic", "fail"])) {
+                        return Err(error(TacticError::ExplicitFailure));
+                    }
+                }
+            }
             let Some(work) = proof.work.pop() else {
                 self.skip_empty_goal_controls(proof)?;
                 if proof.cursor != proof.instructions.len() {
@@ -343,6 +371,13 @@ impl Context {
                 }));
             };
             let mut goal = match work {
+                Work::EndAttempt(index) => {
+                    self.skip_empty_goal_controls(proof)?;
+                    if proof.cursor != proof.instructions.len() {
+                        return Err(error(TacticError::NoGoals));
+                    }
+                    return Ok(ProofAction::AttemptComplete(index));
+                }
                 Work::EndControl(index) => {
                     self.finish_goal_control(proof, index, Vec::new())?;
                     continue;
@@ -398,6 +433,9 @@ impl Context {
             self.txn.lctx = goal.lctx.clone();
             goal.target = self.instantiate(&goal.target)?;
             let Some(&instruction) = proof.instructions.get(proof.cursor) else {
+                if let Some(index) = self.suspend_attempt(proof, &goal)? {
+                    return Ok(ProofAction::AttemptComplete(index));
+                }
                 if self.suspend_goal_control(proof, &goal)? {
                     continue;
                 }
@@ -408,7 +446,14 @@ impl Context {
             let Syntax::Node { kind, args, .. } = instruction else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if kind == &parser_kind(&["Tactic", "andThen"]) {
+            if let Some(spec) = self.backtrack_instruction(instruction)? {
+                proof.work.push(Work::Goal(goal));
+                return Ok(ProofAction::Attempt(spec));
+            } else if kind == &parser_kind(&["Tactic", "skip"]) {
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "fail"]) {
+                return Err(error(TacticError::ExplicitFailure));
+            } else if kind == &parser_kind(&["Tactic", "andThen"]) {
                 let [left, separator, right] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };

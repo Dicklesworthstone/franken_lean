@@ -31,6 +31,7 @@ pub(super) fn mode(kind: &Name) -> Option<Mode> {
         None
     }
 }
+#[derive(Clone)]
 pub(super) struct Frame<'a> {
     mode: Mode,
     body: Vec<&'a Syntax>,
@@ -108,7 +109,7 @@ impl Context {
         for work in proof.work.iter().rev() {
             self.tick()?;
             match work {
-                Work::EndScript(..) => return Ok(false),
+                Work::EndScript(..) | Work::EndAttempt(_) => return Ok(false),
                 Work::EndControl(index) => {
                     boundary = Some(*index);
                     break;

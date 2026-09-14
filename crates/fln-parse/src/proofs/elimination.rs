@@ -39,7 +39,13 @@ struct Chain {
     separator: usize,
     right: Range<usize>,
 }
+struct Choice {
+    start: usize,
+    branches: Vec<(usize, Range<usize>)>,
+    end: usize,
+}
 enum Plan {
+    Choice(Choice),
     Chain(Chain),
     Group(Range<usize>),
     Control(Control),
@@ -48,6 +54,8 @@ enum Plan {
     Eliminate(Elimination),
 }
 enum Task {
+    Choice(Choice),
+    FinishChoice(Choice),
     Chain(Chain),
     FinishChain(usize),
     Group(Range<usize>),
@@ -99,7 +107,15 @@ fn plain_end(
     baseline: usize,
 ) -> usize {
     let mut depth = 0;
+    let mut nested_lets = 0usize;
     for at in start..end {
+        if depth == 0 && at > start && symbol(tokens, at, "let") {
+            nested_lets += 1;
+        }
+        if depth == 0 && symbol(tokens, at, ";") && nested_lets > 0 {
+            nested_lets -= 1;
+            continue;
+        }
         if depth == 0
             && (symbol(tokens, at, ";")
                 || at > start && newline(view, tokens, at) && column(view, tokens, at) <= baseline)
@@ -117,9 +133,83 @@ fn control_word(tokens: &[LexedToken], at: usize) -> Option<(&'static str, &'sta
         Some(("focus", "focus"))
     } else if word(tokens, at, "all_goals") {
         Some(("all_goals", "allGoals"))
+    } else if word(tokens, at, "try") {
+        Some(("try", "try"))
+    } else if word(tokens, at, "repeat") {
+        Some(("repeat", "repeat"))
     } else {
         None
     }
+}
+fn plan_choice(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    limit: usize,
+    baseline: usize,
+) -> Result<Choice, NatDefinitionParseError> {
+    let first = start + 1;
+    if first >= limit || !symbol(tokens, first, "|") {
+        return Err(refusal(view, tokens, first));
+    }
+    let pipe_column = column(view, tokens, first);
+    let mut pipes = vec![first];
+    let mut depth = 0;
+    let mut term_pipes = false;
+    let mut end = limit;
+    for at in first + 1..limit {
+        if depth == 0 {
+            let fresh = newline(view, tokens, at);
+            if fresh
+                && column(view, tokens, at) <= baseline
+                && !(symbol(tokens, at, "|") && column(view, tokens, at) == pipe_column)
+            {
+                end = at;
+                break;
+            }
+            let source = view.normalized();
+            let line_start = source
+                .line_start(source.line_of(tokens[at].extent.start()))
+                .expect("choice line")
+                .0;
+            let line_indent = source.as_bytes()[line_start..tokens[at].extent.start().0]
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
+            if symbol(tokens, at, "|")
+                && (fresh && column(view, tokens, at) == pipe_column
+                    || !fresh && line_indent <= pipe_column && !term_pipes)
+            {
+                pipes.push(at);
+                term_pipes = false;
+            } else if symbol(tokens, at, "match")
+                || symbol(tokens, at, "with")
+                || ((symbol(tokens, at, "fun") || symbol(tokens, at, "λ"))
+                    && symbol(tokens, at + 1, "|"))
+            {
+                // The expression/scoped-elimination planner owns its pipes.
+                // An outer pipe at this block's indentation resumes the choice.
+                term_pipes = true;
+            }
+        }
+        delimiter_depth(&tokens[at], &mut depth);
+    }
+    if depth != 0 {
+        return Err(refusal(view, tokens, end));
+    }
+    let mut branches = Vec::with_capacity(pipes.len());
+    for (index, pipe) in pipes.iter().copied().enumerate() {
+        let stop = pipes.get(index + 1).copied().unwrap_or(end);
+        if pipe + 1 == stop {
+            return Err(refusal(view, tokens, pipe));
+        }
+        branches.push((pipe, pipe + 1..stop));
+    }
+    Ok(Choice {
+        start,
+        branches,
+        end,
+    })
 }
 fn plan_control(
     view: &SourceView,
@@ -210,6 +300,8 @@ fn plan_elimination(
     let pipe_column = column(view, tokens, first);
     let mut pipes = Vec::new();
     let mut depth = 0;
+    let mut in_body = false;
+    let mut nested_pipes = false;
     let mut end = limit;
     for at in first..limit {
         let fresh_line = newline(view, tokens, at);
@@ -224,11 +316,26 @@ fn plan_elimination(
         }
         if depth == 0
             && symbol(tokens, at, "|")
-            && (at == first || !fresh_line || column(view, tokens, at) == pipe_column)
+            && (at == first
+                || !fresh_line && !nested_pipes
+                || fresh_line && column(view, tokens, at) == pipe_column)
         {
-            // An inline nested elimination must be parenthesized; multiline
-            // nesting uses a strictly deeper alternative indentation.
+            // A nested choice owns its inline pipes. The next constructor
+            // alternative resumes at the original pipe indentation.
             pipes.push(at);
+            in_body = false;
+            nested_pipes = false;
+        } else if depth == 0 {
+            if symbol(tokens, at, "=>") || symbol(tokens, at, "↦") {
+                in_body = true;
+            } else if in_body
+                && (word(tokens, at, "first")
+                    || symbol(tokens, at, "match")
+                    || ((symbol(tokens, at, "fun") || symbol(tokens, at, "λ"))
+                        && symbol(tokens, at + 1, "|")))
+            {
+                nested_pipes = true;
+            }
         }
         delimiter_depth(&tokens[at], &mut depth);
     }
@@ -424,7 +531,11 @@ fn split(
     let mut plans = Vec::new();
     let mut separators = Vec::new();
     while cursor < range.end {
-        let (plan, end) = if let Some((keyword, kind)) = control_word(tokens, cursor) {
+        let (plan, end) = if word(tokens, cursor, "first") {
+            let plan = plan_choice(view, tokens, cursor, range.end, baseline)?;
+            let end = plan.end;
+            (Plan::Choice(plan), end)
+        } else if let Some((keyword, kind)) = control_word(tokens, cursor) {
             let plan = plan_control(view, tokens, cursor, range.end, baseline, keyword, kind)?;
             let end = plan.end;
             (Plan::Control(plan), end)
@@ -509,6 +620,7 @@ pub(super) fn sequence(
                 let (plans, separators) = split(view, tokens, range, baseline)?;
                 tasks.push(Task::FinishSequence(separators));
                 tasks.extend(plans.into_iter().rev().map(|plan| match plan {
+                    Plan::Choice(plan) => Task::Choice(plan),
                     Plan::Chain(plan) => Task::Chain(plan),
                     Plan::Group(range) => Task::Group(range),
                     Plan::Plain(range) => Task::Plain(range),
@@ -516,6 +628,32 @@ pub(super) fn sequence(
                     Plan::Bind(plan) => Task::Bind(plan),
                     Plan::Eliminate(plan) => Task::Eliminate(plan),
                 }));
+            }
+            Task::Choice(plan) => {
+                let ranges: Vec<_> = plan
+                    .branches
+                    .iter()
+                    .map(|(_, range)| range.clone())
+                    .collect();
+                tasks.push(Task::FinishChoice(plan));
+                tasks.extend(
+                    ranges
+                        .into_iter()
+                        .rev()
+                        .map(|range| Task::Sequence(range, None)),
+                );
+            }
+            Task::FinishChoice(plan) => {
+                let bodies = values.split_off(values.len() - plan.branches.len());
+                let mut branches = Vec::with_capacity(bodies.len() * 2);
+                for ((pipe, _), body) in plan.branches.into_iter().zip(bodies) {
+                    branches.push(leaves.leaf(pipe)?);
+                    branches.push(body);
+                }
+                values.push(Syntax::node(
+                    parser_kind(&["Tactic", "first"]),
+                    vec![atom(leaves, plan.start, "first")?, null_node(branches)],
+                ));
             }
             Task::Chain(plan) => {
                 tasks.push(Task::FinishChain(plan.separator));
@@ -826,6 +964,104 @@ mod sequencing_tests {
                     let parsed = parse_definition(source.as_bytes()).unwrap();
                     assert_eq!(parsed.reconstruct_original(), source.as_bytes());
                 }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod backtracking_tests {
+    use super::*;
+
+    #[test]
+    fn choice_and_try_preserve_leaf_positions_and_nested_pipe_ownership() {
+        for source in [
+            "theorem t : 0 = 0 := by first | fail \"no\" | rfl",
+            "theorem t : 0 = 0 := by\r\n  first /- alternatives -/\r\n  | have h : 0 = 0 := by\r\n      first | fail | rfl\r\n    exact h\r\n  | rfl -- other\r\n",
+            "theorem t : 0 = 0 := by\n  first\n  | have fn : Bool -> Nat := fun | true => 1 | false => 2\n    rfl\n  | fail",
+            "theorem t : 0 = 0 := by\n  first\n  | cases b with\n    | false => first | fail | rfl\n    | true => rfl\n  | rfl",
+            "theorem t : 0 = 0 := by try (intro x; fail); first | fail | skip",
+        ] {
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_choices_and_try_bodies_refuse_without_discarding_tokens() {
+        for body in [
+            "first",
+            "first rfl",
+            "first |",
+            "first | | rfl",
+            "first | rfl |",
+            "try",
+            "try ()",
+            "skip x",
+            "fail 7",
+        ] {
+            let source = format!("theorem t : 0 = 0 := by {body}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_choices_and_try_use_heap_parser_frames() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                for opener in ["try (", "first | fail | ("] {
+                    let source = format!(
+                        "theorem t : 0 = 0 := by {}rfl{}",
+                        opener.repeat(1000),
+                        ")".repeat(1000)
+                    );
+                    let parsed = parse_definition(source.as_bytes()).unwrap();
+                    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::*;
+    #[test]
+    fn repetition_preserves_nested_choices_and_statement_boundaries() {
+        for source in [
+            "theorem t : 0 = 0 := by repeat (first | fail | rfl)",
+            "theorem t : 0 = 0 := by\r\n  repeat /- loop -/\r\n    first\r\n    | intro x\r\n    | rfl\r\n  skip\r\n",
+            "theorem t : 0 = 0 := by\n  constructor <;> repeat (intro x; rfl)",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for source in ["theorem t := by repeat", "theorem t := by repeat ()"] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn nested_repetition_uses_heap_parser_frames() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!(
+                    "theorem t : 0 = 0 := by {}fail{}",
+                    "repeat (".repeat(1000),
+                    ")".repeat(1000)
+                );
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
             })
             .unwrap()
             .join()

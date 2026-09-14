@@ -137,6 +137,10 @@ impl SourceEquation {
 
 #[derive(Clone)]
 struct Context {
+    // Speculative tactics must observe rigid typing failures before choosing
+    // their successful alternative. Outside speculation, ordinary final K1
+    // admission retains its existing error boundary.
+    attempt_depth: usize,
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
@@ -161,6 +165,7 @@ impl Context {
         let mut txn = ElabTxn::new(env.clone(), KVMap::new(), 0);
         txn.budget.max_heartbeats = 1_000_000;
         Self {
+            attempt_depth: 0,
             txn,
             kernel,
             next: 0,
@@ -452,6 +457,7 @@ impl Context {
             && !actual.has_level_mvar()
             && !expected.has_level_mvar()
         {
+            self.check_attempt_equation(&actual, &expected)?;
             // Closed constraints are checked by the declaration's ordinary K1
             // admission. Keeping them there preserves its original verdict.
             return Ok(());
@@ -525,6 +531,7 @@ impl Context {
                     && !left.has_level_mvar()
                     && !right.has_level_mvar()
                 {
+                    self.check_attempt_equation(&left, &right)?;
                     // Exactly the same policy as `constrain`: once inference
                     // has finished, the retained source terms and annotations
                     // are obligations of the final ordinary K1 declaration.
@@ -631,16 +638,8 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let (syntax, required) = self.lower_pattern_matrices(syntax)?;
-        let result = self.term_prepared(&syntax, expected)?;
-        for row in required {
-            if !self.matrix_rows.remove(&row) {
-                return Err(failure(SourceInferenceError::Match(
-                    matching::MatchError::UnreachableRow,
-                )));
-            }
-        }
-        Ok(result)
+        let syntax = self.lower_pattern_matrices(syntax)?;
+        self.term_prepared(&syntax, expected)
     }
 
     fn term_prepared(
@@ -649,6 +648,7 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            MatrixScope(Vec<Name>),
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
@@ -699,23 +699,756 @@ impl Context {
         }
         let mut tasks = vec![Task::Visit(syntax, expected, true)];
         let mut values: Vec<Typed> = Vec::new();
-        while let Some(task) = tasks.pop() {
-            self.tick()?;
-            match task {
-                Task::Visit(syntax, expected, finish) => {
-                    if let Some(inner) = parenthesized_inner(syntax)? {
-                        tasks.push(Task::Visit(inner, expected, finish));
-                        continue;
-                    }
-                    if let Syntax::Node { kind, args, .. } = syntax {
-                        if kind == &parser_kind(&["Term", "matrixAlias"]) {
-                            let [Syntax::Ident { val: name, .. }, subject, body] = args.as_slice()
-                            else {
-                                return Err(failure(SourceInferenceError::Scope));
+        let mut attempts: Vec<tactics::backtrack::Checkpoint<'_>> = Vec::new();
+        loop {
+            let result = (|| {
+                while let Some(task) = tasks.pop() {
+                    self.tick()?;
+                    match task {
+                        Task::MatrixScope(rows) => {
+                            for row in rows {
+                                self.tick()?;
+                                if !self.matrix_rows.remove(&row) {
+                                    return Err(failure(SourceInferenceError::Match(
+                                        matching::MatchError::UnreachableRow,
+                                    )));
+                                }
+                            }
+                        }
+                        Task::Visit(syntax, expected, finish) => {
+                            if let Some(inner) = parenthesized_inner(syntax)? {
+                                tasks.push(Task::Visit(inner, expected, finish));
+                                continue;
+                            }
+                            if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "matrixScope"]) {
+                                    let [rows, body] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let mut names = Vec::new();
+                                    for row in expect_null_args(rows, "pattern coverage witnesses")?
+                                    {
+                                        self.tick()?;
+                                        let Syntax::Ident { val, .. } = row else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        names.push(val.clone());
+                                    }
+                                    tasks.push(Task::MatrixScope(names));
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "matrixAlias"]) {
+                                    let [Syntax::Ident { val: name, .. }, subject, body] =
+                                        args.as_slice()
+                                    else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let value = self.atom(subject, None)?;
+                                    if !matches!(value.value.node(), ExprNode::FVar { .. }) {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let saved = self.txn.lctx.clone();
+                                    let id = FVarId(self.fresh_name()?);
+                                    self.txn.lctx.add_let(
+                                        id.clone(),
+                                        name.clone(),
+                                        value.type_.clone(),
+                                        value.value.clone(),
+                                    );
+                                    self.matrix_aliases.insert(id.clone(), value.value.clone());
+                                    tasks.push(Task::LetBody(saved, id, name.clone(), value));
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "matrixBranch"]) {
+                                    let [Syntax::Ident { val, .. }, body] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    self.matrix_rows.insert(val.clone());
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "forall"]) {
+                                    let parts =
+                                        expect_node(syntax, kind, 5, "universal quantifier")?;
+                                    if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "forall" || val == "∀")
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let names = expect_null_args(&parts[1], "quantified names")?;
+                                    if names.is_empty() {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let annotation = optional_type_syntax(&parts[2])?
+                                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                                    expect_atom(&parts[3], ",", "quantifier separator")?;
+                                    tasks.push(Task::ForallDomain(names, &parts[4], expected));
+                                    tasks.push(Task::Visit(
+                                        annotation,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "match"])
+                                    || kind == &parser_kind(&["Term", "matchMatrix"])
+                                {
+                                    let parts = self.match_parts(syntax)?;
+                                    let discriminant = parts.discriminant;
+                                    tasks.push(Task::MatchDiscriminant(parts, expected));
+                                    tasks.push(Task::Visit(discriminant, None, true));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "proj"]) {
+                                    let parts = expect_node(syntax, kind, 3, "field projection")?;
+                                    expect_atom(&parts[1], ".", "field dot")?;
+                                    let Syntax::Ident { val: field, .. } = &parts[2] else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    tasks.push(Task::Projection(field.clone(), expected, finish));
+                                    tasks.push(Task::Visit(&parts[0], None, true));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "typeAscription"]) {
+                                    let parts = expect_node(syntax, kind, 5, "term ascription")?;
+                                    expect_atom(&parts[2], ":", "ascription colon")?;
+                                    let [annotation] =
+                                        expect_null_args(&parts[3], "ascribed type")?
+                                    else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    tasks.push(Task::Ascription(&parts[1], expected));
+                                    tasks.push(Task::Visit(
+                                        annotation,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "structInst"]) {
+                                    let parts = self.record_parts(syntax)?;
+                                    if let Some(annotation) = parts.annotation {
+                                        tasks.push(Task::RecordType(parts, expected));
+                                        tasks.push(Task::Visit(
+                                            annotation,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                    } else {
+                                        tasks.push(Task::RecordPrepare(
+                                            parts,
+                                            expected,
+                                            Vec::new(),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "byTactic"]) {
+                                    tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "fun"]) {
+                                    let parts =
+                                        expect_node(syntax, kind, 2, "Lean.Parser.Term.fun")?;
+                                    if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "fun" || val == "λ")
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let basic = expect_node(
+                                        &parts[1],
+                                        &parser_kind(&["Term", "basicFun"]),
+                                        4,
+                                        "Lean.Parser.Term.basicFun",
+                                    )?;
+                                    let names = expect_null_args(&basic[0], "lambda binders")?;
+                                    if names.is_empty() {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    expect_empty_null(
+                                        &basic[1],
+                                        "absent lambda result ascription",
+                                    )?;
+                                    if !matches!(&basic[2], Syntax::Atom { val, .. } if val == "=>" || val == "↦")
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let saved = self.txn.lctx.clone();
+                                    let mut binders = Vec::new();
+                                    let mut expected_body = expected.clone();
+                                    for name in names {
+                                        self.tick()?;
+                                        let Syntax::Ident { val: name, .. } = name else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        if name.is_anonymous() {
+                                            return Err(
+                                                NatDefinitionElabError::AnonymousReferenceName,
+                                            );
+                                        }
+                                        let (domain, codomain) =
+                                            if let Some(expected) = &expected_body {
+                                                let expected = self.whnf(expected)?;
+                                                match expected.node() {
+                                                    ExprNode::ForallE {
+                                                        binder_type,
+                                                        body,
+                                                        binder_info: BinderInfo::Default,
+                                                        ..
+                                                    } => (binder_type.clone(), Some(body.clone())),
+                                                    ExprNode::MVar { .. } => {
+                                                        let universe = self.level()?;
+                                                        (self.hole(Expr::sort(universe))?, None)
+                                                    }
+                                                    _ => {
+                                                        return Err(failure(
+                                                            SourceInferenceError::ExpectedFunction,
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                let universe = self.level()?;
+                                                (self.hole(Expr::sort(universe))?, None)
+                                            };
+                                        let id = FVarId(self.fresh_name()?);
+                                        expected_body = codomain
+                                            .map(|body| {
+                                                self.substitute(&body, &Expr::fvar(id.clone()))
+                                            })
+                                            .transpose()?;
+                                        self.txn.lctx.add_param(
+                                            id.clone(),
+                                            name.clone(),
+                                            domain,
+                                            BinderInfo::Default,
+                                        );
+                                        binders.push(
+                                            self.txn
+                                                .lctx
+                                                .find(&id)
+                                                .expect("new lambda binder")
+                                                .clone(),
+                                        );
+                                    }
+                                    tasks.push(Task::Lambda(saved, binders, expected));
+                                    tasks.push(Task::Visit(&basic[3], expected_body, true));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "let"]) {
+                                    let (name, annotation, value, body) = self.let_parts(args)?;
+                                    if let Some(annotation) = annotation {
+                                        tasks
+                                            .push(Task::LetAnnotation(name, value, body, expected));
+                                        tasks.push(Task::Visit(
+                                            annotation,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                    } else {
+                                        tasks.push(Task::LetValue(name, None, body, expected));
+                                        tasks.push(Task::Visit(value, None, true));
+                                    }
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "arrow"]) {
+                                    let [domain, arrow, codomain] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    if !matches!(arrow, Syntax::Atom { val, .. } if val == "->" || val == "→")
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    tasks.push(Task::Arrow(expected));
+                                    tasks.push(Task::Visit(
+                                        codomain,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    tasks.push(Task::Visit(
+                                        domain,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "app"]) {
+                                    let parts = expect_node(syntax, kind, 2, "application")?;
+                                    let arguments =
+                                        expect_null_args(&parts[1], "application arguments")?;
+                                    if arguments.is_empty() {
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    }
+                                    tasks.push(Task::Function(arguments, expected));
+                                    tasks.push(Task::Visit(&parts[0], None, false));
+                                    continue;
+                                }
+                                if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
+                                    let parts = expect_node(syntax, kind, 3, "scalar infix")?;
+                                    expect_atom(
+                                        &parts[1],
+                                        intrinsic.spelling(),
+                                        "scalar operator",
+                                    )?;
+                                    tasks.push(Task::Infix(intrinsic, expected));
+                                    tasks.push(Task::Visit(&parts[2], None, true));
+                                    tasks.push(Task::Visit(&parts[0], None, true));
+                                    continue;
+                                }
+                            }
+                            let term = self.atom(syntax, expected.as_ref())?;
+                            values.push(if finish {
+                                self.finish_term(term, expected.as_ref())?
+                            } else {
+                                term
+                            });
+                        }
+                        Task::Projection(field, expected, finish) => {
+                            let receiver = values.pop().expect("receiver precedes projection");
+                            let term = self.record_field_path(receiver, &field)?;
+                            values.push(if finish {
+                                self.finish_term(term, expected.as_ref())?
+                            } else {
+                                term
+                            });
+                        }
+                        Task::MatchDiscriminant(parts, expected) => {
+                            let major = values.pop().expect("match discriminant visit");
+                            tasks.push(match self.start_match(parts, major, expected)? {
+                                matching::MatchStart::Regular(state) => Task::MatchNext(*state),
+                                matching::MatchStart::Refined(proof) => Task::Proof(proof),
+                            });
+                        }
+                        Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
+                            matching::MatchStep::Branch {
+                                syntax,
+                                expected,
+                                binders,
+                            } => {
+                                tasks.push(Task::MatchBranch(state, binders));
+                                tasks.push(Task::Visit(syntax, Some(expected), true));
+                            }
+                            matching::MatchStep::Complete(term) => values.push(term),
+                        },
+                        Task::MatchBranch(mut state, binders) => {
+                            let branch = values.pop().expect("match branch visit");
+                            self.accept_match_branch(&mut state, binders, branch)?;
+                            tasks.push(Task::MatchNext(state));
+                        }
+                        Task::Ascription(syntax, expected) => {
+                            let type_ = values.pop().expect("ascription type visit");
+                            self.sort_level(&type_)?;
+                            tasks.push(Task::AscribedValue(type_.value.clone(), expected));
+                            tasks.push(Task::Visit(syntax, Some(type_.value), true));
+                        }
+                        Task::AscribedValue(annotation, expected) => {
+                            let term = values.pop().expect("ascribed term follows its annotation");
+                            // The value's actual type guides surrounding inference.
+                            // The written annotation still constrains the inner value
+                            // and remains in the checked term even when ignored later.
+                            if let Some(expected) = expected {
+                                self.constrain_type(&term.type_, &expected)?;
+                                self.resolve_instances(false)?;
+                            }
+                            // Expected types guide inference but closed constraints are
+                            // left to K1. Retain this assertion in the checked term,
+                            // including when the surrounding program ignores its value.
+                            values.push(Typed {
+                                value: Expr::let_e(
+                                    Name::anonymous(),
+                                    annotation.clone(),
+                                    term.value,
+                                    Expr::bvar(0).expect("fixed ascription identity binder"),
+                                    false,
+                                ),
+                                type_: term.type_,
+                            });
+                        }
+                        Task::RecordType(parts, expected) => {
+                            let type_ = values.pop().expect("record type visit");
+                            self.sort_level(&type_)?;
+                            if let Some(expected) = expected {
+                                self.constrain_type(&type_.value, &expected)?;
+                            }
+                            tasks.push(Task::RecordPrepare(parts, Some(type_.value), Vec::new()));
+                        }
+                        Task::RecordPrepare(parts, expected, sources) => {
+                            if let Some(syntax) = parts.sources.get(sources.len()).copied() {
+                                tasks.push(Task::RecordSource(parts, expected, sources));
+                                tasks.push(Task::Visit(syntax, None, true));
+                            } else {
+                                tasks.push(Task::RecordNext(
+                                    self.start_record(parts, expected, sources)?,
+                                ));
+                            }
+                        }
+                        Task::RecordSource(parts, expected, mut sources) => {
+                            sources.push(values.pop().expect("record update source visit"));
+                            tasks.push(Task::RecordPrepare(parts, expected, sources));
+                        }
+                        Task::RecordNext(mut state) => match self.next_record_field(&mut state)? {
+                            record_terms::RecordStep::Field {
+                                syntax,
+                                domain,
+                                codomain,
+                            } => {
+                                tasks.push(Task::RecordField(state, codomain));
+                                tasks.push(Task::Visit(syntax, Some(domain), true));
+                            }
+                            record_terms::RecordStep::Copy { value, codomain } => {
+                                self.accept_record_field(&mut state, &codomain, value)?;
+                                tasks.push(Task::RecordNext(state));
+                            }
+                            record_terms::RecordStep::Complete(term) => values.push(term),
+                        },
+                        Task::RecordField(mut state, codomain) => {
+                            let value = values.pop().expect("record field visit");
+                            self.accept_record_field(&mut state, &codomain, value)?;
+                            tasks.push(Task::RecordNext(state));
+                        }
+                        Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                            tactics::ProofAction::Attempt(spec) => {
+                                let mut checkpoint = tactics::backtrack::Checkpoint::new(
+                                    self,
+                                    &proof,
+                                    spec,
+                                    tasks.len(),
+                                    values.len(),
+                                );
+                                let branch = checkpoint.begin(self, attempts.len())?;
+                                attempts.push(checkpoint);
+                                tasks.push(Task::Proof(branch));
+                            }
+                            tactics::ProofAction::AttemptComplete(index) => {
+                                if index + 1 != attempts.len() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                let checkpoint = attempts.pop().expect("checked attempt index");
+                                if checkpoint.tasks != tasks.len()
+                                    || checkpoint.values != values.len()
+                                {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                checkpoint.finish(self, &mut proof);
+                                if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
+                                    proof = next.begin(self, attempts.len())?;
+                                    attempts.push(next);
+                                }
+                                tasks.push(Task::Proof(proof));
+                            }
+                            tactics::ProofAction::Refine { syntax, goal } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                let expected = goal.target.clone();
+                                let depth = self.begin_refinement();
+                                tasks.push(Task::RefineTerm(proof, goal, depth));
+                                tasks.push(Task::Visit(syntax, Some(expected), true));
+                            }
+                            tactics::ProofAction::Binding {
+                                goal,
+                                name,
+                                annotation,
+                                value,
+                                opaque,
+                            } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                if let Some(annotation) = annotation {
+                                    tasks.push(Task::ProofBindingType(
+                                        proof, goal, name, value, opaque,
+                                    ));
+                                    tasks.push(Task::Visit(
+                                        annotation,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                } else {
+                                    tasks.push(Task::ProofBindingValue(
+                                        proof, goal, name, None, opaque,
+                                    ));
+                                    tasks.push(Task::Visit(value, None, true));
+                                }
+                            }
+                            tactics::ProofAction::Rewrite {
+                                goal,
+                                rule,
+                                remaining,
+                                close,
+                            } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::RewriteTerm(
+                                    proof,
+                                    goal,
+                                    rule.reverse,
+                                    remaining,
+                                    close,
+                                ));
+                                tasks.push(Task::Visit(rule.syntax, None, true));
+                            }
+                            tactics::ProofAction::Term {
+                                syntax,
+                                goal,
+                                apply,
+                            } => {
+                                let expected = if apply {
+                                    None
+                                } else {
+                                    Some(goal.target.clone())
+                                };
+                                self.txn.lctx = goal.lctx.clone();
+                                // Written arguments can insert implicit dictionaries
+                                // before apply starts opening the remaining telescope.
+                                let instance_start = apply.then_some(self.instance_goals.len());
+                                tasks.push(Task::ProofTerm(proof, goal, instance_start));
+                                tasks.push(Task::Visit(syntax, expected, true));
+                            }
+                            tactics::ProofAction::Complete(term) => values.push(term),
+                        },
+                        Task::ProofBindingType(proof, goal, name, value, opaque) => {
+                            let annotation = values.pop().expect("local proof annotation visit");
+                            self.sort_level(&annotation)?;
+                            tasks.push(Task::ProofBindingValue(
+                                proof,
+                                goal,
+                                name,
+                                Some(annotation.value.clone()),
+                                opaque,
+                            ));
+                            tasks.push(Task::Visit(value, Some(annotation.value), true));
+                        }
+                        Task::ProofBindingValue(mut proof, goal, name, annotation, opaque) => {
+                            let mut value = values.pop().expect("local proof value visit");
+                            if let Some(annotation) = annotation {
+                                value.type_ = annotation;
+                            }
+                            self.bind_proof_value(&mut proof, goal, name, value, opaque)?;
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
+                            let term = values.pop().expect("rewrite rule visit");
+                            self.rewrite_proof_term(
+                                &mut proof, goal, term, reverse, remaining, close,
+                            )?;
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::RefineTerm(mut proof, goal, depth) => {
+                            let term = values.pop().expect("refinement term visit");
+                            self.finish_refinement(&mut proof, goal, term, depth)?;
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::ProofTerm(mut proof, goal, instance_start) => {
+                            let term = values.pop().expect("tactic term visit");
+                            if let Some(instance_start) = instance_start {
+                                self.apply_proof_term(&mut proof, goal, term, instance_start)?;
+                            } else {
+                                self.close_proof_goal(goal, term.value)?;
+                            }
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::Lambda(saved, binders, expected) => {
+                            let mut body = values.pop().expect("lambda body visit");
+                            self.flush(false)?;
+                            body.value = self.instantiate(&body.value)?;
+                            body.type_ = self.instantiate(&body.type_)?;
+                            for local in binders.into_iter().rev() {
+                                self.tick()?;
+                                let domain = self.instantiate(&local.type_)?;
+                                body.value = body
+                                    .value
+                                    .abstract_fvar(&local.id, 0)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                body.type_ = body
+                                    .type_
+                                    .abstract_fvar(&local.id, 0)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                body.value = Expr::lam(
+                                    local.user_name.clone(),
+                                    domain.clone(),
+                                    body.value,
+                                    local.binder_info,
+                                );
+                                body.type_ = Expr::forall_e(
+                                    local.user_name,
+                                    domain,
+                                    body.type_,
+                                    local.binder_info,
+                                );
+                            }
+                            self.txn.lctx = saved;
+                            values.push(self.finish_term(body, expected.as_ref())?);
+                        }
+                        Task::Function(arguments, expected) => {
+                            let function = values.pop().expect("function task follows its visit");
+                            tasks.push(Task::Apply(function, arguments, expected));
+                        }
+                        Task::Apply(function, arguments, expected) => {
+                            if let Some((first, rest)) = arguments.split_first() {
+                                let function = self.insert_implicits(
+                                    function,
+                                    ImplicitInsertion::ExplicitArgument,
+                                )?;
+                                let ExprNode::ForallE {
+                                    binder_type, body, ..
+                                } = function.type_.node()
+                                else {
+                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                };
+                                let domain = binder_type.clone();
+                                let codomain = body.clone();
+                                // Propagate a known result before checking the last
+                                // explicit argument when the codomain does not depend
+                                // on that argument (e.g. Inhabited.mk (fun x => ...)).
+                                if rest.is_empty()
+                                    && !codomain.has_loose_bvar(0)
+                                    && let Some(expected) = &expected
+                                {
+                                    self.constrain_type(&codomain, expected)?;
+                                }
+                                tasks.push(Task::Argument(function, codomain, rest, expected));
+                                tasks.push(Task::Visit(first, Some(domain), true));
+                            } else {
+                                values.push(self.finish_term(function, expected.as_ref())?);
+                            }
+                        }
+                        Task::Argument(function, codomain, rest, expected) => {
+                            let argument = values.pop().expect("argument task follows its visit");
+                            let type_ = self.substitute(&codomain, &argument.value)?;
+                            tasks.push(Task::Apply(
+                                Typed {
+                                    value: Expr::app(function.value, argument.value),
+                                    type_,
+                                },
+                                rest,
+                                expected,
+                            ));
+                        }
+                        Task::Infix(intrinsic, expected) => {
+                            let right = values.pop().expect("infix right visit");
+                            let left = values.pop().expect("infix left visit");
+                            self.flush(false)?;
+                            let name = match intrinsic {
+                                BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                                BoundedInfixIntrinsic::ScalarBeq => {
+                                    if self.instantiate(&left.type_)? == string_const()
+                                        && self.instantiate(&right.type_)? == string_const()
+                                    {
+                                        Name::from_components(["String", "decEq"])
+                                    } else {
+                                        Name::from_components(["Nat", "beq"])
+                                    }
+                                }
                             };
-                            let value = self.atom(subject, None)?;
-                            if !matches!(value.value.node(), ExprNode::FVar { .. }) {
-                                return Err(failure(SourceInferenceError::Scope));
+                            let mut function = self.constant(&name)?;
+                            for argument in [left, right] {
+                                function = self.insert_implicits(
+                                    function,
+                                    ImplicitInsertion::ExplicitArgument,
+                                )?;
+                                let ExprNode::ForallE {
+                                    binder_type, body, ..
+                                } = function.type_.node()
+                                else {
+                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                };
+                                let domain = binder_type.clone();
+                                let body = body.clone();
+                                let argument = self.finish_term(argument, Some(&domain))?;
+                                self.constrain_type(&argument.type_, &domain)?;
+                                function.type_ = self.substitute(&body, &argument.value)?;
+                                function.value = Expr::app(function.value, argument.value);
+                            }
+                            values.push(self.finish_term(function, expected.as_ref())?);
+                        }
+                        Task::ForallDomain(names, body, expected) => {
+                            let domain = values.pop().expect("quantifier domain visit");
+                            let universe = self.sort_level(&domain)?;
+                            let saved = self.txn.lctx.clone();
+                            let mut locals = Vec::new();
+                            for name in names {
+                                self.tick()?;
+                                let Syntax::Ident { val, .. } = name else {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                };
+                                if val.is_anonymous() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                let id = FVarId(self.fresh_name()?);
+                                self.txn.lctx.add_param(
+                                    id.clone(),
+                                    val.clone(),
+                                    domain.value.clone(),
+                                    BinderInfo::Default,
+                                );
+                                locals.push(
+                                    self.txn.lctx.find(&id).expect("quantified local").clone(),
+                                );
+                            }
+                            tasks.push(Task::ForallBody(saved, locals, universe, expected));
+                            tasks.push(Task::Visit(body, Some(self.type_expected()?), true));
+                        }
+                        Task::ForallBody(saved, locals, domain_universe, expected) => {
+                            let body = values.pop().expect("quantifier body visit");
+                            let mut universe = self.sort_level(&body)?;
+                            let mut value = body.value;
+                            for local in locals.iter().rev() {
+                                self.tick()?;
+                                value = value
+                                    .abstract_fvar(&local.id, 0)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                value = Expr::forall_e(
+                                    local.user_name.clone(),
+                                    local.type_.clone(),
+                                    value,
+                                    local.binder_info,
+                                );
+                                universe = Level::imax(domain_universe.clone(), universe)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            }
+                            self.txn.lctx = saved;
+                            values.push(self.finish_term(
+                                Typed {
+                                    value,
+                                    type_: Expr::sort(universe),
+                                },
+                                expected.as_ref(),
+                            )?);
+                        }
+                        Task::Arrow(expected) => {
+                            let right = values.pop().expect("arrow codomain visit");
+                            let left = values.pop().expect("arrow domain visit");
+                            let u = self.sort_level(&left)?;
+                            let v = self.sort_level(&right)?;
+                            let level = Level::imax(u, v)
+                                .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            let body = right
+                                .value
+                                .lift_loose(0, 1)
+                                .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            let term = Typed {
+                                value: Expr::forall_e(
+                                    Name::anonymous(),
+                                    left.value,
+                                    body,
+                                    BinderInfo::Default,
+                                ),
+                                type_: Expr::sort(level),
+                            };
+                            values.push(self.finish_term(term, expected.as_ref())?);
+                        }
+                        Task::LetAnnotation(name, value, body, expected) => {
+                            let annotation = values.pop().expect("let annotation visit");
+                            self.sort_level(&annotation)?;
+                            tasks.push(Task::LetValue(
+                                name,
+                                Some(annotation.value.clone()),
+                                body,
+                                expected,
+                            ));
+                            tasks.push(Task::Visit(value, Some(annotation.value), true));
+                        }
+                        Task::LetValue(name, annotation, body, expected) => {
+                            let mut value = values.pop().expect("let value visit");
+                            if let Some(annotation) = annotation {
+                                value.type_ = annotation;
                             }
                             let saved = self.txn.lctx.clone();
                             let id = FVarId(self.fresh_name()?);
@@ -725,644 +1458,70 @@ impl Context {
                                 value.type_.clone(),
                                 value.value.clone(),
                             );
-                            self.matrix_aliases.insert(id.clone(), value.value.clone());
-                            tasks.push(Task::LetBody(saved, id, name.clone(), value));
-                            tasks.push(Task::Visit(body, expected, finish));
-                            continue;
+                            tasks.push(Task::LetBody(saved, id, name, value));
+                            tasks.push(Task::Visit(body, expected, true));
                         }
-                        if kind == &parser_kind(&["Term", "matrixBranch"]) {
-                            let [Syntax::Ident { val, .. }, body] = args.as_slice() else {
-                                return Err(failure(SourceInferenceError::Scope));
-                            };
-                            self.matrix_rows.insert(val.clone());
-                            tasks.push(Task::Visit(body, expected, finish));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "forall"]) {
-                            let parts = expect_node(syntax, kind, 5, "universal quantifier")?;
-                            if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "forall" || val == "∀")
-                            {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            let names = expect_null_args(&parts[1], "quantified names")?;
-                            if names.is_empty() {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            let annotation = optional_type_syntax(&parts[2])?
-                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                            expect_atom(&parts[3], ",", "quantifier separator")?;
-                            tasks.push(Task::ForallDomain(names, &parts[4], expected));
-                            tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "match"])
-                            || kind == &parser_kind(&["Term", "matchMatrix"])
-                        {
-                            let parts = self.match_parts(syntax)?;
-                            let discriminant = parts.discriminant;
-                            tasks.push(Task::MatchDiscriminant(parts, expected));
-                            tasks.push(Task::Visit(discriminant, None, true));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "proj"]) {
-                            let parts = expect_node(syntax, kind, 3, "field projection")?;
-                            expect_atom(&parts[1], ".", "field dot")?;
-                            let Syntax::Ident { val: field, .. } = &parts[2] else {
-                                return Err(failure(SourceInferenceError::Scope));
-                            };
-                            tasks.push(Task::Projection(field.clone(), expected, finish));
-                            tasks.push(Task::Visit(&parts[0], None, true));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "typeAscription"]) {
-                            let parts = expect_node(syntax, kind, 5, "term ascription")?;
-                            expect_atom(&parts[2], ":", "ascription colon")?;
-                            let [annotation] = expect_null_args(&parts[3], "ascribed type")? else {
-                                return Err(failure(SourceInferenceError::Scope));
-                            };
-                            tasks.push(Task::Ascription(&parts[1], expected));
-                            tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "structInst"]) {
-                            let parts = self.record_parts(syntax)?;
-                            if let Some(annotation) = parts.annotation {
-                                tasks.push(Task::RecordType(parts, expected));
-                                tasks.push(Task::Visit(
-                                    annotation,
-                                    Some(self.type_expected()?),
-                                    true,
-                                ));
-                            } else {
-                                tasks.push(Task::RecordPrepare(parts, expected, Vec::new()));
-                            }
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "byTactic"]) {
-                            tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "fun"]) {
-                            let parts = expect_node(syntax, kind, 2, "Lean.Parser.Term.fun")?;
-                            if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "fun" || val == "λ")
-                            {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            let basic = expect_node(
-                                &parts[1],
-                                &parser_kind(&["Term", "basicFun"]),
-                                4,
-                                "Lean.Parser.Term.basicFun",
-                            )?;
-                            let names = expect_null_args(&basic[0], "lambda binders")?;
-                            if names.is_empty() {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            expect_empty_null(&basic[1], "absent lambda result ascription")?;
-                            if !matches!(&basic[2], Syntax::Atom { val, .. } if val == "=>" || val == "↦")
-                            {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            let saved = self.txn.lctx.clone();
-                            let mut binders = Vec::new();
-                            let mut expected_body = expected.clone();
-                            for name in names {
-                                self.tick()?;
-                                let Syntax::Ident { val: name, .. } = name else {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                };
-                                if name.is_anonymous() {
-                                    return Err(NatDefinitionElabError::AnonymousReferenceName);
-                                }
-                                let (domain, codomain) = if let Some(expected) = &expected_body {
-                                    let expected = self.whnf(expected)?;
-                                    match expected.node() {
-                                        ExprNode::ForallE {
-                                            binder_type,
-                                            body,
-                                            binder_info: BinderInfo::Default,
-                                            ..
-                                        } => (binder_type.clone(), Some(body.clone())),
-                                        ExprNode::MVar { .. } => {
-                                            let universe = self.level()?;
-                                            (self.hole(Expr::sort(universe))?, None)
-                                        }
-                                        _ => {
-                                            return Err(failure(
-                                                SourceInferenceError::ExpectedFunction,
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    let universe = self.level()?;
-                                    (self.hole(Expr::sort(universe))?, None)
-                                };
-                                let id = FVarId(self.fresh_name()?);
-                                expected_body = codomain
-                                    .map(|body| self.substitute(&body, &Expr::fvar(id.clone())))
-                                    .transpose()?;
-                                self.txn.lctx.add_param(
-                                    id.clone(),
-                                    name.clone(),
-                                    domain,
-                                    BinderInfo::Default,
-                                );
-                                binders.push(
-                                    self.txn.lctx.find(&id).expect("new lambda binder").clone(),
-                                );
-                            }
-                            tasks.push(Task::Lambda(saved, binders, expected));
-                            tasks.push(Task::Visit(&basic[3], expected_body, true));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "let"]) {
-                            let (name, annotation, value, body) = self.let_parts(args)?;
-                            if let Some(annotation) = annotation {
-                                tasks.push(Task::LetAnnotation(name, value, body, expected));
-                                tasks.push(Task::Visit(
-                                    annotation,
-                                    Some(self.type_expected()?),
-                                    true,
-                                ));
-                            } else {
-                                tasks.push(Task::LetValue(name, None, body, expected));
-                                tasks.push(Task::Visit(value, None, true));
-                            }
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "arrow"]) {
-                            let [domain, arrow, codomain] = args.as_slice() else {
-                                return Err(failure(SourceInferenceError::Scope));
-                            };
-                            if !matches!(arrow, Syntax::Atom { val, .. } if val == "->" || val == "→")
-                            {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            tasks.push(Task::Arrow(expected));
-                            tasks.push(Task::Visit(codomain, Some(self.type_expected()?), true));
-                            tasks.push(Task::Visit(domain, Some(self.type_expected()?), true));
-                            continue;
-                        }
-                        if kind == &parser_kind(&["Term", "app"]) {
-                            let parts = expect_node(syntax, kind, 2, "application")?;
-                            let arguments = expect_null_args(&parts[1], "application arguments")?;
-                            if arguments.is_empty() {
-                                return Err(failure(SourceInferenceError::ExpectedFunction));
-                            }
-                            tasks.push(Task::Function(arguments, expected));
-                            tasks.push(Task::Visit(&parts[0], None, false));
-                            continue;
-                        }
-                        if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
-                            let parts = expect_node(syntax, kind, 3, "scalar infix")?;
-                            expect_atom(&parts[1], intrinsic.spelling(), "scalar operator")?;
-                            tasks.push(Task::Infix(intrinsic, expected));
-                            tasks.push(Task::Visit(&parts[2], None, true));
-                            tasks.push(Task::Visit(&parts[0], None, true));
-                            continue;
+                        Task::LetBody(saved, id, name, value) => {
+                            self.matrix_aliases.remove(&id);
+                            let mut body = values.pop().expect("let body visit");
+                            body.value = self.instantiate(&body.value)?;
+                            body.type_ = self.instantiate(&body.type_)?;
+                            let abstract_body = body
+                                .value
+                                .abstract_fvar(&id, 0)
+                                .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            let abstract_type = body
+                                .type_
+                                .abstract_fvar(&id, 0)
+                                .map_err(|_| failure(SourceInferenceError::Scope))?;
+                            let type_ = self.substitute(&abstract_type, &value.value)?;
+                            values.push(Typed {
+                                value: Expr::let_e(
+                                    name,
+                                    value.type_,
+                                    value.value,
+                                    abstract_body,
+                                    false,
+                                ),
+                                type_,
+                            });
+                            self.txn.lctx = saved;
                         }
                     }
-                    let term = self.atom(syntax, expected.as_ref())?;
-                    values.push(if finish {
-                        self.finish_term(term, expected.as_ref())?
-                    } else {
-                        term
-                    });
                 }
-                Task::Projection(field, expected, finish) => {
-                    let receiver = values.pop().expect("receiver precedes projection");
-                    let term = self.record_field_path(receiver, &field)?;
-                    values.push(if finish {
-                        self.finish_term(term, expected.as_ref())?
-                    } else {
-                        term
-                    });
-                }
-                Task::MatchDiscriminant(parts, expected) => {
-                    let major = values.pop().expect("match discriminant visit");
-                    tasks.push(match self.start_match(parts, major, expected)? {
-                        matching::MatchStart::Regular(state) => Task::MatchNext(*state),
-                        matching::MatchStart::Refined(proof) => Task::Proof(proof),
-                    });
-                }
-                Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
-                    matching::MatchStep::Branch {
-                        syntax,
-                        expected,
-                        binders,
-                    } => {
-                        tasks.push(Task::MatchBranch(state, binders));
-                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                let [result] = values.as_slice() else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                Ok(result.clone())
+            })();
+            match result {
+                Ok(value) => return Ok(value),
+                Err(problem) => {
+                    if !tactics::backtrack::recoverable(&problem) {
+                        return Err(problem);
                     }
-                    matching::MatchStep::Complete(term) => values.push(term),
-                },
-                Task::MatchBranch(mut state, binders) => {
-                    let branch = values.pop().expect("match branch visit");
-                    self.accept_match_branch(&mut state, binders, branch)?;
-                    tasks.push(Task::MatchNext(state));
-                }
-                Task::Ascription(syntax, expected) => {
-                    let type_ = values.pop().expect("ascription type visit");
-                    self.sort_level(&type_)?;
-                    tasks.push(Task::AscribedValue(type_.value.clone(), expected));
-                    tasks.push(Task::Visit(syntax, Some(type_.value), true));
-                }
-                Task::AscribedValue(annotation, expected) => {
-                    let term = values.pop().expect("ascribed term follows its annotation");
-                    // The value's actual type guides surrounding inference.
-                    // The written annotation still constrains the inner value
-                    // and remains in the checked term even when ignored later.
-                    if let Some(expected) = expected {
-                        self.constrain_type(&term.type_, &expected)?;
-                        self.resolve_instances(false)?;
-                    }
-                    // Expected types guide inference but closed constraints are
-                    // left to K1. Retain this assertion in the checked term,
-                    // including when the surrounding program ignores its value.
-                    values.push(Typed {
-                        value: Expr::let_e(
-                            Name::anonymous(),
-                            annotation.clone(),
-                            term.value,
-                            Expr::bvar(0).expect("fixed ascription identity binder"),
-                            false,
-                        ),
-                        type_: term.type_,
-                    });
-                }
-                Task::RecordType(parts, expected) => {
-                    let type_ = values.pop().expect("record type visit");
-                    self.sort_level(&type_)?;
-                    if let Some(expected) = expected {
-                        self.constrain_type(&type_.value, &expected)?;
-                    }
-                    tasks.push(Task::RecordPrepare(parts, Some(type_.value), Vec::new()));
-                }
-                Task::RecordPrepare(parts, expected, sources) => {
-                    if let Some(syntax) = parts.sources.get(sources.len()).copied() {
-                        tasks.push(Task::RecordSource(parts, expected, sources));
-                        tasks.push(Task::Visit(syntax, None, true));
-                    } else {
-                        tasks.push(Task::RecordNext(
-                            self.start_record(parts, expected, sources)?,
-                        ));
-                    }
-                }
-                Task::RecordSource(parts, expected, mut sources) => {
-                    sources.push(values.pop().expect("record update source visit"));
-                    tasks.push(Task::RecordPrepare(parts, expected, sources));
-                }
-                Task::RecordNext(mut state) => match self.next_record_field(&mut state)? {
-                    record_terms::RecordStep::Field {
-                        syntax,
-                        domain,
-                        codomain,
-                    } => {
-                        tasks.push(Task::RecordField(state, codomain));
-                        tasks.push(Task::Visit(syntax, Some(domain), true));
-                    }
-                    record_terms::RecordStep::Copy { value, codomain } => {
-                        self.accept_record_field(&mut state, &codomain, value)?;
-                        tasks.push(Task::RecordNext(state));
-                    }
-                    record_terms::RecordStep::Complete(term) => values.push(term),
-                },
-                Task::RecordField(mut state, codomain) => {
-                    let value = values.pop().expect("record field visit");
-                    self.accept_record_field(&mut state, &codomain, value)?;
-                    tasks.push(Task::RecordNext(state));
-                }
-                Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
-                    tactics::ProofAction::Refine { syntax, goal } => {
-                        self.txn.lctx = goal.lctx.clone();
-                        let expected = goal.target.clone();
-                        let depth = self.begin_refinement();
-                        tasks.push(Task::RefineTerm(proof, goal, depth));
-                        tasks.push(Task::Visit(syntax, Some(expected), true));
-                    }
-                    tactics::ProofAction::Binding {
-                        goal,
-                        name,
-                        annotation,
-                        value,
-                        opaque,
-                    } => {
-                        self.txn.lctx = goal.lctx.clone();
-                        if let Some(annotation) = annotation {
-                            tasks.push(Task::ProofBindingType(proof, goal, name, value, opaque));
-                            tasks.push(Task::Visit(annotation, Some(self.type_expected()?), true));
-                        } else {
-                            tasks.push(Task::ProofBindingValue(proof, goal, name, None, opaque));
-                            tasks.push(Task::Visit(value, None, true));
-                        }
-                    }
-                    tactics::ProofAction::Rewrite {
-                        goal,
-                        rule,
-                        remaining,
-                        close,
-                    } => {
-                        self.txn.lctx = goal.lctx.clone();
-                        tasks.push(Task::RewriteTerm(
-                            proof,
-                            goal,
-                            rule.reverse,
-                            remaining,
-                            close,
-                        ));
-                        tasks.push(Task::Visit(rule.syntax, None, true));
-                    }
-                    tactics::ProofAction::Term {
-                        syntax,
-                        goal,
-                        apply,
-                    } => {
-                        let expected = if apply {
-                            None
-                        } else {
-                            Some(goal.target.clone())
+                    loop {
+                        let Some(mut checkpoint) = attempts.pop() else {
+                            return Err(problem);
                         };
-                        self.txn.lctx = goal.lctx.clone();
-                        // Written arguments can insert implicit dictionaries
-                        // before apply starts opening the remaining telescope.
-                        let instance_start = apply.then_some(self.instance_goals.len());
-                        tasks.push(Task::ProofTerm(proof, goal, instance_start));
-                        tasks.push(Task::Visit(syntax, expected, true));
-                    }
-                    tactics::ProofAction::Complete(term) => values.push(term),
-                },
-                Task::ProofBindingType(proof, goal, name, value, opaque) => {
-                    let annotation = values.pop().expect("local proof annotation visit");
-                    self.sort_level(&annotation)?;
-                    tasks.push(Task::ProofBindingValue(
-                        proof,
-                        goal,
-                        name,
-                        Some(annotation.value.clone()),
-                        opaque,
-                    ));
-                    tasks.push(Task::Visit(value, Some(annotation.value), true));
-                }
-                Task::ProofBindingValue(mut proof, goal, name, annotation, opaque) => {
-                    let mut value = values.pop().expect("local proof value visit");
-                    if let Some(annotation) = annotation {
-                        value.type_ = annotation;
-                    }
-                    self.bind_proof_value(&mut proof, goal, name, value, opaque)?;
-                    tasks.push(Task::Proof(proof));
-                }
-                Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
-                    let term = values.pop().expect("rewrite rule visit");
-                    self.rewrite_proof_term(&mut proof, goal, term, reverse, remaining, close)?;
-                    tasks.push(Task::Proof(proof));
-                }
-                Task::RefineTerm(mut proof, goal, depth) => {
-                    let term = values.pop().expect("refinement term visit");
-                    self.finish_refinement(&mut proof, goal, term, depth)?;
-                    tasks.push(Task::Proof(proof));
-                }
-                Task::ProofTerm(mut proof, goal, instance_start) => {
-                    let term = values.pop().expect("tactic term visit");
-                    if let Some(instance_start) = instance_start {
-                        self.apply_proof_term(&mut proof, goal, term, instance_start)?;
-                    } else {
-                        self.close_proof_goal(goal, term.value)?;
-                    }
-                    tasks.push(Task::Proof(proof));
-                }
-                Task::Lambda(saved, binders, expected) => {
-                    let mut body = values.pop().expect("lambda body visit");
-                    self.flush(false)?;
-                    body.value = self.instantiate(&body.value)?;
-                    body.type_ = self.instantiate(&body.type_)?;
-                    for local in binders.into_iter().rev() {
+                        tasks.truncate(checkpoint.tasks);
+                        values.truncate(checkpoint.values);
+                        checkpoint.restore(self);
                         self.tick()?;
-                        let domain = self.instantiate(&local.type_)?;
-                        body.value = body
-                            .value
-                            .abstract_fvar(&local.id, 0)
-                            .map_err(|_| failure(SourceInferenceError::Scope))?;
-                        body.type_ = body
-                            .type_
-                            .abstract_fvar(&local.id, 0)
-                            .map_err(|_| failure(SourceInferenceError::Scope))?;
-                        body.value = Expr::lam(
-                            local.user_name.clone(),
-                            domain.clone(),
-                            body.value,
-                            local.binder_info,
-                        );
-                        body.type_ =
-                            Expr::forall_e(local.user_name, domain, body.type_, local.binder_info);
-                    }
-                    self.txn.lctx = saved;
-                    values.push(self.finish_term(body, expected.as_ref())?);
-                }
-                Task::Function(arguments, expected) => {
-                    let function = values.pop().expect("function task follows its visit");
-                    tasks.push(Task::Apply(function, arguments, expected));
-                }
-                Task::Apply(function, arguments, expected) => {
-                    if let Some((first, rest)) = arguments.split_first() {
-                        let function =
-                            self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
-                        let ExprNode::ForallE {
-                            binder_type, body, ..
-                        } = function.type_.node()
-                        else {
-                            return Err(failure(SourceInferenceError::ExpectedFunction));
-                        };
-                        let domain = binder_type.clone();
-                        let codomain = body.clone();
-                        // Propagate a known result before checking the last
-                        // explicit argument when the codomain does not depend
-                        // on that argument (e.g. Inhabited.mk (fun x => ...)).
-                        if rest.is_empty()
-                            && !codomain.has_loose_bvar(0)
-                            && let Some(expected) = &expected
-                        {
-                            self.constrain_type(&codomain, expected)?;
+                        if checkpoint.retry() {
+                            let proof = checkpoint.begin(self, attempts.len())?;
+                            attempts.push(checkpoint);
+                            tasks.push(Task::Proof(proof));
+                            break;
                         }
-                        tasks.push(Task::Argument(function, codomain, rest, expected));
-                        tasks.push(Task::Visit(first, Some(domain), true));
-                    } else {
-                        values.push(self.finish_term(function, expected.as_ref())?);
-                    }
-                }
-                Task::Argument(function, codomain, rest, expected) => {
-                    let argument = values.pop().expect("argument task follows its visit");
-                    let type_ = self.substitute(&codomain, &argument.value)?;
-                    tasks.push(Task::Apply(
-                        Typed {
-                            value: Expr::app(function.value, argument.value),
-                            type_,
-                        },
-                        rest,
-                        expected,
-                    ));
-                }
-                Task::Infix(intrinsic, expected) => {
-                    let right = values.pop().expect("infix right visit");
-                    let left = values.pop().expect("infix left visit");
-                    self.flush(false)?;
-                    let name = match intrinsic {
-                        BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
-                        BoundedInfixIntrinsic::ScalarBeq => {
-                            if self.instantiate(&left.type_)? == string_const()
-                                && self.instantiate(&right.type_)? == string_const()
-                            {
-                                Name::from_components(["String", "decEq"])
-                            } else {
-                                Name::from_components(["Nat", "beq"])
-                            }
+                        if checkpoint.optional() {
+                            tasks.push(Task::Proof(checkpoint.original()));
+                            break;
                         }
-                    };
-                    let mut function = self.constant(&name)?;
-                    for argument in [left, right] {
-                        function =
-                            self.insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
-                        let ExprNode::ForallE {
-                            binder_type, body, ..
-                        } = function.type_.node()
-                        else {
-                            return Err(failure(SourceInferenceError::ExpectedFunction));
-                        };
-                        let domain = binder_type.clone();
-                        let body = body.clone();
-                        let argument = self.finish_term(argument, Some(&domain))?;
-                        self.constrain_type(&argument.type_, &domain)?;
-                        function.type_ = self.substitute(&body, &argument.value)?;
-                        function.value = Expr::app(function.value, argument.value);
                     }
-                    values.push(self.finish_term(function, expected.as_ref())?);
-                }
-                Task::ForallDomain(names, body, expected) => {
-                    let domain = values.pop().expect("quantifier domain visit");
-                    let universe = self.sort_level(&domain)?;
-                    let saved = self.txn.lctx.clone();
-                    let mut locals = Vec::new();
-                    for name in names {
-                        self.tick()?;
-                        let Syntax::Ident { val, .. } = name else {
-                            return Err(failure(SourceInferenceError::Scope));
-                        };
-                        if val.is_anonymous() {
-                            return Err(failure(SourceInferenceError::Scope));
-                        }
-                        let id = FVarId(self.fresh_name()?);
-                        self.txn.lctx.add_param(
-                            id.clone(),
-                            val.clone(),
-                            domain.value.clone(),
-                            BinderInfo::Default,
-                        );
-                        locals.push(self.txn.lctx.find(&id).expect("quantified local").clone());
-                    }
-                    tasks.push(Task::ForallBody(saved, locals, universe, expected));
-                    tasks.push(Task::Visit(body, Some(self.type_expected()?), true));
-                }
-                Task::ForallBody(saved, locals, domain_universe, expected) => {
-                    let body = values.pop().expect("quantifier body visit");
-                    let mut universe = self.sort_level(&body)?;
-                    let mut value = body.value;
-                    for local in locals.iter().rev() {
-                        self.tick()?;
-                        value = value
-                            .abstract_fvar(&local.id, 0)
-                            .map_err(|_| failure(SourceInferenceError::Scope))?;
-                        value = Expr::forall_e(
-                            local.user_name.clone(),
-                            local.type_.clone(),
-                            value,
-                            local.binder_info,
-                        );
-                        universe = Level::imax(domain_universe.clone(), universe)
-                            .map_err(|_| failure(SourceInferenceError::Scope))?;
-                    }
-                    self.txn.lctx = saved;
-                    values.push(self.finish_term(
-                        Typed {
-                            value,
-                            type_: Expr::sort(universe),
-                        },
-                        expected.as_ref(),
-                    )?);
-                }
-                Task::Arrow(expected) => {
-                    let right = values.pop().expect("arrow codomain visit");
-                    let left = values.pop().expect("arrow domain visit");
-                    let u = self.sort_level(&left)?;
-                    let v = self.sort_level(&right)?;
-                    let level =
-                        Level::imax(u, v).map_err(|_| failure(SourceInferenceError::Scope))?;
-                    let body = right
-                        .value
-                        .lift_loose(0, 1)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?;
-                    let term = Typed {
-                        value: Expr::forall_e(
-                            Name::anonymous(),
-                            left.value,
-                            body,
-                            BinderInfo::Default,
-                        ),
-                        type_: Expr::sort(level),
-                    };
-                    values.push(self.finish_term(term, expected.as_ref())?);
-                }
-                Task::LetAnnotation(name, value, body, expected) => {
-                    let annotation = values.pop().expect("let annotation visit");
-                    self.sort_level(&annotation)?;
-                    tasks.push(Task::LetValue(
-                        name,
-                        Some(annotation.value.clone()),
-                        body,
-                        expected,
-                    ));
-                    tasks.push(Task::Visit(value, Some(annotation.value), true));
-                }
-                Task::LetValue(name, annotation, body, expected) => {
-                    let mut value = values.pop().expect("let value visit");
-                    if let Some(annotation) = annotation {
-                        value.type_ = annotation;
-                    }
-                    let saved = self.txn.lctx.clone();
-                    let id = FVarId(self.fresh_name()?);
-                    self.txn.lctx.add_let(
-                        id.clone(),
-                        name.clone(),
-                        value.type_.clone(),
-                        value.value.clone(),
-                    );
-                    tasks.push(Task::LetBody(saved, id, name, value));
-                    tasks.push(Task::Visit(body, expected, true));
-                }
-                Task::LetBody(saved, id, name, value) => {
-                    self.matrix_aliases.remove(&id);
-                    let mut body = values.pop().expect("let body visit");
-                    body.value = self.instantiate(&body.value)?;
-                    body.type_ = self.instantiate(&body.type_)?;
-                    let abstract_body = body
-                        .value
-                        .abstract_fvar(&id, 0)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?;
-                    let abstract_type = body
-                        .type_
-                        .abstract_fvar(&id, 0)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?;
-                    let type_ = self.substitute(&abstract_type, &value.value)?;
-                    values.push(Typed {
-                        value: Expr::let_e(name, value.type_, value.value, abstract_body, false),
-                        type_,
-                    });
-                    self.txn.lctx = saved;
                 }
             }
         }
-        let [result] = values.as_slice() else {
-            return Err(failure(SourceInferenceError::Scope));
-        };
-        Ok(result.clone())
     }
 
     fn let_parts<'a>(

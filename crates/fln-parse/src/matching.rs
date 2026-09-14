@@ -14,6 +14,26 @@ struct Alternative {
     arrow: Option<usize>,
     end: usize,
 }
+struct ConditionalPlan {
+    start: usize,
+    depth: usize,
+    baseline: usize,
+    then_at: Option<usize>,
+    else_at: Option<usize>,
+    end: usize,
+}
+enum Plan {
+    Match(MatchPlan),
+    Conditional(ConditionalPlan),
+}
+impl Plan {
+    fn start(&self) -> usize {
+        match self {
+            Self::Match(p) => p.start,
+            Self::Conditional(p) => p.start,
+        }
+    }
+}
 struct MatchPlan {
     function: bool,
     baseline: usize,
@@ -49,7 +69,7 @@ fn close(
     view: &SourceView,
     tokens: &[LexedToken],
     active: &mut Vec<MatchPlan>,
-    done: &mut Vec<MatchPlan>,
+    done: &mut Vec<Plan>,
     end: usize,
 ) -> Result<(), NatDefinitionParseError> {
     let mut plan = active.pop().expect("active match");
@@ -62,15 +82,37 @@ fn close(
     }
     last.end = end;
     plan.end = end;
-    done.push(plan);
+    done.push(Plan::Match(plan));
     Ok(())
 }
+fn close_conditional(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    active: &mut Vec<ConditionalPlan>,
+    done: &mut Vec<Plan>,
+    end: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let mut conditional = active.pop().expect("active conditional");
+    if conditional
+        .then_at
+        .is_none_or(|at| at <= conditional.start + 1)
+        || conditional.else_at.is_none_or(|at| {
+            at <= conditional.then_at.expect("validated then") + 1 || at + 1 >= end
+        })
+    {
+        return Err(refuse(view, tokens, end));
+    }
+    conditional.end = end;
+    done.push(Plan::Conditional(conditional));
+    Ok(())
+}
+
 fn plan(
     view: &SourceView,
     tokens: &[LexedToken],
     range: Range<usize>,
     equations: bool,
-) -> Result<Vec<MatchPlan>, NatDefinitionParseError> {
+) -> Result<Vec<Plan>, NatDefinitionParseError> {
     let mut delimiters = Vec::new();
     let mut active: Vec<MatchPlan> = if equations {
         vec![MatchPlan {
@@ -85,9 +127,21 @@ fn plan(
     } else {
         Vec::new()
     };
+    let mut conditionals: Vec<ConditionalPlan> = Vec::new();
     let mut lets = Vec::new();
     let mut done = Vec::new();
     for at in range.clone() {
+        // A completed conditional in a local value ends at the next outer
+        // statement. Nested conditionals share this heap plan with matches.
+        while conditionals.last().is_some_and(|p| {
+            p.depth == delimiters.len()
+                && p.else_at.is_some()
+                && later_line(view, tokens, at, p.start)
+                && column(view, tokens, at) <= p.baseline
+                && !is_symbol(tokens, at, "else")
+        }) {
+            close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
+        }
         // A function used in a tactic-local value must stop at the next outer
         // statement, not consume it as the final branch's application argument.
         // Use the enclosing line's indentation, not the inline `fun` column.
@@ -113,6 +167,58 @@ fn plan(
                 })
         });
         match symbol.as_str() {
+            "if" => conditionals.push(ConditionalPlan {
+                start: at,
+                depth,
+                baseline: {
+                    let source = view.normalized();
+                    let begin = source
+                        .line_start(source.line_of(tokens[at].extent.start()))
+                        .expect("conditional line")
+                        .0;
+                    source.as_bytes()[begin..tokens[at].extent.start().0]
+                        .iter()
+                        .take_while(|&&b| b == b' ' || b == b'\t')
+                        .count()
+                },
+                then_at: None,
+                else_at: None,
+                end: range.end,
+            }),
+            "then" | "else" => {
+                let target = conditionals
+                    .iter()
+                    .rposition(|p| {
+                        p.depth == depth
+                            && if symbol == "then" {
+                                p.then_at.is_none()
+                            } else {
+                                p.then_at.is_some() && p.else_at.is_none()
+                            }
+                    })
+                    .ok_or_else(|| refuse(view, tokens, at))?;
+                while conditionals.len() > target + 1 {
+                    close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
+                }
+                let current = &mut conditionals[target];
+                while active
+                    .last()
+                    .is_some_and(|p| p.start > current.start && p.depth == depth)
+                {
+                    close(view, tokens, &mut active, &mut done, at)?;
+                }
+                if symbol == "then" {
+                    if at == current.start + 1 {
+                        return Err(refuse(view, tokens, at));
+                    }
+                    current.then_at = Some(at);
+                } else {
+                    if current.then_at == Some(at - 1) {
+                        return Err(refuse(view, tokens, at));
+                    }
+                    current.else_at = Some(at);
+                }
+            }
             "match" => active.push(MatchPlan {
                 function: false,
                 baseline: 0,
@@ -141,16 +247,23 @@ fn plan(
                 alternatives: Vec::new(),
                 end: range.end,
             }),
-            "let" => lets.push((depth, active.len())),
+            "let" => lets.push((depth, active.len(), conditionals.len())),
             ";" | ":" if proof_body => {}
             ";" => {
                 // A let's separator ends matches in its VALUE, not the outer
                 // match whose branch contains the let and its continuation.
-                let enclosing = if lets.last().is_some_and(|(d, _)| *d == depth) {
-                    lets.pop().expect("let at current depth").1
-                } else {
-                    0
-                };
+                let (enclosing, enclosing_conditionals) =
+                    if lets.last().is_some_and(|(d, _, _)| *d == depth) {
+                        let (_, matches, conditionals) = lets.pop().expect("let at current depth");
+                        (matches, conditionals)
+                    } else {
+                        (0, 0)
+                    };
+                while conditionals.len() > enclosing_conditionals
+                    && conditionals.last().is_some_and(|p| p.depth == depth)
+                {
+                    close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
+                }
                 while active.len() > enclosing && active.last().is_some_and(|p| p.depth == depth) {
                     close(view, tokens, &mut active, &mut done, at)?;
                 }
@@ -159,9 +272,15 @@ fn plan(
             "{" => delimiters.push("}"),
             "[" => delimiters.push("]"),
             "⦃" => delimiters.push("⦄"),
+            ":" if conditionals.last().is_some_and(|p| {
+                p.depth == depth
+                    && p.then_at.is_none()
+                    && at == p.start + 2
+                    && matches!(tokens[p.start + 1].kind, TokenKind::Ident(_))
+            }) => {}
             ":" if lets
                 .last()
-                .is_some_and(|(d, enclosing)| *d == depth && active.len() <= *enclosing) => {}
+                .is_some_and(|(d, enclosing, _)| *d == depth && active.len() <= *enclosing) => {}
             ")" | "}" | "]" | "⦄" | "," | ":" => {
                 // Commas before `with`, or before a row's arrow, separate
                 // columns of this match rather than terminate its branch body.
@@ -173,6 +292,9 @@ fn plan(
                     })
                 {
                     continue;
+                }
+                while conditionals.last().is_some_and(|p| p.depth == depth) {
+                    close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
                 }
                 while active.last().is_some_and(|p| p.depth == depth) {
                     close(view, tokens, &mut active, &mut done, at)?;
@@ -195,6 +317,11 @@ fn plan(
                 current.with = Some(at);
             }
             "|" => {
+                while conditionals.last().is_some_and(|p| {
+                    p.depth == depth && active.last().is_none_or(|m| m.start < p.start)
+                }) {
+                    close_conditional(view, tokens, &mut conditionals, &mut done, at)?;
+                }
                 // Indented tactic alternatives belong to the proof parser,
                 // not the surrounding expression match. Keep their leaves in
                 // the original branch range for that parser to validate.
@@ -222,7 +349,9 @@ fn plan(
                         break;
                     }
                 }
-                let current = active.last_mut().ok_or_else(|| refuse(view, tokens, at))?;
+                let Some(current) = active.last_mut() else {
+                    return Err(refuse(view, tokens, at));
+                };
                 if current.depth != depth || current.with.is_none() {
                     return Err(refuse(view, tokens, at));
                 }
@@ -254,6 +383,9 @@ fn plan(
             _ => {}
         }
     }
+    while !conditionals.is_empty() {
+        close_conditional(view, tokens, &mut conditionals, &mut done, range.end)?;
+    }
     while !active.is_empty() {
         close(view, tokens, &mut active, &mut done, range.end)?;
     }
@@ -262,7 +394,7 @@ fn plan(
     }
     // Descendants start later. Ownership moves into their parent rather than
     // cloning a growing Syntax tree once per enclosing match.
-    done.sort_by_key(|p| std::cmp::Reverse(p.start));
+    done.sort_by_key(|p| std::cmp::Reverse(p.start()));
     Ok(done)
 }
 fn pattern(
@@ -517,14 +649,77 @@ fn parse_planned(
     let mut splices = Splices::new();
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     if grammar == DefinitionGrammar::Scalar
+        // A tactic block owns its statement and alternative boundaries. Its
+        // individual term arguments reenter this planner at bounded ranges;
+        // planning their matches across the whole proof confuses tactic pipes
+        // with constructor alternatives and swallows following instructions.
+        && !is_symbol(tokens, range.start, "by")
         && (equations
             || range.clone().any(|at| {
-                is_symbol(tokens, at, "match")
+                is_symbol(tokens, at, "if") || is_symbol(tokens, at, "match")
                     || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
                         && is_symbol(tokens, at + 1, "|"))
             }))
     {
-        for plan in plan(view, tokens, range.clone(), equations)? {
+        for planned in plan(view, tokens, range.clone(), equations)? {
+            let plan = match planned {
+                Plan::Match(plan) => plan,
+                Plan::Conditional(plan) => {
+                    let then_at = plan.then_at.expect("planned then");
+                    let else_at = plan.else_at.expect("planned else");
+                    let named = is_symbol(tokens, plan.start + 2, ":");
+                    let binding = if named {
+                        null_node(vec![
+                            leaves.leaf(plan.start + 1)?,
+                            leaves.leaf(plan.start + 2)?,
+                        ])
+                    } else {
+                        null_node(vec![])
+                    };
+                    let begin = plan.start + if named { 3 } else { 1 };
+                    let condition = branch_value(
+                        leaves,
+                        view,
+                        tokens,
+                        begin..then_at,
+                        grammar,
+                        &mut splices,
+                        &updates,
+                    )?;
+                    let yes = branch_value(
+                        leaves,
+                        view,
+                        tokens,
+                        then_at + 1..else_at,
+                        grammar,
+                        &mut splices,
+                        &updates,
+                    )?;
+                    let no = branch_value(
+                        leaves,
+                        view,
+                        tokens,
+                        else_at + 1..plan.end,
+                        grammar,
+                        &mut splices,
+                        &updates,
+                    )?;
+                    let syntax = Syntax::node(
+                        parser_kind(&["Term", "ifThenElse"]),
+                        vec![
+                            leaves.leaf(plan.start)?,
+                            binding,
+                            condition,
+                            leaves.leaf(then_at)?,
+                            yes,
+                            leaves.leaf(else_at)?,
+                            no,
+                        ],
+                    );
+                    splices.insert(plan.start, (plan.end, syntax));
+                    continue;
+                }
+            };
             let with = plan.with.expect("validated match header");
             let equation_root = equations && plan.start == range.start;
             let mut discriminators = Vec::new();
@@ -910,5 +1105,57 @@ mod literal_pattern_tests {
             let parsed = parse_definition(source.as_bytes()).unwrap();
             assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
         }).unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    use super::*;
+    #[test]
+    fn conditionals_roundtrip_comments_and_statement_boundaries() {
+        for source in [
+            "def f (b : Bool) : Nat := if /- condition -/ b then 1 else 2",
+            "def f (b : Bool) : Nat :=\r\n  if b then\r\n    1\r\n  else\r\n    2\r\n",
+            "def f : Nat := by\n let n := if true then 1 else 2\n exact n\n",
+            "def f : Nat := if true then let n := 1; n else let n := 2; n",
+            "def f : Nat := if true then match false with | true => 1 | false => 2 else 3",
+            "def f : Nat := if h : true then 1 else 2",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+    }
+    #[test]
+    fn malformed_conditional_boundaries_refuse() {
+        for body in [
+            "if then 1 else 2",
+            "if true then else 2",
+            "if true then 1 else",
+            "if true then 1",
+            "if true else 1",
+            "if true then 1 else 2 else 3",
+            "if true then if false then 1 else 2",
+        ] {
+            let source = format!("def f : Nat := {body}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn deeply_nested_conditionals_use_heap_plans() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!(
+                    "def f : Nat := {}0{}",
+                    "if true then ".repeat(1000),
+                    " else 1".repeat(1000)
+                );
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
