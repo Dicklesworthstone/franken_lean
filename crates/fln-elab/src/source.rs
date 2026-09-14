@@ -793,6 +793,7 @@ impl Context {
                                 }
                                 if kind == &parser_kind(&["Term", "match"])
                                     || kind == &parser_kind(&["Term", "matchMatrix"])
+                                    || kind == &parser_kind(&["Term", "ifThenElse"])
                                 {
                                     let parts = self.match_parts(syntax)?;
                                     let discriminant = parts.discriminant;

@@ -1112,6 +1112,18 @@ mod literal_pattern_tests {
 mod conditional_tests {
     use super::*;
     #[test]
+    fn named_proposition_conditions_preserve_evidence_and_branch_boundaries() {
+        for source in [
+            "def f (p : Prop) [Decidable p] : Nat := if /- evidence -/ h : p then 1 else 2",
+            "theorem f (p : Prop) [Decidable p] (hp : p) : p :=\r\n  if h : p then h else hp\r\n",
+            "theorem f (p : Prop) [Decidable p] (hp : p) : p := by\n  refine if h : p then ?_ else ?_\n  · exact h\n  · exact hp\n",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+    }
+    #[test]
     fn conditionals_roundtrip_comments_and_statement_boundaries() {
         for source in [
             "def f (b : Bool) : Nat := if /- condition -/ b then 1 else 2",

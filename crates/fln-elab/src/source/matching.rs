@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
     ExpectedInductive,
+    ExpectedCondition,
     UnsupportedFamily,
     UnrefinedIndices,
     UnrefinedIndexPattern,
@@ -27,6 +28,9 @@ impl std::fmt::Display for MatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::ExpectedInductive => "match discriminant requires a known inductive type",
+            Self::ExpectedCondition => {
+                "conditional requires Bool or a decidable proposition; named evidence requires Prop"
+            }
             Self::UnsupportedFamily => {
                 "elimination requires a supported single family with direct recursion"
             }
@@ -56,6 +60,18 @@ pub(super) struct MatchParts<'a> {
     pub(super) discriminant: &'a Syntax,
     alternatives: &'a [Syntax],
     pub(super) generated: bool,
+    conditional: Option<ConditionalParts<'a>>,
+}
+#[derive(Clone, Copy)]
+struct ConditionalParts<'a> {
+    binding: Option<&'a Name>,
+    yes: &'a Syntax,
+    no: &'a Syntax,
+}
+impl MatchParts<'_> {
+    pub(in crate::source) fn is_conditional(&self) -> bool {
+        self.conditional.is_some()
+    }
 }
 pub(super) struct MatchPatterns<'a> {
     pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
@@ -183,6 +199,37 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<MatchParts<'a>, NatDefinitionElabError> {
+        if syntax.kind() == Some(&parser_kind(&["Term", "ifThenElse"])) {
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Term", "ifThenElse"]),
+                7,
+                "conditional",
+            )?;
+            expect_atom(&parts[0], "if", "conditional keyword")?;
+            expect_atom(&parts[3], "then", "conditional then")?;
+            expect_atom(&parts[5], "else", "conditional else")?;
+            let binding = match expect_null_args(&parts[1], "conditional evidence")? {
+                [] => None,
+                [Syntax::Ident { val, .. }, colon]
+                    if !val.is_anonymous() && val.parent().is_anonymous() =>
+                {
+                    expect_atom(colon, ":", "conditional evidence separator")?;
+                    Some(val)
+                }
+                _ => return Err(error(MatchError::InvalidPattern)),
+            };
+            return Ok(MatchParts {
+                discriminant: &parts[2],
+                alternatives: &[],
+                generated: true,
+                conditional: Some(ConditionalParts {
+                    binding,
+                    yes: &parts[4],
+                    no: &parts[6],
+                }),
+            });
+        }
         let generated = syntax.kind() == Some(&parser_kind(&["Term", "matchMatrix"]));
         let parts = expect_node(
             syntax,
@@ -221,6 +268,7 @@ impl Context {
             discriminant: &discriminant[1],
             alternatives,
             generated,
+            conditional: None,
         })
     }
 
@@ -280,9 +328,45 @@ impl Context {
     pub(super) fn start_match<'a>(
         &mut self,
         parts: MatchParts<'a>,
-        major: Typed,
+        mut major: Typed,
         expected: Option<Expr>,
     ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
+        if let Some(conditional) = parts.conditional {
+            let type_ = self.whnf(&major.type_)?;
+            if type_ == Expr::const_(Name::from_components(["Bool"]), vec![]) {
+                if conditional.binding.is_some() {
+                    return Err(error(MatchError::ExpectedCondition));
+                }
+            } else if type_ == Expr::sort(Level::zero()) {
+                // Keep the condition in the checked dictionary's type and both
+                // branches in the ordinary Decidable recursor. No source branch
+                // is selected by evaluating a proposition or a host Boolean.
+                let proposition = self.whnf(&major.value)?;
+                let type_ = Expr::app(
+                    Expr::const_(Name::from_components(["Decidable"]), vec![]),
+                    proposition,
+                );
+                let dictionary = self.instance_hole(type_.clone())?;
+                // Normalization helps instance selection for computed conditions,
+                // but cannot erase an invalid unselected arm of that condition.
+                // Retain the original proposition as a checked local value.
+                major = Typed {
+                    value: Expr::let_e(
+                        self.fresh_name()?,
+                        Expr::sort(Level::zero()),
+                        major.value,
+                        dictionary
+                            .lift_loose(0, 1)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                        false,
+                    ),
+                    type_,
+                };
+                self.resolve_instances(false)?;
+            } else {
+                return Err(error(MatchError::ExpectedCondition));
+            }
+        }
         // Keep the existing direct/index-polymorphic path, including recursive
         // call lowering. Only the precise index-shape refusal selects the
         // equation-refining backend; typing faults and resource stops propagate.
@@ -659,6 +743,29 @@ impl Context {
         constructors: &[Name],
     ) -> Result<MatchPatterns<'a>, NatDefinitionElabError> {
         let mut patterns = HashMap::new();
+        if let Some(conditional) = parts.conditional {
+            let (no, yes, fields) = if name == &Name::from_components(["Bool"]) {
+                ("false", "true", vec![])
+            } else if name == &Name::from_components(["Decidable"]) {
+                ("isFalse", "isTrue", vec![conditional.binding.cloned()])
+            } else {
+                return Err(error(MatchError::ExpectedCondition));
+            };
+            let no = Name::str(name.clone(), no);
+            let yes = Name::str(name.clone(), yes);
+            if constructors.len() != 2
+                || !constructors.contains(&no)
+                || !constructors.contains(&yes)
+            {
+                return Err(error(MatchError::UnsupportedFamily));
+            }
+            patterns.insert(no, (fields.clone(), conditional.no));
+            patterns.insert(yes, (fields, conditional.yes));
+            return Ok(MatchPatterns {
+                constructors: patterns,
+                fallback: None,
+            });
+        }
         let mut fallback = None;
         for (index, syntax) in parts.alternatives.iter().enumerate() {
             self.tick()?;

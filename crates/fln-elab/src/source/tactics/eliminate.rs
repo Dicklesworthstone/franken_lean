@@ -993,6 +993,13 @@ impl Context {
             }
         }
         proof.work.push(Work::Close(goal, recursor.value));
+        if matches!(input, EliminationSyntax::Match(parts) if parts.is_conditional()) {
+            // The recursor's minor order is false/true, but source conditionals
+            // elaborate then/else. In particular explicit refine holes must be
+            // presented in source order with the corresponding branch evidence.
+            // Holes above already occupy the recursor's correct minor positions.
+            branches.reverse();
+        }
         for branch in branches.into_iter().rev() {
             proof.work.extend(branch);
         }

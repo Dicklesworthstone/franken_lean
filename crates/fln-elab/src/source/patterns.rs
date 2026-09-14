@@ -748,57 +748,6 @@ impl Context {
         Ok(result)
     }
 
-    /// Both branches become ordinary recursor premises. The source condition
-    /// is never evaluated here, even when it is closed or the result is unused.
-    fn compile_boolean_conditional(
-        &mut self,
-        mut syntax: Syntax,
-    ) -> Result<Syntax, NatDefinitionElabError> {
-        self.tick()?;
-        let Syntax::Node { args, .. } = &mut syntax else {
-            return Err(invalid());
-        };
-        let [keyword, binding, condition, then_word, yes, else_word, no]: [Syntax; 7] =
-            std::mem::take(args).try_into().map_err(|_| invalid())?;
-        expect_atom(&keyword, "if", "conditional keyword")?;
-        expect_atom(&then_word, "then", "conditional then")?;
-        expect_atom(&else_word, "else", "conditional else")?;
-        expect_empty_null(&binding, "named condition requires decidable evidence")?;
-        let alternatives = [("false", no), ("true", yes)]
-            .into_iter()
-            .map(|(name, body)| {
-                Syntax::node(
-                    parser_kind(&["Term", "matchAlt"]),
-                    vec![
-                        atom("|"),
-                        null(vec![null(vec![identifier(Name::from_components([
-                            "Bool", name,
-                        ]))])]),
-                        atom("=>"),
-                        body,
-                    ],
-                )
-            })
-            .collect();
-        Ok(Syntax::node(
-            parser_kind(&["Term", "matchMatrix"]),
-            vec![
-                atom("match"),
-                null(vec![]),
-                null(vec![]),
-                null(vec![Syntax::node(
-                    parser_kind(&["Term", "matchDiscr"]),
-                    vec![null(vec![]), condition],
-                )]),
-                atom("with"),
-                Syntax::node(
-                    parser_kind(&["Term", "matchAlts"]),
-                    vec![null(alternatives)],
-                ),
-            ],
-        ))
-    }
-
     /// Rebuild once, inside out. Ordinary flat matches are not cloned or changed.
     pub(super) fn lower_pattern_matrices<'a>(
         &mut self,
@@ -808,9 +757,7 @@ impl Context {
         let mut needed = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
-            needed |= complex(node, &self.txn.env)
-                || pattern_function(node)
-                || node.kind() == Some(&parser_kind(&["Term", "ifThenElse"]));
+            needed |= complex(node, &self.txn.env) || pattern_function(node);
             if let Syntax::Node { args, .. } = node {
                 scan.extend(args);
             }
@@ -844,9 +791,7 @@ impl Context {
                         args: built.split_off(start),
                     };
                     let mut required = Vec::new();
-                    let node = if node.kind() == Some(&parser_kind(&["Term", "ifThenElse"])) {
-                        self.compile_boolean_conditional(node)?
-                    } else if pattern_function(&node) {
+                    let node = if pattern_function(&node) {
                         self.compile_pattern_function(node, &mut required)?
                     } else if complex(&node, &self.txn.env) {
                         self.compile_pattern_matrix(
