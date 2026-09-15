@@ -611,7 +611,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 50] {
+pub fn source_seed_declarations() -> [Declaration; 51] {
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -663,6 +663,7 @@ pub fn source_seed_declarations() -> [Declaration; 50] {
         decidable::true_instance(),
         decidable::false_instance(),
         decidable::not_instance(),
+        decidable::of_decide_eq_true_declaration(),
     ]
 }
 

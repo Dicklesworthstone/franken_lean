@@ -11,6 +11,7 @@ mod construct;
 mod constructor_transport;
 mod constructors;
 mod control;
+mod decision;
 pub(in crate::source) mod eliminate;
 mod equality;
 mod index_equations;
@@ -22,6 +23,8 @@ pub(in crate::source) use refine::RefinementFrame;
 pub enum TacticError {
     ExplicitFailure,
     ExpectedGoal,
+    ExpectedProposition,
+    DecisionNotTrue,
     NoGoals,
     UnsolvedGoals { count: usize },
     NoMatchingAssumption,
@@ -50,6 +53,8 @@ impl std::fmt::Display for TacticError {
         match self {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
             Self::ExpectedGoal => write!(f, "by proof requires an expected type"),
+            Self::ExpectedProposition => write!(f, "decision requires a proposition"),
+            Self::DecisionNotTrue => write!(f, "decision did not reduce to a proof of the goal"),
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
             Self::SyntheticHoleOutsideRefine => write!(f, "synthetic proof holes require refine"),
@@ -136,6 +141,11 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Cases {
+        goal: ProofGoal,
+        name: Name,
+        proposition: &'a Syntax,
+    },
     Attempt(backtrack::Spec<'a>),
     AttemptComplete(usize),
     Refine {
@@ -500,6 +510,32 @@ impl Context {
                 };
                 expect_atom(keyword, "refine", "refinement tactic")?;
                 return Ok(ProofAction::Refine { syntax: term, goal });
+            } else if kind == &parser_kind(&["Tactic", "by_cases"]) {
+                let [keyword, binder, proposition] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "by_cases", "decidable case split")?;
+                let name = match expect_null_args(binder, "case evidence name")? {
+                    [] => Name::from_components(["h"]),
+                    [Syntax::Ident { val, .. }, colon]
+                        if !val.is_anonymous() && val.parent().is_anonymous() =>
+                    {
+                        expect_atom(colon, ":", "case evidence annotation")?;
+                        val.clone()
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                };
+                return Ok(ProofAction::Cases {
+                    goal,
+                    name,
+                    proposition,
+                });
+            } else if kind == &parser_kind(&["Tactic", "decide"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "decide", "decision proof tactic")?;
+                self.decide_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "constructor"])
                 || kind == &parser_kind(&["Tactic", "left"])
                 || kind == &parser_kind(&["Tactic", "right"])

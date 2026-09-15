@@ -259,3 +259,85 @@ pub fn not_instance() -> Declaration {
     );
     defined("instDecidableNot", vec![], &[&p, &d], result, value)
 }
+
+/// Recover evidence from a checked computation of a Decidable dictionary.
+/// The false branch uses equality transport from True at Bool.false to p at
+/// Bool.true. Its impossible equality is an explicit premise, not a host test.
+pub fn of_decide_eq_true_declaration() -> Declaration {
+    use fln_env::constants::TheoremVal;
+    let explicit = BinderInfo::Default;
+    let p = local("p", Expr::sort(Level::zero()), BinderInfo::Implicit);
+    let d = local("d", decision(fv(&p)), BinderInfo::InstImplicit);
+    let bool_eq = |left: Expr, right: Expr| {
+        app(
+            Expr::const_(name("Eq"), vec![Level::one()]),
+            [constant("Bool"), left, right],
+        )
+    };
+    let requirement = |witness: Expr| {
+        bool_eq(
+            app(constant("decide"), [fv(&p), witness]),
+            constant("Bool.true"),
+        )
+    };
+    let witness = local("decision_witness", decision(fv(&p)), explicit);
+    let equation = local("computed_true", requirement(fv(&witness)), explicit);
+    let motive = close(&[&witness], close(&[&equation], fv(&p), false), true);
+
+    let hp = local("positive_proof", fv(&p), explicit);
+    let true_equation = local(
+        "true_equation",
+        bool_eq(constant("Bool.true"), constant("Bool.true")),
+        explicit,
+    );
+    let yes = close(&[&hp, &true_equation], fv(&hp), true);
+
+    let hn = local("negative_proof", neg(fv(&p)), explicit);
+    let false_equation = local(
+        "false_equation",
+        bool_eq(constant("Bool.false"), constant("Bool.true")),
+        explicit,
+    );
+    let endpoint = local("boolean_endpoint", constant("Bool"), explicit);
+    let endpoint_equality = local(
+        "boolean_equality",
+        bool_eq(constant("Bool.false"), fv(&endpoint)),
+        explicit,
+    );
+    let boolean = local("boolean_motive_argument", constant("Bool"), explicit);
+    let predicate = app(
+        Expr::const_(name("Bool.rec"), vec![Level::one()]),
+        [
+            close(&[&boolean], Expr::sort(Level::zero()), true),
+            constant("True"),
+            fv(&p),
+            fv(&endpoint),
+        ],
+    );
+    let transport = app(
+        Expr::const_(name("Eq.rec"), vec![Level::zero(), Level::one()]),
+        [
+            constant("Bool"),
+            constant("Bool.false"),
+            close(&[&endpoint, &endpoint_equality], predicate, true),
+            constant("True.intro"),
+            constant("Bool.true"),
+            fv(&false_equation),
+        ],
+    );
+    let no = close(&[&hn, &false_equation], transport, true);
+    let value = app(
+        Expr::const_(name("Decidable.rec"), vec![Level::zero()]),
+        [fv(&p), motive, no, yes, fv(&d)],
+    );
+    let h = local("h", requirement(fv(&d)), explicit);
+    Declaration::Thm(TheoremVal {
+        base: ConstantVal {
+            name: name("of_decide_eq_true"),
+            level_params: vec![],
+            type_: close(&[&p, &d, &h], fv(&p), false),
+        },
+        value: close(&[&p, &d], value, true),
+        all: vec![name("of_decide_eq_true")],
+    })
+}

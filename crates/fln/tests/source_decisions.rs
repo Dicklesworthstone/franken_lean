@@ -110,6 +110,7 @@ fn logical_seed_additions_are_not_axioms() {
         "instDecidableTrue",
         "instDecidableFalse",
         "instDecidableNot",
+        "of_decide_eq_true",
     ] {
         assert!(
             !matches!(

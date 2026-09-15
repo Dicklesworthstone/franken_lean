@@ -116,6 +116,8 @@ fn tactic(
             "subst",
             "injection",
             "contradiction",
+            "by_cases",
+            "decide",
             "skip",
             "fail",
         ]
@@ -138,6 +140,23 @@ fn tactic(
         return rewrite(leaves, view, tokens, range, args.remove(0), keyword == "rw");
     }
     match keyword {
+        "by_cases" if range.end > start + 1 => {
+            let named = range.end > start + 3
+                && matches!(&tokens[start + 1].kind, TokenKind::Ident(_))
+                && matches!(&tokens[start + 2].kind, TokenKind::Symbol(s) if s == ":");
+            args.push(null_node(if named {
+                vec![leaves.leaf(start + 1)?, leaves.leaf(start + 2)?]
+            } else {
+                Vec::new()
+            }));
+            args.push(bounded_term(
+                leaves,
+                view,
+                tokens,
+                start + if named { 3 } else { 1 }..range.end,
+                DefinitionGrammar::Scalar,
+            )?);
+        }
         "intro" => {
             let mut names = Vec::new();
             for index in start + 1..range.end {
@@ -195,7 +214,7 @@ fn tactic(
             args.push(leaves.leaf(start + 1)?);
         }
         "assumption" | "rfl" | "contradiction" | "constructor" | "left" | "right" | "skip"
-        | "fail"
+        | "fail" | "decide"
             if range.end == start + 1 => {}
         "exact" | "apply" | "refine" if range.end > start + 1 => args.push(bounded_term(
             leaves,
@@ -583,6 +602,47 @@ mod construction_refinement_tests {
                 parsed.reconstruct_normalized().unwrap(),
                 source.replace("\r\n", "\n").as_bytes()
             );
+        }
+    }
+
+    #[test]
+    fn decidable_case_syntax_is_lossless_and_contextual() {
+        for source in [
+            "def by_cases (h : Nat) : Nat := h",
+            "theorem t : True := by\r\n  by_cases /- choice -/ h : Not False\r\n  · exact h\r\n  · contradiction\r\n",
+            "theorem t : True := by by_cases (Not False) <;> exact True.intro",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+        for suffix in [
+            "by_cases",
+            "by_cases h :",
+            "by_cases : True",
+            "by_cases h : True extra :",
+        ] {
+            let source = format!("theorem t : True := by {suffix}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn decide_is_contextual_and_does_not_drop_extra_arguments() {
+        for source in [
+            "def decide (p : Nat) : Nat := p",
+            "theorem t : True := by\r\n  decide /- checked computation -/\r\n",
+            "theorem t : Both True True := by constructor <;> (decide)",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for tail in ["decide p", "decide 1", "decide [h]"] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
     }
 

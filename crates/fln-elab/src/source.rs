@@ -680,6 +680,7 @@ impl Context {
                 bool,
             ),
             Proof(tactics::ProofState<'a>),
+            ProofCases(tactics::ProofState<'a>, tactics::ProofGoal, Name),
             ProofBindingType(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -1109,6 +1110,19 @@ impl Context {
                             tasks.push(Task::RecordNext(state));
                         }
                         Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                            tactics::ProofAction::Cases {
+                                goal,
+                                name,
+                                proposition,
+                            } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::ProofCases(proof, goal, name));
+                                tasks.push(Task::Visit(
+                                    proposition,
+                                    Some(Expr::sort(Level::zero())),
+                                    true,
+                                ));
+                            }
                             tactics::ProofAction::Attempt(spec) => {
                                 let mut checkpoint = tactics::backtrack::Checkpoint::new(
                                     self,
@@ -1204,6 +1218,11 @@ impl Context {
                             }
                             tactics::ProofAction::Complete(term) => values.push(term),
                         },
+                        Task::ProofCases(mut proof, goal, name) => {
+                            let proposition = values.pop().expect("case proposition visit");
+                            self.split_decision_goal(&mut proof, goal, name, proposition)?;
+                            tasks.push(Task::Proof(proof));
+                        }
                         Task::ProofBindingType(proof, goal, name, value, opaque) => {
                             let annotation = values.pop().expect("local proof annotation visit");
                             self.sort_level(&annotation)?;

@@ -2069,6 +2069,82 @@ fn installed_decision_instances_compute_and_isolate_failed_suffixes() {
 }
 
 #[test]
+fn installed_decidable_cases_keep_evidence_and_reject_bad_suffixes() {
+    let prefix = file(include_str!(
+        "../../../examples/native_decidable_cases.lean"
+    ));
+    let invalid = file("def invalid : Nat := by by_cases h : True; exact 7; exact (1 : String)");
+    let before = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for field in [
+                "\"commands\":10",
+                "\"theorems\":6",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(field), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}
+
+#[test]
+fn installed_decide_produces_proofs_without_accepting_false_suffixes() {
+    let prefix = file(include_str!(
+        "../../../examples/native_decision_proofs.lean"
+    ));
+    let invalid = file("theorem forged : False := by decide");
+    let before = std::fs::read(&prefix).unwrap();
+    for valid in [true, false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command.args(["check-source", "--json"]).arg(&prefix);
+        if !valid {
+            command.arg(&invalid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let json = String::from_utf8(output.stdout).unwrap();
+            for field in [
+                "\"commands\":12",
+                "\"theorems\":9",
+                "\"authority\":true",
+                "\"executed\":false",
+            ] {
+                assert!(json.contains(field), "{json}");
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+        assert_eq!(std::fs::read(&prefix).unwrap(), before);
+    }
+}
+
+#[test]
 fn installed_proposition_conditionals_retain_invalid_unselected_branches() {
     let prefix = file(include_str!(
         "../../../examples/native_proposition_conditionals.lean"
