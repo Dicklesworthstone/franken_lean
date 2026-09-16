@@ -28,12 +28,16 @@ struct Frame {
     candidates: Vec<Candidate>,
     cursor: usize,
     chosen: Option<Expansion>,
+    // Successful prerequisites remain resumable until the enclosing candidate
+    // completes. Arena indices keep this history flat, not recursively cloned.
+    children: Vec<usize>,
+    resumable: bool,
 }
 
-fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabError {
+pub(super) fn registry_error(error: InstanceRegistryError) -> NatDefinitionElabError {
     failure(SourceInferenceError::InstanceRegistry(error))
 }
-fn nonmatch(error: &NatDefinitionElabError) -> bool {
+pub(super) fn nonmatch(error: &NatDefinitionElabError) -> bool {
     let NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) = error else {
         return false;
     };
@@ -254,7 +258,9 @@ impl Context {
                 .iter()
                 .map(|row| Candidate::Global(row.declaration.clone())),
         );
+        let resumable = prepared.expected.has_expr_mvar();
         Ok(Some(Frame {
+            resumable,
             goal,
             target: prepared.target,
             expected: prepared.expected,
@@ -264,6 +270,7 @@ impl Context {
             candidates,
             cursor: 0,
             chosen: None,
+            children: Vec::new(),
         }))
     }
 
@@ -323,7 +330,48 @@ impl Context {
         }))
     }
 
-    fn search_instance(
+    /// Resume the most recent successful prerequisite, descending through its
+    /// own choices first. Its base retains earlier siblings but none of the
+    /// abandoned branch's assignments, holes, constraints or local declarations.
+    fn retry_instance_choice(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        history: &mut [Option<Frame>],
+    ) -> Result<(), NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            let Some(frame) = frames.last_mut() else {
+                return Ok(());
+            };
+            if let Some(child) = frame.children.pop() {
+                let child = history[child].take().expect("live instance choice");
+                frames.push(child);
+                continue;
+            }
+            frame.chosen = None;
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = frame.base.clone();
+            self.txn.budget.heartbeats_consumed = spent;
+            return Ok(());
+        }
+    }
+
+    fn discard_instance_choices(
+        &mut self,
+        frame: Frame,
+        history: &mut [Option<Frame>],
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut pending = frame.children;
+        while let Some(index) = pending.pop() {
+            self.tick()?;
+            if let Some(child) = history[index].take() {
+                pending.extend(child.children);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn search_instance(
         &mut self,
         root: MVarId,
         registry: &InstanceRegistry,
@@ -339,6 +387,7 @@ impl Context {
             return Ok(false);
         };
         let mut frames = vec![first];
+        let mut history = Vec::new();
         let mut attempts = 0usize;
         while !frames.is_empty() {
             self.tick()?;
@@ -369,7 +418,7 @@ impl Context {
                 }
                 if let Some(child) = ready {
                     if frames.iter().any(|frame| frame.key == child.key) {
-                        frames[index].chosen = None;
+                        self.retry_instance_choice(&mut frames, &mut history)?;
                         continue;
                     }
                     if frames.len() >= MAX_SEARCH_DEPTH {
@@ -379,7 +428,7 @@ impl Context {
                     continue;
                 }
                 if remaining {
-                    frames[index].chosen = None;
+                    self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
                 let mut value = self.instantiate(&expansion.value)?;
@@ -389,7 +438,7 @@ impl Context {
                     || actual.has_expr_mvar()
                     || actual.has_level_mvar()
                 {
-                    frames[index].chosen = None;
+                    self.retry_instance_choice(&mut frames, &mut history)?;
                     continue;
                 }
                 // Selection never sees existing output values. Reconcile only
@@ -403,12 +452,13 @@ impl Context {
                 match self.flush(true) {
                     Ok(()) => {}
                     Err(error) if nonmatch(&error) => {
-                        frames.pop();
-                        if let Some(parent) = frames.last_mut() {
-                            parent.chosen = None;
-                            continue;
+                        let failed = frames.pop().expect("current instance frame");
+                        self.discard_instance_choices(failed, &mut history)?;
+                        if frames.is_empty() {
+                            return Ok(false);
                         }
-                        return Ok(false);
+                        self.retry_instance_choice(&mut frames, &mut history)?;
+                        continue;
                     }
                     Err(error) => return Err(error),
                 }
@@ -435,17 +485,28 @@ impl Context {
                             UnificationError::Metavariable(error),
                         )))
                     })?;
-                frames.pop();
+                let complete = frames.pop().expect("completed instance frame");
+                if complete.resumable
+                    && let Some(parent) = frames.last_mut()
+                {
+                    parent.children.push(history.len());
+                    history.push(Some(complete));
+                } else {
+                    // A ground goal has a canonical first solution. Do not
+                    // enumerate alternate dictionaries for already fixed inputs.
+                    self.discard_instance_choices(complete, &mut history)?;
+                }
                 continue;
             }
             let frame = &mut frames[index];
             let Some(candidate) = frame.candidates.get(frame.cursor).cloned() else {
-                frames.pop();
-                if let Some(parent) = frames.last_mut() {
-                    parent.chosen = None;
-                    continue;
+                let failed = frames.pop().expect("exhausted instance frame");
+                self.discard_instance_choices(failed, &mut history)?;
+                if frames.is_empty() {
+                    return Ok(false);
                 }
-                return Ok(false);
+                self.retry_instance_choice(&mut frames, &mut history)?;
+                continue;
             };
             frame.cursor += 1;
             attempts += 1;
