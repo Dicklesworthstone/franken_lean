@@ -105,16 +105,34 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
 /// Partition both scope commands and declarations, preserving every source byte.
 /// Delimiters protect nested terms and explicit universe argument lists; comments
 /// and strings are lexer events, not text searched for command-looking words.
+/// Scope directives must start a source line. Within a declaration they must
+/// also leave its layout block; `end` is still a valid local name in a proof.
 pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let tokens = tokens(&view)?;
     let mut starts = Vec::new();
     let mut depth = 0_usize;
-    for token in &tokens {
+    let source_view = view.normalized();
+    let column = |token: &LexedToken| {
+        let start = token.extent.start();
+        start.0
+            - source_view
+                .line_start(source_view.line_of(start))
+                .expect("token line")
+                .0
+    };
+    let mut declaration_column = None;
+    for (index, token) in tokens.iter().enumerate() {
         if let TokenKind::Symbol(symbol) = &token.kind {
-            if depth == 0 && (control(symbol) || declaration(symbol)) {
+            let scope_start = control(symbol)
+                && (index == 0
+                    || source_view.line_of(token.extent.start())
+                        > source_view.line_of(tokens[index - 1].extent.end()))
+                && declaration_column.is_none_or(|base| column(token) <= base);
+            if depth == 0 && (scope_start || declaration(symbol)) {
                 starts.push(view.to_original(token.extent.start()).0);
+                declaration_column = declaration(symbol).then(|| column(token));
             }
             match symbol.as_str() {
                 "(" | "[" | "{" | ".{" | "⦃" => depth = depth.saturating_add(1),
@@ -194,5 +212,36 @@ mod tests {
         .unwrap();
         assert_eq!(commands.len(), 4);
         assert!(parse_definition(commands[1].1).is_ok());
+    }
+    #[test]
+    fn scope_words_inside_branch_binders_and_indented_terms_stay_in_the_declaration() {
+        for source in [
+            "def choose (x : Bool) : Nat := by\n  cases x with\n  | false => exact 0\n  | true => let end := 7; exact end",
+            "def choose (x : Nat) : Nat := match x with | Nat.zero => 0 | Nat.succ end => end",
+            "def choose (end : Nat) : Nat :=\n  end",
+            "def choose (namespace section open universe : Nat) : Nat := open",
+        ] {
+            let file = format!("namespace Example\n{source}\nend Example");
+            let commands = partition(file.as_bytes()).unwrap();
+            assert_eq!(commands.len(), 3, "{file}");
+            assert!(parse_definition(commands[1].1).is_ok(), "{file}");
+            assert_eq!(
+                parse(commands[2].1).unwrap(),
+                Some(ScopeCommand::End(Some(Name::from_components(["Example"]))))
+            );
+        }
+        let source = include_bytes!("../../../examples/native_index_refinement.lean");
+        let commands = partition(source).unwrap();
+        assert_eq!(
+            commands.len(),
+            partition_definition_commands(source).unwrap().len()
+        );
+        for (_, command) in commands {
+            assert!(
+                parse_definition(command).is_ok(),
+                "{}",
+                String::from_utf8_lossy(command)
+            );
+        }
     }
 }
