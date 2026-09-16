@@ -78,7 +78,7 @@ pub fn elaborate_record(
         2,
         "record name",
     )?;
-    expect_empty_null(&id[1], "absent universe declarations")?;
+    // The source declaration retains its explicit universe scope.
     let Syntax::Ident { val: name, .. } = &id[0] else {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     };
@@ -99,6 +99,8 @@ pub fn elaborate_record(
         "record signature",
     )?;
     let mut context = Context::new(environment, kernel);
+    context.declare_levels(&id[1])?;
+    context.infer_level_params = true;
     let parameters = context.bind_parameters(&signature[0])?;
     let explicit = optional_type_syntax(&signature[1])?
         .map(|s| context.term(s, None))
@@ -181,7 +183,9 @@ pub fn elaborate_record(
         let domain = context.type_term(annotation)?;
         let mut domain = context.expand_record_aliases(domain, &inheritance.aliases)?;
         if let Some(syntax) = default {
+            context.infer_level_params = false;
             let term = context.term(syntax, Some(domain.clone()))?;
+            context.infer_level_params = true;
             // Preserve the declared type even when the default is never selected.
             // Its ordinary helper declaration must still pass kernel checking.
             let mut term = context.finish(Typed {
@@ -297,9 +301,27 @@ pub fn elaborate_record(
     for param in &mut parameters {
         param.type_ = context.instantiate(&param.type_)?;
     }
+    let mut roots: Vec<_> = parameters
+        .iter()
+        .chain(&output)
+        .map(|p| p.type_.clone())
+        .collect();
+    roots.push(Expr::sort(result_level.clone()));
+    for helper in &helpers {
+        if let Declaration::Defn(definition) = helper {
+            roots.extend([definition.base.type_.clone(), definition.value.clone()]);
+        }
+    }
+    let level_params = context.declaration_levels(&roots)?;
+    // Helpers are instantiated at the record's levels by the default registry.
+    for helper in &mut helpers {
+        if let Declaration::Defn(definition) = helper {
+            definition.base.level_params = level_params.clone();
+        }
+    }
     let spec = RecordSpec {
         name: name.clone(),
-        level_params: Vec::new(),
+        level_params,
         parameters,
         fields: output,
         result_level,
