@@ -66,7 +66,7 @@ pub(super) fn update_openers(
     for index in range {
         if let TokenKind::Symbol(s) = &tokens[index].kind {
             match s.as_str() {
-                "{" => stack.push((index, "}", true)),
+                "{" | ".{" => stack.push((index, "}", true)),
                 "(" => stack.push((index, ")", false)),
                 "[" => stack.push((index, "]", false)),
                 "⦃" => stack.push((index, "⦄", false)),
