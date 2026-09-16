@@ -2,6 +2,7 @@
 //! Aliases are eliminated before constructor/default generation; only physical
 //! parent fields enter the record telescope. No declaration is admitted here.
 use super::*;
+mod coercions;
 use crate::instances::InstanceRegistry;
 use crate::records::RecordError;
 use crate::records::inheritance::{RecordParent, RecordParents};
