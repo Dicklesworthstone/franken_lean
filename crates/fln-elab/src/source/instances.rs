@@ -1,8 +1,10 @@
 //! Transactional, bounded native instance search. Class inputs must be known
-//! before search; ordinary locals qualify only when their type is a class.
+//! before search; output parameters may be inferred by the selected instance.
 //! Search uses an explicit stack and never turns exhaustion into "not found".
 use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
+
+mod parameters;
 
 const MAX_SEARCH_DEPTH: usize = 128;
 const MAX_CANDIDATE_ATTEMPTS: usize = 4096;
@@ -20,6 +22,8 @@ struct Expansion {
 struct Frame {
     goal: MVarId,
     target: Expr,
+    expected: Expr,
+    key: Expr,
     binders: Vec<LocalDecl>,
     base: Context,
     candidates: Vec<Candidate>,
@@ -135,17 +139,6 @@ impl Context {
                 if self.txn.mvars.is_assigned(&id) {
                     continue;
                 }
-                let raw = self
-                    .txn
-                    .mvars
-                    .get_decl(&id)
-                    .ok_or_else(|| failure(SourceInferenceError::Scope))?
-                    .type_
-                    .clone();
-                let target = self.instantiate(&raw)?;
-                if target.has_expr_mvar() || target.has_level_mvar() {
-                    continue;
-                }
                 let mut trial = self.clone();
                 let saved = trial.txn.lctx.clone();
                 // An outer equation may itself need this dictionary's fields.
@@ -188,12 +181,14 @@ impl Context {
         Ok(())
     }
 
+    /// Build a speculative frame. Unknown ordinary inputs block this goal;
+    /// unknown output and semi-output parameters do not.
     fn instance_frame(
         &mut self,
         goal: MVarId,
         registry: &InstanceRegistry,
         ambient: &LocalContext,
-    ) -> Result<Frame, NatDefinitionElabError> {
+    ) -> Result<Option<Frame>, NatDefinitionElabError> {
         let decl = self
             .txn
             .mvars
@@ -211,6 +206,9 @@ impl Context {
         } = target.node()
         {
             self.tick()?;
+            if binder_type.has_expr_mvar() || binder_type.has_level_mvar() {
+                return Ok(None);
+            }
             let id = FVarId(self.fresh_name()?);
             let body = self.substitute(body, &Expr::fvar(id.clone()))?;
             binders.push(
@@ -221,9 +219,15 @@ impl Context {
             );
             target = self.instance_type(&body)?;
         }
-        let class = result_head(&target)
-            .filter(|c| registry.is_class(c))
-            .ok_or_else(|| failure(SourceInferenceError::InvalidInstanceBinder))?;
+        let Some(class) = result_head(&target).filter(|c| registry.is_class(c)) else {
+            if target.has_expr_mvar() || target.has_level_mvar() {
+                return Ok(None);
+            }
+            return Err(failure(SourceInferenceError::InvalidInstanceBinder));
+        };
+        let Some(prepared) = self.prepare_instance_target(&target)? else {
+            return Ok(None);
+        };
         let mut candidates = Vec::new();
         // Lean tries the newest local instance before global registrations.
         let locals = self.txn.lctx.clone();
@@ -251,15 +255,17 @@ impl Context {
                 .iter()
                 .map(|row| Candidate::Global(row.declaration.clone())),
         );
-        Ok(Frame {
+        Ok(Some(Frame {
             goal,
-            target,
+            target: prepared.target,
+            expected: prepared.expected,
+            key: prepared.key,
             binders,
             base: self.clone(),
             candidates,
             cursor: 0,
             chosen: None,
-        })
+        }))
     }
 
     fn expand_instance(
@@ -331,7 +337,9 @@ impl Context {
             .ok_or_else(|| failure(SourceInferenceError::Scope))?
             .lctx
             .clone();
-        let first = self.instance_frame(root, registry, &ambient)?;
+        let Some(first) = self.instance_frame(root, registry, &ambient)? else {
+            return Ok(false);
+        };
         let mut frames = vec![first];
         let mut attempts = 0usize;
         while !frames.is_empty() {
@@ -347,23 +355,11 @@ impl Context {
                     expansion.next += 1;
                 }
                 if let Some(id) = expansion.subgoals.get(expansion.next).cloned() {
-                    let ty = self
-                        .txn
-                        .mvars
-                        .get_decl(&id)
-                        .ok_or_else(|| failure(SourceInferenceError::Scope))?
-                        .type_
-                        .clone();
-                    let ty = self.instantiate(&ty)?;
-                    if ty.has_expr_mvar()
-                        || ty.has_level_mvar()
-                        || frames.iter().any(|frame| frame.target == ty)
-                    {
+                    let Some(child) = self.instance_frame(id, registry, &ambient)? else {
                         frames[index].chosen = None;
                         continue;
-                    }
-                    let child = self.instance_frame(id, registry, &ambient)?;
-                    if frames.iter().any(|frame| frame.target == child.target) {
+                    };
+                    if frames.iter().any(|frame| frame.key == child.key) {
                         frames[index].chosen = None;
                         continue;
                     }
@@ -374,10 +370,36 @@ impl Context {
                     continue;
                 }
                 let mut value = self.instantiate(&expansion.value)?;
-                if value.has_expr_mvar() || value.has_level_mvar() {
+                let actual = self.instantiate(&frames[index].target)?;
+                if value.has_expr_mvar()
+                    || value.has_level_mvar()
+                    || actual.has_expr_mvar()
+                    || actual.has_level_mvar()
+                {
                     frames[index].chosen = None;
                     continue;
                 }
+                // Selection never sees existing output values. Reconcile only
+                // after a complete candidate, in this goal's own local scope.
+                // A mismatch ends this goal; trying a lower-priority instance
+                // here would silently turn outParam into semiOutParam.
+                self.txn.lctx = frames[index].base.txn.lctx.clone();
+                let expected = self.instantiate(&frames[index].expected)?;
+                self.equations
+                    .push(SourceEquation::selection(actual, expected));
+                match self.flush(true) {
+                    Ok(()) => {}
+                    Err(error) if nonmatch(&error) => {
+                        frames.pop();
+                        if let Some(parent) = frames.last_mut() {
+                            parent.chosen = None;
+                            continue;
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+                value = self.instantiate(&value)?;
                 for binder in frames[index].binders.iter().rev() {
                     self.tick()?;
                     let domain = self.instantiate(&binder.type_)?;
