@@ -6,6 +6,8 @@
 //! The caller still owns final kernel checking and declaration publication.
 
 mod coercions;
+pub mod scope;
+use scope::SourceScope;
 mod equations;
 mod inductive;
 mod infer;
@@ -30,6 +32,7 @@ use fln_core::options::KVMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceInferenceError {
+    NameScope(scope::ScopeError),
     Recursion(recursion::RecursionError),
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
@@ -55,6 +58,7 @@ pub enum SourceInferenceError {
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NameScope(error) => write!(f, "{error}"),
             Self::LevelSyntax(reason) => write!(f, "{reason}"),
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
@@ -142,6 +146,7 @@ impl SourceEquation {
 
 #[derive(Clone)]
 struct Context {
+    source_scope: SourceScope,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
     // admission retains its existing error boundary.
@@ -173,6 +178,7 @@ impl Context {
         let mut txn = ElabTxn::new(env.clone(), KVMap::new(), 0);
         txn.budget.max_heartbeats = 1_000_000;
         Self {
+            source_scope: SourceScope::default(),
             attempt_depth: 0,
             txn,
             kernel,
@@ -350,6 +356,20 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
+            let resolved = self
+                .resolve_source_name(name)?
+                .unwrap_or_else(|| name.clone());
+            if let Some(local) = self.txn.lctx.find_by_user_name(&resolved) {
+                return Ok(Typed {
+                    value: self
+                        .matrix_aliases
+                        .get(&local.id)
+                        .cloned()
+                        .unwrap_or_else(|| Expr::fvar(local.id.clone())),
+                    type_: local.type_.clone(),
+                });
+            }
+            let name = &resolved;
             if let Some(recursion) = &self.recursion
                 && &recursion.name == name
             {
@@ -1757,7 +1777,16 @@ pub(super) fn definition(
     environment: &Environment,
     kernel: Budget,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    let mut context = Context::new(environment, kernel);
+    definition_scoped(syntax, environment, kernel, &SourceScope::default())
+}
+
+fn definition_scoped(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope);
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -1811,6 +1840,7 @@ pub(super) fn definition(
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
+    let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let signature = expect_node(

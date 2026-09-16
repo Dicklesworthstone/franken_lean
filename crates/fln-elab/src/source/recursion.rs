@@ -137,7 +137,9 @@ impl Context {
         match self.term(syntax, expected.clone()) {
             Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
                 found,
-            ))) if &found == name && !self.txn.env.contains(name) => {}
+            ))) if (&found == name
+                || self.source_scope.declaration_name(&found).as_ref() == Ok(name))
+                && !self.txn.env.contains(name) => {}
             result => return result,
         }
         let spent = self.txn.budget.heartbeats_consumed;

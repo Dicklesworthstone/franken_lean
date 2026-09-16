@@ -100,8 +100,10 @@ impl Context {
                     value: Expr::fvar(local.id.clone()),
                     type_: local.type_.clone(),
                 })
-            } else if self.txn.env.contains(&prefix) {
-                Some(self.constant(&prefix)?)
+            } else if let Some(resolved) = self.resolve_source_name(&prefix)?
+                && self.txn.env.contains(&resolved)
+            {
+                Some(self.constant(&resolved)?)
             } else {
                 None
             };

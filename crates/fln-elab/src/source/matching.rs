@@ -810,7 +810,8 @@ impl Context {
                 {
                     name.append_core(val)
                 } else {
-                    val.clone()
+                    self.resolve_source_name(val)?
+                        .unwrap_or_else(|| val.clone())
                 };
                 if matches!(self.txn.env.find(&resolved), Some(ConstantInfo::Ctor(_))) {
                     Some(resolved)

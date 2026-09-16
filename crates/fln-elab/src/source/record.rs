@@ -47,6 +47,16 @@ pub fn elaborate_record(
     kernel: Budget,
     budget: RecordBudget,
 ) -> Result<SourceRecord, NatDefinitionElabError> {
+    elaborate_record_scoped(syntax, environment, kernel, budget, &SourceScope::default())
+}
+
+pub(super) fn elaborate_record_scoped(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<SourceRecord, NatDefinitionElabError> {
     let root = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -98,7 +108,8 @@ pub fn elaborate_record(
         2,
         "record signature",
     )?;
-    let mut context = Context::new(environment, kernel);
+    let mut context = Context::scoped(environment, kernel, scope);
+    let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let parameters = context.bind_parameters(&signature[0])?;

@@ -84,6 +84,16 @@ pub fn elaborate_inductive(
     kernel: Budget,
     budget: RecordBudget,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_inductive_scoped(syntax, env, kernel, budget, &SourceScope::default())
+}
+
+pub(super) fn elaborate_inductive_scoped(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
     let root = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -116,7 +126,7 @@ pub fn elaborate_inductive(
     let Syntax::Ident { val: name, .. } = &id[0] else {
         return Err(invalid());
     };
-    if name.is_anonymous() || env.contains(name) {
+    if name.is_anonymous() {
         return Err(invalid());
     }
     let sig = expect_node(
@@ -142,7 +152,11 @@ pub fn elaborate_inductive(
     if ctors.len() > budget.max_binders {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
-    let mut context = Context::new(env, kernel);
+    let mut context = Context::scoped(env, kernel, scope);
+    let name = &context.enter_declaration(name)?;
+    if env.contains(name) {
+        return Err(invalid());
+    }
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     let mut parameters = context.bind_parameters(&sig[0])?;

@@ -92,6 +92,13 @@ impl Context {
         }
         self.explicit_levels = names.len();
         self.level_params = names;
+        for name in self.source_scope.universes.clone() {
+            self.tick()?;
+            if self.level_params.contains(&name) {
+                return Err(error(LevelSyntaxError::Duplicate(name)));
+            }
+            self.level_params.push(name);
+        }
         Ok(())
     }
 
@@ -278,6 +285,9 @@ impl Context {
         {
             return Err(error(LevelSyntaxError::LocalUniverseArguments));
         }
+        let name = &self
+            .resolve_source_name(name)?
+            .unwrap_or_else(|| name.clone());
         let levels = expect_null_args(levels, "explicit universe list")?;
         if levels.is_empty() || levels.len() % 2 == 0 {
             return Err(error(LevelSyntaxError::Malformed));
@@ -313,7 +323,7 @@ impl Context {
         })
     }
 
-    /// Match the pinned ordering: explicitly listed levels first in user order,
+    /// Match the pinned ordering: used scope levels, explicit declaration levels,
     /// then automatically introduced levels in lexicographic order. An explicit
     /// but unused parameter is an error, not a vacuous new polymorphic constant.
     pub(super) fn declaration_levels(
@@ -362,6 +372,14 @@ impl Context {
             }
         }
         let mut result = Vec::new();
+        // The pin orders used scope levels before declaration-local levels;
+        // unused scope levels do not force vacuous parameters.
+        for name in self.source_scope.universes.clone() {
+            self.tick()?;
+            if used.remove(&name) {
+                result.push(name);
+            }
+        }
         for name in &self.level_params[..self.explicit_levels] {
             if !used.remove(name) {
                 return Err(error(LevelSyntaxError::Unused(name.clone())));

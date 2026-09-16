@@ -316,6 +316,10 @@ impl Context {
                             })
                         }
                         Syntax::Ident { val, .. } => {
+                            let resolved = self
+                                .resolve_source_name(val)?
+                                .unwrap_or_else(|| val.clone());
+                            let val = &resolved;
                             if matches!(self.txn.env.find(val), Some(ConstantInfo::Ctor(_))) {
                                 Some(Head {
                                     relative: false,
