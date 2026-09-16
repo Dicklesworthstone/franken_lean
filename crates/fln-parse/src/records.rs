@@ -148,7 +148,7 @@ fn fields(
         if let TokenKind::Symbol(s) = &tokens[index].kind {
             match s.as_str() {
                 "(" => stack.push(")"),
-                "{" => stack.push("}"),
+                "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
                 ")" | "}" | "]" | "⦄" if stack.pop() != Some(s.as_str()) => {
@@ -220,7 +220,7 @@ fn parents(
         } else if let TokenKind::Symbol(s) = &tokens[index].kind {
             match s.as_str() {
                 "(" => stack.push(")"),
-                "{" => stack.push("}"),
+                "{" | ".{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
                 ")" | "}" | "]" | "⦄" if stack.pop() != Some(s.as_str()) => {
@@ -247,7 +247,8 @@ pub(super) fn parse(
     if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
         return Err(refuse(&view, &tokens, 1));
     }
-    let (groups, cursor) = bounded_binders(&view, &tokens, 2, DefinitionGrammar::Scalar)?;
+    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
+    let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
     let end_result = if symbol(&tokens, cursor, ":") {
         type_end(&tokens, cursor, "where").min(type_end(&tokens, cursor, "extends"))
     } else {
@@ -289,7 +290,10 @@ pub(super) fn parse(
             ),
             Syntax::node(
                 parser_kind(&["Command", "declId"]),
-                vec![leaves.leaf(1)?, null_node(Vec::new())],
+                vec![
+                    leaves.leaf(1)?,
+                    levels::declaration_syntax(&leaves, universe_suffix)?,
+                ],
             ),
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
