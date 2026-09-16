@@ -597,16 +597,16 @@ impl Context {
                     binder_name,
                     binder_type,
                     body,
-                    ..
+                    binder_info,
                 } = type_.node()
                 else {
                     return Err(failure(SourceInferenceError::Scope));
                 };
                 if let Some(labels) = frame.parents.get(binder_name).cloned() {
-                    parent = Some((labels, binder_type.clone(), body.clone()));
+                    parent = Some((labels, binder_type.clone(), body.clone(), *binder_info));
                 }
             }
-            let explicit_inherited = parent.as_ref().is_some_and(|(labels, _, _)| {
+            let explicit_inherited = parent.as_ref().is_some_and(|(labels, _, _, _)| {
                 labels.iter().any(|label| frame.fields.contains_key(label))
             });
             if !explicit_inherited {
@@ -630,8 +630,30 @@ impl Context {
                     result => return result,
                 }
             }
-            let (labels, domain, codomain) =
+            let (labels, domain, codomain, style) =
                 parent.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            if !explicit_inherited && style == BinderInfo::InstImplicit {
+                // Omitted class parents may use an available dictionary. Probe
+                // transactionally so a failed search cannot constrain a later
+                // structural initializer or refund the work it already spent.
+                let mut trial = self.clone();
+                let attempt = (|| {
+                    let hole = trial.instance_hole(domain.clone())?;
+                    trial.resolve_instances(false)?;
+                    let value = trial.instantiate(&hole)?;
+                    Ok::<_, NatDefinitionElabError>(
+                        (!value.has_expr_mvar() && !value.has_level_mvar()).then_some(Typed {
+                            value,
+                            type_: domain.clone(),
+                        }),
+                    )
+                })();
+                self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                if let Some(value) = attempt? {
+                    *self = trial;
+                    return Ok(RecordStep::Copy { value, codomain });
+                }
+            }
             let frame = state.frames.last_mut().expect("active record frame");
             let mut fields = Vec::new();
             for label in labels {
