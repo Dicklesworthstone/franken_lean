@@ -400,9 +400,9 @@ impl Context {
         let result = (|| {
             let expected_head = trial.whnf(expected)?;
             let candidate = if matches!(expected_head.node(), ExprNode::Sort { .. }) {
-                trial.coerce_shape(&term, false)?;
+                trial.coerce_shape(&term, false)?
             } else {
-                trial.coerce_value(&term, expected)?;
+                trial.coerce_value(&term, expected)?
             };
             let Some(candidate) = candidate else {
                 return Ok(None);
