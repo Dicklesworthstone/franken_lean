@@ -22,9 +22,6 @@ fn n(value: &str) -> Name {
 fn c(value: &str) -> Expr {
     Expr::const_(n(value), vec![])
 }
-fn b(index: u32) -> Expr {
-    Expr::bvar(index).unwrap()
-}
 fn app(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
     args.into_iter().fold(head, Expr::app)
 }
@@ -40,7 +37,11 @@ fn publish(env: &Environment, declaration: Declaration) -> Environment {
         CouncilOutcome::Agreed(checked) => checked,
         _ => panic!("fixture must be kernel accepted: {description}"),
     };
-    match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
+    match checked.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) {
         Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
             result.environment
         }
@@ -57,21 +58,6 @@ fn definition(name: &str, type_: Expr, value: Expr) -> Declaration {
         },
         value,
         hints: ReducibilityHints::Regular(1),
-        safety: DefinitionSafety::Safe,
-        all: vec![n(name)],
-    })
-}
-fn marker(name: &str) -> Declaration {
-    let u = n("u");
-    let sort = Expr::sort(Level::param(u.clone()));
-    Declaration::Defn(DefinitionVal {
-        base: ConstantVal {
-            name: n(name),
-            level_params: vec![u],
-            type_: Expr::forall_e(n("a"), sort.clone(), sort.clone(), BinderInfo::Default),
-        },
-        value: Expr::lam(n("a"), sort, b(0), BinderInfo::Default),
-        hints: ReducibilityHints::Abbrev,
         safety: DefinitionSafety::Safe,
         all: vec![n(name)],
     })
@@ -133,8 +119,12 @@ fn has_constant(expr: &Expr, name: &str) -> bool {
         match expr.node() {
             ExprNode::Const { name: actual, .. } if actual == &n(name) => return true,
             ExprNode::App { f, a } => work.extend([f, a]),
-            ExprNode::Lam { binder_type, body, .. }
-            | ExprNode::ForallE { binder_type, body, .. } => work.extend([binder_type, body]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => work.extend([binder_type, body]),
             ExprNode::MData { expr, .. } => work.push(expr),
             _ => {}
         }
@@ -146,8 +136,8 @@ fn transfer(output: Expr) -> Expr {
 }
 fn fixture(mode: Option<&str>) -> Environment {
     let mut env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
-    env = publish(&env, marker("outParam"));
-    env = publish(&env, marker("semiOutParam"));
+    env = publish(&env, fln_elab::seed::out_param_seed_declaration());
+    env = publish(&env, fln_elab::seed::semi_out_param_seed_declaration());
     env = record(&env, "Other", vec![], false);
     let sort = Expr::sort(Level::one());
     let output = mode.map_or_else(
@@ -306,7 +296,10 @@ fn later_recursive_prerequisite_infers_an_earlier_prerequisites_input() {
         "def buildRoot {b : Type} [need : Needs b] [give : Transfer Nat b] : Root := Root.mk",
     );
     env = register_instance(&env, &n("buildRoot"), 1000).unwrap();
-    env = source(&env, "def rootProbe [root : Root] (dummy : Nat) : Root := root");
+    env = source(
+        &env,
+        "def rootProbe [root : Root] (dummy : Nat) : Root := root",
+    );
     let value = accepted("def recursive := rootProbe 0", &env);
     assert_eq!(value.base.type_, c("Root"));
     for name in ["buildRoot", "needNat", "high"] {
@@ -323,9 +316,15 @@ fn an_all_blocked_recursive_candidate_cannot_guess_an_input() {
         "def blockedRoot {b : Type} [need : Needs b] : Root := Root.mk",
     );
     env = register_instance(&env, &n("blockedRoot"), 1000).unwrap();
-    env = source(&env, "def rootProbe [root : Root] (dummy : Nat) : Root := root");
+    env = source(
+        &env,
+        "def rootProbe [root : Root] (dummy : Nat) : Root := root",
+    );
     assert!(check_definition_source(b"def stuck := rootProbe 0", &env, budget()).is_err());
-    assert!(has_constant(&accepted("def stillWorks := probe 0", &env).value, "high"));
+    assert!(has_constant(
+        &accepted("def stillWorks := probe 0", &env).value,
+        "high"
+    ));
 }
 
 #[test]
