@@ -170,6 +170,9 @@ impl Context {
             }
             self.flush(false)?;
             if self.txn.mvars.assignments().len() == before {
+                if final_pass && self.resolve_default_instance(&registry)? {
+                    continue;
+                }
                 break;
             }
         }
@@ -184,6 +187,63 @@ impl Context {
         Ok(())
     }
 
+    /// Defaults are tried only after ordinary synthesis reaches a fixed point.
+    /// Higher priorities run across all pending goals before any lower priority.
+    /// Commit just one complete result, then rerun ordinary synthesis first.
+    fn resolve_default_instance(
+        &mut self,
+        registry: &InstanceRegistry,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let defaults = crate::instances::defaults::read(&self.txn.env).map_err(registry_error)?;
+        let mut priorities = std::collections::BTreeSet::new();
+        for row in &defaults {
+            priorities.insert(row.candidate.priority);
+        }
+        for priority in priorities.into_iter().rev() {
+            for id in self.instance_goals.clone() {
+                self.tick()?;
+                if self.txn.mvars.is_assigned(&id) {
+                    continue;
+                }
+                let decl = self
+                    .txn
+                    .mvars
+                    .get_decl(&id)
+                    .cloned()
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                let mut probe = self.clone();
+                probe.txn.lctx = decl.lctx;
+                let target = probe.instance_type(&decl.type_);
+                self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
+                let Some(class) = result_head(&target?) else {
+                    continue;
+                };
+                for row in &defaults {
+                    self.tick()?;
+                    if row.candidate.priority != priority || row.class != class {
+                        continue;
+                    }
+                    let mut trial = self.clone();
+                    let saved = trial.txn.lctx.clone();
+                    let suspended = std::mem::take(&mut trial.equations);
+                    let result = trial.search_instance_mode(
+                        id.clone(),
+                        registry,
+                        Some(&row.candidate.declaration),
+                    );
+                    self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                    if result? {
+                        trial.txn.lctx = saved;
+                        trial.equations.extend(suspended);
+                        *self = trial;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Build a speculative frame. Unknown ordinary inputs block this goal;
     /// unknown output and semi-output parameters do not.
     fn instance_frame(
@@ -191,6 +251,7 @@ impl Context {
         goal: MVarId,
         registry: &InstanceRegistry,
         ambient: &LocalContext,
+        default: Option<&Name>,
     ) -> Result<Option<Frame>, NatDefinitionElabError> {
         let decl = self
             .txn
@@ -228,8 +289,19 @@ impl Context {
             }
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         };
-        let Some(prepared) = self.prepare_instance_target(&target)? else {
-            return Ok(None);
+        let prepared = if default.is_some() {
+            // Default application unifies the original goal, including known
+            // outputs. Unlike ordinary synthesis, it can fix unknown inputs.
+            parameters::PreparedTarget {
+                target: target.clone(),
+                expected: target.clone(),
+                key: target,
+            }
+        } else {
+            let Some(prepared) = self.prepare_instance_target(&target)? else {
+                return Ok(None);
+            };
+            prepared
         };
         let mut candidates = Vec::new();
         // Lean tries the newest local instance before global registrations.
@@ -258,6 +330,9 @@ impl Context {
                 .iter()
                 .map(|row| Candidate::Global(row.declaration.clone())),
         );
+        if let Some(default) = default {
+            candidates = vec![Candidate::Global(default.clone())];
+        }
         let resumable = prepared.expected.has_expr_mvar();
         Ok(Some(Frame {
             resumable,
@@ -376,6 +451,15 @@ impl Context {
         root: MVarId,
         registry: &InstanceRegistry,
     ) -> Result<bool, NatDefinitionElabError> {
+        self.search_instance_mode(root, registry, None)
+    }
+
+    fn search_instance_mode(
+        &mut self,
+        root: MVarId,
+        registry: &InstanceRegistry,
+        default: Option<&Name>,
+    ) -> Result<bool, NatDefinitionElabError> {
         let ambient = self
             .txn
             .mvars
@@ -383,7 +467,7 @@ impl Context {
             .ok_or_else(|| failure(SourceInferenceError::Scope))?
             .lctx
             .clone();
-        let Some(first) = self.instance_frame(root, registry, &ambient)? else {
+        let Some(first) = self.instance_frame(root, registry, &ambient, default)? else {
             return Ok(false);
         };
         let mut frames = vec![first];
@@ -406,7 +490,7 @@ impl Context {
                     }
                     remaining = true;
                     let mut trial = self.clone();
-                    let child = trial.instance_frame(id.clone(), registry, &ambient);
+                    let child = trial.instance_frame(id.clone(), registry, &ambient, None);
                     self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
                     if let Some(child) = child? {
                         *self = trial;
