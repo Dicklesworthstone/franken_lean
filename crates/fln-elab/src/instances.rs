@@ -6,6 +6,8 @@
 //! journal is a refusal, not an empty instance set.
 
 pub mod coercions;
+pub mod defaults;
+pub mod numeric;
 
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
