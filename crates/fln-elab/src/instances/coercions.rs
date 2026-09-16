@@ -241,6 +241,44 @@ impl Build {
             ),
         )
     }
+    fn out_bridges(&mut self) -> Result<(), RecordError> {
+        let u = Level::param(n("u"));
+        let v = Level::param(n("v"));
+        let levels = [u.clone(), v.clone()];
+        let a = local("A", Expr::sort(u), BinderInfo::Implicit);
+        let b = local("B", Expr::sort(v), BinderInfo::Implicit);
+        let x = local("x", fv(&a), BinderInfo::Default);
+        let target = [fv(&a), fv(&b)];
+        for class in ["CoeFun", "CoeSort"] {
+            let output = if class == "CoeFun" {
+                close(std::slice::from_ref(&x), fv(&b), true)?
+            } else {
+                fv(&b)
+            };
+            let args = [fv(&a), output];
+            let d = local(
+                "dict",
+                app(constant(class, &levels), args.clone()),
+                BinderInfo::InstImplicit,
+            );
+            let value = app(
+                constant(&format!("{class}.coe"), &levels),
+                args.into_iter().chain([fv(&d)]),
+            );
+            self.definition(
+                &format!("{class}_out"),
+                &["u", "v"],
+                &[a.clone(), b.clone(), d],
+                app(constant("CoeOut", &levels), target.clone()),
+                app(
+                    constant("CoeOut.mk", &levels),
+                    target.clone().into_iter().chain([value]),
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     fn terminal(&mut self) -> Result<(), RecordError> {
         let u = Level::param(n("u"));
         let v = Level::param(n("v"));
@@ -313,5 +351,6 @@ pub fn declarations() -> Result<CoercionSeed, RecordError> {
     build.closure("CoeHTC", "CoeOTC", "CoeHead", "CoeOTC", false)?;
     build.closure("CoeHTCT", "CoeHTC", "CoeHTC", "CoeTail", true)?;
     build.terminal()?;
+    build.out_bridges()?;
     Ok(build.seed)
 }
