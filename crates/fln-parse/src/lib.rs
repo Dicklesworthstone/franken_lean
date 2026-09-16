@@ -31,6 +31,7 @@ pub mod registry;
 pub mod state;
 
 mod inductive;
+mod levels;
 mod matching;
 mod proofs;
 mod record_terms;
@@ -529,6 +530,8 @@ fn nat_definition_token_table() -> TokenTable {
         "<=",
         "<",
         "Type",
+        "Sort",
+        ".{",
         "Prop",
         "_",
         "?",
@@ -601,6 +604,8 @@ fn source_module_token_table() -> TokenTable {
         "<=",
         "<",
         "Type",
+        "Sort",
+        ".{",
         "Prop",
         "_",
         "?",
@@ -721,7 +726,7 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
         if let TokenKind::Symbol(symbol) = &token.kind {
             match symbol.as_str() {
                 "(" => delimiters.push(")"),
-                "{" => delimiters.push("}"),
+                "{" | ".{" => delimiters.push("}"),
                 "[" => delimiters.push("]"),
                 "⦃" => delimiters.push("⦄"),
                 ")" | "}" | "]" | "⦄" => {
@@ -746,15 +751,20 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
 /// Find a type's delimiter without splitting a parenthesized application or
 /// arrow. The term parser still validates every token in the selected range.
 fn type_end(tokens: &[LexedToken], from: usize, delimiter: &str) -> usize {
-    let mut depth = 0usize;
+    let mut delimiters = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(from) {
         if let TokenKind::Symbol(symbol) = &token.kind {
-            if depth == 0 && symbol == delimiter {
+            if delimiters.is_empty() && symbol == delimiter {
                 return index;
             }
             match symbol.as_str() {
-                "(" => depth += 1,
-                ")" if depth > 0 => depth -= 1,
+                "(" => delimiters.push(")"),
+                "{" | ".{" => delimiters.push("}"),
+                "[" => delimiters.push("]"),
+                "⦃" => delimiters.push("⦄"),
+                ")" | "}" | "]" | "⦄" if !delimiters.is_empty() => {
+                    delimiters.pop();
+                }
                 _ => {}
             }
         }
@@ -1228,6 +1238,32 @@ fn bounded_term_spliced(
                     .expect("root term frame")
                     .application
                     .push((term, index));
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar
+                    && (symbol == "Type" || symbol == "Sort") =>
+            {
+                let (term, end) = levels::sort(leaves, view, tokens, index, range.end)?;
+                frames
+                    .last_mut()
+                    .expect("root term frame")
+                    .application
+                    .push((term, index));
+                cursor = end;
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == ".{" =>
+            {
+                let frame = frames.last_mut().expect("root term frame");
+                let (head, start) = frame.application.pop().ok_or_else(|| {
+                    NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: grammar.value_expectation(),
+                    }
+                })?;
+                let (term, end) = levels::explicit(leaves, view, tokens, head, index, range.end)?;
+                frame.application.push((term, start));
+                cursor = end;
             }
             kind if is_bounded_term_atom(kind, grammar) => {
                 let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
@@ -1856,6 +1892,12 @@ fn parse_definition_with_grammar(
         });
     }
     cursor += 1;
+    let (universe_suffix, after_levels) = if grammar == DefinitionGrammar::Scalar {
+        levels::declaration_suffix(&view, &tokens, cursor)?
+    } else {
+        (None, cursor)
+    };
+    cursor = after_levels;
     let (parameter_groups, next) = bounded_binders(&view, &tokens, cursor, grammar)?;
     cursor = next;
     let explicit_result_type = if matches!(
@@ -1926,7 +1968,10 @@ fn parse_definition_with_grammar(
     );
     let declaration_id = Syntax::node(
         parser_kind(&["Command", "declId"]),
-        vec![declaration_name, null_node(Vec::new())],
+        vec![
+            declaration_name,
+            levels::declaration_syntax(&leaves, universe_suffix)?,
+        ],
     );
     let parameters = bounded_binder_syntax(&leaves, &view, &tokens, parameter_groups, grammar)?;
     let result_type = if let Some((colon, type_range)) = explicit_result_type {
