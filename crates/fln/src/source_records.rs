@@ -3,6 +3,45 @@
 use super::*;
 
 impl Engine {
+    /// Build the native source environment with the staged coercion library.
+    /// Every class, eliminator, projection and composition instance passes both
+    /// checking engines before any of its registrations become observable.
+    pub fn with_coercion_seed(
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Self>, EngineAdmissionError> {
+        let engine = match Self::with_source_seed(limits)? {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let seed = fln_elab::instances::coercions::declarations().map_err(|_| {
+            EngineAdmissionError::UnexpectedPublication {
+                detail: "coercion seed construction failed",
+            }
+        })?;
+        let mut engine =
+            match engine.admit_declarations(&seed.declarations, &KVMap::new(), limits)? {
+                Outcome::Complete(batch) => batch.engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        for name in seed.classes {
+            engine.environment = fln_elab::instances::register_class(&engine.environment, &name)
+                .map_err(|_| EngineAdmissionError::UnexpectedPublication {
+                    detail: "coercion class registration failed",
+                })?;
+        }
+        for name in seed.instances {
+            engine.environment =
+                fln_elab::instances::register_instance(&engine.environment, &name, 1000).map_err(
+                    |_| EngineAdmissionError::UnexpectedPublication {
+                        detail: "coercion instance registration failed",
+                    },
+                )?;
+        }
+        Ok(Outcome::Complete(engine))
+    }
+
     /// Admit one definition, theorem, instance, structure, class or inductive command.
     /// A record's block and projections all pass K1 and the independent checker
     /// before class metadata is registered. No failed prefix is exposed.
