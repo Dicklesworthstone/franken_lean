@@ -4,6 +4,8 @@
 //! reachable graph for cycles, preserves typed resource stops, and traverses
 //! levels and complete expression DAGs without recursive host-stack growth.
 
+pub(crate) mod parameters;
+
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::level::{LMVarId, Level, LevelTooDeep, LevelView};
 use std::collections::{HashMap, HashSet};
