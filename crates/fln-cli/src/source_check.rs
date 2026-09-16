@@ -121,7 +121,7 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
                 format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false}}\n",
                     result.files, result.commands, result.theorems, total, json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()))
             } else {
-                format!("Checked {} declarations ({} theorems) in {} files; K1 and independent checker agreed. No code executed.\n",result.commands,result.theorems,result.files)
+                format!("Checked {} source commands ({} theorems) in {} files; K1 and independent checker agreed. No code executed.\n",result.commands,result.theorems,result.files)
             };
             MultiplexerOutput::success(stdout)
         });
