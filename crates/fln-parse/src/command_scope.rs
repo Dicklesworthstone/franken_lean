@@ -14,7 +14,17 @@ pub enum ScopeCommand {
 
 fn table() -> TokenTable {
     let mut table = source_module_token_table();
-    for keyword in ["namespace", "section", "end", "open", "universe"] {
+    for keyword in [
+        "namespace",
+        "section",
+        "end",
+        "open",
+        "universe",
+        "scoped",
+        "in",
+        "hiding",
+        "renaming",
+    ] {
         table.insert(keyword);
     }
     table
@@ -84,9 +94,7 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         "section" if names.len() <= 1 => ScopeCommand::Section(names.pop()),
         "end" if names.len() <= 1 => ScopeCommand::End(names.pop()),
         "open" if !names.is_empty() => ScopeCommand::Open(names),
-        "universe"
-            if !names.is_empty() && names.iter().all(|n| n.parent().is_anonymous()) =>
-        {
+        "universe" if !names.is_empty() && names.iter().all(|n| n.parent().is_anonymous()) => {
             ScopeCommand::Universe(names)
         }
         _ => return Err(bad(1)),
@@ -147,7 +155,10 @@ mod tests {
             parse("namespace «A.B»".as_bytes()).unwrap(),
             Some(ScopeCommand::Namespace(Name::from_components(["A.B"])))
         );
-        assert_eq!(parse(b"section").unwrap(), Some(ScopeCommand::Section(None)));
+        assert_eq!(
+            parse(b"section").unwrap(),
+            Some(ScopeCommand::Section(None))
+        );
         assert_eq!(
             parse(b"/- only trivia -/").unwrap(),
             Some(ScopeCommand::Trivia)
@@ -156,8 +167,19 @@ mod tests {
     #[test]
     fn malformed_scope_commands_are_not_partially_accepted() {
         for source in [
-            "namespace", "namespace A B", "end A B", "section A B", "open", "open A (x)",
-            "universe A.u", "universe u, v", "end := 3",
+            "namespace",
+            "namespace A B",
+            "end A B",
+            "section A B",
+            "open",
+            "open A (x)",
+            "open A in",
+            "open scoped A",
+            "open A hiding x",
+            "open A renaming x -> y",
+            "universe A.u",
+            "universe u, v",
+            "end := 3",
         ] {
             assert!(parse(source.as_bytes()).is_err(), "{source}");
         }
@@ -165,7 +187,11 @@ mod tests {
     }
     #[test]
     fn universe_commas_and_escaped_command_names_are_not_command_boundaries() {
-        let commands = partition("namespace A\ndef «end».{u,v} (x : Sort u) : Sort u := x\ndef q := f.{1,2} Nat\nend A".as_bytes()).unwrap();
+        let commands = partition(
+            "namespace A\ndef «end».{u,v} (x : Sort u) : Sort u := x\ndef q := f.{1,2} Nat\nend A"
+                .as_bytes(),
+        )
+        .unwrap();
         assert_eq!(commands.len(), 4);
         assert!(parse_definition(commands[1].1).is_ok());
     }
