@@ -46,7 +46,7 @@ fn checked_type(
     let candidate = Declaration::Axiom(fln_env::constants::AxiomVal {
         base: ConstantVal {
             name,
-            level_params: vec![],
+            level_params: context.level_params.clone(),
             type_,
         },
         is_unsafe: false,
@@ -112,7 +112,7 @@ pub fn elaborate_inductive(
         2,
         "inductive name",
     )?;
-    expect_empty_null(&id[1], "absent explicit universe parameters")?;
+    // Explicit parameters are installed before opening the family telescope.
     let Syntax::Ident { val: name, .. } = &id[0] else {
         return Err(invalid());
     };
@@ -143,6 +143,8 @@ pub fn elaborate_inductive(
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     let mut context = Context::new(env, kernel);
+    context.declare_levels(&id[1])?;
+    context.infer_level_params = true;
     let mut parameters = context.bind_parameters(&sig[0])?;
     if parameters.iter().any(|p| &p.user_name == name) {
         return Err(invalid());
@@ -351,21 +353,11 @@ pub fn elaborate_inductive(
             inferred = Level::max(inferred, universe).map_err(|_| invalid())?;
             // Replace only the provisional family identity. Parameter and field
             // locals stay available for the candidate builder to close exactly.
-            field.type_ = completed
-                .value
-                .abstract_fvar(&self_id, 0)
-                .map_err(|_| invalid())?
-                .subst_loose(0, &[Expr::const_(name.clone(), vec![])])
-                .map_err(|_| invalid())?;
+            field.type_ = completed.value;
         }
         for index in &mut result_indices {
             *index = context.instantiate(index)?;
             context.require_resolved(std::slice::from_ref(index))?;
-            *index = index
-                .abstract_fvar(&self_id, 0)
-                .map_err(|_| invalid())?
-                .subst_loose(0, &[Expr::const_(name.clone(), vec![])])
-                .map_err(|_| invalid())?;
         }
         field_universes.push(universes);
         constructors.push(ConstructorSpec {
@@ -418,9 +410,36 @@ pub fn elaborate_inductive(
         context.txn.lctx = final_context;
         checked_type(&mut context, annotation, budget)?;
     }
+    let mut roots = vec![family_type];
+    for ctor in &constructors {
+        roots.extend(ctor.fields.iter().map(|f| f.type_.clone()));
+        roots.extend(ctor.result_indices.iter().cloned());
+    }
+    let level_params = context.declaration_levels(&roots)?;
+    let family_constant = Expr::const_(
+        name.clone(),
+        level_params.iter().cloned().map(Level::param).collect(),
+    );
+    for ctor in &mut constructors {
+        for field in &mut ctor.fields {
+            field.type_ = field
+                .type_
+                .abstract_fvar(&self_id, 0)
+                .map_err(|_| invalid())?
+                .subst_loose(0, std::slice::from_ref(&family_constant))
+                .map_err(|_| invalid())?;
+        }
+        for index in &mut ctor.result_indices {
+            *index = index
+                .abstract_fvar(&self_id, 0)
+                .map_err(|_| invalid())?
+                .subst_loose(0, std::slice::from_ref(&family_constant))
+                .map_err(|_| invalid())?;
+        }
+    }
     let specification = InductiveSpec {
         name: name.clone(),
-        level_params: vec![],
+        level_params,
         parameters,
         indices,
         constructors,
