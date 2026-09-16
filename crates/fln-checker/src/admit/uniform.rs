@@ -184,6 +184,49 @@ impl Audit<'_> {
         }
         Ok((binders, self.piece(source, tail)?))
     }
+    /// Recursor locals consume only outer, exactly applied type annotations.
+    /// Work entirely in the independent wire arena; never trust a recursor's
+    /// own domains or call the primary kernel's normalizer to derive them.
+    fn recursor_binders(&mut self, binders: &mut [Binder]) -> Result<(), InductiveVerdict> {
+        for binder in binders {
+            let source = &binder.domain;
+            let mut root = source.root();
+            'annotations: loop {
+                self.tick()?;
+                let mut head = root;
+                let mut arguments = Vec::with_capacity(2);
+                while let Some(ExprNode::Apply { function, argument }) = source.node(head) {
+                    self.tick()?;
+                    if arguments.len() == 2 {
+                        break 'annotations;
+                    }
+                    arguments.push(*argument);
+                    head = *function;
+                }
+                let Some(ExprNode::Constant { name, .. }) = source.node(head) else {
+                    break;
+                };
+                let [crate::wire::NamePart::Text(name)] = name.parts() else {
+                    break;
+                };
+                let arity = match name.as_str() {
+                    "outParam" | "semiOutParam" => 1,
+                    "optParam" | "autoParam" => 2,
+                    _ => break,
+                };
+                if arguments.len() != arity {
+                    break;
+                }
+                // Reverse application order: the retained TYPE is the first
+                // argument, never the optParam default or autoParam tactic.
+                root = arguments[arity - 1];
+            }
+            if root != source.root() {
+                binder.domain = self.piece(source, root)?;
+            }
+        }
+        Ok(())
+    }
     fn import(
         &mut self,
         builder: &mut StructuralTermBuilder,
@@ -733,7 +776,7 @@ fn universe_within(
 pub(super) fn admit(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
-    inductive: &ConstantEntry,
+    inductive: &'_ ConstantEntry,
     budget: AdmissionBudget,
     environment_budget: EnvironmentBudget,
     comparison: &mut StructuralComparisonControl,
@@ -1048,7 +1091,7 @@ fn check(
     let (binders, _) = peel_binders_at(rec_decl.type_(), rec_decl.type_().root(), p + n + q + 2)
         .ok_or_else(|| recursor_error(&rec_name))?;
     let styles: Vec<_> = binders.iter().map(|b| b.1).collect();
-    let shape = Shape {
+    let mut shape = Shape {
         name,
         levels,
         parameters,
@@ -1060,6 +1103,16 @@ fn check(
             None
         },
     };
+    // All family/constructor checks above used their original annotated
+    // domains. Only the newly generated eliminator locals shed annotations.
+    audit.recursor_binders(&mut shape.parameters)?;
+    audit.recursor_binders(&mut shape.indices)?;
+    for constructor in &mut shape.constructors {
+        audit.recursor_binders(&mut constructor.fields)?;
+        for recursive in &mut constructor.recursive {
+            audit.recursor_binders(&mut recursive.arguments)?;
+        }
+    }
     let expected = shape.recursor_type(audit, &styles)?;
     if !audit.equal(rec_decl.type_(), &expected)? {
         return Err(recursor_error(&rec_name));
@@ -1084,4 +1137,108 @@ fn check(
     members.extend(shape.constructors.iter().map(|c| c.entry.name().clone()));
     members.push(rec_name);
     Ok(members)
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+
+    fn normalize(
+        term: WireExpr,
+        comparisons: u64,
+        cancelled: bool,
+    ) -> Result<WireExpr, InductiveVerdict> {
+        let mut budget = AdmissionBudget::unlimited();
+        budget.conversion.quick.max_comparisons = comparisons;
+        let mut control = StructuralComparisonControl::new(budget.conversion.quick);
+        let mut poll = || cancelled;
+        let mut audit = Audit {
+            budget,
+            comparison: &mut control,
+            cancelled: &mut poll,
+        };
+        let mut binders = vec![Binder {
+            name: checker_atom("x"),
+            style: BinderStyle::Default,
+            domain: term,
+        }];
+        audit.recursor_binders(&mut binders)?;
+        Ok(binders.remove(0).domain)
+    }
+
+    fn applied(name: &WireName, arity: usize, layers: usize) -> WireExpr {
+        let mut builder = StructuralTermBuilder::new();
+        if layers == 0 {
+            let root = builder.sort_one();
+            return builder.finish(root).unwrap();
+        }
+        let head = builder.constant(name, &[]);
+        let mut root = builder.sort_one();
+        for _ in 0..layers {
+            let mut application = head;
+            for position in 0..arity {
+                let argument = if position == 0 {
+                    root
+                } else {
+                    builder.sort_zero()
+                };
+                application = builder.apply(application, argument);
+            }
+            root = application;
+        }
+        builder.finish(root).unwrap()
+    }
+
+    #[test]
+    fn only_exact_root_annotation_names_and_arities_are_consumed() {
+        for name in ["outParam", "semiOutParam", "optParam", "autoParam"] {
+            let expected_arity = if matches!(name, "outParam" | "semiOutParam") {
+                1
+            } else {
+                2
+            };
+            for arity in 0..=3 {
+                let original = applied(&checker_atom(name), arity, 1);
+                let actual = normalize(original.clone(), 1000, false).unwrap();
+                let expected = if arity == expected_arity {
+                    applied(&checker_atom(name), arity, 0)
+                } else {
+                    original
+                };
+                assert!(
+                    matches!(actual.node(actual.root()), Some(ExprNode::Sort { .. }))
+                        == (arity == expected_arity)
+                );
+                assert_eq!(actual, expected);
+            }
+            let foreign = applied(
+                &checker_child(&checker_atom("User"), name),
+                expected_arity,
+                1,
+            );
+            assert_eq!(normalize(foreign.clone(), 1000, false).unwrap(), foreign);
+        }
+    }
+
+    #[test]
+    fn annotation_chains_keep_cancellation_and_budget_stops_as_nonanswers() {
+        let name = checker_atom("outParam");
+        let chain = applied(&name, 1, 128);
+        assert_eq!(
+            normalize(chain.clone(), 1000, false).unwrap(),
+            applied(&name, 1, 0)
+        );
+        assert!(matches!(
+            normalize(chain.clone(), 4, false),
+            Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
+                QuickDefEqStop::Resource { .. }
+            )))
+        ));
+        assert!(matches!(
+            normalize(chain, 1000, true),
+            Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
+                QuickDefEqStop::Cancelled { .. }
+            )))
+        ));
+    }
 }
