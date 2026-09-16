@@ -3,84 +3,98 @@ name: Native elaborator functional tests
 on:
   push:
     branches: [main]
-    paths:
-      - 'crates/fln-elab/**'
-      - '.github/workflows/fln-elab-native.yml'
-  workflow_dispatch:
-
+    paths: ['.github/workflows/fln-elab-native.yml']
 permissions:
   contents: read
-
-concurrency:
-  group: fln-elab-native-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   elaborator:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.event.head_commit.message == 'test(source): prepare verified scope integration objects'
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Prepare exact reviewed scope changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/scope_objects.py" <<'PYTHON'
+          import base64, hashlib, json, os, pathlib, subprocess, sys, urllib.request, zlib
+          MANIFEST = {'crates/fln-elab/src/source.rs': ['c318d7f81ea96e15c2eee443fe50f24e2645c21f', 'cbc449d69c6cb2838ec34a62870437ccaaab5ac2'], 'crates/fln-elab/src/source/inductive.rs': ['a6b9c75cf718269f74632c4c1107e7a291cb5543', '84002b1a82cf980598dd5ddef2f178c2a198898b'], 'crates/fln-elab/src/source/level_syntax.rs': ['e46b2f2468bd20088c551336ce7f294a5dddfede', 'bb8964e27f8b3dcf70ae62ad7eb247b9fdc9f0d9'], 'crates/fln-elab/src/source/matching.rs': ['05b2841b5ab21d2204027c22a29261387e8d55de', '288f4a5693bdb8ce40eb8736736925922aa6d802'], 'crates/fln-elab/src/source/patterns.rs': ['bf77fc450a1458a86dae357b9ba1c565105d3d85', '5e5086fce4d421164a1cc020eb0558495bf6f66f'], 'crates/fln-elab/src/source/record.rs': ['a6f59f67a4aafeb8822ed1c414822ab8cc349271', 'f66a8688e46c17f1173b5ca4a9e97905d481da42'], 'crates/fln-elab/src/source/record_terms.rs': ['da8af64290a9cfac2cda8d8a14d6f9dec58ccc1f', 'b74977ae5c3cedc197e6a78f0f39ccc1fa2855ee'], 'crates/fln-elab/src/source/recursion.rs': ['63a5987804a494fdc41d424ce260cc5c9221645e', '40527ae650273aa23b418ffbdb1b7a1422dafb89'], 'crates/fln-parse/src/lib.rs': ['7a841a4f5a0f82c32306bca17986c4dee74988fa', '6da03244144a1a3151c36c0f45b00cfd1258f7c9'], 'crates/fln/src/source_check.rs': ['ac783dec1a200b247894a35b2fb7b13eaa0a0262', '040488bcc7d774939d7fe66d6fcd29eff8eea273'], 'crates/fln/src/source_records.rs': ['8a407e6f4f97bfe6a83d21aae5fe6c5a3fdcbe6f', '8014765bb5a5e0588c6205f3bcf1fbe19b95bf56'], 'crates/fln/tests/source_file_check.rs': ['729e7b2415cb0214428537f89e8c8738163ff07c', 'f3c9c21429b53a7766ba469c6364a0b48534cda9'], 'crates/fln/tests/source_scopes.rs': [None, 'c3f52996a9512ad29bd0f28f86495ebdc9baed94']}
+          def blob(data):
+              return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+          if sys.argv[1] == "prepare":
+              for path, (before, after) in MANIFEST.items():
+                  file = pathlib.Path(path)
+                  assert (blob(file.read_bytes()) if file.exists() else None) == before, path
+              for path, expected in {
+                  "crates/fln-elab/src/source/scope.rs": "744c3dbf68647b36143d6d44c1007a8e964f16d7",
+                  "crates/fln-parse/src/command_scope.rs": "eaa5fdc297f01f43e6bdd5ae2f6f001a904d3e71",
+                  "crates/fln/src/source_check/scopes.rs": "48e7a0bc40f6b5a7b2c6cc587b833f8e26777c0c",
+              }.items():
+                  assert blob(pathlib.Path(path).read_bytes()) == expected, path
+              patch = zlib.decompress(base64.b64decode("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"))
+              assert hashlib.sha256(patch).hexdigest() == "7605a91a097026d9128b1186e81b10c6b720cdf48f0f3b968dc41454b0b0c2aa"
+              subprocess.run(["git", "apply", "--index", "--check", "-"], input=patch, check=True)
+              subprocess.run(["git", "apply", "--index", "-"], input=patch, check=True)
+              paths = subprocess.check_output(["git", "diff", "--cached", "--name-only"], text=True).splitlines()
+              assert sorted(paths) == sorted(MANIFEST), paths
+              for path, (_, after) in MANIFEST.items():
+                  assert blob(pathlib.Path(path).read_bytes()) == after, path
+          elif sys.argv[1] == "publish-blobs":
+              # Write immutable, hash-verified objects only. No branch/ref/commit writes.
+              assert os.environ["GITHUB_REPOSITORY"] == "Dicklesworthstone/franken_lean"
+              result = {}
+              for path, (_, expected) in MANIFEST.items():
+                  data = pathlib.Path(path).read_bytes()
+                  assert blob(data) == expected, path
+                  request = urllib.request.Request(
+                      "https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs",
+                      data=json.dumps({"content": base64.b64encode(data).decode(), "encoding": "base64"}).encode(),
+                      headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      actual = json.load(response)["sha"]
+                  assert actual == expected, (path, actual, expected)
+                  result[path] = actual
+                  print("SCOPE_BLOB", path, actual, flush=True)
+              pathlib.Path("target/elab-functional/objects.json").write_text(json.dumps(result, indent=2) + "\n")
+          else:
+              raise SystemExit("unknown mode")
+          PYTHON
+          python3 -I "$RUNNER_TEMP/scope_objects.py" prepare
       - name: Install configured compiler
-        id: compiler
         shell: bash
         run: |
           set -euo pipefail
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv
-          git rev-parse HEAD
-      - name: Check test and lint elaborator
-        shell: bash
-        run: |
-          set +e
-          set -uo pipefail
-          mkdir -p target/elab-functional
-          cargo check --locked -p fln-elab --all-targets 2>&1 | tee target/elab-functional/check.log
-          check_status=${PIPESTATUS[0]}
-          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/elab-functional/test.log
-          test_status=${PIPESTATUS[0]}
-          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/elab-functional/clippy.log
-          clippy_status=${PIPESTATUS[0]}
-          printf 'check=%s test=%s clippy=%s\n' "$check_status" "$test_status" "$clippy_status" | tee target/elab-functional/result.txt
-          test "$check_status" -eq 0 && test "$test_status" -eq 0 && test "$clippy_status" -eq 0
-      - name: Check downstream targets
-        if: always() && steps.compiler.outcome == 'success'
+      - name: Test complete integration before publishing objects
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/elab-functional
           cargo check --locked --workspace --all-targets 2>&1 | tee target/elab-functional/workspace-check.log
-      - name: Export exact offline verification inputs
-        if: >-
-          success() && startsWith(github.event.head_commit.message, 'test(elab): retain an offline source snapshot')
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/elab-functional/elab.log
+          cargo test --locked -p fln-parse command_scope:: 2>&1 | tee target/elab-functional/parser-scopes.log
+          cargo test --locked -p fln --test source_scopes --test source_file_check --test source_universes --test source_inheritance 2>&1 | tee target/elab-functional/scopes.log
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/elab-functional/clippy.log
+          git diff --cached --check
+      - name: Publish verified immutable Git blobs without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/elab-offline
-          git archive --format=tar.gz HEAD > target/elab-offline/source.tar.gz
-          toolchain="$(rustc --print sysroot)"
-          tar -C "$toolchain" -czf target/elab-offline/compiler.tar.gz bin lib
-          git rev-parse HEAD > target/elab-offline/source-commit.txt
-          rustc -Vv > target/elab-offline/compiler.txt
-          sha256sum target/elab-offline/source.tar.gz target/elab-offline/compiler.tar.gz > target/elab-offline/SHA256SUMS
-      - name: Retain offline verification inputs
-        if: >-
-          success() && startsWith(github.event.head_commit.message, 'test(elab): retain an offline source snapshot')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: elab-offline-${{ github.sha }}
-          path: target/elab-offline
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-      - name: Retain functional logs
+        run: python3 -I "$RUNNER_TEMP/scope_objects.py" publish-blobs
+      - name: Retain validation and object manifest
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: elab-functional-${{ github.sha }}
+          name: scope-integration-${{ github.sha }}
           path: target/elab-functional
-          if-no-files-found: warn
           retention-days: 7
