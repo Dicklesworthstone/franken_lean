@@ -105,10 +105,35 @@ impl Engine {
                         ),
                     ))
                 })?;
+                batch.engine.environment = fln_elab::records::inheritance::register_parents(
+                    batch.engine.environment(),
+                    &record.parents,
+                )
+                .map_err(|error| {
+                    EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::Record(error),
+                        ),
+                    ))
+                })?;
                 if record.is_class {
                     batch.engine.environment = fln_elab::instances::register_class(
                         batch.engine.environment(),
                         &record.name,
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ))
+                    })?;
+                }
+                for parent in &record.parent_instances {
+                    batch.engine.environment = fln_elab::instances::register_instance(
+                        batch.engine.environment(),
+                        parent,
+                        1000,
                     )
                     .map_err(|error| {
                         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
