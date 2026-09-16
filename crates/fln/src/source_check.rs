@@ -1,5 +1,6 @@
 //! Admission-only source batches. No compiler, VM, or artifact publication.
 use super::*;
+mod scopes;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceCheckLimits {
@@ -31,6 +32,12 @@ pub struct SourceFileCheck {
 
 #[derive(Debug)]
 pub enum SourceCheckError {
+    Scope {
+        file: usize,
+        command: usize,
+        offset: usize,
+        message: String,
+    },
     EmptyInput,
     Limit {
         resource: &'static str,
@@ -46,6 +53,15 @@ pub enum SourceCheckError {
 impl std::fmt::Display for SourceCheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Scope {
+                file,
+                command,
+                offset,
+                message,
+            } => write!(
+                f,
+                "file {file}, command {command}, byte {offset}: {message}"
+            ),
             Self::EmptyInput => write!(f, "source checking requires a nonempty file set"),
             Self::Limit { resource, limit } => {
                 write!(f, "source check exceeds {resource} limit {limit}")
@@ -65,7 +81,7 @@ impl SourceCheckError {
     /// Wire classification never turns a frontend resource stop into rejection.
     pub fn disposition(&self) -> (&'static str, bool, u8) {
         match self {
-            Self::EmptyInput => ("input", false, 1),
+            Self::EmptyInput | Self::Scope { .. } => ("input", false, 1),
             Self::Limit { .. } => ("resource", false, 3),
             Self::Command { error, .. } => classify(error),
         }
@@ -126,8 +142,9 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
 }
 
 impl Engine {
-    /// Check ordered, import-free native definition, theorem, instance and record
-    /// commands. Earlier declarations are available to later commands. Imports,
+    /// Check ordered, import-free declarations with native namespace, section,
+    /// open and universe scopes. File boundaries restore source scope; checked
+    /// declarations survive. Earlier declarations are available later. Imports,
     /// evaluation and queries are not silently ignored: the parser refuses them.
     /// Limits apply across the batch; each kernel check uses the supplied budget.
     pub fn check_source_files(
@@ -160,7 +177,8 @@ impl Engine {
         let mut count = 0;
         let mut theorems = 0;
         for (file, source) in sources.iter().enumerate() {
-            let commands = fln_parse::partition_definition_commands(source).map_err(|error| {
+            let mut scopes = scopes::Scopes::new(engine.environment());
+            let commands = fln_parse::command_scope::partition(source).map_err(|error| {
                 SourceCheckError::Command {
                     file,
                     command: count,
@@ -177,8 +195,43 @@ impl Engine {
                 });
             }
             for (start, command) in commands {
+                let control = fln_parse::command_scope::parse(command).map_err(|error| {
+                    SourceCheckError::Command {
+                        file,
+                        command: count,
+                        offset: start
+                            .0
+                            .saturating_add(error.primary_offset().map_or(0, |at| at.0)),
+                        error: Box::new(EngineExecutionError::Frontend(
+                            DefinitionFrontendError::Parse(error),
+                        )),
+                    }
+                })?;
+                if let Some(control) = control {
+                    if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
+                        continue;
+                    }
+                    scopes
+                        .check_limits(&control)
+                        .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
+                    scopes
+                        .apply(control)
+                        .map_err(|message| SourceCheckError::Scope {
+                            file,
+                            command: count,
+                            offset: start.0,
+                            message,
+                        })?;
+                    count += 1;
+                    continue;
+                }
                 let result = engine
-                    .admit_source_command(command, options, limits.admission)
+                    .admit_source_command_in_scope(
+                        command,
+                        options,
+                        limits.admission,
+                        &scopes.current,
+                    )
                     .map_err(|error| SourceCheckError::Command {
                         file,
                         command: count,
@@ -197,6 +250,9 @@ impl Engine {
                     .iter()
                     .filter(|row| matches!(row.declaration, Declaration::Thm(_)))
                     .count();
+                for row in &admitted.admissions {
+                    scopes.admitted(&row.declaration);
+                }
                 engine = admitted.engine;
                 count += 1;
             }

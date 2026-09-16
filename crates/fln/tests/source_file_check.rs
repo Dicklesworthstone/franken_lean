@@ -86,9 +86,17 @@ fn aggregate_limits_and_empty_or_unsupported_inputs_are_not_success() {
         base.check_source_files(&[], &opts, limits()),
         Err(SourceCheckError::EmptyInput)
     ));
+    // Empty/comment-only files are valid source modules; an empty file *set*
+    // remains an input error. Scope-only files likewise need no declaration.
+    let empty = base
+        .check_source_files(&[b""], &opts, limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(empty.commands, 0);
+    assert_eq!(empty.base_logical_root, empty.result_logical_root);
     for source in [
-        b"".as_slice(),
-        b"import Init\ndef a : Nat := 1",
+        b"import Init\ndef a : Nat := 1".as_slice(),
         b"#eval 1",
         b"#check Nat",
     ] {

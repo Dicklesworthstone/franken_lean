@@ -51,15 +51,31 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        self.admit_source_command_in_scope(
+            source,
+            options,
+            limits,
+            &fln_elab::source::scope::SourceScope::default(),
+        )
+    }
+
+    pub(crate) fn admit_source_command_in_scope(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = fln_parse::parse_definition(source)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         if fln_elab::source::is_inductive(parsed.syntax()) {
-            let candidate = fln_elab::source::elaborate_inductive(
+            let candidate = fln_elab::source::scope::elaborate_inductive(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
                 fln_elab::records::RecordBudget::default(),
+                scope,
             )
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -68,6 +84,53 @@ impl Engine {
                 .map_err(EngineExecutionError::from);
         }
         if !fln_elab::source::is_record(parsed.syntax()) {
+            if scope != &fln_elab::source::scope::SourceScope::default() {
+                let declaration = fln_elab::source::scope::elaborate_definition(
+                    parsed.syntax(),
+                    self.environment(),
+                    limits.kernel,
+                    scope,
+                )
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
+                let registration = fln_elab::source::instance_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                let result = self
+                    .admit_declarations(&[declaration], options, limits)
+                    .map_err(EngineExecutionError::from)?;
+                return Ok(match result {
+                    Outcome::Complete(mut batch) => {
+                        if let Some((name, priority)) = registration {
+                            let name = scope.declaration_name(&name).map_err(|error| {
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::NameScope(error),
+                                    ),
+                                ))
+                            })?;
+                            batch.engine.environment = fln_elab::instances::register_instance(
+                                batch.engine.environment(),
+                                &name,
+                                priority,
+                            )
+                            .map_err(|error| {
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::InstanceRegistry(
+                                            error,
+                                        ),
+                                    ),
+                                ))
+                            })?;
+                            batch.result_logical_root = batch.engine.logical_root(options);
+                        }
+                        Outcome::Complete(batch)
+                    }
+                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                });
+            }
             return Ok(
                 match self.admit_source_declaration(source, options, limits)? {
                     Outcome::Complete(admitted) => Outcome::Complete(DeclarationBatchAdmission {
@@ -81,11 +144,12 @@ impl Engine {
                 },
             );
         }
-        let record = fln_elab::source::elaborate_record(
+        let record = fln_elab::source::scope::elaborate_record(
             parsed.syntax(),
             self.environment(),
             limits.kernel,
             fln_elab::records::RecordBudget::default(),
+            scope,
         )
         .map_err(DefinitionFrontendError::Elaborate)
         .map_err(EngineExecutionError::Frontend)?;
