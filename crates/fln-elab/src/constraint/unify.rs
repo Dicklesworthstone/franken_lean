@@ -32,7 +32,8 @@ use fln_kernel::{Declaration, check};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Native delta policy. Opaque declarations, unsafe definitions and partial
-/// definitions never unfold. Polymorphic delta is outside this bounded lane.
+/// definitions never unfold. Polymorphic bodies are instantiated simultaneously
+/// before reduction, under the same work and cancellation budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnificationTransparency {
     None,
@@ -570,11 +571,11 @@ impl Engine<'_> {
                         let argument = args.pop().expect("nonempty application spine");
                         head = self.substitute(body, &argument)?;
                     }
-                    ExprNode::Const { name, levels } if levels.is_empty() => {
+                    ExprNode::Const { name, levels } => {
                         let definition = match self.work.env.find(name) {
                             Some(ConstantInfo::Defn(definition))
                                 if definition.safety == DefinitionSafety::Safe
-                                    && definition.base.level_params.is_empty()
+                                    && definition.base.level_params.len() == levels.len()
                                     && match self.budget.transparency {
                                         UnificationTransparency::None => false,
                                         UnificationTransparency::Abbreviations => {
@@ -583,13 +584,17 @@ impl Engine<'_> {
                                         UnificationTransparency::SafeDefinitions => true,
                                     } =>
                             {
-                                Some(definition.value.clone())
+                                Some((definition.value.clone(), definition.base.level_params.clone()))
                             }
                             _ => None,
                         };
-                        if let Some(value) = definition {
+                        if let Some((value, parameters)) = definition {
                             self.scan(&value)?;
-                            head = value;
+                            head = crate::universe::parameters::instantiate(
+                                || self.meter.node(),
+                                || UnificationError::ExpressionScope,
+                                &value, &parameters, levels,
+                            )?;
                         } else {
                             break;
                         }
