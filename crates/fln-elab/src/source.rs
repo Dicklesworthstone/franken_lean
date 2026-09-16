@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod coercions;
 mod equations;
 mod inductive;
 mod infer;
@@ -626,7 +627,7 @@ impl Context {
         // unification. Unknown class inputs still wait for the expected type.
         self.resolve_instances(false)?;
         if let Some(expected) = expected {
-            self.constrain_type(&term.type_, expected)?;
+            term = self.coerce_expected(term, expected)?;
         }
         self.resolve_instances(false)?;
         term.value = self.lower_matrix_call(&term.value)?;
@@ -1001,7 +1002,23 @@ impl Context {
                             }
                             let term = self.atom(syntax, expected.as_ref())?;
                             values.push(if finish {
-                                self.finish_term(term, expected.as_ref())?
+                                // Numerals in this bounded frontend are Nat terms,
+                                // not an excuse to bypass OfNat by coercing them.
+                                // An explicitly ascribed Nat can still be coerced.
+                                if matches!(
+                                    term.value.node(),
+                                    ExprNode::Lit {
+                                        literal: Literal::Nat(_)
+                                    }
+                                ) {
+                                    if let Some(expected) = &expected {
+                                        self.constrain_type(&term.type_, expected)?;
+                                    }
+                                    self.resolve_instances(false)?;
+                                    term
+                                } else {
+                                    self.finish_term(term, expected.as_ref())?
+                                }
                             } else {
                                 term
                             });
@@ -1049,14 +1066,10 @@ impl Context {
                             // The value's actual type guides surrounding inference.
                             // The written annotation still constrains the inner value
                             // and remains in the checked term even when ignored later.
-                            if let Some(expected) = expected {
-                                self.constrain_type(&term.type_, &expected)?;
-                                self.resolve_instances(false)?;
-                            }
                             // Expected types guide inference but closed constraints are
                             // left to K1. Retain this assertion in the checked term,
                             // including when the surrounding program ignores its value.
-                            values.push(Typed {
+                            let ascribed = Typed {
                                 value: Expr::let_e(
                                     Name::anonymous(),
                                     annotation.clone(),
@@ -1065,7 +1078,10 @@ impl Context {
                                     false,
                                 ),
                                 type_: term.type_,
-                            });
+                            };
+                            // Coerce outside the assertion: its inner annotation
+                            // must remain checked even if a conversion discards it.
+                            values.push(self.finish_term(ascribed, expected.as_ref())?);
                         }
                         Task::RecordType(parts, expected) => {
                             let type_ = values.pop().expect("record type visit");
@@ -1306,6 +1322,7 @@ impl Context {
                                     function,
                                     ImplicitInsertion::ExplicitArgument,
                                 )?;
+                                let function = self.coerce_function(function)?;
                                 let ExprNode::ForallE {
                                     binder_type, body, ..
                                 } = function.type_.node()
@@ -1321,7 +1338,7 @@ impl Context {
                                     && !codomain.has_loose_bvar(0)
                                     && let Some(expected) = &expected
                                 {
-                                    self.constrain_type(&codomain, expected)?;
+                                    self.constrain_result_hint(&codomain, expected)?;
                                 }
                                 tasks.push(Task::Argument(function, codomain, rest, expected));
                                 tasks.push(Task::Visit(first, Some(domain), true));
