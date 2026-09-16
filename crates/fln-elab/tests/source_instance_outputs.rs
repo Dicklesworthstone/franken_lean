@@ -152,7 +152,7 @@ fn fixture(mode: Option<&str>) -> Environment {
         || sort.clone(),
         |mode| {
             Expr::app(
-                Expr::const_(n(mode), vec![Level::succ(Level::one())]),
+                Expr::const_(n(mode), vec![Level::succ(Level::one()).expect("fixed universe two")]),
                 sort.clone(),
             )
         },
