@@ -28,7 +28,9 @@ pub(super) fn parse(
     let mut end = by + 1;
     while end < limit {
         match &tokens[end].kind {
-            TokenKind::Symbol(symbol) if matches!(symbol.as_str(), "(" | "[" | "{" | "⦃") => {
+            TokenKind::Symbol(symbol)
+                if matches!(symbol.as_str(), "(" | "[" | "{" | ".{" | "⦃") =>
+            {
                 depth += 1
             }
             TokenKind::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]" | "}" | "⦄") => {
@@ -274,9 +276,9 @@ fn rewrite(
                 rows.push(leaves.leaf(at)?);
             }
             start = at + 1;
-        } else if is(at, "(") {
+        } else if is(at, "(") || is(at, ".{") {
             depth += 1;
-        } else if is(at, ")") {
+        } else if is(at, ")") || is(at, "}") {
             depth = depth
                 .checked_sub(1)
                 .ok_or_else(|| refusal(view, tokens, at))?;
@@ -359,9 +361,9 @@ fn simplify(
                     rows.push(leaves.leaf(at)?);
                 }
                 start = at + 1;
-            } else if is(at, "(") {
+            } else if is(at, "(") || is(at, ".{") {
                 depth += 1;
-            } else if is(at, ")") {
+            } else if is(at, ")") || is(at, "}") {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| refusal(view, tokens, at))?;
