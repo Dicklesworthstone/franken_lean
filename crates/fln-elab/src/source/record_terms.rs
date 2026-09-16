@@ -2,6 +2,8 @@
 //! independent declarations or trusted projections. Elaboration follows the
 //! constructor telescope so later field types see the actual earlier values.
 use super::*;
+use crate::records::RecordBudget;
+use crate::records::inheritance::{RecordParents, direct_fields};
 use fln_core::name::LeafView;
 use fln_env::constants::ConstantInfo;
 use std::collections::HashMap;
@@ -41,6 +43,12 @@ pub(super) struct RecordParts<'a> {
     pub(super) sources: Vec<&'a Syntax>,
 }
 pub(super) struct RecordBuild<'a> {
+    // Parent subobjects use heap continuations, never recursive elaboration.
+    frames: Vec<RecordFrame<'a>>,
+}
+struct RecordFrame<'a> {
+    parents: HashMap<Name, Vec<Name>>,
+    return_codomain: Option<Expr>,
     fields: HashMap<Name, &'a Syntax>,
     constructor: Typed,
     remaining: u32,
@@ -144,7 +152,50 @@ impl Context {
         Ok(receiver)
     }
 
-    fn record_field(
+    pub(super) fn record_field(
+        &mut self,
+        receiver: Typed,
+        field: &Name,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        let receiver = self.insert_implicits(receiver, ImplicitInsertion::FieldReceiver)?;
+        match self.physical_record_field(receiver.clone(), field) {
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
+                RecordTermError::UnknownField(_),
+            ))) => {}
+            result => return result,
+        }
+        let target = self.whnf(&receiver.type_)?;
+        let mut head = &target;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.tick()?;
+            head = f;
+        }
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Err(error(RecordTermError::ExpectedRecordType));
+        };
+        let registry = RecordParents::read(&self.txn.env)
+            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+        let path = registry
+            .fields(&self.txn.env, name, RecordBudget::default())
+            .map_err(|e| failure(SourceInferenceError::Record(e)))?
+            .into_iter()
+            .find(|row| &row.name == field)
+            .ok_or_else(|| error(RecordTermError::UnknownField(field.clone())))?;
+        let mut receiver = receiver;
+        let mut remaining = RecordBudget::default().max_nodes;
+        for (owner, index) in path.path {
+            self.tick()?;
+            let fields = direct_fields(&self.txn.env, &owner, &mut remaining)
+                .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+            let (label, _) = fields
+                .get(index as usize)
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            receiver = self.physical_record_field(receiver, label)?;
+        }
+        Ok(receiver)
+    }
+
+    fn physical_record_field(
         &mut self,
         receiver: Typed,
         field: &Name,
@@ -350,6 +401,17 @@ impl Context {
         expected: Option<Expr>,
         sources: Vec<Typed>,
     ) -> Result<RecordBuild<'a>, NatDefinitionElabError> {
+        Ok(RecordBuild {
+            frames: vec![self.start_record_frame(parts, expected, sources)?],
+        })
+    }
+
+    fn start_record_frame<'a>(
+        &mut self,
+        parts: RecordParts<'a>,
+        expected: Option<Expr>,
+        sources: Vec<Typed>,
+    ) -> Result<RecordFrame<'a>, NatDefinitionElabError> {
         self.flush(false)?;
         let expected = expected
             .or_else(|| sources.first().map(|source| source.type_.clone()))
@@ -414,6 +476,38 @@ impl Context {
             }
             cursor = body;
         }
+        let inherited = RecordParents::read(&self.txn.env)
+            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+        let mut parents = HashMap::new();
+        let mut remaining = RecordBudget::default().max_nodes;
+        let physical = direct_fields(&self.txn.env, name, &mut remaining)
+            .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+        for parent in inherited.parents(name) {
+            self.tick()?;
+            let (label, _) = physical
+                .get(parent.field as usize)
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let fields = inherited
+                .fields(&self.txn.env, &parent.parent, RecordBudget::default())
+                .map_err(|e| failure(SourceInferenceError::Record(e)))?;
+            let labels: Vec<_> = fields.into_iter().map(|field| field.name).collect();
+            for inherited_label in &labels {
+                self.tick()?;
+                if !known.insert(inherited_label.clone()) {
+                    return Err(error(RecordTermError::DuplicateField(
+                        inherited_label.clone(),
+                    )));
+                }
+            }
+            // Supplying both a parent object and one of its flattened fields is
+            // ambiguous in this profile, never an excuse to discard a value.
+            if parts.fields.iter().any(|(field, _)| field == label)
+                && parts.fields.iter().any(|(field, _)| labels.contains(field))
+            {
+                return Err(error(RecordTermError::DuplicateField(label.clone())));
+            }
+            parents.insert(label.clone(), labels);
+        }
         for (label, _) in &parts.fields {
             if !known.contains(label) {
                 return Err(error(RecordTermError::UnknownField(label.clone())));
@@ -471,7 +565,9 @@ impl Context {
                 type_: source.type_,
             });
         }
-        Ok(RecordBuild {
+        Ok(RecordFrame {
+            parents,
+            return_codomain: None,
             fields: parts.fields.into_iter().collect(),
             constructor,
             remaining: ctor.num_fields,
@@ -487,6 +583,84 @@ impl Context {
     pub(super) fn next_record_field<'a>(
         &mut self,
         state: &mut RecordBuild<'a>,
+    ) -> Result<RecordStep<'a>, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            let frame = state
+                .frames
+                .last_mut()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let mut parent = None;
+            if frame.remaining != 0 {
+                let type_ = self.whnf(&frame.constructor.type_)?;
+                let ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                } = type_.node()
+                else {
+                    return Err(failure(SourceInferenceError::Scope));
+                };
+                if let Some(labels) = frame.parents.get(binder_name).cloned() {
+                    parent = Some((labels, binder_type.clone(), body.clone()));
+                }
+            }
+            let explicit_inherited = parent.as_ref().is_some_and(|(labels, _, _)| {
+                labels.iter().any(|label| frame.fields.contains_key(label))
+            });
+            if !explicit_inherited {
+                match self.next_physical_record_field(frame) {
+                    Ok(RecordStep::Complete(term)) => {
+                        let finished = state
+                            .frames
+                            .pop()
+                            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                        let Some(codomain) = finished.return_codomain else {
+                            return Ok(RecordStep::Complete(term));
+                        };
+                        self.accept_record_field(state, &codomain, term)?;
+                        continue;
+                    }
+                    // Copy a whole available parent before considering defaults:
+                    // reconstructing it unnecessarily can change dependent types.
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::RecordTerm(
+                        RecordTermError::MissingField(_),
+                    ))) if parent.is_some() => {}
+                    result => return result,
+                }
+            }
+            let (labels, domain, codomain) =
+                parent.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let frame = state.frames.last_mut().expect("active record frame");
+            let mut fields = Vec::new();
+            for label in labels {
+                self.tick()?;
+                if let Some(syntax) = frame.fields.remove(&label) {
+                    fields.push((label, syntax));
+                }
+            }
+            let sources = frame.sources.clone();
+            if state.frames.len() >= RecordBudget::default().max_binders {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            let mut child = self.start_record_frame(
+                RecordParts {
+                    fields,
+                    annotation: None,
+                    sources: Vec::new(),
+                },
+                Some(domain),
+                sources,
+            )?;
+            child.return_codomain = Some(codomain);
+            state.frames.push(child);
+        }
+    }
+
+    fn next_physical_record_field<'a>(
+        &mut self,
+        state: &mut RecordFrame<'a>,
     ) -> Result<RecordStep<'a>, NatDefinitionElabError> {
         self.tick()?;
         if state.remaining == 0 {
@@ -607,6 +781,10 @@ impl Context {
         value: Typed,
     ) -> Result<(), NatDefinitionElabError> {
         self.tick()?;
+        let state = state
+            .frames
+            .last_mut()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
         state.constructor.type_ = self.substitute(codomain, &value.value)?;
         state.constructor.value = Expr::app(state.constructor.value.clone(), value.value);
         state.remaining -= 1;
