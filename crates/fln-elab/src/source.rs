@@ -11,7 +11,9 @@ mod inductive;
 mod infer;
 mod instance_command;
 mod instances;
+mod level_syntax;
 mod levels;
+pub use level_syntax::LevelSyntaxError;
 mod matching;
 mod patterns;
 mod record;
@@ -32,6 +34,7 @@ pub enum SourceInferenceError {
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
+    LevelSyntax(LevelSyntaxError),
     ExpectedFunction,
     ExpectedType,
     RecordTerm(record_terms::RecordTermError),
@@ -52,6 +55,7 @@ pub enum SourceInferenceError {
 impl std::fmt::Display for SourceInferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::LevelSyntax(reason) => write!(f, "{reason}"),
             Self::Recursion(reason) => write!(f, "{reason}"),
             Self::Match(reason) => write!(f, "{reason}"),
             Self::Inductive(error) => write!(f, "{error}"),
@@ -147,6 +151,9 @@ struct Context {
     next: u64,
     equations: Vec<SourceEquation>,
     instance_goals: Vec<MVarId>,
+    level_params: Vec<Name>,
+    explicit_levels: usize,
+    infer_level_params: bool,
     // Stable private names link raw IHs to checked specializations. Actual
     // declarations in the local context decide visibility, including rollback.
     induction_specializations: Vec<(Name, Name)>,
@@ -172,6 +179,9 @@ impl Context {
             next: 0,
             equations: Vec::new(),
             instance_goals: Vec::new(),
+            level_params: Vec::new(),
+            explicit_levels: 0,
+            infer_level_params: false,
             induction_specializations: Vec::new(),
             matrix_rows: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
@@ -292,12 +302,11 @@ impl Context {
                 });
             }
             let level = if kind == &parser_kind(&["Term", "type"]) {
-                let [keyword, level] = args.as_slice() else {
-                    return Err(failure(SourceInferenceError::Scope));
-                };
-                expect_atom(keyword, "Type", "type universe")?;
-                expect_empty_null(level, "absent universe level")?;
-                Some(Level::one())
+                Some(self.source_sort(args, true)?)
+            } else if kind == &parser_kind(&["Term", "sort"]) {
+                Some(self.source_sort(args, false)?)
+            } else if kind == &parser_kind(&["Term", "explicitUniv"]) {
+                return self.explicit_universes(args);
             } else if kind == &parser_kind(&["Term", "prop"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(failure(SourceInferenceError::Scope));
@@ -1802,7 +1811,8 @@ pub(super) fn definition(
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
-    expect_empty_null(&id[1], "absent declaration pre-parser")?;
+    context.declare_levels(&id[1])?;
+    context.infer_level_params = true;
     let signature = expect_node(
         &definition[2],
         &parser_kind(&[
@@ -1831,6 +1841,7 @@ pub(super) fn definition(
             .map(|syntax| context.type_term(syntax))
             .transpose()?
     };
+    context.infer_level_params = false;
     // Later binders may determine earlier class inputs, but the body may not
     // rescue a stuck header instance. An explicit result also closes ordinary
     // header holes; inferred results may still constrain ordinary parameters.
@@ -1930,9 +1941,10 @@ pub(super) fn definition(
     {
         return Err(failure(SourceInferenceError::Scope));
     }
+    let level_params = context.declaration_levels(&[term.type_.clone(), term.value.clone()])?;
     let base = ConstantVal {
         name: name.clone(),
-        level_params: Vec::new(),
+        level_params,
         type_: term.type_,
     };
     if is_theorem {
