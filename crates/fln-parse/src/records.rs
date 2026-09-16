@@ -1,7 +1,7 @@
 //! Bounded record/class declarations using the ordinary token leaves and types.
 //! No source rewriting or fabricated definitions: field scopes survive as syntax.
-//! Inheritance, custom constructors and deriving remain explicit
-//! refusals rather than ignored command suffixes.
+//! Parent clauses retain their original type syntax and optional projection names.
+//! Custom constructors and deriving remain explicit refusals.
 use super::*;
 use std::ops::Range;
 
@@ -168,6 +168,81 @@ fn fields(
     Ok(output)
 }
 
+/// Keep the Reference's `extends` / `structParent` node shapes. Commas
+/// nested in a parent type do not split the parent list.
+fn parents(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if start == end {
+        return Ok(null_node(Vec::new()));
+    }
+    if !symbol(tokens, start, "extends") {
+        return Err(refuse(view, tokens, start));
+    }
+    let mut rows = Vec::new();
+    let mut first = start + 1;
+    let mut stack = Vec::new();
+    for index in first..=end {
+        if index == end || (stack.is_empty() && symbol(tokens, index, ",")) {
+            let mut type_start = first;
+            let name = if matches!(
+                tokens.get(first).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) && symbol(tokens, first + 1, ":")
+            {
+                type_start += 2;
+                null_node(vec![leaves.leaf(first)?, leaves.leaf(first + 1)?])
+            } else {
+                null_node(Vec::new())
+            };
+            if type_start >= index {
+                return Err(refuse(view, tokens, type_start));
+            }
+            rows.push(Syntax::node(
+                parser_kind(&["Command", "structParent"]),
+                vec![
+                    name,
+                    bounded_type(
+                        leaves,
+                        view,
+                        tokens,
+                        type_start..index,
+                        DefinitionGrammar::Scalar,
+                    )?,
+                ],
+            ));
+            if index < end {
+                rows.push(leaves.leaf(index)?);
+            }
+            first = index + 1;
+        } else if let TokenKind::Symbol(s) = &tokens[index].kind {
+            match s.as_str() {
+                "(" => stack.push(")"),
+                "{" => stack.push("}"),
+                "[" => stack.push("]"),
+                "⦃" => stack.push("⦄"),
+                ")" | "}" | "]" | "⦄" => {
+                    if stack.pop() != Some(s.as_str()) {
+                        return Err(refuse(view, tokens, index));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !stack.is_empty() {
+        return Err(refuse(view, tokens, end));
+    }
+    Ok(null_node(vec![Syntax::node(
+        parser_kind(&["Command", "extends"]),
+        vec![leaves.leaf(start)?, null_node(rows), null_node(Vec::new())],
+    )]))
+}
+
 pub(super) fn parse(
     view: SourceView,
     tokens: Vec<LexedToken>,
@@ -177,16 +252,22 @@ pub(super) fn parse(
         return Err(refuse(&view, &tokens, 1));
     }
     let (groups, cursor) = bounded_binders(&view, &tokens, 2, DefinitionGrammar::Scalar)?;
-    let end_header = if symbol(&tokens, cursor, ":") {
-        type_end(&tokens, cursor, "where")
+    let end_result = if symbol(&tokens, cursor, ":") {
+        type_end(&tokens, cursor, "where").min(type_end(&tokens, cursor, "extends"))
     } else {
         cursor
+    };
+    let end_header = if symbol(&tokens, end_result, "extends") {
+        type_end(&tokens, end_result, "where")
+    } else {
+        end_result
     };
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let parameters =
         bounded_binder_syntax(&leaves, &view, &tokens, groups, DefinitionGrammar::Scalar)?;
-    let result = optional_type(&leaves, &view, &tokens, cursor..end_header)?;
+    let result = optional_type(&leaves, &view, &tokens, cursor..end_result)?;
+    let inheritance = parents(&leaves, &view, &tokens, end_result, end_header)?;
     let body = if end_header == tokens.len() {
         null_node(Vec::new())
     } else {
@@ -218,7 +299,7 @@ pub(super) fn parse(
                 parser_kind(&["Command", "optDeclSig"]),
                 vec![null_node(parameters), result],
             ),
-            null_node(Vec::new()),
+            inheritance,
             body,
             Syntax::node(
                 parser_kind(&["Command", "optDeriving"]),
@@ -266,7 +347,7 @@ mod tests {
     #[test]
     fn unsupported_record_forms_and_bad_indentation_do_not_disappear() {
         for text in [
-            "structure A extends B where x : Nat",
+            "structure A extends where x : Nat",
             "structure A where\nx : Nat",
             "structure A where\n  x : Nat\n y : Nat",
             "structure A where\n  x : Nat :=",
@@ -289,6 +370,41 @@ mod tests {
             assert!(parse_definition(text.as_bytes()).is_ok(), "refused {text}");
         }
     }
+    #[test]
+    fn inherited_records_preserve_parent_types_projection_names_and_source_bytes() {
+        for text in [
+            "structure Tagged (A : Type) extends Box A where\n  tag : Nat",
+            "class Rich (A : Type) : Type extends toValue : Value A, More A where\n  tag : Nat",
+            "structure Child extends Parent",
+            "-- header\r\nstructure C extends -- first\r\n  left : Box (Nat -> Nat), -- second\r\n  Right where\r\n  x : Nat\r\n",
+        ] {
+            let parsed =
+                parse_definition(text.as_bytes()).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                text.replace("\r\n", "\n").as_bytes()
+            );
+            assert!(parse_nat_definition(text.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_parent_clauses_do_not_drop_tokens() {
+        for text in [
+            "structure C extends",
+            "structure C extends , A",
+            "structure C extends A,",
+            "structure C extends A,,B",
+            "structure C extends p :",
+            "structure C extends A Nat : Type",
+            "structure C extends (A",
+            "structure C extends A)",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
+        }
+    }
+
     #[test]
     fn default_bodies_preserve_crlf_comments_nested_literals_and_method_bindings() {
         let text = "structure Config where\r\n  -- header\r\n  inner : Inner := { value := 7 }\r\n  twice : Nat := let x := inner.value; x + x\r\n  apply (x : Nat) : Nat := x + twice\r\n";
