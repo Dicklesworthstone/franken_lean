@@ -241,7 +241,7 @@ impl Engine<'_> {
                         .map(|value| self.validation_instantiate(value, &validation_store))
                         .transpose()?;
                     for expr in std::iter::once(&domain).chain(value.iter()) {
-                        if expr.has_expr_mvar() || expr.has_level_mvar() || expr.has_loose_bvars() {
+                        if expr.has_expr_mvar() || expr.has_loose_bvars() {
                             return Err(UnificationError::Deferred(
                                 UnificationDeferred::UnresolvedAssignmentType(target.clone()),
                             ));
