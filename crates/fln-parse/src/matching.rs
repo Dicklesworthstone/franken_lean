@@ -269,7 +269,7 @@ fn plan(
                 }
             }
             "(" => delimiters.push(")"),
-            "{" => delimiters.push("}"),
+            "{" | ".{" => delimiters.push("}"),
             "[" => delimiters.push("]"),
             "⦃" => delimiters.push("⦄"),
             ":" if conditionals.last().is_some_and(|p| {
@@ -527,7 +527,7 @@ fn columns(tokens: &[LexedToken], range: Range<usize>) -> Vec<(Range<usize>, Opt
     for at in range.clone() {
         if let TokenKind::Symbol(symbol) = &tokens[at].kind {
             match symbol.as_str() {
-                "(" | "{" | "[" | "⦃" => depth += 1,
+                "(" | "{" | ".{" | "[" | "⦃" => depth += 1,
                 ")" | "}" | "]" | "⦄" => depth = depth.saturating_sub(1),
                 "," if depth == 0 => {
                     result.push((start..at, Some(at)));
