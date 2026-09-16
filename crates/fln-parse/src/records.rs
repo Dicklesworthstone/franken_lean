@@ -151,10 +151,8 @@ fn fields(
                 "{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
-                ")" | "}" | "]" | "⦄" => {
-                    if stack.pop() != Some(s.as_str()) {
-                        return Err(refuse(view, tokens, index));
-                    }
+                ")" | "}" | "]" | "⦄" if stack.pop() != Some(s.as_str()) => {
+                    return Err(refuse(view, tokens, index));
                 }
                 "where" | "extends" | "deriving" => return Err(refuse(view, tokens, index)),
                 _ => {}
@@ -186,7 +184,7 @@ fn parents(
     let mut rows = Vec::new();
     let mut first = start + 1;
     let mut stack = Vec::new();
-    for index in first..=end {
+    for index in start + 1..=end {
         if index == end || (stack.is_empty() && symbol(tokens, index, ",")) {
             let mut type_start = first;
             let name = if matches!(
@@ -225,10 +223,8 @@ fn parents(
                 "{" => stack.push("}"),
                 "[" => stack.push("]"),
                 "⦃" => stack.push("⦄"),
-                ")" | "}" | "]" | "⦄" => {
-                    if stack.pop() != Some(s.as_str()) {
-                        return Err(refuse(view, tokens, index));
-                    }
+                ")" | "}" | "]" | "⦄" if stack.pop() != Some(s.as_str()) => {
+                    return Err(refuse(view, tokens, index));
                 }
                 _ => {}
             }
