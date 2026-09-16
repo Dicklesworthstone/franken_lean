@@ -17,7 +17,6 @@ enum Candidate {
 struct Expansion {
     value: Expr,
     subgoals: Vec<MVarId>,
-    next: usize,
 }
 struct Frame {
     goal: MVarId,
@@ -321,7 +320,6 @@ impl Context {
         Ok(Some(Expansion {
             value: term.value,
             subgoals,
-            next: 0,
         }))
     }
 
@@ -345,20 +343,31 @@ impl Context {
         while !frames.is_empty() {
             self.tick()?;
             let index = frames.len() - 1;
-            if let Some(expansion) = &mut frames[index].chosen {
-                while expansion.next < expansion.subgoals.len()
-                    && self
-                        .txn
-                        .mvars
-                        .is_assigned(&expansion.subgoals[expansion.next])
-                {
-                    expansion.next += 1;
-                }
-                if let Some(id) = expansion.subgoals.get(expansion.next).cloned() {
-                    let Some(child) = self.instance_frame(id, registry, &ambient)? else {
-                        frames[index].chosen = None;
+            if let Some(expansion) = &frames[index].chosen {
+                let mut remaining = false;
+                let mut ready = None;
+                // A later prerequisite may infer the input that blocks an
+                // earlier one. Rescan after each successful child, preserving
+                // declaration order among ready goals. An all-blocked set is
+                // a failed candidate, never permission to guess input values.
+                for id in &expansion.subgoals {
+                    self.tick()?;
+                    if self.txn.mvars.is_assigned(id) {
                         continue;
-                    };
+                    }
+                    remaining = true;
+                    let mut trial = self.clone();
+                    let child = trial.instance_frame(id.clone(), registry, &ambient);
+                    self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                    if let Some(child) = child? {
+                        *self = trial;
+                        ready = Some(child);
+                        break;
+                    }
+                    // Drop speculative output holes and opened binders from
+                    // blocked preparation, but retain every charged heartbeat.
+                }
+                if let Some(child) = ready {
                     if frames.iter().any(|frame| frame.key == child.key) {
                         frames[index].chosen = None;
                         continue;
@@ -367,6 +376,10 @@ impl Context {
                         return Err(failure(SourceInferenceError::ResourceLimit));
                     }
                     frames.push(child);
+                    continue;
+                }
+                if remaining {
+                    frames[index].chosen = None;
                     continue;
                 }
                 let mut value = self.instantiate(&expansion.value)?;
