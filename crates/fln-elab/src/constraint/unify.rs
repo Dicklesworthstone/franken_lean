@@ -12,6 +12,7 @@
 //! its metavariables, universes and constraint queue, atomically on success.
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
+mod assignment_universes;
 mod residual;
 
 use crate::constraint::Constraint;
@@ -209,6 +210,7 @@ fn children(expr: &Expr) -> [Option<&Expr>; 3] {
 struct Facts {
     fvars: HashSet<FVarId>,
     params: Vec<Name>,
+    uvars: Vec<LMVarId>,
 }
 
 /// Explicit DAG walks precede core substitution and kernel submission. Keys
@@ -218,6 +220,7 @@ fn facts(expr: &Expr, meter: &mut Meter<'_>) -> Result<Facts, UnificationError> 
     let mut seen = HashSet::new();
     let mut seen_levels = HashSet::new();
     let mut params = HashSet::new();
+    let mut uvars = HashSet::new();
     let mut pending = vec![expr];
     let mut levels = Vec::new();
     while let Some(current) = pending.pop() {
@@ -246,6 +249,7 @@ fn facts(expr: &Expr, meter: &mut Meter<'_>) -> Result<Facts, UnificationError> 
             LevelView::Param(name) if params.insert(name.clone()) => {
                 result.params.push(name.clone())
             }
+            LevelView::MVar(id) if uvars.insert(id.clone()) => result.uvars.push(id.clone()),
             LevelView::Succ(inner) => levels.push(inner),
             LevelView::Max(a, b) | LevelView::IMax(a, b) => {
                 levels.push(b);
@@ -1036,6 +1040,8 @@ impl Engine<'_> {
 
     fn check_assignment(&mut self, id: &MVarId) -> Result<(), UnificationError> {
         let (value, type_, residuals) = self.prepare_assignment_check(id)?;
+        let (value, type_, generalized_universes) =
+            self.generalize_assignment_universes(value, type_)?;
         if value.has_expr_mvar()
             || type_.has_expr_mvar()
             || value.has_level_mvar()
@@ -1093,9 +1099,11 @@ impl Engine<'_> {
                 }
                 Ok(())
             }
-            Outcome::Complete(Verdict::Rejected { .. }) if !residuals.is_empty() => {
+            Outcome::Complete(Verdict::Rejected { .. })
+                if !residuals.is_empty() || generalized_universes =>
+            {
                 // Failure of the universally quantified obligation need not be
-                // failure after the remaining holes acquire concrete values.
+                // failure after the remaining expression or universe holes specialize.
                 Err(UnificationError::Deferred(
                     UnificationDeferred::UnresolvedAssignmentType(id.clone()),
                 ))
