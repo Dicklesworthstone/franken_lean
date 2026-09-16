@@ -1,7 +1,9 @@
 //! Source record signatures elaborate through the same bidirectional context as
 //! ordinary definitions. Result universes follow field domains unless explicit.
 use super::*;
+mod parents;
 use crate::records::defaults::{RecordDefault, helper_name};
+use crate::records::inheritance::RecordParent;
 use crate::records::{RecordBudget, RecordSpec, record_declarations};
 
 #[derive(Debug)]
@@ -12,6 +14,9 @@ pub struct SourceRecord {
     pub declarations: Vec<Declaration>,
     /// References only: the caller registers these after admitting the full batch.
     pub defaults: Vec<RecordDefault>,
+    /// Parent metadata and instance registrations are published only after checking.
+    pub parents: Vec<RecordParent>,
+    pub parent_instances: Vec<Name>,
 }
 
 pub fn is_record(syntax: &Syntax) -> bool {
@@ -80,7 +85,6 @@ pub fn elaborate_record(
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     }
-    expect_empty_null(&parts[3], "unsupported inheritance")?;
     let deriving = expect_node(
         &parts[5],
         &parser_kind(&["Command", "optDeriving"]),
@@ -99,7 +103,9 @@ pub fn elaborate_record(
     let explicit = optional_type_syntax(&signature[1])?
         .map(|s| context.term(s, None))
         .transpose()?;
-    let mut inferred = Level::one();
+    let inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
+    let mut labels = inheritance.labels;
+    let mut inferred = inheritance.level;
     let fields = match expect_null_args(&parts[4], "record body")? {
         [] => &[][..],
         [keyword, ctor, fields] => {
@@ -120,7 +126,7 @@ pub fn elaborate_record(
             crate::records::RecordError::ResourceLimit,
         )));
     }
-    let mut output = Vec::new();
+    let mut output = inheritance.fields;
     let mut defaults = Vec::new();
     let mut helpers = Vec::new();
     for field in fields {
@@ -149,6 +155,19 @@ pub fn elaborate_record(
         let Syntax::Ident { val: user_name, .. } = &parts[1] else {
             return Err(failure(SourceInferenceError::Scope));
         };
+        if !labels.insert(user_name.clone()) {
+            return Err(failure(SourceInferenceError::Record(
+                crate::records::RecordError::DuplicateField,
+            )));
+        }
+        if parameters
+            .len()
+            .saturating_add(output.len())
+            .saturating_add(1)
+            > budget.max_binders
+        {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
         let sig = expect_node(
             &parts[2],
             &parser_kind(&["Command", "optDeclSig"]),
@@ -159,7 +178,8 @@ pub fn elaborate_record(
         let arguments = context.bind_parameters(&sig[0])?;
         let annotation = optional_type_syntax(&sig[1])?
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-        let mut domain = context.type_term(annotation)?;
+        let domain = context.type_term(annotation)?;
+        let mut domain = context.expand_record_aliases(domain, &inheritance.aliases)?;
         if let Some(syntax) = default {
             let term = context.term(syntax, Some(domain.clone()))?;
             // Preserve the declared type even when the default is never selected.
@@ -168,10 +188,20 @@ pub fn elaborate_record(
                 value: term.value,
                 type_: domain.clone(),
             })?;
-            let locals = context.txn.lctx.decls().to_vec();
+            term.value = context.expand_record_aliases(term.value, &inheritance.aliases)?;
+            term.type_ = context.expand_record_aliases(term.type_, &inheritance.aliases)?;
+            let locals = context
+                .txn
+                .lctx
+                .decls()
+                .iter()
+                .filter(|l| !l.is_let())
+                .cloned()
+                .collect::<Vec<_>>();
             for (index, local) in locals.iter().enumerate().rev() {
                 context.tick()?;
                 let local_type = context.instantiate(&local.type_)?;
+                let local_type = context.expand_record_aliases(local_type, &inheritance.aliases)?;
                 let style = if index < parameters.len() && local.binder_info == BinderInfo::Default
                 {
                     BinderInfo::Implicit
@@ -220,7 +250,7 @@ pub fn elaborate_record(
                 .map_err(|_| failure(SourceInferenceError::Scope))?;
             domain = Expr::forall_e(
                 arg.user_name.clone(),
-                arg.type_.clone(),
+                context.expand_record_aliases(arg.type_.clone(), &inheritance.aliases)?,
                 domain,
                 arg.binder_info,
             );
@@ -283,5 +313,7 @@ pub fn elaborate_record(
         is_class,
         declarations,
         defaults,
+        parents: inheritance.parents,
+        parent_instances: inheritance.instances,
     })
 }
