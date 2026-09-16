@@ -58,7 +58,8 @@ pub(super) fn parse(
     if !matches!(tokens.get(1).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
         return Err(refuse(&view, &tokens, 1));
     }
-    let (groups, cursor) = bounded_binders(&view, &tokens, 2, DefinitionGrammar::Scalar)?;
+    let (universe_suffix, cursor) = levels::declaration_suffix(&view, &tokens, 2)?;
+    let (groups, cursor) = bounded_binders(&view, &tokens, cursor, DefinitionGrammar::Scalar)?;
     let mut end_header = cursor;
     let mut nesting = Vec::new();
     while end_header < tokens.len() {
@@ -72,7 +73,7 @@ pub(super) fn parse(
         if let TokenKind::Symbol(s) = &tokens[end_header].kind {
             match s.as_str() {
                 "(" => nesting.push(")"),
-                "{" => nesting.push("}"),
+                "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
                 ")" | "}" | "]" | "⦄" if nesting.pop() != Some(s.as_str()) => {
@@ -106,7 +107,7 @@ pub(super) fn parse(
         if let TokenKind::Symbol(s) = &tokens[at].kind {
             match s.as_str() {
                 "(" => nesting.push(")"),
-                "{" => nesting.push("}"),
+                "{" | ".{" => nesting.push("}"),
                 "[" => nesting.push("]"),
                 "⦃" => nesting.push("⦄"),
                 ")" | "}" | "]" | "⦄" => {
@@ -133,7 +134,10 @@ pub(super) fn parse(
             leaves.leaf(0)?,
             Syntax::node(
                 parser_kind(&["Command", "declId"]),
-                vec![leaves.leaf(1)?, null_node(vec![])],
+                vec![
+                    leaves.leaf(1)?,
+                    levels::declaration_syntax(&leaves, universe_suffix)?,
+                ],
             ),
             Syntax::node(
                 parser_kind(&["Command", "optDeclSig"]),
