@@ -31,7 +31,8 @@ use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 use fln_env::constants::{
-    AxiomVal, ConstantVal, ConstructorVal, InductiveVal, RecursorRule, RecursorVal,
+    AxiomVal, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal, InductiveVal,
+    RecursorRule, RecursorVal, ReducibilityHints,
 };
 use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
 use fln_env::pmap::CollisionBudget;
@@ -607,11 +608,50 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
     }
 }
 
+fn parameter_marker_seed_declaration(name: &str) -> Declaration {
+    let name = Name::from_components([name]);
+    let universe = Name::from_components(["u"]);
+    let domain = Expr::sort(Level::param(universe.clone()));
+    let binder = Name::from_components(["a"]);
+    Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: vec![universe],
+            type_: Expr::forall_e(
+                binder.clone(),
+                domain.clone(),
+                domain.clone(),
+                BinderInfo::Default,
+            ),
+        },
+        value: Expr::lam(
+            binder,
+            domain,
+            Expr::bvar(0).expect("fixed identity binder"),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![name],
+    })
+}
+
+/// The ordinary polymorphic identity definition used to mark class outputs.
+/// It changes elaboration selection, not the kernel's typing or equality rules.
+pub fn out_param_seed_declaration() -> Declaration {
+    parameter_marker_seed_declaration("outParam")
+}
+
+/// The ordinary identity annotation whose known arguments filter instances.
+pub fn semi_out_param_seed_declaration() -> Declaration {
+    parameter_marker_seed_declaration("semiOutParam")
+}
+
 /// The exact declaration sequence required by the bounded Nat/String/Bool
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 51] {
+pub fn source_seed_declarations() -> [Declaration; 53] {
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -664,6 +704,8 @@ pub fn source_seed_declarations() -> [Declaration; 51] {
         decidable::false_instance(),
         decidable::not_instance(),
         decidable::of_decide_eq_true_declaration(),
+        out_param_seed_declaration(),
+        semi_out_param_seed_declaration(),
     ]
 }
 
@@ -763,10 +805,33 @@ mod tests {
         assert_eq!(declarations[24], string_dec_eq_seed_declaration());
         assert_eq!(declarations[25], eq_seed_declaration());
         assert_eq!(declarations[26], rfl_seed_declaration());
+        assert_eq!(declarations[51], out_param_seed_declaration());
+        assert_eq!(declarations[52], semi_out_param_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"
         );
+    }
+
+    #[test]
+    fn parameter_markers_are_checked_definitions_not_axioms() {
+        let environment = Environment::new();
+        for declaration in [out_param_seed_declaration(), semi_out_param_seed_declaration()] {
+            let Declaration::Defn(definition) = &declaration else {
+                panic!("parameter markers must have checked identity bodies");
+            };
+            assert_eq!(definition.safety, DefinitionSafety::Safe);
+            assert_eq!(definition.hints, ReducibilityHints::Abbrev);
+            assert!(!definition.value.has_expr_mvar());
+            assert!(!definition.value.has_level_mvar());
+            let Outcome::Complete(admitted) = admit(&environment, declaration, Budget::DEFAULT) else {
+                panic!("fixed marker admission must answer");
+            };
+            assert!(matches!(
+                convene(&Council::nobody_was_asked(), admitted),
+                CouncilOutcome::Agreed(_)
+            ));
+        }
     }
 
     #[test]
