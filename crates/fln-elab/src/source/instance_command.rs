@@ -82,7 +82,7 @@ pub(super) fn registration(syntax: &Syntax) -> Result<Option<(Name, u32)>, NatDe
         2,
         "instance identifier",
     )?;
-    expect_empty_null(&id[1], "absent explicit universe declaration")?;
+    level_syntax::explicit_parameters(&id[1])?;
     let Syntax::Ident { val, .. } = &id[0] else {
         return Err(NatDefinitionElabError::AnonymousDeclarationName);
     };
