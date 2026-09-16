@@ -5,6 +5,8 @@
 //! or proof authority. No negative cache outlives a search. Reading a malformed
 //! journal is a refusal, not an empty instance set.
 
+pub mod coercions;
+
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
