@@ -79,11 +79,10 @@ impl Context {
         let ExprNode::Const { name, levels } = head.node() else {
             return Err(failure(SourceInferenceError::InvalidInstanceBinder));
         };
-        // Keep the existing bounded universe profile. Output *expression*
-        // parameters may be unknown; unresolved class universes still postpone.
-        if head.has_level_mvar() {
-            return Ok(None);
-        }
+        // Universe metavariables are equations for candidate matching, not
+        // unknown expression inputs. In particular an output parameter may
+        // determine its own universe. Final publication still requires every
+        // universe in the selected term and goal to be resolved.
         let info = self
             .txn
             .env
