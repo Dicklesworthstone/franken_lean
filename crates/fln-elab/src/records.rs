@@ -150,6 +150,44 @@ impl Builder {
         }
         Ok(body)
     }
+
+    /// Match the kernel's consumeTypeAnnotations rule on generated telescope
+    /// locals. Keep source class/constructor annotations intact: instance search
+    /// reads them from the class declaration, not from its eliminator.
+    fn recursor_locals(&mut self, locals: &[LocalDecl]) -> Result<Vec<LocalDecl>, RecordError> {
+        let mut normalized = Vec::with_capacity(locals.len());
+        for local in locals {
+            let mut local = local.clone();
+            loop {
+                self.tick()?;
+                let mut head = &local.type_;
+                let mut arguments = Vec::new();
+                while let ExprNode::App { f, a } = head.node() {
+                    self.tick()?;
+                    arguments.push(a);
+                    head = f;
+                }
+                let ExprNode::Const { name, .. } = head.node() else {
+                    break;
+                };
+                if !name.parent().is_anonymous() {
+                    break;
+                }
+                let recognized = match name.leaf_view() {
+                    LeafView::Str("outParam" | "semiOutParam") => arguments.len() == 1,
+                    LeafView::Str("optParam" | "autoParam") => arguments.len() == 2,
+                    _ => false,
+                };
+                if !recognized {
+                    break;
+                }
+                // The spine was collected in reverse application order.
+                local.type_ = (*arguments.last().expect("recognized annotation has arguments")).clone();
+            }
+            normalized.push(local);
+        }
+        Ok(normalized)
+    }
 }
 pub(crate) fn fresh(
     used: &mut HashSet<FVarId>,
@@ -245,6 +283,8 @@ pub fn record_declarations(
         elim = Name::from_components([format!("u_{ordinal}").as_str()]);
         ordinal += 1;
     }
+    let rec_parameters = builder.recursor_locals(&spec.parameters)?;
+    let rec_fields = builder.recursor_locals(&spec.fields)?;
     let record_type = app(
         Expr::const_(spec.name.clone(), levels.clone()),
         spec.parameters.iter().map(fv),
@@ -262,7 +302,7 @@ pub fn record_declarations(
     )?;
     let motive = fresh(&mut used, "motive", motive_type, BinderInfo::Default);
     let minor_type = builder.close(
-        &spec.fields,
+        &rec_fields,
         Expr::app(fv(&motive), constructor),
         false,
         false,
@@ -276,12 +316,12 @@ pub fn record_declarations(
     )?;
     let rec_type = builder.close(std::slice::from_ref(&minor), rec_type, false, false)?;
     let rec_type = builder.close(std::slice::from_ref(&motive), rec_type, false, true)?;
-    let rec_type = builder.close(&spec.parameters, rec_type, false, true)?;
-    let rhs = app(fv(&minor), spec.fields.iter().map(fv));
-    let rhs = builder.close(&spec.fields, rhs, true, false)?;
+    let rec_type = builder.close(&rec_parameters, rec_type, false, true)?;
+    let rhs = app(fv(&minor), rec_fields.iter().map(fv));
+    let rhs = builder.close(&rec_fields, rhs, true, false)?;
     let rhs = builder.close(std::slice::from_ref(&minor), rhs, true, false)?;
     let rhs = builder.close(std::slice::from_ref(&motive), rhs, true, false)?;
-    let rhs = builder.close(&spec.parameters, rhs, true, false)?;
+    let rhs = builder.close(&rec_parameters, rhs, true, false)?;
     let ctor_type = builder.close(&spec.fields, record_type.clone(), false, false)?;
     let ctor_type = builder.close(&spec.parameters, ctor_type, false, true)?;
     let mut rec_levels = vec![elim];
@@ -430,4 +470,56 @@ pub(crate) fn constructor_field(
     }
     let position = usize::try_from(u64::from(constructor.num_params) + index).ok()?;
     arguments.get(arity.checked_sub(position + 1)?).cloned()
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+
+    fn unwrap(type_: Expr, remaining: usize) -> Result<Expr, RecordError> {
+        let mut used = HashSet::new();
+        let local = fresh(&mut used, "x", type_, BinderInfo::Default);
+        let normalized = Builder { remaining }.recursor_locals(&[local])?;
+        Ok(normalized[0].type_.clone())
+    }
+
+    #[test]
+    fn recursor_annotations_have_exact_root_names_and_arities() {
+        let sort = Expr::sort(Level::one());
+        for name in ["outParam", "semiOutParam", "optParam", "autoParam"] {
+            let head = Expr::const_(Name::from_components([name]), vec![]);
+            assert_eq!(unwrap(head.clone(), 100).unwrap(), head);
+            let one = Expr::app(head, sort.clone());
+            let is_unary = matches!(name, "outParam" | "semiOutParam");
+            assert_eq!(unwrap(one.clone(), 100).unwrap(), if is_unary { sort.clone() } else { one.clone() });
+            let two = Expr::app(one, sort.clone());
+            assert_eq!(unwrap(two.clone(), 100).unwrap(), if is_unary { two.clone() } else { sort.clone() });
+            let three = Expr::app(two, sort.clone());
+            assert_eq!(unwrap(three.clone(), 100).unwrap(), three);
+            let foreign = Expr::app(
+                Expr::const_(Name::from_components(["User", name]), vec![]),
+                sort.clone(),
+            );
+            assert_eq!(unwrap(foreign.clone(), 100).unwrap(), foreign);
+        }
+    }
+
+    #[test]
+    fn outer_annotation_chains_are_bounded_and_do_not_rewrite_nested_types() {
+        let sort = Expr::sort(Level::one());
+        let annotation = Expr::const_(Name::from_components(["outParam"]), vec![]);
+        let mut chain = sort.clone();
+        for _ in 0..64 {
+            chain = Expr::app(annotation.clone(), chain);
+        }
+        assert_eq!(unwrap(chain.clone(), 1000).unwrap(), sort);
+        assert_eq!(unwrap(chain, 4), Err(RecordError::ResourceLimit));
+        let nested = Expr::forall_e(
+            Name::anonymous(),
+            Expr::app(annotation, sort.clone()),
+            sort,
+            BinderInfo::Default,
+        );
+        assert_eq!(unwrap(nested.clone(), 100).unwrap(), nested);
+    }
 }
