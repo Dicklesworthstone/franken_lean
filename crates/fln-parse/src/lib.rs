@@ -23,6 +23,7 @@
 
 pub mod build;
 pub mod category;
+pub mod command_scope;
 pub mod macro_expand;
 pub mod macro_txn;
 pub mod pratt;
