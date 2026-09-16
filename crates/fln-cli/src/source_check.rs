@@ -96,7 +96,7 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
     let worker = std::thread::Builder::new().name("fln-source-check".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES).spawn(move || {
             let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES));
-            let engine = match fln::Engine::with_source_seed(admission) {
+            let engine = match fln::Engine::with_coercion_seed(admission) {
                 Ok(fln::Outcome::Complete(engine)) => engine,
                 Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source prelude could not complete", false, json, 3),
                 Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source prelude faulted", false, json, 4),
