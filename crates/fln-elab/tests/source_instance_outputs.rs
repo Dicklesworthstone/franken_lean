@@ -32,11 +32,13 @@ fn budget() -> Budget {
     Budget::for_stack_bytes(2 * 1024 * 1024)
 }
 fn publish(env: &Environment, declaration: Declaration) -> Environment {
+    let description = format!("{declaration:?}");
     let Outcome::Complete(admitted) = admit(env, declaration, budget()) else {
-        panic!("fixture admission must answer");
+        panic!("fixture admission must answer: {description}");
     };
-    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
-        panic!("fixture must be kernel accepted");
+    let checked = match convene(&Council::nobody_was_asked(), admitted) {
+        CouncilOutcome::Agreed(checked) => checked,
+        other => panic!("fixture must be kernel accepted: {description}\n{other:?}"),
     };
     match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
         Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
