@@ -93,7 +93,7 @@ fn newline(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
 fn delimiter_depth(token: &LexedToken, depth: &mut usize) {
     if let TokenKind::Symbol(s) = &token.kind {
         match s.as_str() {
-            "(" | "[" | "{" | "⦃" => *depth += 1,
+            "(" | "[" | "{" | ".{" | "⦃" => *depth += 1,
             ")" | "]" | "}" | "⦄" => *depth = depth.saturating_sub(1),
             _ => {}
         }
