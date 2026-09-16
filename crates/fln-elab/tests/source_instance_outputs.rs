@@ -11,10 +11,10 @@ use fln_elab::{LocalContext, check_definition_source};
 use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
 use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
 use fln_env::pmap::CollisionBudget;
+use fln_kernel::Declaration;
 use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::{Budget, Verdict};
-use fln_kernel::Declaration;
 
 fn n(value: &str) -> Name {
     Name::from_components(value.split('.'))
@@ -38,7 +38,7 @@ fn publish(env: &Environment, declaration: Declaration) -> Environment {
     };
     let checked = match convene(&Council::nobody_was_asked(), admitted) {
         CouncilOutcome::Agreed(checked) => checked,
-        other => panic!("fixture must be kernel accepted: {description}\n{other:?}"),
+        _ => panic!("fixture must be kernel accepted: {description}"),
     };
     match checked.publish(DeclarationBudget::default(), CollisionBudget::default(), None) {
         Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
@@ -154,7 +154,10 @@ fn fixture(mode: Option<&str>) -> Environment {
         || sort.clone(),
         |mode| {
             Expr::app(
-                Expr::const_(n(mode), vec![Level::succ(Level::one()).expect("fixed universe two")]),
+                Expr::const_(
+                    n(mode),
+                    vec![Level::succ(Level::one()).expect("fixed universe two")],
+                ),
                 sort.clone(),
             )
         },
@@ -163,7 +166,11 @@ fn fixture(mode: Option<&str>) -> Environment {
     for (name, output, priority) in [("low", "Other", 500), ("high", "Nat", 2000)] {
         env = publish(
             &env,
-            definition(name, transfer(c(output)), app(c("Transfer.mk"), [c("Nat"), c(output)])),
+            definition(
+                name,
+                transfer(c(output)),
+                app(c("Transfer.mk"), [c("Nat"), c(output)]),
+            ),
         );
         env = register_instance(&env, &n(name), priority).unwrap();
     }
@@ -175,6 +182,18 @@ fn fixture(mode: Option<&str>) -> Environment {
         &env,
         "def explicitProbe (b : Type) [dict : Transfer Nat b] (dummy : Nat) : Transfer Nat b := dict",
     )
+}
+fn needs_nat(env: &Environment) -> Environment {
+    let mut env = record(env, "Needs", vec![Expr::sort(Level::one())], true);
+    env = publish(
+        &env,
+        definition(
+            "needNat",
+            Expr::app(c("Needs"), c("Nat")),
+            Expr::app(c("Needs.mk"), c("Nat")),
+        ),
+    );
+    register_instance(&env, &n("needNat"), 1000).unwrap()
 }
 
 #[test]
@@ -244,7 +263,12 @@ fn failed_recursive_candidate_does_not_leak_output_assignments() {
         &env,
         definition(
             "doomed",
-            Expr::forall_e(n("missing"), c("Missing"), transfer(c("Other")), BinderInfo::InstImplicit),
+            Expr::forall_e(
+                n("missing"),
+                c("Missing"),
+                transfer(c("Other")),
+                BinderInfo::InstImplicit,
+            ),
             Expr::lam(
                 n("missing"),
                 c("Missing"),
@@ -262,13 +286,7 @@ fn failed_recursive_candidate_does_not_leak_output_assignments() {
 
 #[test]
 fn later_output_goal_unblocks_an_earlier_independent_goal() {
-    let mut env = fixture(Some("outParam"));
-    env = record(&env, "Needs", vec![Expr::sort(Level::one())], true);
-    env = publish(
-        &env,
-        definition("needNat", Expr::app(c("Needs"), c("Nat")), Expr::app(c("Needs.mk"), c("Nat"))),
-    );
-    env = register_instance(&env, &n("needNat"), 1000).unwrap();
+    let mut env = needs_nat(&fixture(Some("outParam")));
     env = source(
         &env,
         "def combined {b : Type} [need : Needs b] [give : Transfer Nat b] (dummy : Nat) : Needs b := need",
@@ -277,4 +295,49 @@ fn later_output_goal_unblocks_an_earlier_independent_goal() {
     assert_eq!(value.base.type_, Expr::app(c("Needs"), c("Nat")));
     assert!(has_constant(&value.value, "needNat"));
     assert!(has_constant(&value.value, "high"));
+}
+
+#[test]
+fn later_recursive_prerequisite_infers_an_earlier_prerequisites_input() {
+    let mut env = needs_nat(&fixture(Some("outParam")));
+    env = record(&env, "Root", vec![], true);
+    env = source(
+        &env,
+        "def buildRoot {b : Type} [need : Needs b] [give : Transfer Nat b] : Root := Root.mk",
+    );
+    env = register_instance(&env, &n("buildRoot"), 1000).unwrap();
+    env = source(&env, "def rootProbe [root : Root] (dummy : Nat) : Root := root");
+    let value = accepted("def recursive := rootProbe 0", &env);
+    assert_eq!(value.base.type_, c("Root"));
+    for name in ["buildRoot", "needNat", "high"] {
+        assert!(has_constant(&value.value, name), "missing {name}");
+    }
+}
+
+#[test]
+fn an_all_blocked_recursive_candidate_cannot_guess_an_input() {
+    let mut env = needs_nat(&fixture(Some("outParam")));
+    env = record(&env, "Root", vec![], true);
+    env = source(
+        &env,
+        "def blockedRoot {b : Type} [need : Needs b] : Root := Root.mk",
+    );
+    env = register_instance(&env, &n("blockedRoot"), 1000).unwrap();
+    env = source(&env, "def rootProbe [root : Root] (dummy : Nat) : Root := root");
+    assert!(check_definition_source(b"def stuck := rootProbe 0", &env, budget()).is_err());
+    assert!(has_constant(&accepted("def stillWorks := probe 0", &env).value, "high"));
+}
+
+#[test]
+fn recursive_output_cycles_do_not_evade_detection_with_fresh_holes() {
+    let mut env = fixture(Some("outParam"));
+    env = source(
+        &env,
+        "def looping {b : Type} [dict : Transfer Nat b] : Transfer Nat b := dict",
+    );
+    env = register_instance(&env, &n("looping"), 3000).unwrap();
+    let value = accepted("def recovered := probe 0", &env);
+    assert_eq!(value.base.type_, transfer(c("Nat")));
+    assert!(has_constant(&value.value, "high"));
+    assert!(!has_constant(&value.value, "looping"));
 }
