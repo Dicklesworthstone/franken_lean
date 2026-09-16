@@ -1,0 +1,172 @@
+//! File-level scope commands. The ordinary declaration parser remains the only
+//! declaration parser; this layer partitions original bytes without rewriting.
+use super::*;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeCommand {
+    Namespace(Name),
+    Section(Option<Name>),
+    End(Option<Name>),
+    Open(Vec<Name>),
+    Universe(Vec<Name>),
+    Trivia,
+}
+
+fn table() -> TokenTable {
+    let mut table = source_module_token_table();
+    for keyword in ["namespace", "section", "end", "open", "universe"] {
+        table.insert(keyword);
+    }
+    table
+}
+fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
+    let run = lex_run(view.normalized(), &table());
+    let diagnostics: Vec<_> = run
+        .diagnostics()
+        .into_iter()
+        .map(|(message, at)| ParseDiagnostic {
+            message,
+            at: view.to_original(at),
+        })
+        .collect();
+    if !diagnostics.is_empty() {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+    Ok(run
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Token(token) => Some(token),
+            _ => None,
+        })
+        .collect())
+}
+fn control(s: &str) -> bool {
+    matches!(s, "namespace" | "section" | "end" | "open" | "universe")
+}
+fn declaration(s: &str) -> bool {
+    matches!(
+        s,
+        "def" | "theorem" | "instance" | "structure" | "class" | "inductive" | "#check" | "#eval"
+    )
+}
+
+/// Recognize complete scope commands, including comments and escaped identifiers.
+/// Unsupported `open ... in`, selective opens, and modifiers are never ignored.
+pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view)?;
+    let Some(first) = tokens.first() else {
+        return Ok(Some(ScopeCommand::Trivia));
+    };
+    let TokenKind::Symbol(keyword) = &first.kind else {
+        return Ok(None);
+    };
+    if !control(keyword) {
+        return Ok(None);
+    }
+    let bad = |index: usize| NatDefinitionParseError::OutsideSeedGrammar {
+        at: tokens.get(index).map_or(BytePos(source.len()), |t| {
+            view.to_original(t.extent.start())
+        }),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    let mut names = Vec::new();
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        let TokenKind::Ident(name) = &token.kind else {
+            return Err(bad(index));
+        };
+        names.push(name.clone());
+    }
+    let command = match keyword.as_str() {
+        "namespace" if names.len() == 1 => ScopeCommand::Namespace(names.remove(0)),
+        "section" if names.len() <= 1 => ScopeCommand::Section(names.pop()),
+        "end" if names.len() <= 1 => ScopeCommand::End(names.pop()),
+        "open" if !names.is_empty() => ScopeCommand::Open(names),
+        "universe"
+            if !names.is_empty() && names.iter().all(|n| n.parent().is_anonymous()) =>
+        {
+            ScopeCommand::Universe(names)
+        }
+        _ => return Err(bad(1)),
+    };
+    Ok(Some(command))
+}
+
+/// Partition both scope commands and declarations, preserving every source byte.
+/// Delimiters protect nested terms and explicit universe argument lists; comments
+/// and strings are lexer events, not text searched for command-looking words.
+pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let tokens = tokens(&view)?;
+    let mut starts = Vec::new();
+    let mut depth = 0_usize;
+    for token in &tokens {
+        if let TokenKind::Symbol(symbol) = &token.kind {
+            if depth == 0 && (control(symbol) || declaration(symbol)) {
+                starts.push(view.to_original(token.extent.start()).0);
+            }
+            match symbol.as_str() {
+                "(" | "[" | "{" | ".{" | "⦃" => depth = depth.saturating_add(1),
+                ")" | "]" | "}" | "⦄" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    let mut output = Vec::new();
+    let mut start = 0;
+    for next in starts.into_iter().skip(1) {
+        output.push((BytePos(start), &source[start..next]));
+        start = next;
+    }
+    output.push((BytePos(start), &source[start..]));
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scopes_preserve_structural_names_and_original_offsets() {
+        let source = b"-- namespace Fake\r\nnamespace Real\r\n-- end Real\r\ndef x := \"end Real\"\r\nsection\r\nuniverse u v\r\nend\r\nend Real\r\n";
+        let commands = partition(source).unwrap();
+        assert_eq!(commands.len(), 6);
+        let mut joined = Vec::new();
+        for (offset, bytes) in &commands {
+            assert_eq!(*offset, BytePos(joined.len()));
+            joined.extend_from_slice(bytes);
+        }
+        assert_eq!(joined, source);
+        assert_eq!(
+            parse(commands[0].1).unwrap(),
+            Some(ScopeCommand::Namespace(Name::from_components(["Real"])))
+        );
+        assert_eq!(
+            parse("namespace «A.B»".as_bytes()).unwrap(),
+            Some(ScopeCommand::Namespace(Name::from_components(["A.B"])))
+        );
+        assert_eq!(parse(b"section").unwrap(), Some(ScopeCommand::Section(None)));
+        assert_eq!(
+            parse(b"/- only trivia -/").unwrap(),
+            Some(ScopeCommand::Trivia)
+        );
+    }
+    #[test]
+    fn malformed_scope_commands_are_not_partially_accepted() {
+        for source in [
+            "namespace", "namespace A B", "end A B", "section A B", "open", "open A (x)",
+            "universe A.u", "universe u, v", "end := 3",
+        ] {
+            assert!(parse(source.as_bytes()).is_err(), "{source}");
+        }
+        assert_eq!(parse(b"def value := 3").unwrap(), None);
+    }
+    #[test]
+    fn universe_commas_and_escaped_command_names_are_not_command_boundaries() {
+        let commands = partition("namespace A\ndef «end».{u,v} (x : Sort u) : Sort u := x\ndef q := f.{1,2} Nat\nend A".as_bytes()).unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(parse_definition(commands[1].1).is_ok());
+    }
+}
