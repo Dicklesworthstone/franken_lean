@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/fln-kernel-membership.yml'
       - 'crates/fln-kernel/src/admit_membership_tests.rs'
+      - 'crates/fln-kernel/tests/admission_laundering.rs'
   workflow_dispatch:
 permissions:
   contents: write
@@ -25,6 +26,7 @@ jobs:
           git rev-parse HEAD > target/membership-evidence/input-commit.txt
           python3 - <<'PY'
           from pathlib import Path
+          import subprocess
           p = Path('crates/fln-kernel/src/admit.rs')
           text = p.read_text()
           anchor = '    pub recursors: Vec<RecursorVal>,\n}\n'
@@ -33,8 +35,9 @@ jobs:
           if 'mod membership_tests;' not in text:
               text = text.replace(anchor, anchor + registration, 1)
           p.write_text(text)
+          paths = ['crates', 'tools', '.beads', '.cargo', '.github', 'examples', 'docs', 'scripts', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'SUITE.lock', 'COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md', 'IMPLEMENTATION_STATUS.md', 'AGENTS.md', 'KERNEL_CONTRACT.md']
+          subprocess.run(['tar', '-czf', 'target/membership-evidence/source.tar.gz', *[p for p in paths if Path(p).exists()]], check=True)
           PY
-          tar -czf target/membership-evidence/source.tar.gz crates .beads Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md IMPLEMENTATION_STATUS.md AGENTS.md KERNEL_CONTRACT.md
       - name: Install the repository Rust toolchain
         shell: bash
         run: |
@@ -51,19 +54,10 @@ jobs:
             exit 0
           fi
           set +e
-          cargo test --locked -p fln-kernel --lib membership_tests::orphan_constructor_cannot_inhabit_an_empty_proposition -- --exact --nocapture > target/membership-evidence/baseline.log 2>&1
+          cargo test --locked -p fln-kernel --lib admit::membership_tests::orphan_constructor_cannot_inhabit_an_empty_proposition -- --exact --nocapture > target/membership-evidence/baseline.log 2>&1
           status=$?
           set -e
           cat target/membership-evidence/baseline.log
-          # A filtered-out test or compilation failure is not a reproduction.
-          # Use the full module-qualified name if the shorter name matched none.
-          if grep -q '0 tests' target/membership-evidence/baseline.log; then
-            set +e
-            cargo test --locked -p fln-kernel --lib admit::membership_tests::orphan_constructor_cannot_inhabit_an_empty_proposition -- --exact --nocapture > target/membership-evidence/baseline.log 2>&1
-            status=$?
-            set -e
-            cat target/membership-evidence/baseline.log
-          fi
           test "$status" -ne 0
           grep -q 'test result: FAILED' target/membership-evidence/baseline.log
           grep -q 'Accepted' target/membership-evidence/baseline.log
@@ -76,10 +70,9 @@ jobs:
           p = Path('crates/fln-kernel/src/admit.rs')
           text = p.read_text()
           anchor = '        let lparams = first.base.level_params.clone();\n'
-          guard = '''        // Per-parent validation must cover EVERY supplied constructor before
-          // any declaration enters the scratch environment. Otherwise an orphan
-          // bypasses typing/positivity but is still published with the block.
-          // This also guards the nested translator's synthesized admission path.
+          guard = '''// Every supplied constructor must be checked before scratch publication.
+          // A foreign parent would bypass all per-parent typing/positivity checks.
+          // Engine construction also guards the nested synthesized-admission path.
           for ctor in &block.ctors {
               if !block.types.iter().any(|ind| ind.base.name == ctor.induct) {
                   return reject(
@@ -93,14 +86,13 @@ jobs:
               }
           }
           '''
-          # Restore the function-body indent after YAML's block de-indentation.
-          guard = '\n'.join(('        ' + line if i else line) for i, line in enumerate(guard.split('\n')))
+          guard = ''.join('        ' + line + '\n' for line in guard.splitlines())
           assert text.count(anchor) == 1
           if 'outside the inductive block' not in text:
               text = text.replace(anchor, guard + anchor, 1)
           p.write_text(text)
           PY
-          rustfmt --edition 2024 --config skip_children=true crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs
+          rustfmt --edition 2024 --config skip_children=true crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs crates/fln-kernel/tests/admission_laundering.rs
           git diff --check
       - name: Verify the production kernel and independent checker
         shell: bash
@@ -117,7 +109,7 @@ jobs:
           set -euo pipefail
           git config user.name 'FrankenLean implementation'
           git config user.email 'noreply@github.com'
-          git add -- crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs
+          git add -- crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs crates/fln-kernel/tests/admission_laundering.rs
           git diff --cached --binary > target/membership-evidence/verified.patch
           if ! git diff --cached --quiet; then
             git commit -m 'fix(kernel): reject constructors outside their admitted inductive block'
@@ -130,3 +122,17 @@ jobs:
           name: kernel-membership-${{ github.sha }}
           path: target/membership-evidence
           retention-days: 7
+      - name: Retain the pinned compiler for isolated source regression work
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysroot="$(rustc --print sysroot)"
+          mkdir -p target/compiler-export
+          tar -czf "$PWD/target/compiler-export/toolchain.tar.gz" -C "$sysroot" bin/cargo bin/rustc bin/rustfmt bin/cargo-fmt bin/clippy-driver bin/cargo-clippy lib/libLLVM.so.23.1-rust-1.100.0-nightly lib/librustc_driver-*.so lib/rustlib/x86_64-unknown-linux-gnu/lib
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: kernel-compiler-${{ github.sha }}
+          path: target/compiler-export
+          retention-days: 1
