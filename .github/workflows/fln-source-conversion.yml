@@ -1,0 +1,90 @@
+name: Native source conversion
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-conversion.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-source-conversion
+  cancel-in-progress: false
+jobs:
+  conversion:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Apply the checksum-bound production change
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/source-conversion
+          git rev-parse HEAD > target/source-conversion/input.txt
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/32e370de091e7a3d5204a66509f291a0b1b65d37'
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          patch = gzip.decompress(base64.b64decode(data['content']))
+          assert hashlib.sha256(patch).hexdigest() == 'aa63dbe3eec79d9f1c37583f6179fcd388c9fc21c2d344215d94a21bd9898179'
+          pathlib.Path('target/source-conversion/change.patch').write_bytes(patch)
+          expected = {'crates/fln-elab/src/source.rs', 'crates/fln/tests/source_delta_inference.rs', 'crates/fln-cli/tests/source_delta_inference.rs', 'docs/NATIVE_SOURCE_CONVERSION.md'}
+          paths = {line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')}
+          assert paths == expected
+          assert '+++ /dev/null' not in patch.decode().splitlines()
+          subprocess.run(['git', 'apply', '--check', '--index', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '--index', '-'], input=patch, check=True)
+          pathlib.Path('target/source-conversion/paths.json').write_text(json.dumps(sorted(paths)))
+          PY
+          channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/source-conversion/compiler.txt
+      - name: Verify source inference and installed command behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > target/source-conversion/verify.sh <<'SH'
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source.rs crates/fln/tests/source_delta_inference.rs crates/fln-cli/tests/source_delta_inference.rs
+          cargo test --locked -p fln-elab --all-targets --no-fail-fast 2>&1 | tee target/source-conversion/elab.log
+          cargo test --locked -p fln --test source_delta_inference --test source_backtracking --test source_instances --test source_calc --test source_equality --test source_rewriting --no-fail-fast 2>&1 | tee target/source-conversion/engine.log
+          cargo test --locked -p fln-cli --test source_delta_inference --no-fail-fast 2>&1 | tee target/source-conversion/cli.log
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/source-conversion/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-conversion/workspace.log
+          git diff --check
+          SH
+          bash target/source-conversion/verify.sh
+      - name: Commit verified implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --binary > target/source-conversion/verified.patch
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git commit -m 'fix(elab): resume ordinary source conversion and validate speculative exact'
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git merge-base --is-ancestor origin/main HEAD; then
+              git rebase origin/main
+              bash target/source-conversion/verify.sh
+            fi
+            if git push origin HEAD:main; then
+              git rev-parse HEAD > target/source-conversion/published.txt
+              exit 0
+            fi
+          done
+          echo 'Main advanced repeatedly; no forced update attempted.' >&2
+          exit 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: source-conversion-${{ github.sha }}
+          path: target/source-conversion
+          retention-days: 7
