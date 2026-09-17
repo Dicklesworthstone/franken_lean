@@ -1,0 +1,53 @@
+name: native source regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-core/**'
+      - 'crates/fln-syntax/**'
+      - 'crates/fln-parse/**'
+      - 'crates/fln-elab/**'
+      - '.github/workflows/native-source-regressions.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-source-regressions
+  cancel-in-progress: false
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retain the exact public source used by the regression run
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-source-${{ github.sha }}
+          path: ${{ runner.temp }}/native-source.tar.gz
+          retention-days: 2
+          if-no-files-found: error
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Parser and native elaborator tests
+        run: cargo test --locked -p fln-parse -p fln-elab -- --test-threads=1
+      - name: Check downstream workspace consumers
+        run: cargo check --locked --workspace --all-targets
