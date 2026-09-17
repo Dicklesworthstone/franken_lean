@@ -64,7 +64,7 @@ Simplification is progress, not unconditional proof completion. A non-reflexive 
 
 The source integration exposed two independent-checker conversion gaps, repaired in the checker rather than bypassing its veto. Reducible applications normalize before argument congruence, so discarded arguments cannot cause a false mismatch. Scoped let values now enter a private reduction overlay during body inference and are removed at scope exit; inferred local types remain the declared types. Original caller contexts are unchanged on success, cancellation, or failure. Kernel/checker implementations remain separate.
 
-## Rewriting and simplifying named hypotheses
+## Rewriting and simplifying named hypotheses and goals
 
 Named locations are supported by the same native parser, elaborator, and checker council:
 
@@ -78,9 +78,17 @@ Use `rewrite [h, ← k] at hx hy` to apply an ordered rule list to named hypothe
 `simp only [wrap, h, premise] at hx hy` to simplify their types using an explicit
 set. Quantified rules infer their parameters afresh for each hypothesis.
 Conditional `rewrite` rules leave real proof obligations; `simp only` must
-prove conditions with its selected evidence. Hypothesis simplification leaves
+prove conditions with its selected evidence. Hypothesis simplification without an explicit goal selector leaves
 the main goal for subsequent tactics, rather than treating a changed hypothesis
 as proof completion.
+
+An explicit goal marker `⊢` (or the adjacent ASCII spelling `|-`) includes the
+main goal: `rewrite [h] at hx ⊢` transforms `hx` first and then the goal with
+oppositely directed checked transports. Named hypotheses are processed first,
+regardless of where the goal marker appears in the list. `simp only [h] at hx ⊢`
+shares its productive-step limit across both locations and accepts genuine
+hypothesis progress even when the target is already simplified. Escaped names
+such as `«⊢»` remain hypothesis names, not goal selectors.
 
 Each changed hypothesis receives a fresh local identity and a checked transport
 from the old one. A dependent hypothesis or goal keeps referring to the original
@@ -95,11 +103,10 @@ the context and assignments without refunding consumed work.
 fln check-source --json examples/native_hypothesis_rewriting.lean
 ```
 
-The example includes six theorems and two definitions. Installed-binary tests
+The example includes nine theorems and two definitions. Installed-binary tests
 also check that a failing later file emits no partial success and does not alter
-source files or contaminate a subsequent check. Wildcard/goal location selectors,
-occurrence selectors, and full Lean simplifier semantics remain outside this
-bounded named-hypothesis increment.
+source files or contaminate a subsequent check. Wildcard locations (`at *`), occurrence selectors, and full Lean simplifier
+semantics remain outside this bounded explicit-location increment.
 
 ## APIs and limits
 
@@ -110,7 +117,7 @@ bounded named-hypothesis increment.
 Current boundaries are explicit:
 
 - `check-source` accepts import-free `def` and `theorem` files. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
-- Rewriting and simplification support goals and explicit named hypothesis locations (`at hx hy`). Quantified rules use the native bounded unifier, not general higher-order theorem search. Wildcard/goal location selectors, occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
+- Rewriting and simplification support goals and explicit named hypothesis locations (`at hx hy`). Quantified rules use the native bounded unifier, not general higher-order theorem search. Wildcard locations, occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
 - [Native instance synthesis](NATIVE_INSTANCES.md) now supports registered classes, local instances, named global instances and selected tactic-lemma arguments. Full Synod semantics, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier remain incomplete.
 
 ## Verification

@@ -38,3 +38,16 @@ theorem hypSimplify (R : Prop) (r : R) (x y : Nat) (h : R -> x = y)
 def hypCast (A B : Type) (h : A = B) (x : A) : B := by
   rewrite [h] at x
   exact x
+
+-- Explicit locations transform named hypotheses before the selected goal.
+theorem hypAndGoal (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P x := by
+  rewrite [h] at hx ⊢
+  exact hx
+
+-- Hypothesis progress counts even when the selected goal is already simplified.
+theorem hypGoalStable (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by
+  simp only [h] at hx |-
+  exact hx
+
+theorem hypExplicitGoal (x y : Nat) (h : x = y) : y = x := by
+  rw [← h] at ⊢

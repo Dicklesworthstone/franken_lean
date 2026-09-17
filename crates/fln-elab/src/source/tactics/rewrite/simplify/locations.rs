@@ -47,7 +47,7 @@ impl Context {
             return Ok(false);
         };
         let rules = self.simp_rules(args)?;
-        for name in &locations {
+        for name in &locations.hypotheses {
             self.tick()?;
             if initial.lctx.find_by_user_name(name).is_none() {
                 return Err(error(TacticError::RewriteLocation));
@@ -55,7 +55,7 @@ impl Context {
         }
         let mut goal = initial.clone();
         let mut steps = 0;
-        for name in locations {
+        for name in locations.hypotheses {
             self.txn.lctx = goal.lctx.clone();
             let local = goal
                 .lctx
@@ -102,6 +102,10 @@ impl Context {
                     break;
                 }
             }
+        }
+        if locations.target {
+            self.simplify_goal_with_rules(proof, goal, &rules, steps)?;
+            return Ok(true);
         }
         if steps == 0 {
             return Err(error(TacticError::SimplificationNoProgress));

@@ -44,8 +44,8 @@ fn installed_binary_checks_the_hypothesis_rewriting_example_without_artifacts() 
         "\"schema\":\"fln.source-check/1\"",
         "\"outcome\":\"complete\"",
         "\"authority\":true",
-        "\"commands\":8",
-        "\"theorems\":6",
+        "\"commands\":11",
+        "\"theorems\":9",
         "\"executed\":false",
     ] {
         assert!(json.contains(expected), "{json}");
