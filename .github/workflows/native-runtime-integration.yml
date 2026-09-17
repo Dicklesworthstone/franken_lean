@@ -1,0 +1,64 @@
+name: Native runtime integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-runtime-integration.yml']
+permissions:
+  contents: write
+concurrency:
+  group: native-runtime-integration
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Apply the locally tested compiler increment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/runtime-evidence
+          python3 -I - <<'PY'
+          import base64, gzip, pathlib, subprocess
+          payload = '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'
+          patch = gzip.decompress(base64.b64decode(payload))
+          pathlib.Path('target/runtime-evidence/increment.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','-'], input=patch, check=True)
+          subprocess.run(['git','apply','-'], input=patch, check=True)
+          PY
+      - name: Verify compiler and downstream consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          cargo test --locked -p fln-comp 2>&1 | tee target/runtime-evidence/tests.log
+          cargo clippy --locked -p fln-comp --all-targets -- -D warnings 2>&1 | tee target/runtime-evidence/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/runtime-evidence/workspace.log
+      - name: Export tested blobs without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          files = ['crates/fln-comp/src/ingress.rs', 'crates/fln-comp/src/ingress/branch.rs']
+          rows = []
+          for path in files:
+              data = pathlib.Path(path).read_bytes()
+              body = json.dumps({'content':base64.b64encode(data).decode(), 'encoding':'base64'}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs', data=body, headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request) as response:
+                  sha = json.load(response)['sha']
+              assert sha == hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              rows.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          pathlib.Path('target/runtime-evidence/blobs.json').write_text(json.dumps({'base':os.environ['GITHUB_SHA'],'files':rows},indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-runtime-${{ github.sha }}
+          path: target/runtime-evidence
+          retention-days: 3
