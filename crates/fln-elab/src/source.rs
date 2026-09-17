@@ -571,7 +571,7 @@ impl Context {
                         deferred,
                     ))))
                 } else {
-                    Ok(())
+                    Ok(());
                 };
             }
             // An explicit opaque proof hole can postpone an entire batch, even
@@ -1978,7 +1978,9 @@ fn definition_scoped(
             types.push(context.instantiate(&parameter.type_)?);
         }
         types.push(context.instantiate(expected)?);
-        context.require_resolved(&types)?;
+        // Universe holes may still be constrained by the body. Ordinary term
+        // holes and unresolved header instances must not cross this boundary.
+        context.require_resolved_terms(&types)?;
     }
     let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
     let (body, termination, where_clause) = if equations {
@@ -2036,6 +2038,12 @@ fn definition_scoped(
     if let Some(expected) = expected {
         term.type_ = expected;
     }
+    let mut universe_roots: Vec<_> = parameters
+        .iter()
+        .map(|parameter| parameter.type_.clone())
+        .collect();
+    universe_roots.extend([term.type_.clone(), term.value.clone()]);
+    context.generalize_declaration_universes(&universe_roots)?;
     let mut term = context.finish(term)?;
     term.value = eta_expand_nondependent(term.value, &term.type_)?;
     for local in parameters.into_iter().rev() {
