@@ -8479,6 +8479,7 @@ struct SourceSidecarPublication {
 
 struct SourceSuccess<'a> {
     commands: usize,
+    checked_admissions: usize,
     definitions: usize,
     evaluations: usize,
     evaluation_results: Vec<SourceEvaluationResult>,
@@ -8642,7 +8643,7 @@ fn render_source_success(
             emitted_olean_snapshot_json,
             json_string(result.base_root),
             json_string(result.result_root),
-            result.commands,
+            result.checked_admissions,
             json_string(result.checker_schema),
             json_string(result.checker_ground),
             result.steps,
@@ -8710,7 +8711,7 @@ fn render_source_success(
             emitted_olean_snapshot,
             result.base_root,
             result.result_root,
-            result.commands,
+            result.checked_admissions,
             result.checker_schema,
             result.checker_ground,
             result.steps,
@@ -8800,13 +8801,9 @@ fn render_lean_source_check_line(checked: &fln::SourceCheck) -> Result<String, M
 }
 
 fn source_uses_mixed_lean_commands(source: &[u8]) -> bool {
-    fln::partition_source_module(source).is_ok_and(|module| {
-        module.commands.is_empty()
-            || module.commands.iter().any(|(_, command)| {
-                fln::parse_source_command(command)
-                    .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
-            })
-    })
+    // Every source stream can include admission-only commands. Use the common
+    // adapter even without #check so a structure/theorem-only file is silent.
+    fln::partition_source_module(source).is_ok()
 }
 
 fn source_execution_exit_failure(
@@ -9479,7 +9476,34 @@ where
         }
         source_refs = ordered;
     }
-    let commands = completed.executions.len();
+    let Some(commands) = completed
+        .executions
+        .len()
+        .checked_add(completed.source_admissions.len())
+    else {
+        return source_failure(
+            "internal-fault",
+            "source command count overflowed",
+            false,
+            presentation,
+            4,
+        );
+    };
+    let Some(checked_admissions) = completed
+        .source_admissions
+        .iter()
+        .try_fold(completed.executions.len(), |total, command| {
+            total.checked_add(command.admission.admissions.len())
+        })
+    else {
+        return source_failure(
+            "internal-fault",
+            "source admission count overflowed",
+            false,
+            presentation,
+            4,
+        );
+    };
     let evaluations = completed.source_evaluation_indices.len();
     let Some(definitions) = commands.checked_sub(evaluations) else {
         return source_failure(
@@ -9492,11 +9516,11 @@ where
     };
     let Some(final_execution) = completed.executions.last() else {
         return source_failure(
-            "internal-fault",
-            "completed source batch contained no definition executions",
-            false,
+            "execution",
+            "source contains only declarations; use check-source when no execution is requested",
+            true,
             presentation,
-            4,
+            1,
         );
     };
     let Some(flbc_bytes) = completed
@@ -9593,10 +9617,16 @@ where
                 );
             }
         };
-        evaluation_results.push(SourceEvaluationResult {
-            command: index,
-            value,
-        });
+        let Some(&command) = completed.source_execution_command_indices.get(index) else {
+            return source_failure(
+                "internal-fault",
+                "source execution omitted its command index",
+                false,
+                presentation,
+                4,
+            );
+        };
+        evaluation_results.push(SourceEvaluationResult { command, value });
     }
     if matches!(presentation, SourcePresentation::Lean) {
         // Lean definitions are declarations, not requests to print or project
@@ -9608,7 +9638,18 @@ where
     }
     let base_root = completed.base_logical_root.to_string();
     let result_root = completed.result_logical_root.to_string();
-    let checker_ground = checker_ground_name(final_execution.checker.ground);
+    let final_checker = completed
+        .source_admissions
+        .last()
+        .filter(|admitted| {
+            completed
+                .source_execution_command_indices
+                .last()
+                .is_some_and(|index| admitted.command_index > *index)
+        })
+        .and_then(|command| command.admission.admissions.last())
+        .map_or(final_execution.checker, |admission| admission.checker);
+    let checker_ground = checker_ground_name(final_checker.ground);
     let fln::VmExit::Returned(returned) = &final_execution.exit else {
         return source_failure(
             "internal-fault",
@@ -9830,6 +9871,7 @@ where
     render_source_success(
         SourceSuccess {
             commands,
+            checked_admissions,
             definitions,
             evaluations,
             evaluation_results,
@@ -9838,7 +9880,7 @@ where
             flbc_bytes,
             base_root: &base_root,
             result_root: &result_root,
-            checker_schema: final_execution.checker.schema,
+            checker_schema: final_checker.schema,
             checker_ground,
             emitted_flbc,
             emitted_sidecar,

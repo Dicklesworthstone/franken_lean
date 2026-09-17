@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 pub mod source_check;
+mod source_execution;
 mod source_records;
 pub use source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 
@@ -1931,6 +1932,7 @@ struct PlannedSourceModuleExecution {
 
 struct SourceModuleVisibilitySubjects<'a> {
     execution_owners: &'a [usize],
+    command_owners: &'a [usize],
     completed: &'a DefinitionBatchExecution,
     check_owners: &'a [usize],
     checks: &'a [SourceCheck],
@@ -2000,79 +2002,7 @@ fn verify_source_module_visibility(
         }
     }
 
-    let mut declaration_owners = BTreeMap::new();
-    for (execution, &owner) in subjects
-        .completed
-        .executions
-        .iter()
-        .zip(subjects.execution_owners)
-    {
-        let Declaration::Defn(definition) = &execution.declaration else {
-            return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "source execution published a non-definition declaration",
-            });
-        };
-        if declaration_owners
-            .insert(definition.base.name.clone(), owner)
-            .is_some()
-        {
-            return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "source execution published a duplicate declaration name",
-            });
-        }
-    }
-
-    let mut presentations = 0_usize;
-    let declarations = subjects
-        .completed
-        .executions
-        .iter()
-        .zip(subjects.execution_owners)
-        .map(|(execution, owner)| (&execution.declaration, *owner))
-        .chain(
-            subjects
-                .checks
-                .iter()
-                .zip(subjects.check_owners)
-                .map(|(check, owner)| (&check.declaration, *owner)),
-        );
-    for (declaration, owner) in declarations {
-        let Declaration::Defn(definition) = declaration else {
-            return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "source execution or scratch check produced a non-definition declaration",
-            });
-        };
-        let mut references = BTreeSet::new();
-        for expression in [&definition.base.type_, &definition.value] {
-            collect_constant_references(expression, &mut references, &mut presentations, limit)
-                .map_err(|error| match error {
-                    ConstantReferenceCollectionError::PresentationLimit { observed, limit } => {
-                        EngineExecutionError::SourceDependencyPresentationLimit { observed, limit }
-                    }
-                    ConstantReferenceCollectionError::AllocationFailure { requested } => {
-                        EngineExecutionError::AllocationFailure {
-                            resource: "source declaration dependency worklist",
-                            requested,
-                        }
-                    }
-                })?;
-        }
-        for referenced in references {
-            let Some(&referenced_owner) = declaration_owners.get(&referenced) else {
-                continue;
-            };
-            let bit = 1_u64 << (referenced_owner % u64::BITS as usize);
-            if visible[owner * words + referenced_owner / u64::BITS as usize] & bit == 0 {
-                return Err(EngineExecutionError::SourceModuleVisibility {
-                    module: modules[owner].name.clone(),
-                    declaration: definition.base.name.clone(),
-                    referenced,
-                    owner: modules[referenced_owner].name.clone(),
-                });
-            }
-        }
-    }
-    Ok(())
+    source_execution::verify_declarations(modules, subjects, &visible, words, limit)
 }
 
 impl Engine {
@@ -3066,7 +2996,7 @@ impl Engine {
                 self.empty_source_command_execution(options),
             ));
         }
-        self.execute_source_command_stream(partitioned.commands, options, limits)
+        self.execute_source_command_stream(partitioned.commands, options, limits, true)
     }
 
     fn empty_source_command_execution(&self, options: &KVMap) -> SourceCommandBatchExecution {
@@ -3079,6 +3009,8 @@ impl Engine {
                 executions: Vec::new(),
                 source_module_order: Vec::new(),
                 source_evaluation_indices: Vec::new(),
+                source_admissions: Vec::new(),
+                source_execution_command_indices: Vec::new(),
             },
             command_count: 0,
             execution_command_indices: Vec::new(),
@@ -3092,6 +3024,7 @@ impl Engine {
         commands: Vec<(fln_parse::BytePos, &[u8])>,
         options: &KVMap,
         limits: EngineExecutionLimits,
+        allow_checks: bool,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -3134,6 +3067,13 @@ impl Engine {
                 requested: command_count,
             })?;
 
+        let mut source_admissions = Vec::new();
+        source_admissions
+            .try_reserve_exact(command_count)
+            .map_err(|_| EngineExecutionError::AllocationFailure {
+                resource: "source admission table",
+                requested: command_count,
+            })?;
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
         for (command_index, (original_offset, command_source)) in commands.into_iter().enumerate() {
@@ -3146,6 +3086,13 @@ impl Engine {
                     at: Some(original_offset),
                 })?;
             if parsed.kind() == fln_parse::SourceCommandKind::Check {
+                if !allow_checks {
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::StandaloneCheckRequired),
+                        at: Some(original_offset),
+                    });
+                }
                 let checked = match engine.check_parsed_source_command(
                     parsed,
                     options,
@@ -3172,6 +3119,28 @@ impl Engine {
                 outputs.push(SourceCommandOutput::Check {
                     command_index,
                     check_index,
+                });
+                continue;
+            }
+
+            if fln_elab::source::is_record(parsed.syntax())
+                || fln_elab::source::is_inductive(parsed.syntax())
+            {
+                let admission = match engine
+                    .admit_source_command(command_source, options, limits.admission())
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                engine = admission.engine.clone();
+                source_admissions.push(SourceCommandAdmission {
+                    command_index,
+                    admission,
                 });
                 continue;
             }
@@ -3219,6 +3188,25 @@ impl Engine {
                     });
                 }
             };
+            if matches!(declaration, Declaration::Thm(_)) {
+                let admission = match engine
+                    .admit_declarations(&[declaration], options, limits.admission())
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error.into()),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                engine = admission.engine.clone();
+                source_admissions.push(SourceCommandAdmission {
+                    command_index,
+                    admission,
+                });
+                continue;
+            }
             let execution = match engine.execute_definition(declaration, options, limits) {
                 Ok(Outcome::Complete(execution)) => execution,
                 Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
@@ -3246,6 +3234,14 @@ impl Engine {
             }
         }
 
+        let mut execution_indices = Vec::new();
+        execution_indices
+            .try_reserve_exact(execution_command_indices.len())
+            .map_err(|_| EngineExecutionError::AllocationFailure {
+                resource: "retained source execution index table",
+                requested: execution_command_indices.len(),
+            })?;
+        execution_indices.extend_from_slice(&execution_command_indices);
         let result_logical_root = engine.logical_root(options);
         Ok(Outcome::Complete(SourceCommandBatchExecution {
             batch: DefinitionBatchExecution {
@@ -3255,6 +3251,8 @@ impl Engine {
                 executions,
                 source_module_order: Vec::new(),
                 source_evaluation_indices: evaluation_indices,
+                source_admissions,
+                source_execution_command_indices: execution_indices,
             },
             command_count,
             execution_command_indices,
@@ -3475,7 +3473,7 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let query_index = completed.executions.len();
+        let query_index = completed.executions.len() + completed.source_admissions.len();
         let checked = completed
             .engine
             .check_source_command(query_source, options, limits.admission())
@@ -3488,11 +3486,12 @@ impl Engine {
             Outcome::Complete(check) => {
                 let mut completed = completed;
                 let source_module_order = std::mem::take(&mut completed.source_module_order);
-                let definition_prefix = if completed.executions.is_empty() {
-                    None
-                } else {
-                    Some(completed)
-                };
+                let definition_prefix =
+                    if completed.executions.is_empty() && completed.source_admissions.is_empty() {
+                        None
+                    } else {
+                        Some(completed)
+                    };
                 Outcome::Complete(TerminalSourceCheck {
                     definition_prefix,
                     source_module_order,
@@ -3612,6 +3611,7 @@ impl Engine {
                 entry_commands,
                 options,
                 limits,
+                true,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3619,7 +3619,9 @@ impl Engine {
             }
         };
         let source_module_order = std::mem::take(&mut dependency_prefix.source_module_order);
-        let dependency_prefix = if dependency_prefix.executions.is_empty() {
+        let dependency_prefix = if dependency_prefix.executions.is_empty()
+            && dependency_prefix.source_admissions.is_empty()
+        {
             None
         } else {
             Some(dependency_prefix)
@@ -3988,13 +3990,20 @@ impl Engine {
                     executions: Vec::new(),
                     source_module_order: module_order,
                     source_evaluation_indices: Vec::new(),
+                    source_admissions: Vec::new(),
+                    source_execution_command_indices: Vec::new(),
                 },
                 command_count,
                 execution_command_indices: policy.allow_scratch_checks().then(Vec::new),
             }));
         }
-        if policy.allow_scratch_checks() {
-            let mixed = match self.execute_source_command_stream(commands, options, limits)? {
+        {
+            let mixed = match self.execute_source_command_stream(
+                commands,
+                options,
+                limits,
+                policy.allow_scratch_checks(),
+            )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
                     return Ok(Outcome::Inconclusive(inconclusive));
@@ -4061,6 +4070,7 @@ impl Engine {
                 &order,
                 SourceModuleVisibilitySubjects {
                     execution_owners: &execution_owners,
+                    command_owners: &command_owners,
                     completed: &mixed.batch,
                     check_owners: &check_owners,
                     checks: &mixed.checks,
@@ -4074,35 +4084,11 @@ impl Engine {
                 ..
             } = mixed;
             batch.source_module_order = module_order;
-            return Ok(Outcome::Complete(PlannedSourceModuleExecution {
+            Ok(Outcome::Complete(PlannedSourceModuleExecution {
                 batch,
                 command_count,
                 execution_command_indices: Some(execution_command_indices),
-            }));
-        }
-        match self.execute_source_commands(commands, options, limits)? {
-            Outcome::Complete(mut completed) => {
-                verify_source_module_visibility(
-                    modules,
-                    &dependencies,
-                    &order,
-                    SourceModuleVisibilitySubjects {
-                        execution_owners: &command_owners,
-                        completed: &completed,
-                        check_owners: &[],
-                        checks: &[],
-                    },
-                    limits.source_modules.max_dependency_presentations,
-                )?;
-                completed.source_module_order = module_order;
-                Ok(Outcome::Complete(PlannedSourceModuleExecution {
-                    batch: completed,
-                    command_count,
-                    execution_command_indices: None,
-                }))
-            }
-            Outcome::Inconclusive(inconclusive) => Ok(Outcome::Inconclusive(inconclusive)),
-            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+            }))
         }
     }
 
@@ -4112,62 +4098,13 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        let command_count = commands.len();
-        let mut evaluation_indices = Vec::new();
-        let outcome = self.execute_batch(command_count, options, |engine, index| {
-            let (original_offset, source) = commands[index];
-            let parsed = fln_parse::parse_source_command(source)
-                .map_err(|error| error.with_original_offset(original_offset))
-                .map_err(DefinitionFrontendError::Parse)
-                .map_err(EngineExecutionError::Frontend)?;
-            let declaration = match parsed.kind() {
-                fln_parse::SourceCommandKind::Evaluation => {
-                    let requested = evaluation_indices.len().checked_add(1).ok_or(
-                        EngineExecutionError::AllocationFailure {
-                            resource: "source evaluation command index table",
-                            requested: usize::MAX,
-                        },
-                    )?;
-                    evaluation_indices.try_reserve(1).map_err(|_| {
-                        EngineExecutionError::AllocationFailure {
-                            resource: "source evaluation command index table",
-                            requested,
-                        }
-                    })?;
-                    evaluation_indices.push(index);
-                    let name = fresh_generated_command_name(engine.environment(), index)?;
-                    fln_elab::elaborate_evaluation_in_with_budget(
-                        parsed.syntax(),
-                        name,
-                        engine.environment(),
-                        limits.kernel,
-                    )
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?
-                }
-                fln_parse::SourceCommandKind::Definition => {
-                    fln_elab::elaborate_definition_in_with_budget(
-                        parsed.syntax(),
-                        engine.environment(),
-                        limits.kernel,
-                    )
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?
-                }
-                fln_parse::SourceCommandKind::Check => {
-                    return Err(EngineExecutionError::StandaloneCheckRequired);
-                }
-            };
-            engine.execute_definition(declaration, options, limits)
-        })?;
-        Ok(match outcome {
-            Outcome::Complete(mut completed) => {
-                completed.source_evaluation_indices = evaluation_indices;
-                Outcome::Complete(completed)
-            }
-            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-        })
+        Ok(
+            match self.execute_source_command_stream(commands, options, limits, false)? {
+                Outcome::Complete(completed) => Outcome::Complete(completed.batch),
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     /// Execute a nonempty sequence of already-elaborated definitions atomically.
@@ -4233,6 +4170,8 @@ impl Engine {
             executions,
             source_module_order: Vec::new(),
             source_evaluation_indices: Vec::new(),
+            source_admissions: Vec::new(),
+            source_execution_command_indices: Vec::new(),
         }))
     }
 
@@ -5920,6 +5859,19 @@ pub struct DefinitionBatchExecution {
     /// lowered through checked generated definitions. Empty for
     /// already-elaborated and definition-only batches.
     pub source_evaluation_indices: Vec<usize>,
+    /// Checked source commands that publish declarations but do not execute:
+    /// structures, inductives, and theorems. Includes every generated declaration.
+    pub source_admissions: Vec<SourceCommandAdmission>,
+    /// Original source command index for each execution, including gaps for
+    /// admission-only commands and scratch checks. Empty for raw declaration batches.
+    pub source_execution_command_indices: Vec<usize>,
+}
+
+/// One source command's complete, dual-checked admission without VM execution.
+#[derive(Debug)]
+pub struct SourceCommandAdmission {
+    pub command_index: usize,
+    pub admission: DeclarationBatchAdmission,
 }
 
 const SOURCE_RUN_EPOCH_ID: EpochId = EpochId::new(4_032_000);
