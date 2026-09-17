@@ -16,6 +16,7 @@ pub(super) struct Preparation<'a> {
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
     next_branch: usize,
+    next_local: u64,
 }
 
 enum Task {
@@ -52,6 +53,7 @@ impl<'a> Preparation<'a> {
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
             next_branch: 0,
+            next_local: 0,
         }
     }
 
@@ -147,6 +149,69 @@ impl<'a> Preparation<'a> {
             recursion: LambdaRecursion::NonRecursive,
         });
         Ok(())
+    }
+
+    /// Derive the compiler's local-closure metadata from a checked let type.
+    /// This runs after admission, and the ordinary FIR ingress still validates
+    /// captures, calls and ownership. Unsupported erasures remain refusals.
+    fn local_function(&mut self, value: &Expr, type_: &Expr) -> Result<Expr, IngressError> {
+        let ExprNode::Lam {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = value.node()
+        else {
+            return Ok(value.clone());
+        };
+        let definition = DefinitionVal {
+            base: fln_env::constants::ConstantVal {
+                name: Name::anonymous(),
+                level_params: Vec::new(),
+                type_: type_.clone(),
+            },
+            value: value.clone(),
+            hints: fln_env::constants::ReducibilityHints::Abbrev,
+            safety: fln_env::constants::DefinitionSafety::Safe,
+            all: Vec::new(),
+        };
+        let Some(signature) = executable_signature(
+            &definition,
+            &ExecutableValueTypes::bounded_source(),
+            &mut self.visited,
+            self.limits,
+            false,
+        )?
+        else {
+            return Ok(value.clone());
+        };
+        if signature.parameters.is_empty() {
+            return Ok(value.clone());
+        }
+        reserve(&mut self.lambdas, self.limits.max_lambda_bindings)?;
+        let id = self.next_local;
+        self.next_local = id
+            .checked_add(1)
+            .ok_or_else(|| unsupported("local closure identity"))?;
+        // Equal relative bodies at different sites may capture values of
+        // different types. Give metadata keys distinct deterministic identities
+        // without changing de Bruijn indices or lifting already prepared bodies.
+        let lambda = Expr::lam(
+            Name::num(name("_fln_runtime_local"), id),
+            binder_type.clone(),
+            body.clone(),
+            *binder_info,
+        );
+        let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
+        self.lambdas.push(LambdaBinding {
+            lambda: lambda.clone(),
+            parameters: signature.parameters,
+            parameter_ownership,
+            result: signature.result,
+            result_ownership: signature.result_ownership,
+            recursion: LambdaRecursion::NonRecursive,
+        });
+        Ok(lambda)
     }
 
     /// Explicit work frames preserve lexical scope, including branches nested
@@ -280,6 +345,7 @@ impl<'a> Preparation<'a> {
                 } => {
                     let body = pop(&mut values)?;
                     let value = pop(&mut values)?;
+                    let value = self.local_function(&value, &type_)?;
                     values.push(Expr::let_e(name, type_, value, body, nondep));
                 }
                 Task::Proj { name, index } => {
