@@ -3,6 +3,8 @@
 //! This never changes the declaration sent to either checker. Special forms
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
+mod nat;
+
 use super::*;
 use fln_comp::ingress::{BoolCaseBinding, CallableBindings};
 use std::collections::HashSet;
@@ -17,9 +19,15 @@ pub(super) struct Preparation<'a> {
     bool_recursor_checked: bool,
     next_branch: usize,
     next_local: u64,
+    next_nat: u64,
+    nat_family_checked: bool,
 }
 
 enum Task {
+    RecursiveLambda {
+        parameters: Vec<ValueType>,
+        result: ValueType,
+    },
     Visit(Expr),
     Apply(usize),
     Lam {
@@ -54,6 +62,8 @@ impl<'a> Preparation<'a> {
             bool_recursor_checked: false,
             next_branch: 0,
             next_local: 0,
+            next_nat: 0,
+            nat_family_checked: false,
         }
     }
 
@@ -259,6 +269,45 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(args[3].clone()));
                             continue;
                         }
+                        if matches!(head.node(), ExprNode::Const { name: n, levels }
+                            if n == &name("Nat.rec") && levels.len() == 1)
+                            && args.len() >= 4
+                        {
+                            let recursion = self.nat_recursion(&args)?;
+                            let required = args.len().saturating_add(1);
+                            if tasks.len().saturating_add(required) > limit {
+                                return Err(IngressError::ResourceLimit {
+                                    resource: IngressResource::PendingTasks,
+                                    limit,
+                                    observed: tasks.len().saturating_add(required),
+                                });
+                            }
+                            tasks.try_reserve(required).map_err(|_| {
+                                IngressError::AllocationFailure {
+                                    resource: IngressResource::PendingTasks,
+                                    requested: tasks.len().saturating_add(required),
+                                }
+                            })?;
+                            tasks.push(Task::Apply(args.len() - 3));
+                            tasks.extend(args[3..].iter().rev().cloned().map(Task::Visit));
+                            tasks.push(Task::RecursiveLambda {
+                                parameters: recursion.parameters,
+                                result: recursion.result,
+                            });
+                            tasks.push(Task::Visit(recursion.lambda));
+                            continue;
+                        }
+                        if matches!(head.node(), ExprNode::Const { name: n, levels }
+                            if n == &name("Nat.succ") && levels.is_empty())
+                            && args.len() == 1
+                        {
+                            self.check_nat_family()?;
+                            tasks.push(Task::Visit(Expr::app(
+                                Expr::app(Expr::const_(name("Nat.add"), vec![]), args[0].clone()),
+                                nat::literal(1),
+                            )));
+                            continue;
+                        }
                         let required = args.len().saturating_add(2);
                         if tasks.len().saturating_add(required) > limit {
                             return Err(IngressError::ResourceLimit {
@@ -279,6 +328,12 @@ impl<'a> Preparation<'a> {
                         continue;
                     }
                     match expr.node() {
+                        ExprNode::Const { name: n, levels }
+                            if n == &name("Nat.zero") && levels.is_empty() =>
+                        {
+                            self.check_nat_family()?;
+                            values.push(nat::literal(0));
+                        }
                         ExprNode::Lam {
                             binder_name,
                             binder_type,
@@ -321,6 +376,10 @@ impl<'a> Preparation<'a> {
                         }
                         _ => values.push(expr.clone()),
                     }
+                }
+                Task::RecursiveLambda { parameters, result } => {
+                    let lambda = pop(&mut values)?;
+                    values.push(self.register_recursion(lambda, parameters, result)?);
                 }
                 Task::Apply(count) => {
                     let start = values
