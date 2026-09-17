@@ -1,0 +1,78 @@
+name: Native runtime integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-runtime-integration.yml']
+permissions:
+  contents: write
+concurrency:
+  group: native-runtime-integration
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Apply exact locally tested decision runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/runtime-evidence
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          chunks = ['9d63797cefbc0c8f0d448dcab92fe5625a82f11e', '734bab81de70abc094e94afd2a5f189ceaa6f822', '9ce83ff8dec1817e69f2ec2b64da50f73bf9bc9b', 'ce1c5702f90a334917048614b33ae5f33123f496']
+          payload = bytearray()
+          for sha in chunks:
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha, headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request) as response:
+                  blob = json.load(response)
+              data = base64.b64decode(blob['content'])
+              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == sha
+              payload.extend(data)
+          patch = gzip.decompress(base64.b64decode(payload))
+          assert hashlib.sha256(patch).hexdigest() == '9b61fd3f7355d7fbd266ec5162b448d9b137d62192d6902c8bdb2d58d7d2b96c'
+          pathlib.Path('target/runtime-evidence/increment.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','-'], input=patch, check=True)
+          subprocess.run(['git','apply','-'], input=patch, check=True)
+          PY
+      - name: Verify native decisions and their consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          cargo test --locked -p fln-elab 2>&1 | tee target/runtime-evidence/elab.log
+          cargo test --locked -p fln --lib 2>&1 | tee target/runtime-evidence/engine-library.log
+          cargo test --locked -p fln --test runtime_decisions --test runtime_conditionals --test source_decisions --test source_decision_tactics --test source_equality_decisions --test source_generic_decisions --test source_logic --test source_matching 2>&1 | tee target/runtime-evidence/decisions.log
+          cargo test --locked -p fln-cli --test runtime_conditionals --test runtime_decisions 2>&1 | tee target/runtime-evidence/cli.log
+          cargo clippy --locked -p fln -p fln-elab -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/runtime-evidence/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/runtime-evidence/workspace.log
+      - name: Export tested immutable blobs without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          files = ['crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/matching.rs', 'crates/fln/src/runtime.rs', 'crates/fln/src/runtime/decision.rs', 'crates/fln/tests/runtime_decisions.rs', 'crates/fln-cli/tests/runtime_decisions.rs', 'examples/native_runtime_decisions.lean']
+          rows = []
+          for path in files:
+              data = pathlib.Path(path).read_bytes()
+              body = json.dumps({'content':base64.b64encode(data).decode(), 'encoding':'base64'}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs', data=body, headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request) as response:
+                  sha = json.load(response)['sha']
+              assert sha == hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              rows.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          pathlib.Path('target/runtime-evidence/blobs.json').write_text(json.dumps({'base':os.environ['GITHUB_SHA'],'files':rows},indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-runtime-${{ github.sha }}
+          path: target/runtime-evidence
+          retention-days: 3

@@ -26,7 +26,9 @@ mod reduce;
 mod tactics;
 
 use super::*;
-use crate::constraint::unify::{UnificationBudget, UnificationError, UnificationTransparency};
+use crate::constraint::unify::{
+    UnificationBudget, UnificationDeferred, UnificationError, UnificationTransparency,
+};
 use fln_core::expr::{FVarId, MVarId};
 use fln_core::level::{LMVarId, Level};
 use fln_core::options::KVMap;
@@ -503,6 +505,34 @@ impl Context {
         self.flush(false)
     }
 
+    /// Keep the abbreviation-only solution when it succeeds: eagerly unfolding
+    /// named types can change later instance selection. Only ordinary typing
+    /// equations that defer receive a second, safe-definition conversion pass.
+    /// Both attempts use the transactional solver and retain their spent work;
+    /// resource failures and selection queries never take this fallback.
+    fn unify_source_batch(
+        &mut self,
+        pairs: &[(Expr, Expr)],
+        allow_delta: bool,
+    ) -> Result<(), UnificationError> {
+        let mut result =
+            self.txn
+                .unify_many_with(pairs, UnificationBudget::new(self.kernel), &|| false);
+        if allow_delta
+            && matches!(
+                &result,
+                Err(UnificationError::Deferred(
+                    UnificationDeferred::UnsupportedEquation | UnificationDeferred::NotAPattern
+                ))
+            )
+        {
+            let mut budget = UnificationBudget::new(self.kernel);
+            budget.transparency = UnificationTransparency::SafeDefinitions;
+            result = self.txn.unify_many_with(pairs, budget, &|| false);
+        }
+        result.map(|report| assert!(report.awakened.is_empty(), "private source queue"))
+    }
+
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
         loop {
             if self.equations.is_empty() {
@@ -514,21 +544,20 @@ impl Context {
                 self.tick()?;
                 pairs.push(self.equations[index].sides.clone());
             }
-            let deferred =
-                match self
-                    .txn
-                    .unify_many_with(&pairs, UnificationBudget::new(self.kernel), &|| false)
-                {
-                    Ok(report) => {
-                        assert!(report.awakened.is_empty(), "private source queue");
-                        self.equations.clear();
-                        return Ok(());
-                    }
-                    Err(error @ UnificationError::Deferred(_)) => error,
-                    Err(error) => {
-                        return Err(failure(SourceInferenceError::Unification(Box::new(error))));
-                    }
-                };
+            let allow_delta = self
+                .equations
+                .iter()
+                .all(|equation| equation.policy == EquationPolicy::FinalAdmission);
+            let deferred = match self.unify_source_batch(&pairs, allow_delta) {
+                Ok(()) => {
+                    self.equations.clear();
+                    return Ok(());
+                }
+                Err(error @ UnificationError::Deferred(_)) => error,
+                Err(error) => {
+                    return Err(failure(SourceInferenceError::Unification(Box::new(error))));
+                }
+            };
             // A failed selection query is a nonmatch, not a reason to replay
             // all of its rigid subequations. Keep the original atomic matcher
             // and its work cost; only ordinary source inference is resumed.
@@ -568,11 +597,11 @@ impl Context {
                     // are obligations of the final ordinary K1 declaration.
                     continue;
                 }
-                match self
-                    .txn
-                    .unify(&left, &right, UnificationBudget::new(self.kernel))
-                {
-                    Ok(report) => assert!(report.awakened.is_empty(), "private source queue"),
+                match self.unify_source_batch(
+                    &[(left.clone(), right.clone())],
+                    equation.policy == EquationPolicy::FinalAdmission,
+                ) {
+                    Ok(()) => {}
                     Err(UnificationError::Deferred(_)) => {
                         equation.sides = (left, right);
                         self.equations.push(equation);
@@ -1038,6 +1067,15 @@ impl Context {
                                     ));
                                     continue;
                                 }
+                                if kind == &Name::str(Name::anonymous(), "term¬_") {
+                                    let parts =
+                                        expect_node(syntax, kind, 2, "propositional negation")?;
+                                    expect_atom(&parts[0], "¬", "negation prefix")?;
+                                    let function =
+                                        self.constant(&Name::from_components(["Not"]))?;
+                                    tasks.push(Task::Apply(function, &parts[1..], expected));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "app"]) {
                                     let parts = expect_node(syntax, kind, 2, "application")?;
                                     let arguments =
@@ -1340,6 +1378,28 @@ impl Context {
                             if let Some(instance_start) = instance_start {
                                 self.apply_proof_term(&mut proof, goal, term, instance_start)?;
                             } else {
+                                // A speculative `exact` must not select an alternative
+                                // merely because its implicit arguments deferred. On
+                                // a fixed goal, validate its candidate before dropping
+                                // the checkpoint so a bad `exact rfl` can fall back.
+                                let target = self.instantiate(&goal.target)?;
+                                if self.attempt_depth != 0
+                                    && !target.has_expr_mvar()
+                                    && !target.has_level_mvar()
+                                {
+                                    let check = self.hole(target)?;
+                                    let value = self.instantiate(&term.value)?;
+                                    let mut budget = UnificationBudget::new(self.kernel);
+                                    budget.transparency = UnificationTransparency::SafeDefinitions;
+                                    let report = self.txn.unify(&check, &value, budget).map_err(
+                                        |reason| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                reason,
+                                            )))
+                                        },
+                                    )?;
+                                    assert!(report.awakened.is_empty(), "private source queue");
+                                }
                                 self.close_proof_goal(goal, term.value)?;
                             }
                             tasks.push(Task::Proof(proof));

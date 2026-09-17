@@ -1,4 +1,4 @@
-name: Native source conversion
+name: Native source proof integration
 on:
   push:
     branches: [main]
@@ -8,83 +8,158 @@ permissions:
   contents: write
 concurrency:
   group: fln-source-conversion
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
-  conversion:
+  source:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      RUST_TEST_THREADS: '2'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: main
           fetch-depth: 0
-      - name: Apply the checksum-bound production change
+      - name: Prepare checksum-bound independent implementation increments
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/source-conversion
-          git rev-parse HEAD > target/source-conversion/input.txt
+          mkdir -p target/source-proof-integration
+          git rev-parse HEAD > target/source-proof-integration/input.txt
           python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          url = 'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/32e370de091e7a3d5204a66509f291a0b1b65d37'
-          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              data = json.load(response)
-          patch = gzip.decompress(base64.b64decode(data['content']))
-          assert hashlib.sha256(patch).hexdigest() == 'aa63dbe3eec79d9f1c37583f6179fcd388c9fc21c2d344215d94a21bd9898179'
-          pathlib.Path('target/source-conversion/change.patch').write_bytes(patch)
-          expected = {'crates/fln-elab/src/source.rs', 'crates/fln/tests/source_delta_inference.rs', 'crates/fln-cli/tests/source_delta_inference.rs', 'docs/NATIVE_SOURCE_CONVERSION.md'}
-          paths = {line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')}
-          assert paths == expected
-          assert '+++ /dev/null' not in patch.decode().splitlines()
-          subprocess.run(['git', 'apply', '--check', '--index', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '--index', '-'], input=patch, check=True)
-          pathlib.Path('target/source-conversion/paths.json').write_text(json.dumps(sorted(paths)))
+          import base64, gzip, hashlib, json, os, pathlib, urllib.request
+          root = pathlib.Path('target/source-proof-integration')
+          stages = {
+            'conversion': {
+              'blobs': ['32e370de091e7a3d5204a66509f291a0b1b65d37'],
+              'sha256': 'aa63dbe3eec79d9f1c37583f6179fcd388c9fc21c2d344215d94a21bd9898179',
+              'message': 'fix(elab): resume ordinary source conversion and validate speculative exact',
+              'paths': ['crates/fln-elab/src/source.rs', 'crates/fln/tests/source_delta_inference.rs', 'crates/fln-cli/tests/source_delta_inference.rs', 'docs/NATIVE_SOURCE_CONVERSION.md'],
+            },
+            'parser': {
+              'blobs': ['34b1ba7a4bd7adc91ab9324a7258bb63824ad618'],
+              'sha256': '79443d15e9129e798b3edd6574d22378f685d4f7addcf3509e24d9a548283a5b',
+              'message': 'fix(parse): bound proof reentry stack frames without relaxing limits',
+              'paths': ['crates/fln-parse/src/lib.rs', 'crates/fln-parse/tests/source_stack.rs'],
+            },
+            'simp': {
+              'blobs': ['d4848fcf3b6e9c8621cb59f159cacbcd8bd915b5', '413dc56461ccc035395727fe0324cd143d533443', '40f6542e5585852cddcc56b4f007d4d8813ed10f'],
+              'sha256': 'b58b9984648b442218e32a69a6073968c91308888ff77f64ed726786fe1e35ae',
+              'message': 'feat(elab): drive native simp from scoped checked declaration sets',
+              'paths': ['crates/fln-cli/tests/source_simp_attributes.rs', 'crates/fln-elab/src/lib.rs', 'crates/fln-elab/src/simp_sets.rs', 'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/scope.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify/sets.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify/unfold.rs', 'crates/fln-parse/src/command_scope.rs', 'crates/fln-parse/src/command_scope/simp.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln/src/lib.rs', 'crates/fln/src/source_check.rs', 'crates/fln/src/source_records.rs', 'crates/fln/src/source_simp.rs', 'crates/fln/tests/source_simp_attributes.rs', 'docs/NATIVE_SIMP_SETS.md', 'examples/native_simp_attributes.lean'],
+            },
+          }
+          for name, stage in stages.items():
+              data = bytearray()
+              for sha in stage['blobs']:
+                  request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'User-Agent': 'FrankenLean-source-integration'})
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      blob = json.load(response)
+                  decoded = base64.b64decode(blob['content'])
+                  assert hashlib.sha1(b'blob ' + str(len(decoded)).encode() + b'\0' + decoded).hexdigest() == sha
+                  data.extend(decoded)
+              patch = gzip.decompress(data)
+              assert hashlib.sha256(patch).hexdigest() == stage['sha256'], name
+              rows = patch.decode().splitlines()
+              assert {r[6:] for r in rows if r.startswith('+++ b/')} == set(stage['paths']), name
+              assert '+++ /dev/null' not in rows
+              (root / (name + '.patch')).write_bytes(patch)
+          (root / 'stages.json').write_text(json.dumps(stages, indent=2))
           PY
           channel="$(python3 -I -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
-          rustc -Vv > target/source-conversion/compiler.txt
-      - name: Verify source inference and installed command behavior
-        shell: bash
-        run: |
+          rustc -Vv > target/source-proof-integration/compiler.txt
+          cat > target/source-proof-integration/verify.sh <<'SH'
           set -euo pipefail
-          cat > target/source-conversion/verify.sh <<'SH'
-          set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source.rs crates/fln/tests/source_delta_inference.rs crates/fln-cli/tests/source_delta_inference.rs
-          cargo test --locked -p fln-elab --all-targets --no-fail-fast 2>&1 | tee target/source-conversion/elab.log
-          cargo test --locked -p fln --test source_delta_inference --test source_backtracking --test source_instances --test source_calc --test source_equality --test source_rewriting --no-fail-fast 2>&1 | tee target/source-conversion/engine.log
-          cargo test --locked -p fln-cli --test source_delta_inference --no-fail-fast 2>&1 | tee target/source-conversion/cli.log
-          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/source-conversion/clippy.log
-          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-conversion/workspace.log
+          stage="$1"
+          directory="target/source-proof-integration/$stage"
+          mkdir -p "$directory"
+          python3 -I - "$stage" <<'PY'
+          import json, pathlib, subprocess, sys
+          stage = json.loads(pathlib.Path('target/source-proof-integration/stages.json').read_text())[sys.argv[1]]
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *[p for p in stage['paths'] if p.endswith('.rs')]], check=True)
+          PY
+          case "$stage" in
+            conversion)
+              cargo test --locked -p fln-elab --all-targets --no-fail-fast 2>&1 | tee "$directory/elab.log"
+              cargo test --locked -p fln --test source_delta_inference --test source_backtracking --test source_instances --test source_calc --test source_equality --test source_rewriting --no-fail-fast 2>&1 | tee "$directory/engine.log"
+              cargo test --locked -p fln-cli --test source_delta_inference --no-fail-fast 2>&1 | tee "$directory/cli.log"
+              cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee "$directory/clippy.log"
+              ;;
+            parser)
+              cargo test --locked -p fln-parse --all-targets --no-fail-fast 2>&1 | tee "$directory/parser.log"
+              cargo clippy --locked -p fln-parse --all-targets -- -D warnings 2>&1 | tee "$directory/clippy.log"
+              ;;
+            simp)
+              cargo test --locked -p fln-parse -p fln-elab --all-targets --no-fail-fast 2>&1 | tee "$directory/frontends.log"
+              cargo test --locked -p fln --test source_simp_attributes --test source_simp_locations --test source_goal_locations --test source_delta_inference --test source_calc --test source_backtracking --test source_instances --test source_rewriting --test source_equality --test source_scopes --no-fail-fast 2>&1 | tee "$directory/engine.log"
+              cargo test --locked -p fln-cli --test source_simp_attributes --test source_delta_inference --test source_hypothesis_rewriting --no-fail-fast 2>&1 | tee "$directory/cli.log"
+              cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee "$directory/clippy.log"
+              ;;
+            *) exit 2;;
+          esac
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$directory/workspace.log"
           git diff --check
           SH
-          bash target/source-conversion/verify.sh
-      - name: Commit verified implementation directly to main
-        shell: bash
-        run: |
+          cat > target/source-proof-integration/land.sh <<'SH'
           set -euo pipefail
+          stage="$1"
+          root=target/source-proof-integration
+          mkdir -p "$root/$stage"
           git diff --exit-code
-          git diff --cached --binary > target/source-conversion/verified.patch
+          git diff --cached --exit-code
+          git fetch origin main
+          git merge --ff-only origin/main
+          git rev-parse HEAD > "$root/$stage/input.txt"
+          if git apply --reverse --check "$root/$stage.patch" 2>/dev/null; then
+            echo 'Exact increment is already present; no new commit.' > "$root/$stage/already-present.txt"
+            bash "$root/verify.sh" "$stage"
+            git rev-parse HEAD > "$root/$stage/published.txt"
+            exit 0
+          fi
+          git apply --check --index "$root/$stage.patch"
+          git apply --index "$root/$stage.patch"
+          python3 -I - "$stage" <<'PY'
+          import json, pathlib, subprocess, sys
+          row = json.loads(pathlib.Path('target/source-proof-integration/stages.json').read_text())[sys.argv[1]]
+          changed = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert changed == set(row['paths']), changed
+          PY
+          bash "$root/verify.sh" "$stage"
+          git diff --exit-code
+          git diff --cached --binary > "$root/$stage/verified.patch"
+          message="$(python3 -I -c 'import json,sys; print(json.load(open("target/source-proof-integration/stages.json"))[sys.argv[1]]["message"])' "$stage")"
           git config user.name 'FrankenLean implementation'
           git config user.email 'noreply@github.com'
-          git commit -m 'fix(elab): resume ordinary source conversion and validate speculative exact'
+          git commit -m "$message"
           for attempt in 1 2 3; do
             git fetch origin main
             if ! git merge-base --is-ancestor origin/main HEAD; then
               git rebase origin/main
-              bash target/source-conversion/verify.sh
+              bash "$root/verify.sh" "$stage"
             fi
             if git push origin HEAD:main; then
-              git rev-parse HEAD > target/source-conversion/published.txt
+              git rev-parse HEAD > "$root/$stage/published.txt"
               exit 0
             fi
           done
           echo 'Main advanced repeatedly; no forced update attempted.' >&2
           exit 1
+          SH
+      - name: Verify and commit ordinary conversion
+        shell: bash
+        run: bash target/source-proof-integration/land.sh conversion
+      - name: Verify and commit bounded parser reentry
+        shell: bash
+        run: bash target/source-proof-integration/land.sh parser
+      - name: Verify and commit registered native simp sets
+        shell: bash
+        run: bash target/source-proof-integration/land.sh simp
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: source-conversion-${{ github.sha }}
-          path: target/source-conversion
+          name: source-proof-integration-${{ github.sha }}
+          path: target/source-proof-integration
           retention-days: 7

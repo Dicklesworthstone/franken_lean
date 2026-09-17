@@ -266,6 +266,7 @@ struct BoundedTermFrame {
     open: Option<usize>,
     lambda: Option<LambdaTokens>,
     quantifier: Option<QuantifierTokens>,
+    negation: Option<usize>,
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
     operators: Vec<BoundedInfixToken>,
@@ -274,6 +275,12 @@ struct BoundedTermFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedInfix {
     Arrow,
+    And,
+    AndAscii,
+    Or,
+    OrAscii,
+    Iff,
+    IffAscii,
     Equality,
     ScalarBeq,
     NatLor,
@@ -296,6 +303,12 @@ impl BoundedInfix {
     const fn symbol(self) -> &'static str {
         match self {
             Self::Arrow => "->",
+            Self::And => "∧",
+            Self::AndAscii => "/\\",
+            Self::Or => "∨",
+            Self::OrAscii => "\\/",
+            Self::Iff => "↔",
+            Self::IffAscii => "<->",
             Self::Equality => "=",
             Self::ScalarBeq => "==",
             Self::NatLor => "|||",
@@ -317,6 +330,9 @@ impl BoundedInfix {
     const fn precedence(self) -> u8 {
         match self {
             Self::Arrow => 25,
+            Self::And | Self::AndAscii => 35,
+            Self::Or | Self::OrAscii => 30,
+            Self::Iff | Self::IffAscii => 20,
             Self::ScalarBeq | Self::Equality => 50,
             Self::NatLor => 55,
             Self::NatXor => 58,
@@ -330,11 +346,17 @@ impl BoundedInfix {
     }
 
     const fn is_right_associative(self) -> bool {
-        matches!(self, Self::NatPow | Self::Arrow)
+        matches!(
+            self,
+            Self::NatPow | Self::Arrow | Self::And | Self::AndAscii | Self::Or | Self::OrAscii
+        )
     }
 
     const fn is_non_associative(self) -> bool {
-        matches!(self, Self::ScalarBeq | Self::Equality)
+        matches!(
+            self,
+            Self::ScalarBeq | Self::Equality | Self::Iff | Self::IffAscii
+        )
     }
 
     fn syntax_kind(self) -> Name {
@@ -543,6 +565,13 @@ fn nat_definition_token_table() -> TokenTable {
         "⦄",
         "->",
         "→",
+        "∧",
+        "/\\",
+        "∨",
+        "\\/",
+        "↔",
+        "<->",
+        "¬",
         "fun",
         "λ",
         "forall",
@@ -620,6 +649,13 @@ fn source_module_token_table() -> TokenTable {
         "⦄",
         "->",
         "→",
+        "∧",
+        "/\\",
+        "∨",
+        "\\/",
+        "↔",
+        "<->",
+        "¬",
         "fun",
         "λ",
         "forall",
@@ -648,6 +684,12 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
     };
     match symbol.as_str() {
         "->" | "→" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Arrow),
+        "∧" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::And),
+        "/\\" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::AndAscii),
+        "∨" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Or),
+        "\\/" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::OrAscii),
+        "↔" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Iff),
+        "<->" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::IffAscii),
         "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),
         "=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equality),
         "|||" => Some(BoundedInfix::NatLor),
@@ -1084,8 +1126,33 @@ fn hygienic_lparen(lparen: Syntax) -> Syntax {
     )
 }
 
-/// Fold lambda bodies at their enclosing parenthesis or end-of-term boundary.
-/// Lambda nesting uses the same explicit heap frames as application parsing.
+/// A prefix has its own application frame: `f ¬p` applies f to Not p,
+/// rather than negating f p. Its operand accepts precedence 40 and above.
+fn finish_negation_frame(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &mut Vec<BoundedTermFrame>,
+    grammar: DefinitionGrammar,
+    at: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let mut frame = frames.pop().expect("guarded negation frame");
+    let prefix = frame.negation.take().expect("negation prefix");
+    let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
+    let syntax = Syntax::node(
+        Name::str(Name::anonymous(), "term¬_"),
+        vec![leaves.leaf(prefix)?, body],
+    );
+    frames
+        .last_mut()
+        .expect("negation has a parent")
+        .application
+        .push((syntax, prefix));
+    Ok(())
+}
+
+/// Fold prefix bodies at their enclosing delimiter or end-of-term boundary.
+/// Negation, lambda and quantifier nesting all use explicit heap frames.
 fn finish_lambda_frames(
     leaves: &Leaves,
     view: &SourceView,
@@ -1095,12 +1162,17 @@ fn finish_lambda_frames(
     at: usize,
 ) -> Result<(), NatDefinitionParseError> {
     while frames.last().is_some_and(|frame| {
-        frame.lambda.is_some()
+        frame.negation.is_some()
+            || frame.lambda.is_some()
             || frame
                 .quantifier
                 .as_ref()
                 .is_some_and(|prefix| prefix.domain.is_some())
     }) {
+        if frames.last().is_some_and(|frame| frame.negation.is_some()) {
+            finish_negation_frame(leaves, view, tokens, frames, grammar, at)?;
+            continue;
+        }
         let mut frame = frames.pop().expect("guarded lambda frame");
         if let Some(prefix) = frame.quantifier.take() {
             let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
@@ -1183,6 +1255,7 @@ fn bounded_term_spliced(
         open: None,
         lambda: None,
         quantifier: None,
+        negation: None,
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
@@ -1284,6 +1357,21 @@ fn bounded_term_spliced(
                 frame.application.push((term, start));
                 cursor = end;
             }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "¬" =>
+            {
+                frames.push(BoundedTermFrame {
+                    record: None,
+                    ascription: None,
+                    open: None,
+                    lambda: None,
+                    quantifier: None,
+                    negation: Some(index),
+                    application: Vec::new(),
+                    operands: Vec::new(),
+                    operators: Vec::new(),
+                });
+            }
             kind if is_bounded_term_atom(kind, grammar) => {
                 let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
                 frames
@@ -1320,6 +1408,7 @@ fn bounded_term_spliced(
                         colon: cursor,
                         domain: None,
                     }),
+                    negation: None,
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
@@ -1358,6 +1447,7 @@ fn bounded_term_spliced(
                         arrow: cursor,
                     }),
                     quantifier: None,
+                    negation: None,
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
@@ -1426,6 +1516,7 @@ fn bounded_term_spliced(
                         open: None,
                         lambda: None,
                         quantifier: Some(prefix),
+                        negation: None,
                         application: Vec::new(),
                         operands: Vec::new(),
                         operators: Vec::new(),
@@ -1456,6 +1547,7 @@ fn bounded_term_spliced(
                         open,
                         lambda: None,
                         quantifier: None,
+                        negation: None,
                         application: Vec::new(),
                         operands: Vec::new(),
                         operators: Vec::new(),
@@ -1474,6 +1566,7 @@ fn bounded_term_spliced(
                     open: Some(index),
                     lambda: None,
                     quantifier: None,
+                    negation: None,
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
@@ -1528,6 +1621,11 @@ fn bounded_term_spliced(
             kind if bounded_infix(kind, grammar).is_some() => {
                 let operator = bounded_infix(kind, grammar)
                     .expect("the guarded bounded infix remains recognized");
+                if operator.precedence() < 40 {
+                    while frames.last().is_some_and(|frame| frame.negation.is_some()) {
+                        finish_negation_frame(leaves, view, tokens, &mut frames, grammar, index)?;
+                    }
+                }
                 let syntax = leaves.leaf(index)?;
                 let frame = frames.last_mut().expect("the root term frame remains live");
                 push_bounded_infix(view, tokens, frame, grammar, operator, index, syntax)?;

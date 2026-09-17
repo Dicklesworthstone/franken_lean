@@ -61,6 +61,7 @@ pub use fln_comp::flbc::{CodecError, CodecLimits, ValidatedProgram};
 use fln_comp::ingress::{
     FunctionBinding, IngressResource, IntrinsicBinding, LambdaBinding, LambdaRecursion,
 };
+mod runtime;
 pub use fln_comp::ingress::{IngressError, IngressLimits, ScalarConstructorBinding};
 pub use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
@@ -2146,6 +2147,12 @@ impl Engine {
             "instDecidableTrue",
             "instDecidableFalse",
             "instDecidableNot",
+            "instDecidableAnd",
+            "instDecidableOr",
+            "instDecidableImplies",
+            "instDecidableIff",
+            "instDecidableEqBool",
+            "instDecidableEqNat",
         ] {
             engine.environment = fln_elab::instances::register_instance(
                 &engine.environment,
@@ -4293,18 +4300,29 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let catalog = executable_dependencies(&self.environment, &expression, limits.ingress)
+        let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress);
+        let expression = preparation
+            .expression(&expression)
             .map_err(EngineExecutionError::Ingress)?;
+        let catalog = executable_dependencies(
+            &self.environment,
+            &expression,
+            limits.ingress,
+            &mut preparation,
+        )
+        .map_err(EngineExecutionError::Ingress)?;
         let local_lambda = executable_lambda(&admission.declaration, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
-        let lambdas = local_lambda.as_slice();
-        let ingress = fln_comp::ingress::lower_closed_expr_with_scalar_constructors_and_lambdas(
+        if let Some(mut lambda) = local_lambda {
+            lambda.lambda = expression.clone();
+            preparation.lambdas.push(lambda);
+        }
+        let ingress = fln_comp::ingress::lower_closed_expr_with_control_flow(
             &expression,
             &catalog.scalar_constructors,
             &catalog.intrinsics,
             &[],
-            &catalog.functions,
-            lambdas,
+            preparation.callables(&catalog.functions),
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
@@ -5049,6 +5067,7 @@ fn executable_dependencies(
     environment: &Environment,
     source: &Expr,
     limits: IngressLimits,
+    preparation: &mut runtime::Preparation<'_>,
 ) -> Result<ExecutableCatalog, IngressError> {
     let value_types = ExecutableValueTypes::bounded_source();
     let mut pending = BTreeSet::new();
@@ -5087,11 +5106,12 @@ fn executable_dependencies(
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
         };
-        let Some(signature) =
+        let Some(mut signature) =
             executable_signature(definition, &value_types, &mut visited_nodes, limits, true)?
         else {
             continue;
         };
+        signature.body = preparation.expression(&signature.body)?;
         let observed = functions.len().saturating_add(1);
         if observed > maximum_functions {
             return Err(IngressError::ResourceLimit {

@@ -1,0 +1,45 @@
+# Integration is complete; this workflow only validates committed source.
+name: Native equality decision tests
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fln-native-equality-decisions-landing.yml'
+      - 'crates/fln-elab/**'
+      - 'crates/fln/src/**'
+      - 'crates/fln/tests/source*decis*.rs'
+      - 'crates/fln-cli/src/**'
+      - 'crates/fln-cli/tests/source_equality_decisions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-equality-decision-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the repository-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Check native and polymorphic equality decisions through both engines
+        run: |
+          cargo test --locked -p fln --test source_equality_decisions --test source_generic_decisions --test source_decisions --test source_decision_tactics
+          cargo test --locked -p fln-cli --test source_equality_decisions
+          cargo test --locked -p fln-elab --no-fail-fast
+      - name: Check formatting, linting and workspace compatibility
+        run: |
+          rustfmt --check --edition 2024 --config skip_children=true crates/fln-elab/src/seed/decidable_eq.rs crates/fln-elab/src/seed/decidable_generic.rs crates/fln/tests/source_equality_decisions.rs crates/fln/tests/source_generic_decisions.rs crates/fln-cli/tests/source_equality_decisions.rs
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

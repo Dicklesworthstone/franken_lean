@@ -1,0 +1,46 @@
+name: Native propositional logic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fln-core/**'
+      - 'crates/fln-env/**'
+      - 'crates/fln-kernel/**'
+      - 'crates/fln-checker/**'
+      - 'crates/fln-parse/**'
+      - 'crates/fln-elab/**'
+      - 'crates/fln/**'
+      - 'crates/fln-cli/**'
+      - 'examples/native_propositional_logic.lean'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/native-propositional-logic.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-propositional-logic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Check proofs and proof-carrying decisions through both engines
+        run: cargo test --locked -p fln --test source_logic --test source_decisions --test source_equality_decisions --no-fail-fast
+      - name: Check installed-command receipts and recovery
+        run: cargo test --locked -p fln-cli --test source_logic
+      - name: Lint touched source packages and downstream consumers
+        run: |
+          cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

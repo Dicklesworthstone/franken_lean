@@ -21,6 +21,11 @@
 //! kernel rejection (FL-INV-07).
 
 mod decidable;
+mod logic;
+pub use decidable_eq::equality_decision_seed_declarations;
+pub use decidable_generic::generic_equality_decision_seed_declarations;
+mod decidable_eq;
+mod decidable_generic;
 pub mod equality;
 mod heterogeneous;
 pub mod inhabited;
@@ -651,7 +656,23 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 53] {
+pub fn source_seed_declarations() -> [Declaration; 71] {
+    let [
+        and,
+        and_left,
+        and_right,
+        or,
+        or_elim,
+        iff,
+        iff_mp,
+        iff_mpr,
+        and_instance,
+        or_instance,
+        implies_instance,
+        iff_instance,
+    ] = logic::logical_seed_declarations();
+    let [bool_eq, nat_eq, bool_instance, nat_instance] = equality_decision_seed_declarations();
+    let [equality_type, generic_eq] = generic_equality_decision_seed_declarations();
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -706,6 +727,24 @@ pub fn source_seed_declarations() -> [Declaration; 53] {
         decidable::of_decide_eq_true_declaration(),
         out_param_seed_declaration(),
         semi_out_param_seed_declaration(),
+        bool_eq,
+        nat_eq,
+        bool_instance,
+        nat_instance,
+        equality_type,
+        generic_eq,
+        and,
+        and_left,
+        and_right,
+        or,
+        or_elim,
+        iff,
+        iff_mp,
+        iff_mpr,
+        and_instance,
+        or_instance,
+        implies_instance,
+        iff_instance,
     ]
 }
 
@@ -816,7 +855,10 @@ mod tests {
     #[test]
     fn parameter_markers_are_checked_definitions_not_axioms() {
         let environment = Environment::new();
-        for declaration in [out_param_seed_declaration(), semi_out_param_seed_declaration()] {
+        for declaration in [
+            out_param_seed_declaration(),
+            semi_out_param_seed_declaration(),
+        ] {
             let Declaration::Defn(definition) = &declaration else {
                 panic!("parameter markers must have checked identity bodies");
             };
@@ -824,7 +866,8 @@ mod tests {
             assert_eq!(definition.hints, ReducibilityHints::Abbrev);
             assert!(!definition.value.has_expr_mvar());
             assert!(!definition.value.has_level_mvar());
-            let Outcome::Complete(admitted) = admit(&environment, declaration, Budget::DEFAULT) else {
+            let Outcome::Complete(admitted) = admit(&environment, declaration, Budget::DEFAULT)
+            else {
                 panic!("fixed marker admission must answer");
             };
             assert!(matches!(
