@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
     paths: ['.github/workflows/fln-source-frontier-snapshot.yml']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
