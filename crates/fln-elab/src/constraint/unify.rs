@@ -13,6 +13,7 @@
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
 mod assignment_universes;
+mod record_eta;
 mod reduce;
 mod residual;
 
@@ -798,6 +799,9 @@ impl Engine<'_> {
             }
             Err(UnificationError::Deferred(_)) | Ok(false) => {}
             Err(error) => return Err(error),
+        }
+        if self.record_eta(&left, &right, locals, pending)? {
+            return Ok(());
         }
         match (left.node(), right.node()) {
             (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => self.levels(a, b)?,
