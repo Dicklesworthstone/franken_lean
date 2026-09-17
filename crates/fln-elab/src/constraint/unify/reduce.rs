@@ -231,6 +231,11 @@ impl Engine<'_> {
         // to enable a reduction.
         let rec_head = self.instantiate(rec_head)?;
         let major_head = self.instantiate(major_head)?;
+        let compact = self.nat_literal_major(recursor, &major_head, major_arguments)?;
+        let (major_head, major_arguments) = match &compact {
+            Some((head, arguments)) => (head, arguments.as_slice()),
+            None => (&major_head, major_arguments),
+        };
         let ExprNode::Const { levels, .. } = rec_head.node() else {
             return Ok(None);
         };
@@ -319,5 +324,53 @@ impl Engine<'_> {
             result = Expr::app(result, argument.clone());
         }
         Ok(Some(result))
+    }
+
+    /// Expose one constructor layer of a compact numeral, never a unary tree.
+    /// The ordinary iota path still validates the recursor and selected rule.
+    fn nat_literal_major(
+        &mut self,
+        recursor: &RecursorVal,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<(Expr, Vec<Expr>)>, UnificationError> {
+        let ExprNode::Lit {
+            literal: Literal::Nat(value),
+        } = head.node()
+        else {
+            return Ok(None);
+        };
+        if !arguments.is_empty() || recursor.all != [Name::from_components(["Nat"])] {
+            return Ok(None);
+        }
+        self.meter.tick()?;
+        let Declaration::Inductive(seed) = crate::seed::nat_inductive_seed_declaration() else {
+            unreachable!("the canonical Nat seed is inductive");
+        };
+        let index = usize::from(!value.limbs_le().is_empty());
+        // A familiar-looking name is not evidence of Nat's constructor laws.
+        if self.work.env.find(&seed.types[0].base.name)
+            != Some(&ConstantInfo::Induct(seed.types[0].clone()))
+            || self.work.env.find(&seed.ctors[index].base.name)
+                != Some(&ConstantInfo::Ctor(seed.ctors[index].clone()))
+        {
+            return Ok(None);
+        }
+        let fields = if index == 0 {
+            Vec::new()
+        } else {
+            for _ in value.limbs_le() {
+                self.meter.node()?;
+            }
+            let previous = fln_bignum::nat::BigNatView::from_limbs_le(value.limbs_le())
+                .sub(fln_bignum::nat::BigNatView::from_limbs_le(&[1]));
+            vec![Expr::lit(Literal::Nat(
+                fln_bignum::interop::literal_from_bignat(&previous),
+            ))]
+        };
+        Ok(Some((
+            Expr::const_(seed.ctors[index].base.name.clone(), Vec::new()),
+            fields,
+        )))
     }
 }

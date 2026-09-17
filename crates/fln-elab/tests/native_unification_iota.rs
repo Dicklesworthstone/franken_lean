@@ -284,3 +284,203 @@ fn local_let_transparency_is_not_widened_by_iota() {
     unchanged(&txn, &before);
     txn.unify(&expr, &constant("Bool.true"), budget()).unwrap();
 }
+
+#[test]
+fn compact_nat_zero_and_recursive_successor_rules_compute() {
+    for n in [0, 1, 2, 16] {
+        let mut txn = transaction();
+        let step = lam(
+            constant("Nat"),
+            lam(constant("Nat"), apply(constant("Nat.succ"), [bvar(0)])),
+        );
+        txn.unify(&nat_rec(numeral(n), numeral(0), step), &numeral(n), budget())
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_huge_literal_does_not_force_an_unused_induction_hypothesis() {
+    let mut txn = transaction();
+    let step = lam(constant("Nat"), lam(constant("Nat"), bvar(1)));
+    let expr = nat_rec(numeral(u64::MAX), numeral(0), step);
+    let mut bounded = budget();
+    bounded.max_steps = 20_000;
+    let report = txn
+        .unify(&expr, &numeral(u64::MAX - 1), bounded)
+        .unwrap();
+    assert!(report.unifier_steps < bounded.max_steps);
+    assert!(report.expression_assignments.is_empty());
+}
+
+#[test]
+fn universe_assignments_reawaken_constructor_compatibility() {
+    use fln_core::level::LMVarId;
+    let mut txn = transaction();
+    let universe = LMVarId(name("pending_universe"));
+    let equality = apply(
+        Expr::const_(name("Eq"), vec![Level::one()]),
+        [constant("Nat"), numeral(7), bvar(0)],
+    );
+    let proof = apply(
+        Expr::const_(name("Eq.refl"), vec![Level::one()]),
+        [constant("Nat"), numeral(7)],
+    );
+    let expr = apply(
+        Expr::const_(name("Eq.rec"), vec![Level::one(), Level::mvar(universe.clone())]),
+        [
+            constant("Nat"),
+            numeral(7),
+            lam(constant("Nat"), lam(equality, constant("Nat"))),
+            numeral(23),
+            numeral(7),
+            proof,
+        ],
+    );
+    let report = txn
+        .unify_many_with(
+            &[
+                (expr, numeral(23)),
+                (Expr::sort(Level::mvar(universe.clone())), Expr::sort(Level::one())),
+            ],
+            budget(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(report.universe_assignments, vec![universe]);
+    assert!(report.expression_assignments.is_empty());
+}
+
+#[test]
+fn an_ill_typed_selected_assignment_is_still_vetoed_by_k1() {
+    use fln_kernel::verdict::Verdict;
+    let mut txn = transaction();
+    let id = goal(&mut txn, "bad_minor", constant("Nat"));
+    let before = txn.clone();
+    let expr = apply(
+        Expr::const_(name("Bool.rec"), vec![Level::one()]),
+        [
+            lam(constant("Bool"), constant("Bool")),
+            constant("Bool.false"),
+            Expr::mvar(id.clone()),
+            constant("Bool.true"),
+        ],
+    );
+    match txn.unify(&expr, &constant("Bool.true"), budget()).unwrap_err() {
+        UnificationError::AssignmentCheck { id: found, outcome } => {
+            assert_eq!(found, id);
+            assert!(matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })));
+        }
+        other => panic!("expected K1 veto, got {other:?}"),
+    }
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn a_failed_later_recursor_equation_rolls_back_an_earlier_assignment() {
+    let mut txn = transaction();
+    let id = goal(&mut txn, "tentative", constant("Nat"));
+    let before = txn.clone();
+    let result = txn.unify_many_with(
+        &[
+            (Expr::mvar(id), numeral(37)),
+            (select(constant("Bool.false")), constant("Bool.true")),
+        ],
+        budget(),
+        &|| false,
+    );
+    assert!(matches!(result, Err(UnificationError::Deferred(_))));
+    unchanged(&txn, &before);
+    assert!(txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+}
+
+#[test]
+fn cancellation_discards_speculative_assignments_but_keeps_spent_work() {
+    use std::cell::Cell;
+    let mut initial = transaction();
+    let id = goal(&mut initial, "tentative", constant("Nat"));
+    let mut expr = constant("Bool.true");
+    for _ in 0..200 {
+        expr = select(expr);
+    }
+    let equations = [(Expr::mvar(id), numeral(37)), (expr, constant("Bool.true"))];
+    let mut generous = budget();
+    generous.max_steps = 2_000_000;
+    initial.budget.max_heartbeats = generous.max_steps;
+    // Count polls on the successful path, then cancel at its final publication
+    // barrier, after speculative assignment and K1 validation have occurred.
+    let polls = Cell::new(0_u64);
+    let mut control = initial.clone();
+    let report = control
+        .unify_many_with(&equations, generous, &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap();
+    assert_eq!(report.kernel_checks, 1);
+    let stop = polls.get();
+    let calls = Cell::new(0_u64);
+    let mut cancelled = initial.clone();
+    let result = cancelled.unify_many_with(&equations, generous, &|| {
+        let next = calls.get() + 1;
+        calls.set(next);
+        next >= stop
+    });
+    assert!(matches!(result, Err(UnificationError::Cancelled)));
+    assert_eq!(calls.get(), stop);
+    unchanged(&cancelled, &initial);
+    assert_eq!(cancelled.budget.heartbeats_consumed, control.budget.heartbeats_consumed);
+    assert!(cancelled.budget.heartbeats_consumed > initial.budget.heartbeats_consumed);
+}
+
+#[test]
+fn step_and_node_exhaustion_are_typed_nonanswers_not_partial_success() {
+    let mut expr = constant("Bool.true");
+    for _ in 0..30 {
+        expr = select(expr);
+    }
+    let initial = transaction();
+    let mut control = initial.clone();
+    let report = control.unify(&expr, &constant("Bool.true"), budget()).unwrap();
+    let mut limited = budget();
+    limited.max_steps = report.unifier_steps - 1;
+    let mut txn = initial.clone();
+    assert!(matches!(
+        txn.unify(&expr, &constant("Bool.true"), limited),
+        Err(UnificationError::StepLimit { .. })
+    ));
+    unchanged(&txn, &initial);
+    limited = budget();
+    limited.max_visited_nodes = report.visited_nodes - 1;
+    let mut txn = initial.clone();
+    assert!(matches!(
+        txn.unify(&expr, &constant("Bool.true"), limited),
+        Err(UnificationError::NodeLimit { .. })
+    ));
+    unchanged(&txn, &initial);
+}
+
+#[test]
+fn deeply_nested_majors_use_heap_continuations_on_a_small_stack() {
+    let mut txn = transaction();
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let mut expr = constant("Bool.true");
+            for _ in 0..10_000 {
+                expr = select(expr);
+            }
+            let mut large = budget();
+            large.max_steps = 5_000_000;
+            large.max_visited_nodes = 3_000_000;
+            large.kernel = Budget::for_stack_bytes(128 * 1024);
+            // Keep the inherited transaction cap consistent with this stress
+            // test's explicit work limit rather than stopping at the default.
+            txn.budget.max_heartbeats = large.max_steps;
+            // This closed equation makes no assignment and needs no K1 recursion.
+            let report = txn.unify(&expr, &constant("Bool.true"), large).unwrap();
+            assert_eq!(report.kernel_checks, 0);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
