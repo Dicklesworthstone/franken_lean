@@ -58,7 +58,9 @@ jobs:
           set -euo pipefail
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/rewrite-landing/source-tests.log
           cargo test --locked -p fln --lib --test source_equality --test source_rewriting --test source_rewrite_locations --test source_simp_locations --test source_backtracking --test source_automation --test source_instances --no-fail-fast 2>&1 | tee target/rewrite-landing/engine-tests.log
-          cargo test --locked -p fln-cli --test source_check --test source_hypothesis_rewriting --no-fail-fast 2>&1 | tee target/rewrite-landing/cli-tests.log
+          cargo test --locked -p fln-cli --test source_hypothesis_rewriting 2>&1 | tee target/rewrite-landing/cli-tests.log
+          cargo test --locked -p fln-cli --test source_check simp 2>&1 | tee -a target/rewrite-landing/cli-tests.log
+          cargo test --locked -p fln-cli --test source_check installed_binary_checks_a_real_source_proof_file 2>&1 | tee -a target/rewrite-landing/cli-tests.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/rewrite-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/rewrite-landing/workspace.log
           SH

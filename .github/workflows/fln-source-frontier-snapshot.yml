@@ -1,0 +1,32 @@
+name: Source frontier reproduction snapshot
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-frontier-snapshot.yml']
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Preserve source and configured compiler for offline reproduction
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/frontier-snapshot
+          git rev-parse HEAD > target/frontier-snapshot/commit.txt
+          git archive --format=tar.gz HEAD > target/frontier-snapshot/source.tar.gz
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/frontier-snapshot/compiler.txt
+          compiler="$(rustup which rustc)"
+          tar -C "$(dirname "$(dirname "$compiler")")" -czf target/frontier-snapshot/compiler.tar.gz bin lib libexec
+          sha256sum target/frontier-snapshot/*.tar.gz > target/frontier-snapshot/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-frontier-${{ github.sha }}
+          path: target/frontier-snapshot
+          retention-days: 2
+          compression-level: 0
