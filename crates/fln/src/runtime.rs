@@ -3,6 +3,9 @@
 //! This never changes the declaration sent to either checker. Special forms
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
+mod nat;
+mod records;
+
 use super::*;
 use fln_comp::ingress::{BoolCaseBinding, CallableBindings};
 use std::collections::HashSet;
@@ -16,9 +19,18 @@ pub(super) struct Preparation<'a> {
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
     next_branch: usize,
+    next_local: u64,
+    next_nat: u64,
+    nat_family_checked: bool,
+    value_types: ExecutableValueTypes,
+    pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
 
 enum Task {
+    RecursiveLambda {
+        parameters: Vec<ValueType>,
+        result: ValueType,
+    },
     Visit(Expr),
     Apply(usize),
     Lam {
@@ -52,6 +64,11 @@ impl<'a> Preparation<'a> {
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
             next_branch: 0,
+            next_local: 0,
+            next_nat: 0,
+            nat_family_checked: false,
+            value_types: ExecutableValueTypes::bounded_source(),
+            constructors: Vec::new(),
         }
     }
 
@@ -110,6 +127,7 @@ impl<'a> Preparation<'a> {
             ValueType::Nat => 0,
             ValueType::String => 1,
             ValueType::Bool => 2,
+            ValueType::Constructor => 3,
             _ => return Err(unsupported("conditional result representation")),
         };
         let name = Name::num(Name::from_components(["_fln_runtime_bool_case"]), index);
@@ -149,6 +167,62 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
+    /// Derive the compiler's local-closure metadata from a checked let type.
+    /// This runs after admission, and the ordinary FIR ingress still validates
+    /// captures, calls and ownership. Unsupported erasures remain refusals.
+    fn local_function(&mut self, value: &Expr, type_: &Expr) -> Result<Expr, IngressError> {
+        let ExprNode::Lam {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = value.node()
+        else {
+            return Ok(value.clone());
+        };
+        let definition = DefinitionVal {
+            base: fln_env::constants::ConstantVal {
+                name: Name::anonymous(),
+                level_params: Vec::new(),
+                type_: type_.clone(),
+            },
+            value: value.clone(),
+            hints: fln_env::constants::ReducibilityHints::Abbrev,
+            safety: fln_env::constants::DefinitionSafety::Safe,
+            all: Vec::new(),
+        };
+        let Some(signature) = self.signature(&definition, false)? else {
+            return Ok(value.clone());
+        };
+        if signature.parameters.is_empty() {
+            return Ok(value.clone());
+        }
+        reserve(&mut self.lambdas, self.limits.max_lambda_bindings)?;
+        let id = self.next_local;
+        self.next_local = id
+            .checked_add(1)
+            .ok_or_else(|| unsupported("local closure identity"))?;
+        // Equal relative bodies at different sites may capture values of
+        // different types. Give metadata keys distinct deterministic identities
+        // without changing de Bruijn indices or lifting already prepared bodies.
+        let lambda = Expr::lam(
+            Name::num(name("_fln_runtime_local"), id),
+            binder_type.clone(),
+            body.clone(),
+            *binder_info,
+        );
+        let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
+        self.lambdas.push(LambdaBinding {
+            lambda: lambda.clone(),
+            parameters: signature.parameters,
+            parameter_ownership,
+            result: signature.result,
+            result_ownership: signature.result_ownership,
+            recursion: LambdaRecursion::NonRecursive,
+        });
+        Ok(lambda)
+    }
+
     /// Explicit work frames preserve lexical scope, including branches nested
     /// in let values and functions. Branch binders are inserted *before* their
     /// bodies are transformed so nested closure annotations cannot go stale
@@ -185,13 +259,59 @@ impl<'a> Preparation<'a> {
                             let ExprNode::Lam { body: motive, .. } = args[0].node() else {
                                 return Err(unsupported("Boolean motive"));
                             };
-                            let result = scalar_type(motive)
+                            let result = self
+                                .value_type(motive)?
                                 .ok_or_else(|| unsupported("dependent Boolean motive"))?;
                             let case = self.branch_name(result)?;
                             tasks.push(Task::Case { name: case, result });
                             tasks.push(Task::Visit(self.thunk(&args[2])?));
                             tasks.push(Task::Visit(self.thunk(&args[1])?));
                             tasks.push(Task::Visit(args[3].clone()));
+                            continue;
+                        }
+                        if matches!(head.node(), ExprNode::Const { name: n, levels }
+                            if n == &name("Nat.rec") && levels.len() == 1)
+                            && args.len() >= 4
+                        {
+                            let recursion = self.nat_recursion(&args)?;
+                            let required = args.len().saturating_add(1);
+                            if tasks.len().saturating_add(required) > limit {
+                                return Err(IngressError::ResourceLimit {
+                                    resource: IngressResource::PendingTasks,
+                                    limit,
+                                    observed: tasks.len().saturating_add(required),
+                                });
+                            }
+                            tasks.try_reserve(required).map_err(|_| {
+                                IngressError::AllocationFailure {
+                                    resource: IngressResource::PendingTasks,
+                                    requested: tasks.len().saturating_add(required),
+                                }
+                            })?;
+                            tasks.push(Task::Apply(args.len() - 3));
+                            tasks.extend(args[3..].iter().rev().cloned().map(Task::Visit));
+                            tasks.push(Task::RecursiveLambda {
+                                parameters: recursion.parameters,
+                                result: recursion.result,
+                            });
+                            tasks.push(Task::Visit(recursion.lambda));
+                            continue;
+                        }
+                        if matches!(head.node(), ExprNode::Const { name: n, levels }
+                            if n == &name("Nat.succ") && levels.is_empty())
+                            && args.len() == 1
+                        {
+                            self.check_nat_family()?;
+                            tasks.push(Task::Visit(Expr::app(
+                                Expr::app(Expr::const_(name("Nat.add"), vec![]), args[0].clone()),
+                                nat::literal(1),
+                            )));
+                            continue;
+                        }
+                        if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(eliminated) = self.record_recursor(name, levels, &args)?
+                        {
+                            tasks.push(Task::Visit(eliminated));
                             continue;
                         }
                         let required = args.len().saturating_add(2);
@@ -214,6 +334,12 @@ impl<'a> Preparation<'a> {
                         continue;
                     }
                     match expr.node() {
+                        ExprNode::Const { name: n, levels }
+                            if n == &name("Nat.zero") && levels.is_empty() =>
+                        {
+                            self.check_nat_family()?;
+                            values.push(nat::literal(0));
+                        }
                         ExprNode::Lam {
                             binder_name,
                             binder_type,
@@ -248,14 +374,23 @@ impl<'a> Preparation<'a> {
                             idx,
                             expr,
                         } => {
+                            self.value_type(&Expr::const_(type_name.clone(), vec![]))?;
                             tasks.push(Task::Proj {
                                 name: type_name.clone(),
                                 index: *idx,
                             });
                             tasks.push(Task::Visit(expr.clone()));
                         }
+                        ExprNode::Const { name, .. } => {
+                            self.constructor(name)?;
+                            values.push(expr.clone());
+                        }
                         _ => values.push(expr.clone()),
                     }
+                }
+                Task::RecursiveLambda { parameters, result } => {
+                    let lambda = pop(&mut values)?;
+                    values.push(self.register_recursion(lambda, parameters, result)?);
                 }
                 Task::Apply(count) => {
                     let start = values
@@ -280,6 +415,7 @@ impl<'a> Preparation<'a> {
                 } => {
                     let body = pop(&mut values)?;
                     let value = pop(&mut values)?;
+                    let value = self.local_function(&value, &type_)?;
                     values.push(Expr::let_e(name, type_, value, body, nondep));
                 }
                 Task::Proj { name, index } => {

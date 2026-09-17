@@ -4311,7 +4311,7 @@ impl Engine {
             &mut preparation,
         )
         .map_err(EngineExecutionError::Ingress)?;
-        let local_lambda = executable_lambda(&admission.declaration, limits.ingress)
+        let local_lambda = executable_lambda(&admission.declaration, &mut preparation)
             .map_err(EngineExecutionError::Ingress)?;
         if let Some(mut lambda) = local_lambda {
             lambda.lambda = expression.clone();
@@ -4321,7 +4321,7 @@ impl Engine {
             &expression,
             &catalog.scalar_constructors,
             &catalog.intrinsics,
-            &[],
+            &preparation.constructors,
             preparation.callables(&catalog.functions),
             limits.ingress,
         )
@@ -5051,6 +5051,7 @@ struct ExecutableValueTypes {
     nat: Expr,
     string: Expr,
     bool_: Expr,
+    records: BTreeSet<Name>,
 }
 
 impl ExecutableValueTypes {
@@ -5059,6 +5060,7 @@ impl ExecutableValueTypes {
             nat: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
             string: Expr::const_(Name::from_components(["String"]), Vec::new()),
             bool_: Expr::const_(Name::from_components(["Bool"]), Vec::new()),
+            records: BTreeSet::new(),
         }
     }
 }
@@ -5069,7 +5071,6 @@ fn executable_dependencies(
     limits: IngressLimits,
     preparation: &mut runtime::Preparation<'_>,
 ) -> Result<ExecutableCatalog, IngressError> {
-    let value_types = ExecutableValueTypes::bounded_source();
     let mut pending = BTreeSet::new();
     let mut resolved = BTreeSet::new();
     let mut visited_nodes = 0usize;
@@ -5106,9 +5107,7 @@ fn executable_dependencies(
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
         };
-        let Some(mut signature) =
-            executable_signature(definition, &value_types, &mut visited_nodes, limits, true)?
-        else {
+        let Some(mut signature) = preparation.signature(definition, true)? else {
             continue;
         };
         signature.body = preparation.expression(&signature.body)?;
@@ -5289,16 +5288,12 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
 /// execute the function value itself and expose the checked successor snapshot.
 fn executable_lambda(
     declaration: &Declaration,
-    limits: IngressLimits,
+    preparation: &mut runtime::Preparation<'_>,
 ) -> Result<Option<LambdaBinding>, IngressError> {
     let Declaration::Defn(definition) = declaration else {
         return Ok(None);
     };
-    let value_types = ExecutableValueTypes::bounded_source();
-    let mut visited_nodes = 0usize;
-    let Some(signature) =
-        executable_signature(definition, &value_types, &mut visited_nodes, limits, false)?
-    else {
+    let Some(signature) = preparation.signature(definition, false)? else {
         return Ok(None);
     };
     if signature.parameters.is_empty() {
@@ -5539,6 +5534,10 @@ fn executable_value_type(
         Some((ValueType::String, CallableResultOwnership::Owned))
     } else if source == &value_types.bool_ {
         Some((ValueType::Bool, CallableResultOwnership::Scalar))
+    } else if matches!(source.node(), fln_core::expr::ExprNode::Const { name, levels }
+        if levels.is_empty() && value_types.records.contains(name))
+    {
+        Some((ValueType::Constructor, CallableResultOwnership::Owned))
     } else {
         None
     }

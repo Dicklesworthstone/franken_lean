@@ -17,6 +17,7 @@ mod instance_command;
 mod instances;
 mod level_syntax;
 mod levels;
+mod local_functions;
 pub use level_syntax::LevelSyntaxError;
 mod matching;
 mod patterns;
@@ -733,6 +734,8 @@ impl Context {
             BinderNext(binders::Telescope<'a>),
             BinderDomain(binders::Telescope<'a>),
             BinderBody(binders::Telescope<'a>),
+            LocalFunctionAnnotation(local_functions::Build<'a>),
+            LocalFunctionValue(local_functions::Build<'a>),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
@@ -934,7 +937,35 @@ impl Context {
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "let"]) {
-                                    let (name, annotation, value, body) = self.let_parts(args)?;
+                                    let binding = self.let_parts(args)?;
+                                    if !expect_null_args(
+                                        binding.parameters,
+                                        "local function parameters",
+                                    )?
+                                    .is_empty()
+                                    {
+                                        let build = self.start_local_function(binding, expected)?;
+                                        if let Some(annotation) = build.binding.annotation {
+                                            tasks.push(Task::LocalFunctionAnnotation(build));
+                                            tasks.push(Task::Visit(
+                                                annotation,
+                                                Some(self.type_expected()?),
+                                                true,
+                                            ));
+                                        } else {
+                                            let value = build.binding.value;
+                                            tasks.push(Task::LocalFunctionValue(build));
+                                            tasks.push(Task::Visit(value, None, true));
+                                        }
+                                        continue;
+                                    }
+                                    let local_functions::Binding {
+                                        name,
+                                        annotation,
+                                        value,
+                                        body,
+                                        ..
+                                    } = binding;
                                     if let Some(annotation) = annotation {
                                         tasks
                                             .push(Task::LetAnnotation(name, value, body, expected));
@@ -1432,6 +1463,25 @@ impl Context {
                             };
                             values.push(self.finish_term(term, expected.as_ref())?);
                         }
+                        Task::LocalFunctionAnnotation(mut build) => {
+                            let annotation = values.pop().expect("local function annotation visit");
+                            self.sort_level(&annotation)?;
+                            build.result_type = Some(annotation.value.clone());
+                            let value = build.binding.value;
+                            tasks.push(Task::LocalFunctionValue(build));
+                            tasks.push(Task::Visit(value, Some(annotation.value), true));
+                        }
+                        Task::LocalFunctionValue(build) => {
+                            let value = values.pop().expect("local function value visit");
+                            let value = self.close_local_function(&build, value)?;
+                            values.push(value);
+                            tasks.push(Task::LetValue(
+                                build.binding.name,
+                                None,
+                                build.binding.body,
+                                build.expected,
+                            ));
+                        }
                         Task::LetAnnotation(name, value, body, expected) => {
                             let annotation = values.pop().expect("let annotation visit");
                             self.sort_level(&annotation)?;
@@ -1525,7 +1575,7 @@ impl Context {
     fn let_parts<'a>(
         &mut self,
         parts: &'a [Syntax],
-    ) -> Result<(Name, Option<&'a Syntax>, &'a Syntax, &'a Syntax), NatDefinitionElabError> {
+    ) -> Result<local_functions::Binding<'a>, NatDefinitionElabError> {
         let [keyword, config, declaration, separator, body] = parts else {
             return Err(failure(SourceInferenceError::Scope));
         };
@@ -1561,11 +1611,17 @@ impl Context {
         if name.is_anonymous() {
             return Err(NatDefinitionElabError::AnonymousReferenceName);
         }
-        expect_empty_null(&declaration[1], "empty let parameters")?;
+        expect_null_args(&declaration[1], "local function parameters")?;
         let annotation = optional_type_syntax(&declaration[2])?;
         expect_atom(&declaration[3], ":=", "let assignment")?;
         expect_atom(separator, ";", "let separator")?;
-        Ok((name.clone(), annotation, &declaration[4], body))
+        Ok(local_functions::Binding {
+            name: name.clone(),
+            parameters: &declaration[1],
+            annotation,
+            value: &declaration[4],
+            body,
+        })
     }
 
     fn sort_level(&mut self, term: &Typed) -> Result<Level, NatDefinitionElabError> {

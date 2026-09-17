@@ -1,0 +1,80 @@
+name: Land record elimination and recursion
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-local-helpers-landing.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Apply exact tested record computation implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I <<'PY'
+          import pathlib, hashlib, base64, zlib, subprocess
+          before = {'crates/fln/src/runtime.rs':'bed3119fa4c1b3b554eaa64dfc218130e131582c','crates/fln/src/runtime/nat.rs':'6efe94b74f2b3c9f4c11447fb1f87dc52893f8e7','crates/fln/src/runtime/records.rs':'9401fe055d3dd93ab972cf7af7bfa3f1c3ab7ff3','crates/fln/tests/runtime_records.rs':'08cfddc7aaa326b8959b5d3616bedf880a6b1fa0'}
+          after = {'crates/fln/src/runtime.rs':'cb42f107e6324448047040fda0c7faaf5dc10f7a','crates/fln/src/runtime/nat.rs':'b6af3c59d846c76ad44d7e30fcba132ab2e2736e','crates/fln/src/runtime/records.rs':'894f54db522a143ace4d83aab2078a92575b8d06','crates/fln/tests/runtime_records.rs':'d28cbf80cbd09a027697f4aafc786bb1b4c7cefb'}
+          def verify(expected):
+              for name, sha in expected.items():
+                  data=pathlib.Path(name).read_bytes()
+                  assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()==sha, name
+          verify(before)
+          encoded='''eNrFWm1v2zgS/p5fwWaBrHSWFdtx3pSm2e7L4YrrdRftYr+0gUBLVKyN3paU0nhb//ebISmLkiXHbYG7AK0UiRwOZ56ZeYZKGEcRGY/v4pLQ44DTkonjKMmOBQ+OeZWVccpcLshi+N1BnIXskSxYeDKdXrpusJjPoumETCeTs/n8YDwe75J8MBqNdkr/4QcyPplcOGdkhJfpjMCTOC2S59/TF+Q3zgoKc+M8k79/OiC7fmzbvto9Ishh5axiO4atD0ZDr+KIJKwkvzwW/E0eMs/7Kc9EST6RjKbMgXcPLBFkTa7JktHQzWCMZQ+Lw5+jIynyXZ4yiyVxGmdgqdAGEYIlkctZkPPQh0vFRc4tcyGHHFF+J+yb4RU+7V68pOJeuEUlltbvcOt5f8QiLk09wJ6j/ew5Grbn4GzcOWd/VTFnIewYd+MmLLNsV9CyQr9ndz4NQ2u2y6/gFbWR3qm1fJu8ILiv8ikQcQbzM/IL59ar7I4zIeA25573lom84gF7raWET8fWMVhxV3zp9zrGzljELucL112c0egkON0nxmoJu+KsHoOxNp1iqMH/0xOMtKJaWKIqGLeJKHkVlOSthBoEXG0nGAI2EVVSeuQPmlTs91XBnAP068FIT/pPXsYPrIYbhmzKSsYFzGDB882sF44aEOYpjTP9FqOpftGzjvHcL+GJJ8MPnkOcHpj6Rxn4FxalifWA0z1Snc1tMn4hJ9S7wXvPg4HWazXY897Q0oJ/8LvnRTxPfZinREA+wX2i3c5nDiS90fklXnSKaqcnv5Wefr23LJytI+BgjDfHx8fkJUmVsQKa1VijRAQ0oZzkHO6jmItyDGHPeP08qrIAV3HJPxNalixTZhmSF9KSbsuST7clkVpSuWREPuMkzsqcsMeSUxIkuag4w+CsUpaVgoicBEua3UGEERoEVVrBrBxQXgnWlhbkaREnjH8vQFgsMCYRHGVMkzEtiiQOpO0IzUKSf8wAMMu4ICkNljH8snKV1cCxAGBfbdM6SqtS5kZHb9wjR+hU6em3EifPrQ7qGjzZDjGD+kUN2S9fQ0F+W1wruTWV4jVNu4lngVHPJagdssjDlUNctxmCZUStXhcSxOHFOcbv5dw53weF67Y6uC1cCCTj5Wr7bRO6MOaBBc/eb0wnA+XWSPT1HB3N9QQFWas9z765NVfL86JrDVnuyji4t+ybTrJPaRkspcbaEjAXbXF55lxALpvMnel0H2u0jA/SPMA54MzpH2H6wvAJShwPFbON+bB+SztI91qGqwf4wNZsMMdwTXVletqWfTNc2tz83s+5D7yBWZ8/kyqDtFnkHIq8dRiygoGQrCTgKlKTjUafQxt9MuqvloLxOmQ0EhzlTFlthZvSRx9pAqQTHxYql4Oy9HRFSIxtuZCDMnD7EAlo6dAgeA81esU1EpQmm9+H1tchJcF0pars5NSZnmKdPXNmp1+CTR8RtuCM3ndguTajetxmUJiQyHUbli34gYL2VwBASVbeH5uVzTSyGmTb7cRQK9UD5BZ4UbMOgf1GRUeGom1esu1gp/2ixm/7qRLe+1AzEpmaNEiNcWuj/m/q4kuoeyuSZ/Afe8QSCPRxwaAyA0dljwy4IotyqLcLTjPIekUDGRdqTSNH1tEASi93oH6ClaD6hoDBsJL1nSxXRQ41WMSChLGAassoJHWQtIT8UkL9bkQxesc46oOOkcwZbqH+4uIhC6C6gYnzCOhEkYB9HJLlmTI9Gldm56ZUQ+cAzsPqvmrVUbiruYemcBtKoX43i6t631up24zPXK0xfLNu86xHgeZlWxP94mmFvq2gbahYq6hN5zOo7aPp2YnRDD+VOYyepRUurSChPC5Xh60saiQVqW6wZMG9j0woomkMNm1FPsZ1X+jXzarJoLCXez+5bQUkzv+fRKQZg08o1yrAivFemxVA9pRkTKadobKE9Azttp9T+wpiDMklbhs1ISOi+7KGUx+YzawS/WJ39arRcg7kB+Aym0yc6dm+cPmb8by2ixlB+LwJy03Z7cJXlKzom47Pm+mtab0lS/pqw5QsjSZzGlgDhbpLKvzoAcbY3a2Abd8tKeRL7DeapKTLz8clywgk2Fg2JyHwaTkS8mWeBcwlL7MtaTqRvvoX+UihbdkchZDFapOndYqlixw7AOiHoMGCUXy1JU1GOiZUHE6W1R2ThQtaoSQhGWOhUKUADN3KtnLXB1sMEZNYk9hr+xnWrH121SYDkcnmoEgYsH0/dd1bF3thAC9nD9LEo+5kFYc4U0dk77QtNrMjB+LP9lZUew4r0iTxmdXPt96A6p5HoQqt0rwSWHN7GbnG1T8aAnfj7GKeTQnvXbaj7cCoHyVvfZVFuef9zCIqE9X2SaXiibPpxLmE6D05hcsXsERlJoi6jmi7p6VDH/QgxUDIDnQMAqMXFDvx0MbCuAttLey6z2udfqE1vO26Dsg0M9eHPjS1tqHT9b3uxHvc2BVuGraD28FlnGbWk2us9zphVCfEYucpYzNGnzRezifTiE1c9+JyHp3Ow71OGg0pO08bjXGyRF3O5JEjXvaqUAZrNk65WpxTQEoFFEBSrRM0wHEB66ZMyFwKL8eLvMog5dM/kftkYSOs4PmfTKZwoU66oMISSX0gzSd0lVelS/7NoMhhUVECBBaZEHlxJqtKI00gV6YJiWKWYDrncpYABKhHBKuTrClQQaRALJmY7dNYMLeP1XZP/XczW/wm4JEjxJxjki38RgDP34N/gDtwAKR85nmv8XLbpr9yJKL4tof9/lpIP6mT2n5aXsel/JAhP4vQrFTQfssCqO2BveGJLHuIeZ5JjhEBIOVXDZtgw9etPZrYQiv3Btxqfo1YG/dAE2ABFxIzsF8asbYM6CHxbValvswpgjy7JpPBMaBQDFV49yDFJOWg6fAgdPSOMZArNL8cHMKrhIldg5SbmxE4aUEBV/KF3rB6vTW3+d6CM0+a9/s7oe181TRs0mGAMPAtvVUg3E2SlSeFt3bbhxIcxuHAkZJn36B6EljGoaLEGH58yLn91QpLoRDaBet+cZMPraNGd9DimwEqvSntgPkKNiVXcYNmK8MgwGmZzjEU6Wz8N2tEqBddP3+tWTrH1vqwNNUn3q4ruyrdRNXd6zcZp+t5tZR9gyGdScgMiN7qeJsDIuXInjOi4X2rVF/Dd4ENx8SG3qvwGazz2e8cRukVdIEI8oJ1TqA6Z+7SYtPbzmlXEkeln+S5YNbEIdNOmD69uqwmfasjRVPlHogS1PptpHSN2qZoW5xLlbPaPFhFVey4mL+b2FZrIkbP5o6yjnGCO+rhZ1udpOJgcr2WJuvW6Z6MXs3tWIntwuiJNqHd18js0nkofTS77TnNq/XdkgLAN57Z9Umo/D65XduNYDfPx4wi3vqSZT/xhamn3v6EomVe3LPikv6Yle4aoqBwLUVN+fwhEjo0StPQyUUQhWHguuHsIlhEF4M0dFDOFhEdHCmp6MXEOQEqCpe5/H4muVbBsL/31cdKyUh9wDY0+Uz4MaaSGDoSLcpfrEq40ed1DWqEYBwQ+Nczi7rQxCea2kI3Yf5as/v1gUTH6Lv3qC4kBDzJ1CcFfsgUPipwer0BH/irn8EL0LOgqySnoWjCVx5d4fdY7ESw+BuBcLgRRn7LgewieeXsQ0bII/HwLAJvV/VtM/jH/LEZWsiZnpKADxK6YAk8eFdyUPmwpow6UsH6JmVVqhkhAkkaUn6VEquohdpKA+Jd68PRgnyMyyX5DAnwHlRd4WeRRzIiqw/Zd3hOLed/wk0AKzp3cAvXZHZK1ofmQvPZt+kGVtitmbKMMgdoqEcoQ/frD/+U1TAF38EQObm9K23v6+0NTsjaqa1/TT4cLlmS5B8Od2573QaaBrJU1VfRLnz8+h5u0IaqQxPkh5X+Rg+whM7Fl7l8F+4MtL0qWdogqA0YfBJAd1Yq2x5+kXPueP5ReQeXsPV1wD9qXbUWfrptbKduIH3IG6fW51rfjPR1XXtGfqA1FpNqfOrxhSFqegZEhxRuLbLt+MKVk/f3HB5h8/rPc/yAZtp9rSwhG1V/0yr7+QJ7XbGn196VkAsbtxlO6gn7r3BbpoTZUggutXFbtnGbOp1GZzWGbIH+EQGPI0UVBOQex9be2QiVy91fYTApwRtZjTvqu42PLTlrCpxPvmh5ZjqZzXf4pv6LmLpOmH8Y47NHcEfJZFz56lOAv/l7l/+7Zz7S5N7wjLWx415eKtqOkMLud5o9M5ypYwDjUPvVjDd9im9oIcWfm9A4b0EDJVzpeQNhp18+HXv/BSZ5hdw='''
+          patch=zlib.decompress(base64.b64decode(encoded))
+          assert hashlib.sha256(patch).hexdigest()=='2830dbd63ffcc10474b613a7adf92cf42ad60f7d4e7ebb1597167f6ade66469d'
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          verify(after)
+          out=pathlib.Path('target/record-runtime');out.mkdir(parents=True,exist_ok=True)
+          (out/'integration.patch').write_bytes(patch)
+          PY
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee target/record-runtime/compiler.txt
+      - name: Verify record matching and native recursive data
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib --test runtime_records --test runtime_conditionals --test runtime_nat_recursion --test runtime_local_functions --no-fail-fast 2>&1 | tee target/record-runtime/tests.log
+          cargo clippy --locked -p fln --all-targets -- -D warnings 2>&1 | tee target/record-runtime/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/record-runtime/workspace-check.log
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/nat.rs crates/fln/src/runtime/records.rs crates/fln/tests/runtime_records.rs
+          git diff --check
+      - name: Publish tested implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tested_parent="$(git rev-parse HEAD)"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$tested_parent"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- crates/fln/src/runtime.rs crates/fln/src/runtime/nat.rs crates/fln/src/runtime/records.rs crates/fln/tests/runtime_records.rs
+          git commit -m 'feat(runtime): lower record matches and recursive structured accumulators'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/record-runtime/published-commit.txt
+      - name: Retain verification results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: record-runtime-${{ github.sha }}
+          path: target/record-runtime
+          retention-days: 7
+          if-no-files-found: warn

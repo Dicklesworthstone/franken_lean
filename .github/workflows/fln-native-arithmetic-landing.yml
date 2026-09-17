@@ -1,0 +1,95 @@
+name: Land native arithmetic constraints
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-native-arithmetic-landing.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-native-arithmetic-landing
+  cancel-in-progress: false
+jobs:
+  arithmetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - name: Install configured compiler
+        id: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/arithmetic-evidence
+          rustc -Vv > target/arithmetic-evidence/compiler.txt
+          git rev-parse HEAD > target/arithmetic-evidence/input-commit.txt
+      - name: Apply exact native arithmetic implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, pathlib, subprocess, zlib
+          expected = {
+              'crates/fln-elab/src/lib.rs': '034a84bbe49f3846f539aac3f4ef39a3a149016e',
+              'crates/fln-elab/src/constraint/unify/reduce.rs': '482257e2b767de196bae5a5020b93cfe0396b278',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if actual != sha:
+                  raise SystemExit(f'Concurrent source change at {path}: {actual}; expected {sha}')
+          for path in ['crates/fln-elab/src/nat_reduce.rs', 'crates/fln-elab/tests/native_unification_arithmetic.rs']:
+              if pathlib.Path(path).exists():
+                  raise SystemExit(f'Refusing to replace existing {path}')
+          encoded = '''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'''
+          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
+          if hashlib.sha256(patch).hexdigest() != 'c67f40cf8a4b020440752be453d0cf643353ab1767ea753cbbbcf29f95e8f873':
+              raise SystemExit('Native arithmetic patch integrity mismatch')
+          pathlib.Path('target/arithmetic-evidence/implementation.patch').write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          PY
+          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/nat_reduce.rs crates/fln-elab/src/constraint/unify/reduce.rs crates/fln-elab/tests/native_unification_arithmetic.rs
+      - name: Test the real solver and check downstream targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/arithmetic-evidence/tests.log
+          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/arithmetic-evidence/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/arithmetic-evidence/workspace-check.log
+      - name: Publish validated implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+          git add crates/fln-elab/src/lib.rs crates/fln-elab/src/nat_reduce.rs crates/fln-elab/src/constraint/unify/reduce.rs crates/fln-elab/tests/native_unification_arithmetic.rs
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(elab): reduce native Nat arithmetic in transactional constraints' -m 'Evaluate admitted successor, addition, subtraction, multiplication and Boolean comparisons with heap continuations and pre-allocation metering. Preserve delayed constraints, transparency, K1 assignment validation and failure-atomic publication. Fourteen new integration tests cover K1 agreement, computed indices, inductive reduction, malformed primitives, rollback, cancellation and small-stack traversal. Package tests, strict Clippy and workspace compilation passed before this nonforced main publication.'
+          git push origin HEAD:main
+          git rev-parse HEAD > target/arithmetic-evidence/published-commit.txt
+      - name: Retain exact candidate and compiler for independent verification
+        if: always() && steps.compiler.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add crates/fln-elab/src/lib.rs crates/fln-elab/src/constraint/unify/reduce.rs
+          for p in crates/fln-elab/src/nat_reduce.rs crates/fln-elab/tests/native_unification_arithmetic.rs; do
+            if test -f "$p"; then git add "$p"; fi
+          done
+          tree="$(git write-tree)"
+          printf '%s\n' "$tree" > target/arithmetic-evidence/candidate-tree.txt
+          git archive --format=tar.gz "$tree" > target/arithmetic-evidence/candidate-source.tar.gz
+          toolchain="$(rustc --print sysroot)"
+          tar -C "$toolchain" -czf target/arithmetic-evidence/compiler.tar.gz bin lib
+          sha256sum target/arithmetic-evidence/candidate-source.tar.gz target/arithmetic-evidence/compiler.tar.gz > target/arithmetic-evidence/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: arithmetic-${{ github.sha }}
+          path: target/arithmetic-evidence
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0

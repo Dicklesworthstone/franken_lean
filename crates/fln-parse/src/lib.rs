@@ -242,6 +242,7 @@ struct ExplicitBinderTokens {
 struct LetBindingTokens {
     keyword: usize,
     name: usize,
+    parameters: Vec<ExplicitBinderTokens>,
     explicit_type: Option<(usize, std::ops::Range<usize>)>,
     assignment: usize,
     value: std::ops::Range<usize>,
@@ -848,7 +849,8 @@ fn bounded_let_bindings(
                 expected: NatDefinitionExpectation::LocalIdentifier,
             });
         }
-        let mut declaration_cursor = name + 1;
+        let (parameters, mut declaration_cursor) =
+            bounded_binders(view, tokens, name + 1, DefinitionGrammar::Scalar)?;
         let explicit_type = if matches!(
             tokens.get(declaration_cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":"
@@ -881,6 +883,7 @@ fn bounded_let_bindings(
         let_bindings.push(LetBindingTokens {
             keyword,
             name,
+            parameters,
             explicit_type,
             assignment,
             value: value_start..separator,
@@ -901,6 +904,12 @@ fn bounded_value_syntax(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut value = bounded_term(leaves, view, tokens, body_start..tokens.len(), grammar)?;
     for binding in let_bindings.into_iter().rev() {
+        if grammar == DefinitionGrammar::NatOnly && !binding.parameters.is_empty() {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, binding.parameters[0].open),
+                expected: NatDefinitionExpectation::LocalAssignment,
+            });
+        }
         let local_value = bounded_term(leaves, view, tokens, binding.value, grammar)?;
         let explicit_type = match binding.explicit_type {
             Some((colon, type_range)) => null_node(vec![Syntax::node(
@@ -920,7 +929,13 @@ fn bounded_value_syntax(
             parser_kind(&["Term", "letIdDecl"]),
             vec![
                 local_id,
-                null_node(Vec::new()),
+                null_node(bounded_binder_syntax(
+                    leaves,
+                    view,
+                    tokens,
+                    binding.parameters,
+                    grammar,
+                )?),
                 explicit_type,
                 leaves.leaf(binding.assignment)?,
                 local_value,
@@ -3438,6 +3453,61 @@ mod quantified_source_tests {
             .spawn(|| {
                 let source = format!("def f : {}Nat := 0", "forall x : Nat, ".repeat(3000));
                 assert!(parse_source_command(source.as_bytes()).is_ok());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod local_function_tests {
+    use super::*;
+
+    #[test]
+    fn helper_signatures_values_and_source_leaves_round_trip() {
+        for text in [
+            "def f := let id {A : Type} (x : A) : A := x; id 42",
+            "-- local\r\ndef f := let add /- args -/ (x y : Nat) : Nat := x + y; add 40 2\r\n",
+            "def f := let f (x : Nat) := let g (y : Nat) := x + y; g 2; f 40",
+            "def f := match b with | true => let f (x : if b then Nat else Nat) := x; f 42 | false => 0",
+        ] {
+            let parsed =
+                parse_definition(text.as_bytes()).unwrap_or_else(|e| panic!("{text}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                text.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_local_helpers_and_nat_only_widening_are_refused() {
+        for text in [
+            "def f := let f (x : ) := x; f 0",
+            "def f := let f (x : Nat] := x; f 0",
+            "def f := let f (x : Nat) : Nat := ; f 0",
+            "def f := let f (x : Nat) := x;",
+            "def f := let f (x : Nat) := x",
+        ] {
+            assert!(parse_definition(text.as_bytes()).is_err(), "{text}");
+        }
+        assert!(parse_nat_definition(b"def f := let f (x : Nat) := x; f 0").is_err());
+    }
+
+    #[test]
+    fn nested_helper_values_are_planned_on_the_heap() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let text = format!(
+                    "def f := {}0{}",
+                    "let f (x : Nat) : Nat := ".repeat(350),
+                    "; f 0".repeat(350)
+                );
+                let parsed = parse_definition(text.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_normalized().unwrap(), text.as_bytes());
             })
             .unwrap()
             .join()

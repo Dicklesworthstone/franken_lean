@@ -552,64 +552,109 @@ fn branch_value(
     splices: &mut Splices,
     updates: &HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let bounded = &tokens[..range.end];
-    let (bindings, body_start) = bounded_let_bindings(view, bounded, range.start)?;
-    let mut value = bounded_term_spliced(
-        leaves,
-        view,
-        tokens,
-        body_start..range.end,
-        grammar,
-        splices,
-        updates,
-    )?;
-    for binding in bindings.into_iter().rev() {
-        let local_value = bounded_term_spliced(
-            leaves,
-            view,
-            tokens,
-            binding.value,
-            grammar,
-            splices,
-            updates,
-        )?;
-        let annotation = match binding.explicit_type {
-            Some((colon, type_range)) => null_node(vec![Syntax::node(
-                parser_kind(&["Term", "typeSpec"]),
-                vec![
-                    leaves.leaf(colon)?,
-                    bounded_term_spliced(
-                        leaves, view, tokens, type_range, grammar, splices, updates,
-                    )?,
-                ],
-            )]),
-            None => null_node(vec![]),
-        };
-        let declaration = Syntax::node(
-            parser_kind(&["Term", "letIdDecl"]),
-            vec![
-                Syntax::node(
-                    parser_kind(&["Term", "letId"]),
-                    vec![leaves.leaf(binding.name)?],
-                ),
-                null_node(vec![]),
-                annotation,
-                leaves.leaf(binding.assignment)?,
-                local_value,
-            ],
-        );
-        value = Syntax::node(
-            parser_kind(&["Term", "let"]),
-            vec![
-                leaves.leaf(binding.keyword)?,
-                Syntax::node(parser_kind(&["Term", "letConfig"]), vec![null_node(vec![])]),
-                Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
-                leaves.leaf(binding.separator)?,
-                value,
-            ],
-        );
+    if is_symbol(tokens, range.start, "let") {
+        let_values(leaves, view, tokens, range, grammar, splices, updates)
+    } else {
+        bounded_term_spliced(leaves, view, tokens, range, grammar, splices, updates)
     }
-    Ok(value)
+}
+
+// Keep construction temporaries off the ordinary-term parser's small stack.
+#[inline(never)]
+fn let_values(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut Splices,
+    updates: &HashSet<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    enum Task {
+        Value(Range<usize>),
+        Close(Vec<LetBindingTokens>),
+    }
+    let mut tasks = vec![Task::Value(range)];
+    let mut values = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Value(range) => {
+                let (bindings, body_start) =
+                    bounded_let_bindings(view, &tokens[..range.end], range.start)?;
+                if bindings.is_empty() {
+                    values.push(bounded_term_spliced(
+                        leaves, view, tokens, range, grammar, splices, updates,
+                    )?);
+                    continue;
+                }
+                if grammar == DefinitionGrammar::NatOnly
+                    && bindings.iter().any(|b| !b.parameters.is_empty())
+                {
+                    return Err(refuse(view, tokens, range.start));
+                }
+                let bodies = bindings.iter().map(|b| b.value.clone()).collect::<Vec<_>>();
+                tasks.push(Task::Close(bindings));
+                tasks.push(Task::Value(body_start..range.end));
+                tasks.extend(bodies.into_iter().rev().map(Task::Value));
+            }
+            Task::Close(bindings) => {
+                let mut value = values.pop().expect("let continuation follows its values");
+                for binding in bindings.into_iter().rev() {
+                    let local_value = values.pop().expect("let value precedes its continuation");
+                    let annotation = match binding.explicit_type {
+                        Some((colon, type_range)) => null_node(vec![Syntax::node(
+                            parser_kind(&["Term", "typeSpec"]),
+                            vec![
+                                leaves.leaf(colon)?,
+                                bounded_term_spliced(
+                                    leaves, view, tokens, type_range, grammar, splices, updates,
+                                )?,
+                            ],
+                        )]),
+                        None => null_node(vec![]),
+                    };
+                    // The binder parser owns these domains and their child
+                    // matches; leave every value/continuation splice untouched.
+                    for parameter in &binding.parameters {
+                        splices.retain(|start, _| !parameter.type_range.contains(start));
+                    }
+                    let parameters =
+                        bounded_binder_syntax(leaves, view, tokens, binding.parameters, grammar)?;
+                    let declaration = Syntax::node(
+                        parser_kind(&["Term", "letIdDecl"]),
+                        vec![
+                            Syntax::node(
+                                parser_kind(&["Term", "letId"]),
+                                vec![leaves.leaf(binding.name)?],
+                            ),
+                            null_node(parameters),
+                            annotation,
+                            leaves.leaf(binding.assignment)?,
+                            local_value,
+                        ],
+                    );
+                    value = Syntax::node(
+                        parser_kind(&["Term", "let"]),
+                        vec![
+                            leaves.leaf(binding.keyword)?,
+                            Syntax::node(
+                                parser_kind(&["Term", "letConfig"]),
+                                vec![null_node(vec![])],
+                            ),
+                            Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
+                            leaves.leaf(binding.separator)?,
+                            value,
+                        ],
+                    );
+                }
+                values.push(value);
+            }
+        }
+    }
+    if values.len() != 1 {
+        return Err(refuse(view, tokens, 0));
+    }
+    Ok(values.pop().expect("one local value"))
 }
 
 pub(super) fn parse(
@@ -671,7 +716,7 @@ fn parse_planned(
     }
     let mut splices = Splices::new();
     let updates = record_terms::update_openers(tokens, range.clone());
-    bounded_term_spliced(leaves, view, tokens, range, grammar, &mut splices, &updates)
+    branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)
 }
 
 fn parse_compound(
@@ -835,8 +880,7 @@ fn parse_compound(
         };
         splices.insert(plan.start, (plan.end, syntax));
     }
-    let result =
-        bounded_term_spliced(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
+    let result = branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
     if !splices.is_empty() {
         return Err(refuse(view, tokens, 0));
     }
