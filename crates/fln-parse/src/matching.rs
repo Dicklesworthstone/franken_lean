@@ -638,7 +638,35 @@ pub(super) fn declaration_equations(
     parse_planned(leaves, view, tokens, range, grammar, true)
 }
 
+// Keep match construction's temporaries off the ordinary-term call stack:
+// tactic arguments reenter this dispatcher while their enclosing term is live.
 fn parse_planned(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    grammar: DefinitionGrammar,
+    equations: bool,
+) -> Result<Syntax, NatDefinitionParseError> {
+    // Tactic blocks own their pipes; their bounded arguments reenter here.
+    if grammar == DefinitionGrammar::Scalar
+        && !is_symbol(tokens, range.start, "by")
+        && (equations
+            || range.clone().any(|at| {
+                is_symbol(tokens, at, "if")
+                    || is_symbol(tokens, at, "match")
+                    || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
+                        && is_symbol(tokens, at + 1, "|"))
+            }))
+    {
+        return parse_compound(leaves, view, tokens, range, grammar, equations);
+    }
+    let mut splices = Splices::new();
+    let updates = record_terms::update_openers(tokens, range.clone());
+    bounded_term_spliced(leaves, view, tokens, range, grammar, &mut splices, &updates)
+}
+
+fn parse_compound(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
@@ -648,177 +676,156 @@ fn parse_planned(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut splices = Splices::new();
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
-    if grammar == DefinitionGrammar::Scalar
-        // A tactic block owns its statement and alternative boundaries. Its
-        // individual term arguments reenter this planner at bounded ranges;
-        // planning their matches across the whole proof confuses tactic pipes
-        // with constructor alternatives and swallows following instructions.
-        && !is_symbol(tokens, range.start, "by")
-        && (equations
-            || range.clone().any(|at| {
-                is_symbol(tokens, at, "if") || is_symbol(tokens, at, "match")
-                    || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
-                        && is_symbol(tokens, at + 1, "|"))
-            }))
-    {
-        for planned in plan(view, tokens, range.clone(), equations)? {
-            let plan = match planned {
-                Plan::Match(plan) => plan,
-                Plan::Conditional(plan) => {
-                    let then_at = plan.then_at.expect("planned then");
-                    let else_at = plan.else_at.expect("planned else");
-                    let named = is_symbol(tokens, plan.start + 2, ":");
-                    let binding = if named {
-                        null_node(vec![
-                            leaves.leaf(plan.start + 1)?,
-                            leaves.leaf(plan.start + 2)?,
-                        ])
-                    } else {
-                        null_node(vec![])
-                    };
-                    let begin = plan.start + if named { 3 } else { 1 };
-                    let condition = branch_value(
-                        leaves,
-                        view,
-                        tokens,
-                        begin..then_at,
-                        grammar,
-                        &mut splices,
-                        &updates,
-                    )?;
-                    let yes = branch_value(
-                        leaves,
-                        view,
-                        tokens,
-                        then_at + 1..else_at,
-                        grammar,
-                        &mut splices,
-                        &updates,
-                    )?;
-                    let no = branch_value(
-                        leaves,
-                        view,
-                        tokens,
-                        else_at + 1..plan.end,
-                        grammar,
-                        &mut splices,
-                        &updates,
-                    )?;
-                    let syntax = Syntax::node(
-                        parser_kind(&["Term", "ifThenElse"]),
-                        vec![
-                            leaves.leaf(plan.start)?,
-                            binding,
-                            condition,
-                            leaves.leaf(then_at)?,
-                            yes,
-                            leaves.leaf(else_at)?,
-                            no,
-                        ],
-                    );
-                    splices.insert(plan.start, (plan.end, syntax));
-                    continue;
-                }
-            };
-            let with = plan.with.expect("validated match header");
-            let equation_root = equations && plan.start == range.start;
-            let mut discriminators = Vec::new();
-            let discriminant_columns = if equation_root || plan.function {
-                Vec::new()
-            } else {
-                columns(tokens, plan.start + 1..with)
-            };
-            let arity = if equation_root || plan.function {
-                let first = plan.alternatives.first().expect("validated equation row");
-                columns(
-                    tokens,
-                    first.pipe + 1..first.arrow.expect("validated arrow"),
-                )
-                .len()
-            } else {
-                discriminant_columns.len()
-            };
-            for (range, comma) in discriminant_columns {
-                let discriminator = bounded_term_spliced(
+    for planned in plan(view, tokens, range.clone(), equations)? {
+        let plan = match planned {
+            Plan::Match(plan) => plan,
+            Plan::Conditional(plan) => {
+                let then_at = plan.then_at.expect("planned then");
+                let else_at = plan.else_at.expect("planned else");
+                let named = is_symbol(tokens, plan.start + 2, ":");
+                let binding = if named {
+                    null_node(vec![
+                        leaves.leaf(plan.start + 1)?,
+                        leaves.leaf(plan.start + 2)?,
+                    ])
+                } else {
+                    null_node(vec![])
+                };
+                let begin = plan.start + if named { 3 } else { 1 };
+                let condition = branch_value(
                     leaves,
                     view,
                     tokens,
-                    range,
+                    begin..then_at,
                     grammar,
                     &mut splices,
                     &updates,
                 )?;
-                discriminators.push(Syntax::node(
-                    parser_kind(&["Term", "matchDiscr"]),
-                    vec![null_node(vec![]), discriminator],
-                ));
-                if let Some(comma) = comma {
-                    discriminators.push(leaves.leaf(comma)?);
-                }
-            }
-            let mut alternatives = Vec::new();
-            for alt in plan.alternatives {
-                let arrow = alt.arrow.expect("validated alternative");
-                let pattern_columns = columns(tokens, alt.pipe + 1..arrow);
-                if pattern_columns.len() != arity {
-                    return Err(refuse(view, tokens, alt.pipe));
-                }
-                let mut patterns = Vec::new();
-                for (range, comma) in pattern_columns {
-                    patterns.push(pattern(leaves, view, tokens, range)?);
-                    if let Some(comma) = comma {
-                        patterns.push(leaves.leaf(comma)?);
-                    }
-                }
-                let rhs = branch_value(
+                let yes = branch_value(
                     leaves,
                     view,
                     tokens,
-                    arrow + 1..alt.end,
+                    then_at + 1..else_at,
                     grammar,
                     &mut splices,
                     &updates,
                 )?;
-                alternatives.push(Syntax::node(
-                    parser_kind(&["Term", "matchAlt"]),
-                    vec![
-                        leaves.leaf(alt.pipe)?,
-                        null_node(vec![null_node(patterns)]),
-                        leaves.leaf(arrow)?,
-                        rhs,
-                    ],
-                ));
-            }
-            let alternatives = Syntax::node(
-                parser_kind(&["Term", "matchAlts"]),
-                vec![null_node(alternatives)],
-            );
-            if equation_root {
-                if !splices.is_empty() {
-                    return Err(refuse(view, tokens, range.start));
-                }
-                return Ok(alternatives);
-            }
-            let syntax = if plan.function {
-                Syntax::node(
-                    parser_kind(&["Term", "fun"]),
-                    vec![leaves.leaf(plan.start)?, alternatives],
-                )
-            } else {
-                Syntax::node(
-                    parser_kind(&["Term", "match"]),
+                let no = branch_value(
+                    leaves,
+                    view,
+                    tokens,
+                    else_at + 1..plan.end,
+                    grammar,
+                    &mut splices,
+                    &updates,
+                )?;
+                let syntax = Syntax::node(
+                    parser_kind(&["Term", "ifThenElse"]),
                     vec![
                         leaves.leaf(plan.start)?,
-                        null_node(vec![]),
-                        null_node(vec![]),
-                        null_node(discriminators),
-                        leaves.leaf(with)?,
-                        alternatives,
+                        binding,
+                        condition,
+                        leaves.leaf(then_at)?,
+                        yes,
+                        leaves.leaf(else_at)?,
+                        no,
                     ],
-                )
-            };
-            splices.insert(plan.start, (plan.end, syntax));
+                );
+                splices.insert(plan.start, (plan.end, syntax));
+                continue;
+            }
+        };
+        let with = plan.with.expect("validated match header");
+        let equation_root = equations && plan.start == range.start;
+        let mut discriminators = Vec::new();
+        let discriminant_columns = if equation_root || plan.function {
+            Vec::new()
+        } else {
+            columns(tokens, plan.start + 1..with)
+        };
+        let arity = if equation_root || plan.function {
+            let first = plan.alternatives.first().expect("validated equation row");
+            columns(
+                tokens,
+                first.pipe + 1..first.arrow.expect("validated arrow"),
+            )
+            .len()
+        } else {
+            discriminant_columns.len()
+        };
+        for (range, comma) in discriminant_columns {
+            let discriminator =
+                bounded_term_spliced(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
+            discriminators.push(Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null_node(vec![]), discriminator],
+            ));
+            if let Some(comma) = comma {
+                discriminators.push(leaves.leaf(comma)?);
+            }
         }
+        let mut alternatives = Vec::new();
+        for alt in plan.alternatives {
+            let arrow = alt.arrow.expect("validated alternative");
+            let pattern_columns = columns(tokens, alt.pipe + 1..arrow);
+            if pattern_columns.len() != arity {
+                return Err(refuse(view, tokens, alt.pipe));
+            }
+            let mut patterns = Vec::new();
+            for (range, comma) in pattern_columns {
+                patterns.push(pattern(leaves, view, tokens, range)?);
+                if let Some(comma) = comma {
+                    patterns.push(leaves.leaf(comma)?);
+                }
+            }
+            let rhs = branch_value(
+                leaves,
+                view,
+                tokens,
+                arrow + 1..alt.end,
+                grammar,
+                &mut splices,
+                &updates,
+            )?;
+            alternatives.push(Syntax::node(
+                parser_kind(&["Term", "matchAlt"]),
+                vec![
+                    leaves.leaf(alt.pipe)?,
+                    null_node(vec![null_node(patterns)]),
+                    leaves.leaf(arrow)?,
+                    rhs,
+                ],
+            ));
+        }
+        let alternatives = Syntax::node(
+            parser_kind(&["Term", "matchAlts"]),
+            vec![null_node(alternatives)],
+        );
+        if equation_root {
+            if !splices.is_empty() {
+                return Err(refuse(view, tokens, range.start));
+            }
+            return Ok(alternatives);
+        }
+        let syntax = if plan.function {
+            Syntax::node(
+                parser_kind(&["Term", "fun"]),
+                vec![leaves.leaf(plan.start)?, alternatives],
+            )
+        } else {
+            Syntax::node(
+                parser_kind(&["Term", "match"]),
+                vec![
+                    leaves.leaf(plan.start)?,
+                    null_node(vec![]),
+                    null_node(vec![]),
+                    null_node(discriminators),
+                    leaves.leaf(with)?,
+                    alternatives,
+                ],
+            )
+        };
+        splices.insert(plan.start, (plan.end, syntax));
     }
     let result =
         bounded_term_spliced(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
