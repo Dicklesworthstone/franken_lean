@@ -41,10 +41,19 @@ jobs:
           }.items():
               assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() == digest, path
           PY
-          git apply --check --index target/calc-landing/integration.patch
-          git apply --index target/calc-landing/integration.patch
+          git apply --check --index --exclude=crates/fln-parse/src/matching.rs target/calc-landing/integration.patch
+          git apply --index --exclude=crates/fln-parse/src/matching.rs target/calc-landing/integration.patch
           python3 -I - <<'PY'
-          import subprocess
+          import pathlib, subprocess
+          # The compound-parser stack refactor changed this hunk's comments.
+          # Retain that refactor and insert only the original calc ownership rule.
+          path = pathlib.Path('crates/fln-parse/src/matching.rs')
+          text = path.read_text()
+          anchor = '        && !is_symbol(tokens, range.start, "by")\n'
+          assert text.count(anchor) == 1
+          assert '&& !is_symbol(tokens, range.start, "calc")' not in text
+          path.write_text(text.replace(anchor, anchor + '        && !is_symbol(tokens, range.start, "calc")\n', 1))
+          subprocess.run(['git', 'add', '--', str(path)], check=True)
           paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
           assert paths == {'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/tactics.rs', 'crates/fln-parse/src/lib.rs', 'crates/fln-parse/src/matching.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln-parse/src/proofs/elimination.rs', 'crates/fln/tests/source_calc.rs'}, paths
           PY
