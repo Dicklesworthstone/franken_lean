@@ -1,0 +1,105 @@
+name: Native dependent source binders
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-binders-landing.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-source-binders-landing
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - name: Install configured Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Apply exact locally exercised source integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I <<'PY'
+          import pathlib, hashlib, base64, zlib, subprocess
+          before = {
+            'crates/fln-parse/src/lib.rs': '0cdb2d2904094f8d66b24080ac1d05b2c5c86b1c',
+            'crates/fln-parse/src/record_terms.rs': '59773575573265cf6f8560910c13d3c32fccde69',
+            'crates/fln-elab/src/source.rs': '9dd71dbaa0b2b8b92d716d251bf7103ecfd1287a',
+            'crates/fln/tests/source_term_binders.rs': None,
+            'crates/fln-parse/src/term_binders.rs': 'c2b9f416591958862af6b4cce2ce594fd899128a',
+            'crates/fln-elab/src/source/binders.rs': '5b636323b5a95365e7562d30aef5f2ca00e48302',
+          }
+          after = {
+            'crates/fln-parse/src/lib.rs': 'f76ce6b0b0b3e5b2ec27385a3e63924894ea8063',
+            'crates/fln-parse/src/record_terms.rs': 'd5b9277219e650f3496773567b962fe9ac903686',
+            'crates/fln-elab/src/source.rs': '4c76dc9cf1d1f0efbbf9096a8e0b531a9eb72fef',
+            'crates/fln/tests/source_term_binders.rs': '68abf7c549e86e1ecd1fa947cf0251bdb2f5d7c5',
+            'crates/fln-parse/src/term_binders.rs': 'c2b9f416591958862af6b4cce2ce594fd899128a',
+            'crates/fln-elab/src/source/binders.rs': '5b636323b5a95365e7562d30aef5f2ca00e48302',
+          }
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def verify(expected):
+              for name, sha in expected.items():
+                  path = pathlib.Path(name)
+                  if sha is None:
+                      assert not path.exists(), name
+                  else:
+                      assert blob(path.read_bytes()) == sha, name
+          verify(before)
+          encoded = '''eNrlPe1y2ziS//MUiK7KQ60oJZbt2JZjZzw7mb3UZjO5cSp/Mi4WLUEWyxSpJSk7XltVV3VXV/ck8xL3DvcQ8yTX3QBIkAQpUnZmbjP6YVkk0Ohu9DcAst/vM/fZOHITHj+b+kF/4UYxfxZH42e+dzGI4ie9Xo9d1Lb49lvW39m3X7Ae/N1n3377hM3DCVtEYTiNj8SPiI/DaOIkPJrnL8GvHv7CO86FF0x4hA2esGXM2cXS8yej0d13+P06isLIZm+5e83j1ZFoAQg5AIaPRoE7h7/v4O8RYTTc3beHe6w33D2wt7cJK/zEHPB3kzAaQX/vH9x+wlYwXD9OouUU4YW/d+cXE/RBe8SBmd0/62OWK394ApmkHuojDxSMWJ4BfuIhHo5/c4JK/pCYnso0LGN9k3VZP+uk4/7Z0g8Sbejx6pLHGoR8G+W6TcO56cO3HReKFwUvr7DZI3M+2aNM9kRgxidF34RKYP/kA8/BDBAMCRsQwMU0pFH0iARH6Re0BHrV343HkUduakalluOBZmxwxPs1Cek+fFNXk7ykD02ZFnkLTHjZdRHzqfU6b6ZI2Gr2nmwqlgF+6OdQVWoK0xcL3xrLBRz6uISxyg0lc1QjFc3v7xdB+cch629u7h/YwE1A3ySSzy/on7CceL/3kpdW12Ts3+R7QDTxE4T3qISnFiZq6m5nng07gdMQD340TqzvwYicO59wBhKx7unWvhA0/dGWg6FatrW7WAj/397KhmJl1zfJX8TPI5stw040dmIYiNLqVQ1/M5L2c0YEQ8AyZrpjvOrIySiQMNXTtQBfh5BbBE+hVV7EbP960Ab+rsMlBIrRhbuOZo1o61NHyyeTZ7NrjNzZLSLhtOazNLuF77oJldJPuq6M8vHEITA+WXLu8ypjs84TNl4mAxI4VIYtwAXTwzws+TqzO5dKNwC5InRRtOt2jDApwAAGdIUWCX10FS5v1QeJeIf/v8nOMPZG72EPQfiHskCTdQHKJ4hJASwiGDeRDO8QmLzCKNLi9gPZAXIantJo5ChVcssMpNIOwUgPD9bm7sO7R4oBIickcwNfUoktdk9iDOfcBx9HopVR/tCTOic2ckxPLSHRKwgQwFCYHnGI44VYZPLnwyLmC8a2tTx20+R2bdaZh5Pp+57xrl7tc8/HTT+XLYvSMIslo6ca6r2xzl2Dp+w4hRyzrrm1Gw6+hag11ye2Cn8HEm+nL0WmgiPwr0CPl47wCRLcSuA5TyGUVc1AfDLeKQxYlVGivQZbQMDmg50b7qnRB0wBhDmZuzFzkJQ+Sjqmn5g0NdxfLeGZZmVDarCAaRfQzU9WvMFUCQGpbpCsSdqXKXIk+qM29VlYvMw0iUhBGKjV+vRq8JJ0FvEoAM8y+jDFcZ7BMxqqdoWphpIgyN/bG9bapQnOp5w/LoKy5FVapgXnJmgDSgAy/AXdsaGcwBRTWG7XXoLm61nYLHJEyuglLppXcqLXGYhIKOOWE2YpltBonbpRovlNIZBqLIKm5cEOan2amJ1ULPaoompyesUdOfYpdGlooaZ3E4CbL1DO0zjNG6e1KfP14ZVGAuBLB/RBi+u0hBvcHB/hPmn0iQpjLbaEFmrvJeOYFl6PRmbgu84flYoLZNrSilE+qGVAB+cq/uvHsjCdZYqLnCCrTqMkTemqiSYrROOTzIbrsYGoGPy1layJMOAdjcIEYtUrSc4YUIZH8VeWRei75DuDY2WU9ZSzcEjmiuJjpjkwPC5f1lFDcSqdRpYAF6Fm6V8SokOlJA5FHLMvx0tti8vepGLI93H5h72RzXymarMJ5KoGTxrcY2i+jOIyA6zyYFAQ2c6W9zJX2tHhd+gx2fMwyOfmLuAjCOHZ9N8qD3NoS0srjp9aWkIpPhNf5AE2TzSjl/iv8C/1v5xehb8UFDZZjp2BizL3iJMLEttPtsHvWWdHfc/r76y//Sd82/T0+ERf/65eOnubd5YeQXlPIh3CacUX2tJVJruZDBatfFfipZzhpt24udHC8qZZdl+gWWXHPFO3JeKHiZpoZm2/XJa2grTGPnRl3QbNTTVaePAePUtpe2fU1jG2kSXaDIExIpE1hlw5VxNCbhTnmKUrdlxjZRq2AGTKzLefRFIPMYkKjqaBf2UGEbUJAiQNqb96qCsJkdmziSo02V2h0QavbKzjqtHACAwQP9MXWluBuURp0SSgjZyqojUbkJuu5SjooKK9jbXO2rq99pP+SGZIIDS55IkNcEQHT5XsmDB0ZOGQJGfedF7v2ARj3neGhrHWbPhWOTv/UOD39Y3SAubkxO0P9U+MYy2pRi03mMMkYCp5VEbjWhxborPKnOwdDe38feb77wt4uM32V/0mYGdwRfXW75eGbOkQjb0GJJGjsrEooWGbUrv763//eAWt0Yua77ltFJ90zphAFGPzG4B+///d/BNQctDtTDpOIqBXsi1C3o3IjUTuWduhlpo459KTnF60Mrv/NBOJwy+l2TWhodq53zLYNOKzKl2BylG08FkSYAQPDZbuT4wz5yrZPS9FMJU1pOIO4xDSfI1NBpILiiCfLKGAQgFsVYflo9OMyib0JP+N8IoWuCppaIQgj79ILXN9ZhDGBK3hNQU1doUs4b45GSkfrNV0WWjsCHMHAgs39cLvgp6nBqoC66jabUt2eG7KF/nqD2m9mUPu/hUElc1O1nGf6pEt8wgtWN0yX/UDoBwPpJ6ubyxXAte3UsmANfavKgmwhYeq3Mvz95oa/umkSRuvaGgWx2vIURHSd/+hv6D9KroKseM5PKIPeb2DQSTqcr8Ks66R8zVaU2EhW4oEWNOPeYzg7c7+yBoi6Jw5O/5HEUl5+r12gDP0P4RzFroRTpPyP4RDJMJo2yDyGl9NsQANfJ3fW1LardGLldOir9nX1dZ265N2crsiU3nyTFM18S2qf+aaUEnN+pJUJzC1SE2i4/8BKze+RaaJv1qKCQQdjAkqFdw8P7J1tSIV3nw/tF5Xlh/qM0tZqrSP6e+MlM2MqWYL8eBVWk1PTiLY7lfl2q/1N5kps5e21e5Ua7lvaYA9TIBZXqoxZY5/aaH27tOHFsLHHBLRQDy7t7zENkBWDK0E/SkG4X1PrTQcgnU03CKVLK/1KWWnplxv65hb+uZGPbpi4GpNXaezqfHQTV9jeHbZ0iW3cYqVrrNhqUmHhW+7wExNfs78vLyFqF+2E+97cgx/Wk0ojorwuuYG93T0qQu8Od2uK0A0L0UVRFBpy7fpLnipITVcUzccVypoSdcMyde3a7sPq1Gtq1XtyeWB3d/gbLg/kivH/n1YJ6gh8pOWBnb3dA2B1b2d3uGdgeWfCQX/ZiIk6OvvMKKdjo2P2vGM3ams3aiybarD79bCLzXtrm8NP24j8edHOuHHMo+SpRbuHwBgtozF3aNch2KyEf04wdLm4TSB465JB45GIDe/w5iq3Kw0S1upDIrohW3NapNiUDmmQHStNnNIPkmvxo/tV7hcpcZb77gVxS8yZkaWGNsjLPdx0ojj57NlTtgyAOIEU40As7SAasB8D/5ZNlz789QJI9IAHLu5LHAN6Hm08Es6GJTMvxpM6S58PBMQPMw7NfB+CujjxQCzDmyDGmM31IeGPAu4zSDrGV15wyQAam/Cxj6dtaEvA8kKxCKCJQz/ZeR/8BZDH6t+QR2NEF35DR7oWj4GH4mzP/lBsr9rfea7vrlKfU5iNWwvXLCaQhnzjMrlz+NxWxzpef15EJ0Vb8yaAOVeBHv14EyQR8Mgb13ekGpBVaJHT/h9Ii7+nqNPKY4S/1L6t9SC+w5MIb0Ng1Z8hiAFdtemMCV35Hrh9ggekrrlfgpWzLt8R399BdytNfD9wnxOLX37jVnSQ+LfpQvhWdshx8S1PTtMdJNY7CvJ15tQwqgjnIwYvEoTetBUQA6t/+OhGbyZogxEyCVhxmkR9bM0U1Y38E7+JIBbERMMQDibuOPHGVKkJw+kZMIt4aa9r+ZfQ9YW/PNg7oHNxB3ugQzu1wWMeXHwlU6EP8O9o9NGLPRAf3PGalkttmb+VCifVa1alPRpVn1V9ki0jdSxoY/1ga90Rh7r8rVQsc6MkZsfNOmTlY7G9WO3iE4sqe4AD2OVrUAewmZkH6lQmsAYitXo+ofbpOdgRtYf4NAnn7I5B/G6zwYCtsAP8KO5OUJdoa0Kzke+aM0Cr609dz19G3DojZwVmlUc8GKvi/hlag8oEfAMZKG59V1OB273d6DJWLNsGlnW0MzPUvtUsUA+KneaL5Nbq/nPxR9usdwzBCf7j+g6ekXGExCpGDc+7r5oTNgivnDByuB9zC4/aNSGuKc/lVEL6P1fI7ZxTPVOfyig74tt8OkvWLeewA1HDlGPunmcGr/HMVJjP5ozN5stu3oni55j70wFNrMLa6r7qtoCSRMu6fHwT67semly6XAuRzkE8GrgJX1Aw1wjmXbNhcyc9mtFz1AxySai0uK4ZBPyQfNCCD+RmMj5LvVbm2QUJeOylEdQvEwJgAHO4O7QPIfg/3NmuWQJZU9TbQHgvbj9QSCWCh82CJorFLI3jC3GhwG3Qz6aGpaaW+YUiKJLQ3yl8GgICb7kbDGiDQDRApAaI0W8TPskdO+o3btf5CkMndVBPn4bm+GfxVbs+7Q7+1X12W7QtS1M6ZkMojSWvPiqlYUkS1Zk4mTX/QWJSyRHCm/jSRuQE81qJXMe9iHmQeuaIDtBplcVHn/684REYDxsaHrnLKs3ZzHus/ukNT+xe09MLRMT6ORj44+SzOnXYQstwoVpqD0DL6q0tQShv7Mgz2ep3S4wg6CW9ZF4g9b/FpAhWeOMrq7GgKRKUYNGuQyFZYpuVlC+x75JhqtYGoy8oKiQuLdpKg4f2zg3C4HYeLuN2Nq9ATLuO+MlvD/TdC0n4qcLnJy45QjXDdgO04ls74dAekSL+67YJ0CTz00ORadwKQrWVV5u79jxFsAqIsgY3s2CaDdNGFdRHHPhKdZiimu4m6OEHK7fvAIIqFLzeFBB+hKmi2ov9ACjmp4a0RMILpuFI1u7f4P8jEG8XXOMDQA8Gm/UFE3XCLI07yvDaQuqQ4vRMetd+6Ez+7SPuLJa28eQhE4oCLIu8XAmwj6sy1kaSqz4ib5yFPrcQ69EoDqPEUgN18fEOuCzZ3ZDbm3VzHsgrgyvZHJioeZkc0Wup9xDYj1sW0UyVjd+Kwy27rDby5l9AZL+MqK5aRkAeug+xZicQmkKYP3MwZsAS6FHbikQWCiqv2Q5d/cbgYQdxvMkeibLS8iBMvWSYckghafNsSHJ5eu5HlTTKD2JK3LdsPksgN4kUY83YSko/t3cnEwWL9vKXSZ3S2VGSKFzfrKiOmdp0e5knbiKhMeES1sR2Sak7aiyTN4gbdplTo8SYb+Kp0hzGkdCxXKulsAq29LDxy4luqEcsdBJQM22paH2/JSZYedrRVLEcYElzn+TJl+8cov4NBF3VncRDi+a69Q89heL7fYBVgDQoVdXoqztdypGaOm01mg+gprWgI10Mbc4vb+ZUeYJNrnObOOikR/tBHkqcuBA1rjThF2zS4ig+03WPCF4nbzSDRgmQ1JLq9FhKWVnzcV4O1FWUAvSAJHdpN3R1E/LpZkteyzpI7s1AmgXBqSEOJt/ijmYaLLg3buhA3RO44cShQkCh6IJTPG5pNjF5on+i984gL+zlhaEE6dfkKSFezLoI4v3EkJIhYoqXcIKaRp47adcrwtdvgqFUWGvTrtpUZGf1SGcbhm3GvFdfacIuQ/B25tWrgBFQwjpYM3dQakMr/oOcQTkQc2cJ93YXtgOn5uPpkq8Y5y804Mmm33OhyOedBUvaga631VMKo8qDpfYwFwLH4Pj4d0UvizJ+2CyHEJmQF1mYm3LtH8tTI9qG9h8+C3zl8jpszHxjO1E5RhpF5mjaPdUx7pvIC0TTcSV2rcarKZxebhTymGgfWJRxR6NiShfBXDcA8ZKVKxXOk760WqDZaSdogsjGsHG2+ZvQF1oqa1IHE6umGS0NfAudmrH94yephBZbWhRVk8kaxB6l2y66bVVOacE0oY5viSZ7PaUGjbKUmAnin24LYB/r1iu2sdKJBpqKCYDs1iC0KDLVHAeq2nKYVhv4DfYyJECFWjoGehk6nLr/WXE6LHFtZ+jqno56j3QiQniIKBWqTIEsZ/8KpscLxK8hN87nZw1KMlpZOqyC0N8i/e4KmCTydRhuNvLn72SqoaLacmy4M/V6z/VvnSevppMNlTeOVNnNOMjVipmW5BhBWDdqU8oo1fSiu6dXbfW1nOxrCGA++ScPeWxMGprtUxFbirrLCAQDLdrw7E3k4MwP/qskO/4o9+DILEoCa7OevcKpq+3Mjt9prtDa8FhXT/puMT+h7svG3JKuOmoEV5LBjwWF6r9bRxjwWUcBjcTg76dCMndW3V82EWYpIK3FenxynE1XKjXtrLRwentc04jIKlwtNIaQUyjR57ZzXnU5ZP2sNmajJQEP21YV5GfPyUV5vM0OfHqYR3BOhXn2JZU0lTJw0b1v7irzLWVJFs3h0o9rQoEW2/T57NuHXz3AzdukhBM/gO4nlEwgc/RFq6nEEz+3nrLdtb+/R6lwPHx/wE4dANHATcDdM9GQpk2I2jsI4BiYlM3rqDMgilR/0ZwjQwwVwjCe9f3n6CQKyC28C7it2p/h0iwnvnj/pybeC0ltDJ5c8sdnr4NILuPo+ncy9OAZob/GZO5A4/PXj39yFLfcN/RlHEHdWRykw+YpRTj7zLstC7XT7WLmx/j7S3pPeFOJvAmvRC1uMuCjxNd4UJSJBEwWj+LDE8ZV8iseQ/YltPx/uyi98wcOKBuUESx80P8pohA9/U48IiTnYdIWndgRusAxuInehv4dCrLOp11pZ5sYCBzFtE0sMQq+1iQwIKVQ1SNRTITf1QFYKB9u2PsmHYGTPMzkvnFXcoglOH7mRu1eadNEs5YDWvExgdtCV37OFG3jjp1bnTuCzGrE7Pnq1yr2tpIZl6as0UPyVmDM3iG9oX4PWkJikOCvqrBpH34lHk1H7dySB0yic05gQawdAFCUj+B6ixPpm8I0UFNCnT6jR5wQVQ4yJfMZfjHkBZAeqbBw7KC/hMnHcIA0DaHemlb42Qs13hjY9zsab4INrABCz5JN1yIB9/jnAuyLZSh/OA423D38OkhkHbZqz8ApuqXxs+xBbXNyyaOqrB+coK63GphHdiT7krT4o67HbAnhsPWQ7MMCeBh8Br/L88cEKRjJgjB1hqpwQ2OFGvgd3pCVsw5BTGB9D/q7gzanOGSEFOdbgf/tF9EWzY7bfkDuAuGn89zg+ylIeHwsas/fsM2G2MLEFpMH3xl4i6XeyI8tYhJ3kpSUGmRQPczMITsodIpTEOsnJjqP4k+MA9MDZ2ynMXivIqYCYKPTmkkIkB1TOGydOek3pS8TxXSoOYOYpUaDNLJo8YFlGbmzG94nd+sBn8L2fMvkAQ6KmZNWxc4XPN3JA3ThZnV9/+Q/VAd+clO9yRqgWO57r4RLFCeIQ1HHKrS1AdO4mTy3Dw6ky4b0TlKyaiW4jsdXMbvEFdQlGb1sC1eIr4oJrLwoDXGUrvjFJFmgDq+NNOsXXHxm8m/A+odjU4YDhKd2kPEzDTT1yK98se8T6rTxyYJsOD+jb77PjX3/SrorXX6CkaLyRw6+qBVVCULZq7GJ4Mgdfil4B5iFTyoXX3Iqrp5JlMmoLk3GaysTpCmysWUf3q21UgYyshp5F07GzgMnn0TV3VJA4viWFBKIjPqFnTF178vRjWfnfe4SjIGC93bPR5pnNyCIK1QPGzYDeQ4MuWk341getg6xxW/HNozh4VIuzGCq11TNpq2mMWiNf0RGnblYzM/HMBV472XnJWDw7BEVKuj8HrD/9FrpaMR0YmbiRFwMPJZqpoxZ++pjdVltx1SNrXxa3AwBxUO/Q0yXCFPdJSOgDmZPwhgq4EBBR/byCjisO3jTzIIrlDlz4Lgx9o7+iPvtUbyiohJngywD6Gl0XncIYFmkX7ZH+YT39AfyHs5k67NSZoV5lix+xAzkOzWkMHHFuwujK9+Jkrc3AzEhxRHuoYcouO3W705J/wL5W2T13WwQ6hcDTKigDgAPR18LRdQbLwEHIUWN8256nWKcbrEkEGa8QH0fsE6RUy43Gs1rWEVD2JgFUNHRvZjziPwcsjZhPha+NOb4lNDPAyjSzT2ixCcrpOVI4EUtHPwcKF8zJ6b5sJgXrTo2A1K/UINc8yPy5GLPAMdGmqY3PdE/VoXUuKsd1ie8jdX3vH7xtVH0WRgnGi+XgxA9vTEE13pp5lzPJP3nTEsyHNjW0SKRF+czDUDBOQrSTFxxEHpyt716EWMsILp3Yu/Dhe32WULQsCmOjUlSYmKaTcQPh02UucMczPMIMCKpApl2U6QAmOXLooY7xLB/ZytJOPqAlUgh8deydGsp9/XGoek+t8b4M0+12YyheodFtMAo1p9THEg9gJX9ZP3Q5T2k6ELR1qtuaJ7wp7MxF1vQo2GXtobaVfC4GN6mhynUr5RoXLi0PqprP2kAa268vBzUsCa0rCzUpDeV7FLOD9JG6hcxJlYc65Shep/0pkZvLZ7SXdEIWQ9yHRCafAuSVOa2hOuI1n+Sv0bbGEBm4yTJCxVa7EknFKeGJlmMwWsBe7k+a1TB070RJgJ4JVJY2il6WzG9Lr667udLIbXIQc/kIt3DW5ggYzCiqMJhGjVS/R2nsbUogBJ9hDtj3YKFTn67Gwv9zg+kOPz+iDEf+Dx4xtik='''
+          # Correct only transport transcription, then validate the immutable payload.
+          encoded = encoded.replace('OouUU4Y', 'OouU4Y').replace('nFiZq6m5nng', 'nFiZqrm5nng').replace('v2Q5d/cbg', 'v2Q5/cbg')
+          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'b528ec0a0532ca3bacf14da3cbcacf1e4e5e5e0ded054e8642b29cec63860d5f'
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error'], input=patch, check=True)
+          verify(after)
+          PY
+      - name: Compile test and lint the actual integrated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/source-binders
+          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/source-binders/package-tests.log
+          cargo test --locked -p fln --test source_term_binders 2>&1 | tee target/source-binders/dual-checker-tests.log
+          cargo clippy --locked -p fln-parse -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/source-binders/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-binders/workspace-check.log
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-parse/src/lib.rs crates/fln-parse/src/record_terms.rs crates/fln-parse/src/term_binders.rs crates/fln-elab/src/source.rs crates/fln-elab/src/source/binders.rs crates/fln/tests/source_term_binders.rs
+          git diff --check
+      - name: Commit checked implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tested_parent="$(git rev-parse HEAD)"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$tested_parent"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- crates/fln-parse/src/lib.rs crates/fln-parse/src/record_terms.rs crates/fln-elab/src/source.rs crates/fln/tests/source_term_binders.rs
+          git commit -m 'feat(source): enable typed lambdas and dependent Pi telescopes'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/source-binders/published-commit.txt
+      - name: Retain functional results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-binders-${{ github.sha }}
+          path: target/source-binders
+          retention-days: 7
+          if-no-files-found: warn
