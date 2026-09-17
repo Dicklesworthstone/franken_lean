@@ -10,7 +10,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   rewriting:
-    if: startsWith(github.event.head_commit.message, 'feat(elab): verify and land named hypothesis rewrites')
+    if: >-
+      startsWith(github.event.head_commit.message, 'feat(elab): verify and land named hypothesis rewrites')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
