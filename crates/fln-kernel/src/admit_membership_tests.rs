@@ -78,11 +78,7 @@ fn finish_block(env: &Environment, mut block: InductiveBlock) -> InductiveBlock 
 }
 
 fn assert_membership_rejection(env: &Environment, block: InductiveBlock) {
-    let outcome = crate::check(
-        env,
-        &crate::Declaration::Inductive(block),
-        Budget::DEFAULT,
-    );
+    let outcome = crate::check(env, &crate::Declaration::Inductive(block), Budget::DEFAULT);
     match outcome {
         Outcome::Complete(Verdict::Rejected {
             class: RejectClass::BlockMismatch,
@@ -101,74 +97,95 @@ fn assert_membership_rejection(env: &Environment, block: InductiveBlock) {
 fn orphan_constructor_cannot_inhabit_an_empty_proposition() {
     let env = Environment::new();
     let mut block = finish_block(&env, empty_block(&["Empty"], Level::zero()));
-    // A well-formed type does not make this constructor part of the block.
+    // The forged type is well-formed, but it would inhabit an empty Prop.
+    // The old per-parent filter never visits this row; the generated Empty
+    // recursor still matches, leaving the poisoned row unchecked.
     block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
     assert_membership_rejection(&env, block);
+    assert!(!env.contains(&name("Empty")));
+    assert!(!env.contains(&name("Forged")));
 }
 
 #[test]
-fn already_declared_parent_does_not_authorize_an_orphan_constructor() {
-    let mut env = Environment::new();
-    let foreign = finish_block(&env, empty_block(&["Foreign"], Level::zero()));
-    for ind in &foreign.types {
-        env = scratch_add(&env, ConstantInfo::Inductive(ind.clone())).unwrap();
-    }
-    for rec in &foreign.recursors {
-        env = scratch_add(&env, ConstantInfo::Recursor(rec.clone())).unwrap();
-    }
+fn an_existing_parent_is_not_a_member_of_the_current_block() {
+    let base = Environment::new();
+    let foreign = finish_block(&base, empty_block(&["Foreign"], Level::zero()));
+    let foreign_type = foreign.types[0].clone();
+    let env = scratch_admit(
+        &base,
+        ConstantInfo::Induct(foreign_type.clone()),
+        &foreign_type.base.name,
+    )
+    .expect("publish the already-checked foreign type for this fixture");
     let mut block = finish_block(&env, empty_block(&["Empty"], Level::zero()));
     block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
     assert_membership_rejection(&env, block);
+    assert!(env.contains(&name("Foreign")));
+    assert!(!env.contains(&name("Empty")));
+    assert!(!env.contains(&name("Forged")));
 }
 
 #[test]
-fn orphan_type_is_not_allowed_to_escape_well_formedness_checks() {
+fn orphan_inventory_is_rejected_before_its_untrusted_type_is_traversed() {
     let env = Environment::new();
     let mut block = finish_block(&env, empty_block(&["Empty"], Level::zero()));
     let mut forged = constructor(name("Forged"), name("Foreign"), name("Empty"), 0);
-    forged.base.type_ = Expr::bvar(0);
+    forged.base.type_ = Expr::bvar(0).expect("packs");
     block.ctors.push(forged);
     assert_membership_rejection(&env, block);
 }
 
 #[test]
-fn synthesized_admission_also_rejects_orphan_constructors() {
+fn synthesized_admission_cannot_bypass_constructor_membership() {
     let env = Environment::new();
     let mut block = empty_block(&["Empty"], Level::zero());
+    Engine::new(&env, &block, Budget::DEFAULT)
+        .expect("valid baseline")
+        .run_synthesized()
+        .expect("the synthesis baseline must succeed");
     block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
     match Engine::new(&env, &block, Budget::DEFAULT) {
         Err(Stop::Reject(RejectClass::BlockMismatch, message)) => {
-            assert!(message.contains("outside the inductive block"));
+            assert!(message.contains("outside the inductive block"), "{message}");
         }
-        _ => panic!("synthesized admission must not acquire an engine for an orphan inventory"),
+        Err(other) => panic!("expected a typed membership rejection: {other:?}"),
+        Ok(_) => panic!("the synthesized path admitted an orphan inventory"),
     }
 }
 
 #[test]
-fn interleaved_mutual_constructor_rows_preserve_per_parent_order() {
+fn valid_mutual_constructors_may_be_interleaved_in_module_order() {
     let env = Environment::new();
-    let mut block = empty_block(&["A", "B"], Level::succ(Level::zero()));
-    let a0 = name("a0");
-    let a1 = name("a1");
-    let b0 = name("b0");
-    block.types[0].ctors = vec![a0.clone(), a1.clone()];
-    block.types[1].ctors = vec![b0.clone()];
-    block.ctors = vec![
-        constructor(a0, name("A"), name("A"), 0),
-        constructor(b0, name("B"), name("B"), 0),
-        constructor(a1, name("A"), name("A"), 1),
-    ];
+    let mut block = empty_block(&["Left", "Right"], Level::one());
+    for ind in &mut block.types {
+        ind.ctors = vec![
+            Name::str(ind.base.name.clone(), "first"),
+            Name::str(ind.base.name.clone(), "second"),
+        ];
+    }
+    for cidx in 0..2 {
+        for ind in &block.types {
+            block.ctors.push(constructor(
+                ind.ctors[cidx as usize].clone(),
+                ind.base.name.clone(),
+                ind.base.name.clone(),
+                cidx,
+            ));
+        }
+    }
     let accepted = finish_block(&env, block);
-    assert_eq!(accepted.ctors.len(), 3);
+    assert_eq!(accepted.ctors.len(), 4);
+    assert_eq!(accepted.recursors.len(), 2);
 }
 
 #[test]
-fn ordinary_constructor_inventory_still_admits() {
+fn valid_single_constructor_still_admits() {
     let env = Environment::new();
-    let mut block = empty_block(&["Unit"], Level::succ(Level::zero()));
-    let ctor = name("unit");
-    block.types[0].ctors = vec![ctor.clone()];
-    block.ctors.push(constructor(ctor, name("Unit"), name("Unit"), 0));
+    let mut block = empty_block(&["UnitLike"], Level::one());
+    let parent = block.types[0].base.name.clone();
+    let ctor_name = Name::str(parent.clone(), "mk");
+    block.types[0].ctors.push(ctor_name.clone());
+    block.ctors.push(constructor(ctor_name, parent.clone(), parent, 0));
     let accepted = finish_block(&env, block);
     assert_eq!(accepted.ctors.len(), 1);
 }
