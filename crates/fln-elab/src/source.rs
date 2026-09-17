@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod binders;
 mod calc;
 mod coercions;
 pub mod scope;
@@ -729,12 +730,12 @@ impl Context {
             Apply(Typed, &'a [Syntax], Option<Expr>),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
             Arrow(Option<Expr>),
-            ForallDomain(&'a [Syntax], &'a Syntax, Option<Expr>),
-            ForallBody(LocalContext, Vec<LocalDecl>, Level, Option<Expr>),
+            BinderNext(binders::Telescope<'a>),
+            BinderDomain(binders::Telescope<'a>),
+            BinderBody(binders::Telescope<'a>),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
             LetBody(LocalContext, FVarId, Name, Typed),
-            Lambda(LocalContext, Vec<LocalDecl>, Option<Expr>),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -858,25 +859,13 @@ impl Context {
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "forall"]) {
-                                    let parts =
-                                        expect_node(syntax, kind, 5, "universal quantifier")?;
-                                    if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "forall" || val == "∀")
-                                    {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    }
-                                    let names = expect_null_args(&parts[1], "quantified names")?;
-                                    if names.is_empty() {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    }
-                                    let annotation = optional_type_syntax(&parts[2])?
-                                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                                    expect_atom(&parts[3], ",", "quantifier separator")?;
-                                    tasks.push(Task::ForallDomain(names, &parts[4], expected));
-                                    tasks.push(Task::Visit(
-                                        annotation,
-                                        Some(self.type_expected()?),
-                                        true,
+                                if kind == &parser_kind(&["Term", "forall"])
+                                    || kind == &parser_kind(&["Term", "fun"])
+                                    || kind == &parser_kind(&["Term", "depArrow"])
+                                {
+                                    let lambda = kind == &parser_kind(&["Term", "fun"]);
+                                    tasks.push(Task::BinderNext(
+                                        self.start_telescope(syntax, expected, lambda)?,
                                     ));
                                     continue;
                                 }
@@ -942,92 +931,6 @@ impl Context {
                                 }
                                 if kind == &parser_kind(&["Term", "byTactic"]) {
                                     tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "fun"]) {
-                                    let parts =
-                                        expect_node(syntax, kind, 2, "Lean.Parser.Term.fun")?;
-                                    if !matches!(&parts[0], Syntax::Atom { val, .. } if val == "fun" || val == "λ")
-                                    {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    }
-                                    let basic = expect_node(
-                                        &parts[1],
-                                        &parser_kind(&["Term", "basicFun"]),
-                                        4,
-                                        "Lean.Parser.Term.basicFun",
-                                    )?;
-                                    let names = expect_null_args(&basic[0], "lambda binders")?;
-                                    if names.is_empty() {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    }
-                                    expect_empty_null(
-                                        &basic[1],
-                                        "absent lambda result ascription",
-                                    )?;
-                                    if !matches!(&basic[2], Syntax::Atom { val, .. } if val == "=>" || val == "↦")
-                                    {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    }
-                                    let saved = self.txn.lctx.clone();
-                                    let mut binders = Vec::new();
-                                    let mut expected_body = expected.clone();
-                                    for name in names {
-                                        self.tick()?;
-                                        let Syntax::Ident { val: name, .. } = name else {
-                                            return Err(failure(SourceInferenceError::Scope));
-                                        };
-                                        if name.is_anonymous() {
-                                            return Err(
-                                                NatDefinitionElabError::AnonymousReferenceName,
-                                            );
-                                        }
-                                        let (domain, codomain) =
-                                            if let Some(expected) = &expected_body {
-                                                let expected = self.whnf(expected)?;
-                                                match expected.node() {
-                                                    ExprNode::ForallE {
-                                                        binder_type,
-                                                        body,
-                                                        binder_info: BinderInfo::Default,
-                                                        ..
-                                                    } => (binder_type.clone(), Some(body.clone())),
-                                                    ExprNode::MVar { .. } => {
-                                                        let universe = self.level()?;
-                                                        (self.hole(Expr::sort(universe))?, None)
-                                                    }
-                                                    _ => {
-                                                        return Err(failure(
-                                                            SourceInferenceError::ExpectedFunction,
-                                                        ));
-                                                    }
-                                                }
-                                            } else {
-                                                let universe = self.level()?;
-                                                (self.hole(Expr::sort(universe))?, None)
-                                            };
-                                        let id = FVarId(self.fresh_name()?);
-                                        expected_body = codomain
-                                            .map(|body| {
-                                                self.substitute(&body, &Expr::fvar(id.clone()))
-                                            })
-                                            .transpose()?;
-                                        self.txn.lctx.add_param(
-                                            id.clone(),
-                                            name.clone(),
-                                            domain,
-                                            BinderInfo::Default,
-                                        );
-                                        binders.push(
-                                            self.txn
-                                                .lctx
-                                                .find(&id)
-                                                .expect("new lambda binder")
-                                                .clone(),
-                                        );
-                                    }
-                                    tasks.push(Task::Lambda(saved, binders, expected));
-                                    tasks.push(Task::Visit(&basic[3], expected_body, true));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "let"]) {
@@ -1404,38 +1307,6 @@ impl Context {
                             }
                             tasks.push(Task::Proof(proof));
                         }
-                        Task::Lambda(saved, binders, expected) => {
-                            let mut body = values.pop().expect("lambda body visit");
-                            self.flush(false)?;
-                            body.value = self.instantiate(&body.value)?;
-                            body.type_ = self.instantiate(&body.type_)?;
-                            for local in binders.into_iter().rev() {
-                                self.tick()?;
-                                let domain = self.instantiate(&local.type_)?;
-                                body.value = body
-                                    .value
-                                    .abstract_fvar(&local.id, 0)
-                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
-                                body.type_ = body
-                                    .type_
-                                    .abstract_fvar(&local.id, 0)
-                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
-                                body.value = Expr::lam(
-                                    local.user_name.clone(),
-                                    domain.clone(),
-                                    body.value,
-                                    local.binder_info,
-                                );
-                                body.type_ = Expr::forall_e(
-                                    local.user_name,
-                                    domain,
-                                    body.type_,
-                                    local.binder_info,
-                                );
-                            }
-                            self.txn.lctx = saved;
-                            values.push(self.finish_term(body, expected.as_ref())?);
-                        }
                         Task::Function(arguments, expected) => {
                             let function = values.pop().expect("function task follows its visit");
                             tasks.push(Task::Apply(function, arguments, expected));
@@ -1519,59 +1390,25 @@ impl Context {
                             }
                             values.push(self.finish_term(function, expected.as_ref())?);
                         }
-                        Task::ForallDomain(names, body, expected) => {
-                            let domain = values.pop().expect("quantifier domain visit");
-                            let universe = self.sort_level(&domain)?;
-                            let saved = self.txn.lctx.clone();
-                            let mut locals = Vec::new();
-                            for name in names {
-                                self.tick()?;
-                                let Syntax::Ident { val, .. } = name else {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                };
-                                if val.is_anonymous() {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                }
-                                let id = FVarId(self.fresh_name()?);
-                                self.txn.lctx.add_param(
-                                    id.clone(),
-                                    val.clone(),
-                                    domain.value.clone(),
-                                    BinderInfo::Default,
-                                );
-                                locals.push(
-                                    self.txn.lctx.find(&id).expect("quantified local").clone(),
-                                );
+                        Task::BinderNext(mut state) => {
+                            if let Some(syntax) = self.next_telescope_domain(&mut state)? {
+                                tasks.push(Task::BinderDomain(state));
+                                tasks.push(Task::Visit(syntax, Some(self.type_expected()?), true));
+                            } else {
+                                let expected = self.telescope_body_expected(&state)?;
+                                let syntax = state.body;
+                                tasks.push(Task::BinderBody(state));
+                                tasks.push(Task::Visit(syntax, expected, true));
                             }
-                            tasks.push(Task::ForallBody(saved, locals, universe, expected));
-                            tasks.push(Task::Visit(body, Some(self.type_expected()?), true));
                         }
-                        Task::ForallBody(saved, locals, domain_universe, expected) => {
-                            let body = values.pop().expect("quantifier body visit");
-                            let mut universe = self.sort_level(&body)?;
-                            let mut value = body.value;
-                            for local in locals.iter().rev() {
-                                self.tick()?;
-                                value = value
-                                    .abstract_fvar(&local.id, 0)
-                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
-                                value = Expr::forall_e(
-                                    local.user_name.clone(),
-                                    local.type_.clone(),
-                                    value,
-                                    local.binder_info,
-                                );
-                                universe = Level::imax(domain_universe.clone(), universe)
-                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
-                            }
-                            self.txn.lctx = saved;
-                            values.push(self.finish_term(
-                                Typed {
-                                    value,
-                                    type_: Expr::sort(universe),
-                                },
-                                expected.as_ref(),
-                            )?);
+                        Task::BinderDomain(mut state) => {
+                            let domain = values.pop().expect("telescope domain visit");
+                            self.open_telescope_group(&mut state, Some(domain))?;
+                            tasks.push(Task::BinderNext(state));
+                        }
+                        Task::BinderBody(state) => {
+                            let body = values.pop().expect("telescope body visit");
+                            values.push(self.finish_telescope(state, body)?);
                         }
                         Task::Arrow(expected) => {
                             let right = values.pop().expect("arrow codomain visit");

@@ -37,6 +37,7 @@ mod matching;
 mod proofs;
 mod record_terms;
 mod records;
+mod term_binders;
 
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
@@ -247,25 +248,11 @@ struct LetBindingTokens {
     separator: usize,
 }
 
-struct LambdaTokens {
-    keyword: usize,
-    names: std::ops::Range<usize>,
-    arrow: usize,
-}
-
-struct QuantifierTokens {
-    keyword: usize,
-    names: std::ops::Range<usize>,
-    colon: usize,
-    domain: Option<(Syntax, usize)>,
-}
-
 struct BoundedTermFrame {
     record: Option<record_terms::RecordFrame>,
     ascription: Option<(Syntax, usize)>,
     open: Option<usize>,
-    lambda: Option<LambdaTokens>,
-    quantifier: Option<QuantifierTokens>,
+    prefix: Option<term_binders::Prefix>,
     negation: Option<usize>,
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
@@ -1162,69 +1149,21 @@ fn finish_lambda_frames(
     at: usize,
 ) -> Result<(), NatDefinitionParseError> {
     while frames.last().is_some_and(|frame| {
-        frame.negation.is_some()
-            || frame.lambda.is_some()
-            || frame
-                .quantifier
-                .as_ref()
-                .is_some_and(|prefix| prefix.domain.is_some())
+        frame.negation.is_some() || frame.prefix.as_ref().is_some_and(|prefix| prefix.body())
     }) {
         if frames.last().is_some_and(|frame| frame.negation.is_some()) {
             finish_negation_frame(leaves, view, tokens, frames, grammar, at)?;
             continue;
         }
-        let mut frame = frames.pop().expect("guarded lambda frame");
-        if let Some(prefix) = frame.quantifier.take() {
-            let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
-            let (domain, comma) = prefix.domain.expect("completed quantifier domain");
-            let names = prefix
-                .names
-                .map(|index| leaves.leaf(index))
-                .collect::<Result<Vec<_>, _>>()?;
-            let quantified = Syntax::node(
-                parser_kind(&["Term", "forall"]),
-                vec![
-                    leaves.leaf(prefix.keyword)?,
-                    null_node(names),
-                    null_node(vec![Syntax::node(
-                        parser_kind(&["Term", "typeSpec"]),
-                        vec![leaves.leaf(prefix.colon)?, domain],
-                    )]),
-                    leaves.leaf(comma)?,
-                    body,
-                ],
-            );
-            frames
-                .last_mut()
-                .expect("quantifier frame has a parent")
-                .application
-                .push((quantified, prefix.keyword));
-            continue;
-        }
-        let prefix = frame.lambda.take().expect("guarded lambda prefix");
+        let mut frame = frames.pop().expect("completed binder body frame");
+        let prefix = frame.prefix.take().expect("completed binder prefix");
         let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
-        let names = prefix
-            .names
-            .map(|index| leaves.leaf(index))
-            .collect::<Result<Vec<_>, _>>()?;
-        let basic = Syntax::node(
-            parser_kind(&["Term", "basicFun"]),
-            vec![
-                null_node(names),
-                null_node(Vec::new()),
-                leaves.leaf(prefix.arrow)?,
-                body,
-            ],
-        );
-        let lambda = Syntax::node(
-            parser_kind(&["Term", "fun"]),
-            vec![leaves.leaf(prefix.keyword)?, basic],
-        );
+        let (syntax, start) = prefix.finish(leaves, body)?;
         frames
             .last_mut()
-            .expect("lambda frame has a parent")
+            .expect("binder prefix has a parent")
             .application
-            .push((lambda, prefix.keyword));
+            .push((syntax, start));
     }
     Ok(())
 }
@@ -1249,12 +1188,12 @@ fn bounded_term_spliced(
     splices: &mut matching::Splices,
     updates: &std::collections::HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let arrows = term_binders::arrow_openers(tokens, range.clone());
     let mut frames = vec![BoundedTermFrame {
         record: None,
         ascription: None,
         open: None,
-        lambda: None,
-        quantifier: None,
+        prefix: None,
         negation: None,
         application: Vec::new(),
         operands: Vec::new(),
@@ -1277,6 +1216,32 @@ fn bounded_term_spliced(
                 .application
                 .push((syntax, index));
             cursor = end;
+            continue;
+        }
+        if grammar == DefinitionGrammar::Scalar
+            && matches!(&tokens[index].kind, TokenKind::Symbol(s)
+                if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "," | "=>" | "↦"))
+        {
+            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+            if let Some(mut frame) = frames.pop_if(|frame| {
+                frame
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.closes_header(tokens, index))
+            }) {
+                let prefix = frame.prefix.take().expect("binder annotation prefix");
+                let domain = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+                let (prefix, end) =
+                    prefix.finish_header(leaves, view, tokens, index, domain, range.end)?;
+                frames.push(term_binders::frame(prefix));
+                cursor = end;
+                continue;
+            }
+        }
+        if grammar == DefinitionGrammar::Scalar && arrows.contains(&index) {
+            let prefix =
+                term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;
+            frames.push(term_binders::frame(prefix));
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
@@ -1364,8 +1329,7 @@ fn bounded_term_spliced(
                     record: None,
                     ascription: None,
                     open: None,
-                    lambda: None,
-                    quantifier: None,
+                    prefix: None,
                     negation: Some(index),
                     application: Vec::new(),
                     operands: Vec::new(),
@@ -1382,77 +1346,17 @@ fn bounded_term_spliced(
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar
-                    && (symbol == "forall" || symbol == "∀") =>
+                    && matches!(symbol.as_str(), "forall" | "∀" | "fun" | "λ") =>
             {
-                let start = cursor;
-                while cursor < range.end && matches!(tokens[cursor].kind, TokenKind::Ident(_)) {
-                    cursor += 1;
-                }
-                if cursor == start
-                    || cursor >= range.end
-                    || !matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == ":")
-                {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, cursor),
-                        expected: NatDefinitionExpectation::ParameterTypeAscription,
-                    });
-                }
-                frames.push(BoundedTermFrame {
-                    record: None,
-                    ascription: None,
-                    open: None,
-                    lambda: None,
-                    quantifier: Some(QuantifierTokens {
-                        keyword: index,
-                        names: start..cursor,
-                        colon: cursor,
-                        domain: None,
-                    }),
-                    negation: None,
-                    application: Vec::new(),
-                    operands: Vec::new(),
-                    operators: Vec::new(),
-                });
-                cursor += 1;
-            }
-            Some(TokenKind::Symbol(symbol))
-                if grammar == DefinitionGrammar::Scalar && (symbol == "fun" || symbol == "λ") =>
-            {
-                let names_start = cursor;
-                while cursor < range.end && matches!(tokens[cursor].kind, TokenKind::Ident(_)) {
-                    cursor += 1;
-                }
-                if cursor == names_start {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, cursor),
-                        expected: NatDefinitionExpectation::ParameterIdentifier,
-                    });
-                }
-                if cursor >= range.end
-                    || !matches!(&tokens[cursor].kind,
-                    TokenKind::Symbol(arrow) if arrow == "=>" || arrow == "↦")
-                {
-                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                        at: original_position(view, tokens, cursor),
-                        expected: NatDefinitionExpectation::LambdaArrow,
-                    });
-                }
-                frames.push(BoundedTermFrame {
-                    record: None,
-                    ascription: None,
-                    open: None,
-                    lambda: Some(LambdaTokens {
-                        keyword: index,
-                        names: names_start..cursor,
-                        arrow: cursor,
-                    }),
-                    quantifier: None,
-                    negation: None,
-                    application: Vec::new(),
-                    operands: Vec::new(),
-                    operators: Vec::new(),
-                });
-                cursor += 1;
+                let prefix = term_binders::Prefix::start(
+                    leaves,
+                    view,
+                    tokens,
+                    index,
+                    &mut cursor,
+                    range.end,
+                )?;
+                frames.push(term_binders::frame(prefix));
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "." =>
@@ -1498,31 +1402,6 @@ fn bounded_term_spliced(
                     && matches!(symbol.as_str(), "," | "}" | ":" | "with") =>
             {
                 finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
-                if symbol == ","
-                    && frames.last().is_some_and(|frame| {
-                        frame
-                            .quantifier
-                            .as_ref()
-                            .is_some_and(|prefix| prefix.domain.is_none())
-                    })
-                {
-                    let mut frame = frames.pop().expect("quantifier domain frame");
-                    let mut prefix = frame.quantifier.take().expect("quantifier prefix");
-                    let domain = finish_bounded_frame(view, tokens, frame, grammar, index)?;
-                    prefix.domain = Some((domain, index));
-                    frames.push(BoundedTermFrame {
-                        record: None,
-                        ascription: None,
-                        open: None,
-                        lambda: None,
-                        quantifier: Some(prefix),
-                        negation: None,
-                        application: Vec::new(),
-                        operands: Vec::new(),
-                        operators: Vec::new(),
-                    });
-                    continue;
-                }
                 if frames.last().is_some_and(|frame| frame.record.is_some()) {
                     record_terms::delimiter(
                         leaves,
@@ -1545,8 +1424,7 @@ fn bounded_term_spliced(
                         record: None,
                         ascription: Some((value, index)),
                         open,
-                        lambda: None,
-                        quantifier: None,
+                        prefix: None,
                         negation: None,
                         application: Vec::new(),
                         operands: Vec::new(),
@@ -1564,8 +1442,7 @@ fn bounded_term_spliced(
                     record: None,
                     ascription: None,
                     open: Some(index),
-                    lambda: None,
-                    quantifier: None,
+                    prefix: None,
                     negation: None,
                     application: Vec::new(),
                     operands: Vec::new(),
@@ -3548,7 +3425,7 @@ mod quantified_source_tests {
             "def f : forall x : Nat := 0",
             "def f : forall x : Nat, := 0",
             "def f : forall : Nat, Nat := 0",
-            "def f : forall x Nat, Nat := 0",
+            "def f : forall x Nat : , Nat := 0",
         ] {
             assert!(parse_source_command(text.as_bytes()).is_err(), "{text}");
         }
