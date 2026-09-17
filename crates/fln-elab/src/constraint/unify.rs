@@ -13,6 +13,7 @@
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
 mod assignment_universes;
+mod reduce;
 mod residual;
 
 use crate::constraint::Constraint;
@@ -528,122 +529,6 @@ impl Engine<'_> {
             .map_err(|_| UnificationError::ExpressionScope)?;
         self.scan(&result)?;
         Ok(result)
-    }
-
-    fn whnf(&mut self, expr: &Expr, locals: &LocalContext) -> Result<Expr, UnificationError> {
-        let mut head = expr.clone();
-        let mut args = Vec::new();
-        let mut projections: Vec<(Name, u64, Vec<Expr>)> = Vec::new();
-        loop {
-            loop {
-                self.meter.tick()?;
-                match head.node() {
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr,
-                    } => {
-                        projections.push((struct_name.clone(), *idx, std::mem::take(&mut args)));
-                        head = expr.clone();
-                    }
-                    ExprNode::MData { expr, .. } => head = expr.clone(),
-                    ExprNode::LetE { value, body, .. } => head = self.substitute(body, value)?,
-                    ExprNode::App { f, a } => {
-                        args.push(a.clone());
-                        head = f.clone();
-                    }
-                    ExprNode::MVar { id } => {
-                        if let Some(value) = self.work.mvars.get_assigned_expr(id) {
-                            head = value.clone();
-                        } else {
-                            break;
-                        }
-                    }
-                    ExprNode::FVar { id } if self.budget.zeta_delta => {
-                        if let Some(value) = locals.find(id).and_then(|local| local.value.as_ref())
-                        {
-                            head = value.clone();
-                        } else {
-                            break;
-                        }
-                    }
-                    ExprNode::Lam { body, .. } if !args.is_empty() => {
-                        let argument = args.pop().expect("nonempty application spine");
-                        head = self.substitute(body, &argument)?;
-                    }
-                    ExprNode::Const { name, levels } => {
-                        let definition = match self.work.env.find(name) {
-                            Some(ConstantInfo::Defn(definition))
-                                if definition.safety == DefinitionSafety::Safe
-                                    && definition.base.level_params.len() == levels.len()
-                                    && match self.budget.transparency {
-                                        UnificationTransparency::None => false,
-                                        UnificationTransparency::Abbreviations => {
-                                            definition.hints == ReducibilityHints::Abbrev
-                                        }
-                                        UnificationTransparency::SafeDefinitions => true,
-                                    } =>
-                            {
-                                Some((
-                                    definition.value.clone(),
-                                    definition.base.level_params.clone(),
-                                ))
-                            }
-                            _ => None,
-                        };
-                        if let Some((value, parameters)) = definition {
-                            self.scan(&value)?;
-                            head = crate::universe::parameters::instantiate(
-                                || self.meter.node(),
-                                || UnificationError::ExpressionScope,
-                                &value,
-                                &parameters,
-                                levels,
-                            )?;
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            if let Some((structure, index, outer)) = projections.pop() {
-                self.meter.tick()?;
-                if let Some(field) = crate::records::constructor_field(
-                    &self.work.env,
-                    &structure,
-                    index,
-                    &head,
-                    &args,
-                ) {
-                    head = field;
-                    args = outer;
-                    continue;
-                }
-                for argument in args.into_iter().rev() {
-                    self.meter.tick()?;
-                    head = Expr::app(head, argument);
-                }
-                head = Expr::proj(structure, index, head);
-                args = outer;
-                // A stuck major cannot unlock an outer projection. Unwind without
-                // feeding that same blocked projection back into the reduction loop.
-                while let Some((structure, index, outer)) = projections.pop() {
-                    self.meter.tick()?;
-                    for argument in args.into_iter().rev() {
-                        self.meter.tick()?;
-                        head = Expr::app(head, argument);
-                    }
-                    head = Expr::proj(structure, index, head);
-                    args = outer;
-                }
-            }
-            for argument in args.into_iter().rev() {
-                self.meter.tick()?;
-                head = Expr::app(head, argument);
-            }
-            return Ok(head);
-        }
     }
 
     fn assignment_slot(&self) -> Result<(), UnificationError> {
