@@ -64,6 +64,7 @@ jobs:
           toolchain="$(rustc --print sysroot)"
           tar -C "$toolchain" -czf target/elab-offline/compiler.tar.gz bin lib
           git rev-parse HEAD > target/elab-offline/source-commit.txt
+          git rev-parse 'HEAD^{tree}' > target/elab-offline/source-tree.txt
           rustc -Vv > target/elab-offline/compiler.txt
           sha256sum target/elab-offline/source.tar.gz target/elab-offline/compiler.tar.gz > target/elab-offline/SHA256SUMS
       - name: Retain offline verification inputs
