@@ -379,3 +379,195 @@ fn record_eta_does_not_widen_local_let_transparency() {
     unchanged(&txn, &before);
     txn.unify(&record, &p, budget()).unwrap();
 }
+
+fn add_holder(txn: &mut ElabTxn) {
+    add_record(txn, spec("Holder", vec![], vec![binder("pair", constant("PairN"))]));
+}
+
+#[test]
+fn nested_record_projection_receivers_support_field_inference() {
+    let mut txn = transaction();
+    add_holder(&mut txn);
+    let h = local(&mut txn, "h", constant("Holder"));
+    let value = proj("Holder", 0, &h);
+    let x = goal(&mut txn, "x", constant("Nat"));
+    let record = mk("PairN", [Expr::mvar(x.clone()), proj("PairN", 1, &value)]);
+    let report = txn.unify(&record, &value, budget()).unwrap();
+    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("PairN", 0, &value)));
+}
+
+#[test]
+fn dependent_record_fields_are_checked_after_earlier_field_inference() {
+    let mut txn = transaction();
+    let a = binder("A", Expr::sort(Level::one()));
+    let mut pack = spec("Pack", vec![], vec![a.clone(), binder("value", Expr::fvar(a.id))]);
+    pack.result_level = Level::one().succ().unwrap();
+    add_record(&mut txn, pack);
+    let p = local(&mut txn, "p", constant("Pack"));
+    let a = goal(&mut txn, "A", Expr::sort(Level::one()));
+    let x = goal(&mut txn, "x", Expr::mvar(a.clone()));
+    let record = mk("Pack", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
+    let report = txn.unify(&record, &p, budget()).unwrap();
+    assert_eq!(report.expression_assignments, vec![a.clone(), x.clone()]);
+    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&proj("Pack", 0, &p)));
+    assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("Pack", 1, &p)));
+}
+
+#[test]
+fn projected_record_parameters_use_earlier_fields_of_the_same_receiver() {
+    let mut txn = transaction();
+    let a = binder("A", Expr::sort(Level::one()));
+    let box_type = Expr::app(constant("Box"), Expr::fvar(a.id.clone()));
+    let mut envelope = spec("Envelope", vec![], vec![a, binder("box", box_type)]);
+    envelope.result_level = Level::one().succ().unwrap();
+    add_record(&mut txn, envelope);
+    let p = local(&mut txn, "p", constant("Envelope"));
+    let value = proj("Envelope", 1, &p);
+    let a = goal(&mut txn, "A", Expr::sort(Level::one()));
+    let x = goal(&mut txn, "x", Expr::mvar(a.clone()));
+    let record = mk("Box", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
+    let report = txn.unify(&record, &value, budget()).unwrap();
+    assert_eq!(report.expression_assignments, vec![a.clone(), x.clone()]);
+    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&proj("Envelope", 0, &p)));
+    assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("Box", 0, &value)));
+    assert!(report.residual_metavariables.is_empty());
+}
+
+#[test]
+fn projected_functions_can_produce_records() {
+    let mut txn = transaction();
+    let function_type = Expr::forall_e(
+        name("n"), constant("Nat"), constant("PairN"), BinderInfo::Default,
+    );
+    add_record(&mut txn, spec("Factory", vec![], vec![binder("make", function_type)]));
+    let p = local(&mut txn, "p", constant("Factory"));
+    let value = Expr::app(proj("Factory", 0, &p), numeral(31));
+    let x = goal(&mut txn, "x", constant("Nat"));
+    let record = mk("PairN", [Expr::mvar(x.clone()), proj("PairN", 1, &value)]);
+    let report = txn.unify(&record, &value, budget()).unwrap();
+    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("PairN", 0, &value)));
+}
+
+#[test]
+fn dependent_projected_functions_preserve_application_substitution() {
+    let mut txn = transaction();
+    let function_type = Expr::forall_e(
+        name("A"), Expr::sort(Level::one()),
+        Expr::app(constant("Box"), Expr::bvar(0).unwrap()), BinderInfo::Default,
+    );
+    let mut factory = spec("PolyFactory", vec![], vec![binder("make", function_type)]);
+    factory.result_level = Level::one().succ().unwrap();
+    add_record(&mut txn, factory);
+    let p = local(&mut txn, "p", constant("PolyFactory"));
+    let value = Expr::app(proj("PolyFactory", 0, &p), constant("Nat"));
+    let a = goal(&mut txn, "A", Expr::sort(Level::one()));
+    let x = goal(&mut txn, "x", Expr::mvar(a.clone()));
+    let record = mk("Box", [Expr::mvar(a.clone()), Expr::mvar(x.clone())]);
+    let report = txn.unify(&record, &value, budget()).unwrap();
+    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&constant("Nat")));
+    assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("Box", 0, &value)));
+}
+
+#[test]
+fn invalid_projection_names_and_indices_do_not_invent_receiver_types() {
+    let mut txn = transaction();
+    add_holder(&mut txn);
+    let p = local(&mut txn, "p", constant("Holder"));
+    let x = goal(&mut txn, "x", constant("Nat"));
+    let record = mk("PairN", [Expr::mvar(x), numeral(0)]);
+    for value in [proj("PairN", 0, &p), proj("Holder", 1, &p), proj("Holder", u64::MAX, &p)] {
+        let before = txn.clone();
+        assert!(matches!(txn.unify(&record, &value, budget()), Err(UnificationError::Deferred(_))));
+        unchanged(&txn, &before);
+    }
+}
+
+#[test]
+fn a_later_assignment_can_reveal_a_projected_receivers_record_type() {
+    let mut txn = transaction();
+    add_holder(&mut txn);
+    let t = goal(&mut txn, "T", Expr::sort(Level::one()));
+    let p = local(&mut txn, "p", Expr::mvar(t.clone()));
+    let value = proj("Holder", 0, &p);
+    let x = goal(&mut txn, "x", constant("Nat"));
+    let record = mk("PairN", [Expr::mvar(x.clone()), proj("PairN", 1, &value)]);
+    let before = txn.clone();
+    assert!(matches!(txn.unify(&record, &value, budget()), Err(UnificationError::Deferred(_))));
+    unchanged(&txn, &before);
+    let report = txn.unify_many_with(&[
+        (record, value.clone()), (Expr::mvar(t.clone()), constant("Holder")),
+    ], budget(), &|| false).unwrap();
+    assert_eq!(report.expression_assignments, vec![t, x.clone()]);
+    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(txn.mvars.get_assigned_expr(&x), Some(&proj("PairN", 0, &value)));
+}
+
+#[test]
+fn eta_cannot_assign_a_projection_outside_the_metavariables_scope() {
+    let mut txn = transaction();
+    add_holder(&mut txn);
+    let x = goal(&mut txn, "x", constant("Nat"));
+    // This receiver was not present when x's local context was captured.
+    let p = local(&mut txn, "p", constant("Holder"));
+    let value = proj("Holder", 0, &p);
+    let record = mk("PairN", [Expr::mvar(x), proj("PairN", 1, &value)]);
+    let before = txn.clone();
+    assert!(matches!(txn.unify(&record, &value, budget()), Err(UnificationError::Deferred(_))));
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn nested_parameterized_projection_chains_are_metered() {
+    let mut txn = transaction();
+    let mut type_ = constant("PairN");
+    for _ in 0..32 { type_ = Expr::app(constant("Box"), type_); }
+    let mut value = local(&mut txn, "p", type_);
+    for _ in 0..32 { value = proj("Box", 0, &value); }
+    let record = mk("PairN", [proj("PairN", 0, &value), proj("PairN", 1, &value)]);
+    let mut generous = budget();
+    generous.max_steps = 2_000_000;
+    generous.max_visited_nodes = 1_500_000;
+    txn.budget.max_heartbeats = generous.max_steps;
+    let initial = txn.clone();
+    let report = txn.unify(&record, &value, generous).unwrap();
+    assert_eq!(report.kernel_checks, 0);
+    unchanged(&txn, &initial);
+    let mut limited = generous;
+    limited.max_steps = report.unifier_steps - 1;
+    let mut stopped = initial.clone();
+    assert!(matches!(stopped.unify(&record, &value, limited), Err(UnificationError::StepLimit { .. })));
+    unchanged(&stopped, &initial);
+}
+
+#[test]
+fn record_eta_composes_with_function_eta_and_miller_patterns() {
+    let mut txn = transaction();
+    let f = local(&mut txn, "f", Expr::forall_e(
+        name("n"), constant("Nat"), constant("PairN"), BinderInfo::Default,
+    ));
+    let arrow = Expr::forall_e(
+        name("n"), constant("Nat"), constant("Nat"), BinderInfo::Default,
+    );
+    let x = goal(&mut txn, "x", arrow.clone());
+    let y = goal(&mut txn, "y", arrow);
+    let argument = Expr::bvar(0).unwrap();
+    let body = mk("PairN", [
+        Expr::app(Expr::mvar(x.clone()), argument.clone()),
+        Expr::app(Expr::mvar(y.clone()), argument),
+    ]);
+    let left = Expr::lam(name("n"), constant("Nat"), body, BinderInfo::Default);
+    let report = txn.unify(&left, &f, budget()).unwrap();
+    assert_eq!(report.expression_assignments, vec![x.clone(), y.clone()]);
+    assert_eq!(report.kernel_checks, 2);
+    let value = Expr::app(f, numeral(42));
+    for (index, id) in [(0, x), (1, y)] {
+        let application = Expr::app(Expr::mvar(id), numeral(42));
+        let report = txn.unify(&application, &proj("PairN", index, &value), budget()).unwrap();
+        assert!(report.expression_assignments.is_empty());
+    }
+}

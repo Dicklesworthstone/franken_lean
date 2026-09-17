@@ -24,6 +24,13 @@ struct RecordApplication {
     fields: Vec<Expr>,
 }
 
+/// Neutral type synthesis uses heap continuations even for nested projections
+/// and applications of projected, function-valued fields.
+enum NeutralTypeFrame {
+    Application(Expr),
+    Projection { structure: Name, index: u64, receiver: Expr },
+}
+
 impl Engine<'_> {
     pub(super) fn record_eta(
         &mut self,
@@ -246,7 +253,25 @@ impl Engine<'_> {
         expr: &Expr,
         locals: &LocalContext,
     ) -> Result<Option<Expr>, UnificationError> {
-        let (head, arguments) = self.eta_spine(expr)?;
+        let mut head = expr.clone();
+        let mut frames = Vec::new();
+        loop {
+            self.meter.node()?;
+            match head.node() {
+                ExprNode::App { f, a } => {
+                    frames.push(NeutralTypeFrame::Application(a.clone()));
+                    head = f.clone();
+                }
+                ExprNode::Proj { struct_name, idx, expr } => {
+                    frames.push(NeutralTypeFrame::Projection {
+                        structure: struct_name.clone(), index: *idx, receiver: expr.clone(),
+                    });
+                    head = expr.clone();
+                }
+                ExprNode::MData { expr, .. } => head = expr.clone(),
+                _ => break,
+            }
+        }
         let type_ = match head.node() {
             ExprNode::FVar { id } => locals.find(id).map(|local| local.type_.clone()),
             ExprNode::MVar { id } => self.work.mvars.get_decl(id).map(|local| local.type_.clone()),
@@ -276,8 +301,82 @@ impl Engine<'_> {
             }
             _ => None,
         };
-        match type_ {
-            Some(type_) => self.eta_apply_type(type_, &arguments, locals),
+        let Some(mut type_) = type_ else { return Ok(None); };
+        while let Some(frame) = frames.pop() {
+            self.meter.node()?;
+            let next = match frame {
+                NeutralTypeFrame::Application(argument) => {
+                    self.eta_apply_type(type_, std::slice::from_ref(&argument), locals)?
+                }
+                NeutralTypeFrame::Projection { structure, index, receiver } => {
+                    self.eta_projection_type(type_, &structure, index, &receiver, locals)?
+                }
+            };
+            let Some(next) = next else { return Ok(None); };
+            type_ = next;
+        }
+        self.eta_apply_type(type_, &[], locals)
+    }
+
+    /// A dependent field's domain refers to earlier projections of this exact
+    /// receiver. Substituting fresh, unrelated field locals here would allow
+    /// parameter inference to escape the record that was actually projected.
+    fn eta_projection_type(
+        &mut self,
+        receiver_type: Expr,
+        structure: &Name,
+        index: u64,
+        receiver: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<Expr>, UnificationError> {
+        let Some(receiver_type) = self.eta_apply_type(receiver_type, &[], locals)? else {
+            return Ok(None);
+        };
+        let (head, parameters) = self.eta_spine(&receiver_type)?;
+        let ExprNode::Const { name, levels } = head.node() else { return Ok(None); };
+        if name != structure { return Ok(None); }
+        let Some(shape) = self.eta_shape(structure)? else { return Ok(None); };
+        if parameters.len() != shape.parameters || levels.len() != shape.level_params.len()
+            || index >= u64::try_from(shape.fields).map_err(|_| UnificationError::ExpressionScope)?
+        {
+            return Ok(None);
+        }
+        let family_type = self.eta_specialize(&shape.family_type, &shape.level_params, levels)?;
+        let Some(sort) = self.eta_apply_type(family_type, &parameters, locals)? else {
+            return Ok(None);
+        };
+        if !matches!(sort.node(), ExprNode::Sort { level } if level.is_never_zero()) {
+            return Ok(None);
+        }
+        let constructor_type = self.eta_specialize(
+            &shape.constructor_type, &shape.level_params, levels,
+        )?;
+        let Some(mut type_) = self.eta_apply_type(constructor_type, &parameters, locals)? else {
+            return Ok(None);
+        };
+        let mut selected = None;
+        for prior in 0..shape.fields {
+            self.meter.node()?;
+            type_ = self.instantiate(&type_)?;
+            type_ = self.whnf(&type_, locals)?;
+            let ExprNode::ForallE { binder_type, body, .. } = type_.node() else {
+                return Ok(None);
+            };
+            let prior = u64::try_from(prior).map_err(|_| UnificationError::ExpressionScope)?;
+            if prior == index { selected = Some(binder_type.clone()); }
+            self.meter.node()?;
+            let field = Expr::proj(structure.clone(), prior, receiver.clone());
+            type_ = self.substitute(body, &field)?;
+        }
+        let Some(result) = self.eta_apply_type(type_, &[], locals)? else {
+            return Ok(None);
+        };
+        // Metadata is not a license to infer a field of a different family.
+        if !same_terms(&result, &receiver_type, &mut self.meter)? {
+            return Ok(None);
+        }
+        match selected {
+            Some(type_) => self.eta_apply_type(type_, &[], locals),
             None => Ok(None),
         }
     }
