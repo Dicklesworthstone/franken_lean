@@ -312,6 +312,7 @@ fn simplify(
     range: Range<usize>,
     keyword: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let (range, location) = locations::split(leaves, view, tokens, range)?;
     let only = range.start + 1;
     if !matches!(tokens.get(only).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components(["only"]))
     {
@@ -388,7 +389,7 @@ fn simplify(
             null_node(Vec::new()),
             only,
             arguments,
-            null_node(Vec::new()),
+            location,
         ],
     ))
 }
@@ -430,7 +431,7 @@ mod simp_tests {
             "simp",
             "subst",
             "simp [h]",
-            "simp only [h] at h",
+            "simp only [h] at",
             "simp only [*]",
             "simp only [,h]",
             "simp only [h,,k]",

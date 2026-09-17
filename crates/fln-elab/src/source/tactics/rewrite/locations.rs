@@ -4,7 +4,7 @@
 use super::*;
 
 impl Context {
-    fn rewrite_locations(
+    pub(super) fn rewrite_locations(
         &mut self,
         syntax: &Syntax,
     ) -> Result<Option<Vec<Name>>, NatDefinitionElabError> {
@@ -65,7 +65,7 @@ impl Context {
 
     /// Produce a forward map T a -> T b rather than the contravariant map
     /// used for goals. Reverse rewriting first builds genuine symmetric evidence.
-    fn rewrite_hypothesis_value(
+    pub(super) fn rewrite_hypothesis_value(
         &mut self,
         local: &LocalDecl,
         rule: Typed,
@@ -131,7 +131,7 @@ impl Context {
         })
     }
 
-    fn replace_rewritten_hypothesis(
+    pub(super) fn replace_rewritten_hypothesis(
         &mut self,
         mut parent: ProofGoal,
         local: &LocalDecl,

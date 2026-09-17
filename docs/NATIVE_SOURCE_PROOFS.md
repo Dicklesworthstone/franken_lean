@@ -40,7 +40,7 @@ theorem transport (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := 
 
 ## Quantified rewriting and explicit-set simplification
 
-Quantified rewrite instantiation landed at `175bdcf73091da85ace6c97698e6a81541908c63`; source `simp only` landed at `3377252edda6a19f13a2a303ec86f5370be44336`. Rules can infer remaining expression and universe parameters from a matching goal occurrence. Propositional premises can be discharged by existing local proofs or equality reflexivity; unproved premises are never assumed. Failed matches roll back their assignments while retaining consumed work.
+Quantified rewrite instantiation landed at `175bdcf73091da85ace6c97698e6a81541908c63`; source `simp only` landed at `3377252edda6a19f13a2a303ec86f5370be44336`. Rules can infer remaining expression and universe parameters from a matching goal occurrence. `rewrite` and `rw` retain unproved premises as explicit subgoals. `simp only` discharges premises using its selected proofs, selected rewrites/unfolding, or equality reflexivity; it does not search unselected hypotheses or assume missing premises. Failed matches roll back their assignments while retaining consumed work.
 
 ```lean
 theorem contract (f : Nat -> Nat) (x : Nat) (h : f x = x) : f x = x := by
@@ -64,6 +64,43 @@ Simplification is progress, not unconditional proof completion. A non-reflexive 
 
 The source integration exposed two independent-checker conversion gaps, repaired in the checker rather than bypassing its veto. Reducible applications normalize before argument congruence, so discarded arguments cannot cause a false mismatch. Scoped let values now enter a private reduction overlay during body inference and are removed at scope exit; inferred local types remain the declared types. Original caller contexts are unchanged on success, cancellation, or failure. Kernel/checker implementations remain separate.
 
+## Rewriting and simplifying named hypotheses
+
+Named locations are supported by the same native parser, elaborator, and checker council:
+
+```lean
+theorem useHypothesis (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by
+  rw [h] at hx
+  exact hx
+```
+
+Use `rewrite [h, ← k] at hx hy` to apply an ordered rule list to named hypotheses, or
+`simp only [wrap, h, premise] at hx hy` to simplify their types using an explicit
+set. Quantified rules infer their parameters afresh for each hypothesis.
+Conditional `rewrite` rules leave real proof obligations; `simp only` must
+prove conditions with its selected evidence. Hypothesis simplification leaves
+the main goal for subsequent tactics, rather than treating a changed hypothesis
+as proof completion.
+
+Each changed hypothesis receives a fresh local identity and a checked transport
+from the old one. A dependent hypothesis or goal keeps referring to the original
+well-typed identity; the old identity is hidden from source name lookup when
+necessary and otherwise removed from the live context. The final proof binds
+the actual transport, so this does not mutate a local variable's type in place.
+Local definitions, introduced variables, multiple locations, and Type-valued
+transports use the same closure machinery. Failed tactic alternatives restore
+the context and assignments without refunding consumed work.
+
+```bash
+fln check-source --json examples/native_hypothesis_rewriting.lean
+```
+
+The example includes six theorems and two definitions. Installed-binary tests
+also check that a failing later file emits no partial success and does not alter
+source files or contaminate a subsequent check. Wildcard/goal location selectors,
+occurrence selectors, and full Lean simplifier semantics remain outside this
+bounded named-hypothesis increment.
+
 ## APIs and limits
 
 `Engine::admit_source_declaration` checks one definition or theorem without execution. `Engine::check_source_files` checks an ordered batch and returns a `SourceFileCheck` only on complete success. Both use the existing K1 plus independent-checker council and immutable publication path.
@@ -73,7 +110,7 @@ The source integration exposed two independent-checker conversion gaps, repaired
 Current boundaries are explicit:
 
 - `check-source` accepts import-free `def` and `theorem` files. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
-- Rewriting and simplification are goal-only. Quantified rules use the native bounded unifier, not general higher-order theorem search. Hypothesis locations (`at h`), occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
+- Rewriting and simplification support goals and explicit named hypothesis locations (`at hx hy`). Quantified rules use the native bounded unifier, not general higher-order theorem search. Wildcard/goal location selectors, occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
 - [Native instance synthesis](NATIVE_INSTANCES.md) now supports registered classes, local instances, named global instances and selected tactic-lemma arguments. Full Synod semantics, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier remain incomplete.
 
 ## Verification

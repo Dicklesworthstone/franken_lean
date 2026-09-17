@@ -65,6 +65,8 @@ mod tests {
         for source in [
             "theorem t : True := by rw [h] at hx",
             "theorem t : True := by rewrite [← h, k] at hx hy",
+            "theorem t : True := by simp only [h] at hx",
+            "theorem t : True := by\r\n  simp only [f (at), ← h] /- suffix -/ at «h.x» h₂\r\n  assumption",
             "theorem t : True := by\r\n  rw [at, f (at)] /- location -/ at «h.x» h₂\r\n  assumption",
         ] {
             let parsed = parse_source_command(source.as_bytes()).unwrap();
@@ -79,6 +81,10 @@ mod tests {
             "rw [h] at (hx)",
             "rw [h] at hx, hy",
             "rw [h] at *",
+            "simp only [h] at",
+            "simp only [h] at (hx)",
+            "simp only [h] at hx, hy",
+            "simp only [h] at *",
         ] {
             let source = format!("theorem t : True := by {tail}");
             assert!(parse_source_command(source.as_bytes()).is_err(), "{tail}");

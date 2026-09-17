@@ -3,6 +3,7 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod locations;
 mod unfold;
 
 use super::*;
@@ -66,7 +67,7 @@ impl Context {
         expect_atom(keyword, "simp", "simplification keyword")?;
         expect_empty_null(config, "default simplification configuration")?;
         expect_empty_null(discharger, "default simplification discharger")?;
-        expect_empty_null(location, "goal-only simplification")?;
+        self.rewrite_locations(location)?;
         let [only] = expect_null_args(only, "explicit simp set")? else {
             return Err(error(TacticError::MalformedScript));
         };
@@ -348,6 +349,9 @@ impl Context {
         mut goal: ProofGoal,
         args: &[Syntax],
     ) -> Result<(), NatDefinitionElabError> {
+        if self.simplify_at_locations(proof, &goal, args)? {
+            return Ok(());
+        }
         let rules = self.simp_rules(args)?;
         let mut history = vec![self.instantiate(&goal.target)?];
         let mut steps = 0;
