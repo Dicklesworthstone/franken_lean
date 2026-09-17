@@ -648,6 +648,13 @@ fn parse_planned(
     grammar: DefinitionGrammar,
     equations: bool,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    if grammar == DefinitionGrammar::Scalar && is_symbol(tokens, range.start, "by") {
+        let (proof, end) = proofs::parse(leaves, view, tokens, range.start, range.end)?;
+        if end != range.end {
+            return Err(refuse(view, tokens, end));
+        }
+        return Ok(proof);
+    }
     // Tactic blocks own their pipes; their bounded arguments reenter here.
     if grammar == DefinitionGrammar::Scalar
         && !is_symbol(tokens, range.start, "by")
