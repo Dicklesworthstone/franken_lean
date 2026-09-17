@@ -3,14 +3,27 @@ name: Native propositional logic
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-propositional-logic.yml']
+    paths:
+      - 'crates/fln-core/**'
+      - 'crates/fln-env/**'
+      - 'crates/fln-kernel/**'
+      - 'crates/fln-checker/**'
+      - 'crates/fln-parse/**'
+      - 'crates/fln-elab/**'
+      - 'crates/fln/**'
+      - 'crates/fln-cli/**'
+      - 'examples/native_propositional_logic.lean'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/native-propositional-logic.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: native-propositional-notation
-  cancel-in-progress: false
+  group: native-propositional-logic-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -20,165 +33,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Prepare exact constructive declarations
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -I - <<'PY'
-          import base64, json, os, pathlib, subprocess, urllib.request
-          originals = {
-              'crates/fln-elab/src/seed.rs': 'e0d107786301f49fcb2ad6658e11148738e48c3b',
-              'crates/fln/src/lib.rs': '3a7caa19534a31177d396ad3b29ae3f70fd9c3c1',
-              'crates/fln-elab/src/seed/logic.rs': 'd27cf8f1558e44f5dbbcb0cdb3bb62934ac98fa4',
-          }
-          for path, expected in originals.items():
-              actual = subprocess.check_output(['git', 'rev-parse', 'HEAD:' + path], text=True).strip()
-              if actual != expected:
-                  raise SystemExit('Source changed; refusing stale integration: ' + path)
-          def replace(path, old, new):
-              p = pathlib.Path(path)
-              text = p.read_text()
-              if text.count(old) != 1:
-                  raise SystemExit('Expected exactly one source anchor: ' + path)
-              p.write_text(text.replace(old, new, 1))
-          replace('crates/fln-elab/src/seed.rs', 'mod decidable;', 'mod decidable;\nmod logic;')
-          replace('crates/fln-elab/src/seed.rs',
-              'pub fn source_seed_declarations() -> [Declaration; 59] {',
-              'pub fn source_seed_declarations() -> [Declaration; 71] {\n    let [and, and_left, and_right, or, or_elim, iff, iff_mp, iff_mpr,\n        and_instance, or_instance, implies_instance, iff_instance] = logic::logical_seed_declarations();')
-          replace('crates/fln-elab/src/seed.rs', '        generic_eq,\n    ]',
-              '        generic_eq,\n        and, and_left, and_right, or, or_elim, iff, iff_mp, iff_mpr,\n        and_instance, or_instance, implies_instance, iff_instance,\n    ]')
-          replace('crates/fln/src/lib.rs', '            "instDecidableNot",',
-              '            "instDecidableNot",\n            "instDecidableAnd",\n            "instDecidableOr",\n            "instDecidableImplies",\n            "instDecidableIff",')
-          path = pathlib.Path('crates/fln/tests/source_logic.rs')
-          if path.exists():
-              raise SystemExit('Refusing to replace an existing test file')
-          sha = 'cdc7e24cbbbcf9052543bcc975cb7de8365c81c2'
-          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
-              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request) as response:
-              blob = json.load(response)
-          if blob['sha'] != sha or blob['encoding'] != 'base64':
-              raise SystemExit('Unexpected test blob')
-          path.write_bytes(base64.b64decode(blob['content']))
-          PY
-      - name: Install compiler and retain first tested increment
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup show active-toolchain
-          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/logic.rs crates/fln/src/lib.rs crates/fln/tests/source_logic.rs
-          python3 -I - <<'PY'
-          import os, pathlib, shutil
-          destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'logical-declarations'
-          for path in ['crates/fln-elab/src/seed.rs', 'crates/fln-elab/src/seed/logic.rs', 'crates/fln/src/lib.rs', 'crates/fln/tests/source_logic.rs']:
-              output = destination / path
-              output.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copyfile(path, output)
-          PY
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
-      - name: Test the first functional increment
+      - name: Check proofs and proof-carrying decisions through both engines
         run: cargo test --locked -p fln --test source_logic --test source_decisions --test source_equality_decisions --no-fail-fast
-      - name: Apply the locally verified notation increment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
+      - name: Check installed-command receipts and recovery
+        run: cargo test --locked -p fln-cli --test source_logic
+      - name: Lint touched source packages and downstream consumers
         run: |
-          set -euo pipefail
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          originals = {
-              'crates/fln-parse/src/lib.rs': '63c7904300fb7aef4784c9465f56b24ecbedceb5',
-              'crates/fln-parse/src/record_terms.rs': '04385c7ff91f16198bc77cdda37c303e4cd856f3',
-              'crates/fln-elab/src/lib.rs': 'fda4b4997f2c82a7a087d39c16a15d3474b56ee7',
-              'crates/fln-elab/src/source.rs': '0240bb24e5c9f7d7c22fca6e5ff38acb0355cac8',
-              'crates/fln/tests/source_logic.rs': '974b272b0555fcd905674abbf590816ae38080c5',
-          }
-          def git_hash(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          for path, expected in originals.items():
-              if git_hash(pathlib.Path(path).read_bytes()) != expected:
-                  raise SystemExit('Unexpected notation input: ' + path)
-          for path in ['crates/fln-parse/tests/source_logic.rs', 'crates/fln-cli/tests/source_logic.rs', 'examples/native_propositional_logic.lean']:
-              if pathlib.Path(path).exists():
-                  raise SystemExit('Refusing to replace existing path: ' + path)
-          sha = 'b468a0bb3d1b028710a45f8af236602365b6a122'
-          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
-              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request) as response:
-              blob = json.load(response)
-          if blob['sha'] != sha or blob['encoding'] != 'base64':
-              raise SystemExit('Unexpected notation patch')
-          data = base64.b64decode(blob['content'])
-          if git_hash(data) != sha:
-              raise SystemExit('Patch integrity mismatch')
-          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'logical-notation.patch'
-          patch.write_bytes(data)
-          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
-          subprocess.run(['git', 'apply', str(patch)], check=True)
-          PY
-          git diff --check
-      - name: Verify native parser elaborator engine and installed command
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln-elab -p fln-parse --no-fail-fast
-          cargo test --locked -p fln --test source_logic --test source_decisions --test source_equality_decisions --no-fail-fast
-          cargo test --locked -p fln-cli --test source_logic
           cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
-      - name: Export verified immutable blobs without changing any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          logic = {
-              'crates/fln-elab/src/seed.rs': 'f139bbdd7d799579edd73a41930198629b2e430ee18ee42f2306ce7c0f737504',
-              'crates/fln-elab/src/seed/logic.rs': '0b4c6b214c0561d7296a7db554e2ffc74eb813221a0c0d31381af906d91f37b4',
-              'crates/fln/src/lib.rs': '3e6d2560a12407fba8297c03128b5982cf630b888161456d6d4220a818cccb5b',
-              'crates/fln/tests/source_logic.rs': '645d29c9155a8df19ddc472ce2084bc86c6d993728b4ae2b040532ea77e1a8d6',
-          }
-          notation = {
-              'crates/fln-parse/src/lib.rs': 'ba74a3c279af454ddb0b498f0534ba23d4bbb3c4d4e3b920dbfe79f99daf0f03',
-              'crates/fln-parse/src/record_terms.rs': '0a7193a91739a962727d5065242510c359b391467483b7aa8194416e34233223',
-              'crates/fln-elab/src/lib.rs': '2d880ccde60d560302ff6940097d0f77c71580b098c66ff81e94743fa19bdc8c',
-              'crates/fln-elab/src/source.rs': '6344cab2a42683fe127da512598b9aaed301802372d22a3ba959acc77c838094',
-              'crates/fln/tests/source_logic.rs': 'ae64108304e6e40b8e1a4d3943ddbb107f19fbf430cdccea73085ae199481820',
-              'crates/fln-parse/tests/source_logic.rs': 'e47a3499c9abfd9cb29f62383ec401d6097480c1cbf4dcb61221533e9109d71c',
-              'crates/fln-cli/tests/source_logic.rs': '9e54c3c87c26222ee49f869f279231183a1ff02470706a89c3d0d66d371fffde',
-              'examples/native_propositional_logic.lean': 'd910b39d3e30b600cace8b90dc35183bfdab922f7041e9fde76500d8b3133bf4',
-          }
-          result = {
-              'parent': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-              'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
-              'stages': {},
-          }
-          for stage, root, expected in [('logic', pathlib.Path(os.environ['RUNNER_TEMP']) / 'logical-declarations', logic), ('notation', pathlib.Path('.'), notation)]:
-              entries = []
-              for path, digest in expected.items():
-                  data = (root / path).read_bytes()
-                  if hashlib.sha256(data).hexdigest() != digest:
-                      raise SystemExit('Tested source differs from locally verified input: ' + path)
-                  payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
-                  request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs', data=payload,
-                      headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}, method='POST')
-                  with urllib.request.urlopen(request) as response:
-                      blob = json.load(response)
-                  actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-                  if blob['sha'] != actual:
-                      raise SystemExit('Blob integrity mismatch: ' + path)
-                  entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': actual})
-              result['stages'][stage] = entries
-          pathlib.Path('native-logic-verified.json').write_text(json.dumps(result, indent=2) + '\n')
-          print(json.dumps(result, indent=2))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: native-logic-verified-${{ github.sha }}
-          path: native-logic-verified.json
-          if-no-files-found: error
-          retention-days: 2

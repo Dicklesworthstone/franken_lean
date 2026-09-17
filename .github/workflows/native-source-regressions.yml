@@ -1,4 +1,4 @@
-name: native source regressions
+name: Native parser regressions
 
 on:
   push:
@@ -7,7 +7,9 @@ on:
       - 'crates/fln-core/**'
       - 'crates/fln-syntax/**'
       - 'crates/fln-parse/**'
-      - 'crates/fln-elab/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/native-source-regressions.yml'
 
 permissions:
@@ -15,39 +17,20 @@ permissions:
 
 concurrency:
   group: native-source-regressions
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  source-snapshot:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Retain the exact public source used by the regression run
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-source.tar.gz"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-source-${{ github.sha }}
-          path: ${{ runner.temp }}/native-source.tar.gz
-          retention-days: 2
-          if-no-files-found: error
   regressions:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Install repository-pinned Rust
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
-      - name: Parser and native elaborator tests
-        run: cargo test --locked -p fln-parse -p fln-elab -- --test-threads=1
-      - name: Check downstream workspace consumers
-        run: cargo check --locked --workspace --all-targets
+      - name: Parser grouping source reconstruction and bounded-stack regressions
+        run: cargo test --locked -p fln-parse --no-fail-fast
+      - name: Lint the native parser
+        run: cargo clippy --locked -p fln-parse --all-targets -- -D warnings
