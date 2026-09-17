@@ -584,7 +584,10 @@ impl Engine<'_> {
                                         UnificationTransparency::SafeDefinitions => true,
                                     } =>
                             {
-                                Some((definition.value.clone(), definition.base.level_params.clone()))
+                                Some((
+                                    definition.value.clone(),
+                                    definition.base.level_params.clone(),
+                                ))
                             }
                             _ => None,
                         };
@@ -593,7 +596,9 @@ impl Engine<'_> {
                             head = crate::universe::parameters::instantiate(
                                 || self.meter.node(),
                                 || UnificationError::ExpressionScope,
-                                &value, &parameters, levels,
+                                &value,
+                                &parameters,
+                                levels,
                             )?;
                         } else {
                             break;
@@ -963,6 +968,47 @@ impl Engine<'_> {
                 body_locals.add_param(fresh.clone(), fresh.0, a.clone(), *binder_info);
                 pending.push_front((left_body, right_body, body_locals));
                 pending.push_front((a.clone(), c.clone(), locals.clone()));
+            }
+            // Function eta is a comparison under a fresh, typed local, not an
+            // assignment shortcut. The non-lambda side stays in its original
+            // scope; only the lambda body is opened. Further equations use the
+            // ordinary worklist, including pattern checks and shared budgets.
+            // Keep this after Lam/Lam so two explicit domains are still compared.
+            (
+                ExprNode::Lam {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                },
+                _,
+            ) => {
+                let fresh = self.fresh()?;
+                let argument = Expr::fvar(fresh.clone());
+                let body = self.substitute(body, &argument)?;
+                let applied = Expr::app(right.clone(), argument);
+                self.scan(&applied)?;
+                let mut body_locals = locals.clone();
+                body_locals.add_param(fresh.clone(), fresh.0, binder_type.clone(), *binder_info);
+                pending.push_front((body, applied, body_locals));
+            }
+            (
+                _,
+                ExprNode::Lam {
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
+                },
+            ) => {
+                let fresh = self.fresh()?;
+                let argument = Expr::fvar(fresh.clone());
+                let body = self.substitute(body, &argument)?;
+                let applied = Expr::app(left.clone(), argument);
+                self.scan(&applied)?;
+                let mut body_locals = locals.clone();
+                body_locals.add_param(fresh.clone(), fresh.0, binder_type.clone(), *binder_info);
+                pending.push_front((applied, body, body_locals));
             }
             (
                 ExprNode::Proj {
