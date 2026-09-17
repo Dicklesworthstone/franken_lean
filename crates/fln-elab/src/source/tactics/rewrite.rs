@@ -1,5 +1,6 @@
 //! Goal rewriting by explicit equality proofs. The result is an Eq.rec term,
 //! never an unchecked change of the goal's type or a new equality axiom.
+mod locations;
 mod matching;
 mod simplify;
 
@@ -19,7 +20,7 @@ impl Context {
         args: &'a [Syntax],
         close: bool,
     ) -> Result<VecDeque<RewriteRule<'a>>, NatDefinitionElabError> {
-        let [keyword, config, sequence, location] = args else {
+        let [keyword, config, sequence, _location] = args else {
             return Err(error(TacticError::MalformedScript));
         };
         expect_atom(
@@ -28,7 +29,6 @@ impl Context {
             "rewrite keyword",
         )?;
         expect_empty_null(config, "default rewrite configuration")?;
-        expect_empty_null(location, "goal-only rewrite location")?;
         let parts = expect_node(
             sequence,
             &parser_kind(&["Tactic", "rwRuleSeq"]),

@@ -8,6 +8,7 @@
 use super::*;
 use std::ops::Range;
 mod elimination;
+mod locations;
 
 fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {
     NatDefinitionParseError::OutsideSeedGrammar {
@@ -238,6 +239,7 @@ fn rewrite(
     keyword: Syntax,
     close: bool,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let (range, location) = locations::split(leaves, view, tokens, range)?;
     let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
     if range.len() < 4 || !is(range.start + 1, "[") || !is(range.end - 1, "]") {
         return Err(refusal(view, tokens, range.start));
@@ -297,7 +299,7 @@ fn rewrite(
     );
     Ok(Syntax::node(
         parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
-        vec![keyword, null_node(Vec::new()), rules, null_node(Vec::new())],
+        vec![keyword, null_node(Vec::new()), rules, location],
     ))
 }
 

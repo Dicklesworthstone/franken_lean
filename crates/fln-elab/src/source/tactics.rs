@@ -36,6 +36,7 @@ pub enum TacticError {
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
+    RewriteLocation,
     RewriteMetavariablePattern,
     SimplificationNoProgress,
     SimplificationCycle,
@@ -69,6 +70,10 @@ impl std::fmt::Display for TacticError {
             Self::NoMatchingAssumption => write!(f, "no local assumption matches the goal"),
             Self::ApplyMismatch => write!(f, "apply conclusion does not match the goal"),
             Self::ExpectedEquality => write!(f, "rewrite requires an instantiated equality proof"),
+            Self::RewriteLocation => write!(
+                f,
+                "rewrite location must name an available local hypothesis"
+            ),
             Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
             Self::RewriteMetavariablePattern => {
                 write!(f, "rewrite pattern has an unresolved metavariable head")
@@ -581,8 +586,10 @@ impl Context {
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
             {
                 let close = kind == &parser_kind(&["Tactic", "rwSeq"]);
-                let rules = self.rewrite_rules(args, close)?;
-                proof.work.push(Work::Rewrite(goal, rules, close));
+                if !self.rewrite_at_locations(proof, &goal, args, close)? {
+                    let rules = self.rewrite_rules(args, close)?;
+                    proof.work.push(Work::Rewrite(goal, rules, close));
+                }
             } else if kind == &parser_kind(&["Tactic", "intro"]) {
                 let [keyword, names] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
