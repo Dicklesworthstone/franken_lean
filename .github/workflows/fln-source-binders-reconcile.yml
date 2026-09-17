@@ -1,0 +1,149 @@
+name: Integrate native dependent binders
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-source-binders-reconcile.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-source-binders-reconcile
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install configured Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+      - name: Integrate exact source without replacing concurrent changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I <<'PY'
+          import pathlib, hashlib, subprocess, textwrap
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          original = subprocess.run(
+              ['git', 'show', '193ed612c1815f9278a7ca5062b1b13444cfff6c:.github/workflows/fln-source-binders-landing.yml'],
+              check=True, capture_output=True).stdout
+          assert blob(original) == '38e9adc7e9f85e7b7d342672c82fddbccb0670da'
+          script = textwrap.dedent(original.decode().split("          python3 -I <<'PY'\n", 1)[1].split('\n          PY\n', 1)[0])
+          # The separately committed follow-up is the only changed module input.
+          # The original wiring patch still verifies its immutable SHA256 and
+          # every before/after file blob, and does not touch the unifier.
+          script = script.replace('5b636323b5a95365e7562d30aef5f2ca00e48302', 'cbcdb840e016a4ac4d5972f6a7ce93aaee8d6c9f')
+          exec(compile(script, 'verified-source-binder-integration', 'exec'))
+          tests = pathlib.Path('crates/fln/tests/source_term_binders.rs')
+          suffix = r'''
+          #[test]
+          fn expected_implicit_prefixes_are_inserted_before_written_lambdas() {
+              checked("def id : {A : Type} -> A -> A := fun x => x\ntheorem ok : id 7 = 7 := by rfl");
+              checked("def id : {A : Sort _} -> A -> A := fun x => x");
+              checked(
+                  "def first : {A : Type} -> {B : Type} -> A -> B -> A := fun x y => x\ntheorem ok : first 7 true = 7 := by rfl",
+              );
+              checked(
+                  "def first : {A : Type} -> ⦃B : Type⦄ -> A -> B -> A := fun x y => x\ntheorem ok : first 7 true = 7 := by rfl",
+              );
+          }
+
+          #[test]
+          fn expected_instance_prefixes_feed_body_instance_synthesis() {
+              checked(
+                  "class Item (A : Type) where\n  value : A\ndef get : {A : Type} -> [d : Item A] -> Nat -> A := fun (_ : Nat) => Item.value\ninstance natItem : Item Nat := { value := 7 }\ntheorem ok : get 0 = 7 := by rfl",
+              );
+          }
+
+          #[test]
+          fn implicit_prefix_insertion_preserves_source_hygiene_and_scope() {
+              checked("def keep (A : Nat) : {A : Type} -> Nat -> Nat := fun x => A + x");
+          }
+
+          #[test]
+          fn implicit_annotations_suppress_automatic_lambda_insertion() {
+              checked(
+                  "def id : {A : Type} -> A -> A := fun {B : Type} (x : B) => x\ntheorem ok : id 7 = 7 := by rfl",
+              );
+              checked("def id : ⦃A : Type⦄ -> A -> A := fun A x => x");
+          }
+
+          #[test]
+          fn grouped_annotations_observe_preceding_binder_shadowing() {
+              checked("def keep (A : Type) := fun (x y : A) => x");
+              for source in [
+                  "def wrong (A : Type) := fun (A x : A) => x",
+                  "def wrong (A : Type) := forall (A x : A), A",
+                  "def wrong (A : Type) := fun A x : A => x",
+              ] {
+                  assert!(
+                      engine()
+                          .check_source_files(
+                              &[source.as_bytes()],
+                              &KVMap::new(),
+                              SourceCheckLimits::new(limits())
+                          )
+                          .is_err(),
+                      "{source}"
+                  );
+              }
+          }
+
+          #[test]
+          fn failed_tactic_alternatives_do_not_leak_implicit_binders() {
+              checked(
+                  "theorem keep : forall {P : Prop}, P -> P := by\n  first | exact fun (h : Nat) => h | exact fun h => h",
+              );
+          }
+          '''
+          result = tests.read_bytes() + suffix.encode()
+          assert blob(result) == '07e6e5413dd0835101626c420a8f95ba04631a39'
+          tests.write_bytes(result)
+          pathlib.Path('target/source-binders').mkdir(parents=True, exist_ok=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          PY
+      - name: Test actual combined source and both declaration checkers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/source-binders/package-tests.log
+          cargo test --locked -p fln --test source_term_binders 2>&1 | tee target/source-binders/dual-checker-tests.log
+          cargo clippy --locked -p fln-parse -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/source-binders/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/source-binders/workspace-check.log
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln-parse/src/lib.rs crates/fln-parse/src/record_terms.rs crates/fln-parse/src/term_binders.rs crates/fln-elab/src/source.rs crates/fln-elab/src/source/binders.rs crates/fln/tests/source_term_binders.rs
+          git diff --check
+      - name: Commit tested functionality directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tested_parent="$(git rev-parse HEAD)"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$tested_parent"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- crates/fln-parse/src/lib.rs crates/fln-parse/src/record_terms.rs crates/fln-elab/src/source.rs crates/fln/tests/source_term_binders.rs
+          git commit -m 'feat(source): enable dependent binders and implicit lambda inference'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/source-binders/published-commit.txt
+      - name: Retain exact verification results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: integrated-source-binders-${{ github.sha }}
+          path: target/source-binders
+          retention-days: 7
+          if-no-files-found: warn
