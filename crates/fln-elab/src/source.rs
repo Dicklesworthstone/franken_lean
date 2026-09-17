@@ -571,7 +571,7 @@ impl Context {
                         deferred,
                     ))))
                 } else {
-                    Ok(());
+                    Ok(())
                 };
             }
             // An explicit opaque proof hole can postpone an entire batch, even
