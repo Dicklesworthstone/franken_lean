@@ -1,0 +1,132 @@
+name: Kernel constructor membership
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fln-kernel-membership.yml'
+      - 'crates/fln-kernel/src/admit_membership_tests.rs'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fln-kernel-membership
+  cancel-in-progress: false
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Register the admission regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/membership-evidence
+          git rev-parse HEAD > target/membership-evidence/input-commit.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/fln-kernel/src/admit.rs')
+          text = p.read_text()
+          anchor = '    pub recursors: Vec<RecursorVal>,\n}\n'
+          registration = '\n#[cfg(test)]\n#[path = "admit_membership_tests.rs"]\nmod membership_tests;\n'
+          assert text.count(anchor) == 1
+          if 'mod membership_tests;' not in text:
+              text = text.replace(anchor, anchor + registration, 1)
+          p.write_text(text)
+          PY
+          tar -czf target/membership-evidence/source.tar.gz crates .beads Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md IMPLEMENTATION_STATUS.md AGENTS.md KERNEL_CONTRACT.md
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee target/membership-evidence/compiler.txt
+      - name: Reproduce the old acceptance hole
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'outside the inductive block' crates/fln-kernel/src/admit.rs; then
+            echo 'Guard already installed; no baseline reproduction claimed.' > target/membership-evidence/baseline.log
+            exit 0
+          fi
+          set +e
+          cargo test --locked -p fln-kernel --lib membership_tests::orphan_constructor_cannot_inhabit_an_empty_proposition -- --exact --nocapture > target/membership-evidence/baseline.log 2>&1
+          status=$?
+          set -e
+          cat target/membership-evidence/baseline.log
+          # A filtered-out test or compilation failure is not a reproduction.
+          # Use the full module-qualified name if the shorter name matched none.
+          if grep -q '0 tests' target/membership-evidence/baseline.log; then
+            set +e
+            cargo test --locked -p fln-kernel --lib admit::membership_tests::orphan_constructor_cannot_inhabit_an_empty_proposition -- --exact --nocapture > target/membership-evidence/baseline.log 2>&1
+            status=$?
+            set -e
+            cat target/membership-evidence/baseline.log
+          fi
+          test "$status" -ne 0
+          grep -q 'test result: FAILED' target/membership-evidence/baseline.log
+          grep -q 'Accepted' target/membership-evidence/baseline.log
+      - name: Enforce complete constructor-parent coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/fln-kernel/src/admit.rs')
+          text = p.read_text()
+          anchor = '        let lparams = first.base.level_params.clone();\n'
+          guard = '''        // Per-parent validation must cover EVERY supplied constructor before
+          // any declaration enters the scratch environment. Otherwise an orphan
+          // bypasses typing/positivity but is still published with the block.
+          // This also guards the nested translator's synthesized admission path.
+          for ctor in &block.ctors {
+              if !block.types.iter().any(|ind| ind.base.name == ctor.induct) {
+                  return reject(
+                      RejectClass::BlockMismatch,
+                      format!(
+                          "constructor `{}` names parent `{}` outside the inductive block",
+                          ctor.base.name.to_display_string(),
+                          ctor.induct.to_display_string()
+                      ),
+                  );
+              }
+          }
+          '''
+          # Restore the function-body indent after YAML's block de-indentation.
+          guard = '\n'.join(('        ' + line if i else line) for i, line in enumerate(guard.split('\n')))
+          assert text.count(anchor) == 1
+          if 'outside the inductive block' not in text:
+              text = text.replace(anchor, guard + anchor, 1)
+          p.write_text(text)
+          PY
+          rustfmt --edition 2024 --config skip_children=true crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs
+          git diff --check
+      - name: Verify the production kernel and independent checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-kernel --lib membership_tests -- --nocapture 2>&1 | tee target/membership-evidence/membership.log
+          cargo test --locked -p fln-kernel --all-targets --no-fail-fast 2>&1 | tee target/membership-evidence/kernel.log
+          cargo test --locked -p fln-checker --test admit --no-fail-fast 2>&1 | tee target/membership-evidence/checker.log
+          cargo clippy --locked -p fln-kernel --all-targets -- -D warnings 2>&1 | tee target/membership-evidence/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/membership-evidence/workspace.log
+      - name: Publish verified implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git add -- crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs
+          git diff --cached --binary > target/membership-evidence/verified.patch
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix(kernel): reject constructors outside their admitted inductive block'
+            git push origin HEAD:main
+          fi
+          git rev-parse HEAD > target/membership-evidence/published-commit.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: kernel-membership-${{ github.sha }}
+          path: target/membership-evidence
+          retention-days: 7
