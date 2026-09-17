@@ -250,8 +250,22 @@ impl Context {
                 binders.push(self.term_binder(binder, lambda)?);
             }
         }
-        Ok(Telescope {
-            binders,
+        // A grouped annotation is elaborated separately for each name, in the
+        // context extended by the preceding names, just like separate binders.
+        // Reusing one elaborated domain would incorrectly ignore shadowing.
+        let mut individual = Vec::new();
+        for binder in binders {
+            for name in binder.names {
+                self.tick()?;
+                individual.push(Binder {
+                    names: vec![name],
+                    annotation: binder.annotation,
+                    style: binder.style,
+                });
+            }
+        }
+        let mut state = Telescope {
+            binders: individual,
             cursor: 0,
             locals: Vec::new(),
             levels: Vec::new(),
@@ -260,7 +274,83 @@ impl Context {
             expected,
             lambda,
             body,
-        })
+        };
+        self.open_implicit_lambda_prefix(&mut state)?;
+        Ok(state)
+    }
+
+    /// Expected implicit lambdas precede a written ordinary lambda. Explicit
+    /// `{}`/`[]` binders suppress this feature; a leading strict implicit alone
+    /// does not trigger it. Once triggered, preserve every non-explicit binder.
+    /// Synthetic locals cannot capture source names (the Reference uses fresh
+    /// macro scopes here); their domains still enter both checked telescopes.
+    fn open_implicit_lambda_prefix(
+        &mut self,
+        state: &mut Telescope<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if !state.lambda
+            || state.binders.iter().any(|binder| {
+                matches!(
+                    binder.style,
+                    BinderInfo::Implicit | BinderInfo::InstImplicit
+                )
+            })
+        {
+            return Ok(());
+        }
+        let Some(expected) = &state.expected_body else {
+            return Ok(());
+        };
+        let mut expected = self.whnf(expected)?;
+        if !matches!(
+            expected.node(),
+            ExprNode::ForallE {
+                binder_info: BinderInfo::Implicit | BinderInfo::InstImplicit,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+        loop {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = expected.node()
+            else {
+                break;
+            };
+            if *binder_info == BinderInfo::Default {
+                break;
+            }
+            let type_ = self.known_type(binder_type)?.ok_or_else(invalid)?;
+            let level = self.sort_level(&Typed {
+                value: binder_type.clone(),
+                type_,
+            })?;
+            if *binder_info == BinderInfo::InstImplicit {
+                self.validate_instance_binder(binder_type)?;
+            }
+            let id = FVarId(self.fresh_name()?);
+            let name = self.fresh_name()?;
+            self.txn
+                .lctx
+                .add_param(id.clone(), name, binder_type.clone(), *binder_info);
+            state.locals.push(
+                self.txn
+                    .lctx
+                    .find(&id)
+                    .expect("inserted implicit binder")
+                    .clone(),
+            );
+            state.levels.push(level);
+            let body = self.substitute(body, &Expr::fvar(id))?;
+            expected = self.whnf(&body)?;
+        }
+        state.expected_body = Some(expected);
+        Ok(())
     }
 
     /// Returns the next annotation to elaborate, or None once all binders are
