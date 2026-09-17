@@ -52,6 +52,10 @@ pub struct InductiveBlock {
     pub recursors: Vec<RecursorVal>,
 }
 
+#[cfg(test)]
+#[path = "admit_membership_tests.rs"]
+mod membership_tests;
+
 /// A telescope entry: the admission engine's own locals, adopted into every
 /// [`TypeChecker`] it spawns. `name`/`info` feed faithful reconstruction when
 /// the telescope is re-bound (`mk_pi_locals`/`mk_lam_locals`).
@@ -423,6 +427,21 @@ impl<'a> Engine<'a> {
         let first = block.types.first().ok_or_else(|| {
             Stop::Reject(RejectClass::BlockMismatch, "empty inductive block".into())
         })?;
+        // Every supplied constructor must be checked before scratch publication.
+        // A foreign parent would bypass all per-parent typing/positivity checks.
+        // Engine construction also guards the nested synthesized-admission path.
+        for ctor in &block.ctors {
+            if !block.types.iter().any(|ind| ind.base.name == ctor.induct) {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    format!(
+                        "constructor `{}` names parent `{}` outside the inductive block",
+                        ctor.base.name.to_display_string(),
+                        ctor.induct.to_display_string()
+                    ),
+                );
+            }
+        }
         let lparams = first.base.level_params.clone();
         let levels: Vec<Level> = lparams.iter().cloned().map(Level::param).collect();
         Ok(Engine {

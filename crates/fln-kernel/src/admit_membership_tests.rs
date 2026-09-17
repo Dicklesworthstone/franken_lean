@@ -100,7 +100,12 @@ fn orphan_constructor_cannot_inhabit_an_empty_proposition() {
     // The forged type is well-formed, but it would inhabit an empty Prop.
     // The old per-parent filter never visits this row; the generated Empty
     // recursor still matches, leaving the poisoned row unchecked.
-    block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
+    block.ctors.push(constructor(
+        name("Forged"),
+        name("Foreign"),
+        name("Empty"),
+        0,
+    ));
     assert_membership_rejection(&env, block);
     assert!(!env.contains(&name("Empty")));
     assert!(!env.contains(&name("Forged")));
@@ -118,7 +123,12 @@ fn an_existing_parent_is_not_a_member_of_the_current_block() {
     )
     .expect("publish the already-checked foreign type for this fixture");
     let mut block = finish_block(&env, empty_block(&["Empty"], Level::zero()));
-    block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
+    block.ctors.push(constructor(
+        name("Forged"),
+        name("Foreign"),
+        name("Empty"),
+        0,
+    ));
     assert_membership_rejection(&env, block);
     assert!(env.contains(&name("Foreign")));
     assert!(!env.contains(&name("Empty")));
@@ -143,7 +153,12 @@ fn synthesized_admission_cannot_bypass_constructor_membership() {
         .expect("valid baseline")
         .run_synthesized()
         .expect("the synthesis baseline must succeed");
-    block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
+    block.ctors.push(constructor(
+        name("Forged"),
+        name("Foreign"),
+        name("Empty"),
+        0,
+    ));
     match Engine::new(&env, &block, Budget::DEFAULT) {
         Err(Stop::Reject(RejectClass::BlockMismatch, message)) => {
             assert!(message.contains("outside the inductive block"), "{message}");
@@ -185,7 +200,9 @@ fn valid_single_constructor_still_admits() {
     let parent = block.types[0].base.name.clone();
     let ctor_name = Name::str(parent.clone(), "mk");
     block.types[0].ctors.push(ctor_name.clone());
-    block.ctors.push(constructor(ctor_name, parent.clone(), parent, 0));
+    block
+        .ctors
+        .push(constructor(ctor_name, parent.clone(), parent, 0));
     let accepted = finish_block(&env, block);
     assert_eq!(accepted.ctors.len(), 1);
 }
@@ -197,7 +214,11 @@ fn orphan_constructor_cannot_acquire_a_checked_declaration_capability() {
 
     let env = Environment::new();
     let mut block = finish_block(&env, empty_block(&["Empty"], Level::zero()));
-    let baseline = admit(&env, crate::Declaration::Inductive(block.clone()), Budget::DEFAULT);
+    let baseline = admit(
+        &env,
+        crate::Declaration::Inductive(block.clone()),
+        Budget::DEFAULT,
+    );
     let Outcome::Complete(baseline) = baseline else {
         panic!("the valid block must complete capability admission");
     };
@@ -205,14 +226,22 @@ fn orphan_constructor_cannot_acquire_a_checked_declaration_capability() {
         convene(&Council::nobody_was_asked(), baseline),
         CouncilOutcome::Agreed(_)
     ));
-    block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
+    block.ctors.push(constructor(
+        name("Forged"),
+        name("Foreign"),
+        name("Empty"),
+        0,
+    ));
     let poisoned = admit(&env, crate::Declaration::Inductive(block), Budget::DEFAULT);
     let Outcome::Complete(poisoned) = poisoned else {
         panic!("an orphan inventory must be a rejection, not a non-answer");
     };
     assert!(matches!(
         convene(&Council::nobody_was_asked(), poisoned),
-        CouncilOutcome::KernelRejected { class: RejectClass::BlockMismatch, .. }
+        CouncilOutcome::KernelRejected {
+            class: RejectClass::BlockMismatch,
+            ..
+        }
     ));
     assert!(!env.contains(&name("Forged")));
 }
@@ -222,7 +251,12 @@ fn nested_metadata_does_not_skip_constructor_membership() {
     let env = Environment::new();
     let mut block = finish_block(&env, empty_block(&["Empty"], Level::zero()));
     block.types[0].num_nested = 1;
-    block.ctors.push(constructor(name("Forged"), name("Foreign"), name("Empty"), 0));
+    block.ctors.push(constructor(
+        name("Forged"),
+        name("Foreign"),
+        name("Empty"),
+        0,
+    ));
     assert_membership_rejection(&env, block);
 }
 
