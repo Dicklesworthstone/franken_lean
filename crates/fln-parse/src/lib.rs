@@ -552,6 +552,7 @@ fn nat_definition_token_table() -> TokenTable {
         "theorem",
         "instance",
         "by",
+        "calc",
         "[",
         "]",
         ",",
@@ -628,6 +629,7 @@ fn source_module_token_table() -> TokenTable {
         "theorem",
         "instance",
         "by",
+        "calc",
         "[",
         "]",
         ",",
@@ -1205,6 +1207,18 @@ fn bounded_term_spliced(
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>
+            {
+                let (term, end) = proofs::calculation(leaves, view, tokens, index, range.end)?;
+                splices.retain(|start, _| *start < index || *start >= end);
+                frames
+                    .last_mut()
+                    .expect("root term frame")
+                    .application
+                    .push((term, index));
+                cursor = end;
+            }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
             {

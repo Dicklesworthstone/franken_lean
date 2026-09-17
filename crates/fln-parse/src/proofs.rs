@@ -8,6 +8,7 @@
 use super::*;
 use std::ops::Range;
 mod elimination;
+pub(super) use elimination::calculation;
 mod locations;
 
 fn refusal(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionParseError {

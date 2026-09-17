@@ -2,6 +2,7 @@
 //! Each alternative retains its original leaves and owns a complete tactic
 //! sequence. Nested eliminations are parsed without recursing on the host stack.
 use super::*;
+mod calc;
 
 struct Alternative {
     pipe: usize,
@@ -45,6 +46,7 @@ struct Choice {
     end: usize,
 }
 enum Plan {
+    Calc(calc::Calculation, Option<usize>),
     Choice(Choice),
     Chain(Chain),
     Group(Range<usize>),
@@ -54,6 +56,12 @@ enum Plan {
     Eliminate(Elimination),
 }
 enum Task {
+    Calc(calc::Calculation),
+    StartCalcTactic(calc::Calculation, Option<usize>),
+    FinishCalc(calc::Calculation),
+    CalcTactic(Option<usize>),
+    CalcProof(Range<usize>),
+    By(usize),
     Choice(Choice),
     FinishChoice(Choice),
     Chain(Chain),
@@ -449,7 +457,10 @@ fn binding_term(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    if let Some(at) = range.clone().find(|&at| symbol(tokens, at, "by")) {
+    if let Some(at) = range
+        .clone()
+        .find(|&at| symbol(tokens, at, "by") || symbol(tokens, at, "calc"))
+    {
         return Err(refusal(view, tokens, at));
     }
     bounded_term(leaves, view, tokens, range, DefinitionGrammar::Scalar)
@@ -571,6 +582,18 @@ fn split(
                 return Err(refusal(view, tokens, end));
             }
             (Plan::Group(cursor..end), end)
+        } else if symbol(tokens, cursor, "calc")
+            || word(tokens, cursor, "exact") && symbol(tokens, cursor + 1, "calc")
+        {
+            let exact = word(tokens, cursor, "exact").then_some(cursor);
+            let plan = calc::plan(
+                view,
+                tokens,
+                cursor + usize::from(exact.is_some()),
+                range.end,
+            )?;
+            let end = plan.end;
+            (Plan::Calc(plan, exact), end)
         } else if word(tokens, cursor, "have") || symbol(tokens, cursor, "let") {
             let plan = plan_binding(view, tokens, cursor, range.end, baseline)?;
             let end = plan.end;
@@ -612,7 +635,28 @@ pub(super) fn sequence(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let mut tasks = vec![Task::Sequence(range, None)];
+    run(leaves, view, tokens, Task::Sequence(range, None))
+}
+
+pub(crate) fn calculation(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    limit: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let plan = calc::plan(view, tokens, start, limit)?;
+    let end = plan.end;
+    Ok((run(leaves, view, tokens, Task::Calc(plan))?, end))
+}
+
+fn run(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    root: Task,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut tasks = vec![root];
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
@@ -620,6 +664,7 @@ pub(super) fn sequence(
                 let (plans, separators) = split(view, tokens, range, baseline)?;
                 tasks.push(Task::FinishSequence(separators));
                 tasks.extend(plans.into_iter().rev().map(|plan| match plan {
+                    Plan::Calc(plan, exact) => Task::StartCalcTactic(plan, exact),
                     Plan::Choice(plan) => Task::Choice(plan),
                     Plan::Chain(plan) => Task::Chain(plan),
                     Plan::Group(range) => Task::Group(range),
@@ -692,12 +737,72 @@ pub(super) fn sequence(
                     vec![atom(leaves, plan.start, plan.keyword)?, body],
                 ));
             }
+            Task::StartCalcTactic(plan, exact) => {
+                tasks.push(Task::CalcTactic(exact));
+                tasks.push(Task::Calc(plan));
+            }
+            Task::CalcTactic(exact) => {
+                let term = values.pop().expect("calculation term");
+                values.push(if let Some(at) = exact {
+                    Syntax::node(
+                        parser_kind(&["Tactic", "exact"]),
+                        vec![atom(leaves, at, "exact")?, term],
+                    )
+                } else {
+                    Syntax::node(parser_kind(&["Tactic", "calc"]), vec![term])
+                });
+            }
+            Task::Calc(plan) => {
+                let proofs: Vec<_> = plan.steps.iter().map(|step| step.proof.clone()).collect();
+                tasks.push(Task::FinishCalc(plan));
+                tasks.extend(proofs.into_iter().rev().map(Task::CalcProof));
+            }
+            Task::CalcProof(range) => {
+                if symbol(tokens, range.start, "by") {
+                    tasks.push(Task::By(range.start));
+                    tasks.push(Task::Sequence(range.start + 1..range.end, None));
+                } else if symbol(tokens, range.start, "calc") {
+                    let plan = calc::plan(view, tokens, range.start, range.end)?;
+                    if plan.end != range.end {
+                        return Err(refusal(view, tokens, plan.end));
+                    }
+                    tasks.push(Task::Calc(plan));
+                } else {
+                    values.push(binding_term(leaves, view, tokens, range)?);
+                }
+            }
+            Task::By(at) => {
+                let body = values.pop().expect("calculation step proof");
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "byTactic"]),
+                    vec![leaves.leaf(at)?, body],
+                ));
+            }
+            Task::FinishCalc(plan) => {
+                let proofs = values.split_off(values.len() - plan.steps.len());
+                let mut steps = Vec::new();
+                for (step, proof) in plan.steps.into_iter().zip(proofs) {
+                    let relation = binding_term(leaves, view, tokens, step.relation)?;
+                    steps.push(Syntax::node(
+                        parser_kind(&["Term", "calcStep"]),
+                        vec![relation, leaves.leaf(step.assign)?, proof],
+                    ));
+                }
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "calc"]),
+                    vec![leaves.leaf(plan.start)?, null_node(steps)],
+                ));
+            }
             Task::Plain(range) => values.push(tactic(leaves, view, tokens, range)?),
             Task::Bind(plan) => {
                 if plan.by.is_some() {
                     let range = plan.value.clone();
                     tasks.push(Task::FinishBinding(plan));
                     tasks.push(Task::Sequence(range, None));
+                } else if symbol(tokens, plan.value.start, "calc") {
+                    let range = plan.value.clone();
+                    tasks.push(Task::FinishBinding(plan));
+                    tasks.push(Task::CalcProof(range));
                 } else {
                     let value = binding_term(leaves, view, tokens, plan.value.clone())?;
                     values.push(finish_binding(leaves, view, tokens, plan, value)?);
