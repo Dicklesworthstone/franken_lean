@@ -1,14 +1,21 @@
 //! Metered beta/delta/zeta/iota reduction for native unification.
 //!
 //! Eliminator majors use heap continuations rather than recursive calls. Only
-//! registered, safe, single-family recursors with matching constructor metadata
+//! registered, safe single-family recursors and initialized quotient primitives
 //! reduce. A blocked major is rebuilt once; it is never re-entered in a loop.
 //! This module has no declaration-publication authority. Assignment validation
 //! and all-or-nothing publication remain in the parent solver.
+mod quotient;
+
 use super::*;
 use fln_env::constants::RecursorVal;
 
 enum Continuation {
+    Quotient {
+        head: Expr,
+        arguments: Vec<Expr>,
+        major: usize,
+    },
     Projection {
         structure: Name,
         index: u64,
@@ -114,6 +121,18 @@ impl Engine<'_> {
                                 levels,
                             )?;
                         }
+                        Some(ConstantInfo::Quot(_)) => {
+                            let Some(major) = self.quotient_major_index(&head, args.len())? else {
+                                break;
+                            };
+                            let value = args[args.len() - major - 1].clone();
+                            continuations.push(Continuation::Quotient {
+                                head,
+                                arguments: std::mem::take(&mut args),
+                                major,
+                            });
+                            head = value;
+                        }
                         Some(ConstantInfo::Rec(recursor)) => {
                             // Iota is independent of delta transparency. Do not
                             // guess the layout of unsupported recursor families.
@@ -155,6 +174,25 @@ impl Engine<'_> {
             while let Some(continuation) = continuations.pop() {
                 self.meter.tick()?;
                 match continuation {
+                    Continuation::Quotient {
+                        head: eliminator,
+                        arguments: mut outer,
+                        major,
+                    } => {
+                        if let Some(result) =
+                            self.quotient_step(&eliminator, &outer, &head, &args)?
+                        {
+                            // Preserve applications of a function-valued result.
+                            outer.truncate(outer.len() - major - 1);
+                            head = result;
+                            args = outer;
+                            continue 'reduce;
+                        }
+                        let position = outer.len() - major - 1;
+                        outer[position] = self.rebuild_application(head, args)?;
+                        head = eliminator;
+                        args = outer;
+                    }
                     Continuation::Projection {
                         structure,
                         index,

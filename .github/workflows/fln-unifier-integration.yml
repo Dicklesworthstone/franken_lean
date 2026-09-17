@@ -2,49 +2,34 @@ name: Native unifier integration
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/fln-unifier-integration.yml']
+    paths:
+      - '.github/workflows/fln-unifier-integration.yml'
+      - 'crates/fln-elab/**'
+      - 'crates/fln-core/**'
+      - 'crates/fln-env/**'
+      - 'crates/fln-kernel/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
+concurrency:
+  group: native-unifier-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  verify-and-land:
+  verify:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: main
-          fetch-depth: 2
-      - name: Retain source inputs
+      - name: Retain exact source identity
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/unifier-integration
-          git rev-parse HEAD > target/unifier-integration/tested-parent.txt
-          git archive --format=tar.gz HEAD Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock AGENTS.md COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md IMPLEMENTATION_STATUS.md .beads crates/fln-elab crates/fln-core crates/fln-env crates/fln-kernel crates/fln-checker crates/fln-parse crates/fln crates/fln-cli > target/unifier-integration/source-inputs.tar.gz
-      - name: Apply native quotient implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -I <<'PYTHON'
-          import base64, hashlib, pathlib, subprocess, zlib
-          encoded = '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'
-          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == 'f4cf8d187bf2da6a283ca8d3a0ffd39c3b187ea07d4764de909f3036beb7b27b'
-          before = {'crates/fln-elab/src/constraint/unify/reduce.rs': '482257e2b767de196bae5a5020b93cfe0396b278'}
-          after = {'crates/fln-elab/src/constraint/unify/reduce.rs': 'fb2dbd717a389b93c047dcc2b0c5b23a444ce2b2', 'crates/fln-elab/src/constraint/unify/reduce/quotient.rs': '5bc942942564769c337fd52e82c6751a976c6b4d', 'crates/fln-elab/tests/support/quotient.rs': '95e9e9ab2900f17ffe8f037206d5b45d38874365', 'crates/fln-elab/tests/native_unification_quotient.rs': 'e258bf1b0a43ccc443ed21bfdf73941beea32820'}
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          for name, expected in after.items():
-              path = pathlib.Path(name)
-              assert (blob(path.read_bytes()) == before[name]) if name in before else not path.exists(), name
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          for name, expected in after.items():
-              assert blob(pathlib.Path(name).read_bytes()) == expected, name
-          pathlib.Path('target/unifier-integration/applied.patch').write_bytes(patch)
-          PYTHON
+          git rev-parse HEAD | tee target/unifier-integration/tested-commit.txt
+          git archive --format=tar.gz HEAD Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock crates/fln-elab crates/fln-core crates/fln-env crates/fln-kernel > target/unifier-integration/source-inputs.tar.gz
       - name: Install configured Rust toolchain
         shell: bash
         run: |
@@ -52,30 +37,18 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv | tee target/unifier-integration/compiler.txt
-      - name: Verify native quotient and existing reduction paths
+      - name: Run native elaborator tests
         shell: bash
         run: |
           set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/constraint/unify/reduce.rs crates/fln-elab/src/constraint/unify/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln-elab/tests/native_unification_quotient.rs
-          cargo test --locked -p fln-elab --test native_unification_quotient --test native_unification_iota --test native_unification_record_eta --no-fail-fast 2>&1 | tee target/unifier-integration/reduction-tests.log
           cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/unifier-integration/elab-tests.log
+      - name: Check elaborator and downstream compilation
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/unifier-integration/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/unifier-integration/workspace-check.log
-          git diff --check
-      - name: Publish verified implementation directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          tested_parent="$(git rev-parse HEAD)"
-          git fetch origin main
-          test "$(git rev-parse origin/main)" = "$tested_parent"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- crates/fln-elab/src/constraint/unify/reduce.rs crates/fln-elab/src/constraint/unify/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln-elab/tests/native_unification_quotient.rs
-          git commit -m 'feat(elab): reduce quotient primitives in transactional unification'
-          git push origin HEAD:main
-          git rev-parse HEAD | tee target/unifier-integration/published-commit.txt
-          git archive --format=tar.gz HEAD crates/fln-elab > target/unifier-integration/published-source.tar.gz
       - name: Retain source and verification logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
