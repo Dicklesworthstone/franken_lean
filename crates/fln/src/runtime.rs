@@ -4,6 +4,7 @@
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod nat;
+mod records;
 
 use super::*;
 use fln_comp::ingress::{BoolCaseBinding, CallableBindings};
@@ -21,6 +22,8 @@ pub(super) struct Preparation<'a> {
     next_local: u64,
     next_nat: u64,
     nat_family_checked: bool,
+    value_types: ExecutableValueTypes,
+    pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
 
 enum Task {
@@ -64,6 +67,8 @@ impl<'a> Preparation<'a> {
             next_local: 0,
             next_nat: 0,
             nat_family_checked: false,
+            value_types: ExecutableValueTypes::bounded_source(),
+            constructors: Vec::new(),
         }
     }
 
@@ -122,6 +127,7 @@ impl<'a> Preparation<'a> {
             ValueType::Nat => 0,
             ValueType::String => 1,
             ValueType::Bool => 2,
+            ValueType::Constructor => 3,
             _ => return Err(unsupported("conditional result representation")),
         };
         let name = Name::num(Name::from_components(["_fln_runtime_bool_case"]), index);
@@ -185,14 +191,7 @@ impl<'a> Preparation<'a> {
             safety: fln_env::constants::DefinitionSafety::Safe,
             all: Vec::new(),
         };
-        let Some(signature) = executable_signature(
-            &definition,
-            &ExecutableValueTypes::bounded_source(),
-            &mut self.visited,
-            self.limits,
-            false,
-        )?
-        else {
+        let Some(signature) = self.signature(&definition, false)? else {
             return Ok(value.clone());
         };
         if signature.parameters.is_empty() {
@@ -260,7 +259,8 @@ impl<'a> Preparation<'a> {
                             let ExprNode::Lam { body: motive, .. } = args[0].node() else {
                                 return Err(unsupported("Boolean motive"));
                             };
-                            let result = scalar_type(motive)
+                            let result = self
+                                .value_type(motive)?
                                 .ok_or_else(|| unsupported("dependent Boolean motive"))?;
                             let case = self.branch_name(result)?;
                             tasks.push(Task::Case { name: case, result });
@@ -368,11 +368,16 @@ impl<'a> Preparation<'a> {
                             idx,
                             expr,
                         } => {
+                            self.value_type(&Expr::const_(type_name.clone(), vec![]))?;
                             tasks.push(Task::Proj {
                                 name: type_name.clone(),
                                 index: *idx,
                             });
                             tasks.push(Task::Visit(expr.clone()));
+                        }
+                        ExprNode::Const { name, .. } => {
+                            self.constructor(name)?;
+                            values.push(expr.clone());
                         }
                         _ => values.push(expr.clone()),
                     }
