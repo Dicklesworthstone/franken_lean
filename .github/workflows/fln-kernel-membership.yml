@@ -4,11 +4,10 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/fln-kernel-membership.yml'
-      - 'crates/fln-kernel/src/admit_membership_tests.rs'
-      - 'crates/fln-kernel/tests/admission_laundering.rs'
+      - 'crates/fln-kernel/**'
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: fln-kernel-membership
   cancel-in-progress: false
@@ -18,121 +17,35 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Register the admission regression suite
+      - name: Retain the exact source closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/source-closure
+          git rev-parse HEAD > target/source-closure/commit.txt
+          git archive --format=tar.gz -o target/source-closure/source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kernel-source-${{ github.sha }}
+          path: target/source-closure
+          retention-days: 1
+      - name: Verify committed kernel and independent checker
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/membership-evidence
           git rev-parse HEAD > target/membership-evidence/input-commit.txt
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          p = Path('crates/fln-kernel/src/admit.rs')
-          text = p.read_text()
-          anchor = '    pub recursors: Vec<RecursorVal>,\n}\n'
-          registration = '\n#[cfg(test)]\n#[path = "admit_membership_tests.rs"]\nmod membership_tests;\n'
-          assert text.count(anchor) == 1
-          if 'mod membership_tests;' not in text:
-              text = text.replace(anchor, anchor + registration, 1)
-          p.write_text(text)
-          paths = ['crates', 'tools', '.beads', '.cargo', '.github', 'examples', 'docs', 'scripts', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'SUITE.lock', 'COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md', 'IMPLEMENTATION_STATUS.md', 'AGENTS.md', 'KERNEL_CONTRACT.md']
-          subprocess.run(['tar', '-czf', 'target/membership-evidence/source.tar.gz', *[p for p in paths if Path(p).exists()]], check=True)
-          PY
-      - name: Install the repository Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
           channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv | tee target/membership-evidence/compiler.txt
-      - name: Reproduce the old acceptance hole
-        shell: bash
-        run: |
-          set -euo pipefail
-          if grep -q 'outside the inductive block' crates/fln-kernel/src/admit.rs; then
-            echo 'Guard already installed; no baseline reproduction claimed.' > target/membership-evidence/baseline.log
-            exit 0
-          fi
-          set +e
-          cargo test --locked -p fln-kernel --lib admit::membership_tests::orphan_constructor_cannot_inhabit_an_empty_proposition -- --exact --nocapture > target/membership-evidence/baseline.log 2>&1
-          status=$?
-          set -e
-          cat target/membership-evidence/baseline.log
-          test "$status" -ne 0
-          grep -q 'test result: FAILED' target/membership-evidence/baseline.log
-          grep -q 'Accepted' target/membership-evidence/baseline.log
-      - name: Enforce complete constructor-parent coverage
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('crates/fln-kernel/src/admit.rs')
-          text = p.read_text()
-          anchor = '        let lparams = first.base.level_params.clone();\n'
-          guard = '''// Every supplied constructor must be checked before scratch publication.
-          // A foreign parent would bypass all per-parent typing/positivity checks.
-          // Engine construction also guards the nested synthesized-admission path.
-          for ctor in &block.ctors {
-              if !block.types.iter().any(|ind| ind.base.name == ctor.induct) {
-                  return reject(
-                      RejectClass::BlockMismatch,
-                      format!(
-                          "constructor `{}` names parent `{}` outside the inductive block",
-                          ctor.base.name.to_display_string(),
-                          ctor.induct.to_display_string()
-                      ),
-                  );
-              }
-          }
-          '''
-          guard = ''.join('        ' + line + '\n' for line in guard.splitlines())
-          assert text.count(anchor) == 1
-          if 'outside the inductive block' not in text:
-              text = text.replace(anchor, guard + anchor, 1)
-          p.write_text(text)
-          PY
-          rustfmt --edition 2024 --config skip_children=true crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs crates/fln-kernel/tests/admission_laundering.rs
-          git diff --check
-      - name: Verify the production kernel and independent checker
-        shell: bash
-        run: |
-          set -euo pipefail
           cargo test --locked -p fln-kernel --lib membership_tests -- --nocapture 2>&1 | tee target/membership-evidence/membership.log
           cargo test --locked -p fln-kernel --all-targets --no-fail-fast 2>&1 | tee target/membership-evidence/kernel.log
           cargo test --locked -p fln-checker --test admit --no-fail-fast 2>&1 | tee target/membership-evidence/checker.log
           cargo clippy --locked -p fln-kernel --all-targets -- -D warnings 2>&1 | tee target/membership-evidence/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/membership-evidence/workspace.log
-      - name: Publish verified implementation directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'FrankenLean implementation'
-          git config user.email 'noreply@github.com'
-          git add -- crates/fln-kernel/src/admit.rs crates/fln-kernel/src/admit_membership_tests.rs crates/fln-kernel/tests/admission_laundering.rs
-          git diff --cached --binary > target/membership-evidence/verified.patch
-          if ! git diff --cached --quiet; then
-            git commit -m 'fix(kernel): reject constructors outside their admitted inductive block'
-            git push origin HEAD:main
-          fi
-          git rev-parse HEAD > target/membership-evidence/published-commit.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: kernel-membership-${{ github.sha }}
           path: target/membership-evidence
           retention-days: 7
-      - name: Retain the pinned compiler for isolated source regression work
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          sysroot="$(rustc --print sysroot)"
-          mkdir -p target/compiler-export
-          tar -czf "$PWD/target/compiler-export/toolchain.tar.gz" -C "$sysroot" bin/cargo bin/rustc bin/rustfmt bin/cargo-fmt bin/clippy-driver bin/cargo-clippy lib/libLLVM.so.23.1-rust-1.100.0-nightly lib/librustc_driver-*.so lib/rustlib/x86_64-unknown-linux-gnu/lib
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: kernel-compiler-${{ github.sha }}
-          path: target/compiler-export
-          retention-days: 1
