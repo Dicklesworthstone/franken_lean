@@ -1,5 +1,7 @@
 //! Source-level universe substitution uses the same metered DAG traversal as
 //! native unifier delta reduction, without assigning caller universe parameters.
+mod generalization;
+
 use super::{Context, SourceInferenceError, failure};
 use crate::NatDefinitionElabError;
 use fln_core::expr::Expr;
