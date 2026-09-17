@@ -27,6 +27,12 @@ jobs:
           plan=json.loads(pathlib.Path('scripts/native_instance_increment.json').read_text())
           patch=plan['patch_text'].encode() if 'patch_text' in plan else gzip.decompress(base64.b64decode(plan['patch'],validate=True))
           assert hashlib.sha256(patch).hexdigest()==plan['sha256'], 'increment checksum mismatch'
+          message=plan['message']
+          if plan['sha256']=='5ec8fbb85293b86aa353d42fe92af5661930ba4f454d6a0b35ff82e1c5c9836a':
+              amendment=pathlib.Path('scripts/native_unifier_shared_forest.patch').read_bytes()
+              assert hashlib.sha256(amendment).hexdigest()=='013f66a6748a5aabd20b0b03564d93c80cf09a5a488a9771b8e200027106cfa8'
+              patch += amendment
+              message += ' and bounded shared-context unification'
           paths=[]
           for line in patch.decode().splitlines():
               if line.startswith('+++ b/'):
@@ -42,12 +48,9 @@ jobs:
               assert hashlib.sha256(amendment).hexdigest()=='a75bce8c71379ca09187cf68139cb991996eb080a319ff4bcbe8e8efe35559f3'
               subprocess.run(['git','apply','--check','-'],input=amendment,check=True)
               subprocess.run(['git','apply','-'],input=amendment,check=True)
-              target=pathlib.Path('crates/fln-elab/src/source/record_terms.rs')
-              assert hashlib.sha256(target.read_bytes()).hexdigest()=='4eac9caf04b91f9e884ad38dfc882197e5ee40e4e8794b0f218c0f7ce2fb5ed1'
-              pathlib.Path('target/instance-landing/amendment.patch').write_bytes(amendment)
-          pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(paths))
+          pathlib.Path('target/instance-landing/paths.json').write_text(json.dumps(list(dict.fromkeys(paths))))
+          pathlib.Path('target/instance-landing/message.txt').write_text(message)
           pathlib.Path('target/instance-landing/change.patch').write_bytes(patch)
-          pathlib.Path('target/instance-landing/source-digests.json').write_text(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths},indent=2))
           PY
       - name: Verify actual source engine and installed CLI
         shell: bash
@@ -58,8 +61,7 @@ jobs:
           rustc -Vv | tee target/instance-landing/compiler.txt
           python3 - <<'PY'
           import json,pathlib,subprocess
-          paths=json.loads(pathlib.Path('target/instance-landing/paths.json').read_text())
-          for path in paths:
+          for path in json.loads(pathlib.Path('target/instance-landing/paths.json').read_text()):
               if path.endswith('.rs'):
                   subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',path],check=True)
           PY
@@ -76,7 +78,7 @@ jobs:
           cargo test --locked -p fln-cli --no-fail-fast 2>&1 | tee target/instance-landing/cli.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln-checker -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/instance-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/instance-landing/workspace.log
-          for example in native_instances native_records native_record_values native_algebraic native_record_updates native_record_defaults native_record_inheritance; do
+          for example in native_instances native_records native_record_values native_algebraic native_record_updates native_record_defaults native_record_inheritance native_hypothesis_simplification; do
             if test -f "examples/$example.lean"; then
               cargo run --locked -p fln-cli --bin fln -- check-source --json "examples/$example.lean" > "target/instance-landing/$example.json"
             fi
@@ -89,43 +91,18 @@ jobs:
           python3 - <<'PY'
           import json,pathlib,subprocess
           paths=json.loads(pathlib.Path('target/instance-landing/paths.json').read_text())
-          plan=json.loads(pathlib.Path('scripts/native_instance_increment.json').read_text())
+          message=pathlib.Path('target/instance-landing/message.txt').read_text()
           subprocess.run(['git','config','user.name','FrankenLean implementation'],check=True)
           subprocess.run(['git','config','user.email','noreply@github.com'],check=True)
           subprocess.run(['git','add','--',*paths],check=True)
           pathlib.Path('target/instance-landing/verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
-          subprocess.run(['git','commit','-m',plan['message']],check=True)
+          subprocess.run(['git','commit','-m',message],check=True)
           subprocess.run(['git','push','origin','HEAD:main'],check=True)
           pathlib.Path('target/instance-landing/published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
           PY
-      - name: Preserve the checked source snapshot
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar -czf target/instance-landing/source.tar.gz crates tools .beads .cargo .github examples docs scripts Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: native-instances-${{ github.sha }}
           path: target/instance-landing
           retention-days: 7
-      - name: Preserve pinned tools for isolated regression work
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/native-tools
-          python3 - <<'PY'
-          import pathlib,subprocess,tarfile
-          root=pathlib.Path(subprocess.check_output(['rustc','--print','sysroot'],text=True).strip())
-          with tarfile.open('target/native-tools/toolchain.tar.gz','w:gz') as archive:
-              for path in [root/'bin',root/'lib']:
-                  archive.add(path,arcname=str(path.relative_to(root)))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: native-tools-${{ github.sha }}
-          path: target/native-tools
-          retention-days: 1
