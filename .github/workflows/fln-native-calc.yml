@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   calculation:
-    if: startsWith(github.event.head_commit.message, 'feat(elab): integrate native calc')
+    if: "startsWith(github.event.head_commit.message, 'feat(elab): integrate native calc')"
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
