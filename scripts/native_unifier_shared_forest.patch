@@ -1,0 +1,151 @@
+diff --git a/crates/fln-elab/src/constraint/unify.rs b/crates/fln-elab/src/constraint/unify.rs
+index e873975..b23d679 100644
+--- a/crates/fln-elab/src/constraint/unify.rs
++++ b/crates/fln-elab/src/constraint/unify.rs
+@@ -216,13 +216,13 @@ struct Facts {
+ 
+ /// Explicit DAG walks precede core substitution and kernel submission. Keys
+ /// live only while the borrowed roots are pinned; no address is persisted.
+-fn facts(expr: &Expr, meter: &mut Meter<'_>) -> Result<Facts, UnificationError> {
++fn facts(roots: &[Expr], meter: &mut Meter<'_>) -> Result<Facts, UnificationError> {
+     let mut result = Facts::default();
+     let mut seen = HashSet::new();
+     let mut seen_levels = HashSet::new();
+     let mut params = HashSet::new();
+     let mut uvars = HashSet::new();
+-    let mut pending = vec![expr];
++    let mut pending: Vec<_> = roots.iter().rev().collect();
+     let mut levels = Vec::new();
+     while let Some(current) = pending.pop() {
+         if !seen.insert(std::ptr::from_ref(current.node())) {
+@@ -483,7 +483,7 @@ impl Engine<'_> {
+     }
+ 
+     fn scan(&mut self, expr: &Expr) -> Result<Facts, UnificationError> {
+-        let found = facts(expr, &mut self.meter)?;
++        let found = facts(std::slice::from_ref(expr), &mut self.meter)?;
+         self.reserved.extend(found.fvars.iter().cloned());
+         Ok(found)
+     }
+@@ -584,7 +584,10 @@ impl Engine<'_> {
+                                         UnificationTransparency::SafeDefinitions => true,
+                                     } =>
+                             {
+-                                Some((definition.value.clone(), definition.base.level_params.clone()))
++                                Some((
++                                    definition.value.clone(),
++                                    definition.base.level_params.clone(),
++                                ))
+                             }
+                             _ => None,
+                         };
+@@ -593,7 +596,9 @@ impl Engine<'_> {
+                             head = crate::universe::parameters::instantiate(
+                                 || self.meter.node(),
+                                 || UnificationError::ExpressionScope,
+-                                &value, &parameters, levels,
++                                &value,
++                                &parameters,
++                                levels,
+                             )?;
+                         } else {
+                             break;
+@@ -995,24 +1000,31 @@ impl Engine<'_> {
+         // iteration changes neither the resulting set nor the generated names.
+         let mut roots = Vec::new();
+         for declaration in self.work.mvars.decls().values() {
++            self.meter.tick()?;
+             roots.push(declaration.type_.clone());
+             for local in declaration.lctx.decls() {
++                self.meter.tick()?;
+                 self.reserved.insert(local.id.clone());
+                 roots.push(local.type_.clone());
+                 roots.extend(local.value.iter().cloned());
+             }
+         }
+         for assignment in self.work.mvars.assignments().values() {
++            self.meter.tick()?;
+             roots.push(assignment.expr.clone());
+         }
+         for local in self.work.lctx.decls() {
++            self.meter.tick()?;
+             self.reserved.insert(local.id.clone());
+             roots.push(local.type_.clone());
+             roots.extend(local.value.iter().cloned());
+         }
+-        for root in roots {
+-            self.scan(&root)?;
+-        }
++        // Metavariables share persistent local contexts, so the same type and
++        // value DAGs can occur in thousands of these roots. Reserve the whole
++        // forest in one walk, not a fresh traversal per captured declaration.
++        // All roots stay alive until the walk ends; pointer keys never escape.
++        let found = facts(&roots, &mut self.meter)?;
++        self.reserved.extend(found.fvars);
+         loop {
+             let generation = self.generation();
+             let mut postponed = VecDeque::new();
+diff --git a/crates/fln-elab/tests/native_unification.rs b/crates/fln-elab/tests/native_unification.rs
+index 5472ef1..b316518 100644
+--- a/crates/fln-elab/tests/native_unification.rs
++++ b/crates/fln-elab/tests/native_unification.rs
+@@ -693,3 +693,59 @@ fn nat_literal_refinement_budget_stops_are_not_mismatches() {
+     ));
+     assert_semantics_unchanged(&txn, &before);
+ }
++
++/// Captured metavariable contexts share the same large type DAG. Reserving
++/// generated binder names must walk the forest once, not once per capture.
++fn shared_context_transaction() -> ElabTxn {
++    let mut txn = transaction();
++    let mut shared = nat();
++    for _ in 0..160 {
++        shared = pi(nat(), shared);
++    }
++    local(&mut txn, "sharedFunction", shared);
++    for index in 0..64 {
++        natural(&mut txn, &format!("captured{index}"), nat());
++    }
++    txn
++}
++
++#[test]
++fn reserving_shared_captured_contexts_is_bounded_by_the_dag_not_the_unrolled_forest() {
++    let mut txn = shared_context_transaction();
++    let before = txn.clone();
++    txn.budget.max_heartbeats = 3_000;
++    let report = txn.unify(&numeral(1), &numeral(1), budget()).unwrap();
++    assert!(report.unifier_steps < 3_000, "{report:?}");
++    assert!(report.visited_nodes < 1_000, "{report:?}");
++    assert_eq!(report.kernel_checks, 0);
++    assert_semantics_unchanged(&txn, &before);
++}
++
++#[test]
++fn shared_context_reservation_still_obeys_resource_and_cancellation_stops() {
++    let initial = shared_context_transaction();
++    let mut starved = initial.clone();
++    starved.budget.max_heartbeats = 20;
++    assert_eq!(
++        starved
++            .unify(&numeral(1), &numeral(1), budget())
++            .unwrap_err(),
++        UnificationError::HeartbeatLimit
++    );
++    assert_semantics_unchanged(&starved, &initial);
++    assert!(starved.budget.heartbeats_consumed > 0);
++
++    let mut cancelled = initial.clone();
++    let calls = Cell::new(0);
++    assert_eq!(
++        cancelled
++            .unify_many_with(&[(numeral(1), numeral(1))], budget(), &|| {
++                calls.set(calls.get() + 1);
++                calls.get() > 30
++            })
++            .unwrap_err(),
++        UnificationError::Cancelled
++    );
++    assert_semantics_unchanged(&cancelled, &initial);
++    assert!(cancelled.budget.heartbeats_consumed > 0);
++}
