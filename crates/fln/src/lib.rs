@@ -2146,6 +2146,10 @@ impl Engine {
             "instDecidableTrue",
             "instDecidableFalse",
             "instDecidableNot",
+            "instDecidableAnd",
+            "instDecidableOr",
+            "instDecidableImplies",
+            "instDecidableIff",
             "instDecidableEqBool",
             "instDecidableEqNat",
         ] {

@@ -9,7 +9,9 @@ use crate::records::RecordBudget;
 use fln_core::expr::{BinderInfo, Expr, FVarId};
 use fln_core::level::Level;
 use fln_core::name::Name;
-use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints, TheoremVal};
+use fln_env::constants::{
+    ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints, TheoremVal,
+};
 use fln_kernel::Declaration;
 
 fn name(s: &str) -> Name {
@@ -36,11 +38,23 @@ fn fv(local: &LocalDecl) -> Expr {
 }
 fn close(locals: &[&LocalDecl], mut body: Expr, lambda: bool) -> Expr {
     for local in locals.iter().rev() {
-        body = body.abstract_fvar(&local.id, 0).expect("fixed logical telescope");
+        body = body
+            .abstract_fvar(&local.id, 0)
+            .expect("fixed logical telescope");
         body = if lambda {
-            Expr::lam(local.user_name.clone(), local.type_.clone(), body, local.binder_info)
+            Expr::lam(
+                local.user_name.clone(),
+                local.type_.clone(),
+                body,
+                local.binder_info,
+            )
         } else {
-            Expr::forall_e(local.user_name.clone(), local.type_.clone(), body, local.binder_info)
+            Expr::forall_e(
+                local.user_name.clone(),
+                local.type_.clone(),
+                body,
+                local.binder_info,
+            )
         };
     }
     body
@@ -97,12 +111,23 @@ fn connective(s: &str) -> Declaration {
         ]],
         _ => unreachable!("fixed logical connective"),
     };
-    let universes = fields.iter().map(|fs| vec![Level::zero(); fs.len()]).collect::<Vec<_>>();
-    let constructors = fields.into_iter().enumerate().map(|(i, fields)| ConstructorSpec {
-        name: name(if s == "Or" { if i == 0 { "inl" } else { "inr" } } else { "intro" }),
-        fields,
-        result_indices: vec![],
-    }).collect();
+    let universes = fields
+        .iter()
+        .map(|fs| vec![Level::zero(); fs.len()])
+        .collect::<Vec<_>>();
+    let constructors = fields
+        .into_iter()
+        .enumerate()
+        .map(|(i, fields)| ConstructorSpec {
+            name: name(if s == "Or" {
+                if i == 0 { "inl" } else { "inr" }
+            } else {
+                "intro"
+            }),
+            fields,
+            result_indices: vec![],
+        })
+        .collect();
     inductive_with_field_universes(
         &InductiveSpec {
             name: name(s),
@@ -114,11 +139,16 @@ fn connective(s: &str) -> Declaration {
         },
         RecordBudget::default(),
         &universes,
-    ).expect("fixed proof-only connective telescope")
+    )
+    .expect("fixed proof-only connective telescope")
 }
 fn projection(s: &str, field: &str, index: u64) -> Declaration {
     let (a, b) = binary_parameters(BinderInfo::Implicit);
-    let h = local("self", app(constant(s), [fv(&a), fv(&b)]), BinderInfo::Default);
+    let h = local(
+        "self",
+        app(constant(s), [fv(&a), fv(&b)]),
+        BinderInfo::Default,
+    );
     let result = match (s, index) {
         ("And", 0) => fv(&a),
         ("And", _) => fv(&b),
@@ -126,7 +156,12 @@ fn projection(s: &str, field: &str, index: u64) -> Declaration {
         ("Iff", _) => arrow(fv(&b), fv(&a)),
         _ => unreachable!("fixed logical projection"),
     };
-    defined(&format!("{s}.{field}"), &[&a, &b, &h], result, Expr::proj(name(s), index, fv(&h)))
+    defined(
+        &format!("{s}.{field}"),
+        &[&a, &b, &h],
+        result,
+        Expr::proj(name(s), index, fv(&h)),
+    )
 }
 fn or_elim() -> Declaration {
     let (a, b) = binary_parameters(BinderInfo::Implicit);
@@ -138,9 +173,17 @@ fn or_elim() -> Declaration {
     let witness = local("witness", domain, BinderInfo::Default);
     // Or has two constructors in Prop: its recursor eliminates only to Prop
     // and has no universe parameter. No proof-to-data escape is introduced.
-    let value = app(constant("Or.rec"), [
-        fv(&a), fv(&b), close(&[&witness], fv(&c), true), fv(&left), fv(&right), fv(&h),
-    ]);
+    let value = app(
+        constant("Or.rec"),
+        [
+            fv(&a),
+            fv(&b),
+            close(&[&witness], fv(&c), true),
+            fv(&left),
+            fv(&right),
+            fv(&h),
+        ],
+    );
     Declaration::Thm(TheoremVal {
         base: ConstantVal {
             name: name("Or.elim"),
@@ -153,15 +196,17 @@ fn or_elim() -> Declaration {
 }
 fn eliminate(p: Expr, d: Expr, result: Expr, no: Expr, yes: Expr) -> Expr {
     let witness = local("decision_witness", decision(p.clone()), BinderInfo::Default);
-    app(Expr::const_(name("Decidable.rec"), vec![Level::one()]), [
-        p, close(&[&witness], result, true), no, yes, d,
-    ])
+    app(
+        Expr::const_(name("Decidable.rec"), vec![Level::one()]),
+        [p, close(&[&witness], result, true), no, yes, d],
+    )
 }
 fn absurd(p: Expr, false_proof: Expr) -> Expr {
     let witness = local("false_witness", constant("False"), BinderInfo::Default);
-    app(Expr::const_(name("False.rec"), vec![Level::zero()]), [
-        close(&[&witness], p, true), false_proof,
-    ])
+    app(
+        Expr::const_(name("False.rec"), vec![Level::zero()]),
+        [close(&[&witness], p, true), false_proof],
+    )
 }
 
 /// Reference branch order is retained: inspect the left dictionary first,
@@ -174,7 +219,9 @@ fn composite_instance(s: &str, instance_name: &str) -> Declaration {
     let hb = local("hb", fv(&b), BinderInfo::Default);
     let na = local("na", neg(fv(&a)), BinderInfo::Default);
     let nb = local("nb", neg(fv(&b)), BinderInfo::Default);
-    let target = if s == "Implies" { arrow(fv(&a), fv(&b)) } else {
+    let target = if s == "Implies" {
+        arrow(fv(&a), fv(&b))
+    } else {
         app(constant(s), [fv(&a), fv(&b)])
     };
     let h = local("h", target.clone(), BinderInfo::Default);
@@ -184,39 +231,127 @@ fn composite_instance(s: &str, instance_name: &str) -> Declaration {
     let field = |index| Expr::proj(name(s), index, fv(&h));
     let (no, yes) = match s {
         "And" => {
-            let no = close(&[&na], nope(close(&[&h], Expr::app(fv(&na), field(0)), true)), true);
-            let yes = eliminate(fv(&b), fv(&db), result.clone(),
-                close(&[&nb], nope(close(&[&h], Expr::app(fv(&nb), field(1)), true)), true),
-                close(&[&hb], pos(app(constant("And.intro"), [fv(&a), fv(&b), fv(&ha), fv(&hb)])), true));
+            let no = close(
+                &[&na],
+                nope(close(&[&h], Expr::app(fv(&na), field(0)), true)),
+                true,
+            );
+            let yes = eliminate(
+                fv(&b),
+                fv(&db),
+                result.clone(),
+                close(
+                    &[&nb],
+                    nope(close(&[&h], Expr::app(fv(&nb), field(1)), true)),
+                    true,
+                ),
+                close(
+                    &[&hb],
+                    pos(app(
+                        constant("And.intro"),
+                        [fv(&a), fv(&b), fv(&ha), fv(&hb)],
+                    )),
+                    true,
+                ),
+            );
             (no, close(&[&ha], yes, true))
         }
         "Or" => {
             let witness = local("or_witness", target.clone(), BinderInfo::Default);
-            let contradiction = app(constant("Or.rec"), [fv(&a), fv(&b),
-                close(&[&witness], constant("False"), true), fv(&na), fv(&nb), fv(&h)]);
-            let no = eliminate(fv(&b), fv(&db), result.clone(),
+            let contradiction = app(
+                constant("Or.rec"),
+                [
+                    fv(&a),
+                    fv(&b),
+                    close(&[&witness], constant("False"), true),
+                    fv(&na),
+                    fv(&nb),
+                    fv(&h),
+                ],
+            );
+            let no = eliminate(
+                fv(&b),
+                fv(&db),
+                result.clone(),
                 close(&[&nb], nope(close(&[&h], contradiction, true)), true),
-                close(&[&hb], pos(app(constant("Or.inr"), [fv(&a), fv(&b), fv(&hb)])), true));
+                close(
+                    &[&hb],
+                    pos(app(constant("Or.inr"), [fv(&a), fv(&b), fv(&hb)])),
+                    true,
+                ),
+            );
             let yes = pos(app(constant("Or.inl"), [fv(&a), fv(&b), fv(&ha)]));
             (close(&[&na], no, true), close(&[&ha], yes, true))
         }
         "Implies" => {
-            let no = pos(close(&[&ha], absurd(fv(&b), Expr::app(fv(&na), fv(&ha))), true));
-            let yes = eliminate(fv(&b), fv(&db), result.clone(),
-                close(&[&nb], nope(close(&[&h], Expr::app(fv(&nb), Expr::app(fv(&h), fv(&ha))), true)), true),
-                close(&[&hb], pos(close(&[&ha], fv(&hb), true)), true));
+            let no = pos(close(
+                &[&ha],
+                absurd(fv(&b), Expr::app(fv(&na), fv(&ha))),
+                true,
+            ));
+            let yes = eliminate(
+                fv(&b),
+                fv(&db),
+                result.clone(),
+                close(
+                    &[&nb],
+                    nope(close(
+                        &[&h],
+                        Expr::app(fv(&nb), Expr::app(fv(&h), fv(&ha))),
+                        true,
+                    )),
+                    true,
+                ),
+                close(&[&hb], pos(close(&[&ha], fv(&hb), true)), true),
+            );
             (close(&[&na], no, true), close(&[&ha], yes, true))
         }
         "Iff" => {
             let intro = |mp, mpr| app(constant("Iff.intro"), [fv(&a), fv(&b), mp, mpr]);
-            let yes = eliminate(fv(&b), fv(&db), result.clone(),
-                close(&[&nb], nope(close(&[&h], Expr::app(fv(&nb), Expr::app(field(0), fv(&ha))), true)), true),
-                close(&[&hb], pos(intro(close(&[&ha], fv(&hb), true), close(&[&hb], fv(&ha), true))), true));
-            let no = eliminate(fv(&b), fv(&db), result.clone(),
-                close(&[&nb], pos(intro(
-                    close(&[&ha], absurd(fv(&b), Expr::app(fv(&na), fv(&ha))), true),
-                    close(&[&hb], absurd(fv(&a), Expr::app(fv(&nb), fv(&hb))), true))), true),
-                close(&[&hb], nope(close(&[&h], Expr::app(fv(&na), Expr::app(field(1), fv(&hb))), true)), true));
+            let yes = eliminate(
+                fv(&b),
+                fv(&db),
+                result.clone(),
+                close(
+                    &[&nb],
+                    nope(close(
+                        &[&h],
+                        Expr::app(fv(&nb), Expr::app(field(0), fv(&ha))),
+                        true,
+                    )),
+                    true,
+                ),
+                close(
+                    &[&hb],
+                    pos(intro(
+                        close(&[&ha], fv(&hb), true),
+                        close(&[&hb], fv(&ha), true),
+                    )),
+                    true,
+                ),
+            );
+            let no = eliminate(
+                fv(&b),
+                fv(&db),
+                result.clone(),
+                close(
+                    &[&nb],
+                    pos(intro(
+                        close(&[&ha], absurd(fv(&b), Expr::app(fv(&na), fv(&ha))), true),
+                        close(&[&hb], absurd(fv(&a), Expr::app(fv(&nb), fv(&hb))), true),
+                    )),
+                    true,
+                ),
+                close(
+                    &[&hb],
+                    nope(close(
+                        &[&h],
+                        Expr::app(fv(&na), Expr::app(field(1), fv(&hb))),
+                        true,
+                    )),
+                    true,
+                ),
+            );
             (close(&[&na], no, true), close(&[&ha], yes, true))
         }
         _ => unreachable!("fixed composite decision"),
