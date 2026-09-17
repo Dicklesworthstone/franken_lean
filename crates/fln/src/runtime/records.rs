@@ -192,6 +192,66 @@ impl Preparation<'_> {
         )
     }
 
+    /// A nonrecursive singleton eliminator becomes one let-bound major and
+    /// projections into its checked layout. Keep the major shared even when
+    /// several fields or the same field are used by the minor premise.
+    pub(super) fn record_recursor(
+        &mut self,
+        name: &Name,
+        levels: &[fln_core::level::Level],
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let Some(ConstantInfo::Rec(rec)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        if rec.is_unsafe
+            || rec.num_params != 0
+            || rec.num_indices != 0
+            || rec.num_motives != 1
+            || rec.num_minors != 1
+            || rec.all.len() != 1
+            || rec.rules.len() != 1
+            || levels.len() != rec.base.level_params.len()
+            || args.len() != 3
+        {
+            return Ok(None);
+        }
+        let family = Expr::const_(rec.all[0].clone(), vec![]);
+        if self.value_type(&family)? != Some(ValueType::Constructor) {
+            return Ok(None);
+        }
+        let Some(shape) = self.record_shape(&rec.all[0])? else {
+            return Ok(None);
+        };
+        if rec.rules[0].ctor != shape.constructor
+            || rec.rules[0].nfields as usize != shape.fields.len()
+        {
+            return Ok(None);
+        }
+        let ExprNode::Lam { body: motive, .. } = args[0].node() else {
+            return Ok(None);
+        };
+        if self.value_type(motive)?.is_none() {
+            return Err(unsupported("dependent record recursor result"));
+        }
+        let major = Expr::bvar(0).map_err(|_| unsupported("record major scope"))?;
+        let mut body = args[1]
+            .lift_loose(0, 1)
+            .map_err(|_| unsupported("record minor scope"))?;
+        for index in 0..shape.fields.len() {
+            self.tick()?;
+            let field = Expr::proj(shape.name.clone(), index as u64, major.clone());
+            body = self.minor_apply(body, field)?;
+        }
+        Ok(Some(Expr::let_e(
+            Name::anonymous(),
+            family,
+            args[2].clone(),
+            body,
+            false,
+        )))
+    }
+
     pub(super) fn constructor(&mut self, name: &Name) -> Result<(), IngressError> {
         let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name) else {
             return Ok(());

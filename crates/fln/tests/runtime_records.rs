@@ -180,3 +180,47 @@ fn repeated_compilation_produces_identical_record_bytecode() {
         assert_eq!(a.declaration, b.declaration);
     }
 }
+
+#[test]
+fn matching_destructures_records_and_nested_payloads() {
+    let engine = base(
+        "structure Point where\n  x : Nat\n  y : Nat\nstructure Box where\n  point : Point\n  label : String",
+    );
+    run(
+        &engine,
+        "def sum (p : Point) : Nat := match p with | .mk x y => x + y\n#eval sum { x := 17, y := 25 }",
+        "42",
+    );
+    run(
+        &engine,
+        "def sum (p : Box) : Nat := match p with | .mk point label => match point with | .mk x y => x + y + String.length label\n#eval sum { point := { x := 17, y := 20 }, label := \"hello\" }",
+        "42",
+    );
+}
+#[test]
+fn record_match_returns_owned_records_without_duplicating_the_major() {
+    let engine = base("structure Item where\n  label : String\n  count : Nat");
+    run(
+        &engine,
+        "def grow (p : Item) : Item := match p with | .mk label count => { label := label ++ label, count := count + count }\n#eval let p : Item := grow { label := \"hello\", count := 16 }; p.count + String.length p.label",
+        "42",
+    );
+}
+#[test]
+fn nat_recursion_can_return_records_and_share_recursive_objects() {
+    let engine = base("structure State where\n  count : Nat\n  label : String");
+    run(
+        &engine,
+        "def grow (n : Nat) : State := match n with | .zero => { count := 1, label := \"x\" } | .succ k => let p : State := grow k; { p with count := p.count + p.count }\n#eval (grow 10).count",
+        "1024",
+    );
+}
+#[test]
+fn changing_record_accumulators_execute_with_native_ownership() {
+    let engine = base("structure State where\n  count : Nat\n  label : String");
+    run(
+        &engine,
+        "def walk (n : Nat) (p : State) : State := match n with | .zero => p | .succ k => walk k { p with count := p.count + n, label := p.label ++ \"x\" }\n#eval let result : State := walk 7 { count := 7, label := \"\" }; result.count + String.length result.label",
+        "42",
+    );
+}

@@ -308,6 +308,12 @@ impl<'a> Preparation<'a> {
                             )));
                             continue;
                         }
+                        if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(eliminated) = self.record_recursor(name, levels, &args)?
+                        {
+                            tasks.push(Task::Visit(eliminated));
+                            continue;
+                        }
                         let required = args.len().saturating_add(2);
                         if tasks.len().saturating_add(required) > limit {
                             return Err(IngressError::ResourceLimit {

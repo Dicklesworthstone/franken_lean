@@ -11,6 +11,13 @@ pub(super) struct Recursion {
     pub result: ValueType,
 }
 
+struct Motive {
+    parameters: Vec<ValueType>,
+    domains: Vec<Expr>,
+    result: ValueType,
+    result_type: Expr,
+}
+
 pub(super) fn literal(value: u64) -> Expr {
     Expr::lit(Literal::Nat(NatLit::from_u64(value)))
 }
@@ -72,10 +79,10 @@ impl Preparation<'_> {
         Ok(())
     }
 
-    /// A motive can return a scalar or a first-order scalar function. Flatten
+    /// A motive can return data or a first-order data function. Flatten
     /// the latter into extra closure arguments so changing accumulators use
     /// the compiler's existing partial-application and ownership machinery.
-    fn nat_motive(&mut self, motive: &Expr) -> Result<(Vec<ValueType>, ValueType), IngressError> {
+    fn nat_motive(&mut self, motive: &Expr) -> Result<Motive, IngressError> {
         let ExprNode::Lam {
             binder_type, body, ..
         } = motive.node()
@@ -87,6 +94,7 @@ impl Preparation<'_> {
         }
         let mut body = body;
         let mut parameters = vec![ValueType::Nat];
+        let mut domains = vec![scalar(ValueType::Nat)?];
         loop {
             self.tick()?;
             match body.node() {
@@ -96,8 +104,11 @@ impl Preparation<'_> {
                     body: inner,
                     ..
                 } => {
-                    let parameter = scalar_type(binder_type)
+                    let parameter = self
+                        .value_type(binder_type)?
                         .ok_or_else(|| unsupported("dependent Nat recursor parameter"))?;
+                    reserve(&mut domains, self.limits.max_context_depth)?;
+                    domains.push(binder_type.clone());
                     reserve(&mut parameters, self.limits.max_context_depth)?;
                     parameters.push(parameter);
                     body = inner;
@@ -105,15 +116,25 @@ impl Preparation<'_> {
                 _ => break,
             }
         }
-        let result =
-            scalar_type(body).ok_or_else(|| unsupported("dependent Nat recursor result"))?;
-        Ok((parameters, result))
+        let result = self
+            .value_type(body)?
+            .ok_or_else(|| unsupported("dependent Nat recursor result"))?;
+        Ok(Motive {
+            parameters,
+            domains,
+            result,
+            result_type: body.clone(),
+        })
     }
 
     /// Apply only explicit beta redexes before branch preparation. In
     /// particular, an unused induction hypothesis disappears rather than
     /// eagerly evaluating every predecessor of a plain, nonrecursive match.
-    fn minor_apply(&mut self, mut function: Expr, argument: Expr) -> Result<Expr, IngressError> {
+    pub(super) fn minor_apply(
+        &mut self,
+        mut function: Expr,
+        argument: Expr,
+    ) -> Result<Expr, IngressError> {
         loop {
             self.tick()?;
             match function.node() {
@@ -142,7 +163,12 @@ impl Preparation<'_> {
             return Err(unsupported("Nat recursor arity"));
         }
         self.check_nat_family()?;
-        let (parameters, result) = self.nat_motive(&args[0])?;
+        let Motive {
+            parameters,
+            domains,
+            result,
+            result_type,
+        } = self.nat_motive(&args[0])?;
         let extra = parameters.len() - 1;
         let depth = parameters.len().saturating_add(1); // native self + runtime arguments
         if depth > self.limits.max_context_depth {
@@ -174,17 +200,16 @@ impl Preparation<'_> {
             zero = self.minor_apply(zero, argument.clone())?;
             step = self.minor_apply(step, argument)?;
         }
-        let result_type = scalar(result)?;
         if step.has_fvar() {
             // Share the recursive result when it is used more than once. An
             // unused IH was eliminated by beta reduction above, so ordinary
             // matching on a huge Nat still needs only one predecessor step.
             let mut hypothesis_type = result_type.clone();
-            for parameter in parameters[1..].iter().rev() {
+            for domain in domains[1..].iter().rev() {
                 self.tick()?;
                 hypothesis_type = Expr::forall_e(
                     Name::anonymous(),
-                    scalar(*parameter)?,
+                    domain.clone(),
                     hypothesis_type,
                     BinderInfo::Default,
                 );
@@ -210,9 +235,9 @@ impl Preparation<'_> {
                 Expr::app,
             );
         let mut self_type = result_type;
-        for parameter in parameters.iter().rev() {
+        for domain in domains.iter().rev() {
             self.tick()?;
-            let domain = scalar(*parameter)?;
+            let domain = domain.clone();
             body = Expr::lam(Name::anonymous(), domain.clone(), body, BinderInfo::Default);
             self_type = Expr::forall_e(Name::anonymous(), domain, self_type, BinderInfo::Default);
         }
