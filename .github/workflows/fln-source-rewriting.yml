@@ -18,6 +18,9 @@ jobs:
       RUST_TEST_THREADS: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
       - name: Prepare configured compiler and exact source patch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,10 +54,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cat > target/rewrite-landing/verify.sh <<'SH'
+          set -euo pipefail
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/rewrite-landing/source-tests.log
           cargo test --locked -p fln --lib --test source_equality --test source_rewriting --test source_rewrite_locations --test source_backtracking --test source_automation --test source_instances --no-fail-fast 2>&1 | tee target/rewrite-landing/engine-tests.log
           cargo clippy --locked -p fln-elab -p fln-parse -p fln --all-targets -- -D warnings 2>&1 | tee target/rewrite-landing/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/rewrite-landing/workspace.log
+          SH
+          bash target/rewrite-landing/verify.sh
       - name: Commit tested implementation directly to main
         shell: bash
         run: |
@@ -63,8 +70,19 @@ jobs:
           git config user.name 'FrankenLean implementation'
           git config user.email 'noreply@github.com'
           git commit -m 'feat(elab): rewrite named hypotheses with checked dependent transports'
-          git push origin HEAD:main
-          git rev-parse HEAD > target/rewrite-landing/published.txt
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git merge-base --is-ancestor origin/main HEAD; then
+              git rebase origin/main
+              bash target/rewrite-landing/verify.sh
+            fi
+            if git push origin HEAD:main; then
+              git rev-parse HEAD > target/rewrite-landing/published.txt
+              exit 0
+            fi
+          done
+          echo 'Main advanced repeatedly; no forced update attempted.' >&2
+          exit 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
