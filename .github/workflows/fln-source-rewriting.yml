@@ -11,7 +11,7 @@ concurrency:
 jobs:
   rewriting:
     if: >-
-      startsWith(github.event.head_commit.message, 'feat(elab): verify and land hypothesis simplification')
+      startsWith(github.event.head_commit.message, 'feat(elab): verify and land explicit and mixed rewrite locations')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -32,13 +32,13 @@ jobs:
           mkdir -p target/rewrite-landing
           git rev-parse HEAD > target/rewrite-landing/input.txt
           rustc -Vv > target/rewrite-landing/compiler.txt
-          curl --fail --silent --show-error -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/dd8657f4b9f379685b330de8f53776e598abba24 > target/rewrite-landing/blob.json
+          curl --fail --silent --show-error -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/f35b15ae25bbad2c8ccbc75fc240a7610cee3d82 > target/rewrite-landing/blob.json
           python3 -I - <<'PY'
           import base64, gzip, hashlib, json, pathlib
           root = pathlib.Path('target/rewrite-landing')
           encoded = base64.b64decode(json.loads((root / 'blob.json').read_text())['content'])
           patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == 'c941b068924ab33d4f8733942919bcdd40c21ee86109991fd98c52d84f2d9662'
+          assert hashlib.sha256(patch).hexdigest() == '6c0113b02408dfe51375b054c8002ffd05797ef20b085c9bae8845df84cfda1d'
           (root / 'implementation.patch').write_bytes(patch)
           PY
           git apply --check --index target/rewrite-landing/implementation.patch
@@ -46,7 +46,7 @@ jobs:
           python3 -I - <<'PY'
           import subprocess
           paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          assert paths == {'crates/fln-cli/tests/source_hypothesis_rewriting.rs', 'crates/fln-elab/src/source/tactics/rewrite/locations.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify/locations.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln-parse/src/proofs/locations.rs', 'crates/fln/tests/source_simp_locations.rs', 'docs/NATIVE_SOURCE_PROOFS.md', 'examples/native_hypothesis_rewriting.lean'}, paths
+          assert paths == {'crates/fln-cli/tests/source_hypothesis_rewriting.rs', 'crates/fln-elab/src/source/tactics/rewrite/locations.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify.rs', 'crates/fln-elab/src/source/tactics/rewrite/simplify/locations.rs', 'crates/fln-parse/src/lib.rs', 'crates/fln-parse/src/proofs/locations.rs', 'crates/fln/tests/source_goal_locations.rs', 'docs/NATIVE_SOURCE_PROOFS.md', 'examples/native_hypothesis_rewriting.lean'}, paths
           PY
           git diff --cached --check
           git diff --cached --name-only -z -- '*.rs' | xargs -0 rustfmt --edition 2024 --config skip_children=true --check
@@ -57,7 +57,7 @@ jobs:
           cat > target/rewrite-landing/verify.sh <<'SH'
           set -euo pipefail
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/rewrite-landing/source-tests.log
-          cargo test --locked -p fln --lib --test source_equality --test source_rewriting --test source_rewrite_locations --test source_simp_locations --test source_backtracking --test source_automation --test source_instances --no-fail-fast 2>&1 | tee target/rewrite-landing/engine-tests.log
+          cargo test --locked -p fln --lib --test source_equality --test source_rewriting --test source_rewrite_locations --test source_simp_locations --test source_goal_locations --test source_backtracking --test source_automation --test source_instances --no-fail-fast 2>&1 | tee target/rewrite-landing/engine-tests.log
           cargo test --locked -p fln-cli --test source_hypothesis_rewriting 2>&1 | tee target/rewrite-landing/cli-tests.log
           cargo test --locked -p fln-cli --test source_check simp 2>&1 | tee -a target/rewrite-landing/cli-tests.log
           cargo test --locked -p fln-cli --test source_check installed_binary_checks_a_real_source_proof_file 2>&1 | tee -a target/rewrite-landing/cli-tests.log
@@ -72,7 +72,7 @@ jobs:
           git diff --exit-code
           git config user.name 'FrankenLean implementation'
           git config user.email 'noreply@github.com'
-          git commit -m 'feat(elab): simplify named hypotheses with checked explicit-rule transports'
+          git commit -m 'feat(elab): support explicit and mixed hypothesis-goal rewrite locations'
           for attempt in 1 2 3; do
             git fetch origin main
             if ! git merge-base --is-ancestor origin/main HEAD; then
