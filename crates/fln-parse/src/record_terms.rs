@@ -27,6 +27,7 @@ fn frame(record: RecordFrame) -> BoundedTermFrame {
         open: None,
         lambda: None,
         quantifier: None,
+        negation: None,
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),

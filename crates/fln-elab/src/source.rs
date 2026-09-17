@@ -1067,6 +1067,15 @@ impl Context {
                                     ));
                                     continue;
                                 }
+                                if kind == &Name::str(Name::anonymous(), "term¬_") {
+                                    let parts =
+                                        expect_node(syntax, kind, 2, "propositional negation")?;
+                                    expect_atom(&parts[0], "¬", "negation prefix")?;
+                                    let function =
+                                        self.constant(&Name::from_components(["Not"]))?;
+                                    tasks.push(Task::Apply(function, &parts[1..], expected));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "app"]) {
                                     let parts = expect_node(syntax, kind, 2, "application")?;
                                     let arguments =

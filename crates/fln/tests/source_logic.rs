@@ -71,6 +71,9 @@ fn constructors_and_eliminators_are_usable_in_ordinary_proofs() {
         theorem equivalent (p : Prop) : Iff p p := Iff.intro (fun h => h) (fun h => h)
         theorem forwards (p q : Prop) (h : Iff p q) (hp : p) : q := Iff.mp h hp
         theorem backwards (p q : Prop) (h : Iff p q) (hq : q) : p := Iff.mpr h hq
+        theorem dot_left (p q : Prop) (h : And p q) : p := h.left
+        theorem dot_mp (p q : Prop) (h : Iff p q) (hp : p) : q := h.mp hp
+        theorem named_pair (p q : Prop) (hp : p) (hq : q) : And p q := { right := hq, left := hp }
     "#,
     );
 }
@@ -180,4 +183,26 @@ fn logical_seed_additions_have_checked_bodies_or_inductive_rules_not_axioms() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn logical_notation_has_reference_precedence_associativity_and_application_scope() {
+    check(
+        r#"
+        theorem and_assoc (p q r : Prop) : (p ∧ q ∧ r) = And p (And q r) := by rfl
+        theorem or_assoc (p q r : Prop) : (p ∨ q ∨ r) = Or p (Or q r) := by rfl
+        theorem mixed (p q r : Prop) : (p ∨ q ∧ r) = Or p (And q r) := by rfl
+        theorem arrows (p q r : Prop) : (p ∧ q -> r) = ((And p q) -> r) := by rfl
+        theorem iff_scope (p q r : Prop) : (p -> q ↔ r) = Iff (p -> q) r := by rfl
+        theorem negation (p q : Prop) : (¬p ∧ q) = And (Not p) q := by rfl
+        theorem negated_equality : (¬2 = 3) = Not (2 = 3) := by rfl
+        theorem prefix_argument : (decide ¬False) = true := by rfl
+        theorem prefix_function (p : Nat -> Prop) (n : Nat) : (¬p n) = Not (p n) := by rfl
+        theorem repeated (p : Prop) : (¬¬p) = Not (Not p) := by rfl
+        theorem ascii (p q r : Prop) : (p /\ q \/ r) = Or (And p q) r := by rfl
+        theorem ascii_iff (p q : Prop) : (p <-> q) = Iff p q := by rfl
+        theorem decided : 2 + 3 = 5 ∧ ¬3 = 4 := by decide
+        theorem decided_iff : (2 = 2 ∨ False) ↔ ¬(3 = 4) := by decide
+    "#,
+    );
 }

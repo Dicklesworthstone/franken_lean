@@ -882,6 +882,23 @@ impl BoundedInfixIntrinsic {
 }
 
 fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInfixIntrinsic> {
+    if allow_string {
+        for (spelling, constant) in [
+            ("∧", "And"),
+            ("/\\", "And"),
+            ("∨", "Or"),
+            ("\\/", "Or"),
+            ("↔", "Iff"),
+            ("<->", "Iff"),
+        ] {
+            if kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")) {
+                return Some(BoundedInfixIntrinsic::Fixed {
+                    spelling,
+                    intrinsic: Name::from_components([constant]),
+                });
+            }
+        }
+    }
     if allow_string && kind == &Name::str(Name::anonymous(), "term_=_") {
         return Some(BoundedInfixIntrinsic::Fixed {
             spelling: "=",
