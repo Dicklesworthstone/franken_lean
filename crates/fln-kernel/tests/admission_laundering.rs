@@ -4,9 +4,9 @@
 //! crate does not compile), source censuses (no serialization path exists), and
 //! runtime controls (a forged verdict is data with no transition).
 //!
-//! The compile-fail harness drives the pinned rustc directly on a tiny probe
-//! crate, so the refusal is the compiler's own error text, never a comment
-//! claiming the refusal exists.
+//! The compile-fail harness builds a fresh external crate against this checkout
+//! with Cargo and its pinned compiler. Refusals must be the compiler's own
+//! error text, and a compiling public-API control prevents hollow passes.
 
 #![forbid(unsafe_code)]
 
@@ -24,61 +24,52 @@ use fln_kernel::Declaration;
 use fln_kernel::capability::{Admitted, admit};
 use fln_kernel::verdict::Budget;
 
-fn rustc() -> PathBuf {
-    std::env::var_os("RUSTC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rustc"))
-}
-
-fn deps_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"))
-        .join("debug/deps")
-}
-
-fn newest_rlib(crate_name: &str) -> PathBuf {
-    let deps = deps_dir();
-    let prefix = format!("lib{crate_name}-");
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&deps)
-        .unwrap_or_else(|error| panic!("deps dir {} must be readable: {error}", deps.display()))
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let name = path.file_name()?.to_str()?.to_string();
-            (name.starts_with(&prefix) && name.ends_with(".rlib")).then_some(path)
-        })
-        .collect();
-    candidates.sort();
-    candidates
-        .pop()
-        .unwrap_or_else(|| panic!("{crate_name} rlib must exist in {}", deps.display()))
-}
-
-/// Compile `source` as a library crate against the kernel's rlib and return the
-/// compiler's (status, stderr). The refusal must be the compiler's own words.
+/// Compile a fresh external crate against this checkout. Cargo owns artifact
+/// discovery: neither its output layout nor a stale sibling rlib may choose
+/// which version of the capability surface the probe actually checks.
 fn try_compile(root: &Path, name: &str, source: &str) -> (bool, String) {
-    let probe = root.join(format!("{name}.rs"));
-    std::fs::write(&probe, source).expect("write the probe crate");
-    let kernel_rlib = newest_rlib("fln_kernel");
-    let env_rlib = newest_rlib("fln_env");
-    let output = Command::new(rustc())
-        .arg("--edition")
-        .arg("2024")
-        .arg("--crate-type")
-        .arg("lib")
-        .arg("--extern")
-        .arg(format!("fln_kernel={}", kernel_rlib.display()))
-        .arg("--extern")
-        .arg(format!("fln_env={}", env_rlib.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps_dir().display()))
-        .arg(&probe)
-        .arg("-o")
-        .arg(root.join("probe.rlib"))
+    let kernel = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let environment = kernel.parent().expect("workspace crates").join("fln-env");
+    let quote_path = |path: &Path| {
+        path.to_str()
+            .expect("Cargo manifest paths must be UTF-8")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    };
+    let manifest = format!(
+        "[package]\nname = \"admission_probe_{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [workspace]\n\n[lib]\npath = \"probe.rs\"\n\n\
+         [dependencies]\nfln-kernel = {{ path = \"{}\" }}\nfln-env = {{ path = \"{}\" }}\n",
+        quote_path(&kernel),
+        quote_path(&environment),
+    );
+    std::fs::write(root.join("probe.rs"), source).expect("write the probe crate");
+    std::fs::write(root.join("Cargo.toml"), manifest).expect("write probe manifest");
+    let cargo = std::env::var_os("CARGO").expect("Cargo identifies the pinned driver");
+    let output = Command::new(cargo)
+        .current_dir(&kernel)
+        .args(["check", "--offline", "--quiet", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(root.join("target"))
         .output()
-        .expect("the pinned rustc must run");
+        .expect("the pinned compiler driver must run");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     (output.status.success(), stderr)
+}
+
+#[test]
+fn an_external_public_capability_consumer_compiles() {
+    let root = ScratchRoot::create(ADMISSION_PROBE_PREFIX, "admission-probe", "public")
+        .expect("create probe root");
+    let (success, stderr) = try_compile(
+        &root,
+        "public",
+        "pub fn consume(_: fln_kernel::capability::CheckedDecl<'_>) {}",
+    );
+    assert!(success, "the public control must compile: {stderr}");
 }
 
 #[test]
@@ -156,18 +147,12 @@ fn no_serialization_path_exists_for_the_capability() {
 
 #[test]
 fn a_forged_verdict_carries_no_authority() {
-    // A `Verdict::Accepted` value is just data: it cannot be turned into a
-    // capability by any path — the only mint is `admit` on a declaration the
-    // kernel actually checked. The control: a malformed declaration never
-    // yields the capability, so even the real mint cannot be laundered with
-    // false premises.
+    // The control must be rejected by the real admission authority.
     let env = Environment::new();
     let wrong = Declaration::Axiom(AxiomVal {
         base: ConstantVal {
             name: Name::str(Name::anonymous(), "Forged"),
             level_params: vec![],
-            // Not a sort: an axiom whose "type" is a Nat literal fails the
-            // preamble that the type itself checks to a sort.
             type_: Expr::lit(Literal::Nat(NatLit::from_u64(42))),
         },
         is_unsafe: false,
@@ -200,8 +185,6 @@ fn a_forged_verdict_carries_no_authority() {
 
 #[test]
 fn starvation_mints_no_capability() {
-    // The non-promotion half (KR-987): a starved budget is a non-answer and
-    // mints nothing — the arm is Inconclusive-shaped, never Accepted.
     let env = Environment::new();
     let starved = Budget::DEFAULT.narrowed(0, Budget::DEFAULT.depth);
     let decl = Declaration::Axiom(AxiomVal {
