@@ -56,6 +56,13 @@ jobs:
           channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
           rustc -Vv | tee target/instance-landing/compiler.txt
+          python3 - <<'PY'
+          import json,pathlib,subprocess
+          paths=json.loads(pathlib.Path('target/instance-landing/paths.json').read_text())
+          for path in paths:
+              if path.endswith('.rs'):
+                  subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',path],check=True)
+          PY
           cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee target/instance-landing/frontend.log
           cargo test --locked -p fln-checker --test admit --no-fail-fast 2>&1 | tee target/instance-landing/checker.log
           cargo test --locked -p fln --lib --test record_generation --no-fail-fast 2>&1 | tee target/instance-landing/engine.log
@@ -91,9 +98,34 @@ jobs:
           subprocess.run(['git','push','origin','HEAD:main'],check=True)
           pathlib.Path('target/instance-landing/published-commit.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
           PY
+      - name: Preserve the checked source snapshot
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf target/instance-landing/source.tar.gz crates tools .beads .cargo .github examples docs scripts Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: native-instances-${{ github.sha }}
           path: target/instance-landing
           retention-days: 7
+      - name: Preserve pinned tools for isolated regression work
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/native-tools
+          python3 - <<'PY'
+          import pathlib,subprocess,tarfile
+          root=pathlib.Path(subprocess.check_output(['rustc','--print','sysroot'],text=True).strip())
+          with tarfile.open('target/native-tools/toolchain.tar.gz','w:gz') as archive:
+              for path in [root/'bin',root/'lib']:
+                  archive.add(path,arcname=str(path.relative_to(root)))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-tools-${{ github.sha }}
+          path: target/native-tools
+          retention-days: 1
