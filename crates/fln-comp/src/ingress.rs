@@ -37,6 +37,9 @@ use fln_core::name::{LeafView, Name};
 use std::collections::VecDeque;
 use std::fmt;
 
+mod branch;
+pub use branch::{BoolCaseBinding, CallableBindings};
+
 /// Explicit ceilings for the core-expression ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IngressLimits {
@@ -1159,7 +1162,7 @@ struct PreparedFunction<'a> {
     parameter_ownership: Vec<crate::flbc::ArgumentOwnership>,
     result: fir::ValueType,
     result_ownership: crate::flbc::CallableResultOwnership,
-    body: &'a Expr,
+    body: Option<&'a Expr>,
 }
 
 struct PreparedLambda<'a> {
@@ -2377,17 +2380,24 @@ fn prepare_catalog<'a>(
     scalar_constructors: &[ScalarConstructorBinding],
     intrinsics: &[IntrinsicBinding],
     constructors: &[ConstructorBinding],
-    functions: &'a [FunctionBinding],
-    lambdas: &'a [LambdaBinding],
+    callables: CallableBindings<'a>,
     limits: IngressLimits,
 ) -> Result<PreparedCatalog<'a>, IngressError> {
+    let CallableBindings {
+        functions,
+        lambdas,
+        bool_cases,
+    } = callables;
     let constructor_count = scalar_constructors.len().saturating_add(constructors.len());
     charge_fir(
         fir::ValidationResource::Constructors,
         constructor_count,
         limits.fir.max_constructors,
     )?;
-    let function_count = functions.len().saturating_add(1);
+    let function_count = functions
+        .len()
+        .saturating_add(bool_cases.len())
+        .saturating_add(1);
     charge_fir(
         fir::ValidationResource::Functions,
         function_count,
@@ -2471,9 +2481,12 @@ fn prepare_catalog<'a>(
             parameter_ownership: clone_argument_ownership(&binding.parameter_ownership)?,
             result: binding.result,
             result_ownership: binding.result_ownership,
-            body: &binding.body,
+            body: Some(&binding.body),
         });
     }
+
+    prepare_lambdas(&mut catalog, lambdas, limits)?;
+    branch::prepare(&mut catalog, bool_cases, functions.len(), limits)?;
 
     catalog
         .functions
@@ -2528,8 +2541,6 @@ fn prepare_catalog<'a>(
             });
         }
     }
-    prepare_lambdas(&mut catalog, lambdas, limits)?;
-
     Ok(catalog)
 }
 
@@ -4488,6 +4499,31 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
     lambdas: &'a [LambdaBinding],
     limits: IngressLimits,
 ) -> Result<IngressedProgram, IngressError> {
+    lower_closed_expr_with_control_flow(
+        source,
+        scalar_constructors,
+        intrinsics,
+        constructors,
+        CallableBindings {
+            functions,
+            lambdas,
+            bool_cases: &[],
+        },
+        limits,
+    )
+}
+
+/// Lower ordinary expression catalogs plus explicit lazy Boolean case functions.
+/// The selected branch is a closure invocation in a separate FIR basic block;
+/// neither branch body executes while its closure is constructed.
+pub fn lower_closed_expr_with_control_flow<'a>(
+    source: &'a Expr,
+    scalar_constructors: &[ScalarConstructorBinding],
+    intrinsics: &[IntrinsicBinding],
+    constructors: &[ConstructorBinding],
+    callables: CallableBindings<'a>,
+    limits: IngressLimits,
+) -> Result<IngressedProgram, IngressError> {
     if source.has_fvar() {
         return Err(IngressError::OpenFreeVariable);
     }
@@ -4504,8 +4540,7 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
         scalar_constructors,
         intrinsics,
         constructors,
-        functions,
-        lambdas,
+        callables,
         limits,
     )?;
     let mut closure_build = ClosureBuild::new(&catalog)?;
@@ -4567,9 +4602,21 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
         entry_body,
     )?);
     for function in &catalog.functions {
+        let Some(expression) = function.body else {
+            let lowered = branch::assemble(function)?;
+            work.generated_values = work.generated_values.saturating_add(2);
+            charge_fir(
+                fir::ValidationResource::Values,
+                work.function_parameters
+                    .saturating_add(work.generated_values),
+                limits.fir.max_values,
+            )?;
+            fir_functions.push(lowered);
+            continue;
+        };
         let context = parameter_context(&function.parameters, limits)?;
         let body = lower_body(
-            function.body,
+            expression,
             LowerBodySeed {
                 context,
                 parameter_count: function.parameters.len(),
@@ -7888,8 +7935,14 @@ mod tests {
 
     #[test]
     fn an_elided_source_slot_is_a_typed_refusal_if_capture_analysis_and_lowering_disagree() {
-        let catalog = prepare_catalog(&[], &[], &[], &[], &[], IngressLimits::default())
-            .expect("empty catalog is canonical");
+        let catalog = prepare_catalog(
+            &[],
+            &[],
+            &[],
+            CallableBindings::default(),
+            IngressLimits::default(),
+        )
+        .expect("empty catalog is canonical");
         let mut closure_build = ClosureBuild::new(&catalog).expect("empty closure worklist");
         let context = vec![
             None,
