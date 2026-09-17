@@ -2146,6 +2146,8 @@ impl Engine {
             "instDecidableTrue",
             "instDecidableFalse",
             "instDecidableNot",
+            "instDecidableEqBool",
+            "instDecidableEqNat",
         ] {
             engine.environment = fln_elab::instances::register_instance(
                 &engine.environment,

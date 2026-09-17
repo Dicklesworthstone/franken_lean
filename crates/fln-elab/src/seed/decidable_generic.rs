@@ -45,7 +45,12 @@ fn equality_type_declaration() -> Declaration {
     let body = Expr::forall_e(
         name("a"),
         bound(0),
-        Expr::forall_e(name("b"), bound(1), decision(proposition), BinderInfo::Default),
+        Expr::forall_e(
+            name("b"),
+            bound(1),
+            decision(proposition),
+            BinderInfo::Default,
+        ),
         BinderInfo::Default,
     );
     definition(
