@@ -658,6 +658,15 @@ impl Context {
                     left,
                 );
                 self.close_proof_goal(goal, value)?;
+            } else if kind == &parser_kind(&["Tactic", "calc"]) {
+                let [term] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                return Ok(ProofAction::Term {
+                    syntax: term,
+                    goal,
+                    apply: false,
+                });
             } else if kind == &parser_kind(&["Tactic", "assumption"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -797,7 +806,7 @@ impl Context {
 
 /// Decode only the ordinary homogeneous equality head; no lookalike names or
 /// Boolean comparisons count as equality propositions.
-fn equality_target(target: &Expr) -> Option<(Level, Expr, Expr, Expr)> {
+pub(super) fn equality_target(target: &Expr) -> Option<(Level, Expr, Expr, Expr)> {
     let ExprNode::App { f, a: right } = target.node() else {
         return None;
     };

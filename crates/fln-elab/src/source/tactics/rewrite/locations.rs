@@ -3,11 +3,16 @@
 //! identity under an inaccessible name; otherwise it leaves the live context.
 use super::*;
 
+pub(super) struct RewriteLocations {
+    pub(super) hypotheses: Vec<Name>,
+    pub(super) target: bool,
+}
+
 impl Context {
-    fn rewrite_locations(
+    pub(super) fn rewrite_locations(
         &mut self,
         syntax: &Syntax,
-    ) -> Result<Option<Vec<Name>>, NatDefinitionElabError> {
+    ) -> Result<Option<RewriteLocations>, NatDefinitionElabError> {
         let optional = expect_null_args(syntax, "optional rewrite location")?;
         let [location] = optional else {
             return if optional.is_empty() {
@@ -33,16 +38,29 @@ impl Context {
         if names.is_empty() {
             return Err(error(TacticError::MalformedScript));
         }
-        let mut result = Vec::new();
+        let mut result = RewriteLocations {
+            hypotheses: Vec::new(),
+            target: false,
+        };
         for name in names {
             self.tick()?;
-            let Syntax::Ident { val, .. } = name else {
-                return Err(error(TacticError::MalformedScript));
-            };
-            if val.is_anonymous() {
-                return Err(error(TacticError::RewriteLocation));
+            match name {
+                Syntax::Ident { val, .. } if !val.is_anonymous() => {
+                    result.hypotheses.push(val.clone());
+                }
+                Syntax::Node { kind, args, .. }
+                    if kind == &parser_kind(&["Tactic", "locationType"]) =>
+                {
+                    let [Syntax::Atom { val, .. }] = args.as_slice() else {
+                        return Err(error(TacticError::MalformedScript));
+                    };
+                    if val != "⊢" && val != "|-" {
+                        return Err(error(TacticError::MalformedScript));
+                    }
+                    result.target = true;
+                }
+                _ => return Err(error(TacticError::MalformedScript)),
             }
-            result.push(val.clone());
         }
         Ok(Some(result))
     }
@@ -65,7 +83,7 @@ impl Context {
 
     /// Produce a forward map T a -> T b rather than the contravariant map
     /// used for goals. Reverse rewriting first builds genuine symmetric evidence.
-    fn rewrite_hypothesis_value(
+    pub(super) fn rewrite_hypothesis_value(
         &mut self,
         local: &LocalDecl,
         rule: Typed,
@@ -131,7 +149,7 @@ impl Context {
         })
     }
 
-    fn replace_rewritten_hypothesis(
+    pub(super) fn replace_rewritten_hypothesis(
         &mut self,
         mut parent: ProofGoal,
         local: &LocalDecl,
@@ -217,14 +235,14 @@ impl Context {
         };
         let rules = self.rewrite_rules(args, close)?;
         // Resolve every requested name before making a successful prefix.
-        for name in &locations {
+        for name in &locations.hypotheses {
             if initial.lctx.find_by_user_name(name).is_none() {
                 return Err(error(TacticError::RewriteLocation));
             }
         }
         let mut goal = initial.clone();
         for rule in rules {
-            for name in &locations {
+            for name in &locations.hypotheses {
                 self.tick()?;
                 self.txn.lctx = goal.lctx.clone();
                 let local = goal
@@ -247,6 +265,29 @@ impl Context {
                 let (next, parent, value) =
                     self.replace_rewritten_hypothesis(goal, &local, replacement)?;
                 proof.work.push(Work::Close(parent, value));
+                proof
+                    .work
+                    .extend(premises.into_iter().rev().map(Work::Goal));
+                goal = next;
+            }
+            // Explicit locations process the named hypotheses first, then the
+            // target, regardless of where its marker appeared in the list.
+            if locations.target {
+                self.tick()?;
+                self.txn.lctx = goal.lctx.clone();
+                let term = self.located_rule_term(rule.syntax)?;
+                self.flush(false)?;
+                let target = self.instantiate(&goal.target)?;
+                let RewriteMatch {
+                    rule: term,
+                    occurrence,
+                    premises,
+                } = self
+                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
+                let (next, value) =
+                    self.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
+                proof.work.push(Work::Close(goal, value));
                 proof
                     .work
                     .extend(premises.into_iter().rev().map(Work::Goal));

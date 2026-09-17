@@ -3,6 +3,7 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod locations;
 mod unfold;
 
 use super::*;
@@ -66,7 +67,7 @@ impl Context {
         expect_atom(keyword, "simp", "simplification keyword")?;
         expect_empty_null(config, "default simplification configuration")?;
         expect_empty_null(discharger, "default simplification discharger")?;
-        expect_empty_null(location, "goal-only simplification")?;
+        self.rewrite_locations(location)?;
         let [only] = expect_null_args(only, "explicit simp set")? else {
             return Err(error(TacticError::MalformedScript));
         };
@@ -345,20 +346,34 @@ impl Context {
     pub(in crate::source) fn simplify_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,
-        mut goal: ProofGoal,
+        goal: ProofGoal,
         args: &[Syntax],
     ) -> Result<(), NatDefinitionElabError> {
+        if self.simplify_at_locations(proof, &goal, args)? {
+            return Ok(());
+        }
         let rules = self.simp_rules(args)?;
+        self.simplify_goal_with_rules(proof, goal, &rules, 0)
+    }
+
+    // Hypothesis and goal simplification share one productive-step limit. A
+    // changed hypothesis is sufficient progress when the target stays unchanged.
+    fn simplify_goal_with_rules(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        rules: &[RewriteRule<'_>],
+        mut steps: usize,
+    ) -> Result<(), NatDefinitionElabError> {
         let mut history = vec![self.instantiate(&goal.target)?];
-        let mut steps = 0;
         loop {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
-            for rule in &rules {
+            for rule in rules {
                 self.tick()?;
                 let original = self.rewrite_trial();
-                let transition = self.simp_step(&goal, rule, &rules)?;
+                let transition = self.simp_step(&goal, rule, rules)?;
                 let Some((next_goal, value)) = transition else {
                     self.restore_simp_trial(original);
                     continue;
@@ -383,7 +398,7 @@ impl Context {
             if advanced {
                 continue;
             }
-            if let Some(value) = self.simp_selected_proof(&goal.target, &rules)? {
+            if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
                 self.close_proof_goal(goal, value)?;
             } else if let Some(value) = self.simp_reflexivity(&goal)? {
                 self.close_proof_goal(goal, value)?;

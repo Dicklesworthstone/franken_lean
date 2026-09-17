@@ -658,6 +658,7 @@ fn parse_planned(
     // Tactic blocks own their pipes; their bounded arguments reenter here.
     if grammar == DefinitionGrammar::Scalar
         && !is_symbol(tokens, range.start, "by")
+        && !is_symbol(tokens, range.start, "calc")
         && (equations
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")

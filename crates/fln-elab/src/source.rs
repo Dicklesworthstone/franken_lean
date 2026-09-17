@@ -5,6 +5,7 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod calc;
 mod coercions;
 pub mod scope;
 use scope::SourceScope;
@@ -678,6 +679,9 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            CalcNext(calc::Build<'a>),
+            CalcRelation(calc::Build<'a>),
+            CalcProof(calc::Build<'a>, Expr),
             MatrixScope(Vec<Name>),
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
@@ -736,6 +740,31 @@ impl Context {
                 while let Some(task) = tasks.pop() {
                     self.tick()?;
                     match task {
+                        Task::CalcNext(build) => {
+                            if let Some(step) = build.steps.get(build.cursor) {
+                                let relation = &step[0];
+                                tasks.push(Task::CalcRelation(build));
+                                tasks.push(Task::Visit(
+                                    relation,
+                                    Some(Expr::sort(Level::zero())),
+                                    true,
+                                ));
+                            } else {
+                                values.push(self.finish_calculation(build)?);
+                            }
+                        }
+                        Task::CalcRelation(mut build) => {
+                            let relation = values.pop().expect("calculation relation visit");
+                            let relation = self.prepare_calculation_step(&mut build, relation)?;
+                            let proof = &build.steps[build.cursor][2];
+                            tasks.push(Task::CalcProof(build, relation.clone()));
+                            tasks.push(Task::Visit(proof, Some(relation), true));
+                        }
+                        Task::CalcProof(mut build, relation) => {
+                            let proof = values.pop().expect("calculation step proof visit");
+                            self.add_calculation_step(&mut build, relation, proof)?;
+                            tasks.push(Task::CalcNext(build));
+                        }
                         Task::MatrixScope(rows) => {
                             for row in rows {
                                 self.tick()?;
@@ -874,6 +903,12 @@ impl Context {
                                             Vec::new(),
                                         ));
                                     }
+                                    continue;
+                                }
+                                if kind == &parser_kind(&["Term", "calc"]) {
+                                    tasks.push(Task::CalcNext(
+                                        self.start_calculation(syntax, expected)?,
+                                    ));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "byTactic"]) {

@@ -1,0 +1,104 @@
+name: Native calculation source integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-native-calc.yml']
+permissions:
+  contents: write
+concurrency:
+  group: fln-native-calc-landing
+  cancel-in-progress: false
+jobs:
+  calculation:
+    if: "startsWith(github.event.head_commit.message, 'feat(elab): integrate native calc')"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply exact locally tested source integration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/calc-landing
+          git rev-parse HEAD > target/calc-landing/input.txt
+          curl --fail --silent --show-error -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/fcb1189b73e0d4fcb24b16eb2ed9b9934ea563cf > target/calc-landing/blob.json
+          python3 -I - <<'PY'
+          import base64, hashlib, json, pathlib
+          root = pathlib.Path('target/calc-landing')
+          patch = base64.b64decode(json.loads((root / 'blob.json').read_text())['content'])
+          assert hashlib.sha256(patch).hexdigest() == '7e161a71224ceb94881fbce069fa1c1401fd0602cbcda923cbd8d5a8eec578fc'
+          (root / 'integration.patch').write_bytes(patch)
+          for path, digest in {
+              'crates/fln-parse/src/proofs/elimination/calc.rs': 'cf0534885e459ebeb4be92f58332c599df1f307a3cbc60723e0294bb025e780f',
+              'crates/fln-elab/src/source/calc.rs': '653b34bd9444162eb82741426b4a6adec0de3b00c228ad5829c834a3ea10fe1f',
+          }.items():
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() == digest, path
+          PY
+          git apply --check --index --exclude=crates/fln-parse/src/matching.rs target/calc-landing/integration.patch
+          git apply --index --exclude=crates/fln-parse/src/matching.rs target/calc-landing/integration.patch
+          python3 -I - <<'PY'
+          import pathlib, subprocess
+          # The compound-parser stack refactor changed this hunk's comments.
+          # Retain that refactor and insert only the original calc ownership rule.
+          path = pathlib.Path('crates/fln-parse/src/matching.rs')
+          text = path.read_text()
+          anchor = '        && !is_symbol(tokens, range.start, "by")\n'
+          assert text.count(anchor) == 1
+          assert '&& !is_symbol(tokens, range.start, "calc")' not in text
+          path.write_text(text.replace(anchor, anchor + '        && !is_symbol(tokens, range.start, "calc")\n', 1))
+          subprocess.run(['git', 'add', '--', str(path)], check=True)
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert paths == {'crates/fln-elab/src/source.rs', 'crates/fln-elab/src/source/tactics.rs', 'crates/fln-parse/src/lib.rs', 'crates/fln-parse/src/matching.rs', 'crates/fln-parse/src/proofs.rs', 'crates/fln-parse/src/proofs/elimination.rs', 'crates/fln/tests/source_calc.rs'}, paths
+          PY
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/calc-landing/compiler.txt
+          git diff --cached --check
+          git diff --cached --name-only -z -- '*.rs' | xargs -0 rustfmt --edition 2024 --config skip_children=true --check
+      - name: Run real parser elaborator and dual-checker regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > target/calc-landing/verify.sh <<'SH'
+          set -euo pipefail
+          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/calc-landing/frontends.log
+          cargo test --locked -p fln --lib --test source_calc --test source_rewriting --test source_equality --test source_backtracking --test source_instances --no-fail-fast 2>&1 | tee target/calc-landing/engine.log
+          cargo clippy --locked -p fln-parse -p fln-elab -p fln --all-targets -- -D warnings 2>&1 | tee target/calc-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/calc-landing/workspace.log
+          SH
+          bash target/calc-landing/verify.sh
+      - name: Publish verified production hooks directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --binary > target/calc-landing/verified.patch
+          git config user.name 'FrankenLean implementation'
+          git config user.email 'noreply@github.com'
+          git commit -m 'feat(elab): admit native calc equality proofs through the source pipeline'
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git merge-base --is-ancestor origin/main HEAD; then
+              git rebase origin/main
+              bash target/calc-landing/verify.sh
+            fi
+            if git push origin HEAD:main; then
+              git rev-parse HEAD > target/calc-landing/published.txt
+              exit 0
+            fi
+          done
+          echo 'Main advanced repeatedly; no forced update attempted.' >&2
+          exit 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-calc-${{ github.sha }}
+          path: target/calc-landing
+          retention-days: 7
