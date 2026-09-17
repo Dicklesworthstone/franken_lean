@@ -168,7 +168,10 @@ mod tests {
             .generalize_declaration_universes(std::slice::from_ref(&root))
             .unwrap();
         assert!(context.level_params.is_empty());
-        assert_eq!(context.instantiate(&root).unwrap(), Expr::sort(Level::one()));
+        assert_eq!(
+            context.instantiate(&root).unwrap(),
+            Expr::sort(Level::one())
+        );
         let LevelView::MVar(id) = unreachable.view() else {
             panic!("fresh universe")
         };
@@ -201,6 +204,22 @@ mod tests {
                 SourceInferenceError::UnresolvedHoles { count: 1 }
             ))
         ));
+        assert!(context.level_params.is_empty());
+    }
+
+    #[test]
+    fn exhausted_work_budget_does_not_publish_partial_generalization() {
+        let mut context = context();
+        let root = Expr::sort(context.level().unwrap());
+        let before = context.txn.universes.clone();
+        context.txn.budget.max_heartbeats = context.txn.budget.heartbeats_consumed + 1;
+        assert!(matches!(
+            context.generalize_declaration_universes(&[root]),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(context.txn.universes, before);
         assert!(context.level_params.is_empty());
     }
 }
