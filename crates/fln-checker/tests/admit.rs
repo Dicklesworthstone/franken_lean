@@ -18,6 +18,8 @@ mod propositions;
 
 #[path = "admit/indexed.rs"]
 mod indexed;
+#[path = "admit/quotient_computation.rs"]
+mod quotient_computation;
 #[path = "admit/recursor_conversion.rs"]
 mod recursor_conversion;
 

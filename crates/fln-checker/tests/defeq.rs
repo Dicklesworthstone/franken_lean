@@ -316,7 +316,8 @@ fn pure_conversion_preserves_pending_siblings_across_beta_reduction() {
     let right = decoded(&Expr::app(function, argument));
     let progress = slow_equal(&left, &right, &WhnfContext::default());
     assert_eq!(progress.quick_comparisons, 2);
-    assert_eq!(progress.slow_comparisons, 9);
+    // Nine pair comparisons plus seven query-local redex-classifier visits.
+    assert_eq!(progress.slow_comparisons, 16);
     assert_eq!(progress.normalizations, 4);
     assert_eq!(progress.whnf_reductions, 2);
     // Since be66b472 a lambda-headed spine normalizes BEFORE congruence, so
@@ -898,7 +899,7 @@ fn eta_gate_misses_and_structural_mismatches_remain_deferred() {
                     function.clone(),
                     Expr::mdata(
                         KVMap::new(),
-                        Expr::bvar(0).expect("metadata-wrapped eta argument"),
+                        Expr::bvar(1).expect("metadata cannot hide a non-eta argument"),
                     ),
                 ),
                 BinderInfo::Default,
@@ -1771,8 +1772,10 @@ fn deep_slow_child() -> Result<(), String> {
     match def_eq(&left, &right, &context, DefEqBudget::unlimited()) {
         DefEqOutcome::Equal(progress)
             if progress.quick_comparisons == 1
+                // Pair comparisons (2n + 4) plus one charged spine visit for
+                // each application and its head on both sides (2n + 2).
                 && progress.slow_comparisons
-                    == DEPTH.saturating_mul(2).saturating_add(4) as u64
+                    == DEPTH.saturating_mul(4).saturating_add(6) as u64
                 && progress.normalizations == 2
                 && progress.whnf_reductions == 1
                 && progress.materialized_arena_nodes
@@ -2309,4 +2312,295 @@ fn nested_eta_work_is_bounded_and_cancellation_preserves_recovery() {
         "cancellation must reach nested eta contraction: {interrupted:?}"
     );
     assert_eq!(slow_equal(&left, &right, &WhnfContext::default()), full);
+}
+
+fn telescope_eta(function: Expr, width: u32) -> Expr {
+    let mut body = function;
+    for index in (0..width).rev() {
+        body = Expr::app(body, Expr::bvar(index).unwrap());
+    }
+    for index in 0..width {
+        body = Expr::lam(
+            name(format!("eta_{index}")),
+            Expr::sort(Level::zero()),
+            body,
+            BinderInfo::Default,
+        );
+    }
+    body
+}
+
+#[test]
+fn leading_eta_telescopes_compare_in_both_orientations() {
+    for width in [2, 3, 8, 256] {
+        for outside in [
+            constant("many_arguments"),
+            Expr::fvar(FVarId(name("local_function"))),
+            Expr::app(constant("partial"), nat_literal(7)),
+        ] {
+            let expanded = decoded(&telescope_eta(outside.clone(), width));
+            let outside = decoded(&outside);
+            let forward = slow_equal(&expanded, &outside, &WhnfContext::default());
+            let reverse = slow_equal(&outside, &expanded, &WhnfContext::default());
+            assert_eq!(forward, reverse);
+            assert_eq!(forward.delta_unfolds, 0);
+        }
+    }
+}
+
+#[test]
+fn telescope_eta_cannot_capture_any_removed_bound_variable() {
+    for width in [2, 3, 8] {
+        for index in 0..=width {
+            let inside = decoded(&telescope_eta(Expr::bvar(index).unwrap(), width));
+            let outside = decoded(&Expr::bvar(0).unwrap());
+            for (a, b) in [(&inside, &outside), (&outside, &inside)] {
+                let outcome = def_eq(a, b, &WhnfContext::default(), DefEqBudget::unlimited());
+                if index == width {
+                    assert!(matches!(outcome, DefEqOutcome::Equal(_)), "{outcome:?}");
+                } else {
+                    assert!(
+                        matches!(outcome, DefEqOutcome::Deferred { .. }),
+                        "{outcome:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn telescope_eta_requires_every_argument_once_in_the_correct_order() {
+    for indices in [
+        vec![0, 1],
+        vec![0, 0],
+        vec![1, 1],
+        vec![1],
+        vec![2, 0],
+        vec![1, 0, 0],
+    ] {
+        let function = constant("telescope_order");
+        let mut body = function.clone();
+        for index in indices {
+            body = Expr::app(body, Expr::bvar(index).unwrap());
+        }
+        for _ in 0..2 {
+            body = Expr::lam(
+                name("x"),
+                Expr::sort(Level::zero()),
+                body,
+                BinderInfo::Default,
+            );
+        }
+        assert!(matches!(
+            def_eq(
+                &decoded(&body),
+                &decoded(&function),
+                &WhnfContext::default(),
+                DefEqBudget::unlimited()
+            ),
+            DefEqOutcome::Deferred { .. }
+        ));
+    }
+}
+
+#[test]
+fn telescope_eta_sees_through_metadata_without_changing_binder_scope() {
+    // Metadata on the exact bound-zero argument is nonsemantic, whereas the
+    // gate-miss regression above retains a genuinely wrong bound-one argument.
+    let function = constant("metadata_single_eta");
+    let expanded = Expr::lam(
+        name("x"),
+        Expr::sort(Level::zero()),
+        Expr::app(
+            function.clone(),
+            Expr::mdata(KVMap::new(), Expr::bvar(0).unwrap()),
+        ),
+        BinderInfo::Default,
+    );
+    assert_eq!(
+        slow_equal(
+            &decoded(&expanded),
+            &decoded(&function),
+            &WhnfContext::default()
+        )
+        .delta_unfolds,
+        0
+    );
+
+    let metadata = |e| Expr::mdata(KVMap::new(), e);
+    let f = Expr::fvar(FVarId(name("dependent_eta")));
+    let body = metadata(Expr::app(
+        metadata(Expr::app(f.clone(), metadata(Expr::bvar(1).unwrap()))),
+        metadata(Expr::bvar(0).unwrap()),
+    ));
+    let inside = Expr::lam(
+        name("A"),
+        Expr::sort(Level::one()),
+        metadata(Expr::lam(
+            name("a"),
+            Expr::bvar(0).unwrap(),
+            body,
+            BinderInfo::Implicit,
+        )),
+        BinderInfo::Implicit,
+    );
+    assert_eq!(
+        slow_equal(&decoded(&inside), &decoded(&f), &WhnfContext::default()).delta_unfolds,
+        0
+    );
+}
+
+#[test]
+fn telescope_eta_composes_with_preexisting_nested_eta_layers() {
+    let function = constant("mixed_eta");
+    let mut inside = telescope_eta(function.clone(), 3);
+    for _ in 0..4 {
+        inside = eta(inside);
+    }
+    assert_eq!(
+        slow_equal(
+            &decoded(&inside),
+            &decoded(&function),
+            &WhnfContext::default()
+        )
+        .delta_unfolds,
+        0
+    );
+}
+
+#[test]
+fn telescope_eta_stops_are_typed_and_do_not_poison_recovery() {
+    let left = decoded(&telescope_eta(constant("bounded_telescope"), 64));
+    let right = decoded(&constant("bounded_telescope"));
+    let progress = slow_equal(&left, &right, &WhnfContext::default());
+    let budget = DefEqBudget::new(
+        QuickDefEqBudget::unlimited(),
+        progress.slow_comparisons - 1,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        WhnfBudget::unlimited(),
+    );
+    assert!(matches!(
+        def_eq(&left, &right, &WhnfContext::default(), budget),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::SlowComparisons,
+            ..
+        })
+    ));
+    let mut total = 0;
+    assert!(matches!(
+        def_eq_with(
+            &left,
+            &right,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+            || {
+                total += 1;
+                false
+            }
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+    let mut polls = 0;
+    assert!(matches!(
+        def_eq_with(
+            &left,
+            &right,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+            || {
+                polls += 1;
+                polls == total - 1
+            }
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Cancelled { .. })
+    ));
+    assert_eq!(slow_equal(&left, &right, &WhnfContext::default()), progress);
+}
+
+#[test]
+fn deeply_curried_eta_telescopes_fit_a_small_stack() {
+    // Encode directly so the host expression implementation is not the test's
+    // construction or destruction stack. The checker owns its flat arenas.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            let depth = 5000_u32;
+            let mut writer = CanonWriter::new();
+            writer.schema(SCHEMA_EXPR);
+            for _ in 0..depth {
+                write_anonymous_lambda_prefix(&mut writer);
+            }
+            for _ in 0..depth {
+                writer.u8(5);
+            }
+            write_simple_constant(&mut writer, "CurriedEta");
+            for index in (0..depth).rev() {
+                writer.u8(0);
+                writer.u32(index);
+            }
+            for _ in 0..depth {
+                writer.u8(0);
+            }
+            let DecodeOutcome::Complete(Ok(inside)) =
+                decode_expr(&writer.into_bytes(), DecodeBudget::unlimited())
+            else {
+                panic!("valid deep eta input");
+            };
+            let outside = decoded(&constant("CurriedEta"));
+            assert_eq!(
+                slow_equal(&inside, &outside, &WhnfContext::default()).delta_unfolds,
+                0
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn long_spine_classification_is_metered_cancellable_and_query_local() {
+    const DEPTH: usize = 4096;
+    let binding = deep_application(DEPTH).expect("flat application arena");
+    let right = deep_application(DEPTH).expect("flat application arena");
+    let left = decoded(&Expr::fvar(FVarId(name("spine_alias"))));
+    let context = WhnfContext::new(
+        vec![FreeBinding::new(checker_name("spine_alias"), binding)],
+        Vec::new(),
+        ConstantEnvironment::empty(),
+    );
+    let complete = slow_equal(&left, &right, &context);
+    assert_eq!(complete.slow_comparisons, 4 * DEPTH as u64 + 6);
+    // The small budget expires during the first spine scan, not after an
+    // unbounded traversal. Charging scans must not merely add an end-of-query
+    // estimate; this exact prefix and cancellation checkpoint test that.
+    let mut budget = DefEqBudget::unlimited();
+    budget.max_slow_comparisons = 64;
+    let mut scan_polls = 0;
+    let prefix = def_eq_with(&left, &right, &context, budget, &mut || {
+        scan_polls += 1;
+        false
+    });
+    assert!(matches!(prefix,
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::SlowComparisons, allowed: 64, observed: 65, progress,
+        }) if progress.slow_comparisons == 64));
+    let mut polls = 0;
+    let stopped = def_eq_with(
+        &left,
+        &right,
+        &context,
+        DefEqBudget::unlimited(),
+        &mut || {
+            polls += 1;
+            polls == scan_polls - 1
+        },
+    );
+    assert!(matches!(stopped,
+        DefEqOutcome::Inconclusive(DefEqStop::Cancelled { progress, .. })
+        if progress.slow_comparisons < complete.slow_comparisons));
+    // No completed or partially built cache leaks across a failed query.
+    assert_eq!(slow_equal(&left, &right, &context), complete);
 }

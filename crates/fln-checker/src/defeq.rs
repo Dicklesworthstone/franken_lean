@@ -10,13 +10,15 @@
 //! descending definitional-height order. At the exact `String.ofList` comparison gate,
 //! Unicode String literals expand through the checker-owned KR-314 reducer.
 //! Once both heads are stable, the exact `fun x => f x` KR-312 subset contracts
-//! through virtual binders, including nested eta-expanded functions, when `f`
+//! through virtual binders, including leading telescopes and nested eta-expanded functions, when `f`
 //! does not depend on any of the removed binders. Pi-driven eta,
 //! typing, proof irrelevance, recursors, and native computation still produce
 //! a typed deferral. A deferral is not a rejection and this module is not a
 //! declaration-admission authority.
 
-use std::collections::BTreeSet;
+mod spine;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::nat_reduce::{
     NatReductionBudget, NatReductionFault, NatReductionOutcome, NatReductionProgress,
@@ -823,6 +825,7 @@ struct SlowControl {
     budget: DefEqBudget,
     progress: DefEqProgress,
     polls: u64,
+    spines: BTreeMap<DefEqTerm, spine::Demand>,
 }
 
 struct OffsetMaterialization {
@@ -839,6 +842,7 @@ impl SlowControl {
                 ..DefEqProgress::default()
             },
             polls: 0,
+            spines: BTreeMap::new(),
         }
     }
 
@@ -1268,56 +1272,6 @@ fn defer_pair(
     })
 }
 
-/// Whether this application spine exposes a beta/zeta redex or a safe delta
-/// body, or a saturated recursor with a demanded major. Application arguments
-/// are not injective through such a head: a
-/// definition may discard or duplicate them before producing its weak head.
-/// The slow worklist must route such a side through
-/// normalization BEFORE congruence decomposition: decomposing first would
-/// expose the lambda HEAD to a head it can never match (a telescope local, a
-/// constant), even though weak-head-normalizing it dissolves the redex and
-/// lets the spines meet. The real pinned `Init.instTransEq_1` body deferred on
-/// exactly that exposure (fln-51y8 item 120).
-fn spine_head_reduces(
-    term: &WireExpr,
-    root: ExprId,
-    context: &WhnfContext,
-    include_recursors: bool,
-) -> bool {
-    let mut current = root;
-    let mut arguments = 0usize;
-    loop {
-        match term.node(current) {
-            Some(ExprNode::Apply { function, .. }) => {
-                arguments = arguments.saturating_add(1);
-                current = *function;
-            }
-            Some(ExprNode::Metadata { expression, .. }) => current = *expression,
-            Some(ExprNode::Lambda { .. } | ExprNode::Let { .. }) => return true,
-            Some(ExprNode::Free { name }) => {
-                return context
-                    .free_bindings()
-                    .iter()
-                    .any(|binding| binding.name() == name);
-            }
-            Some(ExprNode::Constant { name, .. }) => {
-                return context.constants().find(name).is_some_and(|entry| {
-                    entry.delta_body().is_some()
-                        || (include_recursors
-                            && entry.recursor_metadata().is_some_and(|rec| {
-                                let major = u64::from(rec.num_parameters())
-                                    + u64::from(rec.num_motives())
-                                    + u64::from(rec.num_minors())
-                                    + u64::from(rec.num_indices());
-                                (arguments as u64) > major
-                            }))
-                });
-            }
-            _ => return false,
-        }
-    }
-}
-
 /// Dump the surviving pair of a typed deferral under FLN_CHECKER_TRACE. The
 /// `DefEqDeferred` need references the GENERATED arenas, which are dropped
 /// before any caller-side hook could print them, so an item-126-class
@@ -1357,14 +1311,24 @@ fn trace_unresolved(
 fn compare_pair(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
-    left: &WireExpr,
-    right: &WireExpr,
-    generated: &[WireExpr],
+    sources: TermSources<'_>,
     context: &WhnfContext,
     after_core: bool,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<PairAction, SlowHalt> {
-    let (left_term, left_node) = slow_node(left_reference, left, right, generated)?;
-    let (right_term, right_node) = slow_node(right_reference, left, right, generated)?;
+    let (left_term, left_node) = slow_node(
+        left_reference,
+        sources.left,
+        sources.right,
+        sources.generated,
+    )?;
+    let (right_term, right_node) = slow_node(
+        right_reference,
+        sources.left,
+        sources.right,
+        sources.generated,
+    )?;
 
     match (left_node, right_node) {
         (
@@ -1487,9 +1451,19 @@ fn compare_pair(
                 argument: right_argument,
             },
         ) => {
-            if spine_head_reduces(left_term, left_reference.root, context, !after_core)
-                || spine_head_reduces(right_term, right_reference.root, context, !after_core)
-            {
+            if control.spine_head_reduces(
+                left_reference,
+                sources,
+                context,
+                !after_core,
+                cancelled,
+            )? || control.spine_head_reduces(
+                right_reference,
+                sources,
+                context,
+                !after_core,
+                cancelled,
+            )? {
                 return Ok(defer_pair(
                     left_reference,
                     right_reference,
@@ -2425,6 +2399,28 @@ fn eta_structurally_equal(
     Ok(true)
 }
 
+/// Remove metadata while charging each examined node. This is used only by
+/// exact eta recognition; it neither weak-head reduces nor invents a type.
+fn eta_visible(
+    mut term: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DefEqTerm, SlowHalt> {
+    loop {
+        control.comparison(cancelled)?;
+        let arena = sources.source(term)?;
+        match arena
+            .node(term.root)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: term.location(),
+            }))? {
+            ExprNode::Metadata { expression, .. } => term = child(term, *expression)?,
+            _ => return Ok(term),
+        }
+    }
+}
+
 fn eta_candidate(
     mut lambda: DefEqTerm,
     mut body: ExprId,
@@ -2435,47 +2431,43 @@ fn eta_candidate(
 ) -> Result<bool, SlowHalt> {
     let mut removed = 0u64;
     loop {
-        let body_reference = child(lambda, body)?;
-        control.comparison(cancelled)?;
-        let term = sources.source(body_reference)?;
-        let body_node = term
-            .node(body)
-            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
-                location: body_reference.location(),
-            }))?;
-        let ExprNode::Apply { function, argument } = body_node else {
-            return Ok(false);
-        };
-        let function_reference = child(body_reference, *function)?;
-        let argument_reference = child(body_reference, *argument)?;
-        control.comparison(cancelled)?;
-        let argument_node =
-            term.node(*argument)
-                .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
-                    location: argument_reference.location(),
-                }))?;
-        if !matches!(argument_node, ExprNode::Bound { index: 0 }) {
-            return Ok(false);
+        let mut inside = eta_visible(child(lambda, body)?, sources, control, cancelled)?;
+        let mut width = 1u64;
+        // `fun x y => f x y` has a leading telescope, unlike the separately
+        // nested `(fun x => (fun y => f y) x)` case. Both obey the same virtual
+        // binder law; neither needs generated arenas or recursive conversion.
+        while let Some(ExprNode::Lambda { body, .. }) = sources.source(inside)?.node(inside.root) {
+            width = width
+                .checked_add(1)
+                .ok_or_else(|| control.bound_index(u64::MAX))?;
+            inside = eta_visible(child(inside, *body)?, sources, control, cancelled)?;
+        }
+        for index in 0..width {
+            let term = sources.source(inside)?;
+            let Some(ExprNode::Apply { function, argument }) = term.node(inside.root) else {
+                return Ok(false);
+            };
+            let argument = eta_visible(child(inside, *argument)?, sources, control, cancelled)?;
+            if !matches!(sources.source(argument)?.node(argument.root), Some(ExprNode::Bound { index: actual }) if u64::from(*actual) == index)
+            {
+                return Ok(false);
+            }
+            inside = eta_visible(child(inside, *function)?, sources, control, cancelled)?;
         }
         removed = removed
-            .checked_add(1)
+            .checked_add(width)
             .ok_or_else(|| control.bound_index(u64::MAX))?;
-        // Inference may eta-expand a function which was already eta-expanded.
-        // Contract each exact layer on a worklist, not by recursive conversion.
-        // The final virtual shift proves that no removed binder is captured.
-        if let Some(ExprNode::Lambda { body: inner, .. }) = term.node(*function) {
-            lambda = function_reference;
+        // Contract another exact layer only after every trailing argument of
+        // this telescope was matched in order. The final virtual shift checks
+        // all surviving syntax, including domains beneath surviving binders.
+        if let Some(ExprNode::Lambda { body: inner, .. }) =
+            sources.source(inside)?.node(inside.root)
+        {
+            lambda = inside;
             body = *inner;
             continue;
         }
-        return eta_structurally_equal(
-            function_reference,
-            outside,
-            removed,
-            sources,
-            control,
-            cancelled,
-        );
+        return eta_structurally_equal(inside, outside, removed, sources, control, cancelled);
     }
 }
 
@@ -2588,11 +2580,11 @@ fn run_slow(
         match compare_pair(
             left_reference,
             right_reference,
-            left,
-            right,
-            &generated,
+            TermSources::new(left, right, &generated),
             context,
             false,
+            &mut control,
+            cancelled,
         )? {
             PairAction::Done => {}
             PairAction::Push1((next_left, next_right)) => {
@@ -2692,11 +2684,11 @@ fn run_slow(
                 if let PairAction::Push2(first, second) = compare_pair(
                     left_reference,
                     right_reference,
-                    left,
-                    right,
-                    &generated,
+                    TermSources::new(left, right, &generated),
                     context,
                     true,
+                    &mut control,
+                    cancelled,
                 )? {
                     pending.push((second.0, second.1, offset_context, string_context));
                     pending.push((first.0, first.1, offset_context, string_context));

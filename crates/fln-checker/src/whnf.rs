@@ -4,10 +4,12 @@
 //! implements the eager checker portion of KR-200 through KR-204 with flat arena
 //! cursors and explicit heap frames: safe-definition delta, metadata stripping,
 //! beta, let-zeta, supplied let-bound free unfolding, and explicit-constructor
-//! projection — plus recursor reduction: iota (KR-316) with the K-flagged
+//! projection and registered quotient computation (KR-955) — plus recursor reduction: iota (KR-316) with the K-flagged
 //! corner (KR-317, `to_cnstr_when_K`). Unsafe and partial definitions stay
 //! stuck. Nat literal majors are exposed one constructor layer at a time;
 //! string literal majors and native extensions remain outside this layer.
+
+mod quotient;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -480,6 +482,11 @@ impl<'a> PreparedContext<'a> {
 struct Cursor {
     arena: Arc<WireExpr>,
     root: ExprId,
+}
+
+enum ReductionFrame {
+    Projection(ProjectionFrame),
+    Quotient(quotient::QuotientFrame),
 }
 
 struct ProjectionFrame {
@@ -1995,8 +2002,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
 
     fn run(mut self, input: &WireExpr, root: ExprId) -> Result<WhnfResult, Halt> {
         let mut current = self.materialize_term(input, root, WhnfPhase::Initial)?;
-        let mut pending_arguments = VecDeque::new();
-        let mut projections = Vec::new();
+        let mut pending_arguments = VecDeque::<Cursor>::new();
+        let mut frames = Vec::new();
 
         'normalize: loop {
             self.control.step(current.root.index(), self.cancelled)?;
@@ -2069,6 +2076,21 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     // may be a recursor: iota (KR-316) and the K corner
                     // (KR-317) fire regardless of delta mode — a recursor has
                     // no definition body.
+                    if let Some(major) = self.quotient_major(&current, pending_arguments.len())? {
+                        let next = pending_arguments[major].clone();
+                        frames.push(ReductionFrame::Quotient(quotient::QuotientFrame {
+                            head: current,
+                            arguments: std::mem::take(&mut pending_arguments),
+                            major,
+                            delta_mode: self.delta_mode,
+                            unfolded_bindings: self.unfolded_bindings.clone(),
+                            force_string_delta: self.force_string_delta,
+                        }));
+                        self.delta_mode = DeltaMode::Eager;
+                        self.force_string_delta = false;
+                        current = next;
+                        continue;
+                    }
                     if !pending_arguments.is_empty()
                         && let Some(reduced) =
                             self.try_recursor_reduction(&current, &mut pending_arguments)?
@@ -2085,10 +2107,10 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     continue;
                 }
                 HeadAction::Projection { expression } => {
-                    projections.push(ProjectionFrame {
+                    frames.push(ReductionFrame::Projection(ProjectionFrame {
                         projection: current.clone(),
                         outer_arguments: std::mem::take(&mut pending_arguments),
-                    });
+                    }));
                     current = Cursor {
                         arena: Arc::clone(&current.arena),
                         root: expression,
@@ -2101,8 +2123,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             ExprNode::StringLiteral(value) => Some(value.as_str()),
                             _ => None,
                         };
-                        match (value, projections.last()) {
-                            (Some(value), Some(frame))
+                        match (value, frames.last()) {
+                            (Some(value), Some(ReductionFrame::Projection(frame)))
                                 if self.projection_requests_string(frame)? =>
                             {
                                 Some(self.expand_string(value, current.root.index())?)
@@ -2142,7 +2164,31 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 pending_arguments.clear();
             }
 
-            while let Some(frame) = projections.pop() {
+            while let Some(frame) = frames.pop() {
+                let frame = match frame {
+                    ReductionFrame::Projection(frame) => frame,
+                    ReductionFrame::Quotient(mut frame) => {
+                        self.delta_mode = frame.delta_mode;
+                        self.unfolded_bindings = frame.unfolded_bindings;
+                        self.force_string_delta = frame.force_string_delta;
+                        if let Some(representative) =
+                            self.quotient_representative(&frame.head, &current)?
+                        {
+                            self.control
+                                .reduction(frame.head.root.index(), self.cancelled)?;
+                            let function = frame.arguments[3].clone();
+                            pending_arguments = frame.arguments.split_off(frame.major + 1);
+                            pending_arguments.push_front(representative);
+                            current = function;
+                            continue 'normalize;
+                        }
+                        // Preserve progress within a blocked major, but do not
+                        // re-enter the same unchanged eliminator in a loop.
+                        frame.arguments[frame.major] = current;
+                        current = self.compose_application(&frame.head, &frame.arguments)?;
+                        continue;
+                    }
+                };
                 if let Some(field) = self.projection_field(&frame, &current)? {
                     self.control
                         .reduction(frame.projection.root.index(), self.cancelled)?;
