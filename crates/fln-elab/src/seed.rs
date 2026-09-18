@@ -14,7 +14,10 @@
 //! an explicit allowlist of checked scalar Nat operations, and checked String
 //! extern signatures. Nat/Bool constructors and eliminators are real admitted
 //! declarations. The source seed also admits the canonical quotient quartet and
-//! the explicit `Quot.sound` axiom after Eq. Quotient computation is elaboration,
+//! the explicit `Quot.sound` axiom after Eq. The source seed also admits the
+//! Reference's `propext` axiom after Iff, so equivalence rewriting retains an
+//! explicit, auditable axiom application rather than changing kernel conversion.
+//! Quotient computation is elaboration,
 //! not a license for runtime execution. String constructors and the rest of Prelude remain separate
 //! ingestion work; this seed does not claim full Prelude compatibility.
 //!
@@ -26,6 +29,7 @@ mod decidable;
 mod logic;
 pub use decidable_eq::equality_decision_seed_declarations;
 pub use decidable_generic::generic_equality_decision_seed_declarations;
+pub use logic::propext_seed_declaration;
 mod decidable_eq;
 mod decidable_generic;
 pub mod equality;
@@ -660,7 +664,7 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 73] {
+pub fn source_seed_declarations() -> [Declaration; 74] {
     let [
         and,
         and_left,
@@ -751,6 +755,7 @@ pub fn source_seed_declarations() -> [Declaration; 73] {
         iff_instance,
         quotient_seed_declaration(),
         quotient_sound_seed_declaration(),
+        propext_seed_declaration(),
     ]
 }
 
@@ -854,6 +859,7 @@ mod tests {
         assert_eq!(declarations[52], semi_out_param_seed_declaration());
         assert_eq!(declarations[71], quotient_seed_declaration());
         assert_eq!(declarations[72], quotient_sound_seed_declaration());
+        assert_eq!(declarations[73], propext_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"

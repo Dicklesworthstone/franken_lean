@@ -13,6 +13,36 @@ enum RigidTypeHead {
 }
 
 impl Context {
+    /// Compile an equivalence to an ordinary equality proof. This is not a
+    /// host-side conversion of propositions: the explicit propext application
+    /// and the original rule must survive into the checked transport term.
+    fn equivalence_rewrite_rule(&mut self, rule: Typed) -> Result<Typed, NatDefinitionElabError> {
+        self.tick()?;
+        let ExprNode::App { f, a: right } = rule.type_.node() else {
+            return Ok(rule);
+        };
+        let ExprNode::App { f: head, a: left } = f.node() else {
+            return Ok(rule);
+        };
+        if !matches!(head.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(["Iff"]) && levels.is_empty())
+        {
+            return Ok(rule);
+        }
+        let left = left.clone();
+        let right = right.clone();
+        // Resolving the actual declaration makes an absent propext a typed
+        // refusal even when a later conversion could discard this proof.
+        let propext = self.constant(&Name::from_components(["propext"]))?;
+        Ok(Typed {
+            value: app(propext.value, [left.clone(), right.clone(), rule.value]),
+            type_: app(
+                Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+                [Expr::sort(Level::zero()), left, right],
+            ),
+        })
+    }
+
     /// A sufficient negative discrimination on types, not a conversion result.
     /// These outer forms cannot reduce into each other. Everything else (holes,
     /// aliases, lets, projections and stuck eliminators) goes to the full solver.
@@ -247,6 +277,9 @@ impl Context {
         let resolution = template.resolve_instances(false);
         self.charge_rewrite_trial(&template);
         resolution?;
+        let compiled = template.equivalence_rewrite_rule(rule);
+        self.charge_rewrite_trial(&template);
+        let rule = compiled?;
         let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {
             // An explicitly selected proposition proof can discharge another
             // rule's premise without itself being an equality rewrite.

@@ -10,7 +10,7 @@ use fln_core::expr::{BinderInfo, Expr, FVarId};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_env::constants::{
-    ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints, TheoremVal,
+    AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints, TheoremVal,
 };
 use fln_kernel::Declaration;
 
@@ -94,6 +94,31 @@ fn binary_parameters(info: BinderInfo) -> (LocalDecl, LocalDecl) {
         local("b", Expr::sort(Level::zero()), info),
     )
 }
+
+/// The Reference's explicit propositional-extensionality axiom, not a new
+/// conversion rule. Applications retain their equivalence proof and are
+/// checked by both admission seats. No arbitrary proposition is made an axiom.
+pub fn propext_seed_declaration() -> Declaration {
+    let (a, b) = binary_parameters(BinderInfo::Implicit);
+    let h = local(
+        "h",
+        app(constant("Iff"), [fv(&a), fv(&b)]),
+        BinderInfo::Default,
+    );
+    let equality = app(
+        Expr::const_(name("Eq"), vec![Level::one()]),
+        [Expr::sort(Level::zero()), fv(&a), fv(&b)],
+    );
+    Declaration::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: name("propext"),
+            level_params: vec![],
+            type_: close(&[&a, &b, &h], equality, false),
+        },
+        is_unsafe: false,
+    })
+}
+
 fn connective(s: &str) -> Declaration {
     let (a, b) = binary_parameters(BinderInfo::Default);
     let fields = match s {

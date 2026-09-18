@@ -199,8 +199,8 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
         ConstantInfo::Axiom(a) if !a.is_unsafe => &a.base.type_,
         _ => return Err(SimpSetError::UnsupportedDeclaration(name.clone())),
     };
-    // Keep this admission-independent classifier bounded. Alias-normalized and
-    // iff/propositional rule compilation are separate, unsupported profiles.
+    // Keep this admission-independent classifier bounded. Arbitrary aliases
+    // and proposition-to-Boolean rule compilation are separate profiles.
     let mut applications = 0;
     for _ in 0..MAX_ROWS {
         match ty.node() {
@@ -210,8 +210,13 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
                 applications += 1;
                 ty = f;
             }
-            ExprNode::Const { name: head, .. }
-                if *head == Name::from_components(["Eq"]) && applications == 3 =>
+            ExprNode::Const { name: head, levels }
+                if (*head == Name::from_components(["Eq"])
+                    && applications == 3
+                    && levels.len() == 1)
+                    || (*head == Name::from_components(["Iff"])
+                        && applications == 2
+                        && levels.is_empty()) =>
             {
                 return Ok(());
             }

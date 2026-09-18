@@ -174,12 +174,12 @@ fln check-source --json examples/native_default_simp.lean
 
 This is a native source profile, not the Reference's serialized simp extension
 or a preloaded Init/mathlib simp database. Local/scoped attributes,
-proposition/iff rule compilation, and the complete upstream
+general proposition rule compilation, and the complete upstream
 simplifier remain separate frontiers.
 
 ### Inline declaration attributes
 
-`@[simp]` can also precede a definition or equality theorem, on the same line or
+`@[simp]` can also precede a definition, equality theorem or Iff theorem, on the same line or
 on a preceding line. The supported direction and numeric priority forms are the
 same as for standalone registration, for example `@[simp ← 900]`. Declaration
 names retain their namespace, escaped components and universe parameters.
@@ -204,6 +204,31 @@ publish inline attributes; the separate executable-definition entry point
 refuses them instead of silently dropping their effects.
 
 ## APIs and limits
+
+### Equivalence rewriting
+
+`rw [h]`, `rewrite [h]`, and `simp only [h]` now accept a proof of `P ↔ Q`
+as well as equality. The same path handles reversed rules, quantified parameters,
+conditional premises, named hypotheses, and occurrences in `Prop -> Type`
+contexts. Global Iff theorems may use `@[simp]` or `attribute [simp]`; existing
+priorities, per-call exclusions, namespace resolution, and immutable snapshots
+remain in effect.
+
+The source seed explicitly admits the Reference's propositional-extensionality
+axiom `propext : {P Q : Prop} -> (P ↔ Q) -> P = Q`. Each equivalence rewrite
+retains its original proof in a `propext` application and an ordinary `Eq.rec`
+transport. This is not a new kernel reduction rule, an assumed equivalence,
+or an axiom for the user's theorem. Both admission seats still check the entire
+proof; missing `propext`, forged relations, missing premises, and resource stops
+cannot become successful rewrites. See the pinned `Init/Core.lean` declaration
+and plan §4.2's named-axiom contract.
+
+```bash
+fln check-source --json examples/native_logical_rewriting.lean
+```
+
+General proposition-to-True/False compilation, binder-opening congruence, and
+complete Reference simp semantics remain outside this increment.
 
 `Engine::admit_source_declaration` checks one definition or theorem without execution. `Engine::check_source_files` checks an ordered batch and returns a `SourceFileCheck` only on complete success. Both use the existing K1 plus independent-checker council and immutable publication path.
 
