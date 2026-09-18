@@ -22,6 +22,7 @@ pub struct CallableBindings<'a> {
     pub functions: &'a [FunctionBinding],
     pub lambdas: &'a [LambdaBinding],
     pub bool_cases: &'a [BoolCaseBinding],
+    pub constructor_cases: &'a [ConstructorCaseBinding],
 }
 
 pub(super) fn prepare(
@@ -73,6 +74,7 @@ pub(super) fn prepare(
                 result: case.result,
                 result_ownership: ownership,
                 body: None,
+                case_constructors: None,
             },
             IngressResource::ProgramTables,
             limits.fir.max_functions.saturating_sub(1),
@@ -177,6 +179,7 @@ mod tests {
                 functions: &[],
                 lambdas: &lambdas,
                 bool_cases: cases,
+                constructor_cases: &[],
             },
             limits,
         )

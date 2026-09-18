@@ -27,15 +27,16 @@ use std::fmt;
 /// 11 also admits a validated register operand for computed module names;
 /// version 12 adds the ABI-exact callable result class used by `Nat`, whose
 /// runtime representation may be either a tagged scalar or an owned mpz;
-/// version 13 carries canonical arbitrary-precision Nat literal limbs.
-pub const FLBC_SCHEMA_VERSION: u16 = 13;
+/// version 13 carries canonical arbitrary-precision Nat literal limbs;
+/// version 14 adds borrowed, shape-checked constructor discrimination.
+pub const FLBC_SCHEMA_VERSION: u16 = 14;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 8;
+pub const FLBC_WIRE_VERSION: u16 = 9;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -75,6 +76,7 @@ const OP_CTOR_FIELD: u8 = 15;
 const OP_CHECK_SYSTEM: u8 = 16;
 const OP_CHECK_SYSTEM_VALUE: u8 = 17;
 const OP_NAT_BIG: u8 = 18;
+const OP_CTOR_TEST: u8 = 19;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -468,6 +470,14 @@ pub enum Instruction {
         fields: Vec<Register>,
         scalar_bytes: Vec<u8>,
     },
+    /// Return scalar 1 exactly when the borrowed object is a constructor with
+    /// this tag and object-slot count, or 0 otherwise. No field is accessed.
+    CtorTest {
+        dst: Register,
+        src: Register,
+        expected_tag: u8,
+        expected_fields: u16,
+    },
     /// Read one constructor object field after checking its complete runtime
     /// object-slot shape. Validation guarantees `field < expected_fields`.
     CtorField {
@@ -552,6 +562,7 @@ impl Instruction {
             | Self::Move { src, .. }
             | Self::Drop { src }
             | Self::CtorField { src, .. }
+            | Self::CtorTest { src, .. }
             | Self::CheckSystemValue { module_name: src } => {
                 vec![*src]
             }
@@ -580,6 +591,7 @@ impl Instruction {
             | Self::Move { dst, .. }
             | Self::Ctor { dst, .. }
             | Self::CtorField { dst, .. }
+            | Self::CtorTest { dst, .. }
             | Self::Array { dst, .. }
             | Self::Intrinsic { dst, .. }
             | Self::Call { dst, .. }
@@ -2161,6 +2173,18 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.u16(*expected_fields)?;
             encoder.u16(*field)
         }
+        Instruction::CtorTest {
+            dst,
+            src,
+            expected_tag,
+            expected_fields,
+        } => {
+            encoder.u8(OP_CTOR_TEST)?;
+            encoder.register(*dst)?;
+            encoder.register(*src)?;
+            encoder.u8(*expected_tag)?;
+            encoder.u16(*expected_fields)
+        }
         Instruction::Array { dst, items } => {
             encoder.u8(OP_ARRAY)?;
             encoder.register(*dst)?;
@@ -2292,6 +2316,12 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             expected_tag: decoder.u8()?,
             expected_fields: decoder.u16()?,
             field: decoder.u16()?,
+        }),
+        OP_CTOR_TEST => Ok(Instruction::CtorTest {
+            dst: decoder.register()?,
+            src: decoder.register()?,
+            expected_tag: decoder.u8()?,
+            expected_fields: decoder.u16()?,
         }),
         OP_ARRAY => Ok(Instruction::Array {
             dst: decoder.register()?,
@@ -2986,6 +3016,26 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                     });
                 }
             }
+            Instruction::CtorTest {
+                expected_tag,
+                expected_fields,
+                ..
+            } => {
+                if *expected_tag > abi::TAG_MAX_CTOR_TAG {
+                    return Err(ValidationError::CtorTagOutOfRange {
+                        function: function.id,
+                        pc,
+                        tag: *expected_tag,
+                    });
+                }
+                if usize::from(*expected_fields) >= abi::MAX_CTOR_FIELDS {
+                    return Err(ValidationError::CtorFieldShapeOutOfRange {
+                        function: function.id,
+                        pc,
+                        expected_fields: *expected_fields,
+                    });
+                }
+            }
             Instruction::String { .. }
             | Instruction::Copy { .. }
             | Instruction::Move { .. }
@@ -3454,6 +3504,7 @@ fn ownership_reads<E>(
         | Instruction::Move { src, .. }
         | Instruction::Drop { src }
         | Instruction::CtorField { src, .. }
+        | Instruction::CtorTest { src, .. }
         | Instruction::CheckSystemValue { module_name: src } => visit(*src)?,
         Instruction::Ctor { fields, .. } => {
             for register in fields {
@@ -3646,6 +3697,7 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
         | Instruction::Move { .. }
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
+        | Instruction::CtorTest { .. }
         | Instruction::CheckSystemValue { .. }
         | Instruction::JumpIfZero { .. }
         | Instruction::Return { .. }
@@ -3711,6 +3763,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::Move { .. }
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
+        | Instruction::CtorTest { .. }
         | Instruction::Array { .. }
         | Instruction::Call { .. }
         | Instruction::Closure { .. }
@@ -3906,6 +3959,17 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             expected_tag: *expected_tag,
             expected_fields: *expected_fields,
             field: *field,
+        },
+        Instruction::CtorTest {
+            dst,
+            src,
+            expected_tag,
+            expected_fields,
+        } => Instruction::CtorTest {
+            dst: *dst,
+            src: *src,
+            expected_tag: *expected_tag,
+            expected_fields: *expected_fields,
         },
         Instruction::Array { dst, items } => Instruction::Array {
             dst: *dst,
@@ -11240,8 +11304,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                8, 0, // wire version
-                13, 0, // schema version
+                9, 0, // wire version
+                14, 0, // schema version
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id

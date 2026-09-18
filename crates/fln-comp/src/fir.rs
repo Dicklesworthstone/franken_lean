@@ -28,8 +28,9 @@ use std::fmt;
 /// function, closure signature, and dynamic application; version 13 represents
 /// each `Lean.Core.checkSystem` call as an explicit effect checkpoint; version
 /// 14 carries computed module-name values into that checkpoint; version 15
-/// carries canonical arbitrary-precision Nat literal limbs through lowering.
-pub const FIR_SCHEMA_VERSION: u16 = 15;
+/// carries canonical arbitrary-precision Nat literal limbs through lowering;
+/// version 16 adds exact constructor-shape tests for native case dispatch.
+pub const FIR_SCHEMA_VERSION: u16 = 16;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,6 +404,11 @@ pub enum Operation {
         constructor: ConstructorId,
         fields: Vec<ValueId>,
     },
+    /// Borrowed constructor discrimination; false on another tag or shape.
+    CtorTest {
+        constructor: ConstructorId,
+        value: ValueId,
+    },
     Project {
         projection: ProjectionId,
         value: ValueId,
@@ -475,6 +481,7 @@ impl Operation {
             | Self::Box(value)
             | Self::Unbox { value, .. }
             | Self::Project { value, .. }
+            | Self::CtorTest { value, .. }
             | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
                 rest: empty,
@@ -1168,6 +1175,11 @@ pub enum ValidationError {
         function: FunctionId,
         block: BlockId,
         projection: ProjectionId,
+    },
+    ConstructorTestOperandType {
+        function: FunctionId,
+        block: BlockId,
+        actual: ValueType,
     },
     ProjectionOperandType {
         function: FunctionId,
@@ -1891,6 +1903,16 @@ impl fmt::Display for ValidationError {
                 function.get(),
                 block.get(),
                 projection.get()
+            ),
+            Self::ConstructorTestOperandType {
+                function,
+                block,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} constructor test received {actual:?}",
+                function.get(),
+                block.get()
             ),
             Self::ProjectionOperandType {
                 function,
@@ -2739,6 +2761,28 @@ fn infer_operation_type(
                 }
             }
             Ok(ValueType::Constructor)
+        }
+        Operation::CtorTest { constructor, value } => {
+            if constructor
+                .index()
+                .and_then(|i| program.constructors.get(i))
+                .is_none()
+            {
+                return Err(ValidationError::MissingConstructor {
+                    function: function.id,
+                    block: block.id,
+                    constructor: *constructor,
+                });
+            }
+            let actual = value_type(function, block, value_types, *value)?;
+            if actual != ValueType::Constructor {
+                return Err(ValidationError::ConstructorTestOperandType {
+                    function: function.id,
+                    block: block.id,
+                    actual,
+                });
+            }
+            Ok(ValueType::Bool)
         }
         Operation::Project { projection, value } => {
             let Some(declaration) = projection
@@ -3615,6 +3659,26 @@ fn lower_single_binding(
                 )?,
             })
         }
+        Operation::CtorTest { constructor, value } => {
+            let constructor = constructor
+                .index()
+                .and_then(|i| program.constructors.get(i))
+                .ok_or(LoweringError::InternalInvariant {
+                    reason: "validated constructor test disappeared",
+                })?;
+            let expected_fields = u16::try_from(constructor.fields.len()).map_err(|_| {
+                LoweringError::WidthOverflow {
+                    field: "constructor test field count",
+                    observed: constructor.fields.len(),
+                }
+            })?;
+            Ok(flbc::Instruction::CtorTest {
+                dst,
+                src: lower_register(*value)?,
+                expected_tag: constructor.tag,
+                expected_fields,
+            })
+        }
         Operation::Project { projection, value } => {
             let projection = projection
                 .index()
@@ -3897,6 +3961,9 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         } => {
             write!(output, "ctor c{} fields=", constructor.get())?;
             write_values(output, fields)
+        }
+        Operation::CtorTest { constructor, value } => {
+            write!(output, "ctor-test c{} v{}", constructor.get(), value.get())
         }
         Operation::Project { projection, value } => {
             write!(output, "project p{} v{}", projection.get(), value.get())
@@ -4740,7 +4807,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",

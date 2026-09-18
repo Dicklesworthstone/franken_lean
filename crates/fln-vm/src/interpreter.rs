@@ -2091,6 +2091,24 @@ fn run(
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
+            Instruction::CtorTest {
+                dst,
+                src,
+                expected_tag,
+                expected_fields,
+            } => {
+                let matches = {
+                    let value = register(current_frame(&stack)?, src)?;
+                    value_kind(value) == ValueKind::Ctor(expected_tag)
+                        && u16::from(value.header().other) == expected_fields
+                };
+                set_register(
+                    current_frame_mut(&mut stack)?,
+                    dst,
+                    Obj::mk_nat(usize::from(matches)),
+                )?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
             Instruction::CtorField {
                 dst,
                 src,

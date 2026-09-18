@@ -38,7 +38,9 @@ use std::collections::VecDeque;
 use std::fmt;
 
 mod branch;
+mod constructor_case;
 pub use branch::{BoolCaseBinding, CallableBindings};
+pub use constructor_case::ConstructorCaseBinding;
 
 /// Explicit ceilings for the core-expression ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1163,6 +1165,7 @@ struct PreparedFunction<'a> {
     result: fir::ValueType,
     result_ownership: crate::flbc::CallableResultOwnership,
     body: Option<&'a Expr>,
+    case_constructors: Option<Vec<fir::ConstructorId>>,
 }
 
 struct PreparedLambda<'a> {
@@ -2387,6 +2390,7 @@ fn prepare_catalog<'a>(
         functions,
         lambdas,
         bool_cases,
+        constructor_cases,
     } = callables;
     let constructor_count = scalar_constructors.len().saturating_add(constructors.len());
     charge_fir(
@@ -2397,6 +2401,7 @@ fn prepare_catalog<'a>(
     let function_count = functions
         .len()
         .saturating_add(bool_cases.len())
+        .saturating_add(constructor_cases.len())
         .saturating_add(1);
     charge_fir(
         fir::ValidationResource::Functions,
@@ -2482,11 +2487,18 @@ fn prepare_catalog<'a>(
             result: binding.result,
             result_ownership: binding.result_ownership,
             body: Some(&binding.body),
+            case_constructors: None,
         });
     }
 
     prepare_lambdas(&mut catalog, lambdas, limits)?;
     branch::prepare(&mut catalog, bool_cases, functions.len(), limits)?;
+    constructor_case::prepare(
+        &mut catalog,
+        constructor_cases,
+        functions.len().saturating_add(bool_cases.len()),
+        limits,
+    )?;
 
     catalog
         .functions
@@ -4508,6 +4520,7 @@ pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
             functions,
             lambdas,
             bool_cases: &[],
+            constructor_cases: &[],
         },
         limits,
     )
@@ -4603,8 +4616,15 @@ pub fn lower_closed_expr_with_control_flow<'a>(
     )?);
     for function in &catalog.functions {
         let Some(expression) = function.body else {
-            let lowered = branch::assemble(function)?;
-            work.generated_values = work.generated_values.saturating_add(2);
+            let (lowered, values) = if let Some(constructors) = &function.case_constructors {
+                (
+                    constructor_case::assemble(function, constructors, limits)?,
+                    constructors.len().saturating_mul(2).saturating_add(1),
+                )
+            } else {
+                (branch::assemble(function)?, 2)
+            };
+            work.generated_values = work.generated_values.saturating_add(values);
             charge_fir(
                 fir::ValidationResource::Values,
                 work.function_parameters
@@ -5151,7 +5171,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
@@ -5280,7 +5300,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "function f0 params=[] ownership=[] result=unit result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:unit = check_system 10:4c616b652e4275696c64\n",
@@ -5496,7 +5516,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "intrinsic i1 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
@@ -5554,7 +5574,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "constructor c1 tag=3 fields=[] scalar_bytes=0:\n",
                 "function f0 params=[] ownership=[] result=ctor result_ownership=owned\n",
@@ -5961,7 +5981,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "projection p0 constructor=c0 field=0\n",
                 "projection p1 constructor=c0 field=1\n",
@@ -6215,7 +6235,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
@@ -6802,7 +6822,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/15 entry=f0\n",
+                "fir/16 entry=f0\n",
                 "closure_type s0 params=[string] ownership=[borrowed] result=string result_ownership=owned\n",
                 "intrinsic i0 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=string result_ownership=owned\n",

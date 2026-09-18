@@ -481,6 +481,7 @@ impl<'a> Preparation<'a> {
             functions,
             lambdas: &self.lambdas,
             bool_cases: &self.cases,
+            constructor_cases: &[],
         }
     }
 }
