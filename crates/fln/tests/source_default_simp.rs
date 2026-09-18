@@ -36,6 +36,134 @@ const WRAP: &str = "def wrap.{u} {A : Sort u} (x : A) : A := x\n\
     theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n";
 
 #[test]
+fn inline_simp_attributes_are_registered_only_after_checked_admission() {
+    let base = engine();
+    let result = checked(
+        &base,
+        &["def wrap.{u} {A : Sort u} (x : A) : A := x\n\
+         @[simp 800] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n\
+         theorem nested (n : Nat) : wrap (wrap n) = n := by simp\n\
+         theorem typeValue (A : Type) : wrap A = A := by simp"],
+    );
+    assert_eq!(result.commands, 4);
+    assert_eq!(result.theorems, 3);
+    let rules = simp::read(result.engine.environment()).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].declaration, Name::from_components(["unwrap"]));
+    assert_eq!(rules[0].priority, 800);
+    assert!(!rules[0].reverse);
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+    let defined = checked(&base, &["def wrap (n : Nat) : Nat := n"]).engine;
+    for bad in [
+        "@[simp] theorem circular (n : Nat) : wrap n = n := by simp",
+        "@[simp] theorem bad : (0 : Nat) = 1 := by rfl",
+        "@[simp] theorem unsupported (p : Prop) (h : p) : p := by exact h",
+        "@[simp ←] def backwards (n : Nat) := n",
+    ] {
+        refused(&defined, bad);
+    }
+    assert!(simp::read(defined.environment()).unwrap().is_empty());
+}
+
+#[test]
+fn inline_attributes_bind_qualified_names_and_survive_command_and_file_scopes() {
+    let base = engine();
+    let result = checked(
+        &base,
+        &[
+            "namespace N\n@[simp] def wrap.{u} {A : Sort u} (x : A) : A := x\n\
+         @[simp ← 900] theorem «re.verse».{u} {A : Sort u} (x : A) : x = wrap x := by rfl\nend N",
+            "open N\ntheorem use (n : Nat) : wrap (wrap n) = n := by simp\n\
+         attribute [-simp] wrap «re.verse»",
+        ],
+    );
+    assert_eq!(result.theorems, 2);
+    assert!(simp::read(result.engine.environment()).unwrap().is_empty());
+    assert!(
+        result
+            .engine
+            .environment()
+            .contains(&Name::from_components(["N", "re.verse"]))
+    );
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["N", "wrap"]))
+    );
+}
+
+#[test]
+fn single_declaration_admission_publishes_the_simp_extension_and_logical_root() {
+    let base = engine();
+    let admitted = base
+        .admit_source_declaration(
+            b"@[simp] def wrapped (n : Nat) := n",
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(admitted.base_logical_root, base.logical_root(&KVMap::new()));
+    assert_eq!(
+        admitted.result_logical_root,
+        admitted.engine.logical_root(&KVMap::new())
+    );
+    assert_ne!(admitted.base_logical_root, admitted.result_logical_root);
+    assert_eq!(simp::read(admitted.engine.environment()).unwrap().len(), 1);
+    checked(
+        &admitted.engine,
+        &["theorem use (n : Nat) : wrapped (wrapped n) = n := by simp"],
+    );
+    refused(
+        &base,
+        "@[simp] def early (n : Nat) := n\n@[unknown] def later := 0",
+    );
+    let absolute = base
+        .admit_source_declaration(
+            b"@[simp] def _root_.absolute (n : Nat) := n",
+            &KVMap::new(),
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        simp::read(absolute.engine.environment()).unwrap()[0].declaration,
+        Name::from_components(["absolute"]),
+    );
+    checked(
+        &absolute.engine,
+        &["theorem use (n : Nat) : absolute n = n := by simp"],
+    );
+    checked(
+        &base,
+        &[
+            "namespace N\n@[simp] def _root_.absolute (n : Nat) := n\nend N\ntheorem use (n : Nat) : absolute n = n := by simp",
+        ],
+    );
+}
+
+#[test]
+fn executable_definition_door_cannot_silently_drop_inline_metadata() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let result = base.execute_source_definition(
+        b"@[simp] def wrapped : Nat := 7",
+        &KVMap::new(),
+        fln::EngineExecutionLimits::new(limits().kernel),
+    );
+    assert!(result.is_err());
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    assert!(simp::read(base.environment()).unwrap().is_empty());
+    assert!(
+        !base
+            .environment()
+            .contains(&Name::from_components(["wrapped"]))
+    );
+}
+
+#[test]
 fn registered_polymorphic_lemmas_simplify_without_an_explicit_rule_list() {
     let base = checked(&engine(), &[WRAP]).engine;
     refused(&base, "theorem missing (n : Nat) : wrap n = n := by simp");
@@ -225,6 +353,7 @@ fn malformed_default_registry_never_becomes_success_or_a_tactic_fallback() {
             format!("{error:?}").contains("SimpSet(Malformed)"),
             "{error:?}"
         );
+        assert_eq!(error.disposition(), ("internal-fault", false, 4));
     }
     checked(
         &damaged,

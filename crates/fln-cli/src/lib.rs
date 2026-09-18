@@ -11632,7 +11632,7 @@ mod tests {
     const SECOND_PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
     const PINNED_ILEAN_HEX: &str = include_str!("../../fln-olean/tests/corpus/ilean_probe.hex");
-    const STRING_FLBC: &[u8] = b"FLNFLBC\0\x08\0\x0d\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
+    const OLD_STRING_FLBC: &[u8] = b"FLNFLBC\0\x08\0\x0d\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
 
     fn repository_path(relative: &str) -> PathBuf {
         let invoked_from = std::env::current_dir().expect("the test has an invocation directory");
@@ -11689,6 +11689,24 @@ mod tests {
             fln::Outcome::Complete(execution) => execution.flbc_artifact,
             fln::Outcome::Inconclusive(_) | fln::Outcome::InternalFault(_) => Vec::new(),
         }
+    }
+
+    fn string_flbc_fixture() -> Vec<u8> {
+        let kernel = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+        let engine = fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel))
+            .expect("the source seed council does not reject")
+            .into_complete()
+            .expect("the source seed council answers completely");
+        engine
+            .execute_source_definition(
+                b"def flbcFixture : String := \"hi\"",
+                &fln::KVMap::new(),
+                fln::EngineExecutionLimits::new(kernel),
+            )
+            .expect("the fixture source reaches the engine")
+            .into_complete()
+            .expect("the fixture executes authoritatively")
+            .flbc_artifact
     }
 
     fn encode_checkable_olean(constants: &[fln::ConstantInfo]) -> Vec<u8> {
@@ -11832,10 +11850,18 @@ mod tests {
         assert!(human.stdout.contains("canonical FLBC execution: complete"));
         assert!(human.stdout.contains("return value: 73"));
 
-        let non_scalar = execute_flbc_bytes(STRING_FLBC, STRING_FLBC.len(), true);
+        // The positive fixture comes from the native producer, not a stale
+        // hand-written envelope with yesterday's wire/schema versions.
+        let string = string_flbc_fixture();
+        let non_scalar = execute_flbc_bytes(&string, string.len(), true);
         assert_eq!(non_scalar.exit_code, 0, "{}", non_scalar.stderr);
         assert!(non_scalar.stdout.contains("\"returnKind\":\"string\""));
         assert!(non_scalar.stdout.contains("\"returnValue\":\"hi\""));
+
+        let obsolete = execute_flbc_bytes(OLD_STRING_FLBC, OLD_STRING_FLBC.len(), true);
+        assert_eq!(obsolete.exit_code, 1);
+        assert!(obsolete.stdout.is_empty());
+        assert!(obsolete.stderr.contains("unsupported FLBC wire version 8"));
 
         let mut malformed = artifact.clone();
         malformed[0] ^= u8::MAX;

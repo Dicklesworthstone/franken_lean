@@ -132,19 +132,24 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
                 .0
     };
     let mut declaration_column = None;
+    let mut attribute_prefix = false;
     for (index, token) in tokens.iter().enumerate() {
         if let TokenKind::Symbol(symbol) = &token.kind {
-            let scope_start = control(symbol)
-                && (index == 0
-                    || source_view.line_of(token.extent.start())
-                        > source_view.line_of(tokens[index - 1].extent.end()))
+            let command_line = (index == 0
+                || source_view.line_of(token.extent.start())
+                    > source_view.line_of(tokens[index - 1].extent.end()))
                 && declaration_column.is_none_or(|base| column(token) <= base);
-            if depth == 0 && (scope_start || declaration(symbol)) {
-                starts.push(view.to_original(token.extent.start()).0);
+            let scope_start = control(symbol) && command_line;
+            let inline_start = symbol == "@[" && command_line;
+            if depth == 0 && (scope_start || declaration(symbol) || inline_start) {
+                if !(attribute_prefix && declaration(symbol)) {
+                    starts.push(view.to_original(token.extent.start()).0);
+                }
+                attribute_prefix = inline_start;
                 declaration_column = declaration(symbol).then(|| column(token));
             }
             match symbol.as_str() {
-                "(" | "[" | "{" | ".{" | "⦃" => depth = depth.saturating_add(1),
+                "(" | "[" | "@[" | "{" | ".{" | "⦃" => depth = depth.saturating_add(1),
                 ")" | "]" | "}" | "⦄" => depth = depth.saturating_sub(1),
                 _ => {}
             }

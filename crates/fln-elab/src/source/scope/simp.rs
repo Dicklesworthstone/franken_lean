@@ -11,6 +11,140 @@ use fln_env::{
 };
 use std::collections::BTreeMap;
 
+/// Decode a canonical inline request. This only describes metadata: it must be
+/// installed on the successor of ordinary declaration admission, never before.
+pub fn registration(
+    syntax: &fln_syntax::tree::Syntax,
+) -> Result<Option<(Name, u32, bool)>, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let declaration = expect_node(
+        syntax,
+        &parser_kind(&["Command", "declaration"]),
+        2,
+        "declaration",
+    )?;
+    let modifiers = expect_node(
+        &declaration[0],
+        &parser_kind(&["Command", "declModifiers"]),
+        7,
+        "declaration modifiers",
+    )?;
+    let attributes = match expect_null_args(&modifiers[1], "inline attributes")? {
+        [] => return Ok(None),
+        [attributes] => expect_node(
+            attributes,
+            &parser_kind(&["Term", "attributes"]),
+            3,
+            "inline attributes",
+        )?,
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "one simp attribute",
+            });
+        }
+    };
+    expect_atom(&attributes[0], "@[", "attribute opener")?;
+    expect_atom(&attributes[2], "]", "attribute closer")?;
+    let [attribute] = expect_null_args(&attributes[1], "attribute list")? else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one simp attribute",
+        });
+    };
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "attribute scope",
+    )?;
+    expect_empty_null(&scope[0], "global attribute")?;
+    let parts = expect_node(
+        &instance[1],
+        &parser_kind(&["Attr", "simp"]),
+        4,
+        "simp attribute",
+    )?;
+    expect_atom(&parts[0], "simp", "simp attribute keyword")?;
+    expect_empty_null(&parts[1], "default simp phase")?;
+    let reverse = match expect_null_args(&parts[2], "simp direction")? {
+        [] => false,
+        [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => true,
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "simp direction",
+            });
+        }
+    };
+    let priority = match expect_null_args(&parts[3], "simp priority")? {
+        [] => 1000,
+        [priority] => {
+            let parts = expect_node(
+                priority,
+                &parser_kind(&["Priority", "numPrio"]),
+                1,
+                "numeric priority",
+            )?;
+            let numeral = expect_node(
+                &parts[0],
+                &Name::from_components(["num"]),
+                1,
+                "priority numeral",
+            )?;
+            let [Syntax::Atom { val, .. }] = numeral else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "priority numeral",
+                });
+            };
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "decimal priority",
+                });
+            }
+            val.parse::<u32>()
+                .map_err(|_| NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "u32 priority",
+                })?
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "numeric priority",
+            });
+        }
+    };
+    let definition = match &declaration[1] {
+        Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "definition"]) => {
+            expect_node(&declaration[1], kind, 5, "definition")?
+        }
+        Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "theorem"]) => {
+            expect_node(&declaration[1], kind, 4, "theorem")?
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "simp definition or theorem",
+            });
+        }
+    };
+    let id = expect_node(
+        &definition[1],
+        &parser_kind(&["Command", "declId"]),
+        2,
+        "declaration id",
+    )?;
+    level_syntax::explicit_parameters(&id[1])?;
+    let Syntax::Ident { val, .. } = &id[0] else {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    };
+    if val.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousDeclarationName);
+    }
+    Ok(Some((val.clone(), priority, reverse)))
+}
+
 const MAGIC: &[u8] = b"FLNSIMP\x01";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 16384;
@@ -243,6 +377,58 @@ pub fn update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fln_syntax::tree::Syntax;
+
+    fn child_mut<'a>(syntax: &'a mut Syntax, path: &[usize]) -> &'a mut Syntax {
+        let mut syntax = syntax;
+        for &index in path {
+            let Syntax::Node { args, .. } = syntax else {
+                panic!("test syntax path must name a node");
+            };
+            syntax = &mut args[index];
+        }
+        syntax
+    }
+
+    #[test]
+    fn inline_metadata_requires_the_actual_attribute_shape_and_numeric_priority() {
+        let parsed = fln_parse::parse_definition(
+            "@[simp ← 900] theorem «x.y».{u} {A : Sort u} (x : A) : x = x := by rfl".as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            registration(parsed.syntax()).unwrap(),
+            Some((Name::from_components(["x.y"]), 900, true))
+        );
+        let atom = |val: &str| Syntax::Atom {
+            info: fln_syntax::source::SourceInfo::None,
+            val: val.into(),
+        };
+        // The declaration's optional attrs / attributes / list / attrInstance
+        // are real nested nodes. Near-matching names and ignored extras are not
+        // registration requests, even when the declaration itself is valid.
+        for (path, replacement) in [
+            (&[0, 1, 0, 0][..], atom("@")),
+            (&[0, 1, 0, 2][..], atom("}")),
+            (&[0, 1, 0, 1, 0, 0, 0][..], atom("local")),
+            (&[0, 1, 0, 1, 0, 1, 0][..], atom("unknown")),
+            (&[0, 1, 0, 1, 0, 1, 1][..], atom("↓")),
+            (&[0, 1, 0, 1, 0, 1, 2, 0][..], atom("->")),
+            (&[0, 1, 0, 1, 0, 1, 3, 0, 0, 0][..], atom("4294967296")),
+            (&[0, 1, 0, 1, 0, 1, 3, 0, 0, 0][..], atom("-1")),
+        ] {
+            let mut syntax = parsed.syntax().clone();
+            *child_mut(&mut syntax, path) = replacement;
+            assert!(registration(&syntax).is_err(), "{path:?}");
+        }
+        let mut duplicate = parsed.syntax().clone();
+        let Syntax::Node { args, .. } = child_mut(&mut duplicate, &[0, 1, 0, 1]) else {
+            panic!("attribute list");
+        };
+        args.push(args[0].clone());
+        assert!(registration(&duplicate).is_err());
+    }
+
     #[test]
     fn unknown_and_corrupt_sets_fail_closed() {
         let env = Environment::new();

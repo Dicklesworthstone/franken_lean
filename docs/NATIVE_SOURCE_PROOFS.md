@@ -150,9 +150,35 @@ fln check-source --json examples/native_default_simp.lean
 ```
 
 This is a native source profile, not the Reference's serialized simp extension
-or a preloaded Init/mathlib simp database. Inline `@[simp]`, local/scoped
-attributes, proposition/iff rule compilation, and the complete upstream
+or a preloaded Init/mathlib simp database. Local/scoped attributes,
+proposition/iff rule compilation, and the complete upstream
 simplifier remain separate frontiers.
+
+### Inline declaration attributes
+
+`@[simp]` can also precede a definition or equality theorem, on the same line or
+on a preceding line. The supported direction and numeric priority forms are the
+same as for standalone registration, for example `@[simp ← 900]`. Declaration
+names retain their namespace, escaped components and universe parameters.
+
+```lean
+def wrap.{u} {A : Sort u} (x : A) : A := x
+@[simp] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl
+theorem nested (n : Nat) : wrap (wrap n) = n := by simp
+```
+
+The parser preserves the original attribute tokens in the declaration's syntax
+tree; it does not strip a prefix and reparse shifted source. The registry is
+updated only after K1 and the independent checker admit the declaration. Its
+own attribute is therefore unavailable while proving that declaration. An
+unsupported registration, failed declaration, or later batch error exposes no
+successor snapshot or partial registry update.
+
+This production accepts one global simp attribute on a definition or theorem.
+Other attributes, attribute lists, local/scoped modifiers, pre/post phases and
+annotated instances/inductives are refused. The admission APIs and `check-source`
+publish inline attributes; the separate executable-definition entry point
+refuses them instead of silently dropping their effects.
 
 ## APIs and limits
 
@@ -162,7 +188,7 @@ simplifier remain separate frontiers.
 
 Current boundaries are explicit:
 
-- `check-source` accepts import-free `def` and `theorem` files. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
+- `check-source` accepts import-free declaration files with its supported scope and registration commands, including standalone and inline simp attributes. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
 - Rewriting and simplification support goals and explicit named hypothesis locations (`at hx hy`). Quantified rules use the native bounded unifier, not general higher-order theorem search. Wildcard locations, occurrence controls, binder-opening congruence for arbitrary subterms, Reference simp-extension interchange and complete Lean `rw`/`simp` parity remain open.
 - [Native instance synthesis](NATIVE_INSTANCES.md) now supports registered classes, local instances, named global instances and selected tactic-lemma arguments. Full Synod semantics, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier remain incomplete.
 

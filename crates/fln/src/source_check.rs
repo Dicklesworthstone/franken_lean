@@ -101,6 +101,9 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
         EngineExecutionError::Frontend(NatDefinitionFrontendError::Elaborate(
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
+            SourceInferenceError::SimpSet(
+                fln_elab::source::scope::simp::SimpSetError::Malformed,
+            ) => ("internal-fault", false, 4),
             SourceInferenceError::ResourceLimit
             | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)

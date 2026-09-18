@@ -2823,6 +2823,9 @@ impl Engine {
         let registration = fln_elab::source::instance_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let result = self
             .admit_declaration(declaration, options, limits)
             .map_err(EngineExecutionError::from)?;
@@ -2838,6 +2841,30 @@ impl Engine {
                         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
                             fln_elab::NatDefinitionElabError::Inference(
                                 fln_elab::source::SourceInferenceError::InstanceRegistry(error),
+                            ),
+                        ))
+                    })?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if let Some((name, priority, reverse)) = simp {
+                    let name = fln_elab::source::scope::SourceScope::default()
+                        .declaration_name(&name)
+                        .map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::NameScope(error),
+                                ),
+                            ))
+                        })?;
+                    admitted.engine.environment = fln_elab::source::scope::simp::update(
+                        admitted.engine.environment(),
+                        &name,
+                        Some((priority, reverse)),
+                    )
+                    .map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::SimpSet(error),
                             ),
                         ))
                     })?;
@@ -3641,6 +3668,19 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        if fln_elab::source::scope::simp::registration(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?
+            .is_some()
+        {
+            return Err(EngineExecutionError::Frontend(
+                DefinitionFrontendError::Elaborate(
+                    fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "an executable definition; use check-source for simp attributes",
+                    },
+                ),
+            ));
+        }
         if fln_elab::source::instance_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?

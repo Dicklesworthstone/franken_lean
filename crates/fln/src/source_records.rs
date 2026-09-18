@@ -96,6 +96,9 @@ impl Engine {
                 let registration = fln_elab::source::instance_registration(parsed.syntax())
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?;
+                let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
                 let result = self
                     .admit_declarations(&[declaration], options, limits)
                     .map_err(EngineExecutionError::from)?;
@@ -120,6 +123,28 @@ impl Engine {
                                         fln_elab::source::SourceInferenceError::InstanceRegistry(
                                             error,
                                         ),
+                                    ),
+                                ))
+                            })?;
+                            batch.result_logical_root = batch.engine.logical_root(options);
+                        }
+                        if let Some((name, priority, reverse)) = simp {
+                            let name = scope.declaration_name(&name).map_err(|error| {
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::NameScope(error),
+                                    ),
+                                ))
+                            })?;
+                            batch.engine.environment = fln_elab::source::scope::simp::update(
+                                batch.engine.environment(),
+                                &name,
+                                Some((priority, reverse)),
+                            )
+                            .map_err(|error| {
+                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                    fln_elab::NatDefinitionElabError::Inference(
+                                        fln_elab::source::SourceInferenceError::SimpSet(error),
                                     ),
                                 ))
                             })?;

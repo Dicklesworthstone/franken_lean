@@ -1893,8 +1893,11 @@ fn definition_scoped(
         7,
         "declaration modifiers",
     )?;
-    for modifier in modifiers {
-        expect_empty_null(modifier, "empty declaration modifier")?;
+    scope::simp::registration(syntax)?;
+    for (index, modifier) in modifiers.iter().enumerate() {
+        if index != 1 {
+            expect_empty_null(modifier, "empty declaration modifier")?;
+        }
     }
     let is_instance = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","instance"]));
     let is_theorem = matches!(&declaration[1], Syntax::Node { kind,.. } if kind==&parser_kind(&["Command","theorem"]));

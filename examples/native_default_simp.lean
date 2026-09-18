@@ -2,9 +2,7 @@ namespace Wrapper
 
 def wrap.{u} {A : Sort u} (x : A) : A := x
 
-theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl
-
-attribute [simp] unwrap
+@[simp] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl
 
 theorem nested (n : Nat) : wrap (wrap n) = n := by simp
 

@@ -547,6 +547,7 @@ fn nat_definition_token_table() -> TokenTable {
         "_",
         "?",
         "@",
+        "@[",
         "{",
         ".",
         "}",
@@ -632,6 +633,7 @@ fn source_module_token_table() -> TokenTable {
         "_",
         "?",
         "@",
+        "@[",
         "{",
         ".",
         "}",
@@ -1891,18 +1893,30 @@ fn parse_definition_with_grammar(
         return records::parse(view, tokens);
     }
 
+    let declaration_start = if grammar == DefinitionGrammar::Scalar {
+        command_scope::attributes::inline_end(&view, &tokens)?
+    } else {
+        0
+    };
     if !matches!(
-        tokens.first().map(|token| &token.kind),
+        tokens.get(declaration_start).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == "def" || (grammar == DefinitionGrammar::Scalar && matches!(symbol.as_str(), "theorem" | "instance"))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(&view, &tokens, 0),
+            at: original_position(&view, &tokens, declaration_start),
             expected: NatDefinitionExpectation::DefinitionKeyword,
         });
     }
-    let is_theorem = matches!(&tokens[0].kind, TokenKind::Symbol(symbol) if symbol == "theorem");
-    let is_instance = matches!(&tokens[0].kind, TokenKind::Symbol(symbol) if symbol == "instance");
-    let mut cursor = 1;
+    let is_theorem =
+        matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "theorem");
+    let is_instance = matches!(&tokens[declaration_start].kind, TokenKind::Symbol(symbol) if symbol == "instance");
+    if declaration_start != 0 && is_instance {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(&view, &tokens, declaration_start),
+            expected: NatDefinitionExpectation::DefinitionKeyword,
+        });
+    }
+    let mut cursor = declaration_start + 1;
     let priority_range = if is_instance
         && matches!(tokens.get(cursor).map(|t|&t.kind), Some(TokenKind::Symbol(s)) if s=="(")
     {
@@ -1995,21 +2009,15 @@ fn parse_definition_with_grammar(
     };
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
-    let definition_keyword = leaves.leaf(0)?;
+    let definition_keyword = leaves.leaf(declaration_start)?;
     let declaration_name = leaves.leaf(name_index)?;
 
-    let modifiers = Syntax::node(
-        parser_kind(&["Command", "declModifiers"]),
-        vec![
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-        ],
-    );
+    let mut modifier_parts = vec![null_node(Vec::new()); 7];
+    if declaration_start != 0 {
+        modifier_parts[1] =
+            command_scope::attributes::inline_syntax(&leaves, &tokens, declaration_start)?;
+    }
+    let modifiers = Syntax::node(parser_kind(&["Command", "declModifiers"]), modifier_parts);
     let declaration_id = Syntax::node(
         parser_kind(&["Command", "declId"]),
         vec![
