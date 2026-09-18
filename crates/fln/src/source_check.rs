@@ -1,5 +1,6 @@
 //! Admission-only source batches. No compiler, VM, or artifact publication.
 use super::*;
+pub mod modules;
 mod scopes;
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +159,18 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
+        self.check_source_files_recording(sources, options, limits, None)
+    }
+
+    // Module imports record only the candidates that survived ordinary admission.
+    // The optional recorder is private and never returned on a failed batch.
+    fn check_source_files_recording(
+        &self,
+        sources: &[&[u8]],
+        options: &KVMap,
+        limits: SourceCheckLimits,
+        mut declarations: Option<&mut Vec<Declaration>>,
+    ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
         if sources.is_empty() {
             return Err(SourceCheckError::EmptyInput);
         }
@@ -308,6 +321,9 @@ impl Engine {
                     .count();
                 for row in &admitted.admissions {
                     scopes.admitted(&row.declaration);
+                    if let Some(journal) = declarations.as_deref_mut() {
+                        journal.push(row.declaration.clone());
+                    }
                 }
                 engine = admitted.engine;
                 count += 1;

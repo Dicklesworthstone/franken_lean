@@ -2,6 +2,7 @@
 //! declaration parser; this layer partitions original bytes without rewriting.
 use super::*;
 pub mod attributes;
+pub mod imports;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
@@ -17,6 +18,7 @@ pub enum ScopeCommand {
 fn table() -> TokenTable {
     let mut table = source_module_token_table();
     for keyword in [
+        "prelude",
         "namespace",
         "section",
         "end",

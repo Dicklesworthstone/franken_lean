@@ -1,0 +1,58 @@
+name: Native checked source modules
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-source-modules.yml'
+      - 'crates/fln/src/source_check.rs'
+      - 'crates/fln/src/source_check/modules/**'
+      - 'crates/fln/src/source_check/modules.rs'
+      - 'crates/fln-parse/src/command_scope/imports.rs'
+      - 'crates/fln/tests/source_module_check.rs'
+      - 'crates/fln-cli/src/source_check/**'
+      - 'crates/fln-cli/tests/source_module_check.rs'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-modules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain and identify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          toolchain=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
+          rustc -Vv
+      - name: Read active core beads
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import json
+          for line in open('.beads/issues.jsonl'):
+              row = json.loads(line)
+              title = row.get('title', '')
+              if row.get('status') != 'closed' and any(word in title.lower() for word in ('module', 'import', 'elaboration', 'unifier', 'kernel')):
+                  print(row['id'], row.get('status'), row.get('priority'), title)
+          PY
+      - name: Check parser headers and module admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-parse command_scope -- --nocapture
+          cargo test --locked -p fln --test source_module_check -- --nocapture
+      - name: Check existing proof and metadata consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --test source_default_simp --test source_instances --no-fail-fast
+          if test -f crates/fln-cli/tests/source_module_check.rs; then
+            cargo test --locked -p fln-cli --test source_module_check -- --nocapture
+          fi
+          cargo check --locked --workspace --all-targets
