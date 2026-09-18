@@ -21,13 +21,22 @@ impl Engine<'_> {
         // proofs. In particular, synthesizing an application type does not prove
         // that its arguments are well-typed.
         let left_type = self.eta_neutral_type(left, locals)?;
+        // A known non-proof type rules this rung out. In particular, do not
+        // reconstruct the other side's entire recursor telescope for each
+        // impossible rewrite occurrence. The final guard is unchanged for
+        // every pair that can actually select proof irrelevance.
+        if let Some(type_) = &left_type
+            && !self.proof_type_is_prop(type_, locals)?
+        {
+            return Ok(false);
+        }
         let right_type = self.eta_neutral_type(right, locals)?;
         let Some(proposition) = left_type.as_ref().or(right_type.as_ref()) else {
             return Ok(false);
         };
         // A Pi can itself be a proposition by impredicativity. Opening its
         // codomain also lets type-directed inference work below dependent binders.
-        if !self.proof_type_is_prop(proposition, locals)? {
+        if left_type.is_none() && !self.proof_type_is_prop(proposition, locals)? {
             return Ok(false);
         }
         if let (Some(left_type), Some(right_type)) = (&left_type, &right_type) {

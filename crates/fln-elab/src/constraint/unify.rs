@@ -218,7 +218,7 @@ fn children(expr: &Expr) -> [Option<&Expr>; 3] {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Facts {
     fvars: HashSet<FVarId>,
     params: Vec<Name>,
@@ -437,6 +437,10 @@ struct Engine<'a> {
     residuals: Vec<MVarId>,
     awakened: Vec<Constraint>,
     kernel_checks: usize,
+    // Facts describe immutable syntax, not its interpretation under assignments
+    // or a local context. Pin every key's allocation until this batch ends so a
+    // freed temporary cannot donate its address to an unrelated expression.
+    fact_cache: HashMap<usize, (Expr, Facts)>,
 }
 
 impl Engine<'_> {
@@ -447,15 +451,35 @@ impl Engine<'_> {
     }
 
     fn scan(&mut self, expr: &Expr) -> Result<Facts, UnificationError> {
+        self.meter.tick()?;
+        let key = expr.allocation_identity();
+        if let Some((_, found)) = self.fact_cache.get(&key) {
+            // Copying metadata is work too. Cache hits may avoid a DAG walk,
+            // never cancellation checks or the cost of a large result.
+            for _ in 0..found.fvars.len() + found.params.len() + found.uvars.len() {
+                self.meter.node()?;
+            }
+            return Ok(found.clone());
+        }
         let found = facts(expr, &mut self.meter)?;
         self.reserved.extend(found.fvars.iter().cloned());
+        for _ in 0..found.fvars.len() + found.params.len() + found.uvars.len() {
+            self.meter.node()?;
+        }
+        self.fact_cache.insert(key, (expr.clone(), found.clone()));
         Ok(found)
     }
 
     fn instantiate(&mut self, expr: &Expr) -> Result<Expr, UnificationError> {
         self.scan(expr)?;
+        if !expr.has_expr_mvar() && !expr.has_level_mvar() {
+            return Ok(expr.clone());
+        }
         let expanded = self.work.mvars.instantiate(expr);
         self.scan(&expanded)?;
+        if !expanded.has_level_mvar() {
+            return Ok(expanded);
+        }
         let remaining = self
             .budget
             .max_visited_nodes
@@ -1077,6 +1101,7 @@ impl ElabTxn {
             residuals: Vec::new(),
             awakened: Vec::new(),
             kernel_checks: 0,
+            fact_cache: HashMap::new(),
         };
         let result = engine.solve(equations);
         self.budget.heartbeats_consumed = self
