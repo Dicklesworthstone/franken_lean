@@ -1,5 +1,5 @@
 name: Native source workbench
-# Capture constructive decisions and the current proof frontend for the next checked increment.
+# Capture current source and active product gaps for a checked native frontend increment.
 on:
   push:
     branches: [main]
@@ -30,6 +30,23 @@ jobs:
           git archive --format=tar.gz HEAD crates/fln-elab crates/fln-parse crates/fln-checker crates/fln crates/fln-cli docs examples AGENTS.md README.md COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md .beads Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock > target/source-frontend/frontend.tar.gz
           cp target/source-workbench/commit.txt target/source-workbench/tracked-files.txt target/source-frontend/
           sha256sum target/source-frontend/frontend.tar.gz > target/source-frontend/SHA256SUMS
+      - name: Read active implementation beads
+        shell: python
+        run: |
+          import collections
+          import json
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          print('Bead status counts:', dict(collections.Counter(row.get('status') for row in rows)))
+          active = [row for row in rows if row.get('status') in ('open', 'in_progress', 'blocked')]
+          active.sort(key=lambda row: (row.get('priority', 9), row['id']))
+          Path('target/source-workbench/active-beads.json').write_text(json.dumps(active, ensure_ascii=False, indent=2) + '\n')
+          words = ('elaborat', 'athanor', 'tactic', 'source', 'unif', 'instance', 'match', 'induct', 'simp', 'rewrite')
+          for row in active:
+              title = row.get('title', '')
+              if any(word in title.lower() for word in words):
+                  print(json.dumps({key: row.get(key) for key in ('id', 'title', 'status', 'priority', 'description', 'dependencies')}, ensure_ascii=False))
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: source-frontend-${{ github.sha }}
