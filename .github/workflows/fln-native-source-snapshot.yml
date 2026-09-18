@@ -19,7 +19,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Export exact native integration input
+      - name: Export exact native integration input and file identities
         shell: bash
         run: |
           set -euo pipefail
@@ -27,6 +27,7 @@ jobs:
           git archive --format=tar.gz HEAD > target/native-source-snapshot/source.tar.gz
           git rev-parse HEAD > target/native-source-snapshot/source-commit.txt
           git rev-parse 'HEAD^{tree}' > target/native-source-snapshot/source-tree.txt
+          git ls-tree -r HEAD > target/native-source-snapshot/source-files.txt
           sha256sum target/native-source-snapshot/source.tar.gz > target/native-source-snapshot/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
