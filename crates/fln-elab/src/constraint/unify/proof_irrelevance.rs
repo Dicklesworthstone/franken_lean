@@ -15,41 +15,91 @@ impl Engine<'_> {
         left: &Expr,
         right: &Expr,
         locals: &LocalContext,
+        pending: &mut VecDeque<Equation>,
     ) -> Result<bool, UnificationError> {
-        // Lambda/lambda comparison already opens a shared typed binder. A
-        // lambda/neutral comparison can use the neutral's inferred Pi type.
-        let candidate = match self.eta_neutral_type(left, locals)? {
-            Some(type_) => Some(type_),
-            None => self.eta_neutral_type(right, locals)?,
-        };
-        let Some(proposition) = candidate else {
+        // Neutral synthesis is a hint; the final guard still checks BOTH original
+        // proofs. In particular, synthesizing an application type does not prove
+        // that its arguments are well-typed.
+        let left_type = self.eta_neutral_type(left, locals)?;
+        let right_type = self.eta_neutral_type(right, locals)?;
+        let Some(proposition) = left_type.as_ref().or(right_type.as_ref()) else {
             return Ok(false);
         };
-        // Avoid sending ordinary data equations to K1. A Pi can itself be a
-        // proposition by impredicativity; the guard checks that, not this hint.
-        if !matches!(proposition.node(), ExprNode::ForallE { .. }) {
-            let Some(sort) = self.eta_neutral_type(&proposition, locals)? else {
-                return Ok(false);
-            };
-            let ExprNode::Sort { level } = sort.node() else {
-                return Ok(false);
-            };
-            let level = normalize::simplify(level, &mut self.meter)?;
-            if !level.is_zero() {
-                return Ok(false);
+        // A Pi can itself be a proposition by impredicativity. Opening its
+        // codomain also lets type-directed inference work below dependent binders.
+        if !self.proof_type_is_prop(proposition, locals)? {
+            return Ok(false);
+        }
+        if let (Some(left_type), Some(right_type)) = (&left_type, &right_type) {
+            let left_type = self.instantiate(left_type)?;
+            let right_type = self.instantiate(right_type)?;
+            if (left_type.has_expr_mvar()
+                || left_type.has_level_mvar()
+                || right_type.has_expr_mvar()
+                || right_type.has_level_mvar())
+                && !same_terms(&left_type, &right_type, &mut self.meter)?
+                && self.proof_type_is_prop(&right_type, locals)?
+            {
+                // Generate an ordinary equation, NOT a successful proof verdict.
+                // The original proof pair is postponed by the outer worklist and
+                // must return through check_proof_pair after assignments advance.
+                // If no generation advances, the normal fixed-point rule defers;
+                // there is no recursively re-entered solver or unbounded retry.
+                pending.push_front((left_type, right_type, locals.clone()));
+                return Err(UnificationError::Deferred(
+                    UnificationDeferred::UnsupportedEquation,
+                ));
             }
         }
-        let proposition = self.instantiate(&proposition)?;
+        let proposition = self.instantiate(proposition)?;
         let left = self.instantiate(left)?;
         let right = self.instantiate(right)?;
         if [&proposition, &left, &right]
             .iter()
             .any(|term| term.has_expr_mvar() || term.has_level_mvar() || term.has_loose_bvars())
         {
-            // Proof irrelevance never solves a proof hole by erasing it.
+            // Type inference cannot erase a residual proof obligation.
             return Ok(false);
         }
         self.check_proof_pair(proposition, left, right, locals)
+    }
+
+    /// A metered selection hint, never a typing judgment. A definite Prop result
+    /// is required: this cannot default an unknown universe to zero. Domains and
+    /// application arguments are validated later by the ordinary K1 guard.
+    fn proof_type_is_prop(
+        &mut self,
+        proposition: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        let mut type_ = self.instantiate(proposition)?;
+        let mut context = locals.clone();
+        loop {
+            self.meter.node()?;
+            type_ = self.whnf(&type_, &context)?;
+            if let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = type_.node()
+            {
+                let id = self.fresh()?;
+                let argument = Expr::fvar(id.clone());
+                let domain = self.instantiate(binder_type)?;
+                let body = self.substitute(body, &argument)?;
+                context.add_param(id.clone(), id.0, domain, *binder_info);
+                type_ = body;
+                continue;
+            }
+            let Some(sort) = self.eta_neutral_type(&type_, &context)? else {
+                return Ok(false);
+            };
+            let ExprNode::Sort { level } = sort.node() else {
+                return Ok(false);
+            };
+            return Ok(normalize::simplify(level, &mut self.meter)?.is_zero());
+        }
     }
 
     fn check_proof_pair(

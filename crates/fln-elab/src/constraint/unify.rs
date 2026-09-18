@@ -762,7 +762,7 @@ impl Engine<'_> {
             Err(UnificationError::Deferred(_)) | Ok(false) => {}
             Err(error) => return Err(error),
         }
-        if self.proof_irrelevance(&left, &right, locals)? {
+        if self.proof_irrelevance(&left, &right, locals, pending)? {
             return Ok(());
         }
         if self.record_eta(&left, &right, locals, pending)? {

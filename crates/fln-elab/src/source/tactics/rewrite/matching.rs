@@ -335,3 +335,35 @@ impl Context {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn proof_conversion_stops_cannot_be_hidden_by_tactics_rewriting_or_instance_search() {
+        use fln_core::outcome::InternalFault;
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let exhausted = fln_kernel::check_def_eq(
+            &Environment::new(),
+            &[],
+            &Expr::sort(Level::zero()),
+            &Expr::sort(Level::zero()),
+            budget.narrowed(0, budget.depth),
+        );
+        assert!(matches!(&exhausted, Outcome::Inconclusive(_)));
+        for outcome in [
+            exhausted,
+            Outcome::InternalFault(InternalFault::new("planted conversion", "test fault")),
+        ] {
+            let problem = failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::ConversionCheck {
+                    outcome: Box::new(outcome),
+                },
+            )));
+            assert!(!crate::source::tactics::backtrack::recoverable(&problem));
+            assert!(!crate::source::instances::nonmatch(&problem));
+            assert!(!Context::rewrite_nonmatch(&problem));
+        }
+    }
+}

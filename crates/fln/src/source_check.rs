@@ -128,7 +128,8 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
                     UniverseInstantiationError::VisitLimit { .. }
                     | UniverseInstantiationError::LevelTooDeep(_),
                 ) => ("resource", false, 3),
-                UnificationError::AssignmentCheck { outcome, .. } => match outcome.as_ref() {
+                UnificationError::AssignmentCheck { outcome, .. }
+                | UnificationError::ConversionCheck { outcome } => match outcome.as_ref() {
                     Outcome::Inconclusive(_) => ("inconclusive", false, 3),
                     Outcome::InternalFault(_) => ("internal-fault", false, 4),
                     _ => ("elaboration", false, 1),
