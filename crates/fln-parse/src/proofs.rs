@@ -107,6 +107,7 @@ fn tactic(
         TokenKind::Ident(name) => [
             "intro",
             "revert",
+            "generalize",
             "exact",
             "assumption",
             "apply",
@@ -134,34 +135,34 @@ fn tactic(
     // Tactic words are contextual: `def apply ...` must stay a legal identifier.
     // The selected tactic production gives its keyword an atom leaf.
     let leaf = leaves.leaf(start)?;
-    let mut args = vec![Syntax::Atom {
+    let atom = Syntax::Atom {
         info: leaf.info(),
         val: keyword.to_string(),
-    }];
-    if keyword == "simp" {
-        return simplify(leaves, view, tokens, range, args.remove(0));
-    }
-    if keyword == "rw" || keyword == "rewrite" {
-        return rewrite(leaves, view, tokens, range, args.remove(0), keyword == "rw");
-    }
+    };
     match keyword {
-        "by_cases" if range.end > start + 1 => {
-            let named = range.end > start + 3
-                && matches!(&tokens[start + 1].kind, TokenKind::Ident(_))
-                && matches!(&tokens[start + 2].kind, TokenKind::Symbol(s) if s == ":");
-            args.push(null_node(if named {
-                vec![leaves.leaf(start + 1)?, leaves.leaf(start + 2)?]
-            } else {
-                Vec::new()
-            }));
-            args.push(bounded_term(
-                leaves,
-                view,
-                tokens,
-                start + if named { 3 } else { 1 }..range.end,
-                DefinitionGrammar::Scalar,
-            )?);
-        }
+        "simp" => simplify(leaves, view, tokens, range, atom),
+        "rw" | "rewrite" => rewrite(leaves, view, tokens, range, atom, keyword == "rw"),
+        "generalize" => generalize(leaves, view, tokens, range, atom),
+        "by_cases" => by_cases(leaves, view, tokens, range, atom),
+        "exact" | "apply" | "refine" => term_tactic(leaves, view, tokens, range, keyword, atom),
+        _ => local_tactic(leaves, view, tokens, range, keyword, atom),
+    }
+}
+
+// Separate argument productions keep their debug-build stack frames out of
+// the common dispatch path, especially while the term driver is active.
+#[inline(never)]
+fn local_tactic(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: &str,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let start = range.start;
+    let mut args = vec![atom];
+    match keyword {
         "revert" if range.end > start + 1 => {
             let mut names = Vec::new();
             for index in start + 1..range.end {
@@ -231,16 +232,116 @@ fn tactic(
         "assumption" | "rfl" | "contradiction" | "constructor" | "left" | "right" | "skip"
         | "fail" | "decide"
             if range.end == start + 1 => {}
-        "exact" | "apply" | "refine" if range.end > start + 1 => args.push(bounded_term(
-            leaves,
-            view,
-            tokens,
-            start + 1..range.end,
-            DefinitionGrammar::Scalar,
-        )?),
         _ => return Err(refusal(view, tokens, start)),
     }
     Ok(Syntax::node(parser_kind(&["Tactic", keyword]), args))
+}
+
+#[inline(never)]
+fn term_tactic(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: &str,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    if range.len() < 2 {
+        return Err(refusal(view, tokens, range.start));
+    }
+    let term = bounded_term(
+        leaves,
+        view,
+        tokens,
+        range.start + 1..range.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", keyword]),
+        vec![atom, term],
+    ))
+}
+
+#[inline(never)]
+fn by_cases(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let start = range.start;
+    if range.len() < 2 {
+        return Err(refusal(view, tokens, start));
+    }
+    let named = range.len() > 3
+        && matches!(&tokens[start + 1].kind, TokenKind::Ident(_))
+        && matches!(&tokens[start + 2].kind, TokenKind::Symbol(s) if s == ":");
+    let term = bounded_term(
+        leaves,
+        view,
+        tokens,
+        start + if named { 3 } else { 1 }..range.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    let witness = null_node(if named {
+        vec![leaves.leaf(start + 1)?, leaves.leaf(start + 2)?]
+    } else {
+        Vec::new()
+    });
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "by_cases"]),
+        vec![keyword, witness, term],
+    ))
+}
+
+// Keep this production's syntax temporaries out of the common tactic frame.
+// In debug builds that frame remains live across the heap-driven term parser;
+// growing it can overflow even a nonrecursive parse on a small thread stack.
+#[inline(never)]
+fn generalize(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let start = range.start;
+    if range.len() < 4 {
+        return Err(refusal(view, tokens, start));
+    }
+    let named = matches!(&tokens[start + 1].kind, TokenKind::Ident(_))
+        && matches!(&tokens[start + 2].kind, TokenKind::Symbol(s) if s == ":");
+    let expression = start + if named { 3 } else { 1 };
+    let equality = range.end - 2;
+    if expression >= equality
+        || !matches!(&tokens[equality].kind, TokenKind::Symbol(s) if s == "=")
+        || !matches!(&tokens[range.end - 1].kind, TokenKind::Ident(_))
+    {
+        return Err(refusal(view, tokens, start));
+    }
+    let term = bounded_term(
+        leaves,
+        view,
+        tokens,
+        expression..equality,
+        DefinitionGrammar::Scalar,
+    )?;
+    let witness = null_node(if named {
+        vec![leaves.leaf(start + 1)?, leaves.leaf(start + 2)?]
+    } else {
+        Vec::new()
+    });
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "generalize"]),
+        vec![
+            keyword,
+            witness,
+            term,
+            leaves.leaf(equality)?,
+            leaves.leaf(range.end - 1)?,
+        ],
+    ))
 }
 
 fn rewrite(
@@ -687,6 +788,34 @@ mod construction_refinement_tests {
     }
 
     #[test]
+    fn generalize_preserves_the_expression_and_optional_equality_name() {
+        for source in [
+            "def generalize (x : Nat) : Nat := x",
+            "theorem t : True := by generalize f x = y",
+            "theorem t : True := by\r\n  generalize «eq.h» /- witness -/ : (f x) = «new.x»\r\n  assumption",
+            "theorem t : True := by first | (generalize 3 = x; fail) | assumption",
+            "theorem t : True := by generalize (x = x) = P",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for tail in [
+            "generalize",
+            "generalize x",
+            "generalize x =",
+            "generalize = y",
+            "generalize h : = y",
+            "generalize x = _",
+            "generalize x = y at h",
+            "generalize x = y, z = w",
+            "generalize x = y extra",
+        ] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn malformed_refinement_never_drops_trailing_tokens() {
         for tail in [
             "constructor 1",
@@ -707,6 +836,7 @@ mod construction_refinement_tests {
     #[test]
     fn deeply_grouped_synthetic_holes_use_heap_parser_frames() {
         std::thread::Builder::new()
+            .name("deep-refinement-parser".to_string())
             .stack_size(128 * 1024)
             .spawn(|| {
                 let source = format!(
@@ -716,6 +846,27 @@ mod construction_refinement_tests {
                 );
                 let parsed = parse_definition(source.as_bytes()).unwrap();
                 assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn deeply_grouped_generalization_uses_a_small_stack() {
+        std::thread::Builder::new()
+            .name("deep-generalize-parser".to_string())
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                for witness in ["", "h : "] {
+                    let source = format!(
+                        "theorem t : 0 = 0 := by generalize {witness}{}0{} = x; rfl",
+                        "(".repeat(1000),
+                        ")".repeat(1000),
+                    );
+                    let parsed = parse_definition(source.as_bytes()).unwrap();
+                    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                }
             })
             .unwrap()
             .join()

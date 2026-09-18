@@ -314,7 +314,7 @@ impl Context {
 
     /// Allocation-memoized replacement of exact elaborated occurrences. The
     /// rule has no loose bvars, so no binder-dependent lift of it is required.
-    fn rewrite_template(
+    pub(super) fn rewrite_template(
         &mut self,
         target: &Expr,
         pattern: &Expr,

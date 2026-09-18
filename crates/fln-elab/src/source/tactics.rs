@@ -147,6 +147,12 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Generalize {
+        goal: ProofGoal,
+        name: Name,
+        equality: Option<Name>,
+        expression: &'a Syntax,
+    },
     Cases {
         goal: ProofGoal,
         name: Name,
@@ -616,6 +622,33 @@ impl Context {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "generalize"]) {
+                let [
+                    keyword,
+                    witness,
+                    expression,
+                    equality,
+                    Syntax::Ident { val: name, .. },
+                ] = args.as_slice()
+                else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "generalize", "generalize keyword")?;
+                expect_atom(equality, "=", "generalize equality")?;
+                let equality = match expect_null_args(witness, "generalize witness")? {
+                    [] => None,
+                    [Syntax::Ident { val, .. }, colon] => {
+                        expect_atom(colon, ":", "generalize witness colon")?;
+                        Some(val.clone())
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                };
+                return Ok(ProofAction::Generalize {
+                    goal,
+                    name: name.clone(),
+                    equality,
+                    expression,
+                });
             } else if kind == &parser_kind(&["Tactic", "rfl"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

@@ -785,6 +785,12 @@ impl Context {
             ),
             Proof(tactics::ProofState<'a>),
             ProofCases(tactics::ProofState<'a>, tactics::ProofGoal, Name),
+            ProofGeneralize(
+                tactics::ProofState<'a>,
+                tactics::ProofGoal,
+                Name,
+                Option<Name>,
+            ),
             ProofBindingType(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -1280,6 +1286,16 @@ impl Context {
                                     tasks.push(Task::Visit(value, None, true));
                                 }
                             }
+                            tactics::ProofAction::Generalize {
+                                goal,
+                                name,
+                                equality,
+                                expression,
+                            } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::ProofGeneralize(proof, goal, name, equality));
+                                tasks.push(Task::Visit(expression, None, true));
+                            }
                             tactics::ProofAction::Rewrite {
                                 goal,
                                 rule,
@@ -1318,6 +1334,11 @@ impl Context {
                         Task::ProofCases(mut proof, goal, name) => {
                             let proposition = values.pop().expect("case proposition visit");
                             self.split_decision_goal(&mut proof, goal, name, proposition)?;
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::ProofGeneralize(mut proof, goal, name, equality) => {
+                            let term = values.pop().expect("generalized expression visit");
+                            self.generalize_proof_term(&mut proof, goal, name, equality, term)?;
                             tasks.push(Task::Proof(proof));
                         }
                         Task::ProofBindingType(proof, goal, name, value, opaque) => {

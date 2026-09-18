@@ -18,3 +18,23 @@ theorem revertLocalDefinition (x : Nat) : x = x := by
 
 theorem revertBacktrack (P : Prop) (p : P) : P := by
   first | (revert p; fail) | exact p
+
+theorem generalizeThenRevert : 3 = 3 := by
+  generalize 3 = x
+  revert x
+  intro y
+  rfl
+
+theorem generalizeKeepEquation (P : Nat -> Prop) (n : Nat) (p : P n) : P n := by
+  generalize h : n = m
+  rw [<- h]
+  exact p
+
+theorem generalizeUnderBinder (x : Nat) : forall (y : Nat), x = x := by
+  generalize x = y
+  intro z
+  rfl
+
+theorem generalizeDependentFallback (F : Nat -> Type) (n : Nat) (x : F n) : x = x := by
+  first | generalize n = m | skip
+  rfl

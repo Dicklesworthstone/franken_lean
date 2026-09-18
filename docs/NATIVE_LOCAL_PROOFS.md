@@ -90,8 +90,36 @@ local definitions remain checked let terms, not arbitrary new assumptions.
 Earlier `intro` and `have` continuations are retained. Failed alternatives roll
 back the transformation, and sibling goals do not see its local changes.
 Unknown or repeated names and unsolved descendants are errors. This implements
-explicit named reversion, not arbitrary expression generalization or `revert`
-configuration options.
+explicit named reversion, not `revert` configuration options.
+
+## Generalizing an expression
+
+`generalize e = x` replaces all exact elaborated occurrences of `e` in the goal
+with a fresh arbitrary local `x`. `generalize h : e = x` also introduces a local
+equality witness `h : e = x`, allowing later rewriting back to the original term.
+The expression is elaborated in the original context before the new names are
+introduced. This supports ordinary terms, type-valued goals, universe parameters,
+and occurrences beneath binders without capturing local names.
+
+```lean
+theorem keepEquation (P : Nat -> Prop) (n : Nat) (p : P n) : P n := by
+  generalize h : n = m
+  rw [<- h]
+  exact p
+```
+
+The resulting universal theorem is applied to `e` and, for the named form, the
+actual proof `Eq.refl e`. Its universal type remains an explicit checked let
+annotation in the final term: specializing a candidate cannot erase an invalid
+generic proof. The transformed telescope is checked before selecting a tactic
+alternative, so an ill-typed dependent-index generalization can fail and roll
+back inside `first` or `try`. Resource stops propagate rather than selecting a
+successful fallback. Both admission checkers still validate the completed proof.
+
+This bounded production accepts one expression and the main goal. Comma-separated
+generalizations, `at` locations, configurable occurrence selection, and matching
+modulo arbitrary definitional equality are not yet implemented. Unresolved
+expressions and ill-typed generalizations are refused, not silently ignored.
 
 ```bash
 fln check-source --json examples/native_context_generalization.lean

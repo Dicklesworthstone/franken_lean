@@ -35,7 +35,7 @@ fn installed_context_generalization_checks_all_files_or_reports_no_success() {
         if success {
             let json = String::from_utf8(output.stdout).unwrap();
             for expected in [
-                "\"theorems\":4",
+                "\"theorems\":8",
                 "\"executed\":false",
                 "\"outcome\":\"complete\"",
             ] {
@@ -50,4 +50,25 @@ fn installed_context_generalization_checks_all_files_or_reports_no_success() {
             assert_eq!(std::fs::read(path).unwrap(), *bytes);
         }
     }
+}
+
+#[test]
+fn installed_generalize_retains_its_universal_type_obligation() {
+    let dir = std::env::temp_dir().join(format!("fln-generalize-refusal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("invalid-generic-proof.lean");
+    // The original goal is provable, but p cannot prove P m for arbitrary m.
+    // Specializing the resulting candidate must not erase that failed step.
+    let source =
+        "theorem bad (P : Nat -> Prop) (n : Nat) (p : P n) : P n := by generalize n = m; exact p";
+    std::fs::write(&path, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
 }
