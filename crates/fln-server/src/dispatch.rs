@@ -1,4 +1,4 @@
-//! Bounded JSON-RPC dispatch for the LSP lifecycle and Full document sync.
+//! Bounded JSON-RPC dispatch for the LSP lifecycle and incremental document sync.
 //!
 //! JSON syntax, document-session authority, pending diagnostic waits, and
 //! deterministic wire encoding live in dedicated submodules. The dispatcher is
@@ -12,6 +12,8 @@ use crate::transport;
 
 #[cfg(test)]
 mod diagnostic_wait;
+#[cfg(test)]
+mod incremental;
 mod json;
 mod session;
 mod wait;
@@ -19,9 +21,9 @@ mod wire;
 
 use json::{
     BooleanField, DecodedField, DiagnosticCount, Envelope, EnvelopeError, RawField, RequestId,
-    RequestIdField, VersionField, content_changes_text, diagnostic_count, direct_authority,
-    direct_request_id, direct_uri, direct_version, parse_envelope, save_text, text_document_text,
-    text_document_uri, text_document_version,
+    RequestIdField, VersionField, content_changes_text, content_changes_text_from,
+    diagnostic_count, direct_authority, direct_request_id, direct_uri, direct_version,
+    parse_envelope, save_text, text_document_text, text_document_uri, text_document_version,
 };
 use session::{DocumentSession, RetentionOutcome, SessionRefusal};
 use wait::{PendingDiagnosticWaits, WaitRefusal};
@@ -325,13 +327,17 @@ fn decoded_open_text(params: RawField<'_>) -> Result<String, &'static str> {
     }
 }
 
-fn decoded_change_text(params: RawField<'_>) -> Result<String, &'static str> {
+fn decoded_change_text(
+    params: RawField<'_>,
+    source: Option<&str>,
+) -> Result<String, &'static str> {
+    // Preserve the existing Full-replacement fast path, including the ability
+    // to check a snapshot even when the session cannot retain it. Ordered
+    // ranged/mixed batches use the same structural decoder and private edit
+    // transaction, never a second source authority.
     match content_changes_text(params) {
         DecodedField::Valid(text) => Ok(text),
-        DecodedField::Missing => Err("LSP didChange requires exactly one Full-sync content change"),
-        DecodedField::Invalid => {
-            Err("LSP didChange requires exactly one unambiguous, unranged Full-sync text change")
-        }
+        DecodedField::Missing | DecodedField::Invalid => content_changes_text_from(params, source),
     }
 }
 
@@ -428,7 +434,13 @@ fn handle_change(
             return Ok(None);
         }
     };
-    let text = match decoded_change_text(params) {
+    // A stale event cannot invalidate newer retained source, even when its
+    // payload is malformed or its ranges no longer fit the current snapshot.
+    if session.version(&uri).is_some_and(|current| version <= current) {
+        write_warning(output, SessionRefusal::NonMonotone.message())?;
+        return Ok(None);
+    }
+    let text = match decoded_change_text(params, session.text(&uri)) {
         Ok(text) => text,
         Err(message) => {
             invalidate_source_and_clear(output, session, waits, frontiers, &uri, message)?;
@@ -1098,12 +1110,12 @@ mod tests {
     }
 
     #[test]
-    fn clean_lifecycle_advertises_full_sync_and_utf16() {
+    fn clean_lifecycle_advertises_incremental_sync_and_utf16() {
         let (outcome, output, seen) = run_session(&[]);
         assert!(outcome.clean);
         assert!(seen.is_empty());
         assert!(output.contains("\"positionEncoding\":\"utf-16\""));
-        assert!(output.contains("\"change\":1"));
+        assert!(output.contains("\"change\":2"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub(super) fn initialize_response(id: &RequestId) -> String {
         concat!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{",
             "\"capabilities\":{{\"positionEncoding\":{},",
-            "\"textDocumentSync\":{{\"openClose\":true,\"change\":1,",
+            "\"textDocumentSync\":{{\"openClose\":true,\"change\":2,",
             "\"save\":{{\"includeText\":true}}}}}},",
             "\"serverInfo\":{{\"name\":\"FrankenLean\",\"version\":{}}}",
             "}}}}"
@@ -122,12 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_the_actual_full_sync_coordinate_contract() {
+    fn initialize_advertises_the_actual_incremental_sync_coordinate_contract() {
         let message = initialize_response(&RequestId::Number("17".to_string()));
         assert_valid_envelope(&message);
         assert!(message.contains("\"id\":17"));
         assert!(message.contains("\"positionEncoding\":\"utf-16\""));
-        assert!(message.contains("\"change\":1"));
+        assert!(message.contains("\"change\":2"));
         assert!(message.contains("\"includeText\":true"));
     }
 
