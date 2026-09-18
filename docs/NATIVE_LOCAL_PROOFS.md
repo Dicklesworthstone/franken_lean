@@ -68,3 +68,31 @@ also constructs values through transparent lets and dependent records.
 The CLI regression checks the whole prefix, rejects an invalid unused local value
 in a later file without emitting partial success, and successfully rechecks the
 same prefix afterwards. Package tests are not a full Reference conformance claim.
+
+## Reverting a dependent proof context
+
+`revert x h` moves the selected locals and every later local depending on their
+types or let values back into the goal. The resulting telescope follows local
+declaration order. Unrelated locals remain available. `intro` can open both the
+resulting universal binders and preserved let binders, retaining implicit and
+instance binder information.
+
+```lean
+theorem transport (A : Type) (x : A) (P : A -> Prop) (p : P x) : P x := by
+  revert A
+  intro B y Q q
+  exact q
+```
+
+The new goal has a fresh metavariable in the reduced context. The original goal
+is solved only by applying its completed proof to the original parameters;
+local definitions remain checked let terms, not arbitrary new assumptions.
+Earlier `intro` and `have` continuations are retained. Failed alternatives roll
+back the transformation, and sibling goals do not see its local changes.
+Unknown or repeated names and unsolved descendants are errors. This implements
+explicit named reversion, not arbitrary expression generalization or `revert`
+configuration options.
+
+```bash
+fln check-source --json examples/native_context_generalization.lean
+```

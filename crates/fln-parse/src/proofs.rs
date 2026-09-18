@@ -106,6 +106,7 @@ fn tactic(
     let keyword = match &tokens[start].kind {
         TokenKind::Ident(name) => [
             "intro",
+            "revert",
             "exact",
             "assumption",
             "apply",
@@ -160,6 +161,16 @@ fn tactic(
                 start + if named { 3 } else { 1 }..range.end,
                 DefinitionGrammar::Scalar,
             )?);
+        }
+        "revert" if range.end > start + 1 => {
+            let mut names = Vec::new();
+            for index in start + 1..range.end {
+                if !matches!(&tokens[index].kind, TokenKind::Ident(_)) {
+                    return Err(refusal(view, tokens, index));
+                }
+                names.push(leaves.leaf(index)?);
+            }
+            args.push(null_node(names));
         }
         "intro" => {
             let mut names = Vec::new();
@@ -647,6 +658,29 @@ mod construction_refinement_tests {
             assert_eq!(parsed.reconstruct_original(), source.as_bytes());
         }
         for tail in ["decide p", "decide 1", "decide [h]"] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn revert_preserves_names_comments_and_contextual_identifiers() {
+        for source in [
+            "def revert (x : Nat) : Nat := x",
+            "theorem t : True := by revert h",
+            "theorem t : True := by\r\n  revert «x.y» /- dependencies -/ h₂\r\n  intro z q",
+            "theorem t : True := by first | (revert h; fail) | assumption",
+        ] {
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for tail in [
+            "revert",
+            "revert _",
+            "revert 3",
+            "revert (h)",
+            "revert h, k",
+        ] {
             let source = format!("theorem t : True := by {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }

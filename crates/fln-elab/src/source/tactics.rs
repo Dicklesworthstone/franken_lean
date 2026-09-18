@@ -10,6 +10,7 @@ pub(in crate::source) mod backtrack;
 mod construct;
 mod constructor_transport;
 mod constructors;
+mod context;
 mod control;
 mod decision;
 pub(in crate::source) mod eliminate;
@@ -609,26 +610,12 @@ impl Context {
                         None => self.fresh_name()?,
                         _ => return Err(error(TacticError::MalformedScript)),
                     };
-                    let ty = self.whnf(&goal.target)?;
-                    let ExprNode::ForallE {
-                        binder_type,
-                        body,
-                        binder_info,
-                        ..
-                    } = ty.node()
-                    else {
-                        return Err(failure(SourceInferenceError::ExpectedFunction));
-                    };
-                    let id = FVarId(self.fresh_name()?);
-                    goal.target = self.substitute(body, &Expr::fvar(id.clone()))?;
-                    self.txn
-                        .lctx
-                        .add_param(id.clone(), name, binder_type.clone(), *binder_info);
-                    goal.introduced
-                        .push(self.txn.lctx.find(&id).expect("introduced local").clone());
+                    self.introduce_proof_binder(&mut goal, name)?;
                 }
                 goal.lctx = self.txn.lctx.clone();
                 proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "revert"]) {
+                self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rfl"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
