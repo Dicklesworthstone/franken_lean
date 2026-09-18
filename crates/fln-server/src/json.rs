@@ -3,15 +3,16 @@
 //! Transcript tools are separate binary crates, so they cannot name the private
 //! `dispatch::json` module through the library API. They include this façade as
 //! their local `json` module; the implementation itself remains single-source at
-//! `dispatch/json.rs`.
+//! `dispatch/json/core.rs`. Live document edits depend on dispatch session state
+//! and must not be pulled into these standalone transcript binaries.
 
 #![allow(dead_code)]
-// `include!` splices `dispatch/json.rs` (which ends in a `#[cfg(test)] mod tests`)
+// `include!` splices the decoder (which ends in a `#[cfg(test)] mod tests)
 // above the façade functions below, so the parser's own items legitimately follow
 // a test module whenever this façade is compiled as a test target.
 #![allow(clippy::items_after_test_module)]
 
-include!("dispatch/json.rs");
+include!("dispatch/json/core.rs");
 
 pub(super) fn object_member<'a>(object: RawField<'a>, key: &str) -> RawField<'a> {
     match object_value(object) {
