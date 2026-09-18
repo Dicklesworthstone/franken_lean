@@ -1,4 +1,4 @@
-name: Native quotient source integration
+name: Native explicit application integration
 on:
   push:
     branches: [main]
@@ -10,60 +10,47 @@ jobs:
   verify-and-land:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: main
-          fetch-depth: 3
-      - name: Apply exact quotient source patch
+          fetch-depth: 2
+      - name: Apply explicit applications with exact source guards
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/quotient-source
-          git rev-parse HEAD > target/quotient-source/tested-parent.txt
-          python3 -I <<'PYTHON'
-          import base64, hashlib, pathlib, subprocess, zlib
-          # Recover the immutable transfer payload; authenticate the complete
-          # decoded patch before inspecting or changing any source file.
-          carrier = subprocess.check_output(['git','show','1de2bc2118e48bd6bedfb75a4056a611eddf425c:.github/workflows/fln-proof-conversion-landing.yml']).decode()
-          encoded = carrier.split("base64.b64decode('", 1)[1].split("', validate=True)", 1)[0]
-          for repeated, original in [('X3gm5nc5f3gm5nc5vn','X3gm5nc5vn'),('YJi6m5vYJi6Za','YJi6Za'),('FxOavFtplxOavFxp','FxOavFxp')]:
-              assert encoded.count(repeated) == 1
-              encoded = encoded.replace(repeated, original, 1)
-          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '50d352d16ae305e5523368001d9b3c5cfed0fdc9208b2a084922e71b79531a89'
-          before = {'.github/workflows/fln-unifier-integration.yml': '07c0b26424d136560c13de4f1cdba55c8bf83180', 'crates/fln-cli/tests/source_quotients.rs': None, 'crates/fln-elab/src/seed.rs': '2f68b606adf63cfd400ecdfb04ef7085639e40bf', 'crates/fln-elab/src/seed/quotient.rs': None, 'crates/fln-elab/src/source/reduce.rs': 'd324e2dca31dbe6a0cb9eccd0dcb21aeac4bede2', 'crates/fln-elab/src/source/reduce/quotient.rs': None, 'crates/fln-elab/tests/support/quotient.rs': '95e9e9ab2900f17ffe8f037206d5b45d38874365', 'crates/fln/tests/source_quotients.rs': None, 'examples/native_quotients.lean': None}
-          after = {'.github/workflows/fln-unifier-integration.yml': '162c1838789fbf685761c9765f533ce41deec598', 'crates/fln-cli/tests/source_quotients.rs': '23521c03093c0072b77345d1636305f206d98ce5', 'crates/fln-elab/src/seed.rs': '3047826c1e15a684fe6d377846d9492fa7cbe8d8', 'crates/fln-elab/src/seed/quotient.rs': '072fb25612910082ac48751bbf5170ca01080482', 'crates/fln-elab/src/source/reduce.rs': '150b07cbb1013b82c50ea87457efa1e40498b68b', 'crates/fln-elab/src/source/reduce/quotient.rs': 'ff769a9f46481a4d6a32fd1fdb98665d8bb87fa0', 'crates/fln-elab/tests/support/quotient.rs': '8f4cce1e27b13f8fa2faec2549a52b0a6bbd876a', 'crates/fln/tests/source_quotients.rs': '86b2e563c631b3c4b533abe04898751f7ad838e9', 'examples/native_quotients.lean': '14a0323846fd7a9868bcb84f8e48bf7020a22d41'}
-          def blob(data): return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          for name, expected in before.items():
-              path = pathlib.Path(name)
-              assert (not path.exists()) if expected is None else blob(path.read_bytes()) == expected, name
-          subprocess.run(['git','apply','--check','-'], input=patch, check=True)
-          subprocess.run(['git','apply','-'], input=patch, check=True)
-          for name, expected in after.items():
-              assert blob(pathlib.Path(name).read_bytes()) == expected, name
-          pathlib.Path('target/quotient-source/implementation.patch').write_bytes(patch)
-          PYTHON
-      - name: Install configured compiler and format changed source
+          mkdir -p target/explicit-application
+          git rev-parse HEAD > target/explicit-application/tested-parent.txt
+          python3 -I <<'PY'
+          import base64,hashlib,pathlib,subprocess,zlib
+          encoded = '''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'''
+          patch=zlib.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(patch).hexdigest()=='ea149a056a422b5d0db8683021aed6da7294325f83b17ec9d44249a898ac6291'
+          before={'crates/fln-parse/src/lib.rs':'89d86ec69bb26d62ac200846cdcda560c43e9faf','crates/fln-parse/tests/explicit_application.rs':None,'crates/fln-elab/src/source.rs':'bc0fa8701bb0769511504c49973a4bed9edd8201','crates/fln/tests/source_explicit_application.rs':None}
+          after={'crates/fln-parse/src/lib.rs':'afb983dde7320b17162effd4cca25e51d180ab22','crates/fln-parse/tests/explicit_application.rs':'95dcd792a9cae2df0e3441ee161a86aafc78882b','crates/fln-elab/src/source.rs':'ae91ca774eb4d0ddaf1727a53558374e18789740','crates/fln/tests/source_explicit_application.rs':'aa03b07999c9b3871c49cb3c5b47d5c9410bc89b'}
+          def blob(data):return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          for name,sha in before.items():
+              p=pathlib.Path(name)
+              assert not p.exists() if sha is None else blob(p.read_bytes())==sha,name
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          for name,sha in after.items():assert blob(pathlib.Path(name).read_bytes())==sha,name
+          pathlib.Path('target/explicit-application/implementation.patch').write_bytes(patch)
+          PY
+      - name: Verify exact explicit-application source
         shell: bash
         run: |
           set -euo pipefail
           channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
-          rustc -Vv | tee target/quotient-source/compiler.txt
-          rustfmt --edition 2024 --config skip_children=true crates/fln-cli/tests/source_quotients.rs crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/quotient.rs crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln/tests/source_quotients.rs
-      - name: Verify source quotients and all elaboration regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/quotient-source/elab-tests.log
-          cargo test --locked -p fln --test source_quotients --test source_proof_indices --no-fail-fast 2>&1 | tee target/quotient-source/source-tests.log
-          cargo test --locked -p fln-cli --test source_quotients --no-fail-fast 2>&1 | tee target/quotient-source/cli-tests.log
-          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/quotient-source/clippy.log
-          cargo check --locked --workspace --all-targets 2>&1 | tee target/quotient-source/workspace-check.log
+          rustc -Vv > target/explicit-application/compiler.txt
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln-parse/src/lib.rs crates/fln-parse/tests/explicit_application.rs crates/fln-elab/src/source.rs crates/fln/tests/source_explicit_application.rs
+          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/explicit-application/parse-elab-tests.log
+          cargo test --locked -p fln --test source_explicit_application 2>&1 | tee target/explicit-application/source-tests.log
+          cargo clippy --locked -p fln-parse -p fln-elab -p fln --all-targets -- -D warnings 2>&1 | tee target/explicit-application/clippy.log
           git diff --check
-      - name: Publish verified quotient source support directly to main
+      - name: Publish verified explicit applications directly to main
         shell: bash
         run: |
           set -euo pipefail
@@ -72,19 +59,19 @@ jobs:
           test "$(git rev-parse origin/main)" = "$tested_parent"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- .github/workflows/fln-unifier-integration.yml crates/fln-cli/tests/source_quotients.rs crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/quotient.rs crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln/tests/source_quotients.rs examples/native_quotients.lean
-          git commit -m 'feat(elab): admit and compute quotient primitives in source programs'
+          git add -- crates/fln-parse/src/lib.rs crates/fln-parse/tests/explicit_application.rs crates/fln-elab/src/source.rs crates/fln/tests/source_explicit_application.rs
+          git commit -m 'feat(elab): parse and elaborate explicit application arguments'
           git push origin HEAD:main
-          git rev-parse HEAD | tee target/quotient-source/published-commit.txt
-      - name: Retain tested source and verification results
+          git rev-parse HEAD > target/explicit-application/published-commit.txt
+      - name: Retain exact source and verification
         if: always()
         shell: bash
         run: |
-          tar -czf target/quotient-source/tested-source.tar.gz .github/workflows/fln-unifier-integration.yml crates/fln-cli/tests/source_quotients.rs crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/quotient.rs crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln/tests/source_quotients.rs examples/native_quotients.lean
+          tar -czf target/explicit-application/tested-source.tar.gz crates/fln-parse/src/lib.rs crates/fln-parse/tests/explicit_application.rs crates/fln-elab/src/source.rs crates/fln/tests/source_explicit_application.rs
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: quotient-source-${{ github.sha }}
-          path: target/quotient-source
+          name: explicit-application-${{ github.sha }}
+          path: target/explicit-application
           retention-days: 7
           if-no-files-found: error
