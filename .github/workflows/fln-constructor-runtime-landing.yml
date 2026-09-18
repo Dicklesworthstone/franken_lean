@@ -1,4 +1,4 @@
-name: Native source variants
+name: Native recursive data
 on:
   push:
     branches: [main]
@@ -19,52 +19,21 @@ jobs:
         with:
           ref: main
           fetch-depth: 2
-      - name: Apply exact tested source variant implementation
+      - name: Apply exact tested recursive data implementation
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --depth=1 origin dd2fc42d6aa9cb896a904d7ab79829ec032c041f
           python3 -I <<'PY'
-          import hashlib,subprocess,textwrap
-          original=subprocess.check_output(['git','show','dd2fc42d6aa9cb896a904d7ab79829ec032c041f:.github/workflows/fln-constructor-runtime-landing.yml'])
-          assert hashlib.sha1(b'blob '+str(len(original)).encode()+b'\0'+original).hexdigest()=='701c3d6c6e1b42f1d215365b3b01d2e900d36f29'
-          script=textwrap.dedent(original.decode().split("          python3 -I <<'PY'\n",1)[1].split('\n          PY\n',1)[0])
-          # One transfer character differs from the locally exercised payload.
-          # Its original SHA256 and all before/after blob gates remain intact.
-          assert script.count('FPbS231TUtb')==1
-          script=script.replace('FPbS231TUtb','FPbS831TUtb')
-          exec(compile(script,'exact-verified-variant-transfer','exec'))
+          import pathlib,hashlib,zlib,base64,subprocess
+          before={'crates/fln-cli/tests/source_variant_runtime.rs':'7bcc598db62ed95f70a30e507450ac2b741de387','crates/fln/src/runtime.rs':'4a9c82cbc2ee47e4fa670564002106e8d105034e','crates/fln/src/runtime/data_recursion.rs':None,'crates/fln/src/runtime/records.rs':'bc8a4bcafc0a141eb10ba9b6ba6bbe75a45cfd61','crates/fln/src/runtime/variants.rs':'72f212fc0ec6b3036da12892a0cc6cf871fc7f6e','crates/fln/tests/runtime_recursive_data.rs':None,'examples/native_recursive_data.lean':None}
+          after={'crates/fln-cli/tests/source_variant_runtime.rs':'41f827110657bfdbadea618c6c8880843b37f4fa','crates/fln/src/runtime.rs':'920da5af684279dc087a2bf78fa845de825f001a','crates/fln/src/runtime/data_recursion.rs':'c6eafe8803002aea9d51572e8ba2374d94a69440','crates/fln/src/runtime/records.rs':'e0213dfd11ae52cdf2ebed1d8fdc7a92455dfa73','crates/fln/src/runtime/variants.rs':'8311ae20e40fc27b8af3aafea2e112f08bfa0165','crates/fln/tests/runtime_recursive_data.rs':'a0d2b117f63a8b91e190ce5598ed1b2fcb5df665','examples/native_recursive_data.lean':'d44ab813d6026e311faaa9cb872ab0020ba236fc'}
+          def verify(rows):
+              for n,h in rows.items():
+                  p=pathlib.Path(n)
+                  if h is None:
+                      assert not p.exists(),n
+                  else:
+                      b=p.read_bytes();assert hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()==h,n
+          verify(before)
+          encoded='''eNrNPWtz2ziS3/0rEE2Vj1zRtCQ/4shjzyYZz05qZzJbmVzqqpIUi6Igi2OK1PHh2OPov193AyDBp2jFt7euVCyRQKPRL3Q3GvDcXyzYwcG1nzL30IvdlCeHiyA88AL/ED6nyWESZbHHnVs39t0wdeIsTP0Vt+OEzRZYc8P5/yOPZ953smLM9s+Hi/OJs/HbDwanR4f7x0cHDwah73hcPh4PP7+d3YwnpxYR2yIv47PGDxZhMxfraM45XPVJ3FuOF87q2ieBQDIT/yZH/jpveOGc2fh+kEWc8dNo5XvwVDDZA97DH/cJOFx+sx4Uc8hyg=='
           PY
-      - name: Verify source execution and installed bytecode replay
-        shell: bash
-        run: |
-          set -euo pipefail
-          channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
-          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
-          cargo test --locked -p fln --lib --test runtime_variants --test runtime_records --test runtime_nat_recursion --test runtime_local_functions --test source_record_execution --no-fail-fast 2>&1 | tee target/constructor-runtime/tests.log
-          cargo test --locked -p fln-cli --test source_variant_runtime --test source_record_runtime 2>&1 | tee target/constructor-runtime/cli.log
-          cargo clippy --locked -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/constructor-runtime/clippy.log
-          cargo check --locked --workspace --all-targets 2>&1 | tee target/constructor-runtime/workspace.log
-          xargs rustfmt --edition 2024 --check --config skip_children=true < target/constructor-runtime/rust-paths.txt
-          git diff --check
-      - name: Commit tested source variants directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          parent="$(git rev-parse HEAD)"
-          git fetch origin main
-          test "$(git rev-parse origin/main)" = "$parent"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          xargs git add -- < target/constructor-runtime/paths.txt
-          git commit -m 'feat(runtime): execute native variants with lazy typed payload branches'
-          git push origin HEAD:main
-          git rev-parse HEAD > target/constructor-runtime/published-commit.txt
-          git archive --format=tar.gz HEAD > target/constructor-runtime/published-source.tar.gz
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: constructor-runtime-${{ github.sha }}
-          path: target/constructor-runtime
-          retention-days: 7
-          if-no-files-found: warn
