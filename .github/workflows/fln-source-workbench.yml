@@ -6,93 +6,116 @@ on:
 permissions:
   contents: read
 jobs:
-  computed-elimination:
+  default-simp:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'feat(source): land computed elimination')
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): publish checked default simp and declaration attributes'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: write
     env:
-      RUST_BACKTRACE: '0'
       CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: main
           fetch-depth: 0
-      - name: Apply exact locally checked expression elimination
+      - name: Retrieve checksum-bound implementation patches
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
-          import base64, gzip, hashlib, json, os, pathlib, re, subprocess
-          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'expression-elimination-evidence'
-          evidence.mkdir()
-          stored = subprocess.check_output(['git', 'show', 'b5c2552271cb05cb62f98bc0f477731f9cbbf693:.github/workflows/fln-source-workbench.yml'], text=True)
-          (evidence / 'transmitted-workflow.yml').write_text(stored)
-          encoded = re.search(r"encoded = '''([A-Za-z0-9+/=]+)'''", stored).group(1)
-          # Repair two transmission errors; the independent patch digest below
-          # still must equal the exact locally tested implementation.
-          for old, new in [
-              ('zvHs7bPTx', 'zvHs7PTx'),
-              ('VNbTNVvJVm2tvb', 'VNbTNVvJ57ekAecl89D5PQaTA1qXJ0i3y+ZkbJVm2tvb'),
-          ]:
-              assert encoded.count(old) == 1
-              encoded = encoded.replace(old, new)
-          (evidence / 'encoded.txt').write_text(encoded)
-          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '6224f731797a350252967d62ee643093edf247d7c4ef0acae28ce28414b657b5'
-          (evidence / 'patch.diff').write_bytes(patch)
-          (evidence / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          subprocess.run(['git', 'apply', '--check', str(evidence / 'patch.diff')], check=True)
-          subprocess.run(['git', 'apply', str(evidence / 'patch.diff')], check=True)
-          expected = {
-              'crates/fln-cli/tests/source_expression_elimination.rs': '3b856f539e1dd60ba4dd278ed42150770b007340',
-              'crates/fln-elab/src/source.rs': '8d7e7fa678be3c8af189d72d00911bcb29ec0183',
-              'crates/fln-elab/src/source/tactics.rs': '1cf65454581fead7dad0492b31577cfb09196895',
-              'crates/fln-elab/src/source/tactics/context.rs': '89302e4cbfa1ccd1a89c6ba4d829b695e6f865f1',
-              'crates/fln-elab/src/source/tactics/eliminate.rs': '5f5e5e0d426946da4ff7991b432d4713d7c8d14f',
-              'crates/fln-parse/src/proofs/elimination.rs': '460f3092e14a19cf7ec7c5cb1015bff20a3d46a1',
-              'crates/fln/tests/source_expression_elimination.rs': '4c3e3a1533cca37c83eb7040fbf18d0d68e0dd14',
-              'docs/NATIVE_INDUCTION.md': '79504c609a0da194d367f68560e0705f9456b536',
-              'examples/native_expression_elimination.lean': 'f9a6b08135192869b600ebfa3a91b8dd3efe49b0',
-          }
-          for path, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
-          (evidence / 'files.json').write_text(json.dumps(expected, indent=2) + '\n')
-      - name: Verify native parser elaborator engine and installed command
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-simp-evidence'
+          root.mkdir()
+          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          specs = [
+              ('registry', 'ff98c37d8b009acf8b7037371b6c4b12fda28c66', 'a187f488a046370be1c5b7d0b7b607b931aa04f59bfa1855cb7bdbd17631f4a7'),
+              ('attributes', '53b291f82f0975b2722ab48fd55c2b5ff77db0b0', '0c57b9bbbeaffc4c9aae499c2c742ff9d227c8db62fc76337b60c9b2521bfbf3'),
+          ]
+          for label, blob, digest in specs:
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + blob,
+                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = json.load(response)
+              assert data['encoding'] == 'base64'
+              compressed = base64.b64decode(data['content'])
+              if label == 'attributes':
+                  # Correct one transport character, then require the independently
+                  # recorded original Git-blob and uncompressed-patch identities.
+                  encoded = base64.b64encode(compressed).decode('ascii')
+                  assert encoded.count('sjZ8r2rGcWs7ueWscm') == 1
+                  encoded = encoded.replace('sjZ8r2rGcWs7ueWscm', 'sjZ8r2ZGcWs7ueWscm')
+                  compressed = base64.b64decode(encoded, validate=True)
+                  header = ('blob ' + str(len(compressed)) + '\0').encode()
+                  assert hashlib.sha1(header + compressed).hexdigest() == '2941fd78ee22f41ea1a030ebe186a3a24dbd0d7e'
+              patch = gzip.decompress(compressed)
+              assert hashlib.sha256(patch).hexdigest() == digest, label
+              (root / (label + '.patch')).write_bytes(patch)
+              paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+              assert len(paths) == len(set(paths)) and paths
+              assert all(path.startswith(('crates/', 'docs/', 'examples/')) and '..' not in path.split('/') for path in paths)
+              assert '\ndeleted file mode ' not in patch.decode()
+              (root / (label + '-paths.json')).write_text(json.dumps(paths))
+          subprocess.run(['git', 'apply', '--check', str(root / 'registry.patch')], check=True)
+          subprocess.run(['git', 'apply', str(root / 'registry.patch')], check=True)
+      - name: Check the default simp registry before its first commit
         shell: bash
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/expression-elimination-evidence"
-          exec > >(tee "$evidence/validation.log") 2>&1
+          evidence="$RUNNER_TEMP/default-simp-evidence"
+          exec > >(tee "$evidence/registry-validation.log") 2>&1
           rustup show active-toolchain
           rustc -Vv
           cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
-          cargo test --locked -p fln --no-fail-fast
-          cargo test --locked -p fln-cli --test source_expression_elimination --test source_context_generalization --test source_constrained_simplification
-          cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
-          cargo check --locked --workspace --all-targets
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source.rs crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/context.rs crates/fln-elab/src/source/tactics/eliminate.rs crates/fln-parse/src/proofs/elimination.rs crates/fln/tests/source_expression_elimination.rs crates/fln-cli/tests/source_expression_elimination.rs
+          cargo test --locked -p fln --test source_default_simp --test source_automation --test source_file_check --test source_scopes
+          cargo test --locked -p fln-cli --test source_default_simp
+          cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings
           git diff --check
-      - name: Commit checked functionality directly to main
+      - name: Commit the tested registry directly to main
         shell: python
         run: |
           import json, os, pathlib, subprocess
-          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'expression-elimination-evidence'
-          expected = json.loads((evidence / 'files.json').read_text())
-          for path, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
-          subprocess.run(['git', 'add', '--', *expected], check=True)
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-simp-evidence'
+          paths = json.loads((root / 'registry-paths.json').read_text())
+          subprocess.run(['git', 'add', '--', *paths], check=True)
           actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
-          assert sorted(actual) == sorted(expected), actual
-          message = 'feat(elab): support computed cases and induction with equation witnesses\n\nElaborate arbitrary bounded term discriminants through the heap source driver, retain optional branch equations, and generalize computed expressions before ordinary recursor elimination. Preserve dependent local contexts, generalizing parameters, real induction hypotheses, both kernel checks, and typed nonanswers.\n\nAdd lossless parser and small-stack regressions, eight engine tests, an installed CLI regression, and a runnable example. Full parser/elaborator and engine packages, focused CLI tests, scoped all-target Clippy, and workspace compilation passed before publication. Full workspace tests and Reference artifact parity are not claimed.'
-          subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', message], check=True)
-          (evidence / 'commit.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          assert sorted(actual) == sorted(paths), actual
+          subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', 'feat(simp): execute registered default rules through source checking\n\nConnect the persistent checked simp-set journal, standalone registration/removal commands, default simp execution and explicit-only isolation. Preserve structural declaration identity, deterministic ordering, checked transports and failure-atomic publication.\n\nParser/elaborator packages, focused engine and installed-command tests and parser/elaborator Clippy passed before publication. Full workspace and Reference parity are not claimed.'], check=True)
+          (root / 'registry-commit.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+          subprocess.run(['git', 'apply', '--check', str(root / 'attributes.patch')], check=True)
+          subprocess.run(['git', 'apply', str(root / 'attributes.patch')], check=True)
+      - name: Check declaration attributes across the full source product path
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/default-simp-evidence"
+          exec > >(tee "$evidence/attributes-validation.log") 2>&1
+          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
+          cargo test --locked -p fln --no-fail-fast
+          cargo test --locked -p fln-cli --no-fail-fast
+          cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+          git diff --check
+      - name: Commit tested inline attributes directly to main
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-simp-evidence'
+          paths = json.loads((root / 'attributes-paths.json').read_text())
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert sorted(actual) == sorted(paths), actual
+          subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', 'feat(simp): admit inline simp attributes with atomic checked publication\n\nSupport lossless bounded @[simp] declaration attributes, directions and priorities. Register only after both checkers admit the declaration, including the single-declaration facade, and preserve namespace identities and immutable failure rollback. Reject unsupported execution-door attributes rather than ignoring them.\n\nReplace the stale FLBC fixture with native producer output and retain explicit obsolete-version refusal coverage. Full parser/elaborator, engine and CLI packages, scoped all-target Clippy and workspace compilation passed. Full workspace tests and Reference parity are not claimed.'], check=True)
+          (root / 'attributes-commit.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
           subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: expression-elimination-${{ github.sha }}
-          path: ${{ runner.temp }}/expression-elimination-evidence
+          name: default-simp-${{ github.sha }}
+          path: ${{ runner.temp }}/default-simp-evidence
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: error
