@@ -37,6 +37,41 @@ struct EliminationContext<'a> {
     recursive_source: bool,
     source_match: bool,
 }
+
+/// The pinned `elimTarget` production retains an optional equation binder and
+/// the original term tree. It is not a name-lookup shortcut for expressions.
+pub(super) fn target(
+    args: &[Syntax],
+    induction: bool,
+) -> Result<(&Syntax, Option<&Syntax>), NatDefinitionElabError> {
+    let [keyword, target, _, _, _] = args else {
+        return Err(error(TacticError::MalformedScript));
+    };
+    expect_atom(
+        keyword,
+        if induction { "induction" } else { "cases" },
+        "elimination tactic",
+    )?;
+    let parts = expect_node(
+        target,
+        &parser_kind(&["Tactic", "elimTarget"]),
+        2,
+        "elimination target",
+    )?;
+    let binder = match expect_null_args(&parts[0], "elimination equation")? {
+        [] => None,
+        [name, colon]
+            if matches!(name, Syntax::Ident { val, .. } if !val.is_anonymous())
+                || matches!(name, Syntax::Atom { val, .. } if val == "_") =>
+        {
+            expect_atom(colon, ":", "elimination equation colon")?;
+            Some(name)
+        }
+        _ => return Err(error(TacticError::MalformedScript)),
+    };
+    Ok((&parts[1], binder))
+}
+
 pub(in crate::source) fn add_local(context: &mut LocalContext, local: &LocalDecl) {
     if let Some(value) = &local.value {
         context.add_let(
@@ -300,19 +335,42 @@ impl Context {
         Ok(branch)
     }
 
-    pub(super) fn eliminate_proof_goal<'a>(
+    pub(in crate::source) fn eliminate_proof_term<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
         goal: ProofGoal,
         args: &'a [Syntax],
         induction: bool,
+        equation: Option<Name>,
+        term: Typed,
     ) -> Result<(), NatDefinitionElabError> {
+        // A plain local retains the original dependency-aware behavior. In
+        // particular, dependent hypotheses are specialized with the branches.
+        if equation.is_none()
+            && let ExprNode::FVar { id } = term.value.node()
+        {
+            return self.eliminate_proof_goal_with_indices(
+                proof,
+                goal,
+                &EliminationSyntax::Tactic(args),
+                induction,
+                Some(id),
+                None,
+            );
+        }
+        // Generalize a computed term (or a named equation) before elimination.
+        // The equation is a dependent local: the ordinary motive reverts and
+        // reintroduces it as `e = constructor ...` in each branch. The parent
+        // specializes the universal proof with the actual term and Eq.refl.
+        let name = self.fresh_name()?;
+        let (goal, discriminant) =
+            self.generalized_proof_goal(proof, goal, name, equation, term)?;
         self.eliminate_proof_goal_with_indices(
             proof,
             goal,
             &EliminationSyntax::Tactic(args),
             induction,
-            None,
+            Some(&discriminant),
             None,
         )
     }
@@ -420,16 +478,14 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         let (target_name, explicit, scoped, rows) = match input {
             EliminationSyntax::Tactic(args) => {
-                let [keyword, target, generalizing, with, alternatives] = *args else {
+                let [_, _, generalizing, with, alternatives] = *args else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                expect_atom(
-                    keyword,
-                    if induction { "induction" } else { "cases" },
-                    "elimination tactic",
-                )?;
-                let Syntax::Ident { val, .. } = target else {
-                    return Err(error(TacticError::MalformedScript));
+                let (expression, _) = target(args, induction)?;
+                let name = match expression {
+                    Syntax::Ident { val, .. } => val.clone(),
+                    _ if selected.is_some() => Name::anonymous(),
+                    _ => return Err(error(TacticError::EliminationLocal)),
                 };
                 let rows = expect_null_args(alternatives, "elimination alternatives")?;
                 let scoped = match expect_null_args(with, "elimination with")? {
@@ -441,7 +497,7 @@ impl Context {
                     _ => return Err(error(TacticError::MalformedScript)),
                 };
                 (
-                    val.clone(),
+                    name,
                     expect_null_args(generalizing, "generalized locals")?,
                     scoped,
                     rows,

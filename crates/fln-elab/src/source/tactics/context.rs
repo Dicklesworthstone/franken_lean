@@ -20,6 +20,21 @@ impl Context {
         equality: Option<Name>,
         term: Typed,
     ) -> Result<(), NatDefinitionElabError> {
+        let (child, _) = self.generalized_proof_goal(proof, goal, name, equality, term)?;
+        proof.work.push(Work::Goal(child));
+        Ok(())
+    }
+
+    /// Return the fresh discriminant identity explicitly so elimination never
+    /// has to recover it from a user name or consume a synthetic instruction.
+    pub(super) fn generalized_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        name: Name,
+        equality: Option<Name>,
+        term: Typed,
+    ) -> Result<(ProofGoal, FVarId), NatDefinitionElabError> {
         self.tick()?;
         if name.is_anonymous()
             || equality
@@ -85,6 +100,12 @@ impl Context {
         assert!(report.awakened.is_empty(), "private source queue");
         let (root, mut child) = self.proof_goal(target.clone())?;
         self.introduce_proof_binder(&mut child, name)?;
+        let discriminant = child
+            .introduced
+            .last()
+            .expect("generalized discriminant binder")
+            .id
+            .clone();
         if let Some(equality) = equality {
             self.introduce_proof_binder(&mut child, equality)?;
         }
@@ -101,8 +122,7 @@ impl Context {
         // an ill-typed generic proof that only works at the original argument.
         let value = Expr::let_e(self.fresh_name()?, target, root, value, false);
         proof.work.push(Work::Close(goal, value));
-        proof.work.push(Work::Goal(child));
-        Ok(())
+        Ok((child, discriminant))
     }
 
     /// Preserve a visible let binder before weak-head normalization erases it.

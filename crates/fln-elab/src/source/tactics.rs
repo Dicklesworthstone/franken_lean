@@ -147,6 +147,13 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Eliminate {
+        goal: ProofGoal,
+        args: &'a [Syntax],
+        induction: bool,
+        equation: Option<Name>,
+        expression: &'a Syntax,
+    },
     Generalize {
         goal: ProofGoal,
         name: Name,
@@ -581,12 +588,20 @@ impl Context {
             } else if kind == &parser_kind(&["Tactic", "cases"])
                 || kind == &parser_kind(&["Tactic", "induction"])
             {
-                self.eliminate_proof_goal(
-                    proof,
+                let induction = kind == &parser_kind(&["Tactic", "induction"]);
+                let (expression, binder) = eliminate::target(args, induction)?;
+                let equation = match binder {
+                    None => None,
+                    Some(Syntax::Ident { val, .. }) => Some(val.clone()),
+                    Some(_) => Some(self.fresh_name()?),
+                };
+                return Ok(ProofAction::Eliminate {
                     goal,
                     args,
-                    kind == &parser_kind(&["Tactic", "induction"]),
-                )?;
+                    induction,
+                    equation,
+                    expression,
+                });
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rwSeq"])

@@ -11,7 +11,8 @@ struct Alternative {
 }
 struct Elimination {
     start: usize,
-    target: usize,
+    target: Range<usize>,
+    equation: Option<usize>,
     generalizing: Option<Range<usize>>,
     with: Option<usize>,
     alternatives: Vec<Alternative>,
@@ -267,12 +268,34 @@ fn plan_elimination(
     limit: usize,
     baseline: usize,
 ) -> Result<Elimination, NatDefinitionParseError> {
-    let target = start + 1;
+    let mut target = start + 1;
     let header_limit = plain_end(view, tokens, start, limit, baseline);
-    if target >= header_limit || !matches!(&tokens[target].kind, TokenKind::Ident(_)) {
+    let equation = if target + 1 < header_limit && symbol(tokens, target + 1, ":") {
+        if !matches!(&tokens[target].kind, TokenKind::Ident(_)) && !symbol(tokens, target, "_") {
+            return Err(refusal(view, tokens, target));
+        }
+        let name = target;
+        target += 2;
+        Some(name)
+    } else {
+        None
+    };
+    let mut at = target;
+    let mut depth = 0;
+    while at < header_limit {
+        if depth == 0
+            && (symbol(tokens, at, "with")
+                || at > target && (word(tokens, at, "generalizing") || word(tokens, at, "using")))
+        {
+            break;
+        }
+        delimiter_depth(&tokens[at], &mut depth);
+        at += 1;
+    }
+    if target == at || depth != 0 {
         return Err(refusal(view, tokens, target));
     }
-    let mut at = target + 1;
+    let target = target..at;
     let generalizing = if at < header_limit && word(tokens, at, "generalizing") {
         if !word(tokens, start, "induction") {
             return Err(refusal(view, tokens, at));
@@ -292,6 +315,7 @@ fn plan_elimination(
     let mut result = Elimination {
         start,
         target,
+        equation,
         generalizing,
         with: None,
         alternatives: Vec::new(),
@@ -338,6 +362,7 @@ fn plan_elimination(
                 in_body = true;
             } else if in_body
                 && (word(tokens, at, "first")
+                    || symbol(tokens, at, "with")
                     || symbol(tokens, at, "match")
                     || ((symbol(tokens, at, "fun") || symbol(tokens, at, "λ"))
                         && symbol(tokens, at + 1, "|")))
@@ -885,7 +910,18 @@ fn run(
                     parser_kind(&["Tactic", keyword]),
                     vec![
                         atom(leaves, plan.start, keyword)?,
-                        leaves.leaf(plan.target)?,
+                        Syntax::node(
+                            parser_kind(&["Tactic", "elimTarget"]),
+                            vec![
+                                match plan.equation {
+                                    Some(at) => {
+                                        null_node(vec![leaves.leaf(at)?, leaves.leaf(at + 1)?])
+                                    }
+                                    None => null_node(Vec::new()),
+                                },
+                                binding_term(leaves, view, tokens, plan.target)?,
+                            ],
+                        ),
                         generalizing,
                         null_node(
                             plan.with
@@ -907,6 +943,71 @@ fn run(
 mod tests {
     use super::*;
     #[test]
+    fn expression_discriminants_and_equations_preserve_original_tokens() {
+        for source in [
+            "theorem t : 0 = 0 := by cases (f x) with | false => rfl | true => rfl",
+            "-- header\r\ntheorem t : 0 = 0 := by\r\n  cases h : f /- input -/ x with\r\n  | false => rfl\r\n  | true => rfl\r\n",
+            "theorem t : 0 = 0 := by induction h : (f x) generalizing y with | zero => rfl | succ n ih => exact ih y",
+            "theorem t : 0 = 0 := by cases _ : (f x)",
+            "theorem t : 0 = 0 := by cases «equation name» : (f «argument name») with | false => rfl | true => rfl",
+            "theorem t : 0 = 0 := by cases (match b with | .false => false | .true => true) with | false => rfl | true => rfl",
+            "theorem t (generalizing : Bool) : 0 = 0 := by cases generalizing with | false => rfl | true => rfl",
+            "theorem t : 0 = 0 := by cases h : f n with\n  | false =>\n    cases h : g n with | false => rfl | true => rfl\n  | true => rfl",
+        ] {
+            let parsed =
+                parse_definition(source.as_bytes()).unwrap_or_else(|e| panic!("{source}\n{e:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_expression_targets_are_refused_before_elaboration() {
+        for target in [
+            "",
+            "h :",
+            "2 : f x",
+            "h : (f x",
+            "f x using fake",
+            "f x, g x",
+            "(by cases b)",
+            "h : (calc 0 = 0 := by rfl)",
+        ] {
+            let source = format!("theorem t : 0 = 0 := by cases {target}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn nested_expression_splits_stay_on_the_heap_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let depth = 300;
+                let mut source =
+                    String::from("theorem t (f : Nat -> Bool) (n : Nat) : f n = f n := by\n");
+                for level in 0..depth {
+                    let indent = "  ".repeat(level + 1);
+                    source.push_str(&format!(
+                        "{indent}cases h : (f n) with\n{indent}| false =>\n"
+                    ));
+                }
+                source.push_str(&format!("{}rfl\n", "  ".repeat(depth + 1)));
+                for level in (0..depth).rev() {
+                    source.push_str(&format!("{}| true => rfl\n", "  ".repeat(level + 1)));
+                }
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn scoped_elimination_syntax_preserves_every_original_leaf() {
         for source in [
             "-- proof\r\ntheorem self (n : Nat) : n = n := by\r\n  induction n with\r\n  | zero => rfl -- base\r\n  | succ k ih => rfl\r\n",
@@ -927,7 +1028,7 @@ mod tests {
     fn malformed_eliminations_never_drop_a_branch_or_unrecognized_modifier() {
         for source in [
             "theorem t := by cases",
-            "theorem t := by cases (f x)",
+            "theorem t := by cases h : with | zero => rfl",
             "theorem t := by cases n with",
             "theorem t := by cases n with | zero =>",
             "theorem t := by induction n generalizing with | zero => rfl",

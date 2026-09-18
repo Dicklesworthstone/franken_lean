@@ -784,6 +784,13 @@ impl Context {
                 bool,
             ),
             Proof(tactics::ProofState<'a>),
+            ProofEliminate(
+                tactics::ProofState<'a>,
+                tactics::ProofGoal,
+                &'a [Syntax],
+                bool,
+                Option<Name>,
+            ),
             ProofCases(tactics::ProofState<'a>, tactics::ProofGoal, Name),
             ProofGeneralize(
                 tactics::ProofState<'a>,
@@ -1213,6 +1220,19 @@ impl Context {
                             tasks.push(Task::RecordNext(state));
                         }
                         Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                            tactics::ProofAction::Eliminate {
+                                goal,
+                                args,
+                                induction,
+                                equation,
+                                expression,
+                            } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::ProofEliminate(
+                                    proof, goal, args, induction, equation,
+                                ));
+                                tasks.push(Task::Visit(expression, None, true));
+                            }
                             tactics::ProofAction::Cases {
                                 goal,
                                 name,
@@ -1331,6 +1351,13 @@ impl Context {
                             }
                             tactics::ProofAction::Complete(term) => values.push(term),
                         },
+                        Task::ProofEliminate(mut proof, goal, args, induction, equation) => {
+                            let term = values.pop().expect("elimination expression visit");
+                            self.eliminate_proof_term(
+                                &mut proof, goal, args, induction, equation, term,
+                            )?;
+                            tasks.push(Task::Proof(proof));
+                        }
                         Task::ProofCases(mut proof, goal, name) => {
                             let proposition = values.pop().expect("case proposition visit");
                             self.split_decision_goal(&mut proof, goal, name, proposition)?;

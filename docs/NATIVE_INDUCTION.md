@@ -1,9 +1,9 @@
 # Native cases and induction
 
 The import-free source proof checker supports case analysis and structural
-induction on a named local of an admitted single inductive family. Indexed
-families require distinct parameter locals as their actual indices; dependent
-index telescopes are supported. See `NATIVE_INDEXED.md` and the runnable
+induction on locals and elaborated expressions of an admitted single inductive
+family. Dependent index telescopes and the existing constrained-index lane are
+supported. See `NATIVE_INDEXED.md`, `NATIVE_CONSTRAINED_INDUCTION.md` and the runnable
 `examples/native_indexed_elimination.lean` example.
 These tactics construct applications of that family's ordinary recursor. They
 never add an axiom, accept a proof, or bypass K1 or the independent checker.
@@ -65,6 +65,52 @@ even without an explicit list. Generalization that would invalidate the fixed
 discriminant type is refused. Branch binder names may shadow outer source names,
 but never change their core variable identities or capture another branch's data.
 
+## Computed expressions and branch equations
+
+`cases (f x)` and `induction (f x)` elaborate the discriminant through the ordinary
+native term driver. A local variable, including a parenthesized local, retains
+the dependency-aware behavior above. A computed expression is generalized in
+the goal before applying the family's checked recursor. `induction` still exposes
+real recursive hypotheses and supports an explicit `generalizing` list.
+
+The optional equation form retains the connection to the original expression:
+
+```lean
+theorem keep (f : Nat -> Bool) (n : Nat) (P : Bool -> Prop)
+    (p : P (f n)) : P (f n) := by
+  cases h : f n with
+  | false => rw [<- h]; exact p
+  | true => rw [<- h]; exact p
+```
+
+Here `p` still refers to the original computation. The branches receive the actual
+equations `h : f n = false` and `h : f n = true`. `induction h : expression` uses
+the same mechanism. `_ : expression` keeps an inaccessible equation. Names can
+be shadowed in nested branches without changing their core identities.
+
+The generated universal proof is specialized at the original expression and,
+when requested, `Eq.refl` of that expression. Both the universal type and the
+original input remain checked in the final term. A discarded, ill-typed input
+cannot become valid just because all branches ignore it. The normal restrictions
+on eliminating propositions into data remain in force.
+
+```bash
+fln check-source --json examples/native_expression_elimination.lean
+```
+
+This example exercises an equation-dependent proof, induction on a function
+application, a dependent record result, and a fixed-index case split. Engine and
+installed-CLI tests exercise these paths, failures and subsequent recovery.
+Parser tests cover comments, CRLF, escaped names and nested expression splits on
+a 128 KiB thread stack.
+
+This increment accepts one discriminant. Generalization selects exact elaborated
+occurrences, not occurrences modulo arbitrary definitional equality; ascriptions
+remain real checked terms. Parenthesize nested `match` expressions to distinguish
+their `with` from the tactic's alternatives. Nested `by` or `calc` proofs inside
+the discriminant, multiple discriminants and user-selected `using` recursors
+remain explicitly unsupported.
+
 ## Simplification and checking
 
 Selected recursive definitions now expose their admitted recursor computations
@@ -94,8 +140,8 @@ branch syntax on a small thread stack.
 
 ## Remaining scope
 
-This is not full Lean elimination elaboration. Fixed/repeated indices, mutual families,
-non-local discriminants, `cases h : expression`, `using` recursors, `case`/bullet
+This is not full Lean elimination elaboration. Mutual families,
+multiple discriminants, `using` recursors, `case`/bullet
 selectors, inaccessible patterns and higher-order/nested recursive fields are not
 supported by this tactic lane. Uniformly parameterized families with direct
 recursive fields now have constructor-derived independent admission support;
