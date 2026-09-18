@@ -1,6 +1,7 @@
 //! Explicit command scope for native source elaboration. It carries no admission
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
+pub mod simp;
 use fln_core::name::LeafView;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

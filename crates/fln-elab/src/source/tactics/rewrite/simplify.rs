@@ -1,4 +1,4 @@
-//! Explicit-set, proof-producing simplification. There is no ambient simp set.
+//! Proof-producing simplification with explicit and immutable registered rules.
 //! Rules are tried deterministically and re-instantiated for every application.
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
@@ -11,7 +11,30 @@ use unfold::UnfoldResult;
 
 const MAX_SIMPLIFICATION_STEPS: usize = 256;
 
+/// Registered names are resolved once by the attribute command. They must not
+/// be reparsed or captured by a same-named local or a later namespace scope.
+#[derive(Clone)]
+pub(in crate::source) enum SimpRule<'a> {
+    Explicit(RewriteRule<'a>),
+    Global(scope::simp::SimpEntry),
+}
+impl SimpRule<'_> {
+    fn reverse(&self) -> bool {
+        match self {
+            Self::Explicit(rule) => rule.reverse,
+            Self::Global(rule) => rule.reverse,
+        }
+    }
+}
+
 impl Context {
+    fn selected_simp_term(&mut self, rule: &SimpRule<'_>) -> Result<Typed, NatDefinitionElabError> {
+        match rule {
+            SimpRule::Explicit(rule) => self.simp_rule_term(rule.syntax),
+            SimpRule::Global(rule) => self.constant(&rule.declaration),
+        }
+    }
+
     /// A bare, explicitly selected induction hypothesis can use its checked
     /// companion without changing the public hypothesis's application API.
     /// Both declarations must still be in this branch. Following only direct
@@ -60,7 +83,8 @@ impl Context {
     fn simp_rules<'a>(
         &mut self,
         args: &'a [Syntax],
-    ) -> Result<Vec<RewriteRule<'a>>, NatDefinitionElabError> {
+    ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
+        self.tick()?;
         let [keyword, config, discharger, only, arguments, location] = args else {
             return Err(error(TacticError::MalformedScript));
         };
@@ -68,13 +92,31 @@ impl Context {
         expect_empty_null(config, "default simplification configuration")?;
         expect_empty_null(discharger, "default simplification discharger")?;
         self.rewrite_locations(location)?;
-        let [only] = expect_null_args(only, "explicit simp set")? else {
-            return Err(error(TacticError::MalformedScript));
+        let use_default = match expect_null_args(only, "optional explicit simp set")? {
+            [] => true,
+            [only] => {
+                expect_atom(only, "only", "explicit-set simplification")?;
+                false
+            }
+            _ => return Err(error(TacticError::MalformedScript)),
         };
-        expect_atom(only, "only", "explicit-set simplification")?;
+        // Even `simp []` reads the default set; `simp only` never reads it. A
+        // malformed registry therefore cannot silently become an empty success.
+        let mut defaults = if use_default {
+            scope::simp::read(&self.txn.env)
+                .map_err(|e| failure(SourceInferenceError::SimpSet(e)))?
+                .into_iter()
+                .map(SimpRule::Global)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for _ in &defaults {
+            self.tick()?;
+        }
         let arguments = expect_null_args(arguments, "optional simp rule list")?;
         if arguments.is_empty() {
-            return Ok(Vec::new());
+            return Ok(defaults);
         }
         let [open, rows, close] = arguments else {
             return Err(error(TacticError::MalformedScript));
@@ -110,11 +152,14 @@ impl Context {
                     pending.extend(args);
                 }
             }
-            rules.push(RewriteRule {
+            rules.push(SimpRule::Explicit(RewriteRule {
                 syntax: &parts[2],
                 reverse,
-            });
+            }));
         }
+        // Explicit arguments have precedence; registered rules follow in their
+        // stable priority/registration order. `only` leaves this tail empty.
+        rules.append(&mut defaults);
         Ok(rules)
     }
 
@@ -127,16 +172,14 @@ impl Context {
     fn simp_premise_target(
         &mut self,
         target: &Expr,
-        rules: &[RewriteRule<'_>],
+        rules: &[SimpRule<'_>],
     ) -> Result<Expr, NatDefinitionElabError> {
         let mut target = target.clone();
         for _ in 0..MAX_SIMPLIFICATION_STEPS {
             let mut changed = false;
             for rule in rules {
                 self.tick()?;
-                if let UnfoldResult::Changed(next) =
-                    self.unfold_simp_term(rule.syntax, rule.reverse, &target)?
-                {
+                if let UnfoldResult::Changed(next) = self.unfold_simp_rule(rule, &target)? {
                     target = next;
                     changed = true;
                 }
@@ -151,11 +194,11 @@ impl Context {
     fn simp_selected_proof(
         &mut self,
         target: &Expr,
-        rules: &[RewriteRule<'_>],
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         for rule in rules {
             self.tick()?;
-            let selected = self.simp_rule_term(rule.syntax)?;
+            let selected = self.selected_simp_term(rule)?;
             let type_ = self.simp_premise_target(&selected.type_, rules)?;
             let Some(universe) = self.known_type(&type_)? else {
                 continue;
@@ -180,7 +223,7 @@ impl Context {
         &mut self,
         id: &MVarId,
         target: &Expr,
-        rules: &[RewriteRule<'_>],
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let target = self.simp_premise_target(target, rules)?;
         if let Some(value) = self.simp_selected_proof(&target, rules)? {
@@ -212,7 +255,7 @@ impl Context {
     fn rewrite_simp_premise(
         &mut self,
         target: &Expr,
-        rules: &[RewriteRule<'_>],
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let (root, mut goal) = self.proof_goal(target.clone())?;
         let mut parents = Vec::new();
@@ -266,11 +309,11 @@ impl Context {
     fn simp_step(
         &mut self,
         goal: &ProofGoal,
-        rule: &RewriteRule<'_>,
-        premise_rules: &[RewriteRule<'_>],
+        rule: &SimpRule<'_>,
+        premise_rules: &[SimpRule<'_>],
     ) -> Result<Option<(ProofGoal, Expr)>, NatDefinitionElabError> {
         let target = self.instantiate(&goal.target)?;
-        match self.unfold_simp_term(rule.syntax, rule.reverse, &target)? {
+        match self.unfold_simp_rule(rule, &target)? {
             UnfoldResult::Unchanged => Ok(None),
             UnfoldResult::Changed(next_target) => {
                 let (child, next_goal) = self.proof_goal(next_target)?;
@@ -278,7 +321,7 @@ impl Context {
             }
             UnfoldResult::NotDefinition => {
                 // Re-elaboration gives each polymorphic use fresh universes.
-                let mut term = self.simp_rule_term(rule.syntax)?;
+                let mut term = self.selected_simp_term(rule)?;
                 // Selected definitions normalize the lemma's type as well as
                 // the goal. Keep its actual proof term: conversion is checked
                 // by the final kernel, never replaced by an equality axiom.
@@ -290,7 +333,7 @@ impl Context {
                 }) = self.instantiate_rewrite_rule(
                     term,
                     &target,
-                    rule.reverse,
+                    rule.reverse(),
                     true,
                     premise_rules,
                 )?
@@ -302,7 +345,7 @@ impl Context {
                     goal,
                     term,
                     &occurrence,
-                    rule.reverse,
+                    rule.reverse(),
                 )?))
             }
         }
@@ -362,7 +405,7 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
-        rules: &[RewriteRule<'_>],
+        rules: &[SimpRule<'_>],
         mut steps: usize,
     ) -> Result<(), NatDefinitionElabError> {
         let mut history = vec![self.instantiate(&goal.target)?];

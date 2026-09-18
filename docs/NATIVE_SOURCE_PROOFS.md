@@ -50,7 +50,7 @@ theorem nested (f : Nat -> Nat) (x : Nat) (h : f x = x) : f (f (f x)) = x := by
   simp only [contract f]
 ```
 
-`simp only [h, <- k]` repeatedly tries the explicit rules in deterministic order, searching occurrences inside-out, with fresh parameter instantiation for every application. Every productive equality rewrite creates an ordinary `Eq.rec` transport, or uses conversion when the endpoints are already definitionally equal. `simp only []` can close reflexive equalities using K1 conversion, including literal arithmetic. Unknown rules are errors even when the goal happens to be reflexive. Plain `simp` is not silently treated as an empty default simp set.
+`simp only [h, <- k]` repeatedly tries the explicit rules in deterministic order, searching occurrences inside-out, with fresh parameter instantiation for every application. Every productive equality rewrite creates an ordinary `Eq.rec` transport, or uses conversion when the endpoints are already definitionally equal. `simp only []` can close reflexive equalities using K1 conversion, including literal arithmetic. Unknown rules are errors even when the goal happens to be reflexive. Plain `simp` uses the native registered set described below; `simp only` never consults that set.
 
 A bare safe definition in the list requests selected unfolding. For example, `simp only [twice, h]` unfolds the actual `twice` body at each occurrence's universe arguments, reduces beta/zeta redexes, then applies `h`. A named local let can be unfolded in the same way; local names shadow globals. Definition expansion does not request delta unfolding of unrelated definitions, although ordinary final kernel conversion still applies. Reverse definition unfolding is unsupported and explicitly refused.
 
@@ -60,7 +60,7 @@ fln check-source --json examples/native_simplification.lean
 
 That runnable example contains one definition and five theorems: quantified conditional rewriting, repeated nested rewriting, selected unfolding, transport leaving a genuine goal for `exact`, and arithmetic conversion. Installed-command tests check its actual result and late-failure atomicity across multiple files.
 
-Simplification is progress, not unconditional proof completion. A non-reflexive remaining goal must be solved by following tactics. Cyclic rule sets produce `SimplificationCycle`; productive steps are bounded at 256, in addition to the source heartbeat and kernel budgets. This bounded lane has no global simp registry, theorem ranking, automatic orientation, congruence-lemma database, or full Lean simp parity.
+Simplification is progress, not unconditional proof completion. A non-reflexive remaining goal must be solved by following tactics. Cyclic rule sets produce `SimplificationCycle`; productive steps are bounded at 256, in addition to the source heartbeat and kernel budgets. The native registry supplies explicit priorities, not theorem ranking, automatic orientation, a congruence-lemma database, or full Lean simp parity.
 
 The source integration exposed two independent-checker conversion gaps, repaired in the checker rather than bypassing its veto. Reducible applications normalize before argument congruence, so discarded arguments cannot cause a false mismatch. Scoped let values now enter a private reduction overlay during body inference and are removed at scope exit; inferred local types remain the declared types. Original caller contexts are unchanged on success, cancellation, or failure. Kernel/checker implementations remain separate.
 
@@ -108,6 +108,52 @@ also check that a failing later file emits no partial success and does not alter
 source files or contaminate a subsequent check. Wildcard locations (`at *`), occurrence selectors, and full Lean simplifier
 semantics remain outside this bounded explicit-location increment.
 
+## Registered defaults and ordinary `simp`
+
+`check-source` accepts standalone `attribute [simp] name` commands after the
+named declaration is admitted. The default set is an immutable, versioned
+environment journal. `simp`, `simp []`, and `simp [extraProof]` use it; `simp only`
+and `simp only [...]` remain independent of the journal, including its errors.
+
+```lean
+def wrap.{u} {A : Sort u} (x : A) : A := x
+theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl
+attribute [simp] unwrap
+theorem nested (n : Nat) : wrap (wrap n) = n := by simp
+attribute [-simp] unwrap
+theorem explicit (n : Nat) : wrap n = n := by simp only [unwrap]
+```
+
+The same registered set works at named hypotheses and explicit goal locations.
+Conditional equality rules must discharge their premises using the selected
+evidence or checked reflexivity; registration cannot invent a premise. Safe
+definitions can be registered for selected unfolding, while equality lemmas
+retain their actual proof terms and fresh universe instantiation on each use.
+
+`attribute [simp 1200] rule` sets a priority; `attribute [simp <- 1200] rule`
+selects the reverse direction of an equality. Explicit tactic arguments are
+tried first, then registered rules in descending priority with newer ties first.
+Re-registering an identical row is a no-op. `attribute [-simp] rule` erases it
+only from the returned snapshot, not from older engine snapshots. Names resolve
+in the current namespace/open scope and are stored as structural global names;
+later local shadowing cannot redirect a registered rule.
+
+A multi-name attribute command and a multi-file check publish only on complete
+success. Unknown, ambiguous, unsafe, malformed or unsupported registrations
+fail rather than being ignored. Corrupt journals and resource stops cannot be
+caught as a successful `try`/`first` fallback or become empty default sets. The
+journal has explicit row and payload limits in addition to the simplifier's
+existing work and productive-step limits.
+
+```bash
+fln check-source --json examples/native_default_simp.lean
+```
+
+This is a native source profile, not the Reference's serialized simp extension
+or a preloaded Init/mathlib simp database. Inline `@[simp]`, local/scoped
+attributes, proposition/iff rule compilation, and the complete upstream
+simplifier remain separate frontiers.
+
 ## APIs and limits
 
 `Engine::admit_source_declaration` checks one definition or theorem without execution. `Engine::check_source_files` checks an ordered batch and returns a `SourceFileCheck` only on complete success. Both use the existing K1 plus independent-checker council and immutable publication path.
@@ -117,7 +163,7 @@ semantics remain outside this bounded explicit-location increment.
 Current boundaries are explicit:
 
 - `check-source` accepts import-free `def` and `theorem` files. Imports, `#eval` and `#check` are refused, not ignored. The separate execution and query commands retain their existing roles.
-- Rewriting and simplification support goals and explicit named hypothesis locations (`at hx hy`). Quantified rules use the native bounded unifier, not general higher-order theorem search. Wildcard locations, occurrence controls, binder-opening congruence for arbitrary subterms, global `[simp]` sets and complete Lean `rw`/`simp` parity remain open.
+- Rewriting and simplification support goals and explicit named hypothesis locations (`at hx hy`). Quantified rules use the native bounded unifier, not general higher-order theorem search. Wildcard locations, occurrence controls, binder-opening congruence for arbitrary subterms, Reference simp-extension interchange and complete Lean `rw`/`simp` parity remain open.
 - [Native instance synthesis](NATIVE_INSTANCES.md) now supports registered classes, local instances, named global instances and selected tactic-lemma arguments. Full Synod semantics, broad tactic coverage, arbitrary Lean source compatibility and the independent checker's remaining inductive frontier remain incomplete.
 
 ## Verification

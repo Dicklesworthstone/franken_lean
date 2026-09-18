@@ -1,6 +1,7 @@
 //! File-level scope commands. The ordinary declaration parser remains the only
 //! declaration parser; this layer partitions original bytes without rewriting.
 use super::*;
+pub mod attributes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeCommand {
@@ -9,6 +10,7 @@ pub enum ScopeCommand {
     End(Option<Name>),
     Open(Vec<Name>),
     Universe(Vec<Name>),
+    Simp(attributes::SimpAttribute),
     Trivia,
 }
 
@@ -24,6 +26,7 @@ fn table() -> TokenTable {
         "in",
         "hiding",
         "renaming",
+        "attribute",
     ] {
         table.insert(keyword);
     }
@@ -52,7 +55,10 @@ fn tokens(view: &SourceView) -> Result<Vec<LexedToken>, DefinitionParseError> {
         .collect())
 }
 fn control(s: &str) -> bool {
-    matches!(s, "namespace" | "section" | "end" | "open" | "universe")
+    matches!(
+        s,
+        "namespace" | "section" | "end" | "open" | "universe" | "attribute"
+    )
 }
 fn declaration(s: &str) -> bool {
     matches!(
@@ -73,6 +79,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
     let TokenKind::Symbol(keyword) = &first.kind else {
         return Ok(None);
     };
+    if keyword == "attribute" {
+        return attributes::parse(source).map(|attribute| attribute.map(ScopeCommand::Simp));
+    }
     if !control(keyword) {
         return Ok(None);
     }

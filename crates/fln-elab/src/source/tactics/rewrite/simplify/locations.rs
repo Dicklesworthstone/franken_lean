@@ -6,29 +6,29 @@ impl Context {
     fn simp_hypothesis_step(
         &mut self,
         local: &LocalDecl,
-        rule: &RewriteRule<'_>,
-        rules: &[RewriteRule<'_>],
+        rule: &SimpRule<'_>,
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let target = self.instantiate(&local.type_)?;
-        match self.unfold_simp_term(rule.syntax, rule.reverse, &target)? {
+        match self.unfold_simp_rule(rule, &target)? {
             UnfoldResult::Unchanged => Ok(None),
             UnfoldResult::Changed(type_) => Ok(Some(Typed {
                 value: Expr::fvar(local.id.clone()),
                 type_,
             })),
             UnfoldResult::NotDefinition => {
-                let mut term = self.simp_rule_term(rule.syntax)?;
+                let mut term = self.selected_simp_term(rule)?;
                 term.type_ = self.simp_premise_target(&term.type_, rules)?;
                 let Some(RewriteMatch {
                     rule: term,
                     occurrence,
                     premises,
-                }) = self.instantiate_rewrite_rule(term, &target, rule.reverse, true, rules)?
+                }) = self.instantiate_rewrite_rule(term, &target, rule.reverse(), true, rules)?
                 else {
                     return Ok(None);
                 };
                 assert!(premises.is_empty(), "simp discharges its own premises");
-                self.rewrite_hypothesis_value(local, term, &occurrence, rule.reverse)
+                self.rewrite_hypothesis_value(local, term, &occurrence, rule.reverse())
                     .map(Some)
             }
         }

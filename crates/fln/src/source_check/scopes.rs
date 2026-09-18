@@ -82,6 +82,9 @@ impl Scopes {
     pub fn apply(&mut self, command: ScopeCommand) -> Result<(), String> {
         let namespace = matches!(command, ScopeCommand::Namespace(_));
         match command {
+            ScopeCommand::Simp(_) => {
+                return Err("simp attributes require an environment transition".into());
+            }
             ScopeCommand::Namespace(name) | ScopeCommand::Section(Some(name)) => {
                 // Each structural component is its own scope at the Reference.
                 // This permits `namespace A.B; end B; ...; end A`.

@@ -17,6 +17,31 @@ pub(super) enum UnfoldResult {
 }
 
 impl Context {
+    pub(super) fn unfold_simp_rule(
+        &mut self,
+        rule: &SimpRule<'_>,
+        target: &Expr,
+    ) -> Result<UnfoldResult, NatDefinitionElabError> {
+        match rule {
+            SimpRule::Explicit(rule) => self.unfold_simp_term(rule.syntax, rule.reverse, target),
+            SimpRule::Global(rule) => {
+                self.tick()?;
+                match self.txn.env.find(&rule.declaration) {
+                    Some(ConstantInfo::Defn(definition))
+                        if definition.safety == DefinitionSafety::Safe && !rule.reverse =>
+                    {
+                        let selection = Selection::Global(definition.clone());
+                        self.unfold_simp_selection(target, &selection)
+                    }
+                    Some(_) => Ok(UnfoldResult::NotDefinition),
+                    None => Err(failure(SourceInferenceError::UnknownConstant(
+                        rule.declaration.clone(),
+                    ))),
+                }
+            }
+        }
+    }
+
     /// Selection respects local shadowing. A local proof/parameter with this
     /// name must not accidentally request expansion of a same-named global.
     pub(super) fn unfold_simp_term(
@@ -71,7 +96,15 @@ impl Context {
         if reverse {
             return Err(error(TacticError::MalformedScript));
         }
-        let result = self.simp_unfold_selected(target, &selection)?;
+        self.unfold_simp_selection(target, &selection)
+    }
+
+    fn unfold_simp_selection(
+        &mut self,
+        target: &Expr,
+        selection: &Selection,
+    ) -> Result<UnfoldResult, NatDefinitionElabError> {
+        let result = self.simp_unfold_selected(target, selection)?;
         if self.rewrite_same(&result, target)? {
             Ok(UnfoldResult::Unchanged)
         } else {

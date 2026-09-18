@@ -123,7 +123,7 @@ impl Context {
     fn discharge_rewrite_premises(
         &mut self,
         holes: &[MVarId],
-        selected_rules: &[RewriteRule<'_>],
+        selected_rules: &[SimpRule<'_>],
     ) -> Result<bool, NatDefinitionElabError> {
         loop {
             let before = self.txn.mvars.assignments().len();
@@ -189,7 +189,7 @@ impl Context {
         target: &Expr,
         reverse: bool,
         inside_out: bool,
-        selected_rules: &[RewriteRule<'_>],
+        selected_rules: &[SimpRule<'_>],
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
         self.flush(false)?;
         let mut template = self.rewrite_trial();

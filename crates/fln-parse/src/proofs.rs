@@ -416,8 +416,8 @@ fn rewrite(
     ))
 }
 
-/// Explicit-set simplification. Plain `simp` needs an attribute registry and
-/// is refused rather than silently pretending its default simp set is empty.
+/// Simplification with either an explicit-only set or the environment's native
+/// simp registry. The optional `only` leaf remains visible in the syntax tree.
 fn simplify(
     leaves: &Leaves,
     view: &SourceView,
@@ -426,17 +426,19 @@ fn simplify(
     keyword: Syntax,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let (range, location) = locations::split(leaves, view, tokens, range)?;
-    let only = range.start + 1;
-    if !matches!(tokens.get(only).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components(["only"]))
-    {
-        return Err(refusal(view, tokens, only));
-    }
-    let only_leaf = leaves.leaf(only)?;
-    let only = null_node(vec![Syntax::Atom {
-        info: only_leaf.info(),
-        val: "only".to_string(),
-    }]);
-    let open = range.start + 2;
+    let at = range.start + 1;
+    let has_only = at < range.end
+        && matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(name)) if name == &Name::from_components(["only"]));
+    let only = if has_only {
+        let leaf = leaves.leaf(at)?;
+        null_node(vec![Syntax::Atom {
+            info: leaf.info(),
+            val: "only".to_string(),
+        }])
+    } else {
+        null_node(Vec::new())
+    };
+    let open = at + usize::from(has_only);
     let is = |at: usize, text: &str| matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Symbol(s)) if s == text);
     let arguments = if open == range.end {
         null_node(Vec::new())
@@ -512,6 +514,38 @@ mod simp_tests {
     use super::*;
 
     #[test]
+    fn ordinary_simp_preserves_source_and_an_absent_only_marker() {
+        for tail in [
+            "simp",
+            "simp []",
+            "simp [h, <- k]",
+            "simp at h",
+            "simp [h] at hx ⊢",
+        ] {
+            let source = format!("theorem t (x : Nat) : x = x := by\r\n  /- 🦀 -/ {tail}\r\n");
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+            let mut pending = vec![parsed.syntax()];
+            let mut count = 0;
+            while let Some(node) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = node {
+                    if kind == &parser_kind(&["Tactic", "simp"]) {
+                        assert_eq!(args.len(), 6);
+                        assert!(matches!(&args[3], Syntax::Node { args, .. } if args.is_empty()));
+                        count += 1;
+                    }
+                    pending.extend(args);
+                }
+            }
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
     fn simp_only_accepts_empty_ordered_reverse_and_multiline_rule_lists() {
         for source in [
             "theorem t (x : Nat) : x = x := by simp only []",
@@ -541,9 +575,7 @@ mod simp_tests {
     #[test]
     fn unsupported_simp_features_are_not_silently_ignored() {
         for tail in [
-            "simp",
             "subst",
-            "simp [h]",
             "simp only [h] at",
             "simp only [*]",
             "simp only [,h]",

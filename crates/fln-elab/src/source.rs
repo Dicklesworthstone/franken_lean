@@ -54,6 +54,7 @@ pub enum SourceInferenceError {
     InstanceSynthesisRequired,
     InvalidInstanceBinder,
     InstanceRegistry(crate::instances::InstanceRegistryError),
+    SimpSet(scope::simp::SimpSetError),
     ResourceLimit,
     Scope,
     Universe(crate::universe::UniverseInstantiationError),
@@ -93,6 +94,7 @@ impl std::fmt::Display for SourceInferenceError {
                 "instance binder must end in a registered class with inferable parameters"
             ),
             Self::InstanceRegistry(error) => write!(f, "{error}"),
+            Self::SimpSet(error) => write!(f, "{error}"),
             Self::ResourceLimit => write!(f, "source elaboration work limit reached"),
             Self::Scope => write!(
                 f,

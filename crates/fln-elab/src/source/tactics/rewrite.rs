@@ -3,6 +3,7 @@
 mod locations;
 mod matching;
 mod simplify;
+use simplify::SimpRule;
 
 pub(in crate::source) struct RewriteMatch {
     rule: Typed,

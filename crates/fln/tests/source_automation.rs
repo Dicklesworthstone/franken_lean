@@ -616,7 +616,7 @@ fn simp_only_skips_unused_rules_but_not_unknown_rules_or_missing_proofs() {
     for source in [
         "theorem bad (P : Prop) (x y : Nat) (h : P -> x = y) : x = y := by simp only [h]",
         "theorem bad (x : Nat) : x = x := by simp only [missing]",
-        "theorem bad (x : Nat) : x = x := by simp",
+        "theorem bad (x : Nat) : x = x := by simp [missing]",
     ] {
         assert!(
             base.admit_source_declaration(source.as_bytes(), &KVMap::new(), limits())

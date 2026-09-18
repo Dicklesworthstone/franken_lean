@@ -102,6 +102,7 @@ fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8) {
             NatDefinitionElabError::Inference(reason),
         )) => match reason {
             SourceInferenceError::ResourceLimit
+            | SourceInferenceError::SimpSet(fln_elab::source::scope::simp::SimpSetError::Limit)
             | SourceInferenceError::Record(fln_elab::records::RecordError::ResourceLimit)
             | SourceInferenceError::Inductive(fln_elab::inductive::InductiveError::ResourceLimit)
             | SourceInferenceError::InstanceRegistry(
@@ -210,6 +211,57 @@ impl Engine {
                 })?;
                 if let Some(control) = control {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
+                        continue;
+                    }
+                    if let fln_parse::command_scope::ScopeCommand::Simp(attribute) = control {
+                        // Attribute resolution uses the current source scope,
+                        // but the journal records exact declaration identities.
+                        // Publish the entire command only after every name and
+                        // registration succeeds; late failure exposes no prefix.
+                        let mut environment = engine.environment.clone();
+                        for requested in attribute.declarations {
+                            let name = scopes
+                                .current
+                                .resolve(&requested, |name| environment.contains(name))
+                                .map_err(|error| SourceCheckError::Scope {
+                                    file,
+                                    command: count,
+                                    offset: start.0,
+                                    message: error.to_string(),
+                                })?
+                                .ok_or_else(|| SourceCheckError::Scope {
+                                    file,
+                                    command: count,
+                                    offset: start.0,
+                                    message: format!(
+                                        "unknown simp declaration `{}`",
+                                        requested.to_display_string()
+                                    ),
+                                })?;
+                            environment = fln_elab::source::scope::simp::update(
+                                &environment,
+                                &name,
+                                attribute.rule,
+                            )
+                            .map_err(|error| {
+                                SourceCheckError::Command {
+                                    file,
+                                    command: count,
+                                    offset: start.0,
+                                    error: Box::new(EngineExecutionError::Frontend(
+                                        DefinitionFrontendError::Elaborate(
+                                            fln_elab::NatDefinitionElabError::Inference(
+                                                fln_elab::source::SourceInferenceError::SimpSet(
+                                                    error,
+                                                ),
+                                            ),
+                                        ),
+                                    )),
+                                }
+                            })?;
+                        }
+                        engine.environment = environment;
+                        count += 1;
                         continue;
                     }
                     scopes
