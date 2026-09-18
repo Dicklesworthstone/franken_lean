@@ -16,33 +16,38 @@ jobs:
         with:
           ref: main
           fetch-depth: 2
-      - name: Apply proof inference and source outcome integration
+      - name: Apply exact proof inference and source outcome integration
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/proof-conversion
           git rev-parse HEAD > target/proof-conversion/tested-parent.txt
           git fetch --depth=1 origin 655a8a2f1485c0447c6fc5498df74af9fae662ac
+          git fetch --depth=1 origin 65cc864ba6a232f36107baef91a58de26a351cd7
           python3 -I <<'PY'
           import base64, hashlib, pathlib, subprocess, zlib
-          original = subprocess.check_output(['git','show','655a8a2f1485c0447c6fc5498df74af9fae662ac:.github/workflows/fln-proof-conversion-landing.yml']).decode()
+          path = '.github/workflows/fln-proof-conversion-landing.yml'
+          original = subprocess.check_output(['git','show','655a8a2f1485c0447c6fc5498df74af9fae662ac:'+path]).decode()
           encoded = original.split("encoded = '''",1)[1].split("'''",1)[0]
           patch = zlib.decompress(base64.b64decode(encoded,validate=True))
           assert hashlib.sha256(patch).hexdigest() == '21b035d3c2d89f01b0b087acdd3c2fd3f07f154b43002c83d81c1cc99275dde8'
-          before = {'crates/fln-cli/tests/source_proof_indices.rs':None,'crates/fln-elab/src/constraint/unify.rs':'939fca2f5545be4eeb9af96240b462d893ec756d','crates/fln-elab/src/constraint/unify/proof_irrelevance.rs':'92df7165043d3d54e0dcc7956f7122d2457b2476','crates/fln-elab/tests/native_proof_irrelevance.rs':'1dd14a1b023c74e9796cfc1d0f2360cd48998f23','crates/fln/tests/source_proof_indices.rs':None,'examples/native_proof_indices.lean':None,'crates/fln/src/source_check.rs':'040488bcc7d774939d7fe66d6fcd29eff8eea273','crates/fln-elab/src/source/tactics/backtrack.rs':'df43899ddf6b9d1e0aacdb5bead683df5e093117','crates/fln/tests/proof_conversion_outcomes.rs':None}
+          original = subprocess.check_output(['git','show','65cc864ba6a232f36107baef91a58de26a351cd7:'+path]).decode()
+          encoded = original.split("supplement = zlib.decompress(base64.b64decode('",1)[1].split("',validate=True))",1)[0]
+          supplement = zlib.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(supplement).hexdigest() == '33fb362df677ca6d011412f33fd1a0a5e41896ed8d07232543ec575dafd9676c'
+          placement = zlib.decompress(base64.b64decode('eNrFVl1v2jAUfedXuFRCTg2E0W7aXHVCqzqp0rQ+THtCKHKcmxIRbGY7lK3iv++aBAhdOxXBNAvlOo7vud9HdDodIkJphAMbprnqQC7i0BoZWl0YCaET0mXShrGQE2fw0TW2wRgj8d5agwHp9D+8a/cvCPPyggwGDVJfwlow7oRKrRwsXNctVDcukntw3TEI42IQzkb41RZTSMhHctHrBZdbjGWjEp1Gx29Oh+igG5UvqSIzo3Xq9edgbKZVZJ2eIaBQSrsohmicJQmoKP4ZVRFEBh5M5jJ1H2kTZco6oSREFr2RYxqQxxLbr8ICwVwgvAHOdeGknuLmFkMxSuSfRZG7y+31HBwpYyNX5NNqw3mKRtCEnKAL6DrtkzPypocJK0XwRB8WY1FYh6m4WpmeoCXIOZdjQIgE0gh+0K2KX60bNc+MVlNQaE/BAw3apDUc4eNmMTOcW20c/QJzj/MLjKZB0H4K8eLFKqKuEsboB0hob3OUwMyN61D1YNaFnwqHvtsT2tqE1iZ321Ri6WRe2GwONAqCOgJmjlQ5J5kiw+f1a6WgO29lKpqzXCifzm2LNNuk6ZuIpP5aMwhG9ZqvC4GNFecw9WUQWV4YoN9Wg3CrUjCAHXOD+cCcfVdZmknhEJh+0ovS6i6cX7VrleL1xqFrX1vyuA6Wkw1OdRKQ5ZOC7Waqnu8TA1IjsEDvaauK4uXbq4n3lfexcb4eB4v2saN87V4Bcl0ON+flaEH0d91luV3N9LLBUL6Wsir8cAWOE7wXcz2n7Ans/Pxt+5wwL/rvdwjsbkK/agXBmoPwxxrsdCjTe+o7KBg12FQn68JF/sxiM7E1edhiBljqs0uvV6cv9g/pi+1HX+xA+mL70xc7nL7Y8eiL1eiLHUxf7L/QFzsufbHj0xf7g77Yawip6nrON/87PMs8z3DsGAzHDmA4tmU4VglPb78BBGT3Yw==',validate=True))
+          assert hashlib.sha256(placement).hexdigest() == '4844f70f1b2962cd4d3049afda532dbd642f858ba7d5d6fe90077da57afe6910'
+          before = {'crates/fln-cli/tests/source_proof_indices.rs':None,'crates/fln-elab/src/constraint/unify.rs':'939fca2f5545be4eeb9af96240b462d893ec756d','crates/fln-elab/src/constraint/unify/proof_irrelevance.rs':'92df7165043d3d54e0dcc7956f7122d2457b2476','crates/fln-elab/tests/native_proof_irrelevance.rs':'1dd14a1b023c74e9796cfc1d0f2360cd48998f23','crates/fln/tests/source_proof_indices.rs':None,'examples/native_proof_indices.lean':None,'crates/fln/src/source_check.rs':'040488bcc7d774939d7fe66d6fcd29eff8eea273','crates/fln-elab/src/source/tactics/backtrack.rs':'df43899ddf6b9d1e0aacdb5bead683df5e093117','crates/fln-elab/src/source/tactics/rewrite/matching.rs':'9043cb0f867d470c5284346144d7c1065846cd98','crates/fln/tests/proof_conversion_outcomes.rs':None}
           def blob(data): return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
           for name, expected in before.items():
               path = pathlib.Path(name)
               assert (not path.exists()) if expected is None else blob(path.read_bytes()) == expected, name
-          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
-          subprocess.run(['git','apply','-'],input=patch,check=True)
-          supplement = zlib.decompress(base64.b64decode('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',validate=True))
-          assert hashlib.sha256(supplement).hexdigest() == '33fb362df677ca6d011412f33fd1a0a5e41896ed8d07232543ec575dafd9676c'
-          subprocess.run(['git','apply','--check','-'],input=supplement,check=True)
-          subprocess.run(['git','apply','-'],input=supplement,check=True)
-          expected = {'crates/fln-elab/src/source/tactics/backtrack.rs':'4d02878f3af05f82026080fccd174a240aeeeac9','crates/fln/src/source_check.rs':'ed8e0db3a70be389bd6f821841d74cfab4d396af','crates/fln/tests/source_proof_indices.rs':'efde510efd401edf84d3758b9248a9ff80e9476b','examples/native_proof_indices.lean':'80e8ed4c5a1dd5199e0ca655c3158408e076b0a3','crates/fln/tests/proof_conversion_outcomes.rs':'0cb377db4b4aa2823e93e9342e052b4a44288f55'}
+          for data in [patch,supplement,placement]:
+              subprocess.run(['git','apply','--check','-'],input=data,check=True)
+              subprocess.run(['git','apply','-'],input=data,check=True)
+          expected = {'crates/fln-elab/src/source/tactics/backtrack.rs':'df43899ddf6b9d1e0aacdb5bead683df5e093117','crates/fln-elab/src/source/tactics/rewrite/matching.rs':'5bcf27e4314abc155d004ba53cba394cf8d76d37','crates/fln/src/source_check.rs':'ed8e0db3a70be389bd6f821841d74cfab4d396af','crates/fln/tests/source_proof_indices.rs':'efde510efd401edf84d3758b9248a9ff80e9476b','examples/native_proof_indices.lean':'80e8ed4c5a1dd5199e0ca655c3158408e076b0a3','crates/fln/tests/proof_conversion_outcomes.rs':'0cb377db4b4aa2823e93e9342e052b4a44288f55'}
           for name, expected in expected.items(): assert blob(pathlib.Path(name).read_bytes()) == expected, name
-          pathlib.Path('target/proof-conversion/implementation.patch').write_bytes(patch+supplement)
+          pathlib.Path('target/proof-conversion/implementation.patch').write_bytes(patch+supplement+placement)
           PY
       - name: Install configured compiler and format changed source
         shell: bash
@@ -51,7 +56,7 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv | tee target/proof-conversion/compiler.txt
-          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/proof_irrelevance.rs crates/fln-elab/src/source/tactics/backtrack.rs crates/fln-elab/tests/native_proof_irrelevance.rs crates/fln/src/source_check.rs crates/fln/tests/source_proof_indices.rs crates/fln/tests/proof_conversion_outcomes.rs crates/fln-cli/tests/source_proof_indices.rs
+          rustfmt --edition 2024 --config skip_children=true crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/proof_irrelevance.rs crates/fln-elab/src/source/tactics/rewrite/matching.rs crates/fln-elab/tests/native_proof_irrelevance.rs crates/fln/src/source_check.rs crates/fln/tests/source_proof_indices.rs crates/fln/tests/proof_conversion_outcomes.rs crates/fln-cli/tests/source_proof_indices.rs
       - name: Verify proof inference and source outcome authority
         shell: bash
         run: |
@@ -71,7 +76,7 @@ jobs:
           test "$(git rev-parse origin/main)" = "$tested_parent"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/proof_irrelevance.rs crates/fln-elab/src/source/tactics/backtrack.rs crates/fln-elab/tests/native_proof_irrelevance.rs crates/fln/src/source_check.rs crates/fln/tests/source_proof_indices.rs crates/fln/tests/proof_conversion_outcomes.rs crates/fln-cli/tests/source_proof_indices.rs examples/native_proof_indices.lean
+          git add -- crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/proof_irrelevance.rs crates/fln-elab/src/source/tactics/rewrite/matching.rs crates/fln-elab/tests/native_proof_irrelevance.rs crates/fln/src/source_check.rs crates/fln/tests/source_proof_indices.rs crates/fln/tests/proof_conversion_outcomes.rs crates/fln-cli/tests/source_proof_indices.rs examples/native_proof_indices.lean
           git commit -m 'feat(elab): infer proof indices and preserve proof conversion outcomes end to end'
           git push origin HEAD:main
           git rev-parse HEAD | tee target/proof-conversion/published-commit.txt
@@ -79,7 +84,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          tar -czf target/proof-conversion/tested-source.tar.gz crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/proof_irrelevance.rs crates/fln-elab/src/source/tactics/backtrack.rs crates/fln-elab/tests/native_proof_irrelevance.rs crates/fln/src/source_check.rs crates/fln/tests/source_proof_indices.rs crates/fln/tests/proof_conversion_outcomes.rs crates/fln-cli/tests/source_proof_indices.rs examples/native_proof_indices.lean
+          tar -czf target/proof-conversion/tested-source.tar.gz crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/proof_irrelevance.rs crates/fln-elab/src/source/tactics/rewrite/matching.rs crates/fln-elab/tests/native_proof_irrelevance.rs crates/fln/src/source_check.rs crates/fln/tests/source_proof_indices.rs crates/fln/tests/proof_conversion_outcomes.rs crates/fln-cli/tests/source_proof_indices.rs examples/native_proof_indices.lean
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
