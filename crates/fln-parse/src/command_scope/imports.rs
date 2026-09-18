@@ -15,6 +15,17 @@ pub struct SourceHeader {
 /// Comments, quoted names, BOM and CRLF use the same lexer/view as declarations.
 /// New module-system visibility modifiers are deliberately not stripped or guessed.
 pub fn parse_source_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
+    // SourceView normalizes line endings, but the underlying token table does
+    // not consume a UTF-8 BOM. Strip it only at the file boundary and rebase
+    // every returned offset and parser refusal to the original bytes.
+    let bom_bytes = if source.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
+    let mut header = parse_header(&source[bom_bytes..])
+        .map_err(|error| error.with_original_offset(BytePos(bom_bytes)))?;
+    header.body_start.0 += bom_bytes;
+    Ok(header)
+}
+
+fn parse_header(source: &[u8]) -> Result<SourceHeader, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let tokens = tokens(&view)?;

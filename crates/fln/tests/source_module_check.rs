@@ -164,3 +164,37 @@ fn admission_only_graphs_never_run_evaluations_or_accept_false_imported_proofs()
     }
     assert!(!base.environment().contains(&n("falseProof")));
 }
+
+#[test]
+fn an_import_only_entry_uses_no_phantom_command_budget() {
+    let mut exact = limits();
+    exact.source.max_commands = 1;
+    let result = check_with(&engine(), &[("Main", "import A"), ("A", "def value := 7")], exact)
+        .unwrap().into_complete().unwrap();
+    assert_eq!(result.checked.commands, 1);
+    assert_eq!(result.checked.files, 2);
+}
+
+#[test]
+fn extension_budgets_and_mid_replay_cancellation_retain_the_original_engine() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let files = [("Main", "import A"), ("A", "instance seven : Inhabited Nat := Inhabited.mk 7")];
+    let mut low = limits();
+    low.max_extension_bytes = 0;
+    assert_eq!(check_with(&base, &files, low).unwrap_err().disposition(), ("resource", false, 3));
+    struct Stop(std::sync::atomic::AtomicUsize);
+    impl CancellationProbe for Stop {
+        fn is_cancelled(&self) -> bool {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4
+        }
+    }
+    let names = [n("Main"), n("A")];
+    let inputs = files.iter().zip(&names).map(|((_, source), name)| SourceModuleInput {
+        name, source: source.as_bytes(),
+    }).collect::<Vec<_>>();
+    let stop = Stop(std::sync::atomic::AtomicUsize::new(0));
+    assert!(matches!(base.check_source_modules_with_cancel(&inputs, &names[0], &KVMap::new(), limits(), Some(&stop)), Ok(Outcome::Inconclusive(_))));
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    checked(&base, &files);
+}

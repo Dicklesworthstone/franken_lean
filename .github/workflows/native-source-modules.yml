@@ -9,7 +9,9 @@ on:
       - 'crates/fln/src/source_check/modules.rs'
       - 'crates/fln-parse/src/command_scope/imports.rs'
       - 'crates/fln/tests/source_module_check.rs'
+      - 'crates/fln-cli/src/source_check.rs'
       - 'crates/fln-cli/src/source_check/**'
+      - 'examples/native_modules/**'
       - 'crates/fln-cli/tests/source_module_check.rs'
   workflow_dispatch:
 permissions:
@@ -41,18 +43,25 @@ jobs:
               if row.get('status') != 'closed' and any(word in title.lower() for word in ('module', 'import', 'elaboration', 'unifier', 'kernel')):
                   print(row['id'], row.get('status'), row.get('priority'), title)
           PY
-      - name: Check parser headers and module admission
+      - name: Check parser, isolated imports, installed commands and downstream consumers
         shell: bash
         run: |
-          set -euo pipefail
-          cargo test --locked -p fln-parse command_scope -- --nocapture
-          cargo test --locked -p fln --test source_module_check -- --nocapture
-      - name: Check existing proof and metadata consumers
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln --test source_default_simp --test source_instances --no-fail-fast
-          if test -f crates/fln-cli/tests/source_module_check.rs; then
-            cargo test --locked -p fln-cli --test source_module_check -- --nocapture
-          fi
-          cargo check --locked --workspace --all-targets
+          python3 -I - <<'PY'
+          import subprocess
+          commands = [
+              ['cargo', 'test', '--locked', '-p', 'fln-parse', 'command_scope', '--', '--nocapture'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_module_check', '--', '--nocapture'],
+              ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_module_check', '--', '--nocapture'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_default_simp', '--test', 'source_instances', '--no-fail-fast'],
+              ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_check'],
+              ['cargo', 'check', '--locked', '--workspace', '--all-targets'],
+          ]
+          failed = []
+          for command in commands:
+              print('RUN', ' '.join(command), flush=True)
+              if subprocess.run(command).returncode:
+                  failed.append(' '.join(command))
+          for command in failed:
+              print('FAILED', command, flush=True)
+          raise SystemExit(bool(failed))
+          PY

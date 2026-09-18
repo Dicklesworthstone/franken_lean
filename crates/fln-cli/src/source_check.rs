@@ -1,5 +1,6 @@
 //! User-facing source proof checking. No compiler or VM is entered.
 use super::*;
+mod imports;
 
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     // Unlike the legacy path parser, this new surface refuses conflicting repeats.
@@ -59,11 +60,7 @@ fn failed(class: &str, detail: &str, authority: bool, json: bool, exit: u8) -> M
         format!(
             "fln check-source: {class}: {}{}\n",
             detail.text(),
-            if detail.truncated() {
-                " [detail truncated]"
-            } else {
-                ""
-            }
+            if detail.truncated() { " [detail truncated]" } else { "" }
         )
     };
     MultiplexerOutput::failure(stderr, exit)
@@ -78,23 +75,21 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
     for path in &paths {
         let bytes = match read_bounded(path, max_bytes - total, "Lean source") {
             Ok(bytes) => bytes,
-            Err(error) => {
-                return failed(
-                    error.class(),
-                    &error.to_string(),
-                    false,
-                    json,
-                    error.exit_code(),
-                );
-            }
+            Err(error) => return failed(error.class(), &error.to_string(), false, json, error.exit_code()),
         };
         total += bytes.len();
         sources.push(bytes);
     }
-    // Native stack calibration is tied to the actual worker, not the caller's
-    // unknown stack. No process-wide stream or environment is changed.
-    let worker = std::thread::Builder::new().name("fln-source-check".to_owned())
-        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES).spawn(move || {
+    // Header parsing, elaboration and both checkers use the calibrated worker.
+    // Imports read bounded local snapshots; no global streams or cwd are changed.
+    let worker = std::thread::Builder::new()
+        .name("fln-source-check".to_owned())
+        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let loaded = match imports::load(&paths, sources, total, max_bytes) {
+                Ok(loaded) => loaded,
+                Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
+            };
             let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES));
             let engine = match fln::Engine::with_coercion_seed(admission) {
                 Ok(fln::Outcome::Complete(engine)) => engine,
@@ -107,41 +102,26 @@ pub(super) fn run(paths: Vec<PathBuf>, max_bytes: usize, json: bool) -> Multiple
             };
             let mut limits = fln::SourceCheckLimits::new(admission);
             limits.max_bytes = max_bytes;
-            let inputs: Vec<_> = sources.iter().map(Vec::as_slice).collect();
-            let result = match engine.check_source_files(&inputs, &fln::KVMap::new(), limits) {
+            let result = match loaded.check(&engine, limits) {
                 Ok(fln::Outcome::Complete(result)) => result,
                 Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source check exhausted its configured resources", false, json, 3),
                 Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source check encountered an internal fault", false, json, 4),
-                Err(error) => {
-                    let (class, authority, exit) = error.disposition();
-                    return failed(class, &error.to_string(), authority, json, exit);
-                }
+                Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let stdout = if json {
                 format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false}}\n",
-                    result.files, result.commands, result.theorems, total, json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()))
+                    result.files, result.commands, result.theorems, loaded.total_bytes,
+                    json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()))
             } else {
-                format!("Checked {} source commands ({} theorems) in {} files; K1 and independent checker agreed. No code executed.\n",result.commands,result.theorems,result.files)
+                format!("Checked {} source commands ({} theorems) in {} files; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
             };
             MultiplexerOutput::success(stdout)
         });
     match worker {
-        Err(error) => failed(
-            "resource",
-            &format!("could not start source-check worker: {error}"),
-            false,
-            json,
-            3,
-        ),
+        Err(error) => failed("resource", &format!("could not start source-check worker: {error}"), false, json, 3),
         Ok(worker) => match worker.join() {
             Ok(result) => result,
-            Err(_) => failed(
-                "internal-fault",
-                "source-check worker panicked",
-                false,
-                json,
-                4,
-            ),
+            Err(_) => failed("internal-fault", "source-check worker panicked", false, json, 4),
         },
     }
 }

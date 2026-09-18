@@ -166,9 +166,19 @@ impl Engine {
             let source = &modules[index].source[header.body_start.0..];
             let mut source_limits = limits.source;
             source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
-            let result = imported.check_source_files_recording(
-                &[source], options, source_limits, Some(&mut declarations),
-            ).map_err(|mut error| {
+            let result = if source.is_empty() {
+                // An import-only module has no command to charge. In particular,
+                // a dependency may consume the exact aggregate command budget.
+                let root = imported.logical_root(options);
+                Ok(Outcome::Complete(SourceFileCheck {
+                    engine: imported.clone(), files: 1, commands: 0, theorems: 0,
+                    base_logical_root: root, result_logical_root: root,
+                }))
+            } else {
+                imported.check_source_files_recording(
+                    &[source], options, source_limits, Some(&mut declarations),
+                )
+            }.map_err(|mut error| {
                 // The declaration checker operates on the untouched body slice.
                 // Public errors must still point into the original module bytes.
                 match &mut error {
