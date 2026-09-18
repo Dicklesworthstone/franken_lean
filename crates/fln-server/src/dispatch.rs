@@ -284,10 +284,18 @@ fn invalidate_source_and_clear(
     waits: &mut PendingDiagnosticWaits,
     frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     uri: &str,
+    rejected_version: Option<i64>,
     reason: &str,
 ) -> io::Result<()> {
-    match session.invalidate_text(uri) {
+    let invalidation = match rejected_version {
+        Some(version) => session.reject_change(uri, version),
+        None => session.invalidate_text(uri),
+    };
+    match invalidation {
         Ok(()) | Err(SessionRefusal::NotOpen) => {}
+        Err(SessionRefusal::NonMonotone) => {
+            return write_warning(output, SessionRefusal::NonMonotone.message());
+        }
         Err(refusal) => write_warning(output, refusal.message())?,
     }
     write_protocol_message(output, clear_diagnostics_notification(uri))?;
@@ -430,7 +438,7 @@ fn handle_change(
     let version = match decoded_version(params) {
         Ok(version) => version,
         Err(message) => {
-            invalidate_source_and_clear(output, session, waits, frontiers, &uri, message)?;
+            invalidate_source_and_clear(output, session, waits, frontiers, &uri, None, message)?;
             return Ok(None);
         }
     };
@@ -443,7 +451,9 @@ fn handle_change(
     let text = match decoded_change_text(params, session.text(&uri)) {
         Ok(text) => text,
         Err(message) => {
-            invalidate_source_and_clear(output, session, waits, frontiers, &uri, message)?;
+            invalidate_source_and_clear(
+                output, session, waits, frontiers, &uri, Some(version), message,
+            )?;
             return Ok(None);
         }
     };
@@ -459,16 +469,15 @@ fn handle_change(
             }))
         }
         Err(SessionRefusal::AccountingInvariant) => {
-            write_protocol_message(output, clear_diagnostics_notification(&uri))?;
-            fail_current_frontier(
+            invalidate_source_and_clear(
                 output,
                 session,
                 waits,
                 frontiers,
                 &uri,
-                "retained-source accounting failed before diagnostic publication",
+                Some(version),
+                SessionRefusal::AccountingInvariant.message(),
             )?;
-            write_warning(output, SessionRefusal::AccountingInvariant.message())?;
             Ok(None)
         }
         Err(refusal) => {
@@ -558,6 +567,7 @@ fn handle_save(
                 waits,
                 frontiers,
                 &uri,
+                None,
                 "FrankenLean refused malformed didSave text; retained source was invalidated",
             )?;
             Ok(None)
@@ -1355,5 +1365,71 @@ mod tests {
         let output = String::from_utf8(output).expect("UTF-8 protocol output");
         assert!(outcome.clean);
         assert!(output.contains("\"id\":5,\"error\":{\"code\":-32002"));
+    }
+
+    #[test]
+    fn rejected_versions_fail_waits_before_later_requests_and_cannot_replay_old_source() {
+        let (outcome, output, seen) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"original"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"pending","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":5}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":5},"contentChanges":[{"text":"partial"},{"text":null}]}}"#,
+            r#"{"jsonrpc":"2.0","id":"rejected","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":5}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":4},"contentChanges":[{"text":"stale"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"barrier","method":"textDocument/hover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///x"},"text":"recovered"}}"#,
+            r#"{"jsonrpc":"2.0","id":"restored","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":5}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_changed, 0);
+        assert_eq!(outcome.documents_saved, 1);
+        assert_eq!(
+            seen,
+            [
+                ("file:///x".to_string(), "original".to_string()),
+                ("file:///x".to_string(), "recovered".to_string()),
+            ]
+        );
+        let barrier = output.find(r#""id":"barrier","result":null"#).unwrap();
+        for id in ["pending", "rejected"] {
+            let failure = format!("\"id\":{},\"error\":{{\"code\":-32803", crate::json_string(id));
+            assert!(
+                output.find(&failure).is_some_and(|index| index < barrier),
+                "{output}"
+            );
+            assert_eq!(
+                output
+                    .matches(&format!("\"id\":{}", crate::json_string(id)))
+                    .count(),
+                1
+            );
+        }
+        assert!(output.contains(r#""id":"restored","result":{}"#));
+    }
+
+    #[test]
+    fn failed_edit_only_settles_waits_through_its_version_and_for_its_document() {
+        let (outcome, output, seen) = run_session(&[
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x","version":1,"text":"x"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///y","version":1,"text":"y"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"future-x","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///x","version":6}}"#,
+            r#"{"jsonrpc":"2.0","id":"future-y","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///y","version":2}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":5},"contentChanges":null}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///y","version":2},"contentChanges":[{"text":"Y"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///x","version":6},"contentChanges":[{"text":"X"}]}}"#,
+        ]);
+        assert!(outcome.clean);
+        assert_eq!(outcome.documents_changed, 2);
+        assert_eq!(
+            seen.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>(),
+            ["x", "y", "Y", "X"]
+        );
+        for id in ["future-x", "future-y"] {
+            assert!(
+                output.contains(&format!("\"id\":{},\"result\":{{}}", crate::json_string(id))),
+                "{output}"
+            );
+            assert!(!output.contains(&format!("\"id\":{},\"error\"", crate::json_string(id))));
+        }
     }
 }

@@ -65,7 +65,7 @@ fn real_fln_server_executes_full_document_lifecycle() {
     assert!(messages.iter().any(|message| {
         message.contains("\"id\":\"init-1\"")
             && message.contains("\"positionEncoding\":\"utf-16\"")
-            && message.contains("\"change\":1")
+            && message.contains("\"change\":2")
     }));
     assert!(
         messages.iter().any(|message| {
@@ -252,4 +252,158 @@ fn kernel_rejection_reports_the_command_line_not_the_file_head() {
         !diagnostic.contains(r#""start":{"line":0,"character":0}"#),
         "kernel rejection regressed to the hardcoded file-head position: {diagnostic}"
     );
+}
+
+fn lsp_response_index(messages: &[String], id: &str) -> usize {
+    let field = format!("\"id\":{}", fln_server::json_string(id));
+    let indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| message.contains(&field).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indices.len(),
+        1,
+        "expected one response for {id}: {messages:#?}"
+    );
+    indices[0]
+}
+
+#[test]
+fn installed_lsp_doors_apply_ordered_utf16_edits_and_clear_repaired_diagnostics() {
+    const URI: &str = "file:///tmp/Incremental%20Unsaved.lean";
+    let session = [
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/Incremental%20Unsaved.lean","languageId":"lean4","version":1,"text":"def ok : Nat := 1\ndef s : String := \"🤖\""}}}"#,
+        r#"{"jsonrpc":"2.0","id":"opened","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Incremental%20Unsaved.lean","version":1}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/Incremental%20Unsaved.lean","version":2},"contentChanges":[{"range":{"start":{"line":1,"character":19},"end":{"line":1,"character":21}},"rangeLength":2,"text":"🤖🤖"},{"range":{"start":{"line":1,"character":24},"end":{"line":1,"character":24}},"text":"@more"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"text":"\n"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":"changed","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Incremental%20Unsaved.lean","version":2}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///tmp/Incremental%20Unsaved.lean"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"saved","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Incremental%20Unsaved.lean","version":2}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/Incremental%20Unsaved.lean","version":3},"contentChanges":[{"range":{"start":{"line":2,"character":24},"end":{"line":2,"character":29}},"rangeLength":5,"text":""}]}}"#,
+        r#"{"jsonrpc":"2.0","id":"repaired","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Incremental%20Unsaved.lean","version":3}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ];
+    for (label, binary, arguments) in [
+        ("fln", env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        ("lean", env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let (status, messages, stderr) = run_session(binary, arguments, &session);
+        assert!(status.success(), "{label}: {stderr}");
+        assert!(stderr.is_empty(), "{label}: {stderr}");
+        assert!(messages[lsp_response_index(&messages, "init")].contains(r#""change":2"#));
+        let opened = lsp_response_index(&messages, "opened");
+        let changed = lsp_response_index(&messages, "changed");
+        let saved = lsp_response_index(&messages, "saved");
+        let repaired = lsp_response_index(&messages, "repaired");
+        for index in [opened, changed, saved, repaired] {
+            assert!(
+                messages[index].contains(r#""result":{}"#),
+                "{label}: {messages:#?}"
+            );
+            // Completion must follow processing, not merely acceptance of text.
+            assert!(messages[index - 1].contains(r#""processing":[]"#));
+        }
+        for window in [
+            &messages[opened + 1..changed],
+            &messages[changed + 1..saved],
+        ] {
+            let diagnostics = window
+                .iter()
+                .filter(|message| {
+                    message.contains("textDocument/publishDiagnostics")
+                        && message.contains(r#""diagnostics":[{"#)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{label}: {window:#?}");
+            assert!(diagnostics[0].contains(URI));
+            assert!(diagnostics[0].contains(r#""start":{"line":2,"character":24}"#));
+        }
+        let repair = &messages[saved + 1..repaired];
+        assert!(repair.iter().any(|message| {
+            message.contains("textDocument/publishDiagnostics")
+                && message.contains(URI)
+                && message.contains(r#""diagnostics":[]"#)
+        }));
+        assert!(
+            !repair
+                .iter()
+                .any(|message| message.contains(r#""diagnostics":[{"#))
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.contains("$/lean/fileProgress") && message.contains(r#""kind":1"#)
+                })
+                .count(),
+            4,
+            "{label}: {messages:#?}"
+        );
+        assert!(messages.iter().all(|message| !message.contains("%2520")));
+    }
+}
+
+#[test]
+fn installed_lsp_doors_fail_rejected_version_waits_and_resume_after_full_save() {
+    let session = [
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/Recovery.lean","languageId":"lean4","version":1,"text":"def answer := 42"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"pending","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Recovery.lean","version":5}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/Recovery.lean","version":5},"contentChanges":[{"text":"def answer : Nat := missing"},{"text":null}]}}"#,
+        r#"{"jsonrpc":"2.0","id":"rejected","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Recovery.lean","version":5}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/Recovery.lean","version":4},"contentChanges":[{"text":"def stale := 1"}]}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///tmp/Recovery.lean"}}}"#,
+        r#"{"jsonrpc":"2.0","id":"barrier","method":"textDocument/hover","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///tmp/Recovery.lean"},"text":"def answer := 42"}}"#,
+        r#"{"jsonrpc":"2.0","id":"restored","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Recovery.lean","version":5}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/Recovery.lean","version":6},"contentChanges":[{"range":{"start":{"line":0,"character":14},"end":{"line":0,"character":16}},"rangeLength":2,"text":"43"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":"edited","method":"textDocument/waitForDiagnostics","params":{"uri":"file:///tmp/Recovery.lean","version":6}}"#,
+        r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ];
+    for (label, binary, arguments) in [
+        ("fln", env!("CARGO_BIN_EXE_fln"), &["serve-lsp"][..]),
+        ("lean", env!("CARGO_BIN_EXE_lean"), &["--server"][..]),
+    ] {
+        let (status, messages, stderr) = run_session(binary, arguments, &session);
+        assert!(status.success(), "{label}: {stderr}");
+        assert!(stderr.is_empty(), "{label}: {stderr}");
+        let barrier = lsp_response_index(&messages, "barrier");
+        for id in ["pending", "rejected"] {
+            let index = lsp_response_index(&messages, id);
+            assert!(
+                index < barrier,
+                "{label} postponed a rejected-version wait: {messages:#?}"
+            );
+            assert!(messages[index].contains(r#""error":{"code":-32803"#));
+        }
+        for id in ["restored", "edited"] {
+            let index = lsp_response_index(&messages, id);
+            assert!(index > barrier);
+            assert!(
+                messages[index].contains(r#""result":{}"#),
+                "{label}: {messages:#?}"
+            );
+            assert!(messages[index - 1].contains(r#""processing":[]"#));
+        }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.contains("$/lean/fileProgress") && message.contains(r#""kind":1"#)
+                })
+                .count(),
+            3,
+            "{label} checked a partial, stale, or invalidated snapshot: {messages:#?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains(r#""diagnostics":[{"#))
+        );
+    }
 }

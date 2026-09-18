@@ -6,6 +6,8 @@ pub(super) const MAX_RETAINED_URI_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 struct OpenDocument {
+    // Highest observed, unambiguous client version. Text/diagnostic authority
+    // is independent: a rejected change advances this fence with no source.
     version: i64,
     text: Option<String>,
 }
@@ -251,6 +253,22 @@ impl DocumentSession {
         self.replace_text(uri, None, text)
     }
 
+    /// Fence out older edits and invalidate source after a rejected change.
+    /// Recording a client version does not claim that its text was checked.
+    /// Even accounting recovery must retain this fence, or a delayed event
+    /// could restore an older snapshot under a newer diagnostic frontier.
+    pub(super) fn reject_change(&mut self, uri: &str, version: i64) -> Result<(), SessionRefusal> {
+        let document = self
+            .documents
+            .get_mut(uri)
+            .ok_or(SessionRefusal::NotOpen)?;
+        if version <= document.version {
+            return Err(SessionRefusal::NonMonotone);
+        }
+        document.version = version;
+        self.invalidate_text(uri)
+    }
+
     pub(super) fn invalidate_text(&mut self, uri: &str) -> Result<(), SessionRefusal> {
         let Some(mut document) = self.documents.remove(uri) else {
             return Err(SessionRefusal::NotOpen);
@@ -446,5 +464,69 @@ mod tests {
             session.retained_uri_bytes,
             "file:///a".len() + "file:///b".len()
         );
+    }
+
+    #[test]
+    fn rejected_changes_advance_the_fence_without_retaining_source() {
+        let mut session = DocumentSession::with_limits(2, 32);
+        session
+            .open("file:///a".to_string(), 1, "alpha".to_string())
+            .unwrap();
+        session
+            .open("file:///b".to_string(), 3, "beta".to_string())
+            .unwrap();
+        session.reject_change("file:///a", 5).unwrap();
+        assert_eq!(session.version("file:///a"), Some(5));
+        assert_eq!(session.text("file:///a"), None);
+        assert_eq!(session.text("file:///b"), Some("beta"));
+        assert_eq!(session.retained_bytes, 4);
+        assert_eq!(
+            session.retained_uri_bytes,
+            "file:///a".len() + "file:///b".len()
+        );
+        for version in [1, 4, 5] {
+            assert_eq!(
+                session.change("file:///a", version, "stale".to_string()),
+                Err(SessionRefusal::NonMonotone)
+            );
+        }
+        // didSave carries no version; its full text restores precisely the
+        // latest observed version, never the last successfully checked one.
+        session
+            .save_with_text("file:///a", "recovered".to_string())
+            .unwrap();
+        assert_eq!(session.version("file:///a"), Some(5));
+        assert_eq!(session.text("file:///a"), Some("recovered"));
+        assert_eq!(session.retained_bytes, 13);
+        assert_eq!(
+            session.reject_change("file:///a", 5),
+            Err(SessionRefusal::NonMonotone)
+        );
+        assert_eq!(session.text("file:///a"), Some("recovered"));
+    }
+
+    #[test]
+    fn rejected_version_survives_accounting_recovery() {
+        let mut session = DocumentSession::with_limits(2, 32);
+        session
+            .open("file:///a".to_string(), 1, "alpha".to_string())
+            .unwrap();
+        session
+            .open("file:///b".to_string(), 3, "beta".to_string())
+            .unwrap();
+        session.retained_bytes = 0;
+        assert_eq!(
+            session.reject_change("file:///a", 7),
+            Err(SessionRefusal::AccountingInvariant)
+        );
+        assert_eq!(session.version("file:///a"), Some(7));
+        assert_eq!(session.text("file:///a"), None);
+        assert_eq!(session.text("file:///b"), Some("beta"));
+        assert_eq!(session.retained_bytes, 4);
+        assert_eq!(
+            session.reject_change("file:///missing", 8),
+            Err(SessionRefusal::NotOpen)
+        );
+        assert_eq!(session.retained_bytes, 4);
     }
 }
