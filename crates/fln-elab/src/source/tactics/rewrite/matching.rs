@@ -5,7 +5,58 @@
 use super::*;
 use std::collections::HashSet;
 
+#[derive(Debug, PartialEq, Eq)]
+enum RigidTypeHead {
+    Sort,
+    Forall,
+    Inductive(Name),
+}
+
 impl Context {
+    /// A sufficient negative discrimination on types, not a conversion result.
+    /// These outer forms cannot reduce into each other. Everything else (holes,
+    /// aliases, lets, projections and stuck eliminators) goes to the full solver.
+    /// Inductive applications must have their actual admitted arity; mere name
+    /// spelling is never enough to classify an expression here.
+    fn rigid_rewrite_type_head(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Option<RigidTypeHead>, NatDefinitionElabError> {
+        let mut head = expr;
+        let mut arguments = 0_u64;
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::App { f, .. } => {
+                    arguments = arguments
+                        .checked_add(1)
+                        .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                    head = f;
+                }
+                ExprNode::MData { expr, .. } => head = expr,
+                ExprNode::Sort { .. } if arguments == 0 => {
+                    return Ok(Some(RigidTypeHead::Sort));
+                }
+                ExprNode::ForallE { .. } if arguments == 0 => {
+                    return Ok(Some(RigidTypeHead::Forall));
+                }
+                ExprNode::Const { name, levels } => {
+                    let Some(fln_env::constants::ConstantInfo::Induct(family)) =
+                        self.txn.env.find(name)
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok((!family.is_unsafe
+                        && levels.len() == family.base.level_params.len()
+                        && arguments
+                            == u64::from(family.num_params) + u64::from(family.num_indices))
+                    .then(|| RigidTypeHead::Inductive(name.clone())));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
     pub(super) fn rewrite_trial(&self) -> Self {
         self.clone()
     }
@@ -46,6 +97,17 @@ impl Context {
         let Some(type_) = self.known_type(occurrence)? else {
             return Ok(false);
         };
+        // In a dependent recursor, most visited subterms are types, proofs or
+        // partially applied functions, not values of the rule's carrier type.
+        // Do not unify their large proof terms after their types already have
+        // irreconcilable rigid heads. This accepts nothing and assigns no hole.
+        if let (Some(actual), Some(expected)) = (
+            self.rigid_rewrite_type_head(&type_)?,
+            self.rigid_rewrite_type_head(alpha)?,
+        ) && actual != expected
+        {
+            return Ok(false);
+        }
         self.constrain(&type_, alpha)?;
         self.constrain(occurrence, pattern)?;
         self.equations
@@ -339,6 +401,143 @@ impl Context {
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
+
+    fn context() -> Context {
+        use fln_env::environment::DeclarationBudget;
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let mut env = Environment::new();
+        for declaration in [
+            crate::seed::nat_inductive_seed_declaration(),
+            crate::seed::bool_seed_declaration(),
+            crate::seed::eq_seed_declaration(),
+        ] {
+            let Outcome::Complete(admitted) = admit(&env, declaration, budget) else {
+                panic!("seed admission did not complete");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("seed was rejected");
+            };
+            let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            ) else {
+                panic!("seed publication did not complete");
+            };
+            env = publication.environment;
+        }
+        Context::new(&env, budget)
+    }
+
+    #[test]
+    fn incompatible_type_heads_skip_large_terms_without_spending_the_match_budget() {
+        let mut ctx = context();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let id = FVarId(Name::from_components(["function"]));
+        ctx.txn.lctx.add_param(
+            id.clone(),
+            id.0.clone(),
+            Expr::forall_e(
+                Name::anonymous(),
+                nat.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let mut pattern = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let succ = Expr::const_(Name::from_components(["Nat", "succ"]), vec![]);
+        for _ in 0..128 {
+            pattern = Expr::app(succ.clone(), pattern);
+        }
+        let before = ctx.txn.clone();
+        ctx.txn.budget.max_heartbeats = 64;
+        assert!(
+            !ctx.match_rewrite_occurrence(&pattern, &nat, &Expr::fvar(id))
+                .unwrap()
+        );
+        assert!(ctx.txn.budget.heartbeats_consumed < 64);
+        assert!(ctx.txn.budget.heartbeats_consumed > 0);
+        assert_eq!(ctx.txn.env, before.env);
+        assert_eq!(ctx.txn.mvars, before.mvars);
+        assert_eq!(ctx.txn.universes, before.universes);
+        assert_eq!(ctx.txn.lctx, before.lctx);
+        assert!(ctx.equations.is_empty());
+    }
+
+    #[test]
+    fn type_head_discrimination_requires_real_arity_and_leaves_flexible_types_to_inference() {
+        let mut ctx = context();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        assert_eq!(
+            ctx.rigid_rewrite_type_head(&nat).unwrap(),
+            Some(RigidTypeHead::Inductive(Name::from_components(["Nat"])))
+        );
+        for unknown in [
+            Expr::const_(Name::from_components(["Missing"]), vec![]),
+            Expr::const_(Name::from_components(["Nat"]), vec![Level::one()]),
+            Expr::app(nat.clone(), zero.clone()),
+            Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
+            Expr::let_e(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                nat.clone(),
+                Expr::bvar(0).unwrap(),
+                false,
+            ),
+        ] {
+            assert_eq!(ctx.rigid_rewrite_type_head(&unknown).unwrap(), None);
+        }
+        let carrier = ctx.hole(Expr::sort(Level::one())).unwrap();
+        assert_eq!(ctx.rigid_rewrite_type_head(&carrier).unwrap(), None);
+        assert!(
+            ctx.match_rewrite_occurrence(&zero, &carrier, &zero)
+                .unwrap()
+        );
+        assert_eq!(ctx.instantiate(&carrier).unwrap(), nat);
+    }
+
+    #[test]
+    fn matching_same_type_heads_still_checks_indices_and_resource_stops() {
+        let mut ctx = context();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let zero = Expr::const_(Name::from_components(["Nat", "zero"]), vec![]);
+        let one = Expr::app(
+            Expr::const_(Name::from_components(["Nat", "succ"]), vec![]),
+            zero.clone(),
+        );
+        let eq = Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]);
+        let equal = app(eq.clone(), [nat.clone(), zero.clone(), zero.clone()]);
+        let unequal = app(eq, [nat.clone(), zero.clone(), one]);
+        assert_eq!(
+            ctx.rigid_rewrite_type_head(&equal).unwrap(),
+            ctx.rigid_rewrite_type_head(&unequal).unwrap()
+        );
+        let id = FVarId(Name::from_components(["proof"]));
+        ctx.txn
+            .lctx
+            .add_param(id.clone(), id.0.clone(), equal, BinderInfo::Default);
+        let term = Expr::fvar(id);
+        let problem = ctx
+            .match_rewrite_occurrence(&term, &unequal, &term)
+            .unwrap_err();
+        assert!(Context::rewrite_nonmatch(&problem));
+        assert!(ctx.txn.mvars.assignments().is_empty());
+        ctx.txn.budget.max_heartbeats = ctx.txn.budget.heartbeats_consumed + 1;
+        let problem = ctx
+            .rigid_rewrite_type_head(&Expr::app(nat, zero))
+            .unwrap_err();
+        assert!(matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+        ));
+        assert!(!Context::rewrite_nonmatch(&problem));
+    }
 
     #[test]
     fn proof_conversion_stops_cannot_be_hidden_by_tactics_rewriting_or_instance_search() {

@@ -50,7 +50,7 @@ fn recursive_dependent_indices_and_inferred_fixed_families_are_preserved() {
         theorem identity {{A : Type}} {{P : A -> Type}} (a : A) (v : P a) (t : Trace A P a v) : copyTrace a v t = t := by
           induction t with
           | stop x vx => rfl
-          | step x y vx vy child ih => simp only [copyTrace, ih]; rfl"));
+          | step x y vx vy child ih => simp only [copyTrace, ih]"));
 }
 
 #[test]

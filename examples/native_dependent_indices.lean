@@ -23,4 +23,4 @@ theorem counted : depth 2 false trace = 1 := by rfl
 theorem copy_identity {A : Type} {P : A -> Type} (a : A) (v : P a) (t : Trace A P a v) : copyTrace a v t = t := by
   induction t with
   | stop x vx => rfl
-  | step x y vx vy child ih => simp only [copyTrace, ih]; rfl
+  | step x y vx vy child ih => simp only [copyTrace, ih]

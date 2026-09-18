@@ -89,7 +89,6 @@ theorem trace_copy (A : Type) (P : A -> Type) (f : A -> A) (a : A) (v : P (f a))
   | base x y => rfl
   | step x y child ih =>
     simp only [traceCopy, ih child (HEq.refl (f a)) (HEq.refl v) (HEq.refl child)]
-    rfl
 "#,
     );
 }

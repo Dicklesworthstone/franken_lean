@@ -237,7 +237,7 @@ fn dependent_index_matrices_keep_the_original_index_telescope() {
       theorem allCopied (A : Type) (P : A -> Type) (a : A) (v : P a) (t : Trace A P a v) (b : Bool) : traceCopy a v t b = t := by
         induction t with
         | stop x y => rfl
-        | step x y child ih => simp only [traceCopy, ih]; rfl");
+        | step x y child ih => simp only [traceCopy, ih]");
 }
 
 #[test]
