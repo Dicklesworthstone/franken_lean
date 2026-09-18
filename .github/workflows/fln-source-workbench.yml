@@ -1,4 +1,5 @@
 name: Native source workbench
+# Capture constructive decisions and the current proof frontend for the next checked increment.
 on:
   push:
     branches: [main]
@@ -8,7 +9,6 @@ permissions:
   contents: read
 jobs:
   source:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'test(source):')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -30,21 +30,6 @@ jobs:
           git archive --format=tar.gz HEAD crates/fln-elab crates/fln-parse crates/fln-checker crates/fln crates/fln-cli docs examples AGENTS.md README.md COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md .beads Cargo.toml Cargo.lock rust-toolchain.toml SUITE.lock > target/source-frontend/frontend.tar.gz
           cp target/source-workbench/commit.txt target/source-workbench/tracked-files.txt target/source-frontend/
           sha256sum target/source-frontend/frontend.tar.gz > target/source-frontend/SHA256SUMS
-      - name: Read active implementation beads
-        shell: python
-        run: |
-          import collections
-          import json
-          from pathlib import Path
-          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          print('Bead status counts:', dict(collections.Counter(row.get('status') for row in rows)))
-          active = [row for row in rows if row.get('status') in ('open', 'in_progress', 'blocked')]
-          active.sort(key=lambda row: (row.get('priority', 9), row['id']))
-          Path('target/source-workbench/active-beads.json').write_text(json.dumps(active, ensure_ascii=False, indent=2) + '\n')
-          words = ('elaborat', 'athanor', 'tactic', 'source', 'unif', 'instance', 'match', 'induct', 'simp', 'rewrite')
-          for row in active:
-              if any(word in row.get('title', '').lower() for word in words):
-                  print(json.dumps({key: row.get(key) for key in ('id', 'title', 'status', 'priority', 'description', 'dependencies')}, ensure_ascii=False))
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: source-frontend-${{ github.sha }}
@@ -57,49 +42,3 @@ jobs:
           path: target/source-workbench
           compression-level: 0
           retention-days: 2
-  expression-generalization:
-    if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'feat(source): land expression generalization')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: main
-          fetch-depth: 0
-      - name: Apply the checked feature and small-stack parser correction
-        shell: python
-        run: |
-          import base64, gzip, hashlib, os, pathlib, re, subprocess
-          stored = subprocess.check_output(['git', 'show', 'e559719131e9a987e404eefa5ad2c2be727a9f00:.github/workflows/fln-source-workbench.yml'], text=True)
-          feature = re.search(r"encoded = '''([A-Za-z0-9+/=]+)'''", stored).group(1)
-          stack_fix = '''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'''
-          for name, encoded, digest in (
-              ('generalize', feature, 'f12550f95283d2b10766e704dbae1be31353f831616b6152e004bc6296ff5452'),
-              ('parser-stack', stack_fix, '764980a5baf65763412dbb249949e8b811e57ad8fd6bb2bba506ba188d774373'),
-          ):
-              patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-              assert hashlib.sha256(patch).hexdigest() == digest
-              path = pathlib.Path(os.environ['RUNNER_TEMP']) / (name + '.patch')
-              path.write_bytes(patch)
-              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
-              subprocess.run(['git', 'apply', str(path)], check=True)
-      - name: Reexecute parser elaborator engine CLI and lint regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup show active-toolchain
-          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
-          cargo test --locked -p fln --test source_context_generalization --test source_goal_control --test source_local_proofs --test source_induction --test source_rewrite_locations
-          cargo test --locked -p fln-cli --test source_context_generalization
-          cargo clippy --locked -p fln-elab -p fln-parse -p fln -p fln-cli --all-targets -- -D warnings
-          git diff --check
-      - name: Commit the checked implementation directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add crates/fln-cli/tests/source_context_generalization.rs crates/fln-elab/src/source.rs crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/context.rs crates/fln-elab/src/source/tactics/rewrite.rs crates/fln-parse/src/proofs.rs crates/fln/tests/source_context_generalization.rs docs/NATIVE_LOCAL_PROOFS.md examples/native_context_generalization.lean
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(elab): implement checked expression generalization with equality witnesses'
-          git push origin HEAD:main
