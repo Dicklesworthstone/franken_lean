@@ -35,5 +35,5 @@ jobs:
                   else:
                       b=p.read_bytes();assert hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()==h,n
           verify(before)
-          encoded='''eNrNPWtz2ziS3/0rEE2Vj1zRtCQ/4shjzyYZz05qZzJbmVzqqpIUi6Igi2OK1PHh2OPov193AyDBp2jFt7euVCyRQKPRL3Q3GvDcXyzYwcG1nzL30IvdlCeHiyA88AL/ED6nyWESZbHHnVs39t0wdeIsTP0Vt+OEzRZYc8P5/yOPZ953smLM9s+Hi/OJs/HbDwanR4f7x0cHDwah73hcPh4PP7+d3YwnpxYR2yIv47PGDxZhMxfraM45XPVJ3FuOF87q2ieBQDIT/yZH/jpveOGc2fh+kEWc8dNo5XvwVDDZA97DH/cJOFx+sx4Uc8hyg=='
+          encoded='''eNrNPWtz2ziS3/0rEE2Vj1zRtCQ/4shjzyYZz05qZzJbmVzqqpIUi6Igi2OK1PDh2OPov193AyDBp2jFt7euVCyRQKPRL3Q3GvDcXyzYwcG1nzL30IvdlCeHiyA88AL/ED6nyWESZbHHnVs39t0wdeIsTP0Vt+OEzR7ZYc8P5/yOPZ953smLM9s+Hi/OJs/HbDwanR4f7x0cHDwah73hcPh4PP7+d3YwnpxYR2yIv47PGDxZhMxfraM45XPVJ3FuOF87q2ieBQDIT/yZH/jpveOGc2fh+kEWc8dNo5XvwVPDZA97DH/cJOFx+sx4FjOINcN8NoY8e09Oj38tt+OMBFBOGA=='''
           PY
