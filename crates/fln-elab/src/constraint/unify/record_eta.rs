@@ -28,7 +28,11 @@ struct RecordApplication {
 /// and applications of projected, function-valued fields.
 enum NeutralTypeFrame {
     Application(Expr),
-    Projection { structure: Name, index: u64, receiver: Expr },
+    Projection {
+        structure: Name,
+        index: u64,
+        receiver: Expr,
+    },
 }
 
 impl Engine<'_> {
@@ -87,7 +91,11 @@ impl Engine<'_> {
             self.meter.node()?;
             let index = u64::try_from(index).map_err(|_| UnificationError::ExpressionScope)?;
             let projection = Expr::proj(record.shape.name.clone(), index, neutral.clone());
-            let pair = if reversed { (projection, field) } else { (field, projection) };
+            let pair = if reversed {
+                (projection, field)
+            } else {
+                (field, projection)
+            };
             children.push((pair.0, pair.1, locals.clone()));
         }
         // Full type first, then fields in declaration order. This order matters
@@ -123,17 +131,24 @@ impl Engine<'_> {
         let Some(ConstantInfo::Induct(family)) = self.work.env.find(name) else {
             return Ok(None);
         };
-        if family.is_unsafe || family.is_rec || family.is_reflexive
-            || family.num_indices != 0 || family.num_nested != 0
-            || family.all.len() != 1 || family.all.first() != Some(name)
-            || family.ctors.len() != 1 || &family.base.name != name
+        if family.is_unsafe
+            || family.is_rec
+            || family.is_reflexive
+            || family.num_indices != 0
+            || family.num_nested != 0
+            || family.all.len() != 1
+            || family.all.first() != Some(name)
+            || family.ctors.len() != 1
+            || &family.base.name != name
         {
             return Ok(None);
         }
         let Some(ConstantInfo::Ctor(constructor)) = self.work.env.find(&family.ctors[0]) else {
             return Ok(None);
         };
-        if constructor.is_unsafe || constructor.cidx != 0 || &constructor.induct != name
+        if constructor.is_unsafe
+            || constructor.cidx != 0
+            || &constructor.induct != name
             || constructor.base.name != family.ctors[0]
             || constructor.num_params != family.num_params
             || constructor.base.level_params.len() != family.base.level_params.len()
@@ -141,11 +156,16 @@ impl Engine<'_> {
             return Ok(None);
         }
         // Charge proportional metadata before cloning it.
-        for (constructor_level, family_level) in constructor.base.level_params.iter()
+        for (constructor_level, family_level) in constructor
+            .base
+            .level_params
+            .iter()
             .zip(&family.base.level_params)
         {
             self.meter.node()?;
-            if constructor_level != family_level { return Ok(None); }
+            if constructor_level != family_level {
+                return Ok(None);
+            }
         }
         Ok(Some(RecordShape {
             name: name.clone(),
@@ -170,7 +190,9 @@ impl Engine<'_> {
         crate::universe::parameters::instantiate(
             || self.meter.node(),
             || UnificationError::ExpressionScope,
-            type_, parameters, levels,
+            type_,
+            parameters,
+            levels,
         )
     }
 
@@ -210,15 +232,19 @@ impl Engine<'_> {
         let Some(shape) = self.eta_shape(&family)? else {
             return Ok(None);
         };
-        let arity = shape.parameters.checked_add(shape.fields)
+        let arity = shape
+            .parameters
+            .checked_add(shape.fields)
             .ok_or(UnificationError::ExpressionScope)?;
-        if name != &shape.constructor || levels.len() != shape.level_params.len()
+        if name != &shape.constructor
+            || levels.len() != shape.level_params.len()
             || arguments.len() != arity
         {
             return Ok(None);
         }
         let family_type = self.eta_specialize(&shape.family_type, &shape.level_params, levels)?;
-        let Some(sort) = self.eta_apply_type(family_type, &arguments[..shape.parameters], locals)?
+        let Some(sort) =
+            self.eta_apply_type(family_type, &arguments[..shape.parameters], locals)?
         else {
             return Ok(None);
         };
@@ -226,9 +252,8 @@ impl Engine<'_> {
             // Prop and unresolved Prop/Type choices are not this eta rule.
             return Ok(None);
         }
-        let constructor_type = self.eta_specialize(
-            &shape.constructor_type, &shape.level_params, levels,
-        )?;
+        let constructor_type =
+            self.eta_specialize(&shape.constructor_type, &shape.level_params, levels)?;
         let Some(type_) = self.eta_apply_type(constructor_type, &arguments, locals)? else {
             return Ok(None);
         };
@@ -242,13 +267,17 @@ impl Engine<'_> {
             return Ok(None);
         }
         let fields = arguments.split_off(shape.parameters);
-        Ok(Some(RecordApplication { shape, type_, fields }))
+        Ok(Some(RecordApplication {
+            shape,
+            type_,
+            fields,
+        }))
     }
 
     /// Synthesize only a neutral spine's type. This is a candidate-selection
     /// aid, not a type checker or an alternative to K1 assignment validation.
     /// Unknown heads, malformed applications and blocked types defer.
-    fn eta_neutral_type(
+    pub(super) fn eta_neutral_type(
         &mut self,
         expr: &Expr,
         locals: &LocalContext,
@@ -262,9 +291,15 @@ impl Engine<'_> {
                     frames.push(NeutralTypeFrame::Application(a.clone()));
                     head = f.clone();
                 }
-                ExprNode::Proj { struct_name, idx, expr } => {
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
                     frames.push(NeutralTypeFrame::Projection {
-                        structure: struct_name.clone(), index: *idx, receiver: expr.clone(),
+                        structure: struct_name.clone(),
+                        index: *idx,
+                        receiver: expr.clone(),
                     });
                     head = expr.clone();
                 }
@@ -274,7 +309,11 @@ impl Engine<'_> {
         }
         let type_ = match head.node() {
             ExprNode::FVar { id } => locals.find(id).map(|local| local.type_.clone()),
-            ExprNode::MVar { id } => self.work.mvars.get_decl(id).map(|local| local.type_.clone()),
+            ExprNode::MVar { id } => self
+                .work
+                .mvars
+                .get_decl(id)
+                .map(|local| local.type_.clone()),
             ExprNode::Const { name, levels } => {
                 let Some(info) = self.work.env.find(name) else {
                     return Ok(None);
@@ -301,18 +340,24 @@ impl Engine<'_> {
             }
             _ => None,
         };
-        let Some(mut type_) = type_ else { return Ok(None); };
+        let Some(mut type_) = type_ else {
+            return Ok(None);
+        };
         while let Some(frame) = frames.pop() {
             self.meter.node()?;
             let next = match frame {
                 NeutralTypeFrame::Application(argument) => {
                     self.eta_apply_type(type_, std::slice::from_ref(&argument), locals)?
                 }
-                NeutralTypeFrame::Projection { structure, index, receiver } => {
-                    self.eta_projection_type(type_, &structure, index, &receiver, locals)?
-                }
+                NeutralTypeFrame::Projection {
+                    structure,
+                    index,
+                    receiver,
+                } => self.eta_projection_type(type_, &structure, index, &receiver, locals)?,
             };
-            let Some(next) = next else { return Ok(None); };
+            let Some(next) = next else {
+                return Ok(None);
+            };
             type_ = next;
         }
         self.eta_apply_type(type_, &[], locals)
@@ -333,11 +378,19 @@ impl Engine<'_> {
             return Ok(None);
         };
         let (head, parameters) = self.eta_spine(&receiver_type)?;
-        let ExprNode::Const { name, levels } = head.node() else { return Ok(None); };
-        if name != structure { return Ok(None); }
-        let Some(shape) = self.eta_shape(structure)? else { return Ok(None); };
-        if parameters.len() != shape.parameters || levels.len() != shape.level_params.len()
-            || index >= u64::try_from(shape.fields).map_err(|_| UnificationError::ExpressionScope)?
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if name != structure {
+            return Ok(None);
+        }
+        let Some(shape) = self.eta_shape(structure)? else {
+            return Ok(None);
+        };
+        if parameters.len() != shape.parameters
+            || levels.len() != shape.level_params.len()
+            || index
+                >= u64::try_from(shape.fields).map_err(|_| UnificationError::ExpressionScope)?
         {
             return Ok(None);
         }
@@ -348,9 +401,8 @@ impl Engine<'_> {
         if !matches!(sort.node(), ExprNode::Sort { level } if level.is_never_zero()) {
             return Ok(None);
         }
-        let constructor_type = self.eta_specialize(
-            &shape.constructor_type, &shape.level_params, levels,
-        )?;
+        let constructor_type =
+            self.eta_specialize(&shape.constructor_type, &shape.level_params, levels)?;
         let Some(mut type_) = self.eta_apply_type(constructor_type, &parameters, locals)? else {
             return Ok(None);
         };
@@ -359,11 +411,16 @@ impl Engine<'_> {
             self.meter.node()?;
             type_ = self.instantiate(&type_)?;
             type_ = self.whnf(&type_, locals)?;
-            let ExprNode::ForallE { binder_type, body, .. } = type_.node() else {
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = type_.node()
+            else {
                 return Ok(None);
             };
             let prior = u64::try_from(prior).map_err(|_| UnificationError::ExpressionScope)?;
-            if prior == index { selected = Some(binder_type.clone()); }
+            if prior == index {
+                selected = Some(binder_type.clone());
+            }
             self.meter.node()?;
             let field = Expr::proj(structure.clone(), prior, receiver.clone());
             type_ = self.substitute(body, &field)?;

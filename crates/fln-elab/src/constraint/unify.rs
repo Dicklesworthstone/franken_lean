@@ -14,6 +14,7 @@
 
 mod assignment_universes;
 mod normalize;
+mod proof_irrelevance;
 mod record_eta;
 mod reduce;
 mod residual;
@@ -105,6 +106,10 @@ pub enum UnificationError {
     ExpressionScope,
     Metavariable(MetavarError),
     Universe(UniverseInstantiationError),
+    /// A native proof-conversion check stopped without a Boolean answer.
+    ConversionCheck {
+        outcome: Box<Outcome<Verdict>>,
+    },
     AssignmentCheck {
         id: MVarId,
         outcome: Box<Outcome<Verdict>>,
@@ -128,6 +133,9 @@ impl std::fmt::Display for UnificationError {
             }
             Self::Metavariable(error) => write!(f, "{error}"),
             Self::Universe(error) => write!(f, "{error}"),
+            Self::ConversionCheck { .. } => {
+                write!(f, "kernel proof-conversion check did not complete")
+            }
             Self::AssignmentCheck { id, .. } => write!(
                 f,
                 "kernel did not validate assignment to ?{}",
@@ -753,6 +761,9 @@ impl Engine<'_> {
             }
             Err(UnificationError::Deferred(_)) | Ok(false) => {}
             Err(error) => return Err(error),
+        }
+        if self.proof_irrelevance(&left, &right, locals)? {
+            return Ok(());
         }
         if self.record_eta(&left, &right, locals, pending)? {
             return Ok(());
