@@ -1,0 +1,35 @@
+name: Native pinned compiler snapshot
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-native-toolchain-snapshot.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compiler:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Retain exact configured compiler and native standard library
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/pinned-compiler
+          rustc -Vv > target/pinned-compiler/compiler.txt
+          git rev-parse HEAD > target/pinned-compiler/source-commit.txt
+          tar -czf target/pinned-compiler/compiler.tar.gz -C "$(rustc --print sysroot)" bin lib libexec
+          sha256sum target/pinned-compiler/compiler.tar.gz > target/pinned-compiler/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-pinned-compiler-${{ github.sha }}
+          path: target/pinned-compiler
+          retention-days: 1
+          if-no-files-found: error
