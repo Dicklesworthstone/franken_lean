@@ -1,12 +1,14 @@
 //! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
-//! Dependent, polymorphic, recursive and proof-valued families remain refusals.
+//! Direct self-recursive object fields are supported; dependent, polymorphic,
+//! higher-order recursive and proof-valued fields remain explicit refusals.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
 use std::collections::BTreeSet;
 
 pub(super) struct Shape {
     pub name: Name,
+    pub recursive: bool,
     pub constructors: Vec<ShapeConstructor>,
 }
 
@@ -35,7 +37,6 @@ impl Preparation<'_> {
             return Ok(None);
         };
         if family.is_unsafe
-            || family.is_rec
             || family.is_reflexive
             || family.num_params != 0
             || family.num_indices != 0
@@ -95,6 +96,7 @@ impl Preparation<'_> {
         }
         Ok(Some(Shape {
             name: name.clone(),
+            recursive: family.is_rec,
             constructors,
         }))
     }
@@ -146,7 +148,9 @@ impl Preparation<'_> {
                                 return None;
                             }
                             match field.node() {
-                                ExprNode::Const { name, .. } => Some(name.clone()),
+                                ExprNode::Const { name, .. } if name != &shape.name => {
+                                    Some(name.clone())
+                                }
                                 _ => None,
                             }
                         })
@@ -163,8 +167,15 @@ impl Preparation<'_> {
                         let mut fields = Vec::new();
                         for field in &ctor.fields {
                             self.tick()?;
-                            let Some((value, _)) = executable_value_type(field, &self.value_types)
-                            else {
+                            let value = if matches!(field.node(), ExprNode::Const { name, levels }
+                                if name == &shape.name && levels.is_empty())
+                            {
+                                ValueType::Constructor
+                            } else if let Some((value, _)) =
+                                executable_value_type(field, &self.value_types)
+                            {
+                                value
+                            } else {
                                 return Ok(None);
                             };
                             reserve(&mut fields, self.limits.max_context_depth)?;
@@ -256,6 +267,9 @@ impl Preparation<'_> {
         let Some(shape) = self.record_shape(&rec.all[0])? else {
             return Ok(None);
         };
+        if shape.recursive {
+            return Ok(None);
+        }
         let [ctor] = shape.constructors.as_slice() else {
             return Ok(None);
         };

@@ -1,39 +1,69 @@
-name: Native recursive data
+name: Native constructor runtime
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/fln-constructor-runtime-landing.yml']
+    paths:
+      - '.github/workflows/fln-constructor-runtime-landing.yml'
+      - 'crates/fln-comp/**'
+      - 'crates/fln-vm/**'
+      - 'crates/fln/src/**'
+      - 'crates/fln/tests/runtime_*.rs'
+      - 'crates/fln-cli/tests/source_variant_runtime.rs'
+      - 'examples/native_variants.lean'
+      - 'examples/native_recursive_data.lean'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
-  group: fln-constructor-runtime-landing
+  group: fln-constructor-runtime-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  integrate:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+  verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-          fetch-depth: 2
-      - name: Apply exact tested recursive data implementation
+          persist-credentials: false
+      - name: Record source identity and install configured compiler
         shell: bash
         run: |
           set -euo pipefail
-          python3 -I <<'PY'
-          import pathlib,hashlib,zlib,base64,subprocess
-          before={'crates/fln-cli/tests/source_variant_runtime.rs':'7bcc598db62ed95f70a30e507450ac2b741de387','crates/fln/src/runtime.rs':'4a9c82cbc2ee47e4fa670564002106e8d105034e','crates/fln/src/runtime/data_recursion.rs':None,'crates/fln/src/runtime/records.rs':'bc8a4bcafc0a141eb10ba9b6ba6bbe75a45cfd61','crates/fln/src/runtime/variants.rs':'72f212fc0ec6b3036da12892a0cc6cf871fc7f6e','crates/fln/tests/runtime_recursive_data.rs':None,'examples/native_recursive_data.lean':None}
-          after={'crates/fln-cli/tests/source_variant_runtime.rs':'41f827110657bfdbadea618c6c8880843b37f4fa','crates/fln/src/runtime.rs':'920da5af684279dc087a2bf78fa845de825f001a','crates/fln/src/runtime/data_recursion.rs':'c6eafe8803002aea9d51572e8ba2374d94a69440','crates/fln/src/runtime/records.rs':'e0213dfd11ae52cdf2ebed1d8fdc7a92455dfa73','crates/fln/src/runtime/variants.rs':'8311ae20e40fc27b8af3aafea2e112f08bfa0165','crates/fln/tests/runtime_recursive_data.rs':'a0d2b117f63a8b91e190ce5598ed1b2fcb5df665','examples/native_recursive_data.lean':'d44ab813d6026e311faaa9cb872ab0020ba236fc'}
-          def verify(rows):
-              for n,h in rows.items():
-                  p=pathlib.Path(n)
-                  if h is None:
-                      assert not p.exists(),n
-                  else:
-                      b=p.read_bytes();assert hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()==h,n
-          verify(before)
-          encoded='''eNrNPWtz2ziS3/0rEE2Vj1zRtCQ/4shjzyYZz05qZzJbmVzqqpIUi6Igi2OK1PDh2OPov193AyDBp2jFt7euVCyRQKPRL3Q3GvDcXyzYwcG1nzL30IvdlCeHiyA88AL/ED6nyWESZbHHnVs39t0wdeIsTP0Vt+OEzR7ZYc8P5/yOPZ953smLM9s+Hi/OJs/HbDwanR4f7x0cHDwah73hcPh4PP7+d3YwnpxYR2yIv47PGDxZhMxfraM45XPVJ3FuOF87q2ieBQDIT/yZH/jpveOGc2fh+kEWc8dNo5XvwVPDZA97DH/cJOFx+sx4FjOINcN8NoY8e09Oj38tt+OMBFBOGA=='''
-          PY
+          mkdir -p target/constructor-runtime
+          git rev-parse HEAD > target/constructor-runtime/tested-commit.txt
+          git rev-parse 'HEAD^{tree}' > target/constructor-runtime/tested-tree.txt
+          channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/constructor-runtime/compiler.txt
+      - name: Test compiler and VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-comp -p fln-vm --no-fail-fast 2>&1 | tee target/constructor-runtime/compiler-vm.log
+      - name: Test native source data and recursion
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib --test runtime_variants --test runtime_recursive_data --test runtime_records --test runtime_nat_recursion --test runtime_local_functions --test runtime_conditionals --test source_record_execution --test source_recursion --no-fail-fast 2>&1 | tee target/constructor-runtime/engine.log
+      - name: Test installed execution imports and replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-cli --test source_variant_runtime --test source_record_runtime --test source_nat_runtime --test source_local_helpers --test runtime_conditionals --test source_term_binders --no-fail-fast 2>&1 | tee target/constructor-runtime/cli.log
+      - name: Lint and compile downstream targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p fln-comp -p fln-vm -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/constructor-runtime/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/constructor-runtime/workspace.log
+          rustfmt --edition 2024 --check --config skip_children=true crates/fln/src/runtime.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/variants.rs crates/fln/src/runtime/data_recursion.rs crates/fln/tests/runtime_recursive_data.rs crates/fln/tests/runtime_variants.rs crates/fln-cli/tests/source_variant_runtime.rs crates/fln-vm/tests/constructor_dispatch.rs crates/fln-comp/src/ingress/constructor_case.rs
+      - name: Retain exact verification results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: constructor-runtime-${{ github.sha }}
+          path: target/constructor-runtime
+          retention-days: 7
+          if-no-files-found: error

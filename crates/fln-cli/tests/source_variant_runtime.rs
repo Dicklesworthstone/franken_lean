@@ -125,3 +125,48 @@ fn imported_variants_keep_module_visibility_and_failure_atomicity() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn installed_recursive_data_checks_executes_and_replays() {
+    let dir = directory();
+    let source = dir.join("Recursive.lean");
+    let artifact = dir.join("Recursive.flbc");
+    let proof = include_str!("../../../examples/native_recursive_data.lean");
+    std::fs::write(&source, proof).unwrap();
+    let checked = success(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json"])
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(checked.contains("\"authority\":true"), "{checked}");
+    assert!(checked.contains("\"theorems\":1"), "{checked}");
+    std::fs::write(&source, format!("{proof}\n#eval answer")).unwrap();
+    assert_eq!(
+        success(
+            Command::new(env!("CARGO_BIN_EXE_lean"))
+                .arg(&source)
+                .output()
+                .unwrap()
+        ),
+        "42\n"
+    );
+    let report = success(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["run", "--json", "--emit-flbc"])
+            .arg(&artifact)
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(report.contains("\"finalValue\":42"), "{report}");
+    let replay = success(
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["flbc", "run", "--json"])
+            .arg(&artifact)
+            .output()
+            .unwrap(),
+    );
+    assert!(replay.contains("\"returnValue\":42"), "{replay}");
+}

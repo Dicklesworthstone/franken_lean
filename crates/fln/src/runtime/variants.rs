@@ -40,7 +40,7 @@ impl Preparation<'_> {
         let Some(shape) = self.record_shape(&rec.all[0])? else {
             return Ok(None);
         };
-        if shape.constructors.len() != rec.rules.len() {
+        if shape.recursive || shape.constructors.len() != rec.rules.len() {
             return Ok(None);
         }
         let ExprNode::Lam { body: motive, .. } = args[0].node() else {

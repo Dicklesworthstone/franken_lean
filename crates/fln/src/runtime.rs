@@ -3,6 +3,7 @@
 //! This never changes the declaration sent to either checker. Special forms
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
+mod data_recursion;
 mod nat;
 mod records;
 mod variants;
@@ -319,9 +320,13 @@ impl<'a> Preparation<'a> {
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()
-                            && let Some(case) = self.variant_recursor(name, levels, &args)?
+                            && let Some(recursion) = self.data_recursion(name, levels, &args)?
                         {
-                            let required = case.branches.len().saturating_add(2);
+                            let required = recursion
+                                .arguments
+                                .len()
+                                .saturating_add(recursion.domains.len())
+                                .saturating_add(4);
                             if tasks.len().saturating_add(required) > limit {
                                 return Err(IngressError::ResourceLimit {
                                     resource: IngressResource::PendingTasks,
@@ -335,13 +340,31 @@ impl<'a> Preparation<'a> {
                                     requested: tasks.len().saturating_add(required),
                                 }
                             })?;
-                            tasks.push(Task::ConstructorCase {
-                                name: case.name,
-                                result: case.result,
-                                branches: case.branches.len(),
+                            tasks.push(Task::Apply(recursion.arguments.len()));
+                            tasks.extend(recursion.arguments.into_iter().rev().map(Task::Visit));
+                            tasks.push(Task::RecursiveLambda {
+                                parameters: recursion.parameters,
+                                result: recursion.case.result,
                             });
-                            tasks.extend(case.branches.into_iter().rev().map(Task::Visit));
-                            tasks.push(Task::Visit(case.major));
+                            tasks.push(Task::Lam {
+                                name: recursion.name,
+                                type_: recursion.self_type,
+                                info: BinderInfo::Default,
+                            });
+                            for domain in recursion.domains {
+                                tasks.push(Task::Lam {
+                                    name: Name::anonymous(),
+                                    type_: domain,
+                                    info: BinderInfo::Default,
+                                });
+                            }
+                            self.schedule_constructor_case(recursion.case, &mut tasks, limit)?;
+                            continue;
+                        }
+                        if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(case) = self.variant_recursor(name, levels, &args)?
+                        {
+                            self.schedule_constructor_case(case, &mut tasks, limit)?;
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()
@@ -493,6 +516,36 @@ impl<'a> Preparation<'a> {
             return Err(unsupported("runtime preparation result"));
         }
         pop(&mut values)
+    }
+
+    fn schedule_constructor_case(
+        &mut self,
+        case: variants::Case,
+        tasks: &mut Vec<Task>,
+        limit: usize,
+    ) -> Result<(), IngressError> {
+        let required = case.branches.len().saturating_add(2);
+        if tasks.len().saturating_add(required) > limit {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::PendingTasks,
+                limit,
+                observed: tasks.len().saturating_add(required),
+            });
+        }
+        tasks
+            .try_reserve(required)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::PendingTasks,
+                requested: tasks.len().saturating_add(required),
+            })?;
+        tasks.push(Task::ConstructorCase {
+            name: case.name,
+            result: case.result,
+            branches: case.branches.len(),
+        });
+        tasks.extend(case.branches.into_iter().rev().map(Task::Visit));
+        tasks.push(Task::Visit(case.major));
+        Ok(())
     }
 
     fn spine(&mut self, expr: &Expr) -> Result<(Expr, Vec<Expr>), IngressError> {
