@@ -5,9 +5,10 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod nat;
 mod records;
+mod variants;
 
 use super::*;
-use fln_comp::ingress::{BoolCaseBinding, CallableBindings};
+use fln_comp::ingress::{BoolCaseBinding, CallableBindings, ConstructorCaseBinding};
 use std::collections::HashSet;
 
 pub(super) struct Preparation<'a> {
@@ -16,6 +17,8 @@ pub(super) struct Preparation<'a> {
     visited: usize,
     pub(super) lambdas: Vec<LambdaBinding>,
     pub(super) cases: Vec<BoolCaseBinding>,
+    variant_cases: Vec<ConstructorCaseBinding>,
+    next_variant: u64,
     lambda_keys: HashSet<Expr>,
     bool_recursor_checked: bool,
     next_branch: usize,
@@ -27,6 +30,11 @@ pub(super) struct Preparation<'a> {
 }
 
 enum Task {
+    ConstructorCase {
+        name: Name,
+        result: ValueType,
+        branches: usize,
+    },
     RecursiveLambda {
         parameters: Vec<ValueType>,
         result: ValueType,
@@ -61,6 +69,8 @@ impl<'a> Preparation<'a> {
             visited: 0,
             lambdas: Vec::new(),
             cases: Vec::new(),
+            variant_cases: Vec::new(),
+            next_variant: 0,
             lambda_keys: HashSet::new(),
             bool_recursor_checked: false,
             next_branch: 0,
@@ -309,6 +319,32 @@ impl<'a> Preparation<'a> {
                             continue;
                         }
                         if let ExprNode::Const { name, levels } = head.node()
+                            && let Some(case) = self.variant_recursor(name, levels, &args)?
+                        {
+                            let required = case.branches.len().saturating_add(2);
+                            if tasks.len().saturating_add(required) > limit {
+                                return Err(IngressError::ResourceLimit {
+                                    resource: IngressResource::PendingTasks,
+                                    limit,
+                                    observed: tasks.len().saturating_add(required),
+                                });
+                            }
+                            tasks.try_reserve(required).map_err(|_| {
+                                IngressError::AllocationFailure {
+                                    resource: IngressResource::PendingTasks,
+                                    requested: tasks.len().saturating_add(required),
+                                }
+                            })?;
+                            tasks.push(Task::ConstructorCase {
+                                name: case.name,
+                                result: case.result,
+                                branches: case.branches.len(),
+                            });
+                            tasks.extend(case.branches.into_iter().rev().map(Task::Visit));
+                            tasks.push(Task::Visit(case.major));
+                            continue;
+                        }
+                        if let ExprNode::Const { name, levels } = head.node()
                             && let Some(eliminated) = self.record_recursor(name, levels, &args)?
                         {
                             tasks.push(Task::Visit(eliminated));
@@ -387,6 +423,23 @@ impl<'a> Preparation<'a> {
                         }
                         _ => values.push(expr.clone()),
                     }
+                }
+                Task::ConstructorCase {
+                    name,
+                    result,
+                    branches,
+                } => {
+                    let start = values
+                        .len()
+                        .checked_sub(branches.saturating_add(1))
+                        .ok_or_else(|| unsupported("constructor case stack"))?;
+                    for branch in &values[start + 1..] {
+                        self.register_constructor_branch(branch, result)?;
+                    }
+                    let term = values
+                        .drain(start..)
+                        .fold(Expr::const_(name, vec![]), Expr::app);
+                    values.push(term);
                 }
                 Task::RecursiveLambda { parameters, result } => {
                     let lambda = pop(&mut values)?;
@@ -481,7 +534,7 @@ impl<'a> Preparation<'a> {
             functions,
             lambdas: &self.lambdas,
             bool_cases: &self.cases,
-            constructor_cases: &[],
+            constructor_cases: &self.variant_cases,
         }
     }
 }

@@ -1,18 +1,35 @@
-//! Derive object-field layouts from admitted, closed single-constructor types.
+//! Derive object-field layouts from admitted, closed data families.
 //! These are native FIR layouts, not a claim of Reference packed-ABI parity.
 //! Dependent, polymorphic, recursive and proof-valued families remain refusals.
 use super::*;
 use fln_comp::ingress::ConstructorBinding;
 use std::collections::BTreeSet;
 
-struct Shape {
-    name: Name,
-    constructor: Name,
-    fields: Vec<Expr>,
+pub(super) struct Shape {
+    pub name: Name,
+    pub constructors: Vec<ShapeConstructor>,
+}
+
+pub(super) struct ShapeConstructor {
+    pub name: Name,
+    pub tag: u8,
+    pub fields: Vec<Expr>,
+}
+
+impl Shape {
+    pub(super) fn projection(&self, constructor: &ShapeConstructor) -> Name {
+        if self.constructors.len() == 1 {
+            self.name.clone()
+        } else {
+            // Private post-admission projection keys select the exact variant
+            // layout. Only the corresponding tested branch evaluates them.
+            constructor.name.clone()
+        }
+    }
 }
 
 impl Preparation<'_> {
-    fn record_shape(&mut self, name: &Name) -> Result<Option<Shape>, IngressError> {
+    pub(super) fn record_shape(&mut self, name: &Name) -> Result<Option<Shape>, IngressError> {
         self.tick()?;
         let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
             return Ok(None);
@@ -24,48 +41,61 @@ impl Preparation<'_> {
             || family.num_indices != 0
             || family.num_nested != 0
             || family.all != [name.clone()]
-            || family.ctors.len() != 1
+            || family.ctors.is_empty()
             || !family.base.level_params.is_empty()
             || !matches!(family.base.type_.node(), ExprNode::Sort { level } if level.is_never_zero())
         {
             return Ok(None);
         }
-        let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(&family.ctors[0]) else {
-            return Ok(None);
-        };
-        if ctor.is_unsafe
-            || ctor.induct != *name
-            || ctor.num_params != 0
-            || ctor.cidx != 0
-            || !ctor.base.level_params.is_empty()
-        {
-            return Ok(None);
-        }
-        let mut fields = Vec::new();
-        let mut type_ = &ctor.base.type_;
-        while let ExprNode::ForallE {
-            binder_type, body, ..
-        } = type_.node()
-        {
+        let mut constructors = Vec::new();
+        for (index, ctor_name) in family.ctors.iter().enumerate() {
             self.tick()?;
-            // An erased type/index/proof is not an object field. Do not guess
-            // its representation, even when this particular value is unused.
-            if !matches!(binder_type.node(), ExprNode::Const { levels, .. } if levels.is_empty()) {
+            let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(ctor_name) else {
+                return Ok(None);
+            };
+            let Ok(tag) = u8::try_from(index) else {
+                return Ok(None);
+            };
+            // FIR ingress validates the ABI tag ceiling before execution.
+            if ctor.is_unsafe
+                || ctor.induct != *name
+                || ctor.num_params != 0
+                || ctor.cidx as usize != index
+                || !ctor.base.level_params.is_empty()
+            {
                 return Ok(None);
             }
-            reserve(&mut fields, self.limits.max_context_depth)?;
-            fields.push(binder_type.clone());
-            type_ = body;
-        }
-        if fields.len() != ctor.num_fields as usize
-            || !matches!(type_.node(), ExprNode::Const { name: result, levels } if result == name && levels.is_empty())
-        {
-            return Ok(None);
+            let mut fields = Vec::new();
+            let mut type_ = &ctor.base.type_;
+            while let ExprNode::ForallE {
+                binder_type, body, ..
+            } = type_.node()
+            {
+                self.tick()?;
+                // Types, indices and proofs are not guessed runtime fields.
+                if !matches!(binder_type.node(), ExprNode::Const { levels, .. } if levels.is_empty())
+                {
+                    return Ok(None);
+                }
+                reserve(&mut fields, self.limits.max_context_depth)?;
+                fields.push(binder_type.clone());
+                type_ = body;
+            }
+            if fields.len() != ctor.num_fields as usize
+                || !matches!(type_.node(), ExprNode::Const { name: result, levels } if result == name && levels.is_empty())
+            {
+                return Ok(None);
+            }
+            reserve(&mut constructors, self.limits.fir.max_constructors)?;
+            constructors.push(ShapeConstructor {
+                name: ctor.base.name.clone(),
+                tag,
+                fields,
+            });
         }
         Ok(Some(Shape {
             name: name.clone(),
-            constructor: ctor.base.name.clone(),
-            fields,
+            constructors,
         }))
     }
 
@@ -108,8 +138,9 @@ impl Preparation<'_> {
                         return Ok(None);
                     };
                     let dependencies: Vec<_> = shape
-                        .fields
+                        .constructors
                         .iter()
+                        .flat_map(|ctor| &ctor.fields)
                         .filter_map(|field| {
                             if scalar_type(field).is_some() {
                                 return None;
@@ -128,25 +159,27 @@ impl Preparation<'_> {
                     }
                 }
                 Task::Finish(shape) => {
-                    let mut fields = Vec::new();
-                    for field in &shape.fields {
-                        self.tick()?;
-                        let Some((value, _)) = executable_value_type(field, &self.value_types)
-                        else {
-                            return Ok(None);
-                        };
-                        reserve(&mut fields, self.limits.max_context_depth)?;
-                        fields.push(value);
+                    for ctor in &shape.constructors {
+                        let mut fields = Vec::new();
+                        for field in &ctor.fields {
+                            self.tick()?;
+                            let Some((value, _)) = executable_value_type(field, &self.value_types)
+                            else {
+                                return Ok(None);
+                            };
+                            reserve(&mut fields, self.limits.max_context_depth)?;
+                            fields.push(value);
+                        }
+                        reserve(&mut self.constructors, self.limits.fir.max_constructors)?;
+                        self.constructors.push(ConstructorBinding {
+                            name: ctor.name.clone(),
+                            projection_structure: Some(shape.projection(ctor)),
+                            universe_arity: 0,
+                            tag: ctor.tag,
+                            fields,
+                            static_scalar_bytes: Vec::new(),
+                        });
                     }
-                    reserve(&mut self.constructors, self.limits.fir.max_constructors)?;
-                    self.constructors.push(ConstructorBinding {
-                        name: shape.constructor,
-                        projection_structure: Some(shape.name.clone()),
-                        universe_arity: 0,
-                        tag: 0,
-                        fields,
-                        static_scalar_bytes: Vec::new(),
-                    });
                     active.remove(&shape.name);
                     self.value_types.records.insert(shape.name);
                 }
@@ -223,9 +256,10 @@ impl Preparation<'_> {
         let Some(shape) = self.record_shape(&rec.all[0])? else {
             return Ok(None);
         };
-        if rec.rules[0].ctor != shape.constructor
-            || rec.rules[0].nfields as usize != shape.fields.len()
-        {
+        let [ctor] = shape.constructors.as_slice() else {
+            return Ok(None);
+        };
+        if rec.rules[0].ctor != ctor.name || rec.rules[0].nfields as usize != ctor.fields.len() {
             return Ok(None);
         }
         let ExprNode::Lam { body: motive, .. } = args[0].node() else {
@@ -238,7 +272,7 @@ impl Preparation<'_> {
         let mut body = args[1]
             .lift_loose(0, 1)
             .map_err(|_| unsupported("record minor scope"))?;
-        for index in 0..shape.fields.len() {
+        for index in 0..ctor.fields.len() {
             self.tick()?;
             let field = Expr::proj(shape.name.clone(), index as u64, major.clone());
             body = self.minor_apply(body, field)?;
