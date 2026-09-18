@@ -546,6 +546,7 @@ fn nat_definition_token_table() -> TokenTable {
         "Prop",
         "_",
         "?",
+        "@",
         "{",
         ".",
         "}",
@@ -630,6 +631,7 @@ fn source_module_token_table() -> TokenTable {
         "Prop",
         "_",
         "?",
+        "@",
         "{",
         ".",
         "}",
@@ -965,6 +967,30 @@ fn finish_bounded_application(
     grammar: DefinitionGrammar,
     empty_at: usize,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    if grammar == DefinitionGrammar::Scalar {
+        // `@` binds to one atomic term, before application. Fold right-to-left
+        // so parenthesized heads and explicit universe suffixes retain their
+        // original leaves without another recursive parser invocation.
+        let mut explicit = Vec::with_capacity(terms.len());
+        while let Some((term, at)) = terms.pop() {
+            if matches!(&term, Syntax::Atom { val, .. } if val == "@") {
+                let Some((head, _)) = explicit.pop() else {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, at),
+                        expected: grammar.value_expectation(),
+                    });
+                };
+                explicit.push((
+                    Syntax::node(parser_kind(&["Term", "explicit"]), vec![term, head]),
+                    at,
+                ));
+            } else {
+                explicit.push((term, at));
+            }
+        }
+        explicit.reverse();
+        terms = explicit;
+    }
     let Some((_, first_index)) = terms.first() else {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, empty_at),
@@ -978,7 +1004,7 @@ fn finish_bounded_application(
         tokens.get(*first_index).map(|token| &token.kind),
         Some(TokenKind::Ident(_))
     ) && !(grammar == DefinitionGrammar::Scalar
-        && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if symbol == "("))
+        && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "(" | "@")))
     {
         let at = terms.get(1).map_or(*first_index, |(_, index)| *index);
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -1286,6 +1312,15 @@ fn bounded_term_spliced(
                     .application
                     .push((proof, index));
                 cursor = end;
+            }
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "@" =>
+            {
+                frames
+                    .last_mut()
+                    .expect("root term frame")
+                    .application
+                    .push((leaves.leaf(index)?, index));
             }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "?" =>

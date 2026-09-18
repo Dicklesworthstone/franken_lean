@@ -683,7 +683,15 @@ impl Context {
         term: Typed,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let mut term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
+        let term = self.insert_implicits(term, ImplicitInsertion::Expected(expected))?;
+        self.finish_explicit_term(term, expected)
+    }
+
+    fn finish_explicit_term(
+        &mut self,
+        mut term: Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         // Resolve known dictionaries before their dependent result types enter
         // unification. Unknown class inputs still wait for the expected type.
         self.resolve_instances(false)?;
@@ -693,6 +701,35 @@ impl Context {
         self.resolve_instances(false)?;
         term.value = self.lower_matrix_call(&term.value)?;
         Ok(term)
+    }
+
+    /// Explicit application is a property of this syntactic head, not of a
+    /// value or its binder types. It must not leak into argument elaboration.
+    fn explicit_application_head<'a>(
+        &mut self,
+        mut syntax: &'a Syntax,
+    ) -> Result<(&'a Syntax, bool), NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                syntax = inner;
+                continue;
+            }
+            let kind = parser_kind(&["Term", "explicit"]);
+            if syntax.kind() != Some(&kind) {
+                return Ok((syntax, false));
+            }
+            let parts = expect_node(syntax, &kind, 2, "explicit application")?;
+            expect_atom(&parts[0], "@", "explicit application prefix")?;
+            let head = &parts[1];
+            if !matches!(head, Syntax::Ident { .. })
+                && head.kind() != Some(&parser_kind(&["Term", "explicitUniv"]))
+                && head.kind() != Some(&parser_kind(&["Term", "proj"]))
+            {
+                return Err(failure(SourceInferenceError::ExpectedFunction));
+            }
+            return Ok((head, true));
+        }
     }
 
     fn term(
@@ -726,9 +763,9 @@ impl Context {
             RecordNext(record_terms::RecordBuild<'a>),
             RecordField(record_terms::RecordBuild<'a>, Expr),
             Visit(&'a Syntax, Option<Expr>, bool),
-            Function(&'a [Syntax], Option<Expr>),
-            Argument(Typed, Expr, &'a [Syntax], Option<Expr>),
-            Apply(Typed, &'a [Syntax], Option<Expr>),
+            Function(&'a [Syntax], Option<Expr>, bool),
+            Argument(Typed, Expr, &'a [Syntax], Option<Expr>, bool),
+            Apply(Typed, &'a [Syntax], Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
             Arrow(Option<Expr>),
             BinderNext(binders::Telescope<'a>),
@@ -811,6 +848,12 @@ impl Context {
                         Task::Visit(syntax, expected, finish) => {
                             if let Some(inner) = parenthesized_inner(syntax)? {
                                 tasks.push(Task::Visit(inner, expected, finish));
+                                continue;
+                            }
+                            let (head, explicit) = self.explicit_application_head(syntax)?;
+                            if explicit {
+                                tasks.push(Task::Function(&[], expected, true));
+                                tasks.push(Task::Visit(head, None, false));
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
@@ -1007,7 +1050,7 @@ impl Context {
                                     expect_atom(&parts[0], "¬", "negation prefix")?;
                                     let function =
                                         self.constant(&Name::from_components(["Not"]))?;
-                                    tasks.push(Task::Apply(function, &parts[1..], expected));
+                                    tasks.push(Task::Apply(function, &parts[1..], expected, false));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "app"]) {
@@ -1019,8 +1062,10 @@ impl Context {
                                             SourceInferenceError::ExpectedFunction,
                                         ));
                                     }
-                                    tasks.push(Task::Function(arguments, expected));
-                                    tasks.push(Task::Visit(&parts[0], None, false));
+                                    let (head, explicit) =
+                                        self.explicit_application_head(&parts[0])?;
+                                    tasks.push(Task::Function(arguments, expected, explicit));
+                                    tasks.push(Task::Visit(head, None, false));
                                     continue;
                                 }
                                 if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
@@ -1338,16 +1383,20 @@ impl Context {
                             }
                             tasks.push(Task::Proof(proof));
                         }
-                        Task::Function(arguments, expected) => {
+                        Task::Function(arguments, expected, explicit) => {
                             let function = values.pop().expect("function task follows its visit");
-                            tasks.push(Task::Apply(function, arguments, expected));
+                            tasks.push(Task::Apply(function, arguments, expected, explicit));
                         }
-                        Task::Apply(function, arguments, expected) => {
+                        Task::Apply(function, arguments, expected, explicit) => {
                             if let Some((first, rest)) = arguments.split_first() {
-                                let function = self.insert_implicits(
-                                    function,
-                                    ImplicitInsertion::ExplicitArgument,
-                                )?;
+                                let function = if explicit {
+                                    function
+                                } else {
+                                    self.insert_implicits(
+                                        function,
+                                        ImplicitInsertion::ExplicitArgument,
+                                    )?
+                                };
                                 let function = self.coerce_function(function)?;
                                 let ExprNode::ForallE {
                                     binder_type, body, ..
@@ -1366,13 +1415,19 @@ impl Context {
                                 {
                                     self.constrain_result_hint(&codomain, expected)?;
                                 }
-                                tasks.push(Task::Argument(function, codomain, rest, expected));
+                                tasks.push(Task::Argument(
+                                    function, codomain, rest, expected, explicit,
+                                ));
                                 tasks.push(Task::Visit(first, Some(domain), true));
                             } else {
-                                values.push(self.finish_term(function, expected.as_ref())?);
+                                values.push(if explicit {
+                                    self.finish_explicit_term(function, expected.as_ref())?
+                                } else {
+                                    self.finish_term(function, expected.as_ref())?
+                                });
                             }
                         }
-                        Task::Argument(function, codomain, rest, expected) => {
+                        Task::Argument(function, codomain, rest, expected, explicit) => {
                             let argument = values.pop().expect("argument task follows its visit");
                             let type_ = self.substitute(&codomain, &argument.value)?;
                             tasks.push(Task::Apply(
@@ -1382,6 +1437,7 @@ impl Context {
                                 },
                                 rest,
                                 expected,
+                                explicit,
                             ));
                         }
                         Task::Infix(intrinsic, expected) => {
