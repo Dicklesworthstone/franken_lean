@@ -57,7 +57,7 @@ fn inline_simp_attributes_are_registered_only_after_checked_admission() {
     for bad in [
         "@[simp] theorem circular (n : Nat) : wrap n = n := by simp",
         "@[simp] theorem bad : (0 : Nat) = 1 := by rfl",
-        "@[simp] theorem unsupported (p : Prop) (h : p) : p := by exact h",
+        "@[simp ←] theorem unsupported (p : Prop) (h : p) : p := by exact h",
         "@[simp ←] def backwards (n : Nat) := n",
     ] {
         refused(&defined, bad);

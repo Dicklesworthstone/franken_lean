@@ -28,6 +28,92 @@ impl SimpRule<'_> {
 }
 
 impl Context {
+    /// Recognize a refutation only when the antecedent is known to be a
+    /// proposition. An unknown sort is not permission to guess Prop.
+    pub(super) fn simp_negated_proposition(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        self.tick()?;
+        let ExprNode::ForallE {
+            binder_type, body, ..
+        } = type_.node()
+        else {
+            return Ok(None);
+        };
+        if !matches!(body.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(["False"]) && levels.is_empty())
+        {
+            return Ok(None);
+        }
+        let Some(sort) = self.known_type(binder_type)? else {
+            return Ok(None);
+        };
+        let sort = self.whnf(&sort)?;
+        Ok(
+            matches!(sort.node(), ExprNode::Sort { level } if level.is_zero())
+                .then(|| binder_type.clone()),
+        )
+    }
+
+    /// A selected proof of P rewrites P to True; a selected refutation rewrites
+    /// P to False. Build an actual equivalence, retaining the original evidence,
+    /// then use the same explicit propext/transport path as Iff rewrite rules.
+    pub(super) fn simp_proposition_rewrite_rule(
+        &mut self,
+        rule: Typed,
+        reverse: bool,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        if equality_target(&rule.type_).is_some() {
+            return Ok(rule);
+        }
+        self.tick()?;
+        let Some(sort) = self.known_type(&rule.type_)? else {
+            return Ok(rule);
+        };
+        let sort = self.whnf(&sort)?;
+        if sort.has_expr_mvar()
+            || sort.has_level_mvar()
+            || !self.proof_types_match(&sort, &Expr::sort(Level::zero()))?
+        {
+            return Ok(rule);
+        }
+        // Reversing a fact's generated True/False rule is not an orientation
+        // request on an equality. Keep that unsupported form a typed refusal.
+        if reverse {
+            return Err(error(TacticError::ExpectedEquality));
+        }
+        let lambda = |domain, body| Expr::lam(Name::anonymous(), domain, body, BinderInfo::Default);
+        let (left, right, forward, backward) =
+            if let Some(proposition) = self.simp_negated_proposition(&rule.type_)? {
+                let false_ = self.constant(&Name::from_components(["False"]))?.value;
+                let recursor =
+                    Expr::const_(Name::from_components(["False", "rec"]), vec![Level::zero()]);
+                let motive = lambda(false_.clone(), proposition.clone());
+                let from_false = lambda(
+                    false_.clone(),
+                    app(recursor, [motive, Expr::bvar(0).expect("zero index")]),
+                );
+                (proposition, false_, rule.value, from_false)
+            } else {
+                let true_ = self.constant(&Name::from_components(["True"]))?.value;
+                let intro = self
+                    .constant(&Name::from_components(["True", "intro"]))?
+                    .value;
+                let to_true = lambda(rule.type_.clone(), intro);
+                let from_true = lambda(true_.clone(), rule.value);
+                (rule.type_, true_, to_true, from_true)
+            };
+        let iff = self.constant(&Name::from_components(["Iff"]))?.value;
+        let intro = self
+            .constant(&Name::from_components(["Iff", "intro"]))?
+            .value;
+        Ok(Typed {
+            value: app(intro, [left.clone(), right.clone(), forward, backward]),
+            type_: app(iff, [left, right]),
+        })
+    }
+
     /// An erasure names a global declaration, even when a local has the same
     /// spelling. Hypothesis erasure belongs to the separate `[*]` profile.
     fn simp_erasure_name(&mut self, name: &Name) -> Result<Name, NatDefinitionElabError> {
@@ -328,7 +414,7 @@ impl Context {
             lctx: self.txn.lctx.clone(),
             introduced: Vec::new(),
         };
-        if let Some(value) = self.automatic_reflexivity_candidate(&goal, false)? {
+        if let Some(value) = self.simp_reflexivity(&goal)? {
             return Ok(Some(value));
         }
         if rules.is_empty() {
@@ -451,7 +537,22 @@ impl Context {
         &mut self,
         goal: &ProofGoal,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
-        let Some(candidate) = self.automatic_reflexivity_candidate(goal, false)? else {
+        let target = self.whnf_with_transparency(
+            &goal.target,
+            UnificationTransparency::Abbreviations,
+            false,
+        )?;
+        let candidate = if matches!(target.node(), ExprNode::Const { name, levels }
+            if name == &Name::from_components(["True"]) && levels.is_empty())
+        {
+            Some(
+                self.constant(&Name::from_components(["True", "intro"]))?
+                    .value,
+            )
+        } else {
+            self.automatic_reflexivity_candidate(goal, false)?
+        };
+        let Some(candidate) = candidate else {
             return Ok(None);
         };
         let target = self.instantiate(&goal.target)?;

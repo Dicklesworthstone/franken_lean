@@ -227,8 +227,19 @@ and plan §4.2's named-axiom contract.
 fln check-source --json examples/native_logical_rewriting.lean
 ```
 
-General proposition-to-True/False compilation, binder-opening congruence, and
-complete Reference simp semantics remain outside this increment.
+Selected proposition proofs now compile to proof-producing rules `P = True`;
+selected refutations (`¬ P` or `P -> False`) compile to `P = False`. Quantified
+parameters are inferred from occurrences and conditional premises still require
+selected evidence. Forward registered theorem rules support these conclusions
+too. The generated equivalence keeps the original proof, `Iff.intro`, and, for
+refutations, `False.rec`; the existing explicit `propext` path then supplies the
+equality transport. A resulting `True` goal closes with checked `True.intro`.
+No Boolean truth oracle, new axiom, or unselected local assumption is used.
+
+These rules work in goals, named hypothesis types, and well-typed type-valued
+contexts. Reversing a proposition fact's generated True/False rule is refused;
+explicit Eq/Iff reverse rules retain their existing behavior. Binder-opening
+congruence and complete Reference simp semantics remain outside this increment.
 
 `Engine::admit_source_declaration` checks one definition or theorem without execution. `Engine::check_source_files` checks an ordered batch and returns a `SourceFileCheck` only on complete success. Both use the existing K1 plus independent-checker council and immutable publication path.
 

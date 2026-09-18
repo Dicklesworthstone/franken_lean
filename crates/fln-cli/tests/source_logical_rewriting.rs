@@ -14,6 +14,8 @@ fn logical_rewrites_check_real_files_and_never_publish_a_failed_batch() {
         "@[simp] theorem invalid (P Q : Prop) : P ↔ Q := by constructor; intro h; exact h",
         "theorem invalid (P Q R : Prop) (h : R -> (P ↔ Q)) (q : Q) : P := by simp only [h]; exact q",
         "theorem invalid : (0 : Nat) = 1 := by simp",
+        "theorem missing (P R : Prop) (h : R -> P) (r : R) : P := by simp only [h]",
+        "theorem refuted (P : Prop) (h : ¬ P) : P := by simp only [h]",
     ] {
         std::fs::write(&bad, invalid).unwrap();
         for success in [false, true] {
@@ -32,7 +34,7 @@ fn logical_rewrites_check_real_files_and_never_publish_a_failed_batch() {
             if success {
                 let json = String::from_utf8(output.stdout).unwrap();
                 for field in [
-                    "\"theorems\":5",
+                    "\"theorems\":8",
                     "\"executed\":false",
                     "\"outcome\":\"complete\"",
                 ] {

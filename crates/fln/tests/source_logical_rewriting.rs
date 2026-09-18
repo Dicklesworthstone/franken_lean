@@ -233,3 +233,108 @@ fn conditional_equivalence_failure_restores_alternatives_and_retains_side_goals(
         "theorem missing (P Q R : Prop) (h : R -> (P ↔ Q)) (q : Q) : P := by rw [h]; exact q",
     );
 }
+
+#[test]
+fn selected_propositions_and_refutations_rewrite_nested_contexts() {
+    let base = engine();
+    check(
+        &base,
+        r#"
+      theorem truth (P : Prop) (h : P) : P = True := by simp only [h]
+      theorem falsehood (P : Prop) (h : ¬ P) : P = False := by simp only [h]
+      theorem falseArrow (P : Prop) (h : P -> False) : P = False := by simp only [h]
+      theorem terminal (P : Prop) (h : P) : P := by simp only [h]
+      theorem trivial : True := by simp only []
+      theorem nested (P : Prop) (F : Prop -> Prop) (h : P) (q : F True) : F P := by
+        simp only [h]
+        exact q
+      def typeTransport (P : Prop) (F : Prop -> Type) (h : ¬ P) (q : F False) : F P := by
+        simp only [h]
+        exact q
+      theorem hypothesis (P : Prop) (F : Prop -> Prop) (h : P) (q : F P) : F True := by
+        simp only [h] at q
+        exact q
+      theorem binder (P : Prop) (h : P) : (∀ n : Nat, P) = (∀ n : Nat, True) := by
+        simp only [h]
+    "#,
+    );
+}
+
+#[test]
+fn quantified_facts_infer_indices_and_keep_conditional_obligations() {
+    let base = engine();
+    check(
+        &base,
+        r#"
+      theorem positive (P : Nat -> Prop) (h : ∀ n : Nat, P n) (n : Nat) : P n = True := by
+        simp only [h]
+      theorem negative (P : Nat -> Prop) (h : ∀ n : Nat, ¬ P n) (n : Nat) : P n = False := by
+        simp only [h]
+      theorem condition (P R : Prop) (h : R -> P) (r : R) : P = True := by
+        simp only [h, r]
+    "#,
+    );
+    for source in [
+        "theorem missing (P R : Prop) (h : R -> P) (r : R) : P = True := by simp only [h]",
+        "theorem cyclic (P : Prop) (h : P -> P) : P := by simp only [h]",
+        "theorem data (n : Nat) : False := by simp only [n]",
+        "theorem invalid (P : Prop) (h : ¬ P) : P := by simp only [h]",
+        "theorem reversed (P : Prop) (h : P) : P = True := by simp only [← h]",
+    ] {
+        refuse(&base, source);
+    }
+    check(
+        &base,
+        "theorem recovery (P : Prop) (h : P) : P := by simp only [h]",
+    );
+}
+
+#[test]
+fn registered_proposition_rules_persist_without_leaking_to_old_snapshots() {
+    let base = engine();
+    let registered = check(
+        &base,
+        r#"
+      inductive Known (n : Nat) : Prop where
+        | intro : Known n
+      @[simp] theorem known (n : Nat) : Known n := by constructor
+    "#,
+    )
+    .engine;
+    check(
+        &registered,
+        "theorem uses (n : Nat) : Known n = True := by simp",
+    );
+    refuse(
+        &registered,
+        "theorem omitted (n : Nat) : Known n = True := by simp only []",
+    );
+    refuse(
+        &registered,
+        "theorem erased (n : Nat) : Known n = True := by simp [-known]",
+    );
+    check(
+        &registered,
+        "theorem retained (n : Nat) : Known n = True := by simp",
+    );
+    assert!(
+        fln_elab::source::scope::simp::read(base.environment())
+            .unwrap()
+            .is_empty()
+    );
+    for source in [
+        "theorem old (P : Prop) (h : P) : P = True := by rw [h]",
+        "theorem bad (P : Prop) (h : P) : False := by simp only [h]",
+    ] {
+        refuse(&base, source);
+    }
+    check(
+        &base,
+        r#"
+      theorem restored (P Q : Prop) (h : P) (q : Q) : Q := by
+        first
+        | simp only [h]; fail
+        | exact q
+    "#,
+    );
+}

@@ -166,7 +166,7 @@ impl std::fmt::Display for SimpSetError {
             }
             Self::UnsupportedDeclaration(n) => write!(
                 f,
-                "simp requires a safe definition or equality lemma: {}",
+                "simp requires a safe definition or supported proof rule: {}",
                 n.to_display_string()
             ),
         }
@@ -195,12 +195,16 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
         .ok_or_else(|| SimpSetError::UnknownDeclaration(name.clone()))?;
     let mut ty = match info {
         ConstantInfo::Defn(d) if d.safety == DefinitionSafety::Safe && !reverse => return Ok(()),
+        // Theorem admission already establishes that the complete telescope is
+        // a proposition. Forward rules can now compile its conclusion to True
+        // or a final refutation to False; no new typing authority is added here.
+        ConstantInfo::Thm(_) if !reverse => return Ok(()),
         ConstantInfo::Thm(t) => &t.base.type_,
         ConstantInfo::Axiom(a) if !a.is_unsafe => &a.base.type_,
         _ => return Err(SimpSetError::UnsupportedDeclaration(name.clone())),
     };
-    // Keep this admission-independent classifier bounded. Arbitrary aliases
-    // and proposition-to-Boolean rule compilation are separate profiles.
+    // Reversed rules and axioms retain the bounded equality/Iff classifier.
+    // In particular a data-valued axiom is not classified as a proposition.
     let mut applications = 0;
     for _ in 0..MAX_ROWS {
         match ty.node() {

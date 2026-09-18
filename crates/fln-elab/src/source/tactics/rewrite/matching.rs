@@ -245,6 +245,13 @@ impl Context {
         loop {
             template.tick()?;
             rule.type_ = template.whnf(&rule.type_)?;
+            // A refutation is a rewrite of its proposition to False, not an
+            // implication whose antecedent simp must first prove. Stop before
+            // consuming that final proof binder; outer parameters still infer
+            // normally from the selected occurrence.
+            if inside_out && template.simp_negated_proposition(&rule.type_)?.is_some() {
+                break;
+            }
             let ExprNode::ForallE {
                 binder_type,
                 body,
@@ -277,7 +284,15 @@ impl Context {
         let resolution = template.resolve_instances(false);
         self.charge_rewrite_trial(&template);
         resolution?;
-        let compiled = template.equivalence_rewrite_rule(rule);
+        let compiled = (|| {
+            let rule = template.equivalence_rewrite_rule(rule)?;
+            if inside_out {
+                let rule = template.simp_proposition_rewrite_rule(rule, reverse)?;
+                template.equivalence_rewrite_rule(rule)
+            } else {
+                Ok(rule)
+            }
+        })();
         self.charge_rewrite_trial(&template);
         let rule = compiled?;
         let Some((_, alpha, lhs, rhs)) = equality_target(&rule.type_) else {

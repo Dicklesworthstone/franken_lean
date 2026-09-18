@@ -22,3 +22,13 @@ theorem localTransport (P Q : Prop) (h : P ↔ Q) (p : P) : Q := by
 theorem conditional (P Q R : Prop) (h : R -> (P ↔ Q)) (r : R) (q : Q) : P := by
   simp only [h, r]
   exact q
+
+theorem positiveFact (P : Nat -> Prop) (h : ∀ n : Nat, P n) (n : Nat) : P n = True := by
+  simp only [h]
+
+theorem negativeFact (P : Prop) (h : ¬ P) : P = False := by
+  simp only [h]
+
+theorem nestedFact (P : Prop) (F : Prop -> Prop) (h : P) (q : F True) : F P := by
+  simp only [h]
+  exact q
