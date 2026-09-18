@@ -4,10 +4,17 @@
 //! admitted recursor rules. Stuck majors are rebuilt once and unwound, never
 //! resubmitted in an unproductive loop. Neither reduction nor transparency can
 //! publish a declaration or eliminate an original source typing obligation.
+mod quotient;
+
 use super::*;
 use fln_env::constants::{ConstantInfo, RecursorVal};
 
 enum Continuation {
+    Quotient {
+        head: Expr,
+        arguments: Vec<Expr>,
+        major: usize,
+    },
     Projection {
         structure: Name,
         index: u64,
@@ -111,6 +118,19 @@ impl Context {
                                 levels,
                             )?;
                         }
+                        Some(ConstantInfo::Quot(_)) => {
+                            let Some(major) = self.source_quotient_major(&head, arguments.len())?
+                            else {
+                                break;
+                            };
+                            let value = arguments[arguments.len() - major - 1].clone();
+                            continuations.push(Continuation::Quotient {
+                                head,
+                                arguments: std::mem::take(&mut arguments),
+                                major,
+                            });
+                            head = value;
+                        }
                         Some(ConstantInfo::Rec(recursor)) => {
                             let major = recursor_major(&recursor)?;
                             if recursor.is_unsafe
@@ -137,6 +157,25 @@ impl Context {
             while let Some(continuation) = continuations.pop() {
                 self.tick()?;
                 match continuation {
+                    Continuation::Quotient {
+                        head: eliminator,
+                        arguments: mut outer,
+                        major,
+                    } => {
+                        if let Some(reduced) =
+                            self.source_quotient_step(&eliminator, &outer, &head, &arguments)?
+                        {
+                            changed = true;
+                            outer.truncate(outer.len() - major - 1);
+                            head = reduced;
+                            arguments = outer;
+                            continue 'reduce;
+                        }
+                        let position = outer.len() - major - 1;
+                        outer[position] = self.rebuild_application(head, arguments)?;
+                        head = eliminator;
+                        arguments = outer;
+                    }
                     Continuation::Projection {
                         structure,
                         index,

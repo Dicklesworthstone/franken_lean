@@ -13,7 +13,9 @@
 //! recursive Nat family, opaque `String : Sort 1`, the pin-shaped Bool block,
 //! an explicit allowlist of checked scalar Nat operations, and checked String
 //! extern signatures. Nat/Bool constructors and eliminators are real admitted
-//! declarations. String constructors and the rest of Prelude remain separate
+//! declarations. The source seed also admits the canonical quotient quartet and
+//! the explicit `Quot.sound` axiom after Eq. Quotient computation is elaboration,
+//! not a license for runtime execution. String constructors and the rest of Prelude remain separate
 //! ingestion work; this seed does not claim full Prelude compatibility.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
@@ -28,6 +30,8 @@ mod decidable_eq;
 mod decidable_generic;
 pub mod equality;
 mod heterogeneous;
+mod quotient;
+pub use quotient::{quotient_seed_declaration, quotient_sound_seed_declaration};
 pub mod inhabited;
 pub use equality::{eq_seed_declaration, heq_seed_declaration, rfl_seed_declaration};
 
@@ -656,7 +660,7 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 71] {
+pub fn source_seed_declarations() -> [Declaration; 73] {
     let [
         and,
         and_left,
@@ -745,6 +749,8 @@ pub fn source_seed_declarations() -> [Declaration; 71] {
         or_instance,
         implies_instance,
         iff_instance,
+        quotient_seed_declaration(),
+        quotient_sound_seed_declaration(),
     ]
 }
 
@@ -846,6 +852,8 @@ mod tests {
         assert_eq!(declarations[26], rfl_seed_declaration());
         assert_eq!(declarations[51], out_param_seed_declaration());
         assert_eq!(declarations[52], semi_out_param_seed_declaration());
+        assert_eq!(declarations[71], quotient_seed_declaration());
+        assert_eq!(declarations[72], quotient_sound_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"

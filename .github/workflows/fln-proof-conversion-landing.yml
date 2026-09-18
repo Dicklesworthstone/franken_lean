@@ -1,174 +1,25 @@
 name: Native quotient integration
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/fln-proof-conversion-landing.yml']
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
-  verify-and-land:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+  verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    env:
-      RUST_BACKTRACE: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-          fetch-depth: 2
-      - name: Prepare authenticated source transfer and configured compiler
+          persist-credentials: false
+      - name: Verify committed quotient support
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/quotient-integration
-          git rev-parse HEAD > target/quotient-integration/tested-parent.txt
           channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
-          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
-          rustc -Vv > target/quotient-integration/compiler.txt
-          cat > /tmp/apply-native.py <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess, sys, urllib.request, zlib
-          def blob(data):
-              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-          def fetch_blob(sha):
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/'+sha,
-                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  document=json.load(response)
-              assert document['encoding']=='base64'
-              data=base64.b64decode(document['content'])
-              assert blob(data)==sha
-              return data
-          stage=sys.argv[1]
-          if stage=='checker':
-              chunks=['00e51ce277a6448efa5da9c5ee802d6b5519eb37','2ccc4091576be4a9d1902953a0b707109f0d1811','49792ab904e533855ab8792bb729233a7df37238','5806eebb675f675d4e67199123a343122178039d']
-              encoded=b''.join(fetch_blob(sha) for sha in chunks)
-              patch=zlib.decompress(base64.b64decode(encoded,validate=True))
-              assert hashlib.sha256(patch).hexdigest()=='1e472824119e4792e256df18ed56ce99fb9ec8383d0ac5b9485ae03dfe488dbd'
-              before={'crates/fln-checker/src/defeq.rs':'a90282e26865f636188eccd240132203d2b57645','crates/fln-checker/src/defeq/spine.rs':None,'crates/fln-checker/src/whnf.rs':'d31f17f7de39537cc681c648d4c5f64aa30802e3','crates/fln-checker/src/whnf/quotient.rs':None,'crates/fln-checker/tests/admit.rs':'49571801ef9e73a52b297227b6657fa1bf5c0ccc','crates/fln-checker/tests/admit/quotient_computation.rs':None,'crates/fln-checker/tests/defeq.rs':'eb2d16efe41a209789bab4e65e7b3a7cf651cc32'}
-              after={'crates/fln-checker/src/defeq.rs':'4fe4429311680b53b7dad3326ede72f29bcf6ef4','crates/fln-checker/src/defeq/spine.rs':'580981a30f16c86e08147ca2cf8941a39b56704b','crates/fln-checker/src/whnf.rs':'4a44297969b4097b4a88da5931460dfc20151e86','crates/fln-checker/src/whnf/quotient.rs':'a01a4d1633dbdb16f3290ea73f9593f5b5618244','crates/fln-checker/tests/admit.rs':'5f80547c68ba7a3eb4a30b1b36a84da944fcad78','crates/fln-checker/tests/admit/quotient_computation.rs':'a416a57569142a2fdc55025b9b0395e8b318ff92','crates/fln-checker/tests/defeq.rs':'493c5f8b8dca1e17f332ab3798090d0df0d11ea4'}
-          elif stage=='source':
-              carrier=fetch_blob('327497a67f60f5fb2e102c9cbfa8d50249f2fb0a').decode()
-              encoded=carrier.split("base64.b64decode('",1)[1].split("', validate=True)",1)[0]
-              # Authenticate the original source patch after repairing its three
-              # already-identified transfer duplications. No source edits precede
-              # verification of the entire decoded patch and every input blob.
-              for repeated,original in [('X3gm5nc5f3gm5nc5vn','X3gm5nc5vn'),('YJi6m5vYJi6Za','YJi6Za'),('FxOavFtplxOavFxp','FxOavFxp')]:
-                  assert encoded.count(repeated)==1
-                  encoded=encoded.replace(repeated,original,1)
-              patch=zlib.decompress(base64.b64decode(encoded,validate=True))
-              assert hashlib.sha256(patch).hexdigest()=='50d352d16ae305e5523368001d9b3c5cfed0fdc9208b2a084922e71b79531a89'
-              before={'.github/workflows/fln-unifier-integration.yml':'07c0b26424d136560c13de4f1cdba55c8bf83180','crates/fln-cli/tests/source_quotients.rs':None,'crates/fln-elab/src/seed.rs':'2f68b606adf63cfd400ecdfb04ef7085639e40bf','crates/fln-elab/src/seed/quotient.rs':None,'crates/fln-elab/src/source/reduce.rs':'d324e2dca31dbe6a0cb9eccd0dcb21aeac4bede2','crates/fln-elab/src/source/reduce/quotient.rs':None,'crates/fln-elab/tests/support/quotient.rs':'95e9e9ab2900f17ffe8f037206d5b45d38874365','crates/fln/tests/source_quotients.rs':None,'examples/native_quotients.lean':None}
-              after={'.github/workflows/fln-unifier-integration.yml':'162c1838789fbf685761c9765f533ce41deec598','crates/fln-cli/tests/source_quotients.rs':'23521c03093c0072b77345d1636305f206d98ce5','crates/fln-elab/src/seed.rs':'3047826c1e15a684fe6d377846d9492fa7cbe8d8','crates/fln-elab/src/seed/quotient.rs':'9d19b01aa57a58f5a8947bc74076af10554e592a','crates/fln-elab/src/source/reduce.rs':'e9b9d0fd5925a98f478d1ad3cc661babee3d0ffb','crates/fln-elab/src/source/reduce/quotient.rs':'9de428af88e2416e6bc2634e8af89e833094a450','crates/fln-elab/tests/support/quotient.rs':'8f4cce1e27b13f8fa2faec2549a52b0a6bbd876a','crates/fln/tests/source_quotients.rs':'07da9566ffe28e9f4c4e72b0bf47880108dc41a0','examples/native_quotients.lean':'14a0323846fd7a9868bcb84f8e48bf7020a22d41'}
-          else:
-              raise ValueError('unknown integration stage')
-          if not all(pathlib.Path(p).exists() and blob(pathlib.Path(p).read_bytes())==sha for p,sha in after.items()):
-              for name,expected in before.items():
-                  p=pathlib.Path(name)
-                  assert (not p.exists()) if expected is None else blob(p.read_bytes())==expected,name
-              subprocess.run(['git','apply','--check','-'],input=patch,check=True)
-              subprocess.run(['git','apply','-'],input=patch,check=True)
-              rust=[p for p in after if p.endswith('.rs')]
-              subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',*rust],check=True)
-              for name,sha in after.items():
-                  assert blob(pathlib.Path(name).read_bytes())==sha,name
-          pathlib.Path('target/quotient-integration/'+stage+'.patch').write_bytes(patch)
-          pathlib.Path('target/quotient-integration/'+stage+'-files.json').write_text(json.dumps(after,indent=2))
-          if stage=='source':
-              # Retire source mutation once the tested implementation is committed.
-              # Subsequent executions of this lane verify committed code only.
-              read_only='''name: Native quotient integration
-          on:
-            workflow_dispatch:
-          permissions:
-            contents: read
-          jobs:
-            verify:
-              runs-on: ubuntu-24.04
-              timeout-minutes: 25
-              steps:
-                - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-                  with:
-                    persist-credentials: false
-                - name: Verify committed quotient support
-                  shell: bash
-                  run: |
-                    set -euo pipefail
-                    channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
-                    rustup toolchain install "$channel" --profile minimal --component clippy
-                    cargo test --locked -p fln-checker --test defeq --test whnf --test admit --no-fail-fast
-                    cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
-                    cargo test --locked -p fln --test source_quotients --test source_explicit_application --test source_proof_indices --no-fail-fast
-                    cargo test --locked -p fln-cli --test source_quotients --no-fail-fast
-                    cargo clippy --locked -p fln-checker -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
-                    cargo check --locked --workspace --all-targets
-          '''
-              pathlib.Path('.github/workflows/fln-proof-conversion-landing.yml').write_text(read_only)
-          PY
-          cat > /tmp/publish-native.sh <<'SH'
-          set -euo pipefail
-          stage="$1"
-          message="$2"
-          shift 2
-          tested_parent="$(git rev-parse HEAD)"
-          git fetch origin main
-          test "$(git rev-parse origin/main)" = "$tested_parent"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- "$@"
-          if ! git diff --cached --quiet; then
-            git commit -m "$message"
-            git push origin HEAD:main
-          fi
-          git rev-parse HEAD > "target/quotient-integration/$stage-commit.txt"
-          SH
-      - name: Apply independent quotient conversion and metered spine cache
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 -I /tmp/apply-native.py checker
-      - name: Verify independent conversion before publication
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln-checker --test defeq --test whnf --test admit --no-fail-fast 2>&1 | tee target/quotient-integration/checker-tests.log
-          cargo clippy --locked -p fln-checker --all-targets -- -D warnings 2>&1 | tee target/quotient-integration/checker-clippy.log
-          git diff --check
-      - name: Publish independent checker increment directly to main
-        shell: bash
-        run: |
-          bash /tmp/publish-native.sh checker 'feat(checker): compute quotients and telescope eta with metered spine routing' crates/fln-checker/src/defeq.rs crates/fln-checker/src/defeq/spine.rs crates/fln-checker/src/whnf.rs crates/fln-checker/src/whnf/quotient.rs crates/fln-checker/tests/admit.rs crates/fln-checker/tests/admit/quotient_computation.rs crates/fln-checker/tests/defeq.rs
-      - name: Apply source quotient primitives and end-to-end regressions
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 -I /tmp/apply-native.py source
-      - name: Verify source quotient integration through both checking engines
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast 2>&1 | tee target/quotient-integration/parse-elab-tests.log
-          cargo test --locked -p fln --test source_quotients --test source_explicit_application --test source_proof_indices --no-fail-fast 2>&1 | tee target/quotient-integration/source-tests.log
-          cargo test --locked -p fln-cli --test source_quotients --no-fail-fast 2>&1 | tee target/quotient-integration/cli-tests.log
-          cargo clippy --locked -p fln-checker -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/quotient-integration/clippy.log
-          cargo check --locked --workspace --all-targets 2>&1 | tee target/quotient-integration/workspace-check.log
-          git diff --check
-      - name: Publish source quotient increment directly to main
-        shell: bash
-        run: |
-          bash /tmp/publish-native.sh source 'feat(elab): admit and compute quotient primitives in source programs' .github/workflows/fln-proof-conversion-landing.yml .github/workflows/fln-unifier-integration.yml crates/fln-cli/tests/source_quotients.rs crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/quotient.rs crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln/tests/source_quotients.rs examples/native_quotients.lean
-      - name: Retain exact tested code and verification evidence
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD > target/quotient-integration/final-head.txt
-          git diff --binary > target/quotient-integration/unpublished.patch
-          tar -czf target/quotient-integration/tested-source.tar.gz crates/fln-checker/src/defeq.rs crates/fln-checker/src/defeq/spine.rs crates/fln-checker/src/whnf.rs crates/fln-checker/src/whnf/quotient.rs crates/fln-checker/tests/admit.rs crates/fln-checker/tests/admit/quotient_computation.rs crates/fln-checker/tests/defeq.rs crates/fln-cli/tests/source_quotients.rs crates/fln-elab/src/seed.rs crates/fln-elab/src/seed/quotient.rs crates/fln-elab/src/source/reduce.rs crates/fln-elab/src/source/reduce/quotient.rs crates/fln-elab/tests/support/quotient.rs crates/fln/tests/source_quotients.rs examples/native_quotients.lean
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: quotient-integration-${{ github.sha }}
-          path: target/quotient-integration
-          retention-days: 7
-          if-no-files-found: error
+          rustup toolchain install "$channel" --profile minimal --component clippy
+          cargo test --locked -p fln-checker --test defeq --test whnf --test admit --no-fail-fast
+          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
+          cargo test --locked -p fln --test source_quotients --test source_explicit_application --test source_proof_indices --no-fail-fast
+          cargo test --locked -p fln-cli --test source_quotients --no-fail-fast
+          cargo clippy --locked -p fln-checker -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets

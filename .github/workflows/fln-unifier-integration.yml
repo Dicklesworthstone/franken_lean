@@ -42,12 +42,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/unifier-integration/elab-tests.log
+          cargo test --locked -p fln --test source_quotients --no-fail-fast 2>&1 | tee target/unifier-integration/source-quotients.log
+          cargo test --locked -p fln-cli --test source_quotients --no-fail-fast 2>&1 | tee target/unifier-integration/cli-quotients.log
       - name: Check elaborator and downstream compilation
         if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
-          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/unifier-integration/clippy.log
+          cargo clippy --locked -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings 2>&1 | tee target/unifier-integration/clippy.log
           cargo check --locked --workspace --all-targets 2>&1 | tee target/unifier-integration/workspace-check.log
       - name: Retain source and verification logs
         if: always()
