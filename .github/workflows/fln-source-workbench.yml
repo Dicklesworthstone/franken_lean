@@ -59,3 +59,27 @@ jobs:
           path: target/source-workbench
           compression-level: 0
           retention-days: 2
+  compiler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Export configured compiler for offline source tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/source-compiler
+          rustc -Vv > target/source-compiler/compiler.txt
+          tar -C "$(rustc --print sysroot)" -czf target/source-compiler/compiler.tar.gz bin lib
+          sha256sum target/source-compiler/compiler.tar.gz > target/source-compiler/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-compiler-${{ github.sha }}
+          path: target/source-compiler
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
