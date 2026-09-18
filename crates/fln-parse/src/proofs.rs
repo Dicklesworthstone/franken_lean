@@ -458,23 +458,34 @@ fn simplify(
                     }
                     return Err(refusal(view, tokens, at));
                 }
-                let reverse = is(start, "←") || is(start, "<-");
-                let direction = if reverse {
-                    null_node(vec![leaves.leaf(start)?])
+                let rule = if is(start, "-") {
+                    if at != start + 2 || !matches!(tokens[start + 1].kind, TokenKind::Ident(_)) {
+                        return Err(refusal(view, tokens, start + 1));
+                    }
+                    Syntax::node(
+                        parser_kind(&["Tactic", "simpErase"]),
+                        vec![leaves.leaf(start)?, leaves.leaf(start + 1)?],
+                    )
                 } else {
-                    null_node(Vec::new())
+                    let reverse = is(start, "←") || is(start, "<-");
+                    let direction = if reverse {
+                        null_node(vec![leaves.leaf(start)?])
+                    } else {
+                        null_node(Vec::new())
+                    };
+                    let term = bounded_term(
+                        leaves,
+                        view,
+                        tokens,
+                        start + usize::from(reverse)..at,
+                        DefinitionGrammar::Scalar,
+                    )?;
+                    Syntax::node(
+                        parser_kind(&["Tactic", "simpLemma"]),
+                        vec![null_node(Vec::new()), direction, term],
+                    )
                 };
-                let term = bounded_term(
-                    leaves,
-                    view,
-                    tokens,
-                    start + usize::from(reverse)..at,
-                    DefinitionGrammar::Scalar,
-                )?;
-                rows.push(Syntax::node(
-                    parser_kind(&["Tactic", "simpLemma"]),
-                    vec![null_node(Vec::new()), direction, term],
-                ));
+                rows.push(rule);
                 if !end {
                     rows.push(leaves.leaf(at)?);
                 }
@@ -573,6 +584,38 @@ mod simp_tests {
     }
 
     #[test]
+    fn simp_erasures_preserve_structural_names_direction_and_original_leaves() {
+        for tail in [
+            "simp [-h]",
+            "simp only [-h, h, -h, ← k]",
+            "simp [h, /- 🦀 -/ -N.«a.b»,\r\n    <- k,] at hx ⊢",
+            "simp [-_root_.N.h, -«-», -«simp»]",
+        ] {
+            let source = format!("theorem t (n : Nat) : n = n := by\r\n  {tail}\r\n");
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                parsed.reconstruct_normalized().unwrap(),
+                source.replace("\r\n", "\n").as_bytes()
+            );
+            let mut pending = vec![parsed.syntax()];
+            let mut erasures = 0;
+            while let Some(node) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = node {
+                    if kind == &parser_kind(&["Tactic", "simpErase"]) {
+                        assert!(
+                            matches!(args.as_slice(), [Syntax::Atom { val, .. }, Syntax::Ident { .. }] if val == "-")
+                        );
+                        erasures += 1;
+                    }
+                    pending.extend(args);
+                }
+            }
+            assert!(erasures > 0);
+        }
+    }
+
+    #[test]
     fn unsupported_simp_features_are_not_silently_ignored() {
         for tail in [
             "subst",
@@ -583,6 +626,13 @@ mod simp_tests {
             "simp only [<-]",
             "simp only [h] garbage",
             "simp only [by rfl]",
+            "simp [-]",
+            "simp [-1]",
+            "simp [-h x]",
+            "simp [-(h)]",
+            "simp [-← h]",
+            "simp [-h.{u}]",
+            "simp [-h,,k]",
         ] {
             let source = format!("theorem t (x : Nat) : x = x := by {tail}");
             assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");

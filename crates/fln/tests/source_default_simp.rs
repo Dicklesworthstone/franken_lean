@@ -206,6 +206,129 @@ fn only_excludes_defaults_and_erasure_is_snapshot_local() {
 }
 
 #[test]
+fn per_call_erasures_and_readditions_follow_argument_order_without_changing_defaults() {
+    let base = checked(&engine(), &[WRAP, "attribute [simp] unwrap"]).engine;
+    let before = simp::read(base.environment()).unwrap();
+    for rules in [
+        "simp [-unwrap]",
+        "simp [unwrap, -unwrap]",
+        "simp only [unwrap, -unwrap]",
+        "simp only [(unwrap), -unwrap]",
+        "simp [-unwrap, unwrap, -unwrap]",
+    ] {
+        refused(
+            &base,
+            &format!("theorem excluded (n : Nat) : wrap (wrap n) = n := by {rules}"),
+        );
+    }
+    for rules in [
+        "simp [-unwrap, unwrap]",
+        "simp only [-unwrap, unwrap]",
+        "simp only [(unwrap)]",
+        "simp only [unwrap, -unwrap, unwrap]",
+        "simp only [(unwrap n), -unwrap]",
+        "simp [-wrap]",
+        "simp",
+    ] {
+        let result = checked(
+            &base,
+            &[&format!(
+                "theorem restored (n : Nat) : wrap n = n := by {rules}"
+            )],
+        );
+        assert_eq!(simp::read(result.engine.environment()).unwrap(), before);
+    }
+    assert_eq!(simp::read(base.environment()).unwrap(), before);
+}
+
+#[test]
+fn global_erasure_cannot_capture_a_same_named_local_proof() {
+    let base = checked(&engine(), &[WRAP, "attribute [simp] unwrap"]).engine;
+    checked(
+        &base,
+        &[
+            "theorem localRule (f : Nat -> Nat) (n : Nat) (unwrap : f n = n) : f n = n := by simp [unwrap, -unwrap]\n\
+        theorem localAfter (f : Nat -> Nat) (n : Nat) (unwrap : f n = n) : f n = n := by simp [-unwrap, unwrap]",
+        ],
+    );
+    refused(
+        &base,
+        "theorem removed (n unwrap : Nat) : wrap n = n := by simp [-unwrap]",
+    );
+    refused(
+        &base,
+        "theorem missing (n : Nat) (onlyLocal : n = n) : n = n := by simp [-onlyLocal]",
+    );
+}
+
+#[test]
+fn scoped_erasure_and_explicit_unfolding_use_normal_source_resolution() {
+    checked(
+        &engine(),
+        &["namespace A\n\
+        def «wrap.x».{u} {T : Sort u} (x : T) : T := x\n\
+        @[simp] theorem «unwrap.x».{u} {T : Sort u} (x : T) : «wrap.x» x = x := by rfl\n\
+        theorem inNamespace (n : Nat) : «wrap.x» n = n := by simp only [«wrap.x»]\n\
+        end A\nopen A\n\
+        theorem opened (n : Nat) : «wrap.x» n = n := by simp [-«unwrap.x», «wrap.x»]\n\
+        theorem atRoot (n : Nat) : «wrap.x» n = n := by simp [-_root_.A.«unwrap.x», A.«unwrap.x»]\n\
+        theorem higher (T : Type) : «wrap.x» T = T := by simp only [«wrap.x»]\n\
+        theorem grouped (n : Nat) : «wrap.x» n = n := by simp only [((«wrap.x»))]"],
+    );
+    let base = checked(
+        &engine(),
+        &["namespace A\ndef wrap (n : Nat) := n\nend A\nnamespace B\ndef wrap (n : Nat) := n\nend B"],
+    ).engine;
+    refused(
+        &base,
+        "open A B\ntheorem ambiguous (n : Nat) : n = n := by simp [-wrap]",
+    );
+    refused(
+        &base,
+        "open A B\ntheorem ambiguous (n : Nat) : A.wrap n = n := by simp only [wrap]",
+    );
+    refused(
+        &base,
+        "open A\ntheorem shadow (n : Nat) (wrap : Nat) : A.wrap n = n := by simp only [wrap]",
+    );
+}
+
+#[test]
+fn selected_reverse_direction_replaces_the_registered_direction() {
+    checked(
+        &engine(),
+        &["def left (n : Nat) : Nat := n\n\
+        def right (n : Nat) : Nat := n\n\
+        @[simp] theorem bridge (n : Nat) : left n = right n := by rfl\n\
+        theorem reverse (P : Nat -> Prop) (n : Nat) (h : P (left n)) : P (right n) := by simp [← bridge]; exact h\n\
+        theorem forward (P : Nat -> Prop) (n : Nat) (h : P (right n)) : P (left n) := by simp [← bridge, bridge]; exact h"],
+    );
+}
+
+#[test]
+fn erasures_preserve_hypothesis_transport_backtracking_and_failure_atomicity() {
+    let base = checked(&engine(), &[WRAP, "attribute [simp] unwrap"]).engine;
+    let before = simp::read(base.environment()).unwrap();
+    let result = checked(
+        &base,
+        &[
+            "theorem locations (P : Nat -> Prop) (n : Nat) (h : P (wrap n)) : P n := by simp [-unwrap, unwrap] at h; exact h\n\
+        theorem fallback (n : Nat) : wrap n = n := by first | simp [-unwrap] | simp\n\
+        theorem tryMissing (n : Nat) : wrap n = n := by\n  try simp [-unwrap]\n  simp",
+        ],
+    );
+    assert_eq!(simp::read(result.engine.environment()).unwrap(), before);
+    for source in [
+        "theorem bad (n : Nat) : n = n := by simp [-missing]",
+        "theorem bad (n : Nat) : n = n := by simp only [-missing]",
+        "theorem bad (n : Nat) : (0 : Nat) = 1 := by simp [-unwrap]",
+    ] {
+        refused(&base, source);
+    }
+    assert_eq!(simp::read(base.environment()).unwrap(), before);
+}
+
+#[test]
 fn exact_registered_names_cannot_be_captured_by_locals_or_namespaces() {
     let source = "namespace Lib\n\
         def wrap {A : Type} (x : A) : A := x\n\

@@ -28,6 +28,59 @@ impl SimpRule<'_> {
 }
 
 impl Context {
+    /// An erasure names a global declaration, even when a local has the same
+    /// spelling. Hypothesis erasure belongs to the separate `[*]` profile.
+    fn simp_erasure_name(&mut self, name: &Name) -> Result<Name, NatDefinitionElabError> {
+        for _ in 0..self
+            .source_scope
+            .opened
+            .len()
+            .saturating_add(
+                scope::components(&self.source_scope.namespace)
+                    .map_err(|e| failure(SourceInferenceError::NameScope(e)))?
+                    .len(),
+            )
+            .saturating_add(1)
+        {
+            self.tick()?;
+        }
+        self.source_scope
+            .resolve(name, |candidate| self.txn.env.contains(candidate))
+            .map_err(|e| failure(SourceInferenceError::NameScope(e)))?
+            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))
+    }
+
+    /// Keep the origin of a bare global selection while assembling this call's
+    /// rule set. Applied lemmas have their own expression origin: erasing the
+    /// global does not erase an explicitly instantiated proof. Parentheses do
+    /// not change identity, and local shadowing follows ordinary term lookup.
+    fn simp_rule_global(
+        &mut self,
+        mut syntax: &Syntax,
+    ) -> Result<Option<Name>, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                syntax = inner;
+                continue;
+            }
+            match syntax {
+                Syntax::Ident { val, .. } => {
+                    if self.txn.lctx.find_by_user_name(val).is_some() {
+                        return Ok(None);
+                    }
+                    let resolved = self.resolve_source_name(val)?.ok_or_else(|| {
+                        failure(SourceInferenceError::UnknownConstant(val.clone()))
+                    })?;
+                    return Ok((self.txn.lctx.find_by_user_name(&resolved).is_none()
+                        && self.txn.env.contains(&resolved))
+                    .then_some(resolved));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
     fn selected_simp_term(&mut self, rule: &SimpRule<'_>) -> Result<Typed, NatDefinitionElabError> {
         match rule {
             SimpRule::Explicit(rule) => self.simp_rule_term(rule.syntax),
@@ -124,11 +177,33 @@ impl Context {
         expect_atom(open, "[", "simp rule opener")?;
         expect_atom(close, "]", "simp rule closer")?;
         let rows = expect_null_args(rows, "simp rules")?;
-        let mut rules = Vec::new();
+        let mut rules: Vec<(Option<Name>, SimpRule<'a>)> = Vec::new();
         for (index, row) in rows.iter().enumerate() {
             self.tick()?;
             if index % 2 == 1 {
                 expect_atom(row, ",", "simp rule separator")?;
+                continue;
+            }
+            if matches!(row, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "simpErase"]))
+            {
+                let parts = expect_node(
+                    row,
+                    &parser_kind(&["Tactic", "simpErase"]),
+                    2,
+                    "simp erasure",
+                )?;
+                expect_atom(&parts[0], "-", "simp erasure marker")?;
+                let Syntax::Ident { val, .. } = &parts[1] else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let name = self.simp_erasure_name(val)?;
+                for _ in 0..rules.len().saturating_add(defaults.len()) {
+                    self.tick()?;
+                }
+                rules.retain(|(origin, _)| origin.as_ref() != Some(&name));
+                defaults.retain(
+                    |rule| !matches!(rule, SimpRule::Global(entry) if entry.declaration == name),
+                );
                 continue;
             }
             let parts = expect_node(row, &parser_kind(&["Tactic", "simpLemma"]), 3, "simp lemma")?;
@@ -152,15 +227,33 @@ impl Context {
                     pending.extend(args);
                 }
             }
-            rules.push(SimpRule::Explicit(RewriteRule {
-                syntax: &parts[2],
-                reverse,
-            }));
+            let origin = self.simp_rule_global(&parts[2])?;
+            if let Some(name) = &origin {
+                // One selected direction per named rule. In particular,
+                // `simp [← lemma]` must not retain the default forward rule.
+                for _ in 0..rules.len().saturating_add(defaults.len()) {
+                    self.tick()?;
+                }
+                rules.retain(|(previous, _)| previous.as_ref() != Some(name));
+                defaults.retain(
+                    |rule| !matches!(rule, SimpRule::Global(entry) if &entry.declaration == name),
+                );
+            }
+            rules.push((
+                origin,
+                SimpRule::Explicit(RewriteRule {
+                    syntax: &parts[2],
+                    reverse,
+                }),
+            ));
         }
         // Explicit arguments have precedence; registered rules follow in their
         // stable priority/registration order. `only` leaves this tail empty.
-        rules.append(&mut defaults);
-        Ok(rules)
+        Ok(rules
+            .into_iter()
+            .map(|(_, rule)| rule)
+            .chain(defaults)
+            .collect())
     }
 
     fn restore_simp_trial(&mut self, mut original: Self) {

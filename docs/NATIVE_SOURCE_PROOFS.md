@@ -138,6 +138,29 @@ only from the returned snapshot, not from older engine snapshots. Names resolve
 in the current namespace/open scope and are stored as structural global names;
 later local shadowing cannot redirect a registered rule.
 
+### Per-call exclusions and overrides
+
+`simp [-rule]` removes a named global rule for that invocation only; the
+environment journal and later calls are unchanged. Arguments are processed in
+order: `simp only [rule, -rule]` removes the selection, while
+`simp only [-rule, rule]` adds it back. Selecting `← rule` replaces that global
+rule's default forward direction rather than retaining a cyclic pair.
+
+Erasure resolves structural global names through the current namespace and
+`open` scope. A same-named local cannot redirect it. An explicitly selected
+local proof or applied lemma such as `(rule n)` is separate evidence and is not
+removed by `-rule`. Parentheses around a bare global name retain its identity.
+Unknown or ambiguous names are errors; a known declaration absent from the set
+is a no-op (the Reference's warning for this case is not currently emitted).
+
+Explicit definition unfolding uses the same namespace, root-escape, and local
+shadowing rules as ordinary terms, including parenthesized selections. For
+example, after `open Wrapper`, `simp [-unwrap, (wrap)]` unfolds the actual
+`Wrapper.wrap` definition without modifying `Wrapper.unwrap`'s registration.
+Exclusions work at supported named hypotheses and goal locations, with the
+same checked transports and failure-atomic tactic alternatives. `[*]`, local
+hypothesis erasure, and complete upstream selection semantics remain open.
+
 A multi-name attribute command and a multi-file check publish only on complete
 success. Unknown, ambiguous, unsafe, malformed or unsupported registrations
 fail rather than being ignored. Corrupt journals and resource stops cannot be

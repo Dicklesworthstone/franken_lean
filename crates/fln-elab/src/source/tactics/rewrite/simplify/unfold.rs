@@ -46,10 +46,18 @@ impl Context {
     /// name must not accidentally request expansion of a same-named global.
     pub(super) fn unfold_simp_term(
         &mut self,
-        syntax: &Syntax,
+        mut syntax: &Syntax,
         reverse: bool,
         target: &Expr,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            if let Some(inner) = parenthesized_inner(syntax)? {
+                syntax = inner;
+            } else {
+                break;
+            }
+        }
         let Syntax::Ident { val: name, .. } = syntax else {
             return Ok(UnfoldResult::NotDefinition);
         };
@@ -59,6 +67,13 @@ impl Context {
         if self.specialized_induction_rule(syntax)?.is_some() {
             return Ok(UnfoldResult::NotDefinition);
         }
+        let resolved = if self.txn.lctx.find_by_user_name(name).is_some() {
+            name.clone()
+        } else {
+            self.resolve_source_name(name)?
+                .unwrap_or_else(|| name.clone())
+        };
+        let name = &resolved;
         let selection = if let Some(local) = self
             .txn
             .lctx
