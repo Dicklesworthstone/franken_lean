@@ -6,9 +6,9 @@ on:
 permissions:
   contents: read
 jobs:
-  default-simp:
+  inline-simp:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): publish checked default simp and declaration attributes'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): finish inline simp attribute integration on current main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -21,101 +21,70 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-      - name: Retrieve checksum-bound implementation patches
+      - name: Apply the identity-checked inline attribute implementation
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
           import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-simp-evidence'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'inline-simp-evidence'
           root.mkdir()
           (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          specs = [
-              ('registry', 'ff98c37d8b009acf8b7037371b6c4b12fda28c66', 'a187f488a046370be1c5b7d0b7b607b931aa04f59bfa1855cb7bdbd17631f4a7'),
-              ('attributes', '53b291f82f0975b2722ab48fd55c2b5ff77db0b0', '0c57b9bbbeaffc4c9aae499c2c742ff9d227c8db62fc76337b60c9b2521bfbf3'),
-          ]
-          for label, blob, digest in specs:
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + blob,
-                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  data = json.load(response)
-              assert data['encoding'] == 'base64'
-              compressed = base64.b64decode(data['content'])
-              if label == 'attributes':
-                  # Correct one transport character, then require the independently
-                  # recorded original Git-blob and uncompressed-patch identities.
-                  encoded = base64.b64encode(compressed).decode('ascii')
-                  assert encoded.count('sjZ8r2rGcWs7ueWscm') == 1
-                  encoded = encoded.replace('sjZ8r2rGcWs7ueWscm', 'sjZ8r2ZGcWs7ueWscm')
-                  compressed = base64.b64decode(encoded, validate=True)
-                  header = ('blob ' + str(len(compressed)) + '\0').encode()
-                  assert hashlib.sha1(header + compressed).hexdigest() == '2941fd78ee22f41ea1a030ebe186a3a24dbd0d7e'
-              patch = gzip.decompress(compressed)
-              assert hashlib.sha256(patch).hexdigest() == digest, label
-              (root / (label + '.patch')).write_bytes(patch)
-              paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
-              assert len(paths) == len(set(paths)) and paths
-              assert all(path.startswith(('crates/', 'docs/', 'examples/')) and '..' not in path.split('/') for path in paths)
-              assert '\ndeleted file mode ' not in patch.decode()
-              (root / (label + '-paths.json')).write_text(json.dumps(paths))
-          subprocess.run(['git', 'apply', '--check', str(root / 'registry.patch')], check=True)
-          subprocess.run(['git', 'apply', str(root / 'registry.patch')], check=True)
-      - name: Check the default simp registry before its first commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/default-simp-evidence"
-          exec > >(tee "$evidence/registry-validation.log") 2>&1
-          rustup show active-toolchain
-          rustc -Vv
-          cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
-          cargo test --locked -p fln --test source_default_simp --test source_automation --test source_file_check --test source_scopes
-          cargo test --locked -p fln-cli --test source_default_simp
-          cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings
-          git diff --check
-      - name: Commit the tested registry directly to main
-        shell: python
-        run: |
-          import json, os, pathlib, subprocess
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-simp-evidence'
-          paths = json.loads((root / 'registry-paths.json').read_text())
-          subprocess.run(['git', 'add', '--', *paths], check=True)
-          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
-          assert sorted(actual) == sorted(paths), actual
-          subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', 'feat(simp): execute registered default rules through source checking\n\nConnect the persistent checked simp-set journal, standalone registration/removal commands, default simp execution and explicit-only isolation. Preserve structural declaration identity, deterministic ordering, checked transports and failure-atomic publication.\n\nParser/elaborator packages, focused engine and installed-command tests and parser/elaborator Clippy passed before publication. Full workspace and Reference parity are not claimed.'], check=True)
-          (root / 'registry-commit.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+          request = urllib.request.Request(
+              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/53b291f82f0975b2722ab48fd55c2b5ff77db0b0',
+              headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          assert data['encoding'] == 'base64'
+          compressed = base64.b64decode(data['content'])
+          encoded = base64.b64encode(compressed).decode('ascii')
+          assert encoded.count('sjZ8r2rGcWs7ueWscm') == 1
+          encoded = encoded.replace('sjZ8r2rGcWs7ueWscm', 'sjZ8r2ZGcWs7ueWscm')
+          compressed = base64.b64decode(encoded, validate=True)
+          header = ('blob ' + str(len(compressed)) + '\0').encode()
+          assert hashlib.sha1(header + compressed).hexdigest() == '2941fd78ee22f41ea1a030ebe186a3a24dbd0d7e'
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '0c57b9bbbeaffc4c9aae499c2c742ff9d227c8db62fc76337b60c9b2521bfbf3'
+          (root / 'attributes.patch').write_bytes(patch)
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert len(paths) == len(set(paths)) and paths
+          assert all(path.startswith(('crates/', 'docs/', 'examples/')) and '..' not in path.split('/') for path in paths)
+          assert '\ndeleted file mode ' not in patch.decode()
+          (root / 'paths.json').write_text(json.dumps(paths))
           subprocess.run(['git', 'apply', '--check', str(root / 'attributes.patch')], check=True)
           subprocess.run(['git', 'apply', str(root / 'attributes.patch')], check=True)
-      - name: Check declaration attributes across the full source product path
+      - name: Check native proof admission and the updated installed LSP surface
         shell: bash
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/default-simp-evidence"
-          exec > >(tee "$evidence/attributes-validation.log") 2>&1
+          evidence="$RUNNER_TEMP/inline-simp-evidence"
+          exec > >(tee "$evidence/validation.log") 2>&1
+          rustup show active-toolchain
+          rustc -Vv
+          cargo test --locked -p fln-cli --test lsp_stdio_e2e
           cargo test --locked -p fln-parse -p fln-elab --no-fail-fast
-          cargo test --locked -p fln --no-fail-fast
+          cargo test --locked -p fln --test source_default_simp --test source_automation --test source_file_check --test source_scopes
           cargo test --locked -p fln-cli --no-fail-fast
           cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
           git diff --check
-      - name: Commit tested inline attributes directly to main
+      - name: Commit the checked attribute implementation directly to main
         shell: python
         run: |
           import json, os, pathlib, subprocess
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'default-simp-evidence'
-          paths = json.loads((root / 'attributes-paths.json').read_text())
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'inline-simp-evidence'
+          paths = json.loads((root / 'paths.json').read_text())
           subprocess.run(['git', 'add', '--', *paths], check=True)
           actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
           assert sorted(actual) == sorted(paths), actual
-          subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', 'feat(simp): admit inline simp attributes with atomic checked publication\n\nSupport lossless bounded @[simp] declaration attributes, directions and priorities. Register only after both checkers admit the declaration, including the single-declaration facade, and preserve namespace identities and immutable failure rollback. Reject unsupported execution-door attributes rather than ignoring them.\n\nReplace the stale FLBC fixture with native producer output and retain explicit obsolete-version refusal coverage. Full parser/elaborator, engine and CLI packages, scoped all-target Clippy and workspace compilation passed. Full workspace tests and Reference parity are not claimed.'], check=True)
-          (root / 'attributes-commit.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          message = 'feat(simp): admit inline simp attributes with atomic checked publication\n\nSupport lossless bounded @[simp] declaration attributes, directions and priorities. Register only after both checkers admit the declaration, including the single-declaration facade, and preserve namespace identities and immutable failure rollback. Reject unsupported execution-door attributes rather than ignoring them.\n\nReplace the stale FLBC fixture with native producer output and retain obsolete-version refusal coverage. Parser/elaborator packages, focused engine tests, the complete CLI package including updated incremental-LSP tests, scoped Clippy and workspace compilation passed before publication. The full engine package also passed on the preceding integration base; full workspace tests and Reference parity are not claimed.'
+          subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', message], check=True)
+          (root / 'commit.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
           subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: default-simp-${{ github.sha }}
-          path: ${{ runner.temp }}/default-simp-evidence
+          name: inline-simp-${{ github.sha }}
+          path: ${{ runner.temp }}/inline-simp-evidence
           retention-days: 7
           if-no-files-found: error
