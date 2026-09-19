@@ -45,6 +45,19 @@ jobs:
                   text = text.replace('pub(crate)', 'pub(in crate::source_check)')
               if path.endswith('/source_check/lsp.rs'):
                   text = text.replace('pub(super)', 'pub(crate)')
+                  old = '''                SourceModuleCheckError::Source { module, error } if module == &sources.names[0] => match error {
+                              fln::SourceCheckError::Command { offset, .. } | fln::SourceCheckError::Scope { offset, .. } => *offset,
+                              _ => 0,
+                          },'''
+                  old = '\n'.join(line[10:] if index else line for index, line in enumerate(old.splitlines()))
+                  new = '''                SourceModuleCheckError::Source {
+                              module,
+                              error: fln::SourceCheckError::Command { offset, .. }
+                                  | fln::SourceCheckError::Scope { offset, .. },
+                          } if module == &sources.names[0] => *offset,'''
+                  new = '\n'.join(line[10:] if index else line for index, line in enumerate(new.splitlines()))
+                  assert text.count(old) == 1, 'source diagnostic match anchor'
+                  text = text.replace(old, new)
               target = pathlib.Path(path)
               assert not target.exists(), 'source integration already present: ' + path
               target.parent.mkdir(parents=True, exist_ok=True)
@@ -106,8 +119,14 @@ jobs:
                   return MultiplexerOutput::failure(format!("fln serve-lsp: transport flush error: {error}\\n"), 1);
               }
               match outcome {''')
+          start = text.index('/// Run source bytes through the bounded Engine')
+          end = text.index('/// Convert a byte offset in the UTF-8 document', start)
+          text = text[:start] + text[end:]
+          start = text.index('/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at the')
+          end = text.index('/// Run the native `fln` multiplexer', start)
+          text = text[:start] + text[end:]
           for name in ['lsp_source_snapshot', 'lsp_execution_error_snapshot', 'lsp_error_snapshot', 'lsp_positioned_error_snapshot']:
-              text = replace(text, 'fn ' + name + '(', '#[cfg(test)]\nfn ' + name + '(')
+              assert name not in text, 'obsolete checker still referenced: ' + name
           path.write_text(text)
           path = pathlib.Path('crates/fln-cli/src/bin/support/mod.rs')
           text = path.read_text()
