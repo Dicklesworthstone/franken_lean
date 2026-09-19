@@ -6222,11 +6222,15 @@ fn admit_lean_syntax(
     if let Err(stop) = comparison.comparison(cancelled) {
         return InductiveVerdict::Inconclusive(InductiveStop::Structural(stop));
     }
-    let facts = match declared_type_is_a_type(environment, name, declaration, &budget, cancelled) {
-        Ok(facts) => facts,
-        Err(verdict) => return map_member_preamble(name, verdict),
+    if let Err(verdict) =
+        declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
+    {
+        return map_member_preamble(name, verdict);
+    }
+    let Some(sort_universe) = positive_explicit_sort(declaration.type_()) else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
     };
-    if facts.explicit_universe != Some(1) {
+    if sort_universe != 1 {
         return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
     }
     let mut staged =
