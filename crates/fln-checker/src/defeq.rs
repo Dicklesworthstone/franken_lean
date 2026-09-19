@@ -2427,18 +2427,54 @@ fn eta_candidate(
     mut lambda: DefEqTerm,
     mut body: ExprId,
     outside: DefEqTerm,
-    sources: TermSources<'_>,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &mut Vec<WireExpr>,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, SlowHalt> {
     let mut removed = 0u64;
     loop {
+        let sources = TermSources::new(left, right, generated);
         let mut inside = eta_visible(child(lambda, body)?, sources, control, cancelled)?;
+
+        let sources = TermSources::new(left, right, generated);
+        let inside_term = sources.source(inside)?;
+        if !matches!(inside_term.node(inside.root), Some(ExprNode::Lambda { .. })) {
+            let budget = control.begin_normalization(cancelled)?;
+            match whnf_at_with(inside_term, inside.root, context, budget, cancelled) {
+                WhnfOutcome::Complete(result) => {
+                    control.absorb_whnf(&result, cancelled)?;
+                    if result.reductions != 0 {
+                        inside = retain_generated(generated, lambda.side(), result.term);
+                    }
+                }
+                WhnfOutcome::Refused(refusal) => {
+                    return Err(SlowHalt::Refusal {
+                        side: inside.side(),
+                        refusal: Box::new(refusal),
+                        progress: Box::new(control.progress),
+                    });
+                }
+                WhnfOutcome::Inconclusive(stop) => {
+                    return Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+                        side: inside.side(),
+                        stop,
+                        progress: control.progress,
+                    })));
+                }
+                WhnfOutcome::InternalFault(fault) => {
+                    return Err(SlowHalt::Fault(DefEqFault::Whnf {
+                        side: inside.side(),
+                        fault,
+                    }));
+                }
+            }
+        }
+
         let mut width = 1u64;
-        // `fun x y => f x y` has a leading telescope, unlike the separately
-        // nested `(fun x => (fun y => f y) x)` case. Both obey the same virtual
-        // binder law; neither needs generated arenas or recursive conversion.
+        let sources = TermSources::new(left, right, generated);
         while let Some(ExprNode::Lambda { body, .. }) = sources.source(inside)?.node(inside.root) {
             width = width
                 .checked_add(1)
@@ -2446,11 +2482,13 @@ fn eta_candidate(
             inside = eta_visible(child(inside, *body)?, sources, control, cancelled)?;
         }
         for index in 0..width {
+            let sources = TermSources::new(left, right, generated);
             let term = sources.source(inside)?;
             let Some(ExprNode::Apply { function, argument }) = term.node(inside.root) else {
                 return Ok(false);
             };
             let argument = eta_visible(child(inside, *argument)?, sources, control, cancelled)?;
+            let sources = TermSources::new(left, right, generated);
             let argument_term = sources.source(argument)?;
             let is_matched = if let Some(ExprNode::Bound { index: actual }) =
                 argument_term.node(argument.root)
@@ -2496,9 +2534,7 @@ fn eta_candidate(
         removed = removed
             .checked_add(width)
             .ok_or_else(|| control.bound_index(u64::MAX))?;
-        // Contract another exact layer only after every trailing argument of
-        // this telescope was matched in order. The final virtual shift checks
-        // all surviving syntax, including domains beneath surviving binders.
+        let sources = TermSources::new(left, right, generated);
         if let Some(ExprNode::Lambda { body: inner, .. }) =
             sources.source(inside)?.node(inside.root)
         {
@@ -2506,6 +2542,22 @@ fn eta_candidate(
             body = *inner;
             continue;
         }
+
+        let sources = TermSources::new(left, right, generated);
+        let inside_term = sources.source(inside)?;
+        if !matches!(inside_term.node(inside.root), Some(ExprNode::Bound { .. })) {
+            let budget = control.begin_normalization(cancelled)?;
+            if let WhnfOutcome::Complete(result) =
+                whnf_at_with(inside_term, inside.root, context, budget, cancelled)
+            {
+                control.absorb_whnf(&result, cancelled)?;
+                if result.reductions != 0 {
+                    inside = retain_generated(generated, lambda.side(), result.term);
+                }
+            }
+        }
+
+        let sources = TermSources::new(left, right, generated);
         return eta_structurally_equal(inside, outside, removed, sources, control, cancelled);
     }
 }
@@ -2513,12 +2565,15 @@ fn eta_candidate(
 fn exact_function_eta(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
-    sources: TermSources<'_>,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &mut Vec<WireExpr>,
     context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, SlowHalt> {
     control.comparison(cancelled)?;
+    let sources = TermSources::new(left, right, generated);
     let left_term = sources.source(left_reference)?;
     let left_node = left_term.node(left_reference.root).ok_or(SlowHalt::Fault(
         DefEqFault::MissingExpression {
@@ -2538,7 +2593,9 @@ fn exact_function_eta(
                 left_reference,
                 *body,
                 right_reference,
-                sources,
+                left,
+                right,
+                generated,
                 context,
                 control,
                 cancelled,
@@ -2549,7 +2606,9 @@ fn exact_function_eta(
                 right_reference,
                 *body,
                 left_reference,
-                sources,
+                left,
+                right,
+                generated,
                 context,
                 control,
                 cancelled,
@@ -3095,7 +3154,9 @@ fn run_slow(
                         if exact_function_eta(
                             left_reference,
                             right_reference,
-                            TermSources::new(left, right, &generated),
+                            left,
+                            right,
+                            &mut generated,
                             context,
                             &mut control,
                             cancelled,
