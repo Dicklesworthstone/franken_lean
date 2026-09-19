@@ -1164,6 +1164,11 @@ fn inspect_init_core_module() {
     eprintln!("Quots ({}): {:?}", quots.len(), quots);
     eprintln!("Defs count: {}", defs.len());
     eprintln!("Thms count: {}", thms.len());
+    for c in &decoded.constants {
+        if c.name().to_display_string() == "Function.id_comp" {
+            eprintln!("FOUND Function.id_comp: {:?}", c);
+        }
+    }
 }
 
 #[test]
