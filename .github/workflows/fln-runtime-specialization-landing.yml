@@ -1,0 +1,139 @@
+name: Native runtime specialization landing
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-runtime-specialization-landing.yml']
+permissions:
+  contents: read
+concurrency:
+  group: fln-runtime-specialization-landing
+  cancel-in-progress: false
+jobs:
+  runtime-specialization:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(runtime): validate and land native polymorphic execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Retain input and install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runtime-specialization"
+          git rev-parse HEAD > "$RUNNER_TEMP/runtime-specialization/base.txt"
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee "$RUNNER_TEMP/runtime-specialization/compiler.txt"
+      - name: Validate and publish polymorphic execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'runtime-specialization'
+          def run(*args):
+              subprocess.run(args, check=True)
+          def output(*args):
+              return subprocess.check_output(args).decode().strip()
+          def checked(label, *args):
+              with (root / (label + '.log')).open('wb') as log:
+                  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  for line in iter(process.stdout.readline, b''):
+                      log.write(line)
+                      print(line.decode(errors='replace'), end='', flush=True)
+                  if process.wait():
+                      raise RuntimeError('validation failed: ' + label)
+          expected = {
+              'crates/fln-cli/src/lib.rs': 'e87f99d4d1d2634de2bf551ecc822292fa9d93c6',
+              'crates/fln-elab/src/universe.rs': '4d2433ffb8863f8d531135ddea9b37bd8d616be9',
+              'crates/fln-elab/src/universe/parameters.rs': 'b1b83033abd666241dde841ca89ce741d6c12d2a',
+              'crates/fln-parse/src/lib.rs': 'b46f7375a72576c59910d147c396b985481fa495',
+              'crates/fln/src/lib.rs': '9c67c24ff3995abcb09b0c2f2ae2ddd3681f1992',
+              'crates/fln/src/runtime.rs': 'c28046ffcca64eabf2681267820039d88f3df191',
+              'crates/fln/src/runtime/records.rs': '044398291ce52b45bc3458997dbfb6f944198eb7',
+              'crates/fln/tests/source_do.rs': 'fccad2363336d2f1fb3fce7edcab200a1bf5ff7d',
+              'docs/NATIVE_DO_NOTATION.md': 'add2dbf10a673bfe347c5a5cae170a595e453034',
+          }
+          new = {
+              'crates/fln-cli/tests/source_do_runtime.rs',
+              'crates/fln/src/runtime/specialize.rs',
+              'crates/fln/tests/runtime_specialization.rs',
+              'examples/native_do.lean',
+          }
+          for path, sha in expected.items():
+              assert output('git', 'rev-parse', 'HEAD:' + path) == sha, 'concurrent edit: ' + path
+          for path in new:
+              assert not pathlib.Path(path).exists(), 'new path collision: ' + path
+          chunks = []
+          for sha in [
+              'ef5b9378c0018324b214c9172007c48df50e6e52',
+              '5392ceaaefa68ec65e2b6ecc0d6b9c652d96ec3f',
+              '179fd31d36ab58e6c768702f7145f7f4751fa750',
+              '3b6aaa913cd72b54b35c60f6865ead44561d6ef2',
+              '186be01bf9bc1a8c7e37fc323d9ad40628d8b01d',
+              '0908635ef62a9b7dce32438c06d87729ef0b9678',
+          ]:
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
+                  headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = json.load(response)
+              assert data['encoding'] == 'base64'
+              chunk = base64.b64decode(data['content'])
+              assert hashlib.sha1(('blob ' + str(len(chunk)) + '\0').encode() + chunk).hexdigest() == sha
+              chunks.append(chunk)
+          patch = gzip.decompress(base64.b64decode(b''.join(chunks), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '8e5208edc3072190868b61077b972440e97fa9dbadac25549d3b117443ffb2d5'
+          mailbox = root / 'runtime-specialization.mbox'
+          mailbox.write_bytes(patch)
+          assert not output('git', 'status', '--porcelain')
+          run('git', 'apply', '--index', '--whitespace=error', str(mailbox))
+          changed = output('git', 'diff', '--cached', '--name-only').splitlines()
+          assert set(changed) == set(expected) | new
+          run('git', 'diff', '--cached', '--check')
+          checked('fmt', 'rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *(p for p in changed if p.endswith('.rs')))
+          checked('frontend-tests', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--', '--test-threads=1')
+          targets = [
+              'runtime_conditionals', 'runtime_higher_order', 'runtime_local_functions',
+              'runtime_nat_recursion', 'runtime_records', 'runtime_recursive_data',
+              'runtime_variants', 'runtime_specialization', 'source_do',
+          ]
+          command = ['cargo', 'test', '--locked', '-p', 'fln']
+          for target in targets:
+              command.extend(['--test', target])
+          checked('runtime-tests', *command, '--', '--test-threads=1')
+          checked('runtime-units', 'cargo', 'test', '--locked', '-p', 'fln', '--lib', 'runtime::')
+          checked('cli-tests', 'cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_do_runtime', '--', '--test-threads=1')
+          checked('frontend-clippy', 'cargo', 'clippy', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--all-targets', '--', '-D', 'warnings')
+          checked('product-clippy', 'cargo', 'clippy', '--locked', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings')
+          checked('workspace-check', 'cargo', 'check', '--locked', '--workspace', '--all-targets')
+          run('git', 'config', 'user.name', 'github-actions[bot]')
+          run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          run('git', 'commit', '-m', 'feat(runtime): execute specialized polymorphic and monadic source programs')
+          run('git', 'push', 'origin', 'HEAD:main')
+          (root / 'published-commit.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
+      - name: Retain final source and worktree status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runtime-specialization"
+          git rev-parse HEAD > "$RUNNER_TEMP/runtime-specialization/source-commit.txt"
+          git status --porcelain > "$RUNNER_TEMP/runtime-specialization/worktree-status.txt"
+          git diff HEAD --binary > "$RUNNER_TEMP/runtime-specialization/unpublished.patch"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/runtime-specialization/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: runtime-specialization-${{ github.run_id }}
+          path: ${{ runner.temp }}/runtime-specialization
+          retention-days: 7
+          if-no-files-found: error
