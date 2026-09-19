@@ -3,6 +3,7 @@
 //! Models defeq constraints, typing obligations, typeclass synthesis goals,
 //! and delayed assignments with deterministic, targeted wake-up on assignment.
 
+mod dependencies;
 pub mod unify;
 
 use self::unify::{
@@ -46,40 +47,17 @@ impl ConstraintKind {
     /// delayed-assignment targets are outputs, not blockers on themselves;
     /// their declared types and local contexts are inputs.
     pub fn dependencies(&self, store: &MetavarStore) -> HashSet<MVarId> {
-        let mut reads = HashSet::new();
-        let target = match self {
-            Self::DefEq { lhs, rhs } => {
-                reads.extend(store.collect_mvars(lhs));
-                reads.extend(store.collect_mvars(rhs));
-                None
-            }
-            Self::HasType {
-                expr,
-                expected_type,
-            } => {
-                reads.extend(store.collect_mvars(expr));
-                reads.extend(store.collect_mvars(expected_type));
-                None
-            }
-            Self::SynthInstance { class, mvar } => {
-                reads.extend(store.collect_mvars(class));
-                Some(mvar)
-            }
-            Self::DelayedAssign { mvar, val, .. } => {
-                reads.extend(store.collect_mvars(val));
-                Some(mvar)
-            }
-        };
-        if let Some(decl) = target.and_then(|id| store.get_decl(id)) {
-            reads.extend(store.collect_mvars(&decl.type_));
-            for local in decl.lctx.decls() {
-                reads.extend(store.collect_mvars(&local.type_));
-                if let Some(value) = &local.value {
-                    reads.extend(store.collect_mvars(value));
-                }
-            }
-        }
-        reads
+        dependencies::reads(self, store, None, &HashSet::new())
+    }
+
+    /// Include the retained telescope and transitive metavariable type/context
+    /// edges. Synthesis and delayed targets remain outputs, not self-blockers.
+    pub fn dependencies_in_context(
+        &self,
+        store: &MetavarStore,
+        locals: &LocalContext,
+    ) -> HashSet<MVarId> {
+        dependencies::reads(self, store, Some(locals), &HashSet::new())
     }
 }
 
@@ -100,16 +78,12 @@ impl Constraint {
     /// Inputs include the saved context: K1 checks its dependent local types
     /// and let values even when the obligation's terms themselves are ground.
     pub fn dependencies(&self, store: &MetavarStore) -> HashSet<MVarId> {
-        let mut reads = self.kind.dependencies(store);
-        if let Some(locals) = &self.local_context {
-            for local in locals.decls() {
-                reads.extend(store.collect_mvars(&local.type_));
-                if let Some(value) = &local.value {
-                    reads.extend(store.collect_mvars(value));
-                }
-            }
-        }
-        reads
+        dependencies::reads(
+            &self.kind,
+            store,
+            self.local_context.as_deref(),
+            &HashSet::new(),
+        )
     }
 }
 
