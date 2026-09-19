@@ -1,17 +1,18 @@
 #![forbid(unsafe_code)]
 
-use std::io::{BufReader, BufWriter, Write};
+use std::io::Write;
 
+#[cfg(test)]
 use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
     DiagnosticFrontend, DiagnosticOrderPolicy, DiagnosticPathPolicy, ProjectionRequest,
-    ProjectionSnapshot, Severity, StructuredDiagnostic, StructuredInconclusive,
-    StructuredInternalFault,
+    ProjectionSnapshot, Severity, StructuredDiagnostic,
 };
+#[cfg(test)]
 use fln_core::outcome::BoundedText;
-use fln_core::pos::{FileMap, Position, RawPos};
+#[cfg(test)]
+use fln_core::pos::Position;
 
-const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn write_output(output: fln_cli::MultiplexerOutput) -> std::process::ExitCode {
     if std::io::stdout()
@@ -31,6 +32,7 @@ pub(super) fn write_output(output: fln_cli::MultiplexerOutput) -> std::process::
     std::process::ExitCode::from(output.exit_code)
 }
 
+#[cfg(test)]
 fn lsp_projection_request() -> ProjectionRequest {
     ProjectionRequest {
         epoch: DiagnosticEpoch::V4_32_0,
@@ -44,6 +46,7 @@ fn lsp_projection_request() -> ProjectionRequest {
     }
 }
 
+#[cfg(test)]
 fn project_snapshot(
     request: ProjectionRequest,
     uri: &str,
@@ -61,116 +64,15 @@ fn project_snapshot(
 }
 
 pub(super) fn serve_lsp() -> fln_cli::MultiplexerOutput {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::new(stdout.lock());
-    let request = lsp_projection_request();
-    let mut on_did_open = move |uri: &str, text: &str| {
-        let snapshot = lsp_source_snapshot(uri, text.as_bytes());
-        project_snapshot(request, uri, text, &snapshot)
-    };
-
-    let outcome = fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open);
-    if let Err(error) = writer.flush() {
-        return fln_cli::MultiplexerOutput {
-            stdout: String::new(),
-            stderr: format!("fln serve-lsp: transport flush error: {error}\n"),
-            exit_code: 1,
-        };
-    }
-    match outcome {
-        Ok(outcome) if outcome.clean => fln_cli::MultiplexerOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: 0,
-        },
-        Ok(_) => fln_cli::MultiplexerOutput {
-            stdout: String::new(),
-            stderr: "fln serve-lsp: server exited without clean shutdown\n".to_owned(),
-            exit_code: 1,
-        },
-        Err(error) => fln_cli::MultiplexerOutput {
-            stdout: String::new(),
-            stderr: format!("fln serve-lsp: transport error: {error}\n"),
-            exit_code: 1,
-        },
-    }
+    fln_cli::serve_lsp()
 }
 
-fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
-    let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
-    let engine = match fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel_budget))
-    {
-        Ok(fln::Outcome::Complete(engine)) => engine,
-        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
-            return ProjectionSnapshot::Inconclusive(StructuredInconclusive {
-                cause_class: "seed",
-                detail: BoundedText::new(format!("{inconclusive:?}")),
-                diagnostic: None,
-                progress: None,
-            });
-        }
-        Ok(fln::Outcome::InternalFault(fault)) => {
-            return ProjectionSnapshot::InternalFault(StructuredInternalFault {
-                invariant: "seed-admission",
-                detail: BoundedText::new(format!("{fault:?}")),
-                evidence: None,
-            });
-        }
-        Err(error) => return lsp_error_snapshot(uri, &error.to_string()),
-    };
-    let options = fln::KVMap::new();
-    let limits = fln::EngineExecutionLimits::new(kernel_budget);
-    match engine.execute_source_commands_with_checks(source, &options, limits) {
-        Ok(fln::Outcome::Complete(_)) => ProjectionSnapshot::Complete {
-            diagnostics: Vec::new(),
-        },
-        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
-            ProjectionSnapshot::Inconclusive(StructuredInconclusive {
-                cause_class: "source-check",
-                detail: BoundedText::new(format!("{inconclusive:?}")),
-                diagnostic: None,
-                progress: None,
-            })
-        }
-        Ok(fln::Outcome::InternalFault(fault)) => {
-            ProjectionSnapshot::InternalFault(StructuredInternalFault {
-                invariant: "source-check",
-                detail: BoundedText::new(format!("{fault:?}")),
-                evidence: None,
-            })
-        }
-        Err(error) => lsp_execution_error_snapshot(uri, source, &error),
-    }
-}
-
-fn lsp_execution_error_snapshot(
-    uri: &str,
-    source: &[u8],
-    error: &fln::EngineExecutionError,
-) -> ProjectionSnapshot {
-    match error
-        .primary_source_offset()
-        .and_then(|offset| source_position_at(source, offset.0))
-    {
-        Some(position) => lsp_positioned_error_snapshot(uri, &error.to_string(), position),
-        None => lsp_error_snapshot(uri, &error.to_string()),
-    }
-}
-
-fn source_position_at(source: &[u8], offset: usize) -> Option<Position> {
-    let text = std::str::from_utf8(source).ok()?;
-    if offset > text.len() || !text.is_char_boundary(offset) {
-        return None;
-    }
-    Some(FileMap::of_string(text).to_position(RawPos::new(offset)))
-}
-
+#[cfg(test)]
 fn lsp_error_snapshot(uri: &str, message: &str) -> ProjectionSnapshot {
     lsp_positioned_error_snapshot(uri, message, Position { line: 1, column: 0 })
 }
 
+#[cfg(test)]
 fn lsp_positioned_error_snapshot(uri: &str, message: &str, pos: Position) -> ProjectionSnapshot {
     ProjectionSnapshot::Complete {
         diagnostics: vec![StructuredDiagnostic {

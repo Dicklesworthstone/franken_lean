@@ -2,6 +2,7 @@
 //! Files are read once, bounded as a closure, and handed to the admission-only
 //! module checker. Import text never becomes an arbitrary filesystem path.
 use super::*;
+pub(super) mod editor;
 use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
 use fln::{LeafView, Name, Outcome, SourceFileCheck, SourceModuleInput};
 use std::collections::BTreeMap;
@@ -163,6 +164,10 @@ fn validate_component(component: &str) -> Result<(), Failure> {
 }
 
 fn module_path(root: &Path, name: &Name) -> Result<PathBuf, Failure> {
+    checked_module_path(root, name, false)
+}
+
+fn checked_module_path(root: &Path, name: &Name, allow_missing_final: bool) -> Result<PathBuf, Failure> {
     let mut cursor = name.clone();
     let mut components = Vec::new();
     while !cursor.is_anonymous() {
@@ -185,7 +190,11 @@ fn module_path(root: &Path, name: &Name) -> Result<PathBuf, Failure> {
     for (index, component) in components.into_iter().enumerate() {
         // Append, do not replace an extension: «A.B» names the literal A.B.lean.
         path.push(if index == last { format!("{component}.lean") } else { component });
-        let metadata = std::fs::symlink_metadata(&path).map_err(|e| Failure::io(&path, e))?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if allow_missing_final && index == last && error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(Failure::io(&path, error)),
+        };
         if metadata.file_type().is_symlink() {
             return Err(Failure::input(format!("refusing symlink in source import {}", path.display())));
         }

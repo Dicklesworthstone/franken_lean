@@ -3,7 +3,7 @@
 use super::*;
 
 impl Context {
-    fn simp_hypothesis_step(
+    pub(super) fn simp_hypothesis_step(
         &mut self,
         local: &LocalDecl,
         rule: &SimpRule<'_>,
@@ -128,7 +128,7 @@ impl Context {
             }
         }
         if locations.target {
-            self.simplify_goal_with_rules(proof, goal, &rules, steps)?;
+            self.simplify_goal_with_rules(proof, goal, &rules, steps, None)?;
             return Ok(true);
         }
         if steps == 0 {

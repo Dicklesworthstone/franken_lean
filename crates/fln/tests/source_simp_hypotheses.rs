@@ -97,3 +97,26 @@ fn failed_wildcard_alternatives_restore_the_proof_context() {
     "#,
     );
 }
+
+#[test]
+fn wildcard_composes_with_proposition_rewriting_without_assuming_missing_facts() {
+    let base = engine();
+    check(
+        &base,
+        r#"
+      theorem truth (P : Prop) (p : P) : P := by simp only [*]
+      theorem trueProp : True := by simp only [*]
+      theorem negate (F : Prop -> Prop) (P : Prop) (hp : ¬ P) (h : F False) : F P := by
+        simp only [*]
+      def proofType (F : Prop -> Type) (P : Prop) (p : P) (value : F True) : F P := by
+        simp only [*]
+        exact value
+    "#,
+    );
+    for source in [
+        "theorem missing (P : Prop) : P := by simp only [*]",
+        "theorem refuted (P : Prop) (np : ¬ P) : P := by simp only [*]",
+    ] {
+        refuse(&base, source);
+    }
+}

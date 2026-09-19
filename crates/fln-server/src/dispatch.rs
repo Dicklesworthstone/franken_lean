@@ -14,6 +14,9 @@ use crate::transport;
 mod diagnostic_wait;
 #[cfg(test)]
 mod incremental;
+mod documents;
+use documents::CheckSource;
+pub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};
 mod json;
 mod session;
 mod wait;
@@ -150,10 +153,11 @@ fn check_document(
     output: &mut dyn Write,
     uri: &str,
     content: &str,
-    on_did_open: &mut OnDidOpen<'_>,
+    on_did_open: &mut dyn CheckSource,
+    session: &DocumentSession,
 ) -> io::Result<DiagnosticCompletion> {
     write_protocol_message(output, file_progress_notification(uri, true))?;
-    let notifications = on_did_open(uri, content);
+    let notifications = on_did_open.check(uri, content, &session.sources());
     let classes = notifications
         .iter()
         .map(|message| classify_callback_message(message, uri))
@@ -375,7 +379,7 @@ fn handle_open(
     output: &mut dyn Write,
     session: &mut DocumentSession,
     params: RawField<'_>,
-    on_did_open: &mut OnDidOpen<'_>,
+    on_did_open: &mut dyn CheckSource,
 ) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
@@ -402,7 +406,7 @@ fn handle_open(
     match session.open(uri.clone(), version, text.clone()) {
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
-            let completion = check_document(output, &uri, &text, on_did_open)?;
+            let completion = check_document(output, &uri, &text, on_did_open, session)?;
             Ok(Some(CheckedVersion {
                 uri,
                 version,
@@ -422,7 +426,7 @@ fn handle_change(
     waits: &mut PendingDiagnosticWaits,
     frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
-    on_did_open: &mut OnDidOpen<'_>,
+    on_did_open: &mut dyn CheckSource,
 ) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
@@ -461,7 +465,7 @@ fn handle_change(
     match session.change(&uri, version, text.clone()) {
         Ok(retention) => {
             write_retention_outcome(output, retention)?;
-            let completion = check_document(output, &uri, &text, on_did_open)?;
+            let completion = check_document(output, &uri, &text, on_did_open, session)?;
             Ok(Some(CheckedVersion {
                 uri,
                 version,
@@ -493,7 +497,7 @@ fn handle_save(
     waits: &mut PendingDiagnosticWaits,
     frontiers: &mut BTreeMap<String, DiagnosticFrontier>,
     params: RawField<'_>,
-    on_did_open: &mut OnDidOpen<'_>,
+    on_did_open: &mut dyn CheckSource,
 ) -> io::Result<Option<CheckedVersion>> {
     let uri = match decoded_uri(params) {
         Ok(uri) => uri,
@@ -511,7 +515,7 @@ fn handle_save(
         DecodedField::Valid(text) => match session.save_with_text(&uri, text.clone()) {
             Ok(retention) => {
                 write_retention_outcome(output, retention)?;
-                let completion = check_document(output, &uri, &text, on_did_open)?;
+                let completion = check_document(output, &uri, &text, on_did_open, session)?;
                 Ok(Some(CheckedVersion {
                     uri,
                     version,
@@ -553,7 +557,7 @@ fn handle_save(
                 )?;
                 return Ok(None);
             };
-            let completion = check_document(output, &uri, &text, on_did_open)?;
+            let completion = check_document(output, &uri, &text, on_did_open, session)?;
             Ok(Some(CheckedVersion {
                 uri,
                 version,
@@ -813,10 +817,10 @@ fn running_request(output: &mut dyn Write, state: ServerState, id: &RequestId) -
     }
 }
 
-pub fn serve(
+fn serve_inner(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
-    on_did_open: &mut OnDidOpen<'_>,
+    on_did_open: &mut dyn CheckSource,
 ) -> io::Result<ServerOutcome> {
     let mut state = ServerState::Uninitialized;
     let mut documents_opened = 0u64;

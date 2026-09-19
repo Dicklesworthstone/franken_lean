@@ -303,6 +303,14 @@ impl DocumentSession {
     }
 }
 
+impl DocumentSession {
+    pub(super) fn sources(&self) -> Vec<super::OpenDocumentSource<'_>> {
+        self.documents.iter().map(|(uri, document)| super::OpenDocumentSource {
+            uri, version: document.version, text: document.text.as_deref(),
+        }).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

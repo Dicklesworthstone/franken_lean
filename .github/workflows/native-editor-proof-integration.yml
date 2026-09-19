@@ -45,6 +45,10 @@ jobs:
                   text = text.replace('pub(crate)', 'pub(in crate::source_check)')
               if path.endswith('/source_check/lsp.rs'):
                   text = text.replace('pub(super)', 'pub(crate)')
+                  old = '                SourceModuleCheckError::Source { module, error } if module == &sources.names[0] => match error {\n                    fln::SourceCheckError::Command { offset, .. } | fln::SourceCheckError::Scope { offset, .. } => *offset,\n                    _ => 0,\n                },'
+                  new = '                SourceModuleCheckError::Source {\n                    module,\n                    error: fln::SourceCheckError::Command { offset, .. }\n                        | fln::SourceCheckError::Scope { offset, .. },\n                } if module == &sources.names[0] => *offset,'
+                  assert text.count(old) == 1, 'source diagnostic match anchor'
+                  text = text.replace(old, new)
               target = pathlib.Path(path)
               assert not target.exists(), 'source integration already present: ' + path
               target.parent.mkdir(parents=True, exist_ok=True)
@@ -100,11 +104,40 @@ jobs:
               };
 
           ''' + text[dispatch:]
-          text = replace(text, 'match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open)', 'match fln_server::dispatch::serve_with_documents(&mut reader, &mut writer, &mut on_did_open)')
+          text = replace(text, 'fn serve_lsp() -> MultiplexerOutput {\n    use std::io::{BufReader, BufWriter};', '/// Run the shared native proof-checking LSP session on process standard streams.\npub fn serve_lsp() -> MultiplexerOutput {\n    use std::io::{BufReader, BufWriter, Write};')
+          text = replace(text, 'match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open) {', '''let outcome = fln_server::dispatch::serve_with_documents(&mut reader, &mut writer, &mut on_did_open);
+              if let Err(error) = writer.flush() {
+                  return MultiplexerOutput::failure(format!("fln serve-lsp: transport flush error: {error}\\n"), 1);
+              }
+              match outcome {''')
+          start = text.index('/// Run source bytes through the bounded Engine')
+          end = text.index('/// Convert a byte offset in the UTF-8 document', start)
+          text = text[:start] + text[end:]
+          start = text.index('/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at the')
+          end = text.index('/// Run the native `fln` multiplexer', start)
+          text = text[:start] + text[end:]
           for name in ['lsp_source_snapshot', 'lsp_execution_error_snapshot', 'lsp_error_snapshot', 'lsp_positioned_error_snapshot']:
+              assert name not in text, 'obsolete checker still referenced: ' + name
+          path.write_text(text)
+          path = pathlib.Path('crates/fln-cli/src/bin/support/mod.rs')
+          text = path.read_text()
+          start = text.index('pub(super) fn serve_lsp()')
+          end = text.index('fn lsp_error_snapshot(', start)
+          text = text[:start] + '''pub(super) fn serve_lsp() -> fln_cli::MultiplexerOutput {
+              fln_cli::serve_lsp()
+          }
+
+          ''' + text[end:]
+          text = replace(text, 'use std::io::{BufReader, BufWriter, Write};', 'use std::io::Write;')
+          text = replace(text, 'use fln_core::diag::{', '#[cfg(test)]\nuse fln_core::diag::{')
+          text = replace(text, 'StructuredDiagnostic, StructuredInconclusive,\n    StructuredInternalFault,', 'StructuredDiagnostic,')
+          text = replace(text, 'use fln_core::outcome::BoundedText;', '#[cfg(test)]\nuse fln_core::outcome::BoundedText;')
+          text = replace(text, 'use fln_core::pos::{FileMap, Position, RawPos};', '#[cfg(test)]\nuse fln_core::pos::Position;')
+          text = replace(text, 'const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;\n', '')
+          for name in ['lsp_projection_request', 'project_snapshot', 'lsp_error_snapshot', 'lsp_positioned_error_snapshot']:
               text = replace(text, 'fn ' + name + '(', '#[cfg(test)]\nfn ' + name + '(')
           path.write_text(text)
-          changed = list(blobs) + ['crates/fln-server/src/dispatch.rs', 'crates/fln-server/src/dispatch/session.rs', 'crates/fln-cli/src/source_check.rs', 'crates/fln-cli/src/source_check/imports.rs', 'crates/fln-cli/src/lib.rs']
+          changed = list(blobs) + ['crates/fln-server/src/dispatch.rs', 'crates/fln-server/src/dispatch/session.rs', 'crates/fln-cli/src/source_check.rs', 'crates/fln-cli/src/source_check/imports.rs', 'crates/fln-cli/src/lib.rs', 'crates/fln-cli/src/bin/support/mod.rs']
           (root / 'paths.json').write_text(json.dumps(changed))
           subprocess.run(['git', 'add', '--', *changed], check=True)
           (root / 'integration.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))

@@ -786,6 +786,7 @@ impl Context {
                 bool,
             ),
             Proof(tactics::ProofState<'a>),
+            SimpaTerm(tactics::ProofState<'a>, tactics::ProofGoal, &'a [Syntax]),
             ProofEliminate(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -1222,6 +1223,11 @@ impl Context {
                             tasks.push(Task::RecordNext(state));
                         }
                         Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
+                            tactics::ProofAction::Simpa { goal, args, using } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                tasks.push(Task::SimpaTerm(proof, goal, args));
+                                tasks.push(Task::Visit(using, None, true));
+                            }
                             tactics::ProofAction::Eliminate {
                                 goal,
                                 args,
@@ -1353,6 +1359,11 @@ impl Context {
                             }
                             tactics::ProofAction::Complete(term) => values.push(term),
                         },
+                        Task::SimpaTerm(mut proof, goal, args) => {
+                            let term = values.pop().expect("simpa evidence visit");
+                            self.simpa_proof_term(&mut proof, goal, args, Some(term))?;
+                            tasks.push(Task::Proof(proof));
+                        }
                         Task::ProofEliminate(mut proof, goal, args, induction, equation) => {
                             let term = values.pop().expect("elimination expression visit");
                             self.eliminate_proof_term(
