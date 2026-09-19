@@ -27,11 +27,24 @@ use fln_olean::region::{OleanView, WalkBudget};
 fn reference_lib() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("FLN_REFERENCE_LIB") {
         let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
+        if path.is_dir() {
+            return Some(path);
+        }
     }
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home).join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
-    path.is_dir().then_some(path)
+    for candidate in [
+        std::env::var("HOME").ok().map(PathBuf::from),
+        Some(PathBuf::from("/home/ubuntu")),
+        Some(PathBuf::from("/root")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let path = candidate.join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn pinned_nat_block(lib: &Path) -> fln_kernel::InductiveBlock {
@@ -136,10 +149,7 @@ fn pinned_init_prelude_reaches_two_checker_council_frontier() {
     let private = std::fs::read(&private_path).expect("read Prelude private companion");
 
     let engine = Engine::from_environment(Environment::new());
-    let limits = OleanCheckLimits::new(
-        64 * 1024 * 1024,
-        Budget::for_stack_bytes(2 * 1024 * 1024),
-    );
+    let limits = OleanCheckLimits::new(64 * 1024 * 1024, Budget::for_stack_bytes(2 * 1024 * 1024));
     let result = engine.check_olean_artifact_parts(
         &exported,
         Some(&server),
