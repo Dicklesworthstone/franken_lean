@@ -55,6 +55,39 @@ fn binding_order(left: &Binding, right: &Binding) -> Ordering {
 }
 
 impl Engine<'_> {
+    /// Check latent scope before choosing an assignment orientation. A residual
+    /// can capture a private local even when its type contains no free variable.
+    /// Use the same binding dependency walk as conditional K1 validation, but do
+    /// not assign, quantify or check anything here. A refusal lets the ordinary
+    /// worklist try the reverse orientation or retry after the residual resolves.
+    pub(super) fn assignment_residual_scope(
+        &mut self,
+        target: &MVarId,
+        value: &Expr,
+        allowed: &LocalContext,
+        target_depth: u32,
+    ) -> Result<(), UnificationError> {
+        if !value.has_expr_mvar() {
+            return Ok(());
+        }
+        let mut pending = self.binding_reads(value)?;
+        // Preserve the store's existing occurs-check policy. This preflight is
+        // an orientation hint, not an alternative occurs check or cycle solver.
+        if pending.contains(&Binding::Residual(target.clone())) {
+            return Ok(());
+        }
+        let mut seen = HashSet::new();
+        while let Some(binding) = pending.pop() {
+            self.meter.node()?;
+            if !seen.insert(binding.clone()) || binding == Binding::Residual(target.clone()) {
+                continue;
+            }
+            let (_, dependencies) = self.prepare_binding(binding, target, allowed, target_depth)?;
+            pending.extend(dependencies);
+        }
+        Ok(())
+    }
+
     fn validation_instantiate(
         &mut self,
         expr: &Expr,
@@ -471,7 +504,10 @@ mod tests {
         let mut txn = transaction();
         let a = declare(&mut txn, "older", nat(), MetavarKind::Natural);
         local(&mut txn, "later", nat());
-        let b = declare(&mut txn, "newer", nat(), MetavarKind::Natural);
+        // A natural newer hole can safely be assigned to the older one. Keep
+        // this negative cell nonassignable so it still exercises scope refusal,
+        // not the formerly missing reverse-orientation capability.
+        let b = declare(&mut txn, "newer", nat(), MetavarKind::SyntheticOpaque);
         let before_mvars = txn.mvars.clone();
         let before_queue = txn.constraints.clone();
         assert!(matches!(
