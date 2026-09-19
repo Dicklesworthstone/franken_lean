@@ -2557,7 +2557,7 @@ impl Engine {
         }))
     }
 
-    fn check_decoded_olean(
+    pub fn check_decoded_olean(
         &self,
         decoded: DecodedOlean,
         options: &KVMap,
