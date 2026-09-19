@@ -514,3 +514,235 @@ fn scope_orientation_cancellation_and_limits_are_failure_atomic() {
         unchanged(&t, &base);
     }
 }
+
+fn bare_siblings(type_: Option<Expr>) -> (ElabTxn, MVarId, MVarId, Expr, Expr, Expr) {
+    let mut t = transaction();
+    let common = local(&mut t, "common", nat());
+    let parent = t.lctx.clone();
+    let left_private = local(&mut t, "left_private", nat());
+    let f = hole(&mut t, "left_hole", type_.clone().unwrap_or_else(nat));
+    let left_context = t.lctx.clone();
+    t.lctx = parent;
+    let right_private = local(&mut t, "right_private", nat());
+    let g = hole(&mut t, "right_hole", type_.unwrap_or_else(nat));
+    t.lctx = left_context;
+    local(&mut t, "right_private", nat());
+    (t, f, g, common, left_private, right_private)
+}
+
+#[test]
+fn bare_sibling_holes_share_only_the_common_lexical_context() {
+    for reverse in [false, true] {
+        let (mut t, f, g, witness, left_private, right_private) = bare_siblings(None);
+        let mut common = t.lctx.clone();
+        common.truncate(1);
+        let (left, right) = (Expr::mvar(f.clone()), Expr::mvar(g.clone()));
+        let (left, right) = if reverse {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let before = t.clone();
+        let report = t.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.expression_assignments.len(), 2);
+        assert_eq!(report.residual_metavariables.len(), 1);
+        let residual = report.residual_metavariables[0].clone();
+        assert!(!t.mvars.is_assigned(&residual));
+        assert_eq!(t.mvars.len(), before.mvars.len() + 1);
+        assert_eq!(t.mvars.get_decl(&residual).unwrap().lctx, common);
+        for private in [left_private, right_private] {
+            let before = t.clone();
+            assert!(
+                t.unify(&Expr::mvar(residual.clone()), &private, budget())
+                    .is_err()
+            );
+            unchanged(&t, &before);
+        }
+        t.unify(&Expr::mvar(residual), &witness, budget()).unwrap();
+        assert_eq!(t.instantiate_expr(&Expr::mvar(f)).unwrap(), witness);
+        assert_eq!(t.instantiate_expr(&Expr::mvar(g)).unwrap(), witness);
+        assert_eq!(t.env, before.env);
+        assert_eq!(t.lctx, before.lctx);
+    }
+}
+
+#[test]
+fn a_bare_hole_and_an_applied_hole_can_share_a_scope_safe_result() {
+    for reverse in [false, true] {
+        let mut t = transaction();
+        let witness = local(&mut t, "common", nat());
+        let parent = t.lctx.clone();
+        local(&mut t, "left_private", nat());
+        let bare = hole(&mut t, "bare", nat());
+        let left_context = t.lctx.clone();
+        t.lctx = parent;
+        local(&mut t, "right_private", nat());
+        let f = hole(&mut t, "f", pi(nat(), nat()));
+        t.lctx = left_context;
+        local(&mut t, "right_private", nat());
+        let x = local(&mut t, "x", nat());
+        let pair = (
+            Expr::mvar(bare.clone()),
+            Expr::app(Expr::mvar(f.clone()), x),
+        );
+        let (left, right) = if reverse { (pair.1, pair.0) } else { pair };
+        let report = t.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        let residual = report.residual_metavariables[0].clone();
+        assert_eq!(t.mvars.get_decl(&residual).unwrap().lctx.len(), 1);
+        t.unify(&Expr::mvar(residual), &witness, budget()).unwrap();
+        t.unify(&Expr::mvar(bare), &witness, budget()).unwrap();
+        t.unify(&Expr::app(Expr::mvar(f), number(123)), &witness, budget())
+            .unwrap();
+    }
+}
+
+#[test]
+fn bare_dependent_proof_holes_remain_obligations_not_inhabitants() {
+    let mut t = transaction();
+    let proposition = local(&mut t, "P", Expr::sort(Level::zero()));
+    let parent = t.lctx.clone();
+    local(&mut t, "left_private", nat());
+    let a = hole(&mut t, "a", proposition.clone());
+    t.lctx = parent.clone();
+    local(&mut t, "right_private", nat());
+    let b = hole(&mut t, "b", proposition.clone());
+    let report = t
+        .unify(&Expr::mvar(a.clone()), &Expr::mvar(b.clone()), budget())
+        .unwrap();
+    assert_eq!(report.residual_metavariables.len(), 1);
+    let residual = report.residual_metavariables[0].clone();
+    let declaration = t.mvars.get_decl(&residual).unwrap();
+    assert_eq!(declaration.type_, proposition);
+    assert_eq!(declaration.lctx, parent);
+    assert!(!t.mvars.is_assigned(&residual));
+    assert!(t.instantiate_expr(&Expr::mvar(a)).unwrap().has_expr_mvar());
+    assert!(t.instantiate_expr(&Expr::mvar(b)).unwrap().has_expr_mvar());
+    let before = t.clone();
+    assert!(
+        t.unify(&Expr::mvar(residual), &number(0), budget())
+            .is_err()
+    );
+    unchanged(&t, &before);
+}
+
+#[test]
+fn multiple_bare_scope_equations_reuse_the_common_residual() {
+    let (mut t, a, b, witness, _, _) = bare_siblings(None);
+    t.lctx.truncate(1);
+    local(&mut t, "third_private", nat());
+    let c = hole(&mut t, "third", nat());
+    let report = t
+        .unify_many_with(
+            &[
+                (Expr::mvar(a.clone()), Expr::mvar(b.clone())),
+                (Expr::mvar(b.clone()), Expr::mvar(c.clone())),
+            ],
+            budget(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(report.kernel_checks, 3);
+    assert_eq!(report.residual_metavariables.len(), 1);
+    t.unify(
+        &Expr::mvar(report.residual_metavariables[0].clone()),
+        &witness,
+        budget(),
+    )
+    .unwrap();
+    for id in [a, b, c] {
+        assert_eq!(t.instantiate_expr(&Expr::mvar(id)).unwrap(), witness);
+    }
+}
+
+#[test]
+fn a_private_dependency_of_the_residual_type_cannot_escape_through_a_bare_hole() {
+    let mut t = transaction();
+    let private_type = local(&mut t, "private_type", Expr::sort(Level::one()));
+    let a = hole(&mut t, "a", private_type.clone());
+    t.lctx.truncate(0);
+    local(&mut t, "other_private", nat());
+    let b = hole(&mut t, "b", private_type);
+    let before = t.clone();
+    assert!(t.unify(&Expr::mvar(a), &Expr::mvar(b), budget()).is_err());
+    unchanged(&t, &before);
+}
+
+#[test]
+fn malformed_bare_residual_types_remain_subject_to_the_kernel_veto() {
+    let (mut t, a, b, _, _, _) = bare_siblings(Some(Expr::app(nat(), number(1))));
+    let before = t.clone();
+    assert!(t.unify(&Expr::mvar(a), &Expr::mvar(b), budget()).is_err());
+    unchanged(&t, &before);
+}
+
+#[test]
+fn bare_context_pruning_never_publishes_partial_residuals() {
+    let (base, a, b, _, _, _) = bare_siblings(None);
+    let equations = [(Expr::mvar(a), Expr::mvar(b))];
+    let polls = Cell::new(0);
+    let report = base
+        .clone()
+        .unify_many_with(&equations, budget(), &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap();
+    for stop in [0, polls.get() / 2, polls.get() - 1] {
+        let mut t = base.clone();
+        let count = Cell::new(0);
+        assert!(matches!(
+            t.unify_many_with(&equations, budget(), &|| {
+                let n = count.get();
+                count.set(n + 1);
+                n >= stop
+            }),
+            Err(UnificationError::Cancelled)
+        ));
+        unchanged(&t, &base);
+    }
+    for kind in 0..4 {
+        let mut t = base.clone();
+        let mut limits = budget();
+        match kind {
+            0 => limits.max_assignments = 1,
+            1 => limits.max_steps = report.unifier_steps - 1,
+            2 => limits.max_visited_nodes = report.visited_nodes - 1,
+            _ => limits.kernel = limits.kernel.narrowed(0, limits.kernel.depth),
+        }
+        assert!(t.unify_many_with(&equations, limits, &|| false).is_err());
+        unchanged(&t, &base);
+    }
+}
+
+#[test]
+fn a_later_conflict_restores_the_bare_scope_queue_and_all_holes() {
+    let (mut t, a, b, _, left_private, _) = bare_siblings(None);
+    let row = t.postpone(
+        ConstraintKind::DefEq {
+            lhs: Expr::mvar(a.clone()),
+            rhs: Expr::mvar(b),
+        },
+        0,
+    );
+    let conflict = t.postpone(
+        ConstraintKind::DefEq {
+            lhs: Expr::mvar(a),
+            rhs: left_private,
+        },
+        0,
+    );
+    let before = t.clone();
+    assert!(
+        t.solve_defeq_constraints_with(&[row, conflict], budget(), &|| false)
+            .is_err()
+    );
+    unchanged(&t, &before);
+    let report = t
+        .solve_defeq_constraints_with(&[row], budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.solved, vec![row]);
+    assert_eq!(report.unification.residual_metavariables.len(), 1);
+    assert!(report.unification.awakened.iter().any(|c| c.id == conflict));
+}

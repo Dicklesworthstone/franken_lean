@@ -14,6 +14,10 @@
 //! the argument orders or arities differ. The residual captures only their
 //! common lexical context, never the union of private locals. Its depth is no
 //! deeper than either parent. Both reconstructed assignments cross K1.
+//! Bare holes participate too: after scope-aware ordinary orientation fails,
+//! sibling holes can depend on one residual restricted to their common parent.
+//! A bare/applied pair uses that same construction with an empty telescope on
+//! the bare side. The shared residual remains an obligation, including in Prop.
 use super::*;
 use crate::constraint::ConstraintKind;
 use crate::mvar::MetavarDecl;
@@ -193,8 +197,7 @@ impl Engine<'_> {
         let Some(declaration) = self.work.mvars.get_decl(id).cloned() else {
             return Ok(None);
         };
-        if arguments.is_empty()
-            || self.work.mvars.is_assigned(id)
+        if self.work.mvars.is_assigned(id)
             || declaration.kind == MetavarKind::SyntheticOpaque
             || declaration.depth > self.budget.max_metavar_depth
             || declaration.delayed.is_some()
