@@ -769,7 +769,8 @@ impl Context {
             self.tick()?;
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
-                || collections::is_notation(node);
+                || collections::is_notation(node)
+                || node.kind() == Some(&parser_kind(&["Term", "do"]));
             if let Syntax::Node { args, .. } = node {
                 scan.extend(args);
             }
@@ -812,6 +813,7 @@ impl Context {
                         args: built.split_off(start),
                     };
                     let node = self.expand_collection_node(node, pattern)?;
+                    let node = self.expand_do_node(node, pattern)?;
                     let mut required = Vec::new();
                     let node = if pattern_function(&node) {
                         self.compile_pattern_function(node, &mut required)?

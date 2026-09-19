@@ -8,6 +8,7 @@ use super::*;
 pub(super) enum Prefix {
     Binders(Box<term_binders::Prefix>),
     Assertion(Box<Assertion>),
+    Do(Box<term_do::Prefix>),
 }
 impl From<term_binders::Prefix> for Prefix {
     fn from(value: term_binders::Prefix) -> Self {
@@ -227,12 +228,14 @@ impl Prefix {
 
     pub(super) fn body(&self) -> bool {
         match self {
+            Self::Do(_) => false,
             Self::Binders(p) => p.body(),
             Self::Assertion(p) => matches!(p.phase, Phase::Body),
         }
     }
     pub(super) fn closes_header(&self, tokens: &[LexedToken], at: usize) -> bool {
         match self {
+            Self::Do(p) => p.closes_header(tokens, at),
             Self::Binders(p) => p.closes_header(tokens, at),
             Self::Assertion(p) => match p.phase {
                 Phase::Annotation if p.form != Form::Have => {
@@ -253,13 +256,18 @@ impl Prefix {
         expression: Syntax,
         end: usize,
     ) -> Result<(Self, usize), NatDefinitionParseError> {
-        let Self::Assertion(mut p) = self else {
-            let Self::Binders(p) = self else {
-                unreachable!("prefix variants")
-            };
-            return p
-                .finish_header(leaves, view, tokens, at, expression, end)
-                .map(|(p, next)| (Self::Binders(Box::new(p)), next));
+        let mut p = match self {
+            Self::Do(p) => {
+                return p
+                    .finish_header(leaves, view, tokens, at, expression, end)
+                    .map(|(p, next)| (Self::Do(Box::new(p)), next));
+            }
+            Self::Binders(p) => {
+                return p
+                    .finish_header(leaves, view, tokens, at, expression, end)
+                    .map(|(p, next)| (Self::Binders(Box::new(p)), next));
+            }
+            Self::Assertion(p) => p,
         };
         let mut next = at + 1;
         match p.phase {
@@ -305,11 +313,10 @@ impl Prefix {
         leaves: &Leaves,
         body: Syntax,
     ) -> Result<(Syntax, usize), NatDefinitionParseError> {
-        let Self::Assertion(p) = self else {
-            let Self::Binders(p) = self else {
-                unreachable!("prefix variants")
-            };
-            return p.finish(leaves, body);
+        let p = match self {
+            Self::Do(p) => return p.finish(leaves, body),
+            Self::Binders(p) => return p.finish(leaves, body),
+            Self::Assertion(p) => p,
         };
         let syntax = if p.form == Form::Show {
             let separator = p.proof_intro.expect("show proof introducer");

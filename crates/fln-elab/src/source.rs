@@ -10,6 +10,7 @@ mod binders;
 mod calc;
 mod coercions;
 mod collections;
+mod do_notation;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
@@ -788,6 +789,7 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
         enum Task<'a> {
+            DoAction(&'a [Syntax], Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
@@ -867,6 +869,11 @@ impl Context {
                 while let Some(task) = tasks.pop() {
                     self.tick()?;
                     match task {
+                        Task::DoAction(arguments, expected) => {
+                            let action = values.pop().expect("do action visit");
+                            let function = self.do_action(action)?;
+                            tasks.push(Task::Apply(function, arguments, expected, false));
+                        }
                         Task::CalcNext(build) => {
                             if let Some(step) = build.steps.get(build.cursor) {
                                 let relation = &step[0];
@@ -914,6 +921,26 @@ impl Context {
                                 continue;
                             }
                             if let Syntax::Node { kind, args, .. } = syntax {
+                                if kind == &parser_kind(&["Term", "nativeDoBind"])
+                                    || kind == &parser_kind(&["Term", "nativeDoPure"])
+                                {
+                                    let bind = kind == &parser_kind(&["Term", "nativeDoBind"]);
+                                    if args.len() != if bind { 2 } else { 1 } {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let monad = match &expected {
+                                        Some(type_) => self.do_monad(type_)?,
+                                        None => None,
+                                    };
+                                    if bind && monad.is_none() {
+                                        tasks.push(Task::DoAction(&args[1..], expected));
+                                        tasks.push(Task::Visit(&args[0], None, true));
+                                    } else {
+                                        let function = self.do_operation(bind, monad)?;
+                                        tasks.push(Task::Apply(function, args, expected, false));
+                                    }
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "matrixScope"]) {
                                     let [rows, body] = args.as_slice() else {
                                         return Err(failure(SourceInferenceError::Scope));

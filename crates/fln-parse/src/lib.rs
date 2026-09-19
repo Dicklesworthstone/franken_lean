@@ -39,6 +39,7 @@ mod proofs;
 mod record_terms;
 mod records;
 mod term_binders;
+mod term_do;
 mod term_locals;
 
 use build::{BuildError, Leaves};
@@ -1204,6 +1205,7 @@ fn finish_negation_frame(
 
 /// Fold prefix bodies at their enclosing delimiter or end-of-term boundary.
 /// Negation, lambda and quantifier nesting all use explicit heap frames.
+#[allow(clippy::too_many_arguments)]
 fn finish_lambda_frames(
     leaves: &Leaves,
     view: &SourceView,
@@ -1211,9 +1213,13 @@ fn finish_lambda_frames(
     frames: &mut Vec<BoundedTermFrame>,
     grammar: DefinitionGrammar,
     at: usize,
+    close_do: bool,
 ) -> Result<(), NatDefinitionParseError> {
     while frames.last().is_some_and(|frame| {
-        frame.negation.is_some() || frame.prefix.as_ref().is_some_and(|prefix| prefix.body())
+        frame.negation.is_some()
+            || frame.prefix.as_ref().is_some_and(|prefix| {
+                prefix.body() || (close_do && matches!(prefix, term_locals::Prefix::Do(_)))
+            })
     }) {
         if frames.last().is_some_and(|frame| frame.negation.is_some()) {
             finish_negation_frame(leaves, view, tokens, frames, grammar, at)?;
@@ -1221,7 +1227,11 @@ fn finish_lambda_frames(
         }
         let mut frame = frames.pop().expect("completed binder body frame");
         let prefix = frame.prefix.take().expect("completed binder prefix");
-        let body = finish_bounded_frame(view, tokens, frame, grammar, at)?;
+        let body = if matches!(&prefix, term_locals::Prefix::Do(p) if p.done()) {
+            null_node(vec![])
+        } else {
+            finish_bounded_frame(view, tokens, frame, grammar, at)?
+        };
         let (syntax, start) = prefix.finish(leaves, body)?;
         frames
             .last_mut()
@@ -1269,9 +1279,44 @@ fn bounded_term_spliced(
         let index = cursor;
         cursor += 1;
         if grammar == DefinitionGrammar::Scalar
+            && let Some(ends) = term_do::layout(view, tokens, &frames, index)
+        {
+            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index, false)?;
+            let mut frame = frames.pop().expect("waiting do frame");
+            let prefix = frame.prefix.take().expect("waiting do prefix");
+            let value = if matches!(&prefix, term_locals::Prefix::Do(p) if p.done()) {
+                null_node(vec![])
+            } else {
+                finish_bounded_frame(view, tokens, frame, grammar, index)?
+            };
+            if ends {
+                let (syntax, start) = prefix.finish(leaves, value)?;
+                frames
+                    .last_mut()
+                    .expect("do parent")
+                    .application
+                    .push((syntax, start));
+                cursor = index;
+            } else {
+                let (prefix, next) =
+                    prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
+                frames.push(term_binders::frame(prefix));
+                cursor = next;
+            }
+            continue;
+        }
+        if grammar == DefinitionGrammar::Scalar
             && term_locals::layout_boundary(view, tokens, &frames, index)
         {
-            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+            finish_lambda_frames(
+                leaves,
+                view,
+                tokens,
+                &mut frames,
+                grammar,
+                index,
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+            )?;
             let mut frame = frames.pop().expect("waiting assertion value frame");
             let prefix = frame.prefix.take().expect("waiting assertion prefix");
             let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
@@ -1305,7 +1350,15 @@ fn bounded_term_spliced(
                     .and_then(|frame| frame.prefix.as_ref())
                     .is_some_and(|prefix| prefix.closes_header(tokens, index)))
         {
-            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+            finish_lambda_frames(
+                leaves,
+                view,
+                tokens,
+                &mut frames,
+                grammar,
+                index,
+                matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+            )?;
             if let Some(mut frame) = frames.pop_if(|frame| {
                 frame
                     .prefix
@@ -1336,6 +1389,12 @@ fn bounded_term_spliced(
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
+            _ if grammar == DefinitionGrammar::Scalar && term_locals::word(tokens, index, "do") => {
+                let prefix = term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)?;
+                frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
+                    prefix,
+                ))));
+            }
             _ if grammar == DefinitionGrammar::Scalar
                 && (term_locals::word(tokens, index, "have")
                     || term_locals::word(tokens, index, "show")
@@ -1516,7 +1575,15 @@ fn bounded_term_spliced(
                 if grammar == DefinitionGrammar::Scalar
                     && matches!(symbol.as_str(), "," | "}" | ":" | "with") =>
             {
-                finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+                finish_lambda_frames(
+                    leaves,
+                    view,
+                    tokens,
+                    &mut frames,
+                    grammar,
+                    index,
+                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+                )?;
                 if frames.last().is_some_and(|frame| frame.record.is_some()) {
                     record_terms::delimiter(
                         leaves,
@@ -1590,7 +1657,15 @@ fn bounded_term_spliced(
                 });
             }
             Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
-                finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+                finish_lambda_frames(
+                    leaves,
+                    view,
+                    tokens,
+                    &mut frames,
+                    grammar,
+                    index,
+                    matches!(&tokens[index].kind, TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄" | ",")),
+                )?;
                 if lists.current(&frames) {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, index),
@@ -1674,7 +1749,7 @@ fn bounded_term_spliced(
             }
         }
     }
-    finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, range.end)?;
+    finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, range.end, true)?;
     if frames.len() != 1 {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, range.end),
