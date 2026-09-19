@@ -104,6 +104,9 @@ impl Preparation<'_> {
     /// Discover nested record dependencies in postorder on the heap. All roots
     /// refer to the immutable, dual-checked environment, never caller layouts.
     pub(super) fn value_type(&mut self, source: &Expr) -> Result<Option<ValueType>, IngressError> {
+        if matches!(source.node(), ExprNode::ForallE { .. }) {
+            return self.function_value_type(source);
+        }
         if let Some(value) = scalar_type(source) {
             return Ok(Some(value));
         }

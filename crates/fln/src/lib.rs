@@ -4283,7 +4283,7 @@ impl Engine {
         let expression = preparation
             .expression(&expression)
             .map_err(EngineExecutionError::Ingress)?;
-        let catalog = executable_dependencies(
+        let mut catalog = executable_dependencies(
             &self.environment,
             &expression,
             limits.ingress,
@@ -4296,12 +4296,16 @@ impl Engine {
             lambda.lambda = expression.clone();
             preparation.lambdas.push(lambda);
         }
-        let ingress = fln_comp::ingress::lower_closed_expr_with_control_flow(
+        let interfaces = preparation
+            .finalize_callables(&mut catalog.functions)
+            .map_err(EngineExecutionError::Ingress)?;
+        let ingress = fln_comp::ingress::lower_closed_expr_with_closure_interfaces(
             &expression,
             &catalog.scalar_constructors,
             &catalog.intrinsics,
             &preparation.constructors,
             preparation.callables(&catalog.functions),
+            &interfaces,
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
@@ -5031,6 +5035,7 @@ struct ExecutableValueTypes {
     string: Expr,
     bool_: Expr,
     records: BTreeSet<Name>,
+    closures: std::collections::HashMap<Expr, ValueType>,
 }
 
 impl ExecutableValueTypes {
@@ -5040,6 +5045,7 @@ impl ExecutableValueTypes {
             string: Expr::const_(Name::from_components(["String"]), Vec::new()),
             bool_: Expr::const_(Name::from_components(["Bool"]), Vec::new()),
             records: BTreeSet::new(),
+            closures: std::collections::HashMap::new(),
         }
     }
 }
@@ -5513,6 +5519,8 @@ fn executable_value_type(
         Some((ValueType::String, CallableResultOwnership::Owned))
     } else if source == &value_types.bool_ {
         Some((ValueType::Bool, CallableResultOwnership::Scalar))
+    } else if let Some(value) = value_types.closures.get(source) {
+        Some((*value, CallableResultOwnership::Owned))
     } else if matches!(source.node(), fln_core::expr::ExprNode::Const { name, levels }
         if levels.is_empty() && value_types.records.contains(name))
     {

@@ -1091,6 +1091,20 @@ pub struct LambdaBinding {
     pub recursion: LambdaRecursion,
 }
 
+/// An untrusted callable interface, even when this program constructs no value
+/// with that signature. Higher-order parameters need these interfaces before a
+/// concrete callback is available. Closure ids in its value types refer to the
+/// final sorted, deduplicated table, exactly as in [`LambdaBinding`]. All
+/// nonempty parameter suffixes are retained for partial application. No body,
+/// executable authority, or ownership exemption is granted by an interface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosureSignature {
+    pub parameters: Vec<fir::ValueType>,
+    pub parameter_ownership: Vec<crate::flbc::ArgumentOwnership>,
+    pub result: fir::ValueType,
+    pub result_ownership: crate::flbc::CallableResultOwnership,
+}
+
 /// A core-expression checkpoint that has already passed FIR validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngressedProgram {
@@ -2056,6 +2070,7 @@ fn lambda_spine(lambda: &Expr) -> Option<(usize, &Expr)> {
 fn prepare_lambdas<'a>(
     catalog: &mut PreparedCatalog<'a>,
     bindings: &'a [LambdaBinding],
+    interfaces: &[ClosureSignature],
     limits: IngressLimits,
 ) -> Result<(), IngressError> {
     charge(
@@ -2265,8 +2280,66 @@ fn prepare_lambdas<'a>(
         group_start = group_end;
     }
 
-    for lambda in &catalog.lambdas {
-        for suffix_start in 0..lambda.parameters.len() {
+    charge_fir(
+        fir::ValidationResource::ClosureTypes,
+        interfaces.len(),
+        limits.fir.max_closure_types,
+    )?;
+    // Explicit interfaces are still untrusted compiler input. Refuse malformed
+    // envelopes before slicing ownership arrays, then subject the complete
+    // deduplicated table and every actual call to the ordinary FIR validator.
+    for (index, interface) in interfaces.iter().enumerate() {
+        if interface.parameters.is_empty() {
+            return Err(IngressError::UnsupportedNode {
+                kind: "empty closure interface",
+            });
+        }
+        if interface.parameters.len() != interface.parameter_ownership.len() {
+            return Err(IngressError::FunctionOwnershipArity {
+                binding: index,
+                parameters: interface.parameters.len(),
+                ownership: interface.parameter_ownership.len(),
+            });
+        }
+    }
+    let mut signature_cells = 0usize;
+    for (parameters, parameter_ownership, result, result_ownership) in catalog
+        .lambdas
+        .iter()
+        .map(|lambda| {
+            (
+                &lambda.parameters,
+                &lambda.parameter_ownership,
+                lambda.result,
+                lambda.result_ownership,
+            )
+        })
+        .chain(interfaces.iter().map(|interface| {
+            (
+                &interface.parameters,
+                &interface.parameter_ownership,
+                interface.result,
+                interface.result_ownership,
+            )
+        }))
+    {
+        charge(
+            IngressResource::ContextDepth,
+            parameters.len(),
+            limits.max_context_depth,
+        )?;
+        for suffix_start in 0..parameters.len() {
+            signature_cells = signature_cells.saturating_add(
+                parameters
+                    .len()
+                    .saturating_sub(suffix_start)
+                    .saturating_mul(2),
+            );
+            charge_fir(
+                fir::ValidationResource::Operands,
+                signature_cells,
+                limits.fir.max_operands,
+            )?;
             let observed = catalog.closure_types.len().saturating_add(1);
             charge_fir(
                 fir::ValidationResource::ClosureTypes,
@@ -2282,12 +2355,12 @@ fn prepare_lambdas<'a>(
                 })?;
             catalog.closure_types.push(fir::ClosureTypeDecl {
                 id: fir::ClosureTypeId::new(0),
-                parameters: clone_types(&lambda.parameters[suffix_start..])?,
+                parameters: clone_types(&parameters[suffix_start..])?,
                 parameter_ownership: clone_argument_ownership(
-                    &lambda.parameter_ownership[suffix_start..],
+                    &parameter_ownership[suffix_start..],
                 )?,
-                result: lambda.result,
-                result_ownership: lambda.result_ownership,
+                result,
+                result_ownership,
             });
         }
     }
@@ -2384,6 +2457,7 @@ fn prepare_catalog<'a>(
     intrinsics: &[IntrinsicBinding],
     constructors: &[ConstructorBinding],
     callables: CallableBindings<'a>,
+    interfaces: &[ClosureSignature],
     limits: IngressLimits,
 ) -> Result<PreparedCatalog<'a>, IngressError> {
     let CallableBindings {
@@ -2491,7 +2565,7 @@ fn prepare_catalog<'a>(
         });
     }
 
-    prepare_lambdas(&mut catalog, lambdas, limits)?;
+    prepare_lambdas(&mut catalog, lambdas, interfaces, limits)?;
     branch::prepare(&mut catalog, bool_cases, functions.len(), limits)?;
     constructor_case::prepare(
         &mut catalog,
@@ -4537,6 +4611,29 @@ pub fn lower_closed_expr_with_control_flow<'a>(
     callables: CallableBindings<'a>,
     limits: IngressLimits,
 ) -> Result<IngressedProgram, IngressError> {
+    lower_closed_expr_with_closure_interfaces(
+        source,
+        scalar_constructors,
+        intrinsics,
+        constructors,
+        callables,
+        &[],
+        limits,
+    )
+}
+
+/// Lower typed higher-order callables with explicit closure interfaces. The
+/// interfaces join the lambda-derived signature table, never replace it, and
+/// all generated FIR/FLBC must pass the same independent validators.
+pub fn lower_closed_expr_with_closure_interfaces<'a>(
+    source: &'a Expr,
+    scalar_constructors: &[ScalarConstructorBinding],
+    intrinsics: &[IntrinsicBinding],
+    constructors: &[ConstructorBinding],
+    callables: CallableBindings<'a>,
+    interfaces: &[ClosureSignature],
+    limits: IngressLimits,
+) -> Result<IngressedProgram, IngressError> {
     if source.has_fvar() {
         return Err(IngressError::OpenFreeVariable);
     }
@@ -4554,6 +4651,7 @@ pub fn lower_closed_expr_with_control_flow<'a>(
         intrinsics,
         constructors,
         callables,
+        interfaces,
         limits,
     )?;
     let mut closure_build = ClosureBuild::new(&catalog)?;
@@ -7960,6 +8058,7 @@ mod tests {
             &[],
             &[],
             CallableBindings::default(),
+            &[],
             IngressLimits::default(),
         )
         .expect("empty catalog is canonical");
