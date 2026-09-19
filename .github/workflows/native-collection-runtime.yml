@@ -7,7 +7,8 @@ permissions:
   contents: write
 jobs:
   integrate:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(runtime): validate and publish native polymorphic collection execution'
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(runtime): validate and publish native polymorphic collection execution'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -21,7 +22,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Retain current source for native implementation work
+      - name: Retain exact current source
         shell: bash
         run: |
           set -euo pipefail
@@ -35,53 +36,55 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Prepare digest-bound implementation increments
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
+        shell: bash
         run: |
-          import base64, gzip, hashlib, json, os, pathlib, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
-          root.mkdir()
-          inputs = [
-              ('c8e9ab3bcffb8be8cc7f341a3b40b05431a41299', 'a5ee668bbe7c3e66ccc4657af67161460f71b21c211c92940ce46c49c5a17a37'),
-              ('bde7d57dbcec3570cb875acbcc4f3a36d30e3d0e', '32fd3e88d877c8c821d161a4d2dd5a51cb791b7b0cb58b0e1211ae006b6251cb'),
-          ]
-          for index, (sha, digest) in enumerate(inputs, 1):
-              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  blob = json.load(response)
-              data = base64.b64decode(blob['content'])
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
-              if index == 1:
-                  # Repair transport transcription only, then enforce the original patch digest.
-                  encoded = base64.b64encode(data).decode()
-                  for old, new in [('J2ABdjaI4o1', 'J2ABcjaI4o1'), ('E8nY9dlltG', 'E8nY9dllhtG'), ('CsidZquxmxm6x', 'CsidZquxm6x'), ('HUXYkNfV8J8HA0', 'HUXYkNfV8JHA0')]:
-                      assert encoded.count(old) == 1
-                      encoded = encoded.replace(old, new)
-                  data = base64.b64decode(encoded, validate=True)
-              patch = gzip.decompress(data)
-              assert hashlib.sha256(patch).hexdigest() == digest
-              (root / (str(index) + '.patch')).write_bytes(patch)
-          script = '''import base64, hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/collection-runtime"
+          cat > "$RUNNER_TEMP/collection-runtime/validate.py" <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, sys, urllib.request
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
           stage = int(sys.argv[1])
           out = root / str(stage)
           out.mkdir()
-          patch = root / (str(stage) + '.patch')
-          paths = [line.split(' b/', 1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git a/')]
+          inputs = {
+              1: ('c8e9ab3bcffb8be8cc7f341a3b40b05431a41299', 'a5ee668bbe7c3e66ccc4657af67161460f71b21c211c92940ce46c49c5a17a37'),
+              2: ('bde7d57dbcec3570cb875acbcc4f3a36d30e3d0e', '32fd3e88d877c8c821d161a4d2dd5a51cb791b7b0cb58b0e1211ae006b6251cb'),
+          }
+          def api(path, value=None):
+              payload = None if value is None else json.dumps(value).encode()
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + path, data=payload, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          def blob_sha(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          sha, digest = inputs[stage]
+          blob = api('/git/blobs/' + sha)
+          data = base64.b64decode(blob['content'])
+          assert blob_sha(data) == sha
+          if stage == 1:
+              encoded = base64.b64encode(data).decode()
+              for old, new in [('J2ABdjaI4o1', 'J2ABcjaI4o1'), ('E8nY9dlltG', 'E8nY9dllhtG'), ('CsidZquxmxm6x', 'CsidZquxm6x'), ('HUXYkNfV8J8HA0', 'HUXYkNfV8JHA0')]:
+                  assert encoded.count(old) == 1
+                  encoded = encoded.replace(old, new)
+              data = base64.b64decode(encoded, validate=True)
+          patch = gzip.decompress(data)
+          assert hashlib.sha256(patch).hexdigest() == digest
+          patch_path = out / 'implementation.patch'
+          patch_path.write_bytes(patch)
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
           assert paths and len(paths) == len(set(paths))
           assert all(p.startswith(('crates/', 'examples/')) and '..' not in p.split('/') for p in paths)
-          assert '\\ndeleted file mode ' not in patch.read_text()
+          assert '\ndeleted file mode ' not in patch.decode()
           before = {}
           for path in paths:
               result = subprocess.run(['git', 'rev-parse', 'HEAD:' + path], capture_output=True, text=True)
               before[path] = result.stdout.strip() if result.returncode == 0 else None
           def run(args):
               with (out / 'validation.log').open('a') as log:
-                  log.write('\\n$ ' + ' '.join(args) + '\\n'); log.flush()
+                  log.write('\n$ ' + ' '.join(args) + '\n'); log.flush()
                   subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, check=True)
-          run(['git', 'apply', '--check', str(patch)])
-          run(['git', 'apply', '--index', str(patch)])
+          run(['git', 'apply', '--check', str(patch_path)])
+          run(['git', 'apply', '--index', str(patch_path)])
           run(['rustc', '-Vv'])
           run(['cargo', 'test', '--locked', '-p', 'fln', '--test', 'runtime_polymorphic_data'])
           if stage == 2:
@@ -97,20 +100,13 @@ jobs:
           rows = []
           for path in paths:
               data = pathlib.Path(path).read_bytes()
-              body = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
-              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs', data=body, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  sha = json.load(response)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\\0' + data).hexdigest()
+              sha = api('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
+              assert sha == blob_sha(data)
               rows.append({'path': path, 'before': before[path], 'sha': sha, 'mode': '100644', 'type': 'blob'})
           (out / 'blobs.json').write_text(json.dumps({'base': os.environ['GITHUB_SHA'], 'stage': stage, 'files': rows}, indent=2))
           run(['git', 'archive', '--format=tar.gz', '-o', str(out / 'source.tar.gz'), 'HEAD'])
-          '''
-          import textwrap
-          # The first line is intentionally unindented; dedent the remaining source.
-          first, rest = script.split('\n', 1)
-          (root / 'validate.py').write_text(first + '\n' + textwrap.dedent(rest))
-          compile((root / 'validate.py').read_text(), str(root / 'validate.py'), 'exec')
+          PY
+          python -m py_compile "$RUNNER_TEMP/collection-runtime/validate.py"
       - name: Validate concrete collection layouts and export exact blobs
         env:
           GH_TOKEN: ${{ github.token }}
