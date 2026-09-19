@@ -16,15 +16,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Read active implementation beads
-        shell: python
-        run: |
-          import json
-          for line in open('.beads/issues.jsonl'):
-              row = json.loads(line)
-              if row.get('status') != 'closed' and any(w in row.get('title', '').lower() for w in ('lantern', 'server', 'incremental', 'elaboration', 'unifier')):
-                  print(row['id'], row.get('priority'), row.get('status'), row.get('title'), row.get('description', ''))
-      - name: Apply reactive checking to exact source inputs
+      - name: Apply watched dependency integration to exact source inputs
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
@@ -34,9 +26,9 @@ jobs:
           root.mkdir()
           (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
           blobs = {
-              'crates/fln-server/src/dispatch/workspace.rs': '436f89ee2a678ec874ef8010f885da5eb62ab5f4',
-              'crates/fln-cli/src/source_check/lsp/dependencies.rs': 'b89f63313e01f3902f7b6a5f111ec5b2a950a6c1',
-              'crates/fln-cli/tests/lsp_proof_modules/reactive.rs': 'c911db12cdc4281749ee8438d595ee9f5790c966',
+              'crates/fln-server/src/dispatch/json/files.rs': 'd1d8d766bf41a029f1908f93e9a24187a7e3d903',
+              'crates/fln-server/src/dispatch/watch.rs': '87c41bd677cec04a64196f7e46485cc4fc1bd74b',
+              'crates/fln-cli/tests/lsp_proof_modules/watched.rs': '3b5c44e83b208c1f50dd584e8795d26e4e4ecf89',
           }
           for path, sha in blobs.items():
               request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
@@ -60,96 +52,72 @@ jobs:
           def replace(text, old, new, count=1):
               assert text.count(old) == count, (old, text.count(old), count)
               return text.replace(old, new)
-          def documents(text):
-              return replace(text, 'pub(super) trait CheckSource {', '''pub(super) trait CheckSource {
-              fn tracks_dependencies(&self) -> bool { false }
-              fn affected(&mut self, _: &[String], _: &[OpenDocumentSource<'_>]) -> Vec<String> { Vec::new() }''')
-          edit('crates/fln-server/src/dispatch/documents.rs', documents)
+          edit('crates/fln-server/src/dispatch/json.rs', lambda t: t + '\nmod files;\npub(super) use files::{RegistrationReply, registration_reply, supports_file_registration, watched_file_uris};\n')
           def dispatch(text):
-              text = replace(text, 'mod documents;\n', 'mod workspace;\npub use workspace::{WorkspaceChecker, serve_workspace};\nmod documents;\n')
+              text = replace(text, 'mod workspace;\n', 'mod watch;\nmod workspace;\n')
+              text = replace(text, '            | "textDocument/didClose"\n', '            | "textDocument/didClose"\n            | "workspace/didChangeWatchedFiles"\n')
               start = text.index('fn serve_inner(')
-              prefix, body = text[:start], text[start:]
-              body = replace(body, '        match (method.as_str(), id, state) {', '''        let before = if on_did_open.tracks_dependencies() && state == ServerState::Running
-                      && id.is_none() && matches!(method.as_str(), "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave" | "textDocument/didClose")
-                  { Some(workspace::BeforeChange::capture(&session)) } else { None };
-                  let mut checked_event = None;
-                  match (method.as_str(), id, state) {''')
-              body = replace(body, '                    record_frontier(&mut frontiers, &checked);', '                    checked_event = Some(checked.uri.clone());\n                    record_frontier(&mut frontiers, &checked);', 3)
-              body = replace(body, '            (_, None, _) => {}\n        }\n    }\n}', '''            (_, None, _) => {}
-                  }
-                  if let Some(before) = before {
-                      let changed = before.changed(&session, checked_event.as_deref());
-                      if !changed.is_empty() {
-                          workspace::refresh(output, &session, &mut waits, &mut frontiers,
-                              on_did_open, &changed, checked_event.as_deref())?;
+              end = text.index('#[cfg(test)]', start)
+              prefix, body, suffix = text[:start], text[start:end], text[end:]
+              body = replace(body, '    let mut frontiers = BTreeMap::new();', '    let mut frontiers = BTreeMap::new();\n    let mut file_watcher = watch::Registration::default();')
+              body = replace(body, '        let method = match method(&envelope, id) {', '''        if file_watcher.consume(output, &text, &envelope)? { continue; }
+                  let method = match method(&envelope, id) {''')
+              body = replace(body, '                write_protocol_message(output, initialize_response(request_id))?;', '                file_watcher.configure(envelope.params, on_did_open.tracks_dependencies());\n                write_protocol_message(output, initialize_response(request_id))?;')
+              body = replace(body, '                state = ServerState::Running;', '                state = ServerState::Running;\n                file_watcher.start(output)?;')
+              body = replace(body, '                state = ServerState::ShuttingDown;', '                state = ServerState::ShuttingDown;\n                file_watcher.stop();')
+              anchor = '            ("textDocument/waitForDiagnostics", Some(request_id), state) => {'
+              addition = '''            ("workspace/didChangeWatchedFiles", None, ServerState::Running) => {
+                          if on_did_open.tracks_dependencies() {
+                              match json::watched_file_uris(envelope.params) {
+                                  Ok(uris) if !uris.is_empty() => workspace::refresh(
+                                      output, &session, &mut waits, &mut frontiers, on_did_open, &uris, None,
+                                  )?,
+                                  Ok(_) => {},
+                                  Err(message) => write_warning(output, message)?,
+                              }
+                          }
                       }
-                  }
-              }
-          }''')
-              return prefix + body
-          edit('crates/fln-server/src/dispatch.rs', dispatch)
-          edit('crates/fln-cli/src/source_check/imports/editor.rs', lambda t: replace(t, 'fn document_path(uri:', 'pub(in crate::source_check) fn document_path(uri:'))
-          def checker(text):
-              text = replace(text, 'pub(crate) struct Checker { worker: Option<Worker> }', 'mod dependencies;\npub(crate) struct Checker { worker: Option<Worker>, dependencies: dependencies::Dependencies }')
-              text = replace(text, 'Self { worker: None }', 'Self { worker: None, dependencies: dependencies::Dependencies::default() }')
-              text = replace(text, '        if text.len() > SOURCE_RUN_DEFAULT_MAX_BYTES {', '        self.dependencies.begin(uri, documents);\n        if text.len() > SOURCE_RUN_DEFAULT_MAX_BYTES {')
-              old = '''        if let Err(error) = fln::source_check::modules::parse_source_header(text.as_bytes()) {
-                      return project(uri, text, &diagnostic(uri, text.as_bytes(), error.primary_offset().map_or(0, |p| p.0), &error.to_string()));
-                  }'''
-              new = '''        match fln::source_check::modules::parse_source_header(text.as_bytes()) {
-                      Ok(header) if header.imports.is_empty() => self.dependencies.no_imports(uri),
-                      Ok(_) => {},
-                      Err(error) => return project(uri, text, &diagnostic(uri, text.as_bytes(), error.primary_offset().map_or(0, |p| p.0), &error.to_string())),
-                  }'''
-              text = replace(text, old, new)
-              text = replace(text, '        if self.worker.is_none() {', '        self.dependencies.loaded(uri, &sources.uris);\n        if self.worker.is_none() {')
-              text += '''
-          impl fln_server::dispatch::WorkspaceChecker for Checker {
-              fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
-                  Checker::check(self, uri, text, documents)
-              }
-              fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
-                  self.dependencies.affected(changed, documents)
-              }
-          }
           '''
-              return text
-          edit('crates/fln-cli/src/source_check/lsp.rs', checker)
-          def cli(text):
-              start = text.index('    let mut on_did_open = move |uri: &str, text: &str, documents:')
-              end = text.index('    if let Err(error) = writer.flush()', start)
-              assert 'serve_with_documents' in text[start:end]
-              return text[:start] + '    let outcome = fln_server::dispatch::serve_workspace(&mut reader, &mut writer, &mut checker);\n' + text[end:]
-          edit('crates/fln-cli/src/lib.rs', cli)
-          def tests(text):
-              text = replace(text, 'assert_eq!(errors(&messages, &entry).len(), 2,', 'assert_eq!(errors(&messages, &entry).len(), 4,')
-              text = replace(text, 'assert_eq!(successes(&messages).len(), 4,', 'assert_eq!(successes(&messages).len(), 5,')
-              return text + '\n#[path = "lsp_proof_modules/reactive.rs"]\nmod reactive;\n'
-          edit('crates/fln-cli/tests/lsp_proof_modules.rs', tests)
+              body = replace(body, anchor, addition + anchor)
+              return prefix + body + suffix
+          edit('crates/fln-server/src/dispatch.rs', dispatch)
+          def dependencies(text):
+              text = replace(text, 'dependencies.iter().any(|p| paths.contains(p))', 'dependencies.iter().any(|p| paths.iter().any(|changed| p.starts_with(changed)))')
+              anchor = '    #[test]\n    fn closes_release_observations_but_unavailable_open_sources_do_not()'
+              addition = '''    #[test]
+              fn directory_events_invalidate_descendants_not_string_prefix_neighbors() {
+                  let watches = Dependencies { entries: BTreeMap::from([
+                      ("Main".to_owned(), known(&["Lib/A.lean", "Lib/B.lean"])),
+                      ("Other".to_owned(), known(&["Library/A.lean"])),
+                  ]), ..Dependencies::default() };
+                  assert_eq!(watches.select(&paths(&["Lib"]), false), ["Main"]);
+                  assert_eq!(watches.select(&paths(&["Lib/A.lean"]), false), ["Main"]);
+                  assert!(watches.select(&paths(&["Li"]), false).is_empty());
+              }
+          '''
+              return replace(text, anchor, addition + anchor)
+          edit('crates/fln-cli/src/source_check/lsp/dependencies.rs', dependencies)
+          edit('crates/fln-cli/tests/lsp_proof_modules.rs', lambda t: t + '\n#[path = "lsp_proof_modules/watched.rs"]\nmod watched;\n')
           def docs(text):
-              start = text.index('Dependency edits are consumed')
-              end = text.index('An error in a dependency', start)
-              return text[:start] + '''Accepted dependency opens, changes and saves, rejected edits that invalidate
-          source, and closes now automatically recheck affected open importers before
-          the next request is processed. Transitive consumers are selected from the
-          resolver's complete source closure and checked once in deterministic URI
-          order. Incomplete resolution and dependency-retention pressure fall back to
-          conservative rechecking, never silently missing an edge. The dependency
-          index retains at most 16,384 paths and 4 MiB of path bytes, in addition to
-          session-bounded document identities; these are not allocator RSS limits.
-          Old diagnostic frontiers are replaced even when the importer version has
-          not changed. Unavailable importer text produces a nonanswer, not disk fallback.
-          Legacy callback APIs keep their original single-document behavior; embedders
-          opt into `serve_workspace` with a typed `WorkspaceChecker`.
-          Closed-file disk notifications, cursor goal inspection, semantic
-          hover/completion/definition and Lean RPC sessions remain separate work.
-          ''' + text[end:]
+              text = replace(text, 'Closed-file disk notifications, cursor goal inspection, semantic\nhover/completion/definition and Lean RPC sessions remain separate work.', '''Closed-file changes are handled through `workspace/didChangeWatchedFiles`.
+          When the client advertises dynamic registration, the server requests one
+          `**/*.lean` watcher for create/change/delete events after initialization.
+          A declined registration leaves ordinary editor checking available. Clients
+          with preconfigured watchers may also send notifications without registration.
+          Notification batches are structurally validated and bounded to 4,096 events
+          and 1 MiB before any rechecking; repeated URIs are coalesced. File and folder
+          observations trigger dependency rechecks, not document text/version changes.
+          Actual bounded disk snapshots and current open buffers remain the authority.
+          No filesystem polling, external watcher process or source writes are added.
+          Cursor goal inspection, semantic hover/completion/definition and Lean RPC
+          sessions remain separate work.''')
+              return text
           edit('docs/NATIVE_EDITOR_PROOFS.md', docs)
           (root / 'paths.json').write_text(json.dumps(changed))
           subprocess.run(['git', 'add', '--', *changed], check=True)
           (root / 'integration.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
           (root / 'source-files.json').write_text(json.dumps({p: pathlib.Path(p).read_text() for p in changed}))
-      - name: Test reactive editor checking and downstream integration
+      - name: Test watched files, live editor traffic and downstream compilation
         shell: bash
         run: |
           set -euo pipefail
