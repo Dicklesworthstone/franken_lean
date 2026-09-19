@@ -53,8 +53,8 @@ jobs:
           import subprocess
           import urllib.request
 
-          CHUNKS = ['2f16c9528d93b841b942d79f2fc32655c398dee9']
-          EXPECTED = '589426fe39bbc03f798e19c237543bb5dfd3879a435c62993b8d2e382a84b908'
+          CHUNKS = ['5c3821d2893db48efe09018b9167d6ed29998a73', '2048fd51da2ad1c3347ccdbe3d11c787b309919f', 'e2ccf752a3faaaf01605167b74765e6bd7036bda', '6d18dfce7403bbce2646a7459a42cee6c6feffbb']
+          EXPECTED = '4e7fba12ae5b7cad318f41097f7b07d72ee5a4a14d16ac33800e31a648f01695'
           logs = pathlib.Path('target/unifier-checks')
           logs.mkdir(parents=True, exist_ok=True)
 
