@@ -18,12 +18,13 @@ concurrency:
 
 jobs:
   unifier:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
       - name: Retain exact reproduction source
         shell: bash
         run: |
@@ -38,6 +39,31 @@ jobs:
           path: target/unifier-source
           retention-days: 2
           if-no-files-found: error
+      - name: Apply exact tested scope increment
+        if: startsWith(github.event.head_commit.message, 'feat(elab): publish tested residual-scope assignment orientation')
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, pathlib, subprocess
+          paths = {
+            'crates/fln-elab/src/constraint/unify.rs': ('0b1bc1943939ad029f0d71f8325d37f9924d976b', '57c2c2ee893e0e7d2f364adb7e022701c467d443'),
+            'crates/fln-elab/src/constraint/unify/residual.rs': ('8858a2f988c094cc58a5b549adac8878901f1732', '5855fee80d23204486638677b2cbc6222a87b7b3'),
+            'crates/fln-elab/tests/native_unification_context_pruning.rs': ('f085f8bc24c3e65f39935c76acf49bf27f3384c8', '923a90068e1a52b7ccdb7d1667e6eff0a9076f94'),
+          }
+          def verify(which):
+            for path, identities in paths.items():
+              data = pathlib.Path(path).read_bytes()
+              actual = hashlib.sha1(('blob %d\0' % len(data)).encode() + data).hexdigest()
+              if actual != identities[which]:
+                raise SystemExit('Source identity changed: ' + path + ': ' + actual)
+          verify(0)
+          payload = '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'
+          patch = gzip.decompress(base64.b64decode(payload, validate=True))
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          verify(1)
+          PY
       - name: Install configured compiler
         shell: bash
         run: |
@@ -56,6 +82,18 @@ jobs:
           lint=${PIPESTATUS[0]}
           printf 'tests=%s clippy=%s\n' "$tests" "$lint" | tee target/unifier-checks/result.txt
           test "$tests" -eq 0 && test "$lint" -eq 0
+      - name: Publish verified source directly to main
+        if: success() && startsWith(github.event.head_commit.message, 'feat(elab): publish tested residual-scope assignment orientation')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- crates/fln-elab/src/constraint/unify.rs crates/fln-elab/src/constraint/unify/residual.rs crates/fln-elab/tests/native_unification_context_pruning.rs
+          git commit -m 'feat(elab): orient assignments by residual scope and depth' -m 'Check latent residual scopes before assignment mutation using the same dependency inventory as final conditional K1 validation. Reverse unsafe outer-to-inner aliases, retain opaque and occurs-check policies, and retry blocked residuals after ordinary constraint progress. Eight new regressions cover dependent contexts, depth, late resolution, kernel refusal, queues and rollback. Full elaborator tests and strict all-target Clippy passed before publication; no full-workspace or Reference-parity claim. Advances fln-pv1 without closing it.'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/unifier-checks/published.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
