@@ -1,0 +1,118 @@
+name: Native monadic do landing
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-native-do-landing.yml']
+permissions:
+  contents: read
+concurrency:
+  group: fln-native-do-landing
+  cancel-in-progress: false
+jobs:
+  native-do:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): validate and land native monadic do notation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Retain the input and install the compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-do"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-do/base.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-do/base.tar.gz"
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee "$RUNNER_TEMP/native-do/compiler.txt"
+      - name: Check and publish native monadic source support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-do'
+          def run(*args):
+              subprocess.run(args, check=True)
+          def output(*args):
+              return subprocess.check_output(args).decode().strip()
+          def checked(label, *args):
+              with (root / (label + '.log')).open('wb') as log:
+                  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  for line in iter(process.stdout.readline, b''):
+                      log.write(line)
+                      print(line.decode(errors='replace'), end='', flush=True)
+                  if process.wait():
+                      raise RuntimeError('validation failed: ' + label)
+          expected = {
+              'crates/fln-elab/src/source.rs': '47d8ce3bc0280df2ec06b9ca1b3f3e3d344e9669',
+              'crates/fln-elab/src/source/patterns.rs': '657edc81e0377a6c61d751cc8cde192bd8798ab1',
+              'crates/fln-parse/src/lib.rs': 'cc01ba2df2131189b6a3a2618ae0fff0c310447e',
+              'crates/fln-parse/src/term_locals.rs': '83f104d28509667461da9a8b17bf7f7339b0c56c',
+          }
+          new = {
+              'crates/fln-elab/src/source/do_notation.rs',
+              'crates/fln-parse/src/term_do.rs',
+              'crates/fln-parse/tests/do_notation.rs',
+              'crates/fln/tests/source_do.rs',
+              'docs/NATIVE_DO_NOTATION.md',
+          }
+          for path, sha in expected.items():
+              assert output('git', 'rev-parse', 'HEAD:' + path) == sha, 'concurrent edit: ' + path
+          for path in new:
+              assert not pathlib.Path(path).exists(), 'new path collision: ' + path
+          sha = 'c40b52b1fb84543e002e53e9e20f40bbaafcad86'
+          request = urllib.request.Request(
+              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
+              headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = json.load(response)
+          assert data['encoding'] == 'base64'
+          encoded = base64.b64decode(data['content'])
+          assert hashlib.sha1(('blob ' + str(len(encoded)) + '\0').encode() + encoded).hexdigest() == sha
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '7fe211a2377c8ead47be7f8f69616e8e9f7e8a396365a0b7a9380bd296ff12f7'
+          mailbox = root / 'native-do.mbox'
+          mailbox.write_bytes(patch)
+          assert not output('git', 'status', '--porcelain')
+          run('git', 'apply', '--index', '--whitespace=error', str(mailbox))
+          changed = output('git', 'diff', '--cached', '--name-only').splitlines()
+          assert set(changed) == set(expected) | new
+          run('git', 'diff', '--cached', '--check')
+          checked('fmt', 'rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *(p for p in changed if p.endswith('.rs')))
+          checked('parse-tests', 'cargo', 'test', '--locked', '-p', 'fln-parse')
+          checked('elab-tests', 'cargo', 'test', '--locked', '-p', 'fln-elab')
+          checked('source-do-tests', 'cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_do')
+          checked('frontend-clippy', 'cargo', 'clippy', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--all-targets', '--', '-D', 'warnings')
+          checked('engine-clippy', 'cargo', 'clippy', '--locked', '-p', 'fln', '--test', 'source_do', '--', '-D', 'warnings')
+          checked('workspace-check', 'cargo', 'check', '--locked', '--workspace', '--all-targets')
+          run('git', 'config', 'user.name', 'github-actions[bot]')
+          run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          run('git', 'commit', '-m', 'feat(source): elaborate native monadic do blocks through checked dictionaries')
+          run('git', 'push', 'origin', 'HEAD:main')
+          (root / 'published-commit.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
+      - name: Retain the final source and worktree status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-do"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-do/source-commit.txt"
+          git status --porcelain > "$RUNNER_TEMP/native-do/worktree-status.txt"
+          git diff HEAD --binary > "$RUNNER_TEMP/native-do/unpublished.patch"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-do/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-do-${{ github.run_id }}
+          path: ${{ runner.temp }}/native-do
+          retention-days: 7
+          if-no-files-found: error
