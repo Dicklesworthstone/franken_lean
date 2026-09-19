@@ -146,7 +146,7 @@ fn decide_closes_polymorphic_contexts_without_accepting_false_propositions() {
 #[test]
 fn failed_wildcard_prefix_restores_hypotheses_and_deferred_closures() {
     accepted(
-        "theorem t (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by try rewrite [h, h] at *; rewrite [h] at *; exact hx",
+        "theorem t (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by\n try (rewrite [h, h] at *)\n rewrite [h] at *\n exact hx",
     );
 }
 
