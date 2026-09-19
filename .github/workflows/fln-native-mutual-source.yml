@@ -45,12 +45,16 @@ jobs:
           }
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
-          request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/b237e0f4d67017ee48baa0cd68e0cac838942c50', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              encoded = base64.b64decode(json.load(response)['content']).decode('ascii')
-          assert blob(encoded.encode()) == 'b237e0f4d67017ee48baa0cd68e0cac838942c50'
-          # Transport corrections only. The complete original payload and every
-          # output source file must reproduce the independently retained hashes.
+          def fetch_blob(sha):
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert blob(data) == sha
+              return data
+          encoded = fetch_blob('b237e0f4d67017ee48baa0cd68e0cac838942c50').decode('ascii')
+          # Reconstruct the independently identified transport payload only.
           for sent, original in [('Nk2i1PMKHR', 'Nk2i1iKHR'), ('LZdJJii5', 'LZdJii5'), ('UbQvHLRZZsb', 'UbQvHLRZsb'), ('npbOOPSak', 'npbOIPSak')]:
               assert encoded.count(sent) == 1
               encoded = encoded.replace(sent, original)
@@ -60,14 +64,28 @@ jobs:
           paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
           assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
           assert '\ndeleted file mode ' not in patch.decode()
+          parser = 'crates/fln-parse/src/lib.rs'
+          before = {}
           for path, (old, new) in manifest.items():
               p = pathlib.Path(path)
-              assert (blob(p.read_bytes()) if p.exists() else None) == old, path
+              before[path] = blob(p.read_bytes()) if p.exists() else None
+              if path != parser:
+                  assert before[path] == old, path
+          # Only lib.rs has concurrent changes (native do notation). Three-way
+          # merge against its exact original blob; conflicts must stop this job.
+          original = fetch_blob(manifest[parser][0])
+          actual = subprocess.check_output(['git','hash-object','-w','--stdin'], input=original).decode().strip()
+          assert actual == manifest[parser][0]
+          (root / 'parser-before.rs').write_bytes(pathlib.Path(parser).read_bytes())
           (root / 'integration.patch').write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', str(root / 'integration.patch')], check=True)
-          subprocess.run(['git', 'apply', '--index', str(root / 'integration.patch')], check=True)
+          subprocess.run(['git','apply','--3way','--index',str(root / 'integration.patch')], check=True)
           for path, (old, new) in manifest.items():
-              assert blob(pathlib.Path(path).read_bytes()) == new, path
+              actual = blob(pathlib.Path(path).read_bytes())
+              if path != parser:
+                  assert actual == new, path
+              manifest[path] = [before[path], actual]
+          (root / 'parser-after.rs').write_bytes(pathlib.Path(parser).read_bytes())
+          (root / 'merged.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
           (root / 'manifest.json').write_text(json.dumps(manifest))
       - name: Test the ordinary parser engine and installed command
         shell: bash
@@ -78,8 +96,9 @@ jobs:
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv
-          cargo test --locked -p fln-parse --lib
+          cargo test --locked -p fln-parse
           cargo test --locked -p fln --test source_mutual_inductives --test source_inductive --test generated_mutual_inductives
+          if test -f crates/fln/tests/source_do.rs; then cargo test --locked -p fln --test source_do; fi
           cargo test --locked -p fln-cli --test source_check installed_binary_checks_mutual_source_and_cross_family_computation
           cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
