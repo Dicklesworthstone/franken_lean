@@ -13,6 +13,8 @@ pub type OnDocumentCheck<'a> =
     dyn FnMut(&str, &str, &[OpenDocumentSource<'_>]) -> Vec<String> + 'a;
 
 pub(super) trait CheckSource {
+    fn tracks_dependencies(&self) -> bool { false }
+    fn affected(&mut self, _: &[String], _: &[OpenDocumentSource<'_>]) -> Vec<String> { Vec::new() }
     fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String>;
 }
 impl<F: FnMut(&str, &str) -> Vec<String>> CheckSource for F {

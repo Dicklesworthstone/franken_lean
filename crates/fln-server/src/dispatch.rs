@@ -14,6 +14,8 @@ use crate::transport;
 mod diagnostic_wait;
 #[cfg(test)]
 mod incremental;
+mod workspace;
+pub use workspace::{WorkspaceChecker, serve_workspace};
 mod documents;
 use documents::CheckSource;
 pub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};
@@ -899,6 +901,10 @@ fn serve_inner(
             continue;
         }
 
+        let before = if on_did_open.tracks_dependencies() && state == ServerState::Running
+            && id.is_none() && matches!(method.as_str(), "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave" | "textDocument/didClose")
+        { Some(workspace::BeforeChange::capture(&session)) } else { None };
+        let mut checked_event = None;
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
                 write_protocol_message(output, initialize_response(request_id))?;
@@ -946,6 +952,7 @@ fn serve_inner(
                     handle_open(output, &mut session, envelope.params, on_did_open)?
                 {
                     documents_opened = documents_opened.saturating_add(1);
+                    checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
                         output,
@@ -964,6 +971,7 @@ fn serve_inner(
                     on_did_open,
                 )? {
                     documents_changed = documents_changed.saturating_add(1);
+                    checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
                         output,
@@ -982,6 +990,7 @@ fn serve_inner(
                     on_did_open,
                 )? {
                     documents_saved = documents_saved.saturating_add(1);
+                    checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
                         output,
@@ -1066,6 +1075,13 @@ fn serve_inner(
                 }
             }
             (_, None, _) => {}
+        }
+        if let Some(before) = before {
+            let changed = before.changed(&session, checked_event.as_deref());
+            if !changed.is_empty() {
+                workspace::refresh(output, &session, &mut waits, &mut frontiers,
+                    on_did_open, &changed, checked_event.as_deref())?;
+            }
         }
     }
 }
