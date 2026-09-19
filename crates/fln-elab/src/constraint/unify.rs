@@ -668,11 +668,12 @@ impl Engine<'_> {
                     self.assigned_levels.push(id.clone());
                 }
                 (LevelView::Succ(a), LevelView::Succ(b)) => pending.push((a.clone(), b.clone())),
-                (LevelView::Max(a, b), LevelView::Max(c, d))
-                | (LevelView::IMax(a, b), LevelView::IMax(c, d)) => {
-                    pending.push((b.clone(), d.clone()));
-                    pending.push((a.clone(), c.clone()));
-                }
+                // Max and IMax are not injective constructors. In particular,
+                // normalization may sort unknown atoms differently from their
+                // eventual values. Pairing those positions guesses assignments
+                // and can make a later, perfectly valid typing equation fail.
+                // Leave the equation suspended until other constraints determine
+                // its holes; the worklist retries it after assignment progress.
                 _ => {
                     return Err(UnificationError::Deferred(
                         UnificationDeferred::UnsupportedEquation,
