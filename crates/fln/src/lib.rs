@@ -5632,20 +5632,20 @@ pub struct CheckerExecutionLimits {
 
 impl Default for CheckerExecutionLimits {
     fn default() -> Self {
-        let term = fln_checker::term::TermBudget::new(8_000_000, 100_000_000)
-            .with_max_arena_nodes(8_000_000);
-        let whnf = fln_checker::whnf::WhnfBudget::new(8_000_000, 8_000_000, term);
-        let inference = fln_checker::infer::InferenceBudget::new(8_000_000, 8_000_000, term, term)
+        let term = fln_checker::term::TermBudget::new(100_000_000, 200_000_000)
+            .with_max_arena_nodes(100_000_000);
+        let whnf = fln_checker::whnf::WhnfBudget::new(100_000_000, 100_000_000, term);
+        let inference = fln_checker::infer::InferenceBudget::new(100_000_000, 100_000_000, term, term)
             .with_whnf(whnf);
         Self {
             decode: CheckerDecodeBudget::new(16 * 1024 * 1024, 1_000_000),
             environment: CheckerEnvironmentBudget::new(
-                10_000_000,
+                20_000_000,
                 100_000,
                 100_000,
                 100_000,
-                10_000_000,
-                100_000_000,
+                20_000_000,
+                200_000_000,
             ),
             admission: CheckerAdmissionBudget::new(inference, whnf, inference.defeq),
         }
