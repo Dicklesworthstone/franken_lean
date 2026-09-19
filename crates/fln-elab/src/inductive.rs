@@ -3,6 +3,9 @@
 //! Both checking engines must validate the block. This generator handles
 //! dependent constructor fields and strictly positive uniform recursive fields; it never
 //! infers positivity from a flag or publishes a candidate into an environment.
+mod mutual;
+pub use mutual::mutual_inductive_declaration;
+
 use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, app, fresh, fv};
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
