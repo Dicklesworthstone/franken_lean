@@ -2,8 +2,12 @@
 //! Acceptance must contain a closed theorem; parsing alone is not evidence.
 #![forbid(unsafe_code)]
 
-use fln_core::outcome::Outcome;
-use fln_elab::{check_definition_source, seed::source_seed_declarations};
+use fln_core::{name::Name, outcome::Outcome};
+use fln_elab::{
+    check_definition_source,
+    instances::{register_class, register_instance},
+    seed::source_seed_declarations,
+};
 use fln_env::{
     environment::{DeclarationBudget, DeclarationCommitted, Environment},
     pmap::CollisionBudget,
@@ -40,6 +44,12 @@ fn environment() -> Environment {
             Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
             other => panic!("seed publication {other:?}"),
         };
+    }
+    // Declarations and instance metadata are separate immutable inputs. The
+    // seed helper supplies checked declarations, not their source registrations.
+    env = register_class(&env, &Name::from_components(["Decidable"])).unwrap();
+    for name in ["instDecidableTrue", "instDecidableFalse"] {
+        env = register_instance(&env, &Name::from_components([name]), 1000).unwrap();
     }
     env
 }
@@ -130,5 +140,19 @@ fn decide_closes_polymorphic_contexts_without_accepting_false_propositions() {
     );
     refused(
         "theorem t.{u} (A : Sort u) (x : A) : (fun (_ : A) => False) x := by decide",
+    );
+}
+
+#[test]
+fn failed_wildcard_prefix_restores_hypotheses_and_deferred_closures() {
+    accepted(
+        "theorem t (P : Nat -> Prop) (x y : Nat) (h : x = y) (hx : P x) : P y := by try rewrite [h, h] at *; rewrite [h] at *; exact hx",
+    );
+}
+
+#[test]
+fn wildcard_conditional_rewrite_exposes_a_solvable_real_premise() {
+    accepted(
+        "theorem t (P : Nat -> Prop) (Q : Prop) (x y : Nat) (h : Q -> x = y) (hq : Q) (hx : P x) : P y := by rewrite [h] at *; exact hx; exact hq",
     );
 }
