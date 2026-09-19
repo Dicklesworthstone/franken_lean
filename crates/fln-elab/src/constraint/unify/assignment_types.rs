@@ -48,6 +48,19 @@ impl Engine<'_> {
             // Do not make every ordinary assignment pay for type synthesis.
             return Ok(None);
         }
+        self.value_type_equation(&expected, value, locals)
+    }
+
+    /// A HasType row may constrain holes in the value's declared type even
+    /// when the expected type is closed. Unlike assignment hints it cannot
+    /// skip synthesis just because that expected type contains no holes.
+    pub(super) fn value_type_equation(
+        &mut self,
+        expected: &Expr,
+        value: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<Equation>, UnificationError> {
+        let expected = self.instantiate(expected)?;
         let inferred = match self.assignment_value_type(value, locals) {
             // An unavailable approximation is not a failed typing judgment.
             // Final assignment checking will retain unresolved obligations.
@@ -82,7 +95,9 @@ impl Engine<'_> {
                 UnificationError::Deferred(UnificationDeferred::UnknownMetavariable(id.clone()))
             })?;
             let value = self.work.mvars.get_assigned_expr(&id).ok_or_else(|| {
-                UnificationError::Deferred(UnificationDeferred::UnresolvedAssignmentType(id.clone()))
+                UnificationError::Deferred(UnificationDeferred::UnresolvedAssignmentType(
+                    id.clone(),
+                ))
             })?;
             // Charge the owned context snapshot before making it. Inference
             // opens binders privately; its fresh locals cannot escape this scope.

@@ -5,7 +5,7 @@
 
 pub mod unify;
 
-use self::unify::{UnificationBudget, UnificationError, UnificationReport};
+use self::unify::{TypingConstraint, UnificationBudget, UnificationError, UnificationReport};
 use crate::mvar::{AssignmentJustification, MetavarError, MetavarStore};
 use crate::txn::ElabTxn;
 use fln_core::expr::{Expr, FVarId, MVarId};
@@ -228,6 +228,7 @@ impl ConstraintQueue {
 pub enum ConstraintSolveError {
     Missing(ConstraintId),
     NotDefEq(ConstraintId),
+    UnsupportedKind(ConstraintId),
     Depth {
         id: ConstraintId,
         observed: u32,
@@ -245,6 +246,13 @@ impl std::fmt::Display for ConstraintSolveError {
                 "constraint {} is not a definitional-equality obligation",
                 id.0
             ),
+            Self::UnsupportedKind(id) => {
+                write!(
+                    f,
+                    "constraint {} is not owned by the native equation solver",
+                    id.0
+                )
+            }
             Self::Depth {
                 id,
                 observed,
@@ -258,7 +266,8 @@ impl std::error::Error for ConstraintSolveError {}
 
 #[derive(Debug)]
 pub struct ConstraintSolveReport {
-    /// Only the selected, solved DefEq rows, in stable order.
+    /// Only selected, discharged rows, in stable order. A checked HasType row
+    /// does not solve its value's residual holes; those remain in the report.
     pub solved: Vec<ConstraintId>,
     /// Awakened rows here still require processing; they are not counted solved.
     pub unification: UnificationReport,
@@ -275,6 +284,31 @@ impl ElabTxn {
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ConstraintSolveReport, ConstraintSolveError> {
+        self.solve_selected_constraints_with(ids, budget, cancelled, true)
+    }
+
+    /// Solve a mixed DefEq/HasType batch, with one shared budget and one atomic
+    /// publication. Typing rows generate necessary equations, then K1 checks
+    /// each original term under its local context and typed residual holes.
+    /// SynthInstance remains Synod's responsibility, not a unifier verdict.
+    /// Like queued DefEq, selected rows are interpreted in this transaction's
+    /// local context. A caller must restore that context before resuming them.
+    pub fn solve_constraints_with(
+        &mut self,
+        ids: &[ConstraintId],
+        budget: UnificationBudget,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ConstraintSolveReport, ConstraintSolveError> {
+        self.solve_selected_constraints_with(ids, budget, cancelled, false)
+    }
+
+    fn solve_selected_constraints_with(
+        &mut self,
+        ids: &[ConstraintId],
+        budget: UnificationBudget,
+        cancelled: &dyn Fn() -> bool,
+        defeq_only: bool,
+    ) -> Result<ConstraintSolveReport, ConstraintSolveError> {
         if cancelled() {
             return Err(ConstraintSolveError::Unification(
                 UnificationError::Cancelled,
@@ -289,6 +323,7 @@ impl ElabTxn {
         }
         let selected: BTreeSet<_> = ids.iter().copied().collect();
         let mut equations = Vec::new();
+        let mut typings = Vec::new();
         for id in &selected {
             if cancelled() {
                 return Err(ConstraintSolveError::Unification(
@@ -307,16 +342,28 @@ impl ElabTxn {
                     allowed: budget.max_metavar_depth,
                 });
             }
-            let ConstraintKind::DefEq { lhs, rhs } = &row.kind else {
+            if defeq_only && !matches!(row.kind, ConstraintKind::DefEq { .. }) {
                 return Err(ConstraintSolveError::NotDefEq(*id));
-            };
-            equations.push((lhs.clone(), rhs.clone()));
+            }
+            match &row.kind {
+                ConstraintKind::DefEq { lhs, rhs } => equations.push((lhs.clone(), rhs.clone())),
+                ConstraintKind::HasType {
+                    expr,
+                    expected_type,
+                } => typings.push(TypingConstraint {
+                    id: *id,
+                    expr: expr.clone(),
+                    expected_type: expected_type.clone(),
+                    depth: row.depth,
+                }),
+                _ => return Err(ConstraintSolveError::UnsupportedKind(*id)),
+            }
         }
         let mut trial = self.clone();
         for id in &selected {
             trial.constraints.remove(id);
         }
-        let result = trial.unify_many_with(&equations, budget, cancelled);
+        let result = trial.unify_obligations_with(&equations, &typings, budget, cancelled);
         self.budget.heartbeats_consumed = trial.budget.heartbeats_consumed;
         let unification = result.map_err(ConstraintSolveError::Unification)?;
         if cancelled() {

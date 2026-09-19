@@ -21,7 +21,7 @@ mod record_eta;
 mod reduce;
 mod residual;
 
-use crate::constraint::Constraint;
+use crate::constraint::{Constraint, ConstraintId};
 use crate::lctx::LocalContext;
 use crate::mvar::{AssignmentJustification, MetavarError, MetavarKind};
 use crate::txn::ElabTxn;
@@ -86,6 +86,8 @@ pub enum UnificationDeferred {
     UnresolvedAssignmentType(MVarId),
     CyclicUniverse(LMVarId),
     InvalidLocalContext,
+    UnresolvedTypingConstraint(ConstraintId),
+    InvalidTypingContext(ConstraintId),
 }
 
 /// Nonanswers are not flattened into a Boolean or a kernel rejection. In
@@ -116,6 +118,11 @@ pub enum UnificationError {
         id: MVarId,
         outcome: Box<Outcome<Verdict>>,
     },
+    /// The original queued term, not just its synthesized type, failed K1.
+    ConstraintCheck {
+        id: ConstraintId,
+        outcome: Box<Outcome<Verdict>>,
+    },
 }
 
 impl std::fmt::Display for UnificationError {
@@ -143,6 +150,9 @@ impl std::fmt::Display for UnificationError {
                 "kernel did not validate assignment to ?{}",
                 id.0.to_display_string()
             ),
+            Self::ConstraintCheck { id, .. } => {
+                write!(f, "kernel did not validate typing constraint {}", id.0)
+            }
         }
     }
 }
@@ -422,6 +432,36 @@ fn same_terms(left: &Expr, right: &Expr, meter: &mut Meter<'_>) -> Result<bool, 
 }
 
 type Equation = (Expr, Expr, LocalContext);
+
+/// Kept separate from equations: a synthesized type is only a hint, whereas
+/// the original term must cross K1 before the queue row can be discharged.
+pub(super) struct TypingConstraint {
+    pub id: ConstraintId,
+    pub expr: Expr,
+    pub expected_type: Expr,
+    pub depth: u32,
+}
+
+enum ValidationTarget {
+    Assignment(MVarId),
+    Constraint(ConstraintId),
+}
+
+impl ValidationTarget {
+    fn unresolved(&self) -> UnificationDeferred {
+        match self {
+            Self::Assignment(id) => UnificationDeferred::UnresolvedAssignmentType(id.clone()),
+            Self::Constraint(id) => UnificationDeferred::UnresolvedTypingConstraint(*id),
+        }
+    }
+
+    fn escaping(&self) -> UnificationDeferred {
+        match self {
+            Self::Assignment(id) => UnificationDeferred::EscapingLocal(id.clone()),
+            Self::Constraint(id) => UnificationDeferred::InvalidTypingContext(*id),
+        }
+    }
+}
 
 enum LiteralStep {
     Equal,
@@ -860,9 +900,7 @@ impl Engine<'_> {
                 }
             }
             (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
-                if self.is_flexible_application(&left)?
-                    || self.is_flexible_application(&right)?
-                {
+                if self.is_flexible_application(&left)? || self.is_flexible_application(&right)? {
                     // Keep the whole equation for the next assignment generation.
                     // Decomposing it now would guess that the eventual function
                     // is injective. Other rungs, including function eta, remain
@@ -965,7 +1003,11 @@ impl Engine<'_> {
         Ok(())
     }
 
-    fn solve(&mut self, equations: &[(Expr, Expr)]) -> Result<(), UnificationError> {
+    fn solve(
+        &mut self,
+        equations: &[(Expr, Expr)],
+        typings: &[TypingConstraint],
+    ) -> Result<(), UnificationError> {
         let mut pending = VecDeque::new();
         for (left, right) in equations {
             if left.has_loose_bvars() || right.has_loose_bvars() {
@@ -974,6 +1016,13 @@ impl Engine<'_> {
             self.scan(left)?;
             self.scan(right)?;
             pending.push_back((left.clone(), right.clone(), self.work.lctx.clone()));
+        }
+        for typing in typings {
+            if typing.expr.has_loose_bvars() || typing.expected_type.has_loose_bvars() {
+                return Err(UnificationError::LooseBoundVariable);
+            }
+            self.scan(&typing.expr)?;
+            self.scan(&typing.expected_type)?;
         }
         // Reserve all pre-existing identities before opening binders. Map
         // iteration changes neither the resulting set nor the generated names.
@@ -1019,6 +1068,20 @@ impl Engine<'_> {
             if typing_generation != Some(current_generation) {
                 typing_generation = Some(current_generation);
                 let mut typing = self.retry_assignment_types()?;
+                for obligation in typings {
+                    self.meter.node()?;
+                    for _ in self.work.lctx.decls() {
+                        self.meter.node()?;
+                    }
+                    let locals = self.work.lctx.clone();
+                    if let Some(equation) = self.value_type_equation(
+                        &obligation.expected_type,
+                        &obligation.expr,
+                        &locals,
+                    )? {
+                        typing.push_back(equation);
+                    }
+                }
                 if !typing.is_empty() {
                     // Keep every postponed equation. Type progress may unlock
                     // it; an inferred type is not permission to discard it.
@@ -1053,11 +1116,35 @@ impl Engine<'_> {
         for id in self.assigned.clone() {
             self.check_assignment(&id)?;
         }
+        for typing in typings {
+            self.meter.node()?;
+            let target = ValidationTarget::Constraint(typing.id);
+            for _ in self.work.lctx.decls() {
+                self.meter.node()?;
+            }
+            let locals = self.work.lctx.clone();
+            let prepared = self.prepare_value_check(
+                &target,
+                &typing.expr,
+                &typing.expected_type,
+                &locals,
+                typing.depth,
+            )?;
+            self.check_prepared_value(&target, prepared)?;
+        }
         Ok(())
     }
 
     fn check_assignment(&mut self, id: &MVarId) -> Result<(), UnificationError> {
-        let (value, type_, residuals) = self.prepare_assignment_check(id)?;
+        let prepared = self.prepare_assignment_check(id)?;
+        self.check_prepared_value(&ValidationTarget::Assignment(id.clone()), prepared)
+    }
+
+    fn check_prepared_value(
+        &mut self,
+        target: &ValidationTarget,
+        (value, type_, residuals): (Expr, Expr, Vec<MVarId>),
+    ) -> Result<(), UnificationError> {
         let (value, type_, generalized_universes) =
             self.generalize_assignment_universes(value, type_)?;
         if value.has_expr_mvar()
@@ -1065,16 +1152,12 @@ impl Engine<'_> {
             || value.has_level_mvar()
             || type_.has_level_mvar()
         {
-            return Err(UnificationError::Deferred(
-                UnificationDeferred::UnresolvedAssignmentType(id.clone()),
-            ));
+            return Err(UnificationError::Deferred(target.unresolved()));
         }
         let value_facts = self.scan(&value)?;
         let type_facts = self.scan(&type_)?;
         if !value_facts.fvars.is_empty() || !type_facts.fvars.is_empty() {
-            return Err(UnificationError::Deferred(
-                UnificationDeferred::EscapingLocal(id.clone()),
-            ));
+            return Err(UnificationError::Deferred(target.escaping()));
         }
         let mut params = type_facts.params;
         for name in value_facts.params {
@@ -1122,13 +1205,17 @@ impl Engine<'_> {
             {
                 // Failure of the universally quantified obligation need not be
                 // failure after the remaining expression or universe holes specialize.
-                Err(UnificationError::Deferred(
-                    UnificationDeferred::UnresolvedAssignmentType(id.clone()),
-                ))
+                Err(UnificationError::Deferred(target.unresolved()))
             }
-            _ => Err(UnificationError::AssignmentCheck {
-                id: id.clone(),
-                outcome: Box::new(outcome),
+            _ => Err(match target {
+                ValidationTarget::Assignment(id) => UnificationError::AssignmentCheck {
+                    id: id.clone(),
+                    outcome: Box::new(outcome),
+                },
+                ValidationTarget::Constraint(id) => UnificationError::ConstraintCheck {
+                    id: *id,
+                    outcome: Box::new(outcome),
+                },
             }),
         }
     }
@@ -1152,11 +1239,22 @@ impl ElabTxn {
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<UnificationReport, UnificationError> {
+        self.unify_obligations_with(equations, &[], budget, cancelled)
+    }
+
+    pub(super) fn unify_obligations_with(
+        &mut self,
+        equations: &[(Expr, Expr)],
+        typings: &[TypingConstraint],
+        budget: UnificationBudget,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<UnificationReport, UnificationError> {
         if cancelled() {
             return Err(UnificationError::Cancelled);
         }
         if equations
             .len()
+            .saturating_add(typings.len())
             .saturating_add(self.mvars.len())
             .saturating_add(self.universes.len())
             > budget.max_visited_nodes
@@ -1192,7 +1290,7 @@ impl ElabTxn {
             kernel_checks: 0,
             fact_cache: HashMap::new(),
         };
-        let result = engine.solve(equations);
+        let result = engine.solve(equations, typings);
         self.budget.heartbeats_consumed = self
             .budget
             .heartbeats_consumed
