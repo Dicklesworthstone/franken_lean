@@ -5,10 +5,15 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, MVarId, NatLit
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
+use fln_core::outcome::Outcome;
 use fln_elab::constraint::unify::{UnificationBudget, UnificationError};
 use fln_elab::mvar::MetavarKind;
 use fln_elab::seed::bootstrap_nat_environment;
 use fln_elab::txn::ElabTxn;
+use fln_env::environment::{DeclarationBudget, Environment};
+use fln_env::pmap::CollisionBudget;
+use fln_kernel::capability::{Published, admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::Budget;
 use std::cell::Cell;
 
@@ -43,11 +48,27 @@ fn budget() -> UnificationBudget {
     UnificationBudget::new(Budget::for_stack_bytes(1024 * 1024))
 }
 fn transaction() -> ElabTxn {
-    ElabTxn::new(
-        bootstrap_nat_environment(budget().kernel).unwrap(),
-        KVMap::new(),
-        23,
-    )
+    // The opaque Nat bootstrap supports literals, not constructor names.
+    // These tests need the real inductive block, admitted through K1.
+    let Outcome::Complete(admitted) = admit(
+        &Environment::new(),
+        fln_elab::seed::nat_inductive_seed_declaration(),
+        budget().kernel,
+    ) else {
+        panic!("Nat admission did not complete");
+    };
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+    else {
+        panic!("Nat seed was rejected");
+    };
+    let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) else {
+        panic!("Nat publication did not complete");
+    };
+    ElabTxn::new(publication.environment, KVMap::new(), 23)
 }
 fn hole_at(
     txn: &mut ElabTxn,
@@ -481,4 +502,24 @@ fn identical_suffix_holes_remain_unsolved_after_head_recovery() {
     // in the input. The unresolved argument is not part of f's assigned value.
     assert!(report.residual_metavariables.is_empty());
     assert_eq!(report.kernel_checks, 1);
+}
+
+#[test]
+fn constructor_spelling_cannot_authorize_a_head_in_the_opaque_nat_bootstrap() {
+    let mut txn = ElabTxn::new(
+        bootstrap_nat_environment(budget().kernel).unwrap(),
+        KVMap::new(),
+        23,
+    );
+    let f = hole(&mut txn, "f", pi(nat(), nat()));
+    let before = txn.clone();
+    assert!(matches!(
+        txn.unify(
+            &Expr::app(Expr::mvar(f), number(7)),
+            &Expr::app(succ(), number(7)),
+            budget(),
+        ),
+        Err(UnificationError::AssignmentCheck { .. })
+    ));
+    unchanged(&txn, &before);
 }
