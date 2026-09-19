@@ -16,7 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
-use fln::{Budget, Declaration, Engine, EngineAdmissionLimits, Environment, KVMap, Outcome};
+use fln::{
+    Budget, Declaration, Engine, EngineAdmissionLimits, Environment, KVMap, OleanCheckLimits,
+    Outcome,
+};
 use fln_env::constants::ConstantInfo;
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
@@ -115,6 +118,50 @@ fn pinned_init_nat_completes_the_two_checker_council() {
         }
         Outcome::InternalFault(fault) => {
             panic!("pinned Nat council faulted: {fault:?}")
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude companion chain"]
+fn pinned_init_prelude_reaches_two_checker_council_frontier() {
+    let lib = reference_lib().expect(
+        "pinned Reference library is unavailable; install Lean v4.32.0 or set FLN_REFERENCE_LIB before invoking this ignored real-artifact test",
+    );
+    let base = lib.join("Init/Prelude.olean");
+    let exported = std::fs::read(&base).expect("read exported Prelude");
+    let server_path = base.with_extension("olean.server");
+    let server = std::fs::read(&server_path).expect("read Prelude server companion");
+    let private_path = base.with_extension("olean.private");
+    let private = std::fs::read(&private_path).expect("read Prelude private companion");
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(
+        64 * 1024 * 1024,
+        Budget::for_stack_bytes(2 * 1024 * 1024),
+    );
+    let result = engine.check_olean_artifact_parts(
+        &exported,
+        Some(&server),
+        Some(&private),
+        &KVMap::new(),
+        limits,
+    );
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!(
+                "COMPLETE: checked {} declarations!",
+                checked.declarations.len()
+            );
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
         }
     }
 }
