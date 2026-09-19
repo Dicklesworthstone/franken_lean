@@ -34,8 +34,8 @@ use crate::string_reduce::{
 };
 use crate::universe::{UniverseError, level_roots_equal};
 use crate::whnf::{
-    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with,
-    whnf_delta_step_at_with,
+    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_at_with,
+    whnf_core_at_with, whnf_delta_step_at_with,
 };
 use crate::wire::{
     ExprId, ExprNode, MAX_BVAR_INDEX, NamePart, WireExpr, WireName, expression_owned_units,
@@ -2428,6 +2428,7 @@ fn eta_candidate(
     mut body: ExprId,
     outside: DefEqTerm,
     sources: TermSources<'_>,
+    context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, SlowHalt> {
@@ -2450,8 +2451,44 @@ fn eta_candidate(
                 return Ok(false);
             };
             let argument = eta_visible(child(inside, *argument)?, sources, control, cancelled)?;
-            if !matches!(sources.source(argument)?.node(argument.root), Some(ExprNode::Bound { index: actual }) if u64::from(*actual) == index)
+            let argument_term = sources.source(argument)?;
+            let is_matched = if let Some(ExprNode::Bound { index: actual }) =
+                argument_term.node(argument.root)
             {
+                u64::from(*actual) == index
+            } else {
+                let budget = control.begin_normalization(cancelled)?;
+                match whnf_at_with(argument_term, argument.root, context, budget, cancelled) {
+                    WhnfOutcome::Complete(result) => {
+                        control.absorb_whnf(&result, cancelled)?;
+                        matches!(
+                            result.term.node(result.term.root()),
+                            Some(ExprNode::Bound { index: actual }) if u64::from(*actual) == index
+                        )
+                    }
+                    WhnfOutcome::Refused(refusal) => {
+                        return Err(SlowHalt::Refusal {
+                            side: argument.side(),
+                            refusal: Box::new(refusal),
+                            progress: Box::new(control.progress),
+                        });
+                    }
+                    WhnfOutcome::Inconclusive(stop) => {
+                        return Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+                            side: argument.side(),
+                            stop,
+                            progress: control.progress,
+                        })));
+                    }
+                    WhnfOutcome::InternalFault(fault) => {
+                        return Err(SlowHalt::Fault(DefEqFault::Whnf {
+                            side: argument.side(),
+                            fault,
+                        }));
+                    }
+                }
+            };
+            if !is_matched {
                 return Ok(false);
             }
             inside = eta_visible(child(inside, *function)?, sources, control, cancelled)?;
@@ -2477,6 +2514,7 @@ fn exact_function_eta(
     left_reference: DefEqTerm,
     right_reference: DefEqTerm,
     sources: TermSources<'_>,
+    context: &WhnfContext,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, SlowHalt> {
@@ -2501,6 +2539,7 @@ fn exact_function_eta(
                 *body,
                 right_reference,
                 sources,
+                context,
                 control,
                 cancelled,
             )
@@ -2511,6 +2550,7 @@ fn exact_function_eta(
                 *body,
                 left_reference,
                 sources,
+                context,
                 control,
                 cancelled,
             )
@@ -3056,6 +3096,7 @@ fn run_slow(
                             left_reference,
                             right_reference,
                             TermSources::new(left, right, &generated),
+                            context,
                             &mut control,
                             cancelled,
                         )? {
