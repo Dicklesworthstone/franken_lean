@@ -2,167 +2,52 @@ name: Native editor proof integration
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-editor-proof-integration.yml']
+    paths:
+      - '.github/workflows/native-editor-proof-integration.yml'
+      - 'crates/fln-server/**'
+      - 'crates/fln-cli/src/lib.rs'
+      - 'crates/fln-cli/src/bin/**'
+      - 'crates/fln-cli/src/source_check*'
+      - 'crates/fln-cli/src/source_check/**'
+      - 'crates/fln-cli/tests/lsp*'
+      - 'crates/fln-cli/tests/lsp_proof_modules/**'
+      - 'crates/fln-cli/tests/source_module_check.rs'
+      - 'crates/fln/src/source_check*'
+      - 'crates/fln/src/source_check/**'
+      - 'crates/fln/tests/source_module*'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   editor-proofs:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Apply watched dependency integration to exact source inputs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'editor-proof-integration'
-          root.mkdir()
-          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          blobs = {
-              'crates/fln-server/src/dispatch/json/files.rs': 'd1d8d766bf41a029f1908f93e9a24187a7e3d903',
-              'crates/fln-server/src/dispatch/watch.rs': '87c41bd677cec04a64196f7e46485cc4fc1bd74b',
-              'crates/fln-cli/tests/lsp_proof_modules/watched.rs': '3b5c44e83b208c1f50dd584e8795d26e4e4ecf89',
-          }
-          for path, sha in blobs.items():
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
-                  headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  data = json.load(response)
-              content = base64.b64decode(data['content'])
-              assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
-              target = pathlib.Path(path)
-              assert not target.exists(), 'integration already present: ' + path
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_bytes(content)
-          changed = list(blobs)
-          def edit(path, operation):
-              target = pathlib.Path(path)
-              before = target.read_text()
-              after = operation(before)
-              assert before != after, path
-              target.write_text(after)
-              changed.append(path)
-          def replace(text, old, new, count=1):
-              assert text.count(old) == count, (old, text.count(old), count)
-              return text.replace(old, new)
-          edit('crates/fln-server/src/dispatch/json.rs', lambda t: t + '\nmod files;\npub(super) use files::{RegistrationReply, registration_reply, supports_file_registration, watched_file_uris};\n')
-          def dispatch(text):
-              text = replace(text, 'mod workspace;\n', 'mod watch;\nmod workspace;\n')
-              text = replace(text, '            | "textDocument/didClose"\n', '            | "textDocument/didClose"\n            | "workspace/didChangeWatchedFiles"\n')
-              start = text.index('fn serve_inner(')
-              end = text.index('#[cfg(test)]', start)
-              prefix, body, suffix = text[:start], text[start:end], text[end:]
-              body = replace(body, '    let mut frontiers = BTreeMap::new();', '    let mut frontiers = BTreeMap::new();\n    let mut file_watcher = watch::Registration::default();')
-              body = replace(body, '        let method = match method(&envelope, id) {', '''        if file_watcher.consume(output, &text, &envelope)? { continue; }
-                  let method = match method(&envelope, id) {''')
-              body = replace(body, '                write_protocol_message(output, initialize_response(request_id))?;', '                file_watcher.configure(envelope.params, on_did_open.tracks_dependencies());\n                write_protocol_message(output, initialize_response(request_id))?;')
-              body = replace(body, '                state = ServerState::Running;', '                state = ServerState::Running;\n                file_watcher.start(output)?;')
-              body = replace(body, '                state = ServerState::ShuttingDown;', '                state = ServerState::ShuttingDown;\n                file_watcher.stop();')
-              anchor = '            ("textDocument/waitForDiagnostics", Some(request_id), state) => {'
-              addition = '''            ("workspace/didChangeWatchedFiles", None, ServerState::Running) => {
-                          if on_did_open.tracks_dependencies() {
-                              match json::watched_file_uris(envelope.params) {
-                                  Ok(uris) if !uris.is_empty() => workspace::refresh(
-                                      output, &session, &mut waits, &mut frontiers, on_did_open, &uris, None,
-                                  )?,
-                                  Ok(_) => {},
-                                  Err(message) => write_warning(output, message)?,
-                              }
-                          }
-                      }
-          '''
-              body = replace(body, anchor, addition + anchor)
-              return prefix + body + suffix
-          edit('crates/fln-server/src/dispatch.rs', dispatch)
-          def dependencies(text):
-              text = replace(text, 'dependencies.iter().any(|p| paths.contains(p))', 'dependencies.iter().any(|p| paths.iter().any(|changed| p.starts_with(changed)))')
-              anchor = '    #[test]\n    fn closes_release_observations_but_unavailable_open_sources_do_not()'
-              addition = '''    #[test]
-              fn directory_events_invalidate_descendants_not_string_prefix_neighbors() {
-                  let watches = Dependencies { entries: BTreeMap::from([
-                      ("Main".to_owned(), known(&["Lib/A.lean", "Lib/B.lean"])),
-                      ("Other".to_owned(), known(&["Library/A.lean"])),
-                  ]), ..Dependencies::default() };
-                  assert_eq!(watches.select(&paths(&["Lib"]), false), ["Main"]);
-                  assert_eq!(watches.select(&paths(&["Lib/A.lean"]), false), ["Main"]);
-                  assert!(watches.select(&paths(&["Li"]), false).is_empty());
-              }
-          '''
-              return replace(text, anchor, addition + anchor)
-          edit('crates/fln-cli/src/source_check/lsp/dependencies.rs', dependencies)
-          edit('crates/fln-cli/tests/lsp_proof_modules.rs', lambda t: t + '\n#[path = "lsp_proof_modules/watched.rs"]\nmod watched;\n')
-          def docs(text):
-              text = replace(text, 'Closed-file disk notifications, cursor goal inspection, semantic\nhover/completion/definition and Lean RPC sessions remain separate work.', '''Closed-file changes are handled through `workspace/didChangeWatchedFiles`.
-          When the client advertises dynamic registration, the server requests one
-          `**/*.lean` watcher for create/change/delete events after initialization.
-          A declined registration leaves ordinary editor checking available. Clients
-          with preconfigured watchers may also send notifications without registration.
-          Notification batches are structurally validated and bounded to 4,096 events
-          and 1 MiB before any rechecking; repeated URIs are coalesced. File and folder
-          observations trigger dependency rechecks, not document text/version changes.
-          Actual bounded disk snapshots and current open buffers remain the authority.
-          No filesystem polling, external watcher process or source writes are added.
-          Cursor goal inspection, semantic hover/completion/definition and Lean RPC
-          sessions remain separate work.''')
-              return text
-          edit('docs/NATIVE_EDITOR_PROOFS.md', docs)
-          (root / 'paths.json').write_text(json.dumps(changed))
-          subprocess.run(['git', 'add', '--', *changed], check=True)
-          (root / 'integration.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
-          (root / 'source-files.json').write_text(json.dumps({p: pathlib.Path(p).read_text() for p in changed}))
-      - name: Test watched files, live editor traffic and downstream compilation
+      - name: Check native proof libraries, reactive documents and watched files
         shell: bash
         run: |
           set -euo pipefail
-          exec > >(tee "$RUNNER_TEMP/editor-proof-integration/validation.log") 2>&1
+          exec > >(tee "$RUNNER_TEMP/native-editor-validation.log") 2>&1
+          git rev-parse HEAD
+          git rev-parse HEAD^{tree}
           toolchain=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
+          rustc -Vv
           cargo test --locked -p fln-server
           cargo test --locked -p fln-cli --lib source_check::lsp::dependencies
           cargo test --locked -p fln-cli --test lsp_proof_modules --test lsp_stdio_e2e --test source_module_check --no-fail-fast
           cargo test --locked -p fln --test source_module_session --test source_module_check --no-fail-fast
           cargo clippy --locked -p fln-server -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
-          git diff --cached --check
-      - name: Export tested source tree without moving any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'editor-proof-integration'
-          paths = json.loads((root / 'paths.json').read_text())
-          assert sorted(subprocess.check_output(['git','diff','--cached','--name-only'], text=True).splitlines()) == sorted(paths)
-          def post(endpoint, value):
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint,
-                  data=json.dumps(value).encode(), method='POST',
-                  headers={'Accept':'application/vnd.github+json','Content-Type':'application/json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  return json.load(response)
-          tree = []
-          for path in paths:
-              content = pathlib.Path(path).read_bytes()
-              assert content == subprocess.check_output(['git','show',':' + path])
-              sha = hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest()
-              assert post('blobs', {'content':content.decode('utf-8'),'encoding':'utf-8'})['sha'] == sha
-              tree.append({'path':path,'mode':'100644','type':'blob','sha':sha})
-          base_tree = subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip()
-          result = post('trees', {'base_tree':base_tree,'tree':tree})
-          assert result['sha'] == subprocess.check_output(['git','write-tree'], text=True).strip()
-          result = {'parent':(root / 'base.txt').read_text().strip(), 'tree':result['sha'], 'files':tree}
-          (root / 'tested-tree.json').write_text(json.dumps(result, indent=2))
-          print('VALIDATED_SOURCE_TREE ' + json.dumps(result), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: editor-proof-integration-${{ github.sha }}
-          path: ${{ runner.temp }}/editor-proof-integration
+          name: native-editor-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/native-editor-validation.log
           retention-days: 7
           if-no-files-found: error

@@ -71,7 +71,7 @@ impl Dependencies {
         self.entries.iter().filter(|(_, watch)| match watch {
             Watch::Unknown => true,
             Watch::Known(dependencies) => !dependencies.is_empty()
-                && (uncertain || dependencies.iter().any(|p| paths.contains(p))),
+                && (uncertain || dependencies.iter().any(|p| paths.iter().any(|changed| p.starts_with(changed)))),
         }).map(|(uri, _)| uri.clone()).collect()
     }
     pub(super) fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
@@ -139,6 +139,16 @@ mod tests {
         assert_eq!(watches.select(&paths(&["New"]), false), ["Main"]);
         watches.no_imports("Main");
         assert!(watches.select(&paths(&["New"]), false).is_empty());
+    }
+    #[test]
+    fn directory_events_invalidate_descendants_not_string_prefix_neighbors() {
+        let watches = Dependencies { entries: BTreeMap::from([
+            ("Main".to_owned(), known(&["Lib/A.lean", "Lib/B.lean"])),
+            ("Other".to_owned(), known(&["Library/A.lean"])),
+        ]), ..Dependencies::default() };
+        assert_eq!(watches.select(&paths(&["Lib"]), false), ["Main"]);
+        assert_eq!(watches.select(&paths(&["Lib/A.lean"]), false), ["Main"]);
+        assert!(watches.select(&paths(&["Li"]), false).is_empty());
     }
     #[test]
     fn closes_release_observations_but_unavailable_open_sources_do_not() {

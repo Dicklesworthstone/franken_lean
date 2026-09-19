@@ -36,8 +36,18 @@ Old diagnostic frontiers are replaced even when the importer version has
 not changed. Unavailable importer text produces a nonanswer, not disk fallback.
 Legacy callback APIs keep their original single-document behavior; embedders
 opt into `serve_workspace` with a typed `WorkspaceChecker`.
-Closed-file disk notifications, cursor goal inspection, semantic
-hover/completion/definition and Lean RPC sessions remain separate work.
+Closed-file changes are handled through `workspace/didChangeWatchedFiles`.
+When the client advertises dynamic registration, the server requests one
+`**/*.lean` watcher for create/change/delete events after initialization.
+A declined registration leaves ordinary editor checking available. Clients
+with preconfigured watchers may also send notifications without registration.
+Notification batches are structurally validated and bounded to 4,096 events
+and 1 MiB before any rechecking; repeated URIs are coalesced. File and folder
+observations trigger dependency rechecks, not document text/version changes.
+Actual bounded disk snapshots and current open buffers remain the authority.
+No filesystem polling, external watcher process or source writes are added.
+Cursor goal inspection, semantic hover/completion/definition and Lean RPC
+sessions remain separate work.
 An error in a dependency is reported on the importing document
 with the module and original dependency offset in the error text; it is not a
 claim of dependency-local editor range projection.

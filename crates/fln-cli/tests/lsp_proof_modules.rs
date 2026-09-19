@@ -179,3 +179,6 @@ fn admission_only_editor_reports_eval_instead_of_running_or_silently_ignoring_it
 
 #[path = "lsp_proof_modules/reactive.rs"]
 mod reactive;
+
+#[path = "lsp_proof_modules/watched.rs"]
+mod watched;
