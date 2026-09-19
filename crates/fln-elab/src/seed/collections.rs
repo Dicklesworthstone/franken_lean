@@ -4,6 +4,8 @@
 //! the existing inductive generator; every operation is a safe definition over
 //! those recursors. The seed consumer must admit every row through its ordinary
 //! kernel and independent-checker policy before publishing an environment.
+mod list;
+
 use super::*;
 use crate::inductive::{ConstructorSpec, InductiveSpec, inductive_declaration};
 use crate::lctx::LocalDecl;
@@ -240,4 +242,9 @@ pub(super) fn option_seed_declarations() -> [Declaration; 6] {
         option_predicate(true),
         option_predicate(false),
     ]
+}
+
+/// Option must already be available because List.head? returns it.
+pub(super) fn list_seed_declarations() -> [Declaration; 9] {
+    list::declarations()
 }

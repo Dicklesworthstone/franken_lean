@@ -4,15 +4,20 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/native-collections.yml'
+      - 'crates/fln-elab/src/seed.rs'
       - 'crates/fln-elab/src/seed/collections.rs'
       - 'crates/fln-elab/src/seed/collections/**'
+      - 'crates/fln-elab/src/source/infer.rs'
+      - 'crates/fln-elab/src/source/coercions.rs'
+      - 'crates/fln-elab/src/constraint/unify.rs'
+      - 'crates/fln-elab/tests/universe_maximum_constraints.rs'
+      - 'crates/fln/tests/source_function_universes.rs'
       - 'crates/fln/tests/source_collections.rs'
+      - 'crates/fln-cli/tests/source_collections.rs'
+      - 'examples/native_collections.lean'
   workflow_dispatch:
 permissions:
-  contents: write
-concurrency:
-  group: native-collection-integration
-  cancel-in-progress: false
+  contents: read
 jobs:
   collections:
     runs-on: ubuntu-24.04
@@ -27,79 +32,42 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Retain exact source for local reproduction
+      - name: Identify source and install configured compiler
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/collection-evidence
           git rev-parse HEAD > target/collection-evidence/base.txt
           git rev-parse HEAD^{tree} > target/collection-evidence/tree.txt
-          git archive --format=tar.gz HEAD > target/collection-evidence/source.tar.gz
           channel=$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv > target/collection-evidence/compiler.txt
-      - name: Check collection increments and retain immutable successful candidates
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check native collections, inference, and installed commands
         shell: python
         run: |
-          import base64, gzip, hashlib, json, mailbox, os, pathlib, subprocess, urllib.request
+          import pathlib, subprocess
           evidence = pathlib.Path('target/collection-evidence')
-          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
-          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
-          def request(path, body=None):
-              data = None if body is None else json.dumps(body).encode()
-              with urllib.request.urlopen(urllib.request.Request(api + path, data=data, headers=headers)) as response:
-                  return json.load(response)
-          def run(label, command):
-              with (evidence / (label + '.log')).open('wb') as log:
-                  result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
-              print(label, result.returncode, flush=True)
-              if result.returncode:
-                  print((evidence / (label + '.log')).read_text()[-16000:], flush=True)
-              return result.returncode
-          def export(label, paths, valid):
-              rows = []
-              if valid:
-                  for path in paths:
-                      data = pathlib.Path(path).read_bytes()
-                      sha = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
-                      assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-                      rows.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
-              (evidence / (label + '-blobs.json')).write_text(json.dumps({'base': os.environ['GITHUB_SHA'], 'passed': valid, 'files': rows}, indent=2))
-          paths = ['crates/fln-elab/src/seed.rs', 'crates/fln-elab/src/seed/collections.rs', 'crates/fln/tests/source_collections.rs']
+          commands = [
+              ('source', ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_collections', '--test', 'source_function_universes']),
+              ('cli', ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_collections']),
+              ('elaborator', ['cargo', 'test', '--locked', '-p', 'fln-elab']),
+              ('engine', ['cargo', 'test', '--locked', '-p', 'fln', '--lib']),
+              ('clippy', ['cargo', 'clippy', '--locked', '-p', 'fln-elab', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings']),
+              ('workspace', ['cargo', 'check', '--locked', '--workspace', '--all-targets']),
+          ]
           failed = []
-          if not pathlib.Path(paths[1]).exists():
-              sha = 'c5340cea005d6e952a5438f1fb1e6a2ad47f9f23'
-              data = base64.b64decode(request('/git/blobs/' + sha)['content'])
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
-              patch = gzip.decompress(base64.b64decode(data))
-              assert hashlib.sha256(patch).hexdigest() == '803c3f72f36484179f475eef0598798f0f63d31a2fb16c8f09bed72704b5c39b'
-              mbox = evidence / 'increments.mbox'
-              mbox.write_bytes(patch)
-              messages = list(mailbox.mbox(mbox))
-              assert len(messages) == 2
-              for index, message in enumerate(messages, 1):
-                  payload = message.get_payload(decode=True)
-                  subprocess.run(['git', 'apply', '--check', '-'], input=payload, check=True)
-                  subprocess.run(['git', 'apply', '-'], input=payload, check=True)
-                  if index == 2:
-                      paths.append('crates/fln-elab/src/seed/collections/list.rs')
-                  subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths], check=True)
-                  code = run(str(index) + '-source', ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_collections'])
-                  export(str(index), paths, code == 0)
-                  failed.append(code)
-          else:
-              failed.append(run('source', ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_collections']))
-          failed.append(run('elaborator', ['cargo', 'test', '--locked', '-p', 'fln-elab']))
-          failed.append(run('engine', ['cargo', 'test', '--locked', '-p', 'fln', '--lib']))
-          failed.append(run('workspace', ['cargo', 'check', '--locked', '--workspace', '--all-targets']))
-          raise SystemExit(any(failed))
+          for label, command in commands:
+              with (evidence / (label + '.log')).open('wb') as log:
+                  code = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT).returncode
+              print(label, code, flush=True)
+              if code:
+                  failed.append(label)
+                  print((evidence / (label + '.log')).read_text()[-16000:], flush=True)
+          raise SystemExit(bool(failed))
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: native-collections-${{ github.sha }}
           path: target/collection-evidence
           retention-days: 3
-          compression-level: 0
           if-no-files-found: error

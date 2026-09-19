@@ -20,6 +20,8 @@
 //! Quotient computation is elaboration,
 //! not a license for runtime execution. String constructors and the rest of Prelude remain separate
 //! ingestion work; this seed does not claim full Prelude compatibility.
+//! Option and List are native admitted families with a bounded set of safe
+//! recursor-backed operations, not additional trusted runtime primitives.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
 //! internal fault while constructing this environment is never rendered as a
@@ -661,11 +663,11 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
     parameter_marker_seed_declaration("semiOutParam")
 }
 
-/// The exact declaration sequence required by the bounded Nat/String/Bool
-/// source frontend. Order is part of the deterministic seed contract: the
-/// scalar type rows and Bool block must exist before intrinsic signatures can
-/// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 80] {
+/// The exact declaration sequence required by the bounded native source
+/// frontend. Order is part of the deterministic seed contract: scalar types
+/// precede intrinsic signatures, and collection families precede their checked
+/// operation bodies. This is not a complete Prelude ingestion path.
+pub fn source_seed_declarations() -> [Declaration; 89] {
     let [
         and,
         and_left,
@@ -684,6 +686,17 @@ pub fn source_seed_declarations() -> [Declaration; 80] {
     let [equality_type, generic_eq] = generic_equality_decision_seed_declarations();
     let [option, option_get_d, option_map, option_bind, option_is_some, option_is_none] =
         collections::option_seed_declarations();
+    let [
+        list,
+        list_length,
+        list_append,
+        list_map,
+        list_foldr,
+        list_foldl,
+        list_reverse,
+        list_head,
+        list_tail,
+    ] = collections::list_seed_declarations();
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -765,6 +778,15 @@ pub fn source_seed_declarations() -> [Declaration; 80] {
         option_bind,
         option_is_some,
         option_is_none,
+        list,
+        list_length,
+        list_append,
+        list_map,
+        list_foldr,
+        list_foldl,
+        list_reverse,
+        list_head,
+        list_tail,
     ]
 }
 
