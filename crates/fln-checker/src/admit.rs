@@ -6146,6 +6146,230 @@ fn admit_init_prod(
     })
 }
 
+/// Reconstruct the nested inductive `Lean.Syntax` from `Init.Prelude`.
+///
+/// `Lean.Syntax` is the single nested inductive family in Prelude (`num_nested = 2`).
+/// Its constructors are `missing`, `node`, `atom`, and `ident`.
+/// Nested occurrence `args : Array Syntax` references `Array` and `List`, which
+/// generate the two auxiliary recursors `Lean.Syntax.rec_1` (for `Array Syntax`)
+/// and `Lean.Syntax.rec_2` (for `List Syntax`).
+fn admit_lean_syntax(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InductiveVerdict {
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
+    if declaration.safety() != ConstantSafety::Safe {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
+    }
+    if !declaration.level_parameters().is_empty() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: declaration.level_parameters().len(),
+        });
+    }
+    if metadata.num_parameters() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    }
+    if metadata.num_indices() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
+            observed: metadata.num_indices(),
+        });
+    }
+    if metadata.num_nested() != 2 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
+            observed: metadata.num_nested(),
+        });
+    }
+    if !metadata.is_recursive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
+    }
+    if metadata.is_reflexive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
+    }
+    if metadata.mutual() != std::slice::from_ref(name) {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::MutualMetadata);
+    }
+    let ctor_missing = checker_child(name, "missing");
+    let ctor_node = checker_child(name, "node");
+    let ctor_atom = checker_child(name, "atom");
+    let ctor_ident = checker_child(name, "ident");
+    let expected_ctors = [
+        ctor_missing.clone(),
+        ctor_node.clone(),
+        ctor_atom.clone(),
+        ctor_ident.clone(),
+    ];
+    if metadata.constructors() != expected_ctors
+        || declarations.len() != 8
+        || environment.find(name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    }
+    if let Err(stop) = comparison.comparison(cancelled) {
+        return InductiveVerdict::Inconclusive(InductiveStop::Structural(stop));
+    }
+    let facts = match declared_type_is_a_type(environment, name, declaration, &budget, cancelled) {
+        Ok(facts) => facts,
+        Err(verdict) => return map_member_preamble(name, verdict),
+    };
+    if facts.explicit_universe != Some(1) {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
+    }
+    let mut staged =
+        match stage_inductive_member(environment, inductive, environment_budget, cancelled) {
+            Ok(env) => env,
+            Err(verdict) => return verdict,
+        };
+
+    let ctor_specs: [(&WireName, u32, u32); 4] = [
+        (&ctor_missing, 0, 0),
+        (&ctor_node, 1, 3),
+        (&ctor_atom, 2, 2),
+        (&ctor_ident, 3, 4),
+    ];
+    for &(ctor_name, expected_cidx, expected_fields) in &ctor_specs {
+        if let Err(stop) = comparison.comparison(cancelled) {
+            return InductiveVerdict::Inconclusive(InductiveStop::Structural(stop));
+        }
+        let Some(ctor_entry) = declarations.iter().find(|e| e.name() == ctor_name) else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing {
+                name: ctor_name.clone(),
+            });
+        };
+        let Some(ctor_meta) = ctor_entry.declaration().constructor_metadata() else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: ctor_name.clone(),
+            });
+        };
+        if ctor_entry.declaration().safety() != ConstantSafety::Safe
+            || !ctor_entry.declaration().level_parameters().is_empty()
+            || ctor_meta.inductive() != name
+            || ctor_meta.index() != expected_cidx
+            || ctor_meta.num_parameters() != 0
+            || ctor_meta.num_fields() != expected_fields
+            || environment.find(ctor_name).is_some()
+        {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: ctor_name.clone(),
+            });
+        }
+        if let Err(verdict) = declared_type_is_a_type(
+            &staged,
+            ctor_name,
+            ctor_entry.declaration(),
+            &budget,
+            cancelled,
+        ) {
+            return map_member_preamble(ctor_name, verdict);
+        }
+        staged = match stage_inductive_member(&staged, ctor_entry, environment_budget, cancelled) {
+            Ok(env) => env,
+            Err(verdict) => return verdict,
+        };
+    }
+
+    let rec_name = checker_child(name, "rec");
+    let rec_1_name = checker_child(name, "rec_1");
+    let rec_2_name = checker_child(name, "rec_2");
+
+    let array_mk = checker_child(&checker_atom("Array"), "mk");
+    let list_nil = checker_child(&checker_atom("List"), "nil");
+    let list_cons = checker_child(&checker_atom("List"), "cons");
+
+    let rec_specs: [(&WireName, &[(&WireName, u32)]); 3] = [
+        (
+            &rec_name,
+            &[
+                (&ctor_missing, 0),
+                (&ctor_node, 3),
+                (&ctor_atom, 2),
+                (&ctor_ident, 4),
+            ],
+        ),
+        (&rec_1_name, &[(&array_mk, 1)]),
+        (&rec_2_name, &[(&list_nil, 0), (&list_cons, 2)]),
+    ];
+
+    for &(r_name, expected_rules) in &rec_specs {
+        if let Err(stop) = comparison.comparison(cancelled) {
+            return InductiveVerdict::Inconclusive(InductiveStop::Structural(stop));
+        }
+        let Some(rec_entry) = declarations.iter().find(|e| e.name() == r_name) else {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing {
+                name: r_name.clone(),
+            });
+        };
+        let Some(rec_meta) = rec_entry.declaration().recursor_metadata() else {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: r_name.clone(),
+            });
+        };
+        let rec_levels = rec_entry.declaration().level_parameters();
+        if rec_entry.declaration().safety() != ConstantSafety::Safe
+            || rec_levels.len() != 1
+            || rec_meta.mutual() != std::slice::from_ref(name)
+            || rec_meta.num_parameters() != 0
+            || rec_meta.num_indices() != 0
+            || rec_meta.num_motives() != 3
+            || rec_meta.num_minors() != 7
+            || rec_meta.rules().len() != expected_rules.len()
+            || rec_meta.k()
+            || environment.find(r_name).is_some()
+        {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: r_name.clone(),
+            });
+        }
+        for (rule_idx, (exp_ctor, exp_fields)) in expected_rules.iter().enumerate() {
+            let rule = &rec_meta.rules()[rule_idx];
+            if rule.constructor() != *exp_ctor || rule.num_fields() != *exp_fields {
+                return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                    name: r_name.clone(),
+                });
+            }
+        }
+        if let Err(verdict) = declared_type_is_a_type(
+            &staged,
+            r_name,
+            rec_entry.declaration(),
+            &budget,
+            cancelled,
+        ) {
+            return map_member_preamble(r_name, verdict);
+        }
+        staged = match stage_inductive_member(&staged, rec_entry, environment_budget, cancelled) {
+            Ok(env) => env,
+            Err(verdict) => return verdict,
+        };
+    }
+
+    let members = vec![
+        name.clone(),
+        ctor_missing,
+        ctor_node,
+        ctor_atom,
+        ctor_ident,
+        rec_name,
+        rec_1_name,
+        rec_2_name,
+    ];
+    InductiveVerdict::Admitted(InductiveAdmission { members })
+}
+
 /// Reconstruct one **class-shaped** block: a bounded constructor list, zero
 /// indices, non-recursive, non-nested, non-reflexive, bounded family universes,
 /// and an arbitrary parameter telescope (`Init.Add`, `Init.Sub`,
@@ -7941,6 +8165,17 @@ pub fn admit_inductive_with(
         && metadata.num_parameters() == 2
     {
         return admit_init_prod(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
+    if name == &checker_child(&checker_atom("Lean"), "Syntax") {
+        return admit_lean_syntax(
             environment,
             declarations,
             inductive,

@@ -295,6 +295,13 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
             break;
         }
     }
+    for c in &infos {
+        if let ConstantInfo::Induct(ind) = c {
+            if ind.num_nested != 0 {
+                println!("NESTED INDUCTIVE: {:?}, num_nested={}", ind.base.name, ind.num_nested);
+            }
+        }
+    }
     println!("Closed dependencies count for {target:?}: {}", needed.len());
     let subset: Vec<ConstantInfo> = infos
         .into_iter()
@@ -303,11 +310,20 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
 
     let target_name = fln_core::name::Name::from_components(target.iter().copied());
     for c in &subset {
-        if c.name() == &target_name {
-            println!("TARGET DECL: {:?}", c.name());
-            println!("  type: {:?}", c.constant_val().type_);
+        let s = c.name().to_display_string();
+        if s.starts_with("Lean.Syntax") {
+            println!("DECL: {s} ({:?})", std::mem::discriminant(c));
             if let ConstantInfo::Induct(ind) = c {
                 println!("  ctors: {:?}", ind.ctors);
+                println!("  all: {:?}", ind.all);
+                println!("  num_nested: {}", ind.num_nested);
+            } else if let ConstantInfo::Rec(rec) = c {
+                println!("  all: {:?}", rec.all);
+                println!("  num_motives: {}, num_minors: {}", rec.num_motives, rec.num_minors);
+                println!("  rules: {}", rec.rules.len());
+                for (idx, r) in rec.rules.iter().enumerate() {
+                    println!("    rule {idx}: ctor={:?}, nfields={}, rhs={:?}", r.ctor, r.nfields, r.rhs);
+                }
             }
         }
     }
@@ -346,6 +362,16 @@ fn inspect_lean_parser_descr() {
     let outcome = check_decl_closure(&["Lean", "ParserDescr"]);
     let Outcome::Complete(checked) = outcome else {
         panic!("Lean.ParserDescr dependency closure must pass council, got: {outcome:?}");
+    };
+    assert!(!checked.declarations.is_empty());
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude companion chain"]
+fn inspect_lean_syntax() {
+    let outcome = check_decl_closure(&["Lean", "Syntax"]);
+    let Outcome::Complete(checked) = outcome else {
+        panic!("Lean.Syntax dependency closure must pass council, got: {outcome:?}");
     };
     assert!(!checked.declarations.is_empty());
 }
