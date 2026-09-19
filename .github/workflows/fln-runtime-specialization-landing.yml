@@ -56,11 +56,12 @@ jobs:
               'crates/fln-elab/src/universe.rs': '4d2433ffb8863f8d531135ddea9b37bd8d616be9',
               'crates/fln-elab/src/universe/parameters.rs': 'b1b83033abd666241dde841ca89ce741d6c12d2a',
               'crates/fln-parse/src/lib.rs': 'b46f7375a72576c59910d147c396b985481fa495',
-              'crates/fln/src/lib.rs': '9c67c24ff3995abcb09b0c2f2ae2ddd3681f1992',
+              'crates/fln/src/lib.rs': '11d692111607b5c76fd46df566227c605851405d',
               'crates/fln/src/runtime.rs': 'c28046ffcca64eabf2681267820039d88f3df191',
               'crates/fln/src/runtime/records.rs': '044398291ce52b45bc3458997dbfb6f944198eb7',
               'crates/fln/tests/source_do.rs': 'fccad2363336d2f1fb3fce7edcab200a1bf5ff7d',
               'docs/NATIVE_DO_NOTATION.md': 'add2dbf10a673bfe347c5a5cae170a595e453034',
+              'crates/fln-checker/src/whnf.rs': '74bcebaed2cc777baa044071c3a5183503e01ac1',
           }
           new = {
               'crates/fln-cli/tests/source_do_runtime.rs',
@@ -96,6 +97,29 @@ jobs:
           mailbox.write_bytes(patch)
           assert not output('git', 'status', '--porcelain')
           run('git', 'apply', '--index', '--whitespace=error', str(mailbox))
+          # The preceding real-main run passed all 992 selected tests but
+          # stopped at a concurrent checker's collapsible-if warning. Preserve
+          # its semantics and keep the strict Clippy gate rather than mute it.
+          checker = pathlib.Path('crates/fln-checker/src/whnf.rs')
+          old = '\n'.join([
+              '        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root) {',
+              '            if matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero)) {',
+              '                return Ok(None);',
+              '            }',
+              '        }',
+          ])
+          replacement = '\n'.join([
+              '        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root)',
+              '            && matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero))',
+              '        {',
+              '            return Ok(None);',
+              '        }',
+          ])
+          source = checker.read_text()
+          assert source.count(old) == 1
+          checker.write_text(source.replace(old, replacement))
+          run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', str(checker))
+          run('git', 'add', '--', str(checker))
           changed = output('git', 'diff', '--cached', '--name-only').splitlines()
           assert set(changed) == set(expected) | new
           run('git', 'diff', '--cached', '--check')
