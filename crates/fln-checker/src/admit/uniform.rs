@@ -60,7 +60,6 @@ fn constructor_error(name: &WireName) -> InductiveVerdict {
     InductiveVerdict::Rejected(InductiveRejection::ConstructorShape { name: name.clone() })
 }
 fn recursor_error(name: &WireName) -> InductiveVerdict {
-    eprintln!("fln-checker uniform.rs: recursor_error for {name:?}");
     InductiveVerdict::Rejected(InductiveRejection::RecursorShape { name: name.clone() })
 }
 fn size(term: &WireExpr) -> usize {

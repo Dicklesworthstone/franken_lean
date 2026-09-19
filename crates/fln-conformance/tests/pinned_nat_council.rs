@@ -310,18 +310,6 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
                 println!("  ctors: {:?}", ind.ctors);
             }
         }
-        if let ConstantInfo::Rec(rec) = c {
-            if rec.base.name.to_display_string() == "Lean.ParserDescr.rec" {
-                println!("RECURSOR TYPE OF Lean.ParserDescr.rec:");
-                let mut cur = rec.base.type_.clone();
-                let mut b_idx = 0;
-                while let fln_core::expr::ExprNode::ForallE { binder_name, binder_type, body, binder_info } = cur.node() {
-                    println!("  binder #{b_idx}: name={:?}, info={:?}, type={:?}", binder_name.to_display_string(), binder_info, binder_type);
-                    cur = body.clone();
-                    b_idx += 1;
-                }
-                println!("  return: {:?}", cur);
-            }
         }
     }
 
