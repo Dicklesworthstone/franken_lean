@@ -944,3 +944,328 @@ fn pinned_init_prelude_coe_notation_tactics_council_run() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn inspect_init_sizeof_module() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+    let sizeof_base = lib.join("Init/SizeOf.olean");
+    let exported = std::fs::read(&sizeof_base).expect("read exported SizeOf");
+    let server =
+        std::fs::read(sizeof_base.with_extension("olean.server")).expect("read SizeOf server");
+    let private =
+        std::fs::read(sizeof_base.with_extension("olean.private")).expect("read SizeOf private");
+
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+        .expect("decode SizeOf");
+
+    eprintln!("Init.SizeOf module imports:");
+    for import in &decoded.module.imports {
+        eprintln!("  import: {}", import.module.to_display_string());
+    }
+    eprintln!("Init.SizeOf constant count: {}", decoded.constants.len());
+    let mut inducts = Vec::new();
+    let mut ctors = Vec::new();
+    let mut recs = Vec::new();
+    let mut defs = Vec::new();
+    let mut thms = Vec::new();
+    let mut axioms = Vec::new();
+    let mut opaques = Vec::new();
+    let mut quots = Vec::new();
+    for c in &decoded.constants {
+        match c {
+            ConstantInfo::Induct(i) => inducts.push(i.base.name.to_display_string()),
+            ConstantInfo::Ctor(ctor) => ctors.push(ctor.base.name.to_display_string()),
+            ConstantInfo::Rec(r) => recs.push(r.base.name.to_display_string()),
+            ConstantInfo::Defn(d) => defs.push(d.base.name.to_display_string()),
+            ConstantInfo::Thm(t) => thms.push(t.base.name.to_display_string()),
+            ConstantInfo::Axiom(a) => axioms.push(a.base.name.to_display_string()),
+            ConstantInfo::Opaque(o) => opaques.push(o.base.name.to_display_string()),
+            ConstantInfo::Quot(q) => quots.push(q.base.name.to_display_string()),
+        }
+    }
+    eprintln!("Inductives ({}): {:?}", inducts.len(), inducts);
+    eprintln!("Ctors ({}): {:?}", ctors.len(), ctors);
+    eprintln!("Recs ({}): {:?}", recs.len(), recs);
+    eprintln!("Axioms ({}): {:?}", axioms.len(), axioms);
+    eprintln!("Opaques ({}): {:?}", opaques.len(), opaques);
+    eprintln!("Quots ({}): {:?}", quots.len(), quots);
+    eprintln!("Defs count: {}", defs.len());
+    eprintln!("Thms count: {}", thms.len());
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_init_sizeof_dependencies() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let prelude = load("Init/Prelude");
+    let coe = load("Init/Coe");
+    let notation = load("Init/Notation");
+    let tactics = load("Init/Tactics");
+    let sizeof = load("Init/SizeOf");
+
+    let mut available = std::collections::BTreeSet::new();
+    for c in &prelude.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &coe.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &notation.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &tactics.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &sizeof.constants {
+        available.insert(c.name().clone());
+    }
+
+    eprintln!(
+        "Total available constants before SizeOf: Prelude={}, Coe={}, Notation={}, Tactics={}",
+        prelude.constants.len(),
+        coe.constants.len(),
+        notation.constants.len(),
+        tactics.constants.len()
+    );
+    eprintln!("Init.SizeOf has {} constants", sizeof.constants.len());
+
+    let mut missing = std::collections::BTreeSet::new();
+    for c in &sizeof.constants {
+        let mut exprs = vec![c.constant_val().type_.clone()];
+        match c {
+            ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+            ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+            ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+            _ => {}
+        }
+        for e in exprs {
+            let mut stack = vec![e];
+            while let Some(cur) = stack.pop() {
+                match cur.node() {
+                    fln_core::expr::ExprNode::Const { name, .. } => {
+                        if !available.contains(name) {
+                            missing.insert((c.name().clone(), name.clone()));
+                        }
+                    }
+                    fln_core::expr::ExprNode::App { f, a } => {
+                        stack.push(f.clone());
+                        stack.push(a.clone());
+                    }
+                    fln_core::expr::ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | fln_core::expr::ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_.clone());
+                        stack.push(value.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::Proj { expr, .. } => {
+                        stack.push(expr.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    eprintln!("Missing constants count: {}", missing.len());
+    for (caller, dep) in &missing {
+        eprintln!(
+            "  caller {} needs missing: {}",
+            caller.to_display_string(),
+            dep.to_display_string()
+        );
+    }
+    assert!(
+        missing.is_empty(),
+        "all dependencies of Init.SizeOf must be available"
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn inspect_init_core_module() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+    let core_base = lib.join("Init/Core.olean");
+    let exported = std::fs::read(&core_base).expect("read exported Core");
+    let server =
+        std::fs::read(core_base.with_extension("olean.server")).expect("read Core server");
+    let private =
+        std::fs::read(core_base.with_extension("olean.private")).expect("read Core private");
+
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+        .expect("decode Core");
+
+    eprintln!("Init.Core module imports:");
+    for import in &decoded.module.imports {
+        eprintln!("  import: {}", import.module.to_display_string());
+    }
+    eprintln!("Init.Core constant count: {}", decoded.constants.len());
+    let mut inducts = Vec::new();
+    let mut ctors = Vec::new();
+    let mut recs = Vec::new();
+    let mut defs = Vec::new();
+    let mut thms = Vec::new();
+    let mut axioms = Vec::new();
+    let mut opaques = Vec::new();
+    let mut quots = Vec::new();
+    for c in &decoded.constants {
+        match c {
+            ConstantInfo::Induct(i) => inducts.push(i.base.name.to_display_string()),
+            ConstantInfo::Ctor(ctor) => ctors.push(ctor.base.name.to_display_string()),
+            ConstantInfo::Rec(r) => recs.push(r.base.name.to_display_string()),
+            ConstantInfo::Defn(d) => defs.push(d.base.name.to_display_string()),
+            ConstantInfo::Thm(t) => thms.push(t.base.name.to_display_string()),
+            ConstantInfo::Axiom(a) => axioms.push(a.base.name.to_display_string()),
+            ConstantInfo::Opaque(o) => opaques.push(o.base.name.to_display_string()),
+            ConstantInfo::Quot(q) => quots.push(q.base.name.to_display_string()),
+        }
+    }
+    eprintln!("Inductives ({}): {:?}", inducts.len(), inducts);
+    eprintln!("Ctors ({}): {:?}", ctors.len(), ctors);
+    eprintln!("Recs ({}): {:?}", recs.len(), recs);
+    eprintln!("Axioms ({}): {:?}", axioms.len(), axioms);
+    eprintln!("Opaques ({}): {:?}", opaques.len(), opaques);
+    eprintln!("Quots ({}): {:?}", quots.len(), quots);
+    eprintln!("Defs count: {}", defs.len());
+    eprintln!("Thms count: {}", thms.len());
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_init_core_dependencies() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let prelude = load("Init/Prelude");
+    let coe = load("Init/Coe");
+    let notation = load("Init/Notation");
+    let tactics = load("Init/Tactics");
+    let sizeof = load("Init/SizeOf");
+    let core = load("Init/Core");
+
+    let mut available = std::collections::BTreeSet::new();
+    for c in &prelude.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &coe.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &notation.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &tactics.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &sizeof.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &core.constants {
+        available.insert(c.name().clone());
+    }
+
+    eprintln!(
+        "Total available constants: Prelude={}, Coe={}, Notation={}, Tactics={}, SizeOf={}, Core={}",
+        prelude.constants.len(),
+        coe.constants.len(),
+        notation.constants.len(),
+        tactics.constants.len(),
+        sizeof.constants.len(),
+        core.constants.len()
+    );
+
+    let mut missing = std::collections::BTreeSet::new();
+    for c in &core.constants {
+        let mut exprs = vec![c.constant_val().type_.clone()];
+        match c {
+            ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+            ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+            ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+            _ => {}
+        }
+        for e in exprs {
+            let mut stack = vec![e];
+            while let Some(cur) = stack.pop() {
+                match cur.node() {
+                    fln_core::expr::ExprNode::Const { name, .. } => {
+                        if !available.contains(name) {
+                            missing.insert((c.name().clone(), name.clone()));
+                        }
+                    }
+                    fln_core::expr::ExprNode::App { f, a } => {
+                        stack.push(f.clone());
+                        stack.push(a.clone());
+                    }
+                    fln_core::expr::ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | fln_core::expr::ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_.clone());
+                        stack.push(value.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::Proj { expr, .. } => {
+                        stack.push(expr.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    eprintln!("Missing constants count: {}", missing.len());
+    for (caller, dep) in &missing {
+        eprintln!(
+            "  caller {} needs missing: {}",
+            caller.to_display_string(),
+            dep.to_display_string()
+        );
+    }
+    assert!(
+        missing.is_empty(),
+        "all dependencies of Init.Core must be available"
+    );
+}
+
+
