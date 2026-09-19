@@ -6,7 +6,10 @@ use fln_core::level::{Level, LevelView};
 use fln_core::name::Name;
 use std::collections::HashMap;
 
-pub(crate) fn instantiate<E>(
+/// Simultaneously substitute universe parameters on a metered, heap-walked DAG.
+/// Replacements are not recursively substituted; malformed parameter maps fail
+/// through the caller's typed error. This operation confers no admission authority.
+pub fn instantiate<E>(
     mut tick: impl FnMut() -> Result<(), E>,
     scope: impl Fn() -> E,
     expr: &Expr,

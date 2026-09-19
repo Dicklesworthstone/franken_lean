@@ -1507,11 +1507,7 @@ impl SourceResultKind {
     }
 }
 
-fn source_result_kind(declaration: &fln::Declaration) -> Option<SourceResultKind> {
-    let fln::Declaration::Defn(definition) = declaration else {
-        return None;
-    };
-    let type_ = &definition.base.type_;
+fn source_result_kind(type_: &fln::Expr) -> Option<SourceResultKind> {
     if type_ == &fln::Expr::const_(fln::Name::from_components(["Nat"]), Vec::new()) {
         Some(SourceResultKind::Nat)
     } else if type_ == &fln::Expr::const_(fln::Name::from_components(["String"]), Vec::new()) {
@@ -1559,10 +1555,10 @@ impl From<fln::ClosedVmValueError> for SourceValueProjectionError {
 }
 
 fn closed_source_cli_value(
-    declaration: &fln::Declaration,
+    runtime_type: &fln::Expr,
     exit: &fln::VmExit,
 ) -> Result<Option<SourceFinalValue>, SourceValueProjectionError> {
-    let Some(declared) = source_result_kind(declaration) else {
+    let Some(declared) = source_result_kind(runtime_type) else {
         return Ok(None);
     };
     let Some(value) = fln::closed_vm_value(exit)? else {
@@ -8978,7 +8974,8 @@ fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> 
                     );
                 }
                 evaluation_output_position += 1;
-                let value = match closed_source_cli_value(&execution.declaration, &execution.exit) {
+                let value = match closed_source_cli_value(&execution.runtime_type, &execution.exit)
+                {
                     Ok(Some(value)) => value,
                     Ok(None) => {
                         return source_failure(
@@ -9594,7 +9591,7 @@ where
                 4,
             );
         };
-        let value = match closed_source_cli_value(&execution.declaration, &execution.exit) {
+        let value = match closed_source_cli_value(&execution.runtime_type, &execution.exit) {
             Ok(Some(value)) => value,
             Ok(None) => {
                 return source_failure(
@@ -9660,7 +9657,7 @@ where
         );
     };
     let final_value =
-        match closed_source_cli_value(&final_execution.declaration, &final_execution.exit) {
+        match closed_source_cli_value(&final_execution.runtime_type, &final_execution.exit) {
             Ok(Some(value)) => value,
             Ok(None) => {
                 return source_failure(
@@ -10840,7 +10837,10 @@ pub fn serve_lsp() -> MultiplexerOutput {
     let mut checker = source_check::lsp::Checker::new();
     let outcome = fln_server::dispatch::serve_workspace(&mut reader, &mut writer, &mut checker);
     if let Err(error) = writer.flush() {
-        return MultiplexerOutput::failure(format!("fln serve-lsp: transport flush error: {error}\n"), 1);
+        return MultiplexerOutput::failure(
+            format!("fln serve-lsp: transport flush error: {error}\n"),
+            1,
+        );
     }
     match outcome {
         Ok(outcome) => {

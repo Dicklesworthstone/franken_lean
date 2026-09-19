@@ -210,6 +210,7 @@ impl Preparation<'_> {
         if !definition.base.level_params.is_empty() {
             return Ok(None);
         }
+        let definition = self.normalize_definition_signature(definition)?;
         let mut type_ = &definition.base.type_;
         loop {
             self.tick()?;
@@ -231,7 +232,7 @@ impl Preparation<'_> {
             }
         }
         executable_signature(
-            definition,
+            &definition,
             &self.value_types,
             &mut self.visited,
             self.limits,

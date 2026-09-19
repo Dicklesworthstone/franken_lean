@@ -2994,8 +2994,10 @@ impl Engine {
     /// Execute one import-free source command stream containing definitions,
     /// evaluations, and scratch-only `#check` queries in source order.
     ///
-    /// Definitions and evaluations use the ordinary dual-check, publication,
-    /// compiler, codec, and Golem path. Each query observes the exact immutable
+    /// Executable definitions and evaluations use the ordinary dual-check,
+    /// publication, compiler, codec, and Golem path. Parametric definitions are
+    /// admitted as templates for concrete call-site specialization; instance
+    /// commands use the source registry and neither fabricates a VM result. Each query observes the exact immutable
     /// successor produced by the preceding executable commands, but its
     /// generated candidate is admitted only into a discarded scratch successor.
     /// A later frontend/admission/compiler refusal or non-answer returns no
@@ -3150,8 +3152,19 @@ impl Engine {
                 continue;
             }
 
+            let is_instance = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                && fln_elab::source::instance_registration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_some();
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
+                || is_instance
             {
                 let admission = match engine
                     .admit_source_command(command_source, options, limits.admission())
@@ -3215,7 +3228,13 @@ impl Engine {
                     });
                 }
             };
-            if matches!(declaration, Declaration::Thm(_)) {
+            // Parametric definitions are checked templates, not standalone VM
+            // entry points. Compile concrete uses on demand; never use a failed
+            // compilation as a reason to silently admit an executable command.
+            let is_template = !is_evaluation
+                && matches!(&declaration,
+                Declaration::Defn(definition) if runtime::is_template(definition));
+            if matches!(declaration, Declaration::Thm(_)) || is_template {
                 let admission = match engine
                     .admit_declarations(&[declaration], options, limits.admission())
                     .map_err(|error| EngineExecutionError::BatchCommand {
@@ -4243,8 +4262,10 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
-        let expression = match &declaration {
-            Declaration::Defn(definition) => definition.value.clone(),
+        let (expression, declared_type) = match &declaration {
+            Declaration::Defn(definition) => {
+                (definition.value.clone(), definition.base.type_.clone())
+            }
             Declaration::Axiom(_) => {
                 return Err(EngineExecutionError::UnsupportedDeclaration { kind: "axiom" });
             }
@@ -4280,6 +4301,9 @@ impl Engine {
         };
 
         let mut preparation = runtime::Preparation::new(&self.environment, limits.ingress);
+        let runtime_type = preparation
+            .normalize_type(&declared_type)
+            .map_err(EngineExecutionError::Ingress)?;
         let expression = preparation
             .expression(&expression)
             .map_err(EngineExecutionError::Ingress)?;
@@ -4323,6 +4347,7 @@ impl Engine {
         Ok(Outcome::Complete(DefinitionExecution {
             engine: admission.engine,
             declaration: admission.declaration,
+            runtime_type,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -5089,10 +5114,14 @@ fn executable_dependencies(
             intrinsics.push(binding);
             continue;
         }
-        let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
+        let definition = match environment.find(&name) {
+            Some(ConstantInfo::Defn(definition)) => Some(definition.clone()),
+            _ => preparation.specialized_definition(&name),
+        };
+        let Some(definition) = definition else {
             continue;
         };
-        let Some(mut signature) = preparation.signature(definition, true)? else {
+        let Some(mut signature) = preparation.signature(&definition, true)? else {
             continue;
         };
         signature.body = preparation.expression(&signature.body)?;
@@ -5635,8 +5664,9 @@ impl Default for CheckerExecutionLimits {
         let term = fln_checker::term::TermBudget::new(100_000_000, 200_000_000)
             .with_max_arena_nodes(100_000_000);
         let whnf = fln_checker::whnf::WhnfBudget::new(100_000_000, 100_000_000, term);
-        let inference = fln_checker::infer::InferenceBudget::new(100_000_000, 100_000_000, term, term)
-            .with_whnf(whnf);
+        let inference =
+            fln_checker::infer::InferenceBudget::new(100_000_000, 100_000_000, term, term)
+                .with_whnf(whnf);
         Self {
             decode: CheckerDecodeBudget::new(16 * 1024 * 1024, 1_000_000),
             environment: CheckerEnvironmentBudget::new(
@@ -5783,6 +5813,11 @@ pub struct DefinitionExecution {
     pub engine: Engine,
     /// The exact declaration admitted by K1 and then published.
     pub declaration: Declaration,
+    /// The admitted type with safe aliases normalized by the same metered
+    /// runtime preparation that produced the bytecode. Presentation uses this
+    /// type, not the runtime object's tag, to distinguish Nat from Bool. The
+    /// exact checked declaration above remains unchanged.
+    pub runtime_type: Expr,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.
