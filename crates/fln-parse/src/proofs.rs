@@ -458,7 +458,15 @@ fn simplify(
                     }
                     return Err(refusal(view, tokens, at));
                 }
-                let rule = if is(start, "-") {
+                let rule = if is(start, "*") {
+                    if at != start + 1 {
+                        return Err(refusal(view, tokens, start + 1));
+                    }
+                    Syntax::node(
+                        parser_kind(&["Tactic", "simpStar"]),
+                        vec![leaves.leaf(start)?],
+                    )
+                } else if is(start, "-") {
                     if at != start + 2 || !matches!(tokens[start + 1].kind, TokenKind::Ident(_)) {
                         return Err(refusal(view, tokens, start + 1));
                     }
@@ -616,11 +624,44 @@ mod simp_tests {
     }
 
     #[test]
+    fn simp_wildcards_preserve_original_leaves_and_are_not_identifier_names() {
+        for tactic in [
+            "simp [*]",
+            "simp only [*, *]",
+            "simp [h, /- 🦀 -/ *,] at hx ⊢",
+        ] {
+            let source = format!("theorem t (P : Prop) (h : P) : P := by {tactic}\r\n");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            let mut pending = vec![parsed.syntax()];
+            let mut stars = 0;
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = syntax {
+                    if kind == &parser_kind(&["Tactic", "simpStar"]) {
+                        assert!(
+                            matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "*")
+                        );
+                        stars += 1;
+                    }
+                    pending.extend(args);
+                }
+            }
+            assert!(stars > 0);
+        }
+        assert!(
+            parse_definition("theorem t (P : Prop) («*» : P) : P := by simp only [«*»]".as_bytes())
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn unsupported_simp_features_are_not_silently_ignored() {
         for tail in [
             "subst",
             "simp only [h] at",
-            "simp only [*]",
+            "simp only [* h]",
+            "simp only [← *]",
+            "simp only [-*]",
             "simp only [,h]",
             "simp only [h,,k]",
             "simp only [<-]",

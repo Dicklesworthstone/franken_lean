@@ -46,7 +46,7 @@ impl Context {
         let Some(locations) = self.rewrite_locations(location)? else {
             return Ok(false);
         };
-        let rules = self.simp_rules(args)?;
+        let mut rules = self.simp_rules(args)?;
         for name in &locations.hypotheses {
             self.tick()?;
             if initial.lctx.find_by_user_name(name).is_none() {
@@ -72,10 +72,18 @@ impl Context {
                     .cloned()
                     .ok_or_else(|| error(TacticError::RewriteLocation))?;
                 let mut advanced = false;
-                for rule in &rules {
+                // A hypothesis cannot simplify itself using wildcard evidence,
+                // including through conditional-premise discharge.
+                let active: Vec<_> = rules
+                    .iter()
+                    .filter(|rule| !matches!(rule, SimpRule::Local(id) if id == &local.id))
+                    .cloned()
+                    .collect();
+                for rule in &active {
                     self.tick()?;
                     let original = self.rewrite_trial();
-                    let Some(replacement) = self.simp_hypothesis_step(&local, rule, &rules)? else {
+                    let Some(replacement) = self.simp_hypothesis_step(&local, rule, &active)?
+                    else {
                         self.restore_simp_trial(original);
                         continue;
                     };
@@ -92,6 +100,22 @@ impl Context {
                     history.push(target);
                     let (next, parent, value) =
                         self.replace_rewritten_hypothesis(goal, &local, replacement)?;
+                    // The replacement is a fresh checked local. Future
+                    // locations and the target must use it, never a removed ID.
+                    let replacement_id = next
+                        .lctx
+                        .find_by_user_name(&name)
+                        .ok_or_else(|| failure(SourceInferenceError::Scope))?
+                        .id
+                        .clone();
+                    for rule in &mut rules {
+                        self.tick()?;
+                        if let SimpRule::Local(id) = rule
+                            && id == &local.id
+                        {
+                            *id = replacement_id.clone();
+                        }
+                    }
                     proof.work.push(Work::Close(parent, value));
                     goal = next;
                     steps += 1;

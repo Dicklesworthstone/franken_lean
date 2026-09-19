@@ -24,6 +24,9 @@ impl Context {
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
         match rule {
             SimpRule::Explicit(rule) => self.unfold_simp_term(rule.syntax, rule.reverse, target),
+            // Wildcard evidence is a proof, never an unfolding request. This
+            // also keeps a local `have`'s checked let value in its proof term.
+            SimpRule::Local(_) => Ok(UnfoldResult::NotDefinition),
             SimpRule::Global(rule) => {
                 self.tick()?;
                 match self.txn.env.find(&rule.declaration) {

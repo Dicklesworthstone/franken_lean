@@ -17,12 +17,16 @@ const MAX_SIMPLIFICATION_STEPS: usize = 256;
 pub(in crate::source) enum SimpRule<'a> {
     Explicit(RewriteRule<'a>),
     Global(scope::simp::SimpEntry),
+    /// A wildcard selects a proof by local identity, not its display spelling.
+    /// Location simplification remaps this identity when replacing the local.
+    Local(FVarId),
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
+            Self::Local(_) => false,
         }
     }
 }
@@ -171,6 +175,18 @@ impl Context {
         match rule {
             SimpRule::Explicit(rule) => self.simp_rule_term(rule.syntax),
             SimpRule::Global(rule) => self.constant(&rule.declaration),
+            SimpRule::Local(id) => {
+                self.tick()?;
+                let local = self
+                    .txn
+                    .lctx
+                    .find(id)
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                Ok(Typed {
+                    value: Expr::fvar(id.clone()),
+                    type_: local.type_.clone(),
+                })
+            }
         }
     }
 
@@ -264,10 +280,42 @@ impl Context {
         expect_atom(close, "]", "simp rule closer")?;
         let rows = expect_null_args(rows, "simp rules")?;
         let mut rules: Vec<(Option<Name>, SimpRule<'a>)> = Vec::new();
+        let mut wildcard_ids = std::collections::HashSet::new();
         for (index, row) in rows.iter().enumerate() {
             self.tick()?;
             if index % 2 == 1 {
                 expect_atom(row, ",", "simp rule separator")?;
+                continue;
+            }
+            if matches!(row, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "simpStar"]))
+            {
+                let parts = expect_node(
+                    row,
+                    &parser_kind(&["Tactic", "simpStar"]),
+                    1,
+                    "simp wildcard",
+                )?;
+                expect_atom(&parts[0], "*", "simp wildcard marker")?;
+                // Work on an immutable snapshot: rule elaboration may allocate
+                // holes, but never contributes synthetic premises to `[*]`.
+                let locals = self.txn.lctx.decls().to_vec();
+                for local in locals {
+                    self.tick()?;
+                    if !wildcard_ids.insert(local.id.clone()) {
+                        continue;
+                    }
+                    let type_ = self.instantiate(&local.type_)?;
+                    let Some(sort) = self.known_type(&type_)? else {
+                        continue;
+                    };
+                    let sort = self.whnf(&sort)?;
+                    if !sort.has_expr_mvar()
+                        && !sort.has_level_mvar()
+                        && self.proof_types_match(&sort, &Expr::sort(Level::zero()))?
+                    {
+                        rules.push((None, SimpRule::Local(local.id)));
+                    }
+                }
                 continue;
             }
             if matches!(row, Syntax::Node { kind, .. } if kind == &parser_kind(&["Tactic", "simpErase"]))

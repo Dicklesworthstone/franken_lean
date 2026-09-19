@@ -258,3 +258,26 @@ The equality and rewriting production commits were made only after actual source
 The final local scoped runs reported 382 elaborator/parser tests, 113 engine-library and focused proof tests, and all 70 CLI package tests passing, with zero failures or ignored tests. Package Clippy and workspace all-target compilation passed. These are scoped observations on the configured `nightly-2026-08-31` compiler, not a full workspace test-suite, Reference-parity, or release-gate claim.
 
 The proof-automation increment is additionally tested with the complete checker package, the complete parser/elaborator packages, the engine library and source equality/rewriting/file/automation targets, and the complete CLI package. Scoped Clippy with warnings denied and all-target workspace compilation are run before publication. The exact patch and command logs are retained by the source-simplification landing run; these checks do not close the full-workspace test, real-Prelude council, general elaboration, or release gates. The larger `fln-kpd` / `franken_lean-jxw` workstreams remain open.
+
+
+### Selecting local evidence with `simp [*]`
+
+`simp [*]` and `simp only [*]` select the current propositional hypotheses by
+local identity, including shadowed hypotheses and checked local `have` values.
+Equality and equivalence hypotheses become rewrite rules; other selected proofs
+can close matching goals or discharge conditional rules. Quantified hypotheses
+remain polymorphic and are instantiated at each matching occurrence. Arbitrary
+data variables are not guessed as missing theorem parameters. Repeated stars do
+not duplicate evidence, and the persistent registry is unchanged.
+
+At supported named locations, the hypothesis being simplified is excluded from
+wildcard evidence, including conditional-premise discharge. Replacing a local
+updates the wildcard identity for subsequent locations and the goal. The old and
+new types are connected by ordinary checked transports; no type is retagged.
+Failures roll back with the surrounding tactic alternative without refunding
+work. Both declaration checkers retain their veto.
+
+Run `fln check-source --json examples/native_simp_hypotheses.lean` for five
+examples. This increment does not add `at *`, local-hypothesis erasure, automatic
+rule orientation, proposition-to-True/False compilation, or complete upstream
+simplifier semantics. `-name` retains its existing global-erasure meaning.
