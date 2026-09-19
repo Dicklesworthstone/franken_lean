@@ -25,6 +25,7 @@
 //! internal fault while constructing this environment is never rendered as a
 //! kernel rejection (FL-INV-07).
 
+mod collections;
 mod decidable;
 mod logic;
 pub use decidable_eq::equality_decision_seed_declarations;
@@ -664,7 +665,7 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// source frontend. Order is part of the deterministic seed contract: the
 /// scalar type rows and Bool block must exist before intrinsic signatures can
 /// be admitted.
-pub fn source_seed_declarations() -> [Declaration; 74] {
+pub fn source_seed_declarations() -> [Declaration; 80] {
     let [
         and,
         and_left,
@@ -681,6 +682,8 @@ pub fn source_seed_declarations() -> [Declaration; 74] {
     ] = logic::logical_seed_declarations();
     let [bool_eq, nat_eq, bool_instance, nat_instance] = equality_decision_seed_declarations();
     let [equality_type, generic_eq] = generic_equality_decision_seed_declarations();
+    let [option, option_get_d, option_map, option_bind, option_is_some, option_is_none] =
+        collections::option_seed_declarations();
     [
         nat_inductive_seed_declaration(),
         string_seed_declaration(),
@@ -756,6 +759,12 @@ pub fn source_seed_declarations() -> [Declaration; 74] {
         quotient_seed_declaration(),
         quotient_sound_seed_declaration(),
         propext_seed_declaration(),
+        option,
+        option_get_d,
+        option_map,
+        option_bind,
+        option_is_some,
+        option_is_none,
     ]
 }
 
