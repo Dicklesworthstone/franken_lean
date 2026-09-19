@@ -1490,9 +1490,33 @@ fn bounded_term_spliced(
                 }
             }
             Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
+                // A named argument is an application argument, never a free
+                // term or a hygienic parenthesis. Preserve its five raw leaves
+                // and parse its value on this same bounded frame stack.
+                let ascription = if grammar == DefinitionGrammar::Scalar
+                    && cursor + 1 < range.end
+                    && matches!(&tokens[cursor].kind, TokenKind::Ident(_))
+                    && matches!(&tokens[cursor + 1].kind, TokenKind::Symbol(s) if s == ":=")
+                {
+                    if frames
+                        .last()
+                        .is_none_or(|frame| frame.application.is_empty())
+                    {
+                        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                            at: original_position(view, tokens, index),
+                            expected: grammar.value_expectation(),
+                        });
+                    }
+                    let name = leaves.leaf(cursor)?;
+                    let assignment = cursor + 1;
+                    cursor += 2;
+                    Some((name, assignment))
+                } else {
+                    None
+                };
                 frames.push(BoundedTermFrame {
                     record: None,
-                    ascription: None,
+                    ascription,
                     open: Some(index),
                     prefix: None,
                     negation: None,
@@ -1521,16 +1545,29 @@ fn bounded_term_spliced(
                 let ascription = frame.ascription.take();
                 let inner = finish_bounded_frame(view, tokens, frame, grammar, index)?;
                 let grouped = if let Some((value, colon)) = ascription {
-                    Syntax::node(
-                        parser_kind(&["Term", "typeAscription"]),
-                        vec![
-                            hygienic_lparen(leaves.leaf(open)?),
-                            value,
-                            leaves.leaf(colon)?,
-                            null_node(vec![inner]),
-                            leaves.leaf(index)?,
-                        ],
-                    )
+                    if matches!(&tokens[colon].kind, TokenKind::Symbol(s) if s == ":=") {
+                        Syntax::node(
+                            parser_kind(&["Term", "namedArgument"]),
+                            vec![
+                                leaves.leaf(open)?,
+                                value,
+                                leaves.leaf(colon)?,
+                                inner,
+                                leaves.leaf(index)?,
+                            ],
+                        )
+                    } else {
+                        Syntax::node(
+                            parser_kind(&["Term", "typeAscription"]),
+                            vec![
+                                hygienic_lparen(leaves.leaf(open)?),
+                                value,
+                                leaves.leaf(colon)?,
+                                null_node(vec![inner]),
+                                leaves.leaf(index)?,
+                            ],
+                        )
+                    }
                 } else {
                     Syntax::node(
                         parser_kind(&["Term", "paren"]),
