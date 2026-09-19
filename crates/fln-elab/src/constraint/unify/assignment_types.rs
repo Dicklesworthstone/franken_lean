@@ -27,6 +27,12 @@ enum TypeFrame {
         domain_level: Level,
         checkpoint: usize,
     },
+    Let {
+        id: FVarId,
+        value: Expr,
+        checkpoint: usize,
+    },
+    Application(Expr),
 }
 
 impl Engine<'_> {
@@ -80,7 +86,12 @@ impl Engine<'_> {
         'infer: loop {
             self.meter.node()?;
             current = self.instantiate(&current)?;
-            current = self.whnf(&current, &context)?;
+            // Synthesize lets and applications through their typing structure
+            // before reducing away annotations or substituting large bodies.
+            // Other heads retain the existing transparency-aware reduction.
+            if !matches!(current.node(), ExprNode::LetE { .. } | ExprNode::App { .. }) {
+                current = self.whnf(&current, &context)?;
+            }
             let mut inferred = match current.node() {
                 ExprNode::Lam {
                     binder_name,
@@ -121,6 +132,26 @@ impl Engine<'_> {
                         style: *binder_info,
                     });
                     current = binder_type.clone();
+                    continue 'infer;
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    let id = self.fresh()?;
+                    let opened = self.substitute(body, &Expr::fvar(id.clone()))?;
+                    let checkpoint = context.len();
+                    context.add_let(id.clone(), id.0.clone(), type_.clone(), value.clone());
+                    frames.push(TypeFrame::Let {
+                        id,
+                        value: value.clone(),
+                        checkpoint,
+                    });
+                    current = opened;
+                    continue 'infer;
+                }
+                ExprNode::App { f, a } => {
+                    frames.push(TypeFrame::Application(a.clone()));
+                    current = f.clone();
                     continue 'infer;
                 }
                 ExprNode::Sort { level } => Expr::sort(
@@ -188,6 +219,25 @@ impl Engine<'_> {
                             .map_err(|_| UnificationError::ExpressionScope)?;
                         inferred = Expr::sort(simplify_level(&level, &mut self.meter)?);
                         context.truncate(checkpoint);
+                    }
+                    TypeFrame::Let {
+                        id,
+                        value,
+                        checkpoint,
+                    } => {
+                        self.scan(&inferred)?;
+                        let body = inferred
+                            .abstract_fvar(&id, 0)
+                            .map_err(|_| UnificationError::ExpressionScope)?;
+                        context.truncate(checkpoint);
+                        inferred = self.substitute(&body, &value)?;
+                    }
+                    TypeFrame::Application(argument) => {
+                        let type_ = self.whnf(&inferred, &context)?;
+                        let ExprNode::ForallE { body, .. } = type_.node() else {
+                            return Ok(None);
+                        };
+                        inferred = self.substitute(body, &argument)?;
                     }
                 }
             }
