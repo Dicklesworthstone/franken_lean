@@ -14,6 +14,7 @@
 
 mod assignment_types;
 mod assignment_universes;
+mod delayed;
 mod flex_flex;
 mod normalize;
 mod proof_irrelevance;
@@ -36,6 +37,8 @@ use fln_env::constants::{
 use fln_kernel::verdict::{Budget, Verdict};
 use fln_kernel::{Declaration, check};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+pub(super) use delayed::DelayedConstraint;
 
 /// Native delta policy. Opaque declarations, unsafe definitions and partial
 /// definitions never unfold. Polymorphic bodies are instantiated simultaneously
@@ -88,6 +91,7 @@ pub enum UnificationDeferred {
     InvalidLocalContext,
     UnresolvedTypingConstraint(ConstraintId),
     InvalidTypingContext(ConstraintId),
+    UnresolvedDelayedAssignment(ConstraintId),
 }
 
 /// Nonanswers are not flattened into a Boolean or a kernel rejection. In
@@ -1007,6 +1011,7 @@ impl Engine<'_> {
         &mut self,
         equations: &[(Expr, Expr)],
         typings: &[TypingConstraint],
+        delayed: &[DelayedConstraint],
     ) -> Result<(), UnificationError> {
         let mut pending = VecDeque::new();
         for (left, right) in equations {
@@ -1023,6 +1028,17 @@ impl Engine<'_> {
             }
             self.scan(&typing.expr)?;
             self.scan(&typing.expected_type)?;
+        }
+        for obligation in delayed {
+            self.scan(&Expr::mvar(obligation.mvar.clone()))?;
+            self.scan(&obligation.val)?;
+            if obligation.val.has_loose_bvars() {
+                return Err(UnificationError::LooseBoundVariable);
+            }
+            for local in &obligation.fvars {
+                self.meter.node()?;
+                self.reserved.insert(local.clone());
+            }
         }
         // Reserve all pre-existing identities before opening binders. Map
         // iteration changes neither the resulting set nor the generated names.
@@ -1050,6 +1066,8 @@ impl Engine<'_> {
         // missing Pi/sort at assignment time may become known through a later
         // equation. Rechecking is worklist production, never kernel admission.
         let mut typing_generation = None;
+        let mut delayed_generation = None;
+        let mut delayed_reason = None;
         loop {
             let generation = self.generation();
             let mut postponed = VecDeque::new();
@@ -1065,6 +1083,26 @@ impl Engine<'_> {
                 }
             }
             let current_generation = self.generation();
+            if delayed_generation != Some(current_generation) {
+                delayed_generation = Some(current_generation);
+                delayed_reason = None;
+                let mut resumed = VecDeque::new();
+                for obligation in delayed {
+                    self.meter.node()?;
+                    match self.resume_delayed_assignment(obligation, &mut resumed) {
+                        Ok(()) => {}
+                        Err(UnificationError::Deferred(reason)) => {
+                            delayed_reason.get_or_insert(reason);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !resumed.is_empty() {
+                    resumed.extend(postponed);
+                    pending = resumed;
+                    continue;
+                }
+            }
             if typing_generation != Some(current_generation) {
                 typing_generation = Some(current_generation);
                 let mut typing = self.retry_assignment_types()?;
@@ -1090,7 +1128,7 @@ impl Engine<'_> {
                     continue;
                 }
             }
-            if postponed.is_empty() {
+            if postponed.is_empty() && delayed_reason.is_none() {
                 break;
             }
             if self.generation() == generation {
@@ -1107,7 +1145,9 @@ impl Engine<'_> {
                 }
                 if !progress {
                     return Err(UnificationError::Deferred(
-                        first_reason.expect("a postponed equation has a reason"),
+                        first_reason
+                            .or_else(|| delayed_reason.clone())
+                            .expect("a blocked obligation has a reason"),
                     ));
                 }
             }
@@ -1115,6 +1155,22 @@ impl Engine<'_> {
         }
         for id in self.assigned.clone() {
             self.check_assignment(&id)?;
+        }
+        let mut checked_delayed = HashSet::new();
+        for obligation in delayed {
+            self.meter.node()?;
+            // An already-assigned target still has to satisfy its queued
+            // obligation. It must not be overwritten or trusted unchecked.
+            if !self.work.mvars.is_assigned(&obligation.mvar) {
+                return Err(UnificationError::Deferred(
+                    UnificationDeferred::UnresolvedDelayedAssignment(obligation.id),
+                ));
+            }
+            if checked_delayed.insert(obligation.mvar.clone())
+                && !self.assigned.contains(&obligation.mvar)
+            {
+                self.check_assignment(&obligation.mvar)?;
+            }
         }
         for typing in typings {
             self.meter.node()?;
@@ -1239,13 +1295,14 @@ impl ElabTxn {
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<UnificationReport, UnificationError> {
-        self.unify_obligations_with(equations, &[], budget, cancelled)
+        self.unify_obligations_with(equations, &[], &[], budget, cancelled)
     }
 
     pub(super) fn unify_obligations_with(
         &mut self,
         equations: &[(Expr, Expr)],
         typings: &[TypingConstraint],
+        delayed: &[DelayedConstraint],
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<UnificationReport, UnificationError> {
@@ -1255,6 +1312,7 @@ impl ElabTxn {
         if equations
             .len()
             .saturating_add(typings.len())
+            .saturating_add(delayed.len())
             .saturating_add(self.mvars.len())
             .saturating_add(self.universes.len())
             > budget.max_visited_nodes
@@ -1290,7 +1348,7 @@ impl ElabTxn {
             kernel_checks: 0,
             fact_cache: HashMap::new(),
         };
-        let result = engine.solve(equations, typings);
+        let result = engine.solve(equations, typings, delayed);
         self.budget.heartbeats_consumed = self
             .budget
             .heartbeats_consumed

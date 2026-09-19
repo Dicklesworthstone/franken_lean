@@ -5,7 +5,9 @@
 
 pub mod unify;
 
-use self::unify::{TypingConstraint, UnificationBudget, UnificationError, UnificationReport};
+use self::unify::{
+    DelayedConstraint, TypingConstraint, UnificationBudget, UnificationError, UnificationReport,
+};
 use crate::mvar::{AssignmentJustification, MetavarError, MetavarStore};
 use crate::txn::ElabTxn;
 use fln_core::expr::{Expr, FVarId, MVarId};
@@ -287,10 +289,12 @@ impl ElabTxn {
         self.solve_selected_constraints_with(ids, budget, cancelled, true)
     }
 
-    /// Solve a mixed DefEq/HasType batch, with one shared budget and one atomic
-    /// publication. Typing rows generate necessary equations, then K1 checks
+    /// Solve a mixed DefEq/HasType/DelayedAssign batch with one shared budget
+    /// and one atomic publication. Typing rows generate necessary equations, then K1 checks
     /// each original term under its local context and typed residual holes.
     /// SynthInstance remains Synod's responsibility, not a unifier verdict.
+    /// Delayed rows assign only their designated target; their explicit
+    /// arguments must be distinct, in-scope parameter locals, not local lets.
     /// Like queued DefEq, selected rows are interpreted in this transaction's
     /// local context. A caller must restore that context before resuming them.
     pub fn solve_constraints_with(
@@ -324,6 +328,8 @@ impl ElabTxn {
         let selected: BTreeSet<_> = ids.iter().copied().collect();
         let mut equations = Vec::new();
         let mut typings = Vec::new();
+        let mut delayed = Vec::new();
+        let mut delayed_arguments = 0usize;
         for id in &selected {
             if cancelled() {
                 return Err(ConstraintSolveError::Unification(
@@ -356,6 +362,23 @@ impl ElabTxn {
                     expected_type: expected_type.clone(),
                     depth: row.depth,
                 }),
+                ConstraintKind::DelayedAssign { mvar, fvars, val } => {
+                    delayed_arguments = delayed_arguments.saturating_add(fvars.len());
+                    if delayed_arguments > budget.max_visited_nodes {
+                        return Err(ConstraintSolveError::Unification(
+                            UnificationError::NodeLimit {
+                                limit: budget.max_visited_nodes,
+                            },
+                        ));
+                    }
+                    delayed.push(DelayedConstraint {
+                        id: *id,
+                        mvar: mvar.clone(),
+                        fvars: fvars.clone(),
+                        val: val.clone(),
+                        depth: row.depth,
+                    });
+                }
                 _ => return Err(ConstraintSolveError::UnsupportedKind(*id)),
             }
         }
@@ -363,7 +386,8 @@ impl ElabTxn {
         for id in &selected {
             trial.constraints.remove(id);
         }
-        let result = trial.unify_obligations_with(&equations, &typings, budget, cancelled);
+        let result =
+            trial.unify_obligations_with(&equations, &typings, &delayed, budget, cancelled);
         self.budget.heartbeats_consumed = trial.budget.heartbeats_consumed;
         let unification = result.map_err(ConstraintSolveError::Unification)?;
         if cancelled() {

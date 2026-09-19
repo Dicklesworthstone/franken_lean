@@ -412,3 +412,331 @@ fn unresolved_type_shapes_stop_without_discarding_the_obligation() {
     );
     unchanged(&tx, &before);
 }
+
+fn delayed(tx: &mut ElabTxn, mvar: &MVarId, fvars: Vec<FVarId>, val: Expr) -> ConstraintId {
+    tx.postpone(
+        ConstraintKind::DelayedAssign {
+            mvar: mvar.clone(),
+            fvars,
+            val,
+        },
+        0,
+    )
+}
+fn fvar(expr: &Expr) -> FVarId {
+    let fln_core::expr::ExprNode::FVar { id } = expr.node() else {
+        panic!("local")
+    };
+    id.clone()
+}
+
+#[test]
+fn delayed_assignment_abstracts_dependent_locals_and_replays_the_relation() {
+    let mut tx = txn();
+    let ty = pi(
+        Expr::sort(Level::one()),
+        pi(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap()),
+    );
+    let function = hole(&mut tx, "identity", ty, MetavarKind::Natural);
+    let a = local(&mut tx, "A", Expr::sort(Level::one()));
+    let x = local(&mut tx, "x", a.clone());
+    let row = delayed(&mut tx, &function, vec![fvar(&a), fvar(&x)], x.clone());
+    let before_context = tx.lctx.clone();
+    let report = tx
+        .solve_constraints_with(&[row], budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.solved, vec![row]);
+    assert_eq!(
+        report.unification.expression_assignments,
+        vec![function.clone()]
+    );
+    assert_eq!(report.unification.kernel_checks, 1);
+    assert_eq!(tx.lctx, before_context);
+    assert_eq!(tx.mvars.len(), 1);
+    tx.unify(
+        &Expr::app(Expr::app(Expr::mvar(function), a), x.clone()),
+        &x,
+        budget(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn typing_progress_revives_a_delayed_assignment_with_unknown_function_type() {
+    for reverse in [false, true] {
+        let mut tx = txn();
+        let ty = hole(&mut tx, "F", Expr::sort(Level::one()), MetavarKind::Natural);
+        let function = hole(
+            &mut tx,
+            "function",
+            Expr::mvar(ty.clone()),
+            MetavarKind::Natural,
+        );
+        let x = local(&mut tx, "x", nat());
+        let row = delayed(&mut tx, &function, vec![fvar(&x)], x.clone());
+        let typing = has_type(&mut tx, Expr::mvar(function.clone()), pi(nat(), nat()));
+        let mut ids = vec![row, typing];
+        if reverse {
+            ids.reverse();
+        }
+        let report = tx
+            .solve_constraints_with(&ids, budget(), &|| false)
+            .unwrap();
+        assert_eq!(tx.mvars.get_assigned_expr(&ty), Some(&pi(nat(), nat())));
+        assert!(tx.mvars.is_assigned(&function));
+        assert_eq!(report.unification.kernel_checks, 3);
+        assert!(report.unification.residual_metavariables.is_empty());
+        tx.unify(&Expr::app(Expr::mvar(function), x.clone()), &x, budget())
+            .unwrap();
+    }
+}
+
+#[test]
+fn delayed_values_wait_for_resolution_instead_of_assigning_the_wrong_hole() {
+    let mut tx = txn();
+    let outer = hole(&mut tx, "outer", nat(), MetavarKind::Natural);
+    let _x = local(&mut tx, "private", nat());
+    let inner = hole(&mut tx, "inner", nat(), MetavarKind::Natural);
+    let row = delayed(&mut tx, &outer, vec![], Expr::mvar(inner.clone()));
+    let before = tx.clone();
+    // An ordinary equation could reverse this alias. The explicit output of a
+    // DelayedAssign must stay outer; guessing inner := outer loses its scope.
+    assert!(
+        tx.solve_constraints_with(&[row], budget(), &|| false)
+            .is_err()
+    );
+    unchanged(&tx, &before);
+    let solution = defeq(&mut tx, Expr::mvar(inner), lit(9));
+    let report = tx
+        .solve_constraints_with(&[row, solution], budget(), &|| false)
+        .unwrap();
+    assert_eq!(tx.mvars.get_assigned_expr(&outer), Some(&lit(9)));
+    assert_eq!(report.unification.kernel_checks, 2);
+}
+
+#[test]
+fn incompatible_delayed_rows_cannot_overwrite_a_target_or_drop_a_relation() {
+    let mut tx = txn();
+    let target = hole(&mut tx, "target", nat(), MetavarKind::Natural);
+    let first = delayed(&mut tx, &target, vec![], lit(1));
+    let second = delayed(&mut tx, &target, vec![], lit(2));
+    let before = tx.clone();
+    assert!(
+        tx.solve_constraints_with(&[second, first], budget(), &|| false)
+            .is_err()
+    );
+    unchanged(&tx, &before);
+    tx.solve_constraints_with(&[first], budget(), &|| false)
+        .unwrap();
+    assert_eq!(tx.mvars.get_assigned_expr(&target), Some(&lit(1)));
+    assert!(tx.constraints.constraints().contains_key(&second));
+}
+
+#[test]
+fn delayed_abstraction_cannot_hide_incorrect_argument_types() {
+    let mut tx = txn();
+    let function = hole(&mut tx, "function", pi(nat(), nat()), MetavarKind::Natural);
+    let wrong = local(&mut tx, "wrong", Expr::sort(Level::zero()));
+    // The constant lambda itself passes K1, but applying its Nat domain to
+    // this local is malformed. Its necessary domain equation must survive.
+    let row = delayed(&mut tx, &function, vec![fvar(&wrong)], lit(7));
+    let before = tx.clone();
+    assert!(
+        tx.solve_constraints_with(&[row], budget(), &|| false)
+            .is_err()
+    );
+    unchanged(&tx, &before);
+}
+
+#[test]
+fn malformed_delayed_telescopes_and_opaque_targets_do_not_publish() {
+    for mode in 0..4 {
+        let mut tx = txn();
+        let kind = if mode == 3 {
+            MetavarKind::SyntheticOpaque
+        } else {
+            MetavarKind::Natural
+        };
+        let function = hole(&mut tx, "function", pi(nat(), pi(nat(), nat())), kind);
+        let x = local(&mut tx, "x", nat());
+        let let_id = FVarId(name("let_arg"));
+        tx.lctx
+            .add_let(let_id.clone(), let_id.0.clone(), nat(), lit(1));
+        let args = match mode {
+            0 => vec![fvar(&x), fvar(&x)],
+            1 => vec![FVarId(name("missing"))],
+            2 => vec![let_id],
+            _ => vec![fvar(&x)],
+        };
+        let row = delayed(&mut tx, &function, args, lit(7));
+        let before = tx.clone();
+        assert!(
+            tx.solve_constraints_with(&[row], budget(), &|| false)
+                .is_err()
+        );
+        unchanged(&tx, &before);
+    }
+}
+
+#[test]
+fn delayed_kernel_veto_rolls_back_other_assignments_and_all_queue_indexes() {
+    let mut tx = txn();
+    let good = hole(&mut tx, "good", nat(), MetavarKind::Natural);
+    let bad = hole(&mut tx, "bad", pi(nat(), nat()), MetavarKind::Natural);
+    let x = local(&mut tx, "x", nat());
+    let first = delayed(&mut tx, &good, vec![], lit(7));
+    let second = delayed(&mut tx, &bad, vec![fvar(&x)], Expr::sort(Level::zero()));
+    let before = tx.clone();
+    assert!(
+        matches!(tx.solve_constraints_with(&[first, second], budget(), &|| false),
+            Err(ConstraintSolveError::Unification(UnificationError::AssignmentCheck { id, outcome }))
+            if id == bad && matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. }))
+        )
+    );
+    unchanged(&tx, &before);
+}
+
+#[test]
+fn delayed_proof_residuals_remain_explicit_obligations() {
+    let mut tx = txn();
+    let proposition = local(&mut tx, "P", Expr::sort(Level::zero()));
+    let target = hole(&mut tx, "target", proposition.clone(), MetavarKind::Natural);
+    let residual = hole(
+        &mut tx,
+        "residual",
+        proposition,
+        MetavarKind::SyntheticOpaque,
+    );
+    let row = delayed(&mut tx, &target, vec![], Expr::mvar(residual.clone()));
+    let report = tx
+        .solve_constraints_with(&[row], budget(), &|| false)
+        .unwrap();
+    assert!(tx.mvars.is_assigned(&target));
+    assert!(!tx.mvars.is_assigned(&residual));
+    assert_eq!(report.unification.residual_metavariables, vec![residual]);
+    assert_eq!(tx.mvars.len(), 2);
+}
+
+#[test]
+fn delayed_assignment_budgets_and_final_cancellation_restore_the_transaction() {
+    let mut base = txn();
+    let function = hole(
+        &mut base,
+        "function",
+        pi(nat(), nat()),
+        MetavarKind::Natural,
+    );
+    let x = local(&mut base, "x", nat());
+    let row = delayed(&mut base, &function, vec![fvar(&x)], x);
+    let polls = Cell::new(0);
+    let report = base
+        .clone()
+        .solve_constraints_with(&[row], budget(), &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap()
+        .unification;
+    for stop in [0, polls.get() / 2, polls.get() - 1] {
+        let calls = Cell::new(0);
+        let mut tx = base.clone();
+        assert!(matches!(
+            tx.solve_constraints_with(&[row], budget(), &|| {
+                let now = calls.get();
+                calls.set(now + 1);
+                now >= stop
+            }),
+            Err(ConstraintSolveError::Unification(
+                UnificationError::Cancelled
+            ))
+        ));
+        unchanged(&tx, &base);
+    }
+    for mode in 0..3 {
+        let mut tx = base.clone();
+        let mut b = budget();
+        match mode {
+            0 => b.max_assignments = 0,
+            1 => b.max_steps = report.unifier_steps - 1,
+            _ => b.max_visited_nodes = report.visited_nodes - 1,
+        }
+        assert!(tx.solve_constraints_with(&[row], b, &|| false).is_err());
+        unchanged(&tx, &base);
+    }
+}
+
+#[test]
+fn preexisting_delayed_targets_are_checked_not_overwritten_or_trusted() {
+    use fln_elab::mvar::AssignmentJustification;
+    for invalid in [false, true] {
+        let mut tx = txn();
+        let target = hole(&mut tx, "target", nat(), MetavarKind::Natural);
+        let value = if invalid {
+            Expr::sort(Level::zero())
+        } else {
+            lit(7)
+        };
+        // The store API is not proof authority. Even syntactically identical
+        // values in an already assigned target still require a K1 check here.
+        tx.assign_mvar(
+            target.clone(),
+            value.clone(),
+            AssignmentJustification::UserGiven,
+        )
+        .unwrap();
+        let row = delayed(&mut tx, &target, vec![], value);
+        let before = tx.clone();
+        let result = tx.solve_constraints_with(&[row], budget(), &|| false);
+        if invalid {
+            assert!(matches!(
+                result,
+                Err(ConstraintSolveError::Unification(
+                    UnificationError::AssignmentCheck { .. }
+                ))
+            ));
+            unchanged(&tx, &before);
+        } else {
+            let report = result.unwrap();
+            assert_eq!(report.unification.kernel_checks, 1);
+            assert!(report.unification.expression_assignments.is_empty());
+            assert_eq!(tx.mvars, before.mvars);
+        }
+    }
+}
+
+#[test]
+fn delayed_targets_cannot_cross_the_request_depth_or_invent_declarations() {
+    for undeclared in [false, true] {
+        let mut tx = txn();
+        let target = MVarId(name("target"));
+        if !undeclared {
+            tx.mvars.declare(
+                target.clone(),
+                target.0.clone(),
+                nat(),
+                tx.lctx.clone(),
+                MetavarKind::Natural,
+                1,
+                None,
+            );
+        }
+        let row = delayed(&mut tx, &target, vec![], lit(7));
+        let before = tx.clone();
+        let mut b = budget();
+        b.max_metavar_depth = 1;
+        assert!(tx.solve_constraints_with(&[row], b, &|| false).is_err());
+        unchanged(&tx, &before);
+        if !undeclared {
+            let deeper = tx.postpone(
+                ConstraintKind::DelayedAssign {
+                    mvar: target.clone(),
+                    fvars: vec![],
+                    val: lit(7),
+                },
+                1,
+            );
+            tx.solve_constraints_with(&[deeper], b, &|| false).unwrap();
+            assert_eq!(tx.mvars.get_assigned_expr(&target), Some(&lit(7)));
+        }
+    }
+}
