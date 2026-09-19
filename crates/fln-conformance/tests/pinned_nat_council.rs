@@ -1268,4 +1268,116 @@ fn preflight_init_core_dependencies() {
     );
 }
 
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init 5-module companion chain"]
+fn pinned_init_prelude_coe_notation_tactics_sizeof_council_run() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let prelude_base = lib.join("Init/Prelude.olean");
+    let prelude_exported = std::fs::read(&prelude_base).expect("read exported Prelude");
+    let prelude_server =
+        std::fs::read(prelude_base.with_extension("olean.server")).expect("read Prelude server");
+    let prelude_private =
+        std::fs::read(prelude_base.with_extension("olean.private")).expect("read Prelude private");
+
+    let coe_base = lib.join("Init/Coe.olean");
+    let coe_exported = std::fs::read(&coe_base).expect("read exported Coe");
+    let coe_server =
+        std::fs::read(coe_base.with_extension("olean.server")).expect("read Coe server");
+    let coe_private =
+        std::fs::read(coe_base.with_extension("olean.private")).expect("read Coe private");
+
+    let notation_base = lib.join("Init/Notation.olean");
+    let notation_exported = std::fs::read(&notation_base).expect("read exported Notation");
+    let notation_server =
+        std::fs::read(notation_base.with_extension("olean.server")).expect("read Notation server");
+    let notation_private = std::fs::read(notation_base.with_extension("olean.private"))
+        .expect("read Notation private");
+
+    let tactics_base = lib.join("Init/Tactics.olean");
+    let tactics_exported = std::fs::read(&tactics_base).expect("read exported Tactics");
+    let tactics_server =
+        std::fs::read(tactics_base.with_extension("olean.server")).expect("read Tactics server");
+    let tactics_private =
+        std::fs::read(tactics_base.with_extension("olean.private")).expect("read Tactics private");
+
+    let sizeof_base = lib.join("Init/SizeOf.olean");
+    let sizeof_exported = std::fs::read(&sizeof_base).expect("read exported SizeOf");
+    let sizeof_server =
+        std::fs::read(sizeof_base.with_extension("olean.server")).expect("read SizeOf server");
+    let sizeof_private =
+        std::fs::read(sizeof_base.with_extension("olean.private")).expect("read SizeOf private");
+
+    let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
+    let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
+    let notation_name = fln_core::name::Name::from_components(["Init", "Notation"]);
+    let tactics_name = fln_core::name::Name::from_components(["Init", "Tactics"]);
+    let sizeof_name = fln_core::name::Name::from_components(["Init", "SizeOf"]);
+
+    let modules = [
+        fln::OleanModuleInput {
+            name: &prelude_name,
+            artifact: &prelude_exported,
+            server_artifact: Some(&prelude_server),
+            private_artifact: Some(&prelude_private),
+        },
+        fln::OleanModuleInput {
+            name: &coe_name,
+            artifact: &coe_exported,
+            server_artifact: Some(&coe_server),
+            private_artifact: Some(&coe_private),
+        },
+        fln::OleanModuleInput {
+            name: &notation_name,
+            artifact: &notation_exported,
+            server_artifact: Some(&notation_server),
+            private_artifact: Some(&notation_private),
+        },
+        fln::OleanModuleInput {
+            name: &tactics_name,
+            artifact: &tactics_exported,
+            server_artifact: Some(&tactics_server),
+            private_artifact: Some(&tactics_private),
+        },
+        fln::OleanModuleInput {
+            name: &sizeof_name,
+            artifact: &sizeof_exported,
+            server_artifact: Some(&sizeof_server),
+            private_artifact: Some(&sizeof_private),
+        },
+    ];
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let result = engine.check_olean_modules(&modules, &KVMap::new(), limits);
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!("COMPLETE: checked {} modules!", checked.modules.len());
+            for m in &checked.modules {
+                eprintln!(
+                    "  module {}: {} declarations",
+                    m.name.to_display_string(),
+                    m.declarations.len()
+                );
+            }
+            assert_eq!(checked.modules.len(), 5);
+            assert_eq!(checked.modules[0].declarations.len(), 2314);
+            assert_eq!(checked.modules[1].declarations.len(), 158);
+            assert_eq!(checked.modules[2].declarations.len(), 284);
+            assert_eq!(checked.modules[3].declarations.len(), 360);
+            assert_eq!(checked.modules[4].declarations.len(), 174);
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
+        }
+    }
+}
+
+
 
