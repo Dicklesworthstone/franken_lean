@@ -5,8 +5,10 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/fln-unifier-scope.yml'
+      - 'crates/fln-elab/src/constraint.rs'
       - 'crates/fln-elab/src/constraint/**'
       - 'crates/fln-elab/tests/native_unification*.rs'
+      - 'crates/fln-elab/tests/native_constraint*.rs'
   workflow_dispatch:
 
 permissions:
@@ -50,27 +52,20 @@ jobs:
           import pathlib
           import subprocess
           import urllib.request
-          
-          CHUNKS = [
-              '1946126f63776642b4901f1462b2147ac9aac1ae',
-              '3eb1bc3ae4ae47e624cd4de3fe343b941a7eab80',
-              '447f21bb8e1bdb197343c08193326de47e365b05',
-              'aff6dfb69414de4a4a8be795650858f9330b034b',
-              'aad59ee6f23803ea9bfdabbd63f43153c7eed867',
-              '0057c649c9e67c76316210b7dd95f0388806c086',
-          ]
-          EXPECTED = '13330eba6db43282d5682306e4a3ed049759acd05df633bf1f8bdb00f133e82c'
+
+          CHUNKS = ['2f16c9528d93b841b942d79f2fc32655c398dee9']
+          EXPECTED = '589426fe39bbc03f798e19c237543bb5dfd3879a435c62993b8d2e382a84b908'
           logs = pathlib.Path('target/unifier-checks')
           logs.mkdir(parents=True, exist_ok=True)
-          
+
           def blob_hash(data):
               return hashlib.sha1(('blob %d\0' % len(data)).encode() + data).hexdigest()
-          
+
           def fetch_blob(sha):
               url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
               request = urllib.request.Request(url, headers={
                   'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                  'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0',
+                  'User-Agent': 'FrankenLean-Native-Constraint-Verification',
                   'Accept': 'application/vnd.github+json',
               })
               with urllib.request.urlopen(request, timeout=30) as response:
@@ -81,15 +76,15 @@ jobs:
               if blob_hash(data) != sha:
                   raise RuntimeError('Blob identity mismatch')
               return data
-          
+
           payload = b''.join(fetch_blob(sha) for sha in CHUNKS)
           if hashlib.sha256(payload).hexdigest() != EXPECTED:
               raise RuntimeError('Source transport checksum mismatch')
           stages = json.loads(gzip.decompress(payload))
-          
+
           def run(args, **kwargs):
               return subprocess.run(args, check=True, **kwargs)
-          
+
           def checks(label):
               commands = [
                   ('tests', ['cargo', 'test', '--locked', '-p', 'fln-elab', '--no-fail-fast']),
@@ -102,12 +97,17 @@ jobs:
                   print(path, 'exit', result.returncode, flush=True)
                   print('\n'.join(path.read_text(errors='replace').splitlines()[-12:]), flush=True)
                   result.check_returncode()
-          
+
           def verify(stage, which):
               for path, identities in stage['paths'].items():
-                  if blob_hash(pathlib.Path(path).read_bytes()) != identities[which]:
+                  source = pathlib.Path(path)
+                  expected = identities[which]
+                  if expected is None:
+                      if source.exists() or source.is_symlink():
+                          raise RuntimeError('New path already exists: ' + path)
+                  elif source.is_symlink() or blob_hash(source.read_bytes()) != expected:
                       raise RuntimeError('Concurrent source change requires review: ' + path)
-          
+
           run(['git', 'config', 'user.name', 'github-actions[bot]'])
           run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'])
           for number, stage in enumerate(stages):

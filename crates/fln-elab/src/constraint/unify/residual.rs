@@ -8,7 +8,7 @@
 //! depend on earlier locals. Scope compatibility includes the residual's entire
 //! declared context, not just the free variables visible in its type.
 
-use super::{Engine, UnificationDeferred, UnificationError};
+use super::{Engine, UnificationDeferred, UnificationError, ValidationTarget};
 use crate::lctx::LocalContext;
 use crate::mvar::{AssignmentJustification, MetavarStore};
 use fln_core::expr::{BinderInfo, Expr, FVarId, MVarId};
@@ -77,12 +77,14 @@ impl Engine<'_> {
             return Ok(());
         }
         let mut seen = HashSet::new();
+        let validation_target = ValidationTarget::Assignment(target.clone());
         while let Some(binding) = pending.pop() {
             self.meter.node()?;
             if !seen.insert(binding.clone()) || binding == Binding::Residual(target.clone()) {
                 continue;
             }
-            let (_, dependencies) = self.prepare_binding(binding, target, allowed, target_depth)?;
+            let (_, dependencies) =
+                self.prepare_binding(binding, &validation_target, allowed, target_depth)?;
             pending.extend(dependencies);
         }
         Ok(())
@@ -128,7 +130,7 @@ impl Engine<'_> {
     fn prepare_binding(
         &mut self,
         binding: Binding,
-        target: &MVarId,
+        target: &ValidationTarget,
         allowed: &LocalContext,
         target_depth: u32,
     ) -> Result<(PreparedBinding, Vec<Binding>), UnificationError> {
@@ -139,11 +141,7 @@ impl Engine<'_> {
                     .decls()
                     .iter()
                     .position(|local| &local.id == id)
-                    .ok_or_else(|| {
-                        UnificationError::Deferred(UnificationDeferred::EscapingLocal(
-                            target.clone(),
-                        ))
-                    })?;
+                    .ok_or_else(|| UnificationError::Deferred(target.escaping()))?;
                 let local = &allowed.decls()[position];
                 let mut dependencies = Vec::new();
                 // Preserve the original ordering of local declarations. Residual
@@ -178,9 +176,7 @@ impl Engine<'_> {
                 for local in declaration.lctx.decls() {
                     self.meter.tick()?;
                     if !seen.insert(local.id.clone()) || allowed.find(&local.id) != Some(local) {
-                        return Err(UnificationError::Deferred(
-                            UnificationDeferred::EscapingLocal(target.clone()),
-                        ));
+                        return Err(UnificationError::Deferred(target.escaping()));
                     }
                     dependencies.push(Binding::Local(local.id.clone()));
                 }
@@ -224,10 +220,30 @@ impl Engine<'_> {
             .get_assigned_expr(target)
             .cloned()
             .expect("a reported assignment exists");
-        let mut roots = self.binding_reads(&raw_value)?;
-        roots.extend(self.binding_reads(&declaration.type_)?);
+        self.prepare_value_check(
+            &ValidationTarget::Assignment(target.clone()),
+            &raw_value,
+            &declaration.type_,
+            &declaration.lctx,
+            declaration.depth,
+        )
+    }
+
+    /// Shared closure construction for assignments and queued HasType rows.
+    /// No artificial metavariable is declared to check a term's type: only the
+    /// private validation copy replaces existing residuals with bound locals.
+    pub(super) fn prepare_value_check(
+        &mut self,
+        target: &ValidationTarget,
+        raw_value: &Expr,
+        raw_type: &Expr,
+        locals: &LocalContext,
+        depth: u32,
+    ) -> Result<(Expr, Expr, Vec<MVarId>), UnificationError> {
+        let mut roots = self.binding_reads(raw_value)?;
+        roots.extend(self.binding_reads(raw_type)?);
         let mut local_ids = HashSet::new();
-        for (index, local) in declaration.lctx.decls().iter().enumerate() {
+        for (index, local) in locals.decls().iter().enumerate() {
             self.meter.tick()?;
             if !local_ids.insert(local.id.clone()) || local.index != index {
                 return Err(UnificationError::Deferred(
@@ -252,16 +268,10 @@ impl Engine<'_> {
                         continue;
                     }
                     if !visiting.insert(binding.clone()) {
-                        return Err(UnificationError::Deferred(
-                            UnificationDeferred::UnresolvedAssignmentType(target.clone()),
-                        ));
+                        return Err(UnificationError::Deferred(target.unresolved()));
                     }
-                    let (prepared, dependencies) = self.prepare_binding(
-                        binding,
-                        target,
-                        &declaration.lctx,
-                        declaration.depth,
-                    )?;
+                    let (prepared, dependencies) =
+                        self.prepare_binding(binding, target, locals, depth)?;
                     tasks.push(Task::Exit(prepared));
                     tasks.extend(dependencies.into_iter().rev().map(Task::Enter));
                 }
@@ -275,9 +285,7 @@ impl Engine<'_> {
                         .transpose()?;
                     for expr in std::iter::once(&domain).chain(value.iter()) {
                         if expr.has_expr_mvar() || expr.has_loose_bvars() {
-                            return Err(UnificationError::Deferred(
-                                UnificationDeferred::UnresolvedAssignmentType(target.clone()),
-                            ));
+                            return Err(UnificationError::Deferred(target.unresolved()));
                         }
                         if self
                             .scan(expr)?
@@ -285,9 +293,7 @@ impl Engine<'_> {
                             .iter()
                             .any(|id| !telescope.contains(id))
                         {
-                            return Err(UnificationError::Deferred(
-                                UnificationDeferred::EscapingLocal(target.clone()),
-                            ));
+                            return Err(UnificationError::Deferred(target.escaping()));
                         }
                     }
                     match &prepared.binding {
@@ -329,8 +335,8 @@ impl Engine<'_> {
                 }
             }
         }
-        let mut value = self.validation_instantiate(&raw_value, &validation_store)?;
-        let mut type_ = self.validation_instantiate(&declaration.type_, &validation_store)?;
+        let mut value = self.validation_instantiate(raw_value, &validation_store)?;
+        let mut type_ = self.validation_instantiate(raw_type, &validation_store)?;
         for local in telescope.decls().iter().rev() {
             self.meter.tick()?;
             self.scan(&value)?;

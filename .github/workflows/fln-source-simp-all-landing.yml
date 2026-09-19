@@ -1,0 +1,88 @@
+name: Native simp_all verified integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/land_source_simp_all.py
+      - .github/workflows/fln-source-simp-all-landing.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fln-source-simp-all-landing
+  cancel-in-progress: false
+
+jobs:
+  simplify-all:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '4'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          mkdir -p target/simp-all-landing
+          rustc -Vv | tee target/simp-all-landing/compiler.txt
+          git rev-parse HEAD | tee target/simp-all-landing/input-commit.txt
+      - name: Apply scoped implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/land_source_simp_all.py
+          rustfmt --edition 2024 --config skip_children=true crates/fln-parse/src/proofs.rs crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/rewrite/simplify/locations.rs crates/fln-elab/tests/source_simp_all.rs
+          git diff --check
+          git add -- crates/fln-parse/src/proofs.rs crates/fln-elab/src/source/tactics.rs crates/fln-elab/src/source/tactics/rewrite/simplify/locations.rs crates/fln-elab/tests/source_simp_all.rs examples/native_simp_all.lean docs/NATIVE_SIMP_ALL.md
+          git diff --cached > target/simp-all-landing/implementation.patch
+          git diff --cached --name-only | tee target/simp-all-landing/changed-files.txt
+          while IFS= read -r path; do
+            case "$path" in
+              crates/fln-parse/src/proofs.rs|crates/fln-elab/src/source/tactics.rs|crates/fln-elab/src/source/tactics/rewrite/simplify/locations.rs|crates/fln-elab/tests/source_simp_all.rs|examples/native_simp_all.lean|docs/NATIVE_SIMP_ALL.md) ;;
+              *) printf 'Unexpected changed file: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done < target/simp-all-landing/changed-files.txt
+          git config user.name 'FrankenLean source integration'
+          git config user.email 'noreply@github.com'
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat(elab): add proof-producing fixed-point simp_all automation'
+          fi
+      - name: Verify and publish without overwriting concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            cargo test --locked -p fln-elab --test source_simp_all -- --nocapture 2>&1 | tee "target/simp-all-landing/focused-${attempt}.log"
+            cargo test --locked -p fln-elab -p fln-parse --no-fail-fast 2>&1 | tee "target/simp-all-landing/source-${attempt}.log"
+            cargo test --locked -p fln --lib --no-fail-fast 2>&1 | tee "target/simp-all-landing/engine-${attempt}.log"
+            cargo run --locked -p fln-cli --bin fln -- check-source --json examples/native_simp_all.lean 2>&1 | tee "target/simp-all-landing/council-${attempt}.log"
+            cargo clippy --locked -p fln-elab -p fln-parse --all-targets -- -D warnings 2>&1 | tee "target/simp-all-landing/clippy-${attempt}.log"
+            cargo check --locked --workspace --all-targets 2>&1 | tee "target/simp-all-landing/workspace-${attempt}.log"
+            git diff --check
+            if git push origin HEAD:main; then
+              git rev-parse HEAD | tee target/simp-all-landing/published-commit.txt
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            git fetch origin main
+            git rebase origin/main
+            # The next iteration checks the reconciled tree again before push.
+          done
+      - name: Retain exact source patch and execution evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-simp-all-${{ github.sha }}
+          path: target/simp-all-landing
+          retention-days: 7
+          if-no-files-found: warn
