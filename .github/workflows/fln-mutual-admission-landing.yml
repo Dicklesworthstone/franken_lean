@@ -1,0 +1,91 @@
+name: Native mutual-inductive admission landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fln-mutual-admission-landing.yml'
+      - 'scripts/patches/mutual-admission.part*.b64'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fln-mutual-admission-landing
+  cancel-in-progress: false
+
+jobs:
+  mutual:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply the exact recovered implementation without replacing concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/mutual-landing
+          git rev-parse HEAD | tee target/mutual-landing/base.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, os, pathlib, subprocess
+          encoded = ''.join(pathlib.Path(f'scripts/patches/mutual-admission.part{i}.b64').read_text().strip() for i in (1, 2))
+          series = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(series).hexdigest() == '840b7bc2b1358d4c1fbbbda7dad56dcefa620a4683bf4d560aa8067be1748238'
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mutual-admission.mbox'
+          path.write_bytes(series)
+          # git am rejects conflicting hunks and existing additions. No reset,
+          # clean, force-push or whole-file stale replacement is involved.
+          subprocess.run(['git', 'am', str(path)], check=True)
+          PY
+          git log -2 --format=fuller | tee target/mutual-landing/commits.txt
+          git diff --check HEAD~2 HEAD
+      - name: Install the repository compiler
+        id: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee target/mutual-landing/compiler.txt
+      - name: Check independent reconstruction and adversarial admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-checker --no-fail-fast 2>&1 | tee target/mutual-landing/checker-tests.log
+          cargo test --locked -p fln --lib --test mutual_inductive_admission 2>&1 | tee target/mutual-landing/engine-tests.log
+          cargo clippy --locked -p fln-checker -p fln --all-targets -- -D warnings 2>&1 | tee target/mutual-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/mutual-landing/workspace-check.log
+      - name: Publish the verified two-commit series directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=no)"
+          git push origin HEAD:main
+          git rev-parse HEAD | tee target/mutual-landing/published.txt
+      - name: Retain the exact source and verification results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/mutual-landing
+          git archive --format=tar.gz HEAD > target/mutual-landing/source.tar.gz
+          git rev-parse HEAD > target/mutual-landing/source-commit.txt
+          git rev-parse 'HEAD^{tree}' > target/mutual-landing/source-tree.txt
+          sha256sum target/mutual-landing/source.tar.gz > target/mutual-landing/source.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mutual-admission-${{ github.run_id }}
+          path: target/mutual-landing
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
