@@ -901,10 +901,48 @@ fn body_matches_declared_type(
     budget: &AdmissionBudget,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(), Verdict> {
+    if cancelled() {
+        return Err(stopped_err(name, AdmissionPhase::Body));
+    }
+
+    // Pin environment.cpp:163-178 (add_definition unsafe branch):
+    // A non-safe definition may be recursive (e.g. `._unsafe_rec` implementation
+    // helpers reference themselves). The declared type was already checked against
+    // `environment` (which excludes `name`), but the body checks against a scratch
+    // environment holding the definition's own header.
+    let body_environment = if declaration.kind() == ConstantKind::Definition
+        && quarantine_of(declaration) != Quarantine::None
+        && environment.find(name).is_none()
+    {
+        let header = ConstantDeclaration::header(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.kind(),
+            declaration.safety(),
+        );
+        let entry = ConstantEntry::new(name.clone(), header);
+        match environment.extend_with(entry, EnvironmentBudget::unlimited(), &mut *cancelled) {
+            EnvironmentOutcome::Complete {
+                environment: extended,
+                ..
+            } => extended,
+            EnvironmentOutcome::Inconclusive(_) => {
+                return Err(stopped_err(name, AdmissionPhase::Body));
+            }
+            EnvironmentOutcome::Refused { .. } | EnvironmentOutcome::InternalFault { .. } => {
+                return Err(Verdict::InternalFault(
+                    AdmissionFault::PredeclarationUnbuildable { name: name.clone() },
+                ));
+            }
+        }
+    } else {
+        environment.clone()
+    };
+
     let context = match InferenceContext::new(
         Vec::new(),
         declaration.level_parameters().to_vec(),
-        environment.clone(),
+        body_environment,
     ) {
         Ok(context) => context,
         Err(refusal) => {

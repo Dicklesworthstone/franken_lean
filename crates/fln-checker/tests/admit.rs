@@ -13065,6 +13065,71 @@ fn kr975b_the_reference_gate_is_keyed_on_the_header_and_fires_in_both_directions
     }
 }
 
+fn recursive_definition(
+    name: &str,
+    constant_safety: ConstantSafety,
+    def_safety: DefinitionSafety,
+) -> ConstantEntry {
+    let nat = Expr::const_(primary_name("Nat"), Vec::new());
+    let type_expr = Expr::forall_e(
+        primary_name("n"),
+        nat.clone(),
+        nat.clone(),
+        BinderInfo::Default,
+    );
+    let self_const = Expr::const_(primary_name(name), Vec::new());
+    let body_expr = Expr::lam(
+        primary_name("n"),
+        nat,
+        Expr::app(self_const, Expr::bvar(0).unwrap()),
+        BinderInfo::Default,
+    );
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            decoded(&type_expr),
+            constant_safety,
+            DefinitionBody::new(
+                decoded(&body_expr),
+                ReducibilityHint::Regular(0),
+                def_safety,
+                Vec::new(),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn kr974_unsafe_recursive_definition_is_admitted_into_quarantine() {
+    let entry = recursive_definition("loop_fn", ConstantSafety::Unsafe, DefinitionSafety::Unsafe);
+    match admit(&nat_environment(), &entry, AdmissionBudget::unlimited()) {
+        Verdict::Admitted(admission) => {
+            assert_eq!(admission.name(), &checker_name("loop_fn"));
+            assert_eq!(admission.ground(), AdmissionGround::UnsafeQuarantine);
+        }
+        other => panic!("an unsafe recursive definition must be admitted, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr974_safe_recursive_definition_is_rejected_as_unknown_constant() {
+    let entry = recursive_definition("loop_fn", ConstantSafety::Safe, DefinitionSafety::Safe);
+    match admit(&nat_environment(), &entry, AdmissionBudget::unlimited()) {
+        Verdict::Rejected(AdmissionRejection::BodyTypeRefused { name, refusal }) => {
+            assert_eq!(name, checker_name("loop_fn"));
+            assert!(
+                matches!(
+                    *refusal,
+                    fln_checker::infer::InferenceRefusal::UnknownConstant { .. }
+                ),
+                "safe recursive definition must fail because self is unknown: got {refusal:?}"
+            );
+        }
+        other => panic!("a safe recursive definition must be rejected, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------- KR-977
 
 /// One member of a mutual block: an unsafe definition naming the whole block.
