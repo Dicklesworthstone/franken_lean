@@ -2717,3 +2717,29 @@ fn nested_arithmetic_in_a_demanded_major_uses_heap_frames() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn nat_reduction_in_eager_whnf_reduces_ble_and_arithmetic_without_unfolding() {
+    let context = definition_context(nat_literal_family_entries());
+    let term = decoded(&natural_operation(
+        "ble",
+        [numeric_literal(55296), numeric_literal(4294967296)],
+    ));
+    let result = complete(whnf(&term, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        result.term.node(result.term.root()),
+        Some(&ExprNode::Constant {
+            name: checker_qualified(&["Bool", "true"]),
+            levels: Vec::new(),
+        })
+    );
+    assert!(result.steps < 100, "must reduce in O(1) steps without unfolding recursion: took {}", result.steps);
+
+    let add_term = decoded(&natural_operation(
+        "add",
+        [numeric_literal(100), numeric_literal(200)],
+    ));
+    let add_result = complete(whnf(&add_term, &context, WhnfBudget::unlimited()));
+    assert_eq!(add_result.term, decoded(&numeric_literal(300)));
+    assert!(add_result.steps < 100, "must reduce addition in O(1) steps: took {}", add_result.steps);
+}

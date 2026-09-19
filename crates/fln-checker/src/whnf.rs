@@ -708,11 +708,14 @@ impl<'a, 'c> Reducer<'a, 'c> {
         ))
     }
 
-    fn compose_application(
+    fn compose_application<'b, I>(
         &mut self,
         function: &Cursor,
-        arguments: &VecDeque<Cursor>,
-    ) -> Result<Cursor, Halt> {
+        arguments: I,
+    ) -> Result<Cursor, Halt>
+    where
+        I: IntoIterator<Item = &'b Cursor>,
+    {
         self.control.step(function.root.index(), self.cancelled)?;
         let mut composer = Composer::new(
             self.control.budget.materialization,
@@ -722,7 +725,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             self.cancelled,
         );
         let mut root = composer.copy_cursor(function, 0)?;
-        for (index, argument) in arguments.iter().enumerate() {
+        for (index, argument) in arguments.into_iter().enumerate() {
             let argument = composer.copy_cursor(argument, index.saturating_add(1))?;
             root = composer.push_expression(
                 ExprNode::Apply {
@@ -1964,6 +1967,112 @@ impl<'a, 'c> Reducer<'a, 'c> {
         Ok(Some(reduced))
     }
 
+    /// KR-313 natural literal acceleration in the WHNF loop (type_checker.cpp:689).
+    /// If the head constant is in the pinned Nat operation table and enough
+    /// pending arguments are present, evaluate the arithmetic or comparison
+    /// natively before attempting delta unfolding.
+    fn try_nat_reduction(
+        &mut self,
+        current: &Cursor,
+        pending_arguments: &mut VecDeque<Cursor>,
+    ) -> Result<Option<Cursor>, Halt> {
+        let (name, levels) = match self.node(current)? {
+            ExprNode::Constant { name, levels } => (name.clone(), levels),
+            _ => return Ok(None),
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        let Some(operation) = crate::nat_reduce::operation_for_name(&name) else {
+            return Ok(None);
+        };
+        let arity = usize::from(operation.arity());
+        if pending_arguments.len() < arity {
+            return Ok(None);
+        }
+        let app = self.compose_application(current, pending_arguments.iter().take(arity))?;
+        let at = app.root.index();
+        let steps = self
+            .control
+            .budget
+            .max_steps
+            .saturating_sub(self.control.steps);
+        let reductions = self
+            .control
+            .budget
+            .max_reductions
+            .saturating_sub(self.control.reductions);
+        let materialization = self.control.budget.materialization;
+        let budget = NatReductionBudget::new(
+            steps,
+            steps,
+            reductions,
+            materialization.max_arena_nodes,
+            materialization.max_output_units,
+            materialization.max_output_units,
+            WhnfBudget::new(steps, reductions, materialization)
+                .with_string(self.remaining_string_budget()),
+            NatBudget::new(steps, materialization.max_output_units),
+        );
+        let result = reduce_nat_at_with(
+            NatReductionQuery::new(&app.arena, app.root, &app.arena, app.root, self.context.source),
+            budget,
+            NatReductionScope::ClosedPair,
+            &mut *self.cancelled,
+        );
+        match result {
+            NatReductionOutcome::Reduced(result) => {
+                self.absorb_demanded_nat(result.progress, at)?;
+                self.control.reduction(at, self.cancelled)?;
+                for _ in 0..arity {
+                    pending_arguments.pop_front();
+                }
+                Ok(Some(Cursor {
+                    root: result.term.root(),
+                    arena: Arc::new(result.term),
+                }))
+            }
+            NatReductionOutcome::NotReduced { progress, .. } => {
+                self.has_auxiliary_work = true;
+                self.absorb_demanded_nat(progress, at)?;
+                Ok(None)
+            }
+            NatReductionOutcome::Refused {
+                refusal: crate::nat_reduce::NatReductionRefusal::Whnf { refusal, .. },
+                progress,
+            } => {
+                self.absorb_demanded_nat(progress, at)?;
+                Err(Halt::Refusal(refusal))
+            }
+            NatReductionOutcome::Inconclusive(stop) => {
+                let progress = stop.progress();
+                self.control.steps = self
+                    .control
+                    .steps
+                    .saturating_add(progress.steps)
+                    .saturating_add(progress.whnf_steps)
+                    .saturating_add(progress.numeric_steps);
+                self.control.reductions = self
+                    .control
+                    .reductions
+                    .saturating_add(progress.whnf_reductions)
+                    .saturating_add(progress.numeric_reductions);
+                Err(Halt::Stop(Box::new(WhnfStop::NatReduction {
+                    at,
+                    stop: Box::new(stop),
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                })))
+            }
+            NatReductionOutcome::InternalFault(fault) => {
+                Err(Halt::Fault(WhnfFault::NatReduction {
+                    at,
+                    fault: Box::new(fault),
+                }))
+            }
+        }
+    }
+
     fn head_action(&self, current: &Cursor) -> Result<HeadAction, Halt> {
         let node = self.node(current)?;
         match node {
@@ -2064,6 +2173,17 @@ impl<'a, 'c> Reducer<'a, 'c> {
                             DeltaMode::Disabled => false,
                             DeltaMode::Once => self.delta_reductions == 0,
                         };
+                    if matches!(self.delta_mode, DeltaMode::Eager)
+                        && let Some(reduced) =
+                            self.try_nat_reduction(&current, &mut pending_arguments)?
+                    {
+                        if forced {
+                            self.force_string_delta = false;
+                        }
+                        self.delta_reductions = self.delta_reductions.saturating_add(1);
+                        current = reduced;
+                        continue;
+                    }
                     if may_unfold && let Some(unfolded) = self.unfold_definition(&current)? {
                         if forced {
                             self.force_string_delta = false;

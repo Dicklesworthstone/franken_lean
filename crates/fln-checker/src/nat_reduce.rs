@@ -43,7 +43,7 @@ pub enum NatReductionOperation {
 }
 
 impl NatReductionOperation {
-    const fn arity(self) -> u8 {
+    pub(crate) const fn arity(self) -> u8 {
         match self {
             NatReductionOperation::Successor => 1,
             NatReductionOperation::Add
@@ -643,7 +643,7 @@ fn text_name(name: &WireName, namespace: &str, leaf: &str) -> bool {
     )
 }
 
-fn operation_for_name(name: &WireName) -> Option<NatReductionOperation> {
+pub(crate) fn operation_for_name(name: &WireName) -> Option<NatReductionOperation> {
     let [NamePart::Text(namespace), NamePart::Text(leaf)] = name.parts() else {
         return None;
     };
