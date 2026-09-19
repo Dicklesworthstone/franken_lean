@@ -993,6 +993,18 @@ fn inspect_init_sizeof_module() {
     eprintln!("Quots ({}): {:?}", quots.len(), quots);
     eprintln!("Defs count: {}", defs.len());
     eprintln!("Thms count: {}", thms.len());
+    for c in &decoded.constants {
+        if c.name().to_display_string() == "Unit.sizeOf" {
+            eprintln!("Found Unit.sizeOf:");
+            eprintln!("  kind: {:?}", match c { ConstantInfo::Thm(_) => "Thm", ConstantInfo::Defn(_) => "Defn", _ => "Other" });
+            eprintln!("  type: {:?}", c.constant_val().type_);
+            if let ConstantInfo::Thm(t) = c {
+                eprintln!("  thm value: {:?}", t.value);
+            } else if let ConstantInfo::Defn(d) = c {
+                eprintln!("  defn value: {:?}", d.value);
+            }
+        }
+    }
 }
 
 #[test]
