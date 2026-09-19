@@ -1,0 +1,61 @@
+name: Native goal inspection
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-goal-inspection.yml'
+      - 'crates/fln-elab/src/source/**'
+      - 'crates/fln-elab/src/source.rs'
+      - 'crates/fln/src/source_check/**'
+      - 'crates/fln-server/src/dispatch/**'
+      - 'crates/fln-server/src/dispatch.rs'
+      - 'crates/fln-cli/src/source_check/**'
+      - 'crates/fln/tests/source_goal_inspection.rs'
+      - 'crates/fln-cli/tests/lsp_goals.rs'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  goals:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install exact repository toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          rustc -Vv
+      - name: Retain reproducible offline development inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-goals"
+          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/native-goals/source.tar.gz"
+          sysroot=$(rustc --print sysroot)
+          tar -czf "$RUNNER_TEMP/native-goals/rust.tar.gz" -C "$sysroot" bin lib
+          git rev-parse HEAD > "$RUNNER_TEMP/native-goals/source-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-goal-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/native-goals
+          retention-days: 1
+          compression-level: 0
+      - name: Check native goal and protocol consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-server
+          cargo test --locked -p fln --test source_module_check --test source_module_session
+          if test -f crates/fln/tests/source_goal_inspection.rs; then
+            cargo test --locked -p fln --test source_goal_inspection
+          fi
+          if test -f crates/fln-cli/tests/lsp_goals.rs; then
+            cargo test --locked -p fln-cli --test lsp_goals
+          fi
+          cargo test --locked -p fln-cli --test lsp_stdio_e2e --test lsp_proof_modules
+          cargo check --locked --workspace --all-targets
