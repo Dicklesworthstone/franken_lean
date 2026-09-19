@@ -163,6 +163,7 @@ fn pinned_init_prelude_reaches_two_checker_council_frontier() {
                 "COMPLETE: checked {} declarations!",
                 checked.declarations.len()
             );
+            assert_eq!(checked.declarations.len(), 2314);
         }
         Ok(Outcome::Inconclusive(reason)) => {
             panic!("INCONCLUSIVE: {reason:?}");
