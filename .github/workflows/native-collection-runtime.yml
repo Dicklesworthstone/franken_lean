@@ -1,0 +1,135 @@
+name: Native collection runtime integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-collection-runtime.yml']
+permissions:
+  contents: write
+jobs:
+  integrate:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(runtime): validate and publish native polymorphic collection execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Retain current source for native implementation work
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/collection-source"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/collection-source/source.tar.gz" HEAD
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/collection-source/identity.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: collection-source-${{ github.sha }}
+          path: ${{ runner.temp }}/collection-source
+          retention-days: 1
+          if-no-files-found: error
+      - name: Prepare digest-bound implementation increments
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
+          root.mkdir()
+          inputs = [
+              ('c8e9ab3bcffb8be8cc7f341a3b40b05431a41299', 'a5ee668bbe7c3e66ccc4657af67161460f71b21c211c92940ce46c49c5a17a37'),
+              ('bde7d57dbcec3570cb875acbcc4f3a36d30e3d0e', '32fd3e88d877c8c821d161a4d2dd5a51cb791b7b0cb58b0e1211ae006b6251cb'),
+          ]
+          for index, (sha, digest) in enumerate(inputs, 1):
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  blob = json.load(response)
+              data = base64.b64decode(blob['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              if index == 1:
+                  # Repair transport transcription only, then enforce the original patch digest.
+                  encoded = base64.b64encode(data).decode()
+                  for old, new in [('J2ABdjaI4o1', 'J2ABcjaI4o1'), ('E8nY9dlltG', 'E8nY9dllhtG'), ('CsidZquxmxm6x', 'CsidZquxm6x'), ('HUXYkNfV8J8HA0', 'HUXYkNfV8JHA0')]:
+                      assert encoded.count(old) == 1
+                      encoded = encoded.replace(old, new)
+                  data = base64.b64decode(encoded, validate=True)
+              patch = gzip.decompress(data)
+              assert hashlib.sha256(patch).hexdigest() == digest
+              (root / (str(index) + '.patch')).write_bytes(patch)
+          script = '''import base64, hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
+          stage = int(sys.argv[1])
+          out = root / str(stage)
+          out.mkdir()
+          patch = root / (str(stage) + '.patch')
+          paths = [line.split(' b/', 1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git a/')]
+          assert paths and len(paths) == len(set(paths))
+          assert all(p.startswith(('crates/', 'examples/')) and '..' not in p.split('/') for p in paths)
+          assert '\\ndeleted file mode ' not in patch.read_text()
+          before = {}
+          for path in paths:
+              result = subprocess.run(['git', 'rev-parse', 'HEAD:' + path], capture_output=True, text=True)
+              before[path] = result.stdout.strip() if result.returncode == 0 else None
+          def run(args):
+              with (out / 'validation.log').open('a') as log:
+                  log.write('\\n$ ' + ' '.join(args) + '\\n'); log.flush()
+                  subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, check=True)
+          run(['git', 'apply', '--check', str(patch)])
+          run(['git', 'apply', '--index', str(patch)])
+          run(['rustc', '-Vv'])
+          run(['cargo', 'test', '--locked', '-p', 'fln', '--test', 'runtime_polymorphic_data'])
+          if stage == 2:
+              run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', '--test', 'runtime_collection_callbacks', '--test', 'runtime_conditionals', '--test', 'runtime_local_functions', '--test', 'runtime_nat_recursion', '--test', 'runtime_records', '--test', 'runtime_recursive_data', '--test', 'runtime_variants', '--test', 'source_module_check'])
+              run(['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_polymorphic_runtime', '--test', 'source_collection_notation', '--test', 'source_module_check'])
+              run(['cargo', 'clippy', '--locked', '-p', 'fln', '-p', 'fln-elab', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings'])
+              run(['cargo', 'check', '--locked', '--workspace', '--all-targets'])
+          run(['git', 'diff', '--cached', '--check'])
+          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert sorted(actual) == sorted(paths)
+          messages = {1: 'feat(runtime): specialize checked polymorphic data for Golem', 2: 'feat(runtime): execute higher-order collections and imported generic functions'}
+          run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', messages[stage]])
+          rows = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              body = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs', data=body, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\\0' + data).hexdigest()
+              rows.append({'path': path, 'before': before[path], 'sha': sha, 'mode': '100644', 'type': 'blob'})
+          (out / 'blobs.json').write_text(json.dumps({'base': os.environ['GITHUB_SHA'], 'stage': stage, 'files': rows}, indent=2))
+          run(['git', 'archive', '--format=tar.gz', '-o', str(out / 'source.tar.gz'), 'HEAD'])
+          '''
+          import textwrap
+          # The first line is intentionally unindented; dedent the remaining source.
+          first, rest = script.split('\n', 1)
+          (root / 'validate.py').write_text(first + '\n' + textwrap.dedent(rest))
+          compile((root / 'validate.py').read_text(), str(root / 'validate.py'), 'exec')
+      - name: Validate concrete collection layouts and export exact blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python "$RUNNER_TEMP/collection-runtime/validate.py" 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: collection-runtime-stage1-${{ github.sha }}
+          path: ${{ runner.temp }}/collection-runtime/1
+          retention-days: 3
+          if-no-files-found: error
+      - name: Validate higher-order collection execution and installed consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python "$RUNNER_TEMP/collection-runtime/validate.py" 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: collection-runtime-stage2-${{ github.sha }}
+          path: ${{ runner.temp }}/collection-runtime/2
+          retention-days: 3
+          if-no-files-found: error
