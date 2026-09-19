@@ -7,7 +7,7 @@ use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::Outcome;
 use fln_elab::constraint::ConstraintKind;
-use fln_elab::constraint::unify::{UnificationBudget, UnificationError};
+use fln_elab::constraint::unify::{UnificationBudget, UnificationDeferred, UnificationError};
 use fln_elab::mvar::MetavarKind;
 use fln_elab::seed::bootstrap_nat_environment;
 use fln_elab::txn::ElabTxn;
@@ -312,6 +312,7 @@ fn a_residual_assignment_remains_a_lambda_with_no_escaped_binders() {
     assert!(assignment.has_expr_mvar());
 }
 
+
 #[test]
 fn late_native_step_and_node_stops_roll_back_the_created_residual() {
     let (base, _, left, right) = equation();
@@ -334,6 +335,7 @@ fn late_native_step_and_node_stops_roll_back_the_created_residual() {
     txn.unify(&left, &right, budget()).unwrap();
 }
 
+
 #[test]
 fn a_retained_dependent_binder_keeps_its_domain_and_can_be_solved_later() {
     let mut txn = transaction();
@@ -351,4 +353,223 @@ fn a_retained_dependent_binder_keeps_its_domain_and_can_be_solved_later() {
     let value = lam(Expr::sort(Level::one()), lam(bvar(0), bvar(0)));
     txn.unify(&Expr::mvar(residual), &value, budget()).unwrap();
     txn.unify(&app(Expr::mvar(f), &[nat(), number(5), number(99)]), &number(5), budget()).unwrap();
+}
+
+fn curried(arity: usize) -> Expr {
+    (0..arity).fold(nat(), |body, _| pi(nat(), body))
+}
+fn distinct_equation() -> (ElabTxn, MVarId, MVarId, Expr, Expr) {
+    let mut txn = transaction();
+    let f = natural(&mut txn, "f", curried(2));
+    let g = natural(&mut txn, "g", curried(2));
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let z = local(&mut txn, "z", nat());
+    let left = app(Expr::mvar(f.clone()), &[x, y.clone()]);
+    let right = app(Expr::mvar(g.clone()), &[y, z]);
+    (txn, f, g, left, right)
+}
+
+#[test]
+fn distinct_heads_share_one_typed_residual_and_check_both_assignments() {
+    for reverse in [false, true] {
+        let (mut txn, f, g, left, right) = distinct_equation();
+        let env = txn.env.clone();
+        let (left, right) = if reverse { (right, left) } else { (left, right) };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.expression_assignments.len(), 2);
+        assert_eq!(report.residual_metavariables.len(), 1);
+        let residual = report.residual_metavariables[0].clone();
+        assert!(!txn.mvars.is_assigned(&residual));
+        assert_eq!(txn.mvars.len(), 3);
+        txn.unify(&Expr::mvar(residual), &lam(nat(), bvar(0)), budget()).unwrap();
+        txn.unify(&app(Expr::mvar(f), &[number(4), number(5)]), &number(5), budget()).unwrap();
+        txn.unify(&app(Expr::mvar(g), &[number(5), number(6)]), &number(5), budget()).unwrap();
+        assert_eq!(txn.env, env);
+    }
+}
+
+#[test]
+fn distinct_arities_and_permuted_intersections_rebind_each_function_separately() {
+    for reverse in [false, true] {
+        let mut txn = transaction();
+        let f = natural(&mut txn, "f", curried(4));
+        let g = natural(&mut txn, "g", curried(3));
+        let x = local(&mut txn, "x", nat());
+        let y = local(&mut txn, "y", nat());
+        let z = local(&mut txn, "z", nat());
+        let w = local(&mut txn, "w", nat());
+        let v = local(&mut txn, "v", nat());
+        let left = app(Expr::mvar(f.clone()), &[x.clone(), y, z.clone(), w]);
+        let right = app(Expr::mvar(g.clone()), &[z, x, v]);
+        let (left, right) = if reverse { (right, left) } else { (left, right) };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.residual_metavariables.len(), 1);
+        let residual = report.residual_metavariables[0].clone();
+        txn.unify(&Expr::mvar(residual), &lam(nat(), lam(nat(), bvar(1))), budget()).unwrap();
+        let expected = if reverse { number(12) } else { number(10) };
+        txn.unify(&app(Expr::mvar(f), &[number(10), number(11), number(12), number(13)]), &expected, budget()).unwrap();
+        txn.unify(&app(Expr::mvar(g), &[number(12), number(10), number(14)]), &expected, budget()).unwrap();
+    }
+}
+
+#[test]
+fn disjoint_arguments_leave_a_shared_unsolved_value_not_a_guessed_constant() {
+    let mut txn = transaction();
+    let f = natural(&mut txn, "f", curried(1));
+    let g = natural(&mut txn, "g", curried(1));
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let report = txn.unify(
+        &Expr::app(Expr::mvar(f.clone()), x),
+        &Expr::app(Expr::mvar(g.clone()), y), budget(),
+    ).unwrap();
+    let residual = report.residual_metavariables[0].clone();
+    assert_eq!(txn.mvars.get_decl(&residual).unwrap().type_, nat());
+    assert!(!txn.mvars.is_assigned(&residual));
+    txn.unify(&Expr::mvar(residual), &number(29), budget()).unwrap();
+    txn.unify(&Expr::app(Expr::mvar(f), number(7)), &number(29), budget()).unwrap();
+    txn.unify(&Expr::app(Expr::mvar(g), number(9)), &number(29), budget()).unwrap();
+}
+
+#[test]
+fn subsequent_equations_can_prune_the_shared_residual_again() {
+    let mut txn = transaction();
+    let f = natural(&mut txn, "f", curried(2));
+    let g = natural(&mut txn, "g", curried(2));
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let z = local(&mut txn, "z", nat());
+    let report = txn.unify_many_with(&[
+        (app(Expr::mvar(f.clone()), &[x.clone(), y.clone()]), app(Expr::mvar(g.clone()), &[y.clone(), z.clone()])),
+        (app(Expr::mvar(f.clone()), &[x.clone(), z]), app(Expr::mvar(g.clone()), &[y, x])),
+    ], budget(), &|| false).unwrap();
+    assert_eq!(report.expression_assignments.len(), 3);
+    assert_eq!(report.kernel_checks, 3);
+    assert_eq!(report.residual_metavariables.len(), 1);
+    let residual = report.residual_metavariables[0].clone();
+    assert_eq!(txn.mvars.get_decl(&residual).unwrap().type_, nat());
+    txn.unify(&Expr::mvar(residual), &number(13), budget()).unwrap();
+    txn.unify(&app(Expr::mvar(f), &[number(1), number(2)]), &number(13), budget()).unwrap();
+    txn.unify(&app(Expr::mvar(g), &[number(3), number(4)]), &number(13), budget()).unwrap();
+}
+
+#[test]
+fn different_captured_contexts_are_not_silently_merged() {
+    let mut txn = transaction();
+    let f = natural(&mut txn, "f", curried(1));
+    local(&mut txn, "capture", nat());
+    let g = natural(&mut txn, "g", curried(1));
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let before = txn.clone();
+    assert!(matches!(txn.unify(
+        &Expr::app(Expr::mvar(f), x), &Expr::app(Expr::mvar(g), y), budget(),
+    ), Err(UnificationError::Deferred(_))));
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn the_assignment_limit_covers_both_sides_before_creating_the_shared_hole() {
+    let (mut txn, _, _, left, right) = distinct_equation();
+    let before = txn.clone();
+    let mut limits = budget();
+    limits.max_assignments = 1;
+    assert!(matches!(txn.unify(&left, &right, limits), Err(UnificationError::AssignmentLimit { limit: 1 })));
+    unchanged(&txn, &before);
+    txn.unify(&left, &right, budget()).unwrap();
+}
+
+#[test]
+fn a_kernel_veto_on_the_second_assignment_cannot_publish_the_first_one() {
+    let mut txn = transaction();
+    let f = natural(&mut txn, "f", curried(1));
+    let g = natural(&mut txn, "g", pi(Expr::const_(name("UnknownDomain"), Vec::new()), nat()));
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let before = txn.clone();
+    let error = txn.unify(
+        &Expr::app(Expr::mvar(f), x), &Expr::app(Expr::mvar(g.clone()), y), budget(),
+    ).unwrap_err();
+    assert!(matches!(error,
+        UnificationError::Deferred(UnificationDeferred::UnresolvedAssignmentType(id)) if id == g
+    ));
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn an_opaque_second_head_cannot_become_a_shared_natural_hole() {
+    let mut txn = transaction();
+    let f = natural(&mut txn, "f", curried(1));
+    let g = hole(&mut txn, "g", curried(1), MetavarKind::SyntheticOpaque, 0);
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let before = txn.clone();
+    assert!(matches!(txn.unify(
+        &Expr::app(Expr::mvar(f), x), &Expr::app(Expr::mvar(g), y), budget(),
+    ), Err(UnificationError::Deferred(_))));
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn identical_inputs_generate_identical_residual_identities_and_assignments() {
+    let mut snapshots = Vec::new();
+    for _ in 0..8 {
+        let (mut txn, _, _, left, right) = distinct_equation();
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        snapshots.push((txn.mvars, report.expression_assignments, report.residual_metavariables));
+    }
+    assert!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn shared_residual_depth_preserves_the_stricter_parent_scope() {
+    let mut txn = transaction();
+    let f = hole(&mut txn, "f", curried(2), MetavarKind::Natural, 1);
+    let g = natural(&mut txn, "g", curried(2));
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let z = local(&mut txn, "z", nat());
+    let mut limits = budget();
+    limits.max_metavar_depth = 1;
+    let report = txn.unify(
+        &app(Expr::mvar(f), &[x, y.clone()]),
+        &app(Expr::mvar(g), &[y, z]), limits,
+    ).unwrap();
+    let residual = report.residual_metavariables[0].clone();
+    assert_eq!(txn.mvars.get_decl(&residual).unwrap().depth, 1);
+    let before = txn.clone();
+    assert!(matches!(txn.unify(&Expr::mvar(residual.clone()), &lam(nat(), bvar(0)), budget()),
+        Err(UnificationError::Deferred(UnificationDeferred::MetavariableDepth(_)))
+    ));
+    unchanged(&txn, &before);
+    txn.unify(&Expr::mvar(residual), &lam(nat(), bvar(0)), limits).unwrap();
+}
+
+#[test]
+fn distinct_heads_retain_a_dependent_result_parameter_in_the_shared_telescope() {
+    let mut txn = transaction();
+    let type_ = pi(Expr::sort(Level::one()), pi(bvar(0), pi(nat(), bvar(2))));
+    let f = natural(&mut txn, "f", type_.clone());
+    let g = natural(&mut txn, "g", type_);
+    let a = local(&mut txn, "A", Expr::sort(Level::one()));
+    let x = local(&mut txn, "x", a.clone());
+    let y = local(&mut txn, "y", a.clone());
+    let n = local(&mut txn, "n", nat());
+    let m = local(&mut txn, "m", nat());
+    let report = txn.unify(
+        &app(Expr::mvar(f), &[a.clone(), x, n]),
+        &app(Expr::mvar(g), &[a, y, m]), budget(),
+    ).unwrap();
+    assert_eq!(report.kernel_checks, 2);
+    assert_eq!(report.residual_metavariables.len(), 1);
+    let residual = &report.residual_metavariables[0];
+    let ExprNode::ForallE { binder_type, body, .. } = txn.mvars.get_decl(residual).unwrap().type_.node() else {
+        panic!("expected a shared dependent telescope");
+    };
+    assert_eq!(binder_type, &Expr::sort(Level::one()));
+    assert_eq!(body, &bvar(0));
+    assert!(!txn.mvars.is_assigned(residual));
 }

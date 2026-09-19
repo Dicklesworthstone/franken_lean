@@ -9,6 +9,10 @@
 //! metavariable context. Dropping an argument that a retained domain or result
 //! depends on is refused. Captured-argument, nonpattern and opaque cases keep
 //! their existing postponement behavior; this is not full Lean unification.
+//!
+//! Distinct heads share the intersection of their local arguments, even when
+//! the argument orders or arities differ. Their captured contexts must agree;
+//! both reconstructed assignments cross K1, and the shared hole stays explicit.
 use super::*;
 use crate::constraint::ConstraintKind;
 use crate::mvar::MetavarDecl;
@@ -37,20 +41,35 @@ impl Engine<'_> {
         let Some(right) = self.pruning_pattern(right, locals)? else {
             return Ok(false);
         };
-        if left.declaration.id != right.declaration.id
-            || left.declaration.lctx != right.declaration.lctx
-            || left.binders.len() != right.binders.len()
+        let same_head = left.declaration.id == right.declaration.id;
+        if left.declaration.lctx != right.declaration.lctx
+            || (same_head && left.binders.len() != right.binders.len())
         {
             return Ok(false);
         }
         let mut retained = Vec::new();
-        for (index, (a, b)) in left.binders.iter().zip(&right.binders).enumerate() {
-            self.meter.node()?;
-            if a.0 == b.0 {
-                retained.push(index);
+        if same_head {
+            for (index, (a, b)) in left.binders.iter().zip(&right.binders).enumerate() {
+                self.meter.node()?;
+                if a.0 == b.0 {
+                    retained.push(index);
+                }
+            }
+        } else {
+            let mut right_arguments = HashSet::new();
+            for (id, _, _) in &right.binders {
+                self.meter.node()?;
+                right_arguments.insert(id.clone());
+            }
+            // Hash iteration never determines the residual telescope's order.
+            for (index, (id, _, _)) in left.binders.iter().enumerate() {
+                self.meter.node()?;
+                if right_arguments.contains(id) {
+                    retained.push(index);
+                }
             }
         }
-        if retained.len() == left.binders.len()
+        if (same_head && retained.len() == left.binders.len())
             || !same_terms(&left.result_type, &right.result_type, &mut self.meter)?
         {
             return Ok(false);
@@ -72,7 +91,12 @@ impl Engine<'_> {
         {
             return Ok(false);
         }
-        self.assignment_slot()?;
+        let assignments = if same_head { 1 } else { 2 };
+        if self.generation().saturating_add(assignments) > self.budget.max_assignments {
+            return Err(UnificationError::AssignmentLimit {
+                limit: self.budget.max_assignments,
+            });
+        }
         let residual = self.fresh_pruning_metavariable()?;
         let mut body = Expr::mvar(residual.clone());
         for &index in &retained {
@@ -81,7 +105,7 @@ impl Engine<'_> {
         }
         let value = self.close_pruning_lambda(body.clone(), &left.binders)?;
         let other = self.close_pruning_lambda(body, &right.binders)?;
-        if !same_terms(&value, &other, &mut self.meter)? {
+        if same_head && !same_terms(&value, &other, &mut self.meter)? {
             return Ok(false);
         }
         self.meter.node()?;
@@ -91,7 +115,7 @@ impl Engine<'_> {
             residual_type,
             left.declaration.lctx,
             MetavarKind::Natural,
-            left.declaration.depth,
+            left.declaration.depth.max(right.declaration.depth),
             Some(left.declaration.id.0.clone()),
         );
         let id = left.declaration.id;
@@ -101,6 +125,15 @@ impl Engine<'_> {
             .map_err(UnificationError::Metavariable)?;
         self.awakened.extend(awakened);
         self.assigned.push(id);
+        if !same_head {
+            let id = right.declaration.id;
+            let awakened = self
+                .work
+                .assign_mvar(id.clone(), other, AssignmentJustification::DirectDefEq)
+                .map_err(UnificationError::Metavariable)?;
+            self.awakened.extend(awakened);
+            self.assigned.push(id);
+        }
         Ok(true)
     }
 
