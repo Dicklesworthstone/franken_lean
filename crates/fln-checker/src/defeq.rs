@@ -2870,6 +2870,16 @@ fn run_slow(
                     &mut control,
                     cancelled,
                 )?;
+                // When both weak heads reduce to identical standalone expressions
+                // (e.g. beta-redexes in generated noConfusion principles reducing
+                // to identical noConfusionType applications), reflexivity decides
+                // the pair immediately without redundant delta unfolding.
+                if left_result.reductions != 0
+                    && right_result.reductions != 0
+                    && left_result.term == right_result.term
+                {
+                    continue;
+                }
                 // Auxiliary K-gate reductions count as work, but a failed gate
                 // can leave the compared term unchanged. Do not resubmit that
                 // same pair forever merely because the gate spent reductions.
