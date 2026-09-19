@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 use fln_checker::defeq::{DefEqBudget, DefEqOutcome, QuickDefEqBudget, def_eq, def_eq_with};
 use fln_checker::environment::{
-    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
-    DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
+    ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+    EnvironmentOutcome, InductiveDeclaration, ReducibilityHint,
 };
 use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfContext};
 use fln_checker::wire::{
@@ -166,4 +167,123 @@ fn projection_delta_budget_stop_and_cancellation_do_not_become_conversion() {
         DefEqOutcome::Inconclusive(_)
     ));
     slow_equal(&projected, &rhs, &context);
+}
+
+fn structure_context(
+    struct_name: &str,
+    ctor_name: &str,
+    num_params: u32,
+    num_fields: u32,
+) -> WhnfContext {
+    let struct_wire = checker_name(struct_name);
+    let ctor_wire = checker_name(ctor_name);
+    let induct_meta = InductiveDeclaration::new(
+        num_params,
+        0,
+        Vec::new(),
+        vec![ctor_wire.clone()],
+        0,
+        false,
+        false,
+    );
+    let ctor_meta = ConstructorDeclaration::new(struct_wire.clone(), 0, num_params, num_fields);
+    let entries = vec![
+        ConstantEntry::new(
+            struct_wire,
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::param(name("u")))),
+                ConstantSafety::Safe,
+                induct_meta,
+            ),
+        ),
+        ConstantEntry::new(
+            ctor_wire,
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&Expr::sort(Level::param(name("u")))),
+                ConstantSafety::Safe,
+                ctor_meta,
+            ),
+        ),
+    ];
+    let EnvironmentOutcome::Complete { environment, .. } =
+        ConstantEnvironment::build(entries, EnvironmentBudget::unlimited())
+    else {
+        panic!("environment build failed");
+    };
+    WhnfContext::new(Vec::new(), Vec::new(), environment)
+}
+
+#[test]
+fn structure_eta_single_field_converts_symmetrically() {
+    let context = structure_context("PLift", "PLift.up", 1, 1);
+    let alpha = constant("A");
+    let b = Expr::bvar(0).unwrap();
+    let proj = Expr::proj(name("PLift"), 0, b.clone());
+    let eta_term = Expr::app(Expr::app(constant("PLift.up"), alpha), proj);
+
+    let lhs = decoded(&eta_term);
+    let rhs = decoded(&b);
+    assert!(matches!(
+        def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(matches!(
+        def_eq(&rhs, &lhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn structure_eta_multi_field_converts_symmetrically() {
+    let context = structure_context("Pair", "Pair.mk", 2, 2);
+    let alpha = constant("A");
+    let beta = constant("B");
+    let p = Expr::bvar(0).unwrap();
+    let proj0 = Expr::proj(name("Pair"), 0, p.clone());
+    let proj1 = Expr::proj(name("Pair"), 1, p.clone());
+    let eta_term = Expr::app(
+        Expr::app(
+            Expr::app(Expr::app(constant("Pair.mk"), alpha), beta),
+            proj0,
+        ),
+        proj1,
+    );
+
+    let lhs = decoded(&eta_term);
+    let rhs = decoded(&p);
+    assert!(matches!(
+        def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(matches!(
+        def_eq(&rhs, &lhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn structure_eta_rejects_swapped_fields_or_wrong_structure() {
+    let context = structure_context("Pair", "Pair.mk", 2, 2);
+    let alpha = constant("A");
+    let beta = constant("B");
+    let p = Expr::bvar(0).unwrap();
+    // Swapped fields: Proj(Pair, 1, p) in field 0, Proj(Pair, 0, p) in field 1
+    let proj0 = Expr::proj(name("Pair"), 0, p.clone());
+    let proj1 = Expr::proj(name("Pair"), 1, p.clone());
+    let swapped = Expr::app(
+        Expr::app(
+            Expr::app(Expr::app(constant("Pair.mk"), alpha), beta),
+            proj1,
+        ),
+        proj0,
+    );
+
+    let lhs = decoded(&swapped);
+    let rhs = decoded(&p);
+    assert!(!matches!(
+        def_eq(&lhs, &rhs, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
 }

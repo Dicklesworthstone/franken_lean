@@ -20,6 +20,8 @@ mod spine;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::term::{TermBudget, TermOutcome, TermStop, copy_compact_subterm_with};
+
 use crate::nat_reduce::{
     NatReductionBudget, NatReductionFault, NatReductionOutcome, NatReductionProgress,
     NatReductionQuery, NatReductionRefusal, NatReductionScope, NatReductionStop,
@@ -2517,6 +2519,229 @@ fn exact_function_eta(
     }
 }
 
+fn is_non_rec_structure(
+    constants: &crate::environment::ConstantEnvironment,
+    name: &WireName,
+) -> bool {
+    let Some(decl) = constants.find(name) else {
+        return false;
+    };
+    let Some(induct) = decl.inductive_metadata() else {
+        return false;
+    };
+    induct.constructors().len() == 1 && induct.num_indices() == 0 && !induct.is_recursive()
+}
+
+fn collect_constructor_spine(
+    term: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(DefEqTerm, Vec<DefEqTerm>), SlowHalt> {
+    let mut args = Vec::new();
+    let mut cur = eta_visible(term, sources, control, cancelled)?;
+    loop {
+        control.comparison(cancelled)?;
+        let arena = sources.source(cur)?;
+        let node = arena
+            .node(cur.root)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: cur.location(),
+            }))?;
+        match node {
+            ExprNode::Apply { function, argument } => {
+                args.push(child(cur, *argument)?);
+                cur = eta_visible(child(cur, *function)?, sources, control, cancelled)?;
+            }
+            ExprNode::Metadata { expression, .. } => {
+                cur = child(cur, *expression)?;
+            }
+            _ => break,
+        }
+    }
+    args.reverse();
+    Ok((cur, args))
+}
+
+struct StructureEtaMatch {
+    s_on_left: bool,
+    fields: Vec<(DefEqTerm, WireExpr)>,
+}
+
+struct ConstructorCandidate {
+    induct_name: WireName,
+    num_params: usize,
+    num_fields: usize,
+}
+
+fn candidate_constructor(
+    term: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+) -> Result<Option<ConstructorCandidate>, SlowHalt> {
+    let mut cur = term;
+    loop {
+        let arena = sources.source(cur)?;
+        let node = arena
+            .node(cur.root)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: cur.location(),
+            }))?;
+        match node {
+            ExprNode::Apply { function, .. } => {
+                cur = child(cur, *function)?;
+            }
+            ExprNode::Metadata { expression, .. } => {
+                cur = child(cur, *expression)?;
+            }
+            ExprNode::Constant {
+                name: ctor_name, ..
+            } => {
+                let Some(decl) = context.constants().find(ctor_name) else {
+                    return Ok(None);
+                };
+                let Some(ctor) = decl.constructor_metadata() else {
+                    return Ok(None);
+                };
+                let induct_name = ctor.inductive().clone();
+                let num_params = match usize::try_from(ctor.num_parameters()) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                let num_fields = match usize::try_from(ctor.num_fields()) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                if num_fields == 0 {
+                    return Ok(None);
+                }
+                if !is_non_rec_structure(context.constants(), &induct_name) {
+                    return Ok(None);
+                }
+                return Ok(Some(ConstructorCandidate {
+                    induct_name,
+                    num_params,
+                    num_fields,
+                }));
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn try_structure_eta_candidate(
+    s: DefEqTerm,
+    t: DefEqTerm,
+    s_on_left: bool,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<StructureEtaMatch>, SlowHalt> {
+    let Some(candidate) = candidate_constructor(s, sources, context)? else {
+        return Ok(None);
+    };
+    let (_head, spine_args) = collect_constructor_spine(s, sources, control, cancelled)?;
+    let expected_args = match candidate.num_params.checked_add(candidate.num_fields) {
+        Some(sum) => sum,
+        None => return Ok(None),
+    };
+    if spine_args.len() != expected_args {
+        return Ok(None);
+    }
+
+    let t_visible = eta_visible(t, sources, control, cancelled)?;
+    let t_arena = sources.source(t_visible)?;
+    let copied_t = match copy_compact_subterm_with(
+        t_arena,
+        t_visible.root,
+        TermBudget::unlimited(),
+        cancelled,
+    ) {
+        TermOutcome::Complete(term) => term,
+        TermOutcome::Inconclusive(stop) => {
+            return Err(SlowHalt::Stop(Box::new(match stop {
+                TermStop::Cancelled { polls, .. } => DefEqStop::Cancelled {
+                    polls: control.polls.saturating_add(polls),
+                    progress: control.progress,
+                },
+                TermStop::Resource {
+                    allowed, observed, ..
+                } => DefEqStop::Resource {
+                    limit: DefEqLimit::MaterializedArenaNodes,
+                    allowed,
+                    observed,
+                    progress: control.progress,
+                },
+            })));
+        }
+        TermOutcome::InternalFault(_) => {
+            return Err(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: t.location(),
+            }));
+        }
+    };
+
+    let mut fields = Vec::with_capacity(candidate.num_fields);
+    for i in 0..candidate.num_fields {
+        let s_field = spine_args[candidate.num_params + i];
+        let mut nodes = copied_t.nodes().to_vec();
+        let proj_root = ExprId::from_index(nodes.len()).ok_or(SlowHalt::Fault(
+            DefEqFault::MissingExpression {
+                location: t.location(),
+            },
+        ))?;
+        nodes.push(ExprNode::Projection {
+            structure_name: candidate.induct_name.clone(),
+            index: i as u64,
+            expression: copied_t.root(),
+        });
+        let proj_expr = WireExpr::from_parts(nodes, copied_t.levels().to_vec(), proj_root);
+        let arena_nodes = proj_expr.nodes().len() as u64;
+        let owned_units = proj_expr
+            .nodes()
+            .iter()
+            .map(expression_owned_units)
+            .chain(proj_expr.levels().iter().map(level_owned_units))
+            .sum::<u64>();
+        let admission =
+            control.prepare_offset_materialization(arena_nodes, owned_units, cancelled)?;
+        control.commit_offset_materialization(admission);
+        fields.push((s_field, proj_expr));
+    }
+    Ok(Some(StructureEtaMatch { s_on_left, fields }))
+}
+
+fn exact_structure_eta(
+    left_reference: DefEqTerm,
+    right_reference: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<StructureEtaMatch>, SlowHalt> {
+    if let Some(matched) = try_structure_eta_candidate(
+        left_reference,
+        right_reference,
+        true,
+        sources,
+        context,
+        control,
+        cancelled,
+    )? {
+        return Ok(Some(matched));
+    }
+    try_structure_eta_candidate(
+        right_reference,
+        left_reference,
+        false,
+        sources,
+        context,
+        control,
+        cancelled,
+    )
+}
+
 fn retain_generated(generated: &mut Vec<WireExpr>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
     let root = term.root();
     let index = generated.len();
@@ -2824,6 +3049,36 @@ fn run_slow(
                             &mut control,
                             cancelled,
                         )? {
+                            continue;
+                        }
+                        if let Some(matched) = exact_structure_eta(
+                            left_reference,
+                            right_reference,
+                            TermSources::new(left, right, &generated),
+                            context,
+                            &mut control,
+                            cancelled,
+                        )? {
+                            let projected_side = if matched.s_on_left {
+                                DefEqSide::Right
+                            } else {
+                                DefEqSide::Left
+                            };
+                            for (s_field, proj_expr) in matched.fields.into_iter().rev() {
+                                let proj_term =
+                                    retain_generated(&mut generated, projected_side, proj_expr);
+                                let (next_left, next_right) = if matched.s_on_left {
+                                    (s_field, proj_term)
+                                } else {
+                                    (proj_term, s_field)
+                                };
+                                pending.push((
+                                    next_left,
+                                    next_right,
+                                    offset_context,
+                                    string_context,
+                                ));
+                            }
                             continue;
                         }
                         trace_unresolved(
