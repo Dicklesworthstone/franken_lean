@@ -1,0 +1,65 @@
+name: Native unifier scope tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fln-unifier-scope.yml'
+      - 'crates/fln-elab/src/constraint/**'
+      - 'crates/fln-elab/tests/native_unification*.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fln-unifier-scope-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  unifier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Retain exact reproduction source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/unifier-source
+          git archive --format=tar.gz HEAD > target/unifier-source/source.tar.gz
+          git rev-parse HEAD > target/unifier-source/commit.txt
+          sha256sum target/unifier-source/source.tar.gz > target/unifier-source/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unifier-source-${{ github.sha }}
+          path: target/unifier-source
+          retention-days: 2
+          if-no-files-found: error
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component clippy
+          rustc -Vv
+      - name: Exercise native elaborator
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p target/unifier-checks
+          cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/unifier-checks/tests.log
+          tests=${PIPESTATUS[0]}
+          cargo clippy --locked -p fln-elab --all-targets -- -D warnings 2>&1 | tee target/unifier-checks/clippy.log
+          lint=${PIPESTATUS[0]}
+          printf 'tests=%s clippy=%s\n' "$tests" "$lint" | tee target/unifier-checks/result.txt
+          test "$tests" -eq 0 && test "$lint" -eq 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: unifier-checks-${{ github.sha }}
+          path: target/unifier-checks
+          retention-days: 7
+          if-no-files-found: warn
