@@ -289,3 +289,61 @@ fn cancellation_and_resource_stops_never_publish_a_prefix_and_allow_recovery() {
     }
     assert!(verdict(&rs).is_admitted());
 }
+
+#[test]
+fn interleaved_recursive_fields_have_distinct_family_targets_and_induction_hypotheses() {
+    for (generic, indexed, higher, families) in [
+        (false, false, false, 3),
+        (true, false, false, 3),
+        (true, true, false, 2),
+        (true, false, true, 3),
+        (true, true, true, 2),
+    ] {
+        accepts(&fixture(
+            generic,
+            indexed,
+            higher,
+            families,
+            Mutation::MultipleChildren,
+        ));
+    }
+}
+
+#[test]
+fn cyclic_family_signatures_cannot_use_private_staging_to_justify_themselves() {
+    use fln_core::expr::BinderInfo;
+    use fln_core::level::Level;
+    let mut f = fixture(false, false, false, 2, Mutation::None);
+    f.parameters = 1;
+    // Both declared types have a syntactically valid final Sort. Validation
+    // must still reject their shared parameter type, which names a sibling
+    // unavailable in the predecessor environment.
+    for ty in &mut f.types {
+        ty.ty = Expr::forall_e(
+            fixtures::name("x"),
+            Expr::const_(fixtures::name("Mutual1"), vec![]),
+            Expr::sort(Level::one()),
+            BinderInfo::Default,
+        );
+    }
+    assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+}
+
+#[test]
+fn inconsistent_sorts_and_universe_telescopes_cannot_gain_mutual_admission() {
+    use fln_core::level::Level;
+    let mut f = fixture(false, false, false, 2, Mutation::None);
+    f.types[1].ty = Expr::sort(Level::succ(Level::one()).unwrap());
+    assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+    f.types[1].ty = Expr::sort(Level::zero());
+    assert!(matches!(
+        verdict(&rows(&f)),
+        InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse)
+    ));
+    let mut f = fixture(true, false, false, 2, Mutation::None);
+    f.levels.push(fixtures::name("u"));
+    assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+    let mut f = fixture(true, false, false, 2, Mutation::None);
+    f.rec_levels[0] = fixtures::name("u");
+    assert!(matches!(verdict(&rows(&f)), InductiveVerdict::Rejected(_)));
+}

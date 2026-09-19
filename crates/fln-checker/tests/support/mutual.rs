@@ -109,6 +109,7 @@ pub struct Fixture {
 pub enum Mutation {
     #[default]
     None,
+    MultipleChildren,
     WrongCallFamily,
     SwapMotives,
     SwapMinors,
@@ -255,17 +256,41 @@ pub fn fixture(
         if indexed && family == 1 {
             result_indices.push(witness.e());
         }
+        let mut children = vec![Child {
+            field,
+            arguments: arguments.clone(),
+            family: target,
+            indices: child_indices,
+        }];
+        if matches!(mutation, Mutation::MultipleChildren) {
+            // Interleave a nonrecursive field before a second, self-recursive
+            // child. Both IH offsets and the destination family's index spine
+            // differ from the first child's; neither is a shared-position case.
+            if generic {
+                fields.push(B::new(&format!("interleaved{family}"), a.e()));
+            }
+            let field = B::new(
+                &format!("sibling{family}"),
+                close(
+                    &arguments,
+                    family_type(family, result_indices.clone()),
+                    false,
+                ),
+            );
+            fields.push(field.clone());
+            children.push(Child {
+                field,
+                arguments,
+                family,
+                indices: result_indices.clone(),
+            });
+        }
         cs.push(C {
             name: name(&format!("Mutual{family}.node")),
             family,
             fields,
             indices: result_indices,
-            children: vec![Child {
-                field,
-                arguments,
-                family: target,
-                indices: child_indices,
-            }],
+            children,
         });
     }
     let mut minors = Vec::new();
