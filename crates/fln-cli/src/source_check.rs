@@ -1,6 +1,7 @@
 //! User-facing source proof checking. No compiler or VM is entered.
 use super::*;
 mod imports;
+pub(super) mod lsp;
 
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     // Unlike the legacy path parser, this new surface refuses conflicting repeats.

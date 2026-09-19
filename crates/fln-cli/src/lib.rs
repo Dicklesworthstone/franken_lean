@@ -10829,66 +10829,24 @@ fn run_sources(
     )
 }
 
-fn serve_lsp() -> MultiplexerOutput {
-    use std::io::{BufReader, BufWriter};
+/// Run the shared native proof-checking LSP session on process standard streams.
+pub fn serve_lsp() -> MultiplexerOutput {
+    use std::io::{BufReader, BufWriter, Write};
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
 
-    let lsp_request = ProjectionRequest {
-        epoch: fln_core::diag::DiagnosticEpoch::V4_32_0,
-        mode: fln_core::mode::Mode::Sound,
-        frontend: DiagnosticFrontend::Lsp,
-        format: DiagnosticFormat::Lsp,
-        channel: DiagnosticChannel::Protocol,
-        color: DiagnosticColorPolicy::Never,
-        path: DiagnosticPathPolicy::Preserve,
-        ordering: fln_core::diag::DiagnosticOrderPolicy::SourcePositionV1,
+    let mut checker = source_check::lsp::Checker::new();
+    let mut on_did_open = move |uri: &str, text: &str, documents: &[fln_server::dispatch::OpenDocumentSource<'_>]| {
+        checker.check(uri, text, documents)
     };
 
-    let mut on_did_open = move |uri: &str, text: &str| -> Vec<String> {
-        let snapshot = lsp_source_snapshot(uri, text.as_bytes());
-        // Pass the exact unsaved document as the projection source so diagnostic
-        // columns (Lean codepoint columns) are converted to the LSP UTF-16 code
-        // units the editor expects. The compatibility `project` entry supplies no
-        // source and silently leaves non-ASCII columns wrong.
-        let sources = [fln_server::LspSource::new(uri, text)];
-        let mut messages = match fln_server::project_with_sources(lsp_request, &snapshot, &sources)
-        {
-            Ok(projection) => projection.messages,
-            Err(_refusal) => Vec::new(),
-        };
-        // The projection generates publishDiagnostics keyed by the
-        // diagnostic's file_name (which we now set to the document URI).
-        // When there are no diagnostics at all (clean execution), the
-        // projection sends $/lean/diagnosticOutcome but no
-        // publishDiagnostics — so the editor would never clear stale
-        // markers. Ensure we always send a publishDiagnostics for the
-        // opened URI; if the projection already emitted one for this
-        // file, we still send our explicit clear first (the last one
-        // wins per the LSP spec, so the projection's version takes
-        // precedence for files with real diagnostics).
-        let has_publish_for_uri = messages
-            .iter()
-            .any(|m| m.contains("publishDiagnostics") && m.contains(uri));
-        if !has_publish_for_uri {
-            messages.insert(
-                0,
-                format!(
-                    concat!(
-                        "{{\"jsonrpc\":\"2.0\",",
-                        "\"method\":\"textDocument/publishDiagnostics\",",
-                        "\"params\":{{\"uri\":{},\"version\":null,\"diagnostics\":[]}}}}"
-                    ),
-                    fln_server::json_string(uri)
-                ),
-            );
-        }
-        messages
-    };
-
-    match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open) {
+    let outcome = fln_server::dispatch::serve_with_documents(&mut reader, &mut writer, &mut on_did_open);
+    if let Err(error) = writer.flush() {
+        return MultiplexerOutput::failure(format!("fln serve-lsp: transport flush error: {error}\n"), 1);
+    }
+    match outcome {
         Ok(outcome) => {
             if outcome.clean {
                 MultiplexerOutput::success(String::new())
@@ -10905,84 +10863,6 @@ fn serve_lsp() -> MultiplexerOutput {
     }
 }
 
-/// Run source bytes through the bounded Engine and produce a diagnostic
-/// snapshot suitable for LSP projection. This is the bridge between the
-/// existing source runner and the LSP transport: `didOpen` feeds text here,
-/// and the resulting `ProjectionSnapshot` is projected by `fln-server`.
-///
-/// The `uri` is the document URI from the LSP client (e.g. `file:///path/to/file.lean`).
-/// It is used as the `file_name` in any diagnostics so that `fln-server`'s
-/// projection generates `publishDiagnostics` notifications keyed to the
-/// correct document.
-fn lsp_source_snapshot(uri: &str, source: &[u8]) -> ProjectionSnapshot {
-    let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
-    let engine = match fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel_budget))
-    {
-        Ok(fln::Outcome::Complete(engine)) => engine,
-        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
-            return ProjectionSnapshot::Inconclusive(StructuredInconclusive {
-                cause_class: "seed",
-                detail: BoundedText::new(format!("{inconclusive:?}")),
-                diagnostic: None,
-                progress: None,
-            });
-        }
-        Ok(fln::Outcome::InternalFault(fault)) => {
-            return ProjectionSnapshot::InternalFault(StructuredInternalFault {
-                invariant: "seed-admission",
-                detail: BoundedText::new(format!("{fault:?}")),
-                evidence: None,
-            });
-        }
-        Err(error) => {
-            return lsp_error_snapshot(uri, &error.to_string());
-        }
-    };
-    let options = fln::KVMap::new();
-    let limits = fln::EngineExecutionLimits::new(kernel_budget);
-    match engine.execute_source_commands_with_checks(source, &options, limits) {
-        Ok(fln::Outcome::Complete(_completed)) => ProjectionSnapshot::Complete {
-            diagnostics: Vec::new(),
-        },
-        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
-            ProjectionSnapshot::Inconclusive(StructuredInconclusive {
-                cause_class: "source-check",
-                detail: BoundedText::new(format!("{inconclusive:?}")),
-                diagnostic: None,
-                progress: None,
-            })
-        }
-        Ok(fln::Outcome::InternalFault(fault)) => {
-            ProjectionSnapshot::InternalFault(StructuredInternalFault {
-                invariant: "source-check",
-                detail: BoundedText::new(format!("{fault:?}")),
-                evidence: None,
-            })
-        }
-        Err(error) => lsp_execution_error_snapshot(uri, source, &error),
-    }
-}
-
-/// Build a `ProjectionSnapshot` for a source-execution failure, placing the
-/// diagnostic at the real parse position when the error carries a recoverable
-/// source offset, and falling back to the file-level `(1, 0)` position for
-/// elaboration, kernel, or structural failures that carry none. Parse offsets
-/// are already rebased into the file's coordinate system by the frontend, so a
-/// syntax error at line 3 column 5 lands there instead of at the file head.
-fn lsp_execution_error_snapshot(
-    uri: &str,
-    source: &[u8],
-    error: &fln::EngineExecutionError,
-) -> ProjectionSnapshot {
-    match error
-        .primary_source_offset()
-        .and_then(|offset| source_position_at(source, offset.0))
-    {
-        Some(position) => lsp_positioned_error_snapshot(uri, &error.to_string(), position),
-        None => lsp_error_snapshot(uri, &error.to_string()),
-    }
-}
-
 /// Convert a byte offset in the UTF-8 document into a Lean 1-based-line,
 /// 0-based-codepoint-column position, or `None` when the source is not valid
 /// UTF-8, or the offset is out of range or not on a character boundary — in
@@ -10994,45 +10874,6 @@ fn source_position_at(source: &[u8], offset: usize) -> Option<fln_core::pos::Pos
         return None;
     }
     Some(fln_core::pos::FileMap::of_string(text).to_position(fln_core::pos::RawPos::new(offset)))
-}
-
-/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at the
-/// start of the file. Position (1, 0) is the Lean convention for file-level
-/// errors that carry no recoverable source position. The `uri` is used as
-/// `file_name` so that the projection generates a `publishDiagnostics` for the
-/// right document.
-fn lsp_error_snapshot(uri: &str, message: &str) -> ProjectionSnapshot {
-    lsp_positioned_error_snapshot(uri, message, fln_core::pos::Position { line: 1, column: 0 })
-}
-
-/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at an
-/// explicit Lean position (1-based line, 0-based codepoint column). The column
-/// is converted to LSP UTF-16 code units by the projector once the document
-/// source is supplied to `project_with_sources`.
-fn lsp_positioned_error_snapshot(
-    uri: &str,
-    message: &str,
-    pos: fln_core::pos::Position,
-) -> ProjectionSnapshot {
-    // Strip the `file://` prefix if present, because `complete_messages`
-    // in fln-server re-adds `file://` when building the notification URI.
-    let file_name = uri.strip_prefix("file://").unwrap_or(uri);
-    ProjectionSnapshot::Complete {
-        diagnostics: vec![StructuredDiagnostic {
-            file_name: BoundedText::new(file_name.to_owned()),
-            pos,
-            end_pos: None,
-            severity: Severity::Error,
-            error_name: None,
-            caption: BoundedText::new(message.to_owned()),
-            body: BoundedText::new(String::new()),
-            cause_class: "engine-error",
-            related: Vec::new(),
-            evidence: Vec::new(),
-            omitted_related: 0,
-            omitted_evidence: 0,
-        }],
-    }
 }
 
 /// Run the native `fln` multiplexer without touching process-global arguments
