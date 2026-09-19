@@ -26,7 +26,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Import the identity-bound native source integration
+      - name: Import the identity-bound file integration
         if: >-
           github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
         env:
@@ -57,7 +57,6 @@ jobs:
               assert blob(data) == sha
               return data
           encoded = fetch_blob('b237e0f4d67017ee48baa0cd68e0cac838942c50').decode('ascii')
-          # Reconstruct the independently identified transport payload only.
           for sent, original in [('Nk2i1PMKHR', 'Nk2i1iKHR'), ('LZdJJii5', 'LZdJii5'), ('UbQvHLRZZsb', 'UbQvHLRZsb'), ('npbOOPSak', 'npbOIPSak')]:
               assert encoded.count(sent) == 1
               encoded = encoded.replace(sent, original)
@@ -74,10 +73,8 @@ jobs:
               before[path] = blob(p.read_bytes()) if p.exists() else None
               if path != parser:
                   assert before[path] == old, path
-          # Merge only the observed concurrent do-notation changes in lib.rs.
           original = fetch_blob(manifest[parser][0])
-          actual = subprocess.check_output(['git','hash-object','-w','--stdin'], input=original).decode().strip()
-          assert actual == manifest[parser][0]
+          assert subprocess.check_output(['git','hash-object','-w','--stdin'], input=original).decode().strip() == manifest[parser][0]
           (root / 'parser-before.rs').write_bytes(pathlib.Path(parser).read_bytes())
           (root / 'integration.patch').write_bytes(patch)
           subprocess.run(['git','apply','--3way','--index',str(root / 'integration.patch')], check=True)
@@ -87,14 +84,42 @@ jobs:
                   assert actual == new, path
               manifest[path] = [before[path], actual]
           (root / 'parser-after.rs').write_bytes(pathlib.Path(parser).read_bytes())
-          (root / 'merged.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
-          (root / 'manifest.json').write_text(json.dumps(manifest))
-      - name: Test the ordinary parser engine and installed command
+          (root / 'second-manifest.json').write_text(json.dumps(manifest))
+          parts = ['bae732d90868989605760092dcbfdb74449b2baa', '6ef197cace62b30b48cc231af5cb794d3a94c4a8', '6d04f91e1e44602c816c8b3c4cec5b670f73f1bb', 'f403896c6aa28e04911dbedd8139735fcfbec447']
+          encoded = b''.join(fetch_blob(sha) for sha in parts)
+          assert blob(encoded) == '477b9e4d5c3774aedadfb03726917c1fcefe7cbe'
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '4531d6d7fd9b7918fb0ca3c8b982be951e4e08429188df0f2567232fc3590c44'
+          (root / 'matching.patch').write_bytes(patch)
+          (root / 'export.py').write_text('''import hashlib,json,os,pathlib,subprocess,sys,urllib.request
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'mutual-source'
+          def post(endpoint,value):
+              request=urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/'+endpoint,data=json.dumps(value).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(request,timeout=60) as response:
+                  return json.load(response)
+          paths=subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()
+          entries=[]
+          for path in paths:
+              data=pathlib.Path(path).read_bytes()
+              assert data==subprocess.check_output(['git','show',':'+path])
+              sha=hashlib.sha1(('blob '+str(len(data))+'\\0').encode()+data).hexdigest()
+              assert post('blobs',{'content':data.decode(),'encoding':'utf-8'})['sha']==sha
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          parent=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          base=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
+          tree=post('trees',{'base_tree':base,'tree':entries})['sha']
+          assert tree==subprocess.check_output(['git','write-tree'],text=True).strip()
+          result={'parent':parent,'tree':tree,'files':entries}
+          (root/(sys.argv[1]+'-tested-tree.json')).write_text(json.dumps(result,indent=2))
+          (root/(sys.argv[1]+'.patch')).write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
+          print('MUTUAL_TESTED_TREE '+sys.argv[1]+' '+json.dumps(result),flush=True)
+          ''')
+      - name: Test ordinary mutual file integration
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/mutual-source"
-          exec > >(tee "$RUNNER_TEMP/mutual-source/validation.log") 2>&1
+          exec > >(tee "$RUNNER_TEMP/mutual-source/file-validation.log") 2>&1
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv
@@ -102,38 +127,59 @@ jobs:
           cargo test --locked -p fln --test source_mutual_inductives --test source_inductive --test generated_mutual_inductives
           if test -f crates/fln/tests/source_do.rs; then cargo test --locked -p fln --test source_do; fi
           cargo test --locked -p fln-cli --test source_check installed_binary_checks_mutual_source_and_cross_family_computation
-          cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo clippy --locked --no-deps -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
           git diff --check
           git diff --cached --check
-      - name: Export exactly tested blobs without moving main
+      - name: Export tested file integration
         if: >-
           github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
         env:
           GH_TOKEN: ${{ github.token }}
+        run: python "$RUNNER_TEMP/mutual-source/export.py" second
+      - name: Integrate checked mutual case analysis
+        if: >-
+          github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
         shell: python
         run: |
-          import hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mutual-source'
-          manifest = json.loads((root / 'manifest.json').read_text())
-          def post(endpoint, value):
-              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint, data=json.dumps(value).encode(), headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json','Content-Type':'application/json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          entries = []
-          assert sorted(subprocess.check_output(['git','diff','--cached','--name-only'], text=True).splitlines()) == sorted(manifest)
-          for path, (old, new) in manifest.items():
-              data = pathlib.Path(path).read_bytes()
-              assert data == subprocess.check_output(['git','show',':' + path])
-              assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == new
-              assert post('blobs', {'content':data.decode(),'encoding':'utf-8'})['sha'] == new
-              entries.append({'path':path,'mode':'100644','type':'blob','sha':new})
-          parent = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
-          tree = post('trees', {'base_tree':subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip(), 'tree':entries})['sha']
-          assert tree == subprocess.check_output(['git','write-tree'], text=True).strip()
-          result = {'parent':parent,'tree':tree,'files':entries}
-          (root / 'tested-tree.json').write_text(json.dumps(result,indent=2))
-          print('MUTUAL_TESTED_TREE ' + json.dumps(result), flush=True)
+          import hashlib,os,pathlib,re,subprocess
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'mutual-source'
+          patch=(root/'matching.patch').read_text()
+          allowed={'crates/fln-cli/tests/source_check.rs','crates/fln-elab/src/source/matching.rs','crates/fln-elab/src/source/matching/mutual.rs','crates/fln/tests/source_mutual_inductives.rs','docs/NATIVE_MUTUAL_CHECKER.md','examples/native_mutual_inductives.lean'}
+          rows={}
+          def blob(data):
+              return hashlib.sha1(('blob '+str(len(data))+'\0').encode()+data).hexdigest()
+          for section in patch.split('diff --git ')[1:]:
+              path=section.splitlines()[0].split(' b/',1)[1]
+              assert path in allowed and path not in rows
+              match=re.search(r'^index ([0-9a-f]{40})\.\.([0-9a-f]{40})',section,re.M)
+              assert match and '\ndeleted file mode ' not in section
+              old,new=match.groups()
+              p=pathlib.Path(path)
+              assert (blob(p.read_bytes()) if p.exists() else '0'*40)==old,path
+              rows[path]=new
+          assert set(rows)==allowed
+          subprocess.run(['git','apply','--check',str(root/'matching.patch')],check=True)
+          subprocess.run(['git','apply','--index',str(root/'matching.patch')],check=True)
+          for path,sha in rows.items():
+              assert blob(pathlib.Path(path).read_bytes())==sha,path
+      - name: Verify ordinary mutual matches
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee "$RUNNER_TEMP/mutual-source/match-validation.log") 2>&1
+          cargo test --locked -p fln --test source_mutual_inductives --test source_inductive --test source_matching --test source_pattern_matrices
+          cargo test --locked -p fln-cli --test source_check installed_binary_checks_mutual_source_and_cross_family_computation
+          cargo clippy --locked --no-deps -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+          git diff --check
+          git diff --cached --check
+      - name: Export tested mutual matches
+        if: >-
+          github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python "$RUNNER_TEMP/mutual-source/export.py" third
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
