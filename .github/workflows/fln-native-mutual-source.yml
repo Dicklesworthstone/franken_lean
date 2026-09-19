@@ -8,6 +8,8 @@ on:
       - 'crates/fln-parse/src/command_scope.rs'
       - 'crates/fln-elab/src/source/inductive/**'
       - 'crates/fln-elab/src/source/inductive.rs'
+      - 'crates/fln-elab/src/source/matching/**'
+      - 'crates/fln-elab/src/source/matching.rs'
       - 'crates/fln/tests/source_mutual_inductives.rs'
       - 'examples/native_mutual_inductives.lean'
 permissions:
@@ -25,7 +27,8 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Import the identity-bound native source integration
-        if: github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
+        if: >-
+          github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
@@ -71,8 +74,7 @@ jobs:
               before[path] = blob(p.read_bytes()) if p.exists() else None
               if path != parser:
                   assert before[path] == old, path
-          # Only lib.rs has concurrent changes (native do notation). Three-way
-          # merge against its exact original blob; conflicts must stop this job.
+          # Merge only the observed concurrent do-notation changes in lib.rs.
           original = fetch_blob(manifest[parser][0])
           actual = subprocess.check_output(['git','hash-object','-w','--stdin'], input=original).decode().strip()
           assert actual == manifest[parser][0]
@@ -105,7 +107,8 @@ jobs:
           git diff --check
           git diff --cached --check
       - name: Export exactly tested blobs without moving main
-        if: github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
+        if: >-
+          github.event.head_commit.message == 'test(source): validate ordinary mutual inductive file checking'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
