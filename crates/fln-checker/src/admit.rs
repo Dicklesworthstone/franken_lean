@@ -2008,7 +2008,10 @@ fn structural_expression_equal(
             ) if left_structure == right_structure && left_index == right_index => {
                 push(*left_expression, *right_expression)?;
             }
-            _ => return Ok(Ok(false)),
+            (left_mismatch, right_mismatch) => {
+                eprintln!("structural_expression_equal MISMATCH: left={left_mismatch:?}, right={right_mismatch:?}");
+                return Ok(Ok(false));
+            }
         }
     }
     Ok(Ok(true))
@@ -8182,6 +8185,7 @@ pub fn admit_inductive_with(
         });
     };
     let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        eprintln!("admit.rs: reject 8185 for {recursor_name:?}");
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
@@ -8198,6 +8202,18 @@ pub fn admit_inductive_with(
         || recursor_metadata.k()
         || environment.find(&recursor_name).is_some()
     {
+        eprintln!("admit.rs: reject 8201 for {recursor_name:?}: safety={:?}, levels_len={}, mutual={:?}, params={}, indices={}, motives={}, minors={}/{}, rules={}/{}, k={}, find={}",
+            recursor.declaration().safety(),
+            recursor_levels.len(),
+            recursor_metadata.mutual() == std::slice::from_ref(name),
+            recursor_metadata.num_parameters(),
+            recursor_metadata.num_indices(),
+            recursor_metadata.num_motives(),
+            metadata.constructors().len(), recursor_metadata.num_minors(),
+            recursor_metadata.rules().len(), metadata.constructors().len(),
+            recursor_metadata.k(),
+            environment.find(&recursor_name).is_some()
+        );
         return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
             name: recursor_name,
         });
@@ -8216,6 +8232,34 @@ pub fn admit_inductive_with(
     ) {
         Ok(true) => {}
         Ok(false) => {
+            eprintln!("admit.rs: reject 8219 (recursor type compare failed) for {recursor_name:?}: actual nodes={}, expected nodes={}",
+                recursor.declaration().type_().nodes().len(),
+                expected_recursor_type.nodes().len(),
+            );
+            let mut stack = vec![(recursor.declaration().type_().root(), expected_recursor_type.root(), String::new())];
+            while let Some((a_id, e_id, path)) = stack.pop() {
+                let a_node = recursor.declaration().type_().node(a_id);
+                let e_node = expected_recursor_type.node(e_id);
+                match (a_node, e_node) {
+                    (Some(ExprNode::Forall { binder_name: an, binder_type: at, body: ab, style: as_ }),
+                     Some(ExprNode::Forall { binder_name: en, binder_type: et, body: eb, style: es })) => {
+                        if as_ != es || an != en {
+                            eprintln!("FORALL DIFF at {path}: actual={an:?}/{as_:?} expected={en:?}/{es:?}");
+                        }
+                        stack.push((*ab, *eb, format!("{path} -> body({en:?})")));
+                        stack.push((*at, *et, format!("{path} -> type({en:?})")));
+                    }
+                    (Some(ExprNode::Apply { function: af, argument: aa }),
+                     Some(ExprNode::Apply { function: ef, argument: ea })) => {
+                        stack.push((*aa, *ea, format!("{path} -> arg")));
+                        stack.push((*af, *ef, format!("{path} -> fn")));
+                    }
+                    (Some(a), Some(e)) if a == e => {}
+                    (a, e) => {
+                        eprintln!("MISMATCH at {path}:\n  actual: {a:?}\n  expected: {e:?}");
+                    }
+                }
+            }
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -8232,6 +8276,8 @@ pub fn admit_inductive_with(
         if rule.constructor() != constructor
             || usize::try_from(rule.num_fields()).ok() != Some(expected_fields)
         {
+            eprintln!("admit.rs: reject 8235 for {recursor_name:?}: ctor {:?} vs {:?}, fields {} vs {:?}",
+                rule.constructor(), constructor, rule.num_fields(), expected_fields);
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
@@ -8249,6 +8295,7 @@ pub fn admit_inductive_with(
         ) {
             Ok(true) => {}
             Ok(false) => {
+                eprintln!("admit.rs: reject 8252 (rule rhs compare failed) for {recursor_name:?} at ctor {index}");
                 return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                     name: recursor_name,
                 });
