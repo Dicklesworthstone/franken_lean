@@ -17,6 +17,7 @@ mod assignment_universes;
 mod delayed;
 mod flex_flex;
 mod normalize;
+mod pattern_spine;
 mod proof_irrelevance;
 mod record_eta;
 mod reduce;
@@ -880,6 +881,23 @@ impl Engine<'_> {
             }
             Err(UnificationError::Deferred(_)) | Ok(false) => {}
             Err(error) => return Err(error),
+        }
+        // Preserve successful existing pattern orientations. Eagerly unfolding
+        // local lets could collapse two distinct arguments and turn a formerly
+        // solvable pattern into a non-pattern. Only retry conversion after both
+        // ordinary orientations have refused, without publishing an assignment.
+        if self.is_flexible_application(&left)? || self.is_flexible_application(&right)? {
+            let normalized_left = self.pattern_whnf(&left, locals)?;
+            let normalized_right = self.pattern_whnf(&right, locals)?;
+            if !same_terms(&left, &normalized_left, &mut self.meter)?
+                || !same_terms(&right, &normalized_right, &mut self.meter)?
+            {
+                // Keep an equivalent equation on the worklist. This also makes
+                // fixed-point pruning see the normalized telescope, and lets
+                // original equations replay after a shared residual is created.
+                pending.push_front((normalized_left, normalized_right, locals.clone()));
+                return Ok(());
+            }
         }
         if self.proof_irrelevance(&left, &right, locals, pending)? {
             return Ok(());
