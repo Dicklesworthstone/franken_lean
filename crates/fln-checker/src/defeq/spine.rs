@@ -117,7 +117,7 @@ impl SlowControl {
                 PathStep::Metadata => demand,
                 PathStep::Projection => match demand {
                     Demand::Always | Demand::Constructor => Demand::Always,
-                    Demand::Arguments(0) => Demand::Always,
+                    Demand::Arguments(0) => Demand::Arguments(0),
                     _ => Demand::Never,
                 },
             };

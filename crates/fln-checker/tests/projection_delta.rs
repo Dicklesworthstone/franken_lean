@@ -130,6 +130,20 @@ fn projection_application_head_reduces_before_application_congruence() {
 }
 
 #[test]
+fn projection_over_stuck_neutral_application_compares_by_application_congruence() {
+    let context = defined_projection_context(DefinitionSafety::Safe);
+    let proj = Expr::proj(
+        name("S"),
+        0,
+        Expr::fvar(fln_core::expr::FVarId(name("neutral"))),
+    );
+    let applied1 = Expr::app(proj.clone(), Expr::app(identity(), nat_literal(42)));
+    let applied2 = Expr::app(proj, nat_literal(42));
+    slow_equal(&decoded(&applied1), &decoded(&applied2), &context);
+    slow_equal(&decoded(&applied2), &decoded(&applied1), &context);
+}
+
+#[test]
 fn projection_delta_does_not_bypass_constructor_field_or_safety_checks() {
     for (structure, field, safety) in [
         ("OtherStructure", 0, DefinitionSafety::Safe),

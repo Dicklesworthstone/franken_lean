@@ -3936,17 +3936,17 @@ impl<'a> InferenceEngine<'a> {
                 InferenceRefusal::ApplicationTypeMismatch { argument, mismatch },
             )),
             DefEqOutcome::Deferred { need, .. } => {
+                if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
+                    eprintln!(
+                        "INFER_DOMAIN_DEFER arg={argument} need={need:?}\n  actual={:?}\n  expected={:?}",
+                        actual.nodes(),
+                        expected.nodes()
+                    );
+                }
                 if conversion == ConversionMode::Ordinary
                     && self.proof_conversion(actual, expected)?
                 {
                     return Ok(());
-                }
-                if std::env::var_os("FLN_CHECKER_TRACE").is_some() {
-                    eprintln!(
-                        "INFER_DOMAIN_DEFER arg={argument} actual={:?} expected={:?}",
-                        actual.nodes(),
-                        expected.nodes()
-                    );
                 }
                 Err(LeafHalt::Deferred(
                     InferenceDeferred::ApplicationConversion { argument, need },
