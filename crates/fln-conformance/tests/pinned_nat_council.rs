@@ -310,7 +310,6 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
                 println!("  ctors: {:?}", ind.ctors);
             }
         }
-        }
     }
 
     let engine = Engine::from_environment(Environment::new());
