@@ -45,17 +45,8 @@ jobs:
                   text = text.replace('pub(crate)', 'pub(in crate::source_check)')
               if path.endswith('/source_check/lsp.rs'):
                   text = text.replace('pub(super)', 'pub(crate)')
-                  old = '''                SourceModuleCheckError::Source { module, error } if module == &sources.names[0] => match error {
-                              fln::SourceCheckError::Command { offset, .. } | fln::SourceCheckError::Scope { offset, .. } => *offset,
-                              _ => 0,
-                          },'''
-                  old = '\n'.join(line[10:] if index else line for index, line in enumerate(old.splitlines()))
-                  new = '''                SourceModuleCheckError::Source {
-                              module,
-                              error: fln::SourceCheckError::Command { offset, .. }
-                                  | fln::SourceCheckError::Scope { offset, .. },
-                          } if module == &sources.names[0] => *offset,'''
-                  new = '\n'.join(line[10:] if index else line for index, line in enumerate(new.splitlines()))
+                  old = '                SourceModuleCheckError::Source { module, error } if module == &sources.names[0] => match error {\n                    fln::SourceCheckError::Command { offset, .. } | fln::SourceCheckError::Scope { offset, .. } => *offset,\n                    _ => 0,\n                },'
+                  new = '                SourceModuleCheckError::Source {\n                    module,\n                    error: fln::SourceCheckError::Command { offset, .. }\n                        | fln::SourceCheckError::Scope { offset, .. },\n                } if module == &sources.names[0] => *offset,'
                   assert text.count(old) == 1, 'source diagnostic match anchor'
                   text = text.replace(old, new)
               target = pathlib.Path(path)
