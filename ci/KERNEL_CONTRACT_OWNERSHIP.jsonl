@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":473,"projection_hash":"0fde864e109e1affe4e64617ec12c27cf5ce155db00b6b1222b80a72c417d40f"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":474,"projection_hash":"beebd3c526b9db3f7b58f08e5062df84469eaf612c146ec6a9f0bc2aa4da7d03"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -119,6 +119,7 @@
 {"id":"fln-i9so"}
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-in1"}
+{"id":"fln-init-chain-council-3116-kipb"}
 {"id":"fln-iron-target-profile-contract-ba9"}
 {"id":"fln-it70"}
 {"id":"fln-ivm"}
