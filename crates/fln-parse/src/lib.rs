@@ -31,6 +31,7 @@ pub mod recovery;
 pub mod registry;
 pub mod state;
 
+mod collections;
 mod inductive;
 mod levels;
 mod matching;
@@ -285,6 +286,7 @@ enum BoundedInfix {
     NatPow,
     NatDecLe,
     NatDecLt,
+    ListCons,
 }
 
 impl BoundedInfix {
@@ -313,6 +315,7 @@ impl BoundedInfix {
             Self::NatPow => "^",
             Self::NatDecLe => "<=",
             Self::NatDecLt => "<",
+            Self::ListCons => "::",
         }
     }
     const fn precedence(self) -> u8 {
@@ -330,13 +333,20 @@ impl BoundedInfix {
             Self::NatShiftLeft | Self::NatShiftRight => 75,
             Self::NatPow => 80,
             Self::NatDecLe | Self::NatDecLt => 50,
+            Self::ListCons => 67,
         }
     }
 
     const fn is_right_associative(self) -> bool {
         matches!(
             self,
-            Self::NatPow | Self::Arrow | Self::And | Self::AndAscii | Self::Or | Self::OrAscii
+            Self::NatPow
+                | Self::Arrow
+                | Self::And
+                | Self::AndAscii
+                | Self::Or
+                | Self::OrAscii
+                | Self::ListCons
         )
     }
 
@@ -532,6 +542,7 @@ fn nat_definition_token_table() -> TokenTable {
         "+",
         "-",
         "++",
+        "::",
         "*",
         "/",
         "%",
@@ -618,6 +629,7 @@ fn source_module_token_table() -> TokenTable {
         "+",
         "-",
         "++",
+        "::",
         "*",
         "/",
         "%",
@@ -684,6 +696,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "<->" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::IffAscii),
         "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),
         "=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equality),
+        "::" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ListCons),
         "|||" => Some(BoundedInfix::NatLor),
         "^^^" => Some(BoundedInfix::NatXor),
         "&&&" => Some(BoundedInfix::NatLand),
@@ -1232,6 +1245,7 @@ fn bounded_term_spliced(
     updates: &std::collections::HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let arrows = term_binders::arrow_openers(tokens, range.clone());
+    let mut lists = collections::Lists::default();
     let mut frames = vec![BoundedTermFrame {
         record: None,
         ascription: None,
@@ -1287,7 +1301,20 @@ fn bounded_term_spliced(
             frames.push(term_binders::frame(prefix));
             continue;
         }
+        if grammar == DefinitionGrammar::Scalar
+            && lists.current(&frames)
+            && matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
+                if symbol == "," || symbol == "]")
+        {
+            lists.delimiter(leaves, view, tokens, &mut frames, index)?;
+            continue;
+        }
         match tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(symbol))
+                if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
+            {
+                lists.open(&mut frames, index);
+            }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>
             {
@@ -1465,6 +1492,7 @@ fn bounded_term_spliced(
                         range.end,
                     )?;
                 } else if symbol == ":"
+                    && !lists.current(&frames)
                     && frames
                         .last()
                         .is_some_and(|frame| frame.open.is_some() && frame.ascription.is_none())
@@ -1527,6 +1555,12 @@ fn bounded_term_spliced(
             }
             Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
                 finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+                if lists.current(&frames) {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: grammar.value_expectation(),
+                    });
+                }
                 if frames.len() == 1 {
                     return Err(NatDefinitionParseError::OutsideSeedGrammar {
                         at: original_position(view, tokens, index),

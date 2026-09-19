@@ -9,6 +9,7 @@ mod application;
 mod binders;
 mod calc;
 mod coercions;
+mod collections;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
