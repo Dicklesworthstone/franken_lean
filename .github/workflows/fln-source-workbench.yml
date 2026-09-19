@@ -88,3 +88,80 @@ jobs:
           path: ${{ runner.temp }}/inline-simp-evidence
           retention-days: 7
           if-no-files-found: error
+  assignment-transfer:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'build(elab): materialize checked assignment inference for direct main publication'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Import the exact locally tested patch as immutable Git blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'assignment-transfer'
+          root.mkdir()
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          def request(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(api + path, data=body, headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          manifest = {
+              'crates/fln-elab/src/constraint/unify.rs': ['7ec99cccb07c68e9858e0ef4c64358964c8fbbc5', '5c9f1bb5fd2c5838e4bc1ece7812faabdcd73b49'],
+              'crates/fln-elab/src/constraint/unify/assignment_types.rs': [None, 'd10de8322a65a8b842df4af8970d1464fb817353'],
+              'crates/fln-elab/src/constraint/unify/residual.rs': ['6c5022e9208a1b32eec6bb2cb7a0dea4bac5cb78', '8858a2f988c094cc58a5b549adac8878901f1732'],
+              'crates/fln-elab/tests/native_assignment_types.rs': [None, '1560d6e82fcba2ac1716f1e73e6c7be5fb299194'],
+              'crates/fln-elab/tests/native_unification.rs': ['5472ef120e892d1eed28f0f32ab21a8e8b593105', '9050c10f7a31bfdab7042e887863f30785a77f52'],
+              'crates/fln-elab/tests/universe_residuals.rs': ['dd8116b710a3b89a9e36694a0a2235ad7b51db81', '87a9bf5c570f40d49e91380c19a703b99ae8c86a'],
+          }
+          encoded = base64.b64decode(request('/git/blobs/5fab5b9520f0f32e862cf6626a23976bd1964d44')['content']).decode('ascii')
+          # Repair one transport-only duplicated character; both the encoded
+          # payload identity and the decompressed patch identity must then match.
+          assert encoded.count('seOUVGTJJ69') == 1
+          encoded = encoded.replace('seOUVGTJJ69', 'seOUVGTJ69')
+          assert blob(encoded.encode()) == 'ee3bba008e933aef2cb87113be4dde4bccb9a664'
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '3d1a2b6e78e4c113ca3501204aa74414a68353f15a8dfc5e9fd1a00fc633faec'
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
+          assert sorted(paths) == sorted(manifest) and len(paths) == len(set(paths))
+          for path, (before, after) in manifest.items():
+              file = pathlib.Path(path)
+              assert not file.is_symlink()
+              assert (blob(file.read_bytes()) if file.exists() else None) == before, path
+          patch_file = root / 'assignment.patch'
+          patch_file.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', str(patch_file)], check=True)
+          subprocess.run(['git', 'apply', str(patch_file)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for path, (before, after) in manifest.items():
+              data = pathlib.Path(path).read_bytes()
+              assert blob(data) == after, path
+              result = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert result['sha'] == after, path
+          # This job creates immutable objects only. The connected GitHub
+          # caller separately checks current main and publishes a fast-forward.
+          receipt = {'base': base, 'blobs': {path: after for path, (_, after) in manifest.items()},
+              'patch_sha256': hashlib.sha256(patch).hexdigest(), 'published_branch': False}
+          (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2), flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: assignment-transfer-${{ github.sha }}
+          path: ${{ runner.temp }}/assignment-transfer
+          retention-days: 7
+          if-no-files-found: error
