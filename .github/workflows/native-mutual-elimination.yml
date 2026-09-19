@@ -1,0 +1,133 @@
+name: Native mutual elimination
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-mutual-elimination.yml'
+      - 'crates/fln-elab/src/source/matching/**'
+      - 'crates/fln-elab/src/source/matching.rs'
+      - 'crates/fln-elab/src/source/tactics/eliminate.rs'
+      - 'crates/fln/tests/source_mutual_matching.rs'
+      - 'crates/fln/tests/source_mutual_cases.rs'
+permissions:
+  contents: read
+concurrency:
+  group: native-mutual-elimination
+  cancel-in-progress: false
+jobs:
+  elimination:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Install configured Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mutual-elimination"
+          channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+          rustc -Vv > "$RUNNER_TEMP/mutual-elimination/compiler.txt"
+      - name: Validate and publish the two recovered implementation commits
+        if: github.event.head_commit.message == 'feat(elab): validate and publish native mutual match and cases support'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mutual-elimination'
+          def run(*args):
+              subprocess.run(args, check=True)
+          def output(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def checked(label, *args):
+              with (root / (label + '.log')).open('wb') as log:
+                  result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+              print((root / (label + '.log')).read_text(), flush=True)
+              result.check_returncode()
+          def fetch_blob(sha):
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  value = json.load(response)
+              assert value['encoding'] == 'base64'
+              data = base64.b64decode(value['content'])
+              assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == sha
+              return data
+          chunks = ['d973094369ec56f3ef4740ca139e1f4325cbd87b','85da91d6d7325f0589d19178313e849656d62117','460e7c1a9d4df5c9e6470c929d9cf06445225d64']
+          encoded = b''.join(fetch_blob(sha) for sha in chunks)
+          assert hashlib.sha1(('blob ' + str(len(encoded)) + '\0').encode() + encoded).hexdigest() == 'b13f45475a6d41eb4394de50a99ad6d2f09f8f46'
+          mailbox = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(mailbox).hexdigest() == '60ae3ac864fbca098a1cd72729f31748d6d0c0be1439155df4528a21d25c7ef3'
+          (root / 'implementation.mbox').write_bytes(mailbox)
+          parts = root / 'parts'
+          parts.mkdir()
+          run('git','mailsplit','-o' + str(parts),str(root / 'implementation.mbox'))
+          patches = sorted(parts.iterdir())
+          assert len(patches) == 2
+          allowed = {'crates/fln-elab/src/source/matching.rs','crates/fln-elab/src/source/matching/mutual.rs','crates/fln-elab/src/source/tactics/eliminate.rs','crates/fln/tests/source_mutual_matching.rs','crates/fln/tests/source_mutual_cases.rs','docs/NATIVE_MUTUAL_ELIMINATION.md'}
+          originals = {'crates/fln-elab/src/source/matching.rs':'288f4a5693bdb8ce40eb8736736925922aa6d802','crates/fln-elab/src/source/tactics/eliminate.rs':'5f5e5e0d426946da4ff7991b432d4713d7c8d14f'}
+          expected = [
+              {'crates/fln-elab/src/source/matching.rs':'8a388d1aad0bc432feeb799f425049c397671049','crates/fln-elab/src/source/matching/mutual.rs':'b1a7cdc919e8516517d2841ac99cf99489f0d496','crates/fln/tests/source_mutual_matching.rs':'57f2922d119a4f5aacb126974a5d9d0585c39006','docs/NATIVE_MUTUAL_ELIMINATION.md':'99dd5f5a392245092ca6b2b8acb59f5e74f041f0'},
+              {'crates/fln-elab/src/source/matching/mutual.rs':'415162aa546dce69b48f9c391ffcf2f9dfe7bd9e','crates/fln-elab/src/source/tactics/eliminate.rs':'48fe5f57a6a7e4451ceec1e533ddbc6a8b75196a','crates/fln/tests/source_mutual_cases.rs':'cbc4c40aebf42a7e5afaf2a7c6eea4c557f87175','docs/NATIVE_MUTUAL_ELIMINATION.md':'312343c83d91f21ed39af0de5204636deada85e9'}
+          ]
+          run('git','config','user.name','github-actions[bot]')
+          run('git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
+          for index, patch in enumerate(patches):
+              assert not output('git','status','--porcelain')
+              run('git','fetch','origin','main')
+              run('git','merge','--ff-only','origin/main')
+              if index == 0:
+                  for path, sha in originals.items():
+                      assert output('git','rev-parse','HEAD:' + path) == sha, 'concurrent edit: ' + path
+                  for path in allowed - set(originals):
+                      assert not pathlib.Path(path).exists(), 'new file collision: ' + path
+              else:
+                  for path, sha in expected[0].items():
+                      assert output('git','rev-parse','HEAD:' + path) == sha, 'concurrent edit: ' + path
+                  assert output('git','rev-parse','HEAD:crates/fln-elab/src/source/tactics/eliminate.rs') == originals['crates/fln-elab/src/source/tactics/eliminate.rs']
+              run('git','apply','--index','--whitespace=error',str(patch))
+              changed = output('git','diff','--cached','--name-only').splitlines()
+              assert set(changed) == set(expected[index])
+              for path, sha in expected[index].items():
+                  assert output('git','hash-object',path) == sha, path
+              run('git','diff','--cached','--check')
+              tests = ['--test','source_mutual_matching']
+              if index == 1:
+                  tests += ['--test','source_mutual_cases']
+              checked(str(index) + '-focused','cargo','test','--locked','-p','fln',*tests)
+              checked(str(index) + '-elab','cargo','test','--locked','-p','fln-elab')
+              checked(str(index) + '-clippy','cargo','clippy','--locked','-p','fln-elab','-p','fln','--all-targets','--','-D','warnings')
+              checked(str(index) + '-workspace','cargo','check','--locked','--workspace','--all-targets')
+              subject = ['feat(elab): compile source matches through admitted mutual recursors','feat(elab): support dependent cases over mutual inductive families'][index]
+              run('git','commit','-m',subject,'-m','Recovered identity-verified implementation; focused source tests, elaborator tests, all-target package Clippy and workspace compilation passed before publication. No new axioms or kernel-rule changes. fln-qb5 remains open.')
+              run('git','push','origin','HEAD:main')
+              (root / ('published-' + str(index) + '.txt')).write_text(output('git','rev-parse','HEAD') + '\n')
+      - name: Check mutual elimination on the committed tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --test source_mutual_matching --test source_mutual_cases 2>&1 | tee "$RUNNER_TEMP/mutual-elimination/focused.log"
+      - name: Retain exact source and any unpublished changes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mutual-elimination"
+          git rev-parse HEAD > "$RUNNER_TEMP/mutual-elimination/source-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/mutual-elimination/source-tree.txt"
+          git status --porcelain > "$RUNNER_TEMP/mutual-elimination/worktree-status.txt"
+          git diff HEAD --binary > "$RUNNER_TEMP/mutual-elimination/unpublished.patch"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/mutual-elimination/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mutual-elimination-${{ github.run_id }}
+          path: ${{ runner.temp }}/mutual-elimination
+          retention-days: 7
+          if-no-files-found: error
