@@ -1021,7 +1021,7 @@ impl Context {
                                     let parts = expect_node(syntax, kind, 3, "show term")?;
                                     expect_atom(&parts[0], "show", "show keyword")?;
                                     let value = if parts[2].kind()
-                                        == Some(&parser_kind(&["Term", "byTactic"]))
+                                        == Some(&parser_kind(&["Term", "byTactic'"]))
                                     {
                                         &parts[2]
                                     } else {
@@ -1082,7 +1082,9 @@ impl Context {
                                     ));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "byTactic"]) {
+                                if kind == &parser_kind(&["Term", "byTactic"])
+                                    || kind == &parser_kind(&["Term", "byTactic'"])
+                                {
                                     tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
                                     continue;
                                 }
@@ -1843,7 +1845,11 @@ impl Context {
             return Err(failure(SourceInferenceError::Scope));
         };
         expect_atom(keyword, "suffices", "suffices keyword")?;
-        expect_atom(separator, ";", "suffices separator")?;
+        if separator.kind() == Some(&Name::from_components(["null"])) {
+            expect_empty_null(separator, "suffices linebreak")?;
+        } else {
+            expect_atom(separator, ";", "suffices separator")?;
+        }
         let parts = expect_node(
             declaration,
             &parser_kind(&["Term", "sufficesDecl"]),
@@ -1875,7 +1881,7 @@ impl Context {
             }
             Name::from_components(["this"])
         };
-        let continuation = if parts[2].kind() == Some(&parser_kind(&["Term", "byTactic"])) {
+        let continuation = if parts[2].kind() == Some(&parser_kind(&["Term", "byTactic'"])) {
             &parts[2]
         } else {
             let rhs = expect_node(
@@ -1951,7 +1957,11 @@ impl Context {
         expect_null_args(&declaration[1], "local function parameters")?;
         let annotation = optional_type_syntax(&declaration[2])?;
         expect_atom(&declaration[3], ":=", "let assignment")?;
-        expect_atom(separator, ";", "let separator")?;
+        if opaque && separator.kind() == Some(&Name::from_components(["null"])) {
+            expect_empty_null(separator, "assertion linebreak")?;
+        } else {
+            expect_atom(separator, ";", "let separator")?;
+        }
         Ok(local_functions::Binding {
             name,
             opaque,

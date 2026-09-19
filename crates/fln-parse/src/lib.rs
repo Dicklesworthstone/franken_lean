@@ -1268,6 +1268,19 @@ fn bounded_term_spliced(
     while cursor < range.end {
         let index = cursor;
         cursor += 1;
+        if grammar == DefinitionGrammar::Scalar
+            && term_locals::layout_boundary(view, tokens, &frames, index)
+        {
+            finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
+            let mut frame = frames.pop().expect("waiting assertion value frame");
+            let prefix = frame.prefix.take().expect("waiting assertion prefix");
+            let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
+            let (prefix, next) =
+                prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
+            frames.push(term_binders::frame(prefix));
+            cursor = next;
+            continue;
+        }
         if let Some((end, syntax)) = splices.remove(&index) {
             if end > range.end {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -1352,7 +1365,8 @@ fn bounded_term_spliced(
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "by" =>
             {
-                let (proof, end) = proofs::parse(leaves, view, tokens, index, range.end)?;
+                let limit = term_locals::proof_limit(view, tokens, &frames, index, range.end);
+                let (proof, end) = proofs::parse(leaves, view, tokens, index, limit)?;
                 // Tactic arguments are parsed by their own bounded term call.
                 // Its returned syntax already owns these matches. Nested by
                 // blocks are forbidden by that parser, bounding re-entry depth.

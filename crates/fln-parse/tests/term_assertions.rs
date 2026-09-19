@@ -131,3 +131,72 @@ fn deeply_chained_suffices_does_not_recurse_on_the_host_stack() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn assertion_layout_retains_comments_crlf_and_real_primed_proof_nodes() {
+    let source = "theorem t (P : Prop) (p : P) : P :=\r\n  have /- local -/ h : P := show P by\r\n    exact p -- evidence\r\n  suffices P by\r\n    exact this\r\n  h\r\n";
+    let parsed = parse_definition(source.as_bytes()).unwrap();
+    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    assert_eq!(
+        parsed.reconstruct_normalized().unwrap(),
+        source.replace('\r', "").as_bytes()
+    );
+    let mut nodes = vec![parsed.syntax()];
+    let mut primed = 0;
+    while let Some(node) = nodes.pop() {
+        if let fln_syntax::tree::Syntax::Node { kind, args, .. } = node {
+            if kind.to_display_string() == "Lean.Parser.Term.byTactic'" {
+                primed += 1;
+            }
+            nodes.extend(args);
+        }
+    }
+    assert_eq!(primed, 2);
+}
+#[test]
+fn incomplete_multiline_assertions_fail_without_inventing_evidence() {
+    for source in [
+        "def x : Nat :=\n  have h :=\n  h",
+        "def x : Nat :=\n  have h := 0",
+        "def x : Nat :=\n  have h := by\n  h",
+        "def x : Nat :=\n  suffices Nat from this",
+        "def x : Nat :=\n  suffices Nat by\n    exact this",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn deep_multiline_assertions_keep_the_small_stack_bound() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            for prefix in ["have h : Nat := 0", "suffices h : Nat from h"] {
+                let mut source = String::from("def chain : Nat :=\n");
+                for _ in 0..600 {
+                    source.push_str("  ");
+                    source.push_str(prefix);
+                    source.push('\n');
+                }
+                source.push_str("  0");
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            }
+            let mut source = String::from("def nested : Nat :=\n");
+            for depth in 1..=120 {
+                source.push_str(&"  ".repeat(depth));
+                source.push_str("have h : Nat :=\n");
+            }
+            source.push_str(&"  ".repeat(121));
+            source.push_str("0\n");
+            for depth in (1..=120).rev() {
+                source.push_str(&"  ".repeat(depth));
+                source.push_str("h\n");
+            }
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

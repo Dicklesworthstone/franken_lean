@@ -233,3 +233,20 @@ fn suffices_never_proves_its_own_subgoal_or_discards_bad_evidence() {
         refused(source);
     }
 }
+
+#[test]
+fn multiline_have_and_suffices_keep_proof_blocks_inside_their_scope() {
+    for source in [
+        "theorem layout (P : Prop) (p : P) : P :=\n  have h : P := p\n  h",
+        "theorem layout (P : Prop) (p : P) : P :=\n  have h : P := by\n    exact p\n  show P from h",
+        "theorem layout (P : Prop) (p : P) : P :=\n  have : P := by\n    have h : P := p\n    exact h\n  this",
+        "theorem layout (P : Prop) (p : P) : P :=\n  suffices h : P by\n    exact h\n  (fun x => x) p",
+        "theorem layout (P : Prop) (p : P) : P :=\n  suffices h : P by\n    exact h\n  by\n    exact p",
+        "theorem layout (P : Prop) (p : P) : P :=\n  suffices P from this\n  p",
+        "theorem layout (P : Prop) (p : P) : P :=\n  have h : P :=\n    have q : P := p\n    q\n  h",
+        "theorem layout (P : Prop) (p : P) : P :=\n  have h : P := show P by\n    exact p\n  h",
+        "theorem layout (P : Prop) (p : P) : P :=\n  have h : P :=\n    (fun x => x)\n      p\n  h",
+    ] {
+        accepted(source);
+    }
+}

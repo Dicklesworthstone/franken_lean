@@ -63,6 +63,108 @@ fn refuse(view: &SourceView, tokens: &[LexedToken], at: usize) -> NatDefinitionP
         expected: NatDefinitionExpectation::ScalarValue,
     }
 }
+fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
+    let source = view.normalized();
+    let pos = tokens[at].extent.start();
+    pos.0
+        - source
+            .line_start(source.line_of(pos))
+            .expect("token line")
+            .0
+}
+fn newline(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
+    at > 0
+        && view.normalized().line_of(tokens[at].extent.start())
+            > view.normalized().line_of(tokens[at - 1].extent.end())
+}
+
+// A group, binder annotation, or record blocks an outer layout boundary. Only
+// completed prefix bodies can be closed to reach the waiting local witness.
+fn pending_value(frames: &[BoundedTermFrame]) -> Option<usize> {
+    for frame in frames.iter().rev() {
+        if frame.negation.is_some() {
+            continue;
+        }
+        match frame.prefix.as_ref()? {
+            Prefix::Assertion(p) if matches!(p.phase, Phase::Value) => return Some(p.keyword),
+            prefix if prefix.body() => {}
+            _ => return None,
+        }
+    }
+    None
+}
+pub(super) fn layout_boundary(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &[BoundedTermFrame],
+    at: usize,
+) -> bool {
+    if !newline(view, tokens, at) || word(tokens, at, ";") {
+        return false;
+    }
+    // A first witness token on the next line cannot terminate an empty value.
+    if frames
+        .last()
+        .is_none_or(|f| f.application.is_empty() && f.operands.is_empty())
+    {
+        return false;
+    }
+    pending_value(frames)
+        .is_some_and(|keyword| column(view, tokens, at) <= column(view, tokens, keyword))
+}
+
+/// Bound a tactic-valued assertion before handing it to the independent proof
+/// planner. Its own nested declarations and branches remain in the same slice.
+pub(super) fn proof_limit(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &[BoundedTermFrame],
+    by: usize,
+    end: usize,
+) -> usize {
+    let Some(keyword) = pending_value(frames) else {
+        return end;
+    };
+    if by + 1 >= end {
+        return end;
+    }
+    let mut baseline = column(view, tokens, keyword);
+    let first = by + 1;
+    if newline(view, tokens, first) && column(view, tokens, first) <= baseline {
+        // An inline declaration can place `have ... := by` far to the right.
+        // Its first indented tactic establishes the proof's actual baseline.
+        baseline = column(view, tokens, first).saturating_sub(1);
+    }
+    let mut depth = 0usize;
+    for at in first..end {
+        if at > first
+            && depth == 0
+            && newline(view, tokens, at)
+            && column(view, tokens, at) <= baseline
+        {
+            return at;
+        }
+        if let TokenKind::Symbol(s) = &tokens[at].kind {
+            match s.as_str() {
+                "(" | "[" | "{" | ".{" | "⦃" => depth += 1,
+                ")" | "]" | "}" | "⦄" if depth == 0 => return at,
+                ")" | "]" | "}" | "⦄" => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    end
+}
+fn separator(leaves: &Leaves, at: Option<usize>) -> Result<Syntax, NatDefinitionParseError> {
+    Ok(at.map_or_else(|| Ok(null_node(vec![])), |at| leaves.leaf(at))?)
+}
+fn primed_proof(mut proof: Syntax) -> Syntax {
+    if let Syntax::Node { kind, .. } = &mut proof {
+        *kind = parser_kind(&["Term", "byTactic'"]);
+    }
+    proof
+}
+
 impl Prefix {
     pub(super) fn assertion(
         view: &SourceView,
@@ -181,7 +283,14 @@ impl Prefix {
             }
             Phase::Value => {
                 p.value = Some(expression);
-                p.separator = Some(at);
+                if word(tokens, at, ";") {
+                    p.separator = Some(at);
+                } else {
+                    // The pin's semicolonOrLinebreak pushes an empty null node.
+                    // This token belongs to the continuation, not a fake atom.
+                    p.separator = None;
+                    next = at;
+                }
                 p.phase = Phase::Body;
             }
             Phase::Body => return Err(refuse(view, tokens, at)),
@@ -207,7 +316,7 @@ impl Prefix {
             let rhs = if body.kind() == Some(&parser_kind(&["Term", "byTactic"]))
                 && matches!(&leaves.leaf(separator)?, Syntax::Atom { val, .. } if val == "by")
             {
-                body
+                primed_proof(body)
             } else {
                 Syntax::node(
                     parser_kind(&["Term", "fromTerm"]),
@@ -238,7 +347,7 @@ impl Prefix {
             let rhs = if proof.kind() == Some(&parser_kind(&["Term", "byTactic"]))
                 && matches!(&leaves.leaf(intro)?, Syntax::Atom { val, .. } if val == "by")
             {
-                proof
+                primed_proof(proof)
             } else {
                 Syntax::node(
                     parser_kind(&["Term", "fromTerm"]),
@@ -253,12 +362,12 @@ impl Prefix {
                         parser_kind(&["Term", "sufficesDecl"]),
                         vec![binder, p.annotation.expect("suffices proposition"), rhs],
                     ),
-                    leaves.leaf(p.separator.expect("suffices separator"))?,
+                    separator(leaves, p.separator)?,
                     body,
                 ],
             )
         } else {
-            let separator = p.separator.expect("have separator");
+            let separator = separator(leaves, p.separator)?;
             let name = match p.name {
                 Some(at) => leaves.leaf(at)?,
                 None => Syntax::node(
@@ -290,7 +399,7 @@ impl Prefix {
                     atom(leaves, p.keyword, "have")?,
                     Syntax::node(parser_kind(&["Term", "letConfig"]), vec![null_node(vec![])]),
                     Syntax::node(parser_kind(&["Term", "letDecl"]), vec![declaration]),
-                    leaves.leaf(separator)?,
+                    separator,
                     body,
                 ],
             )
