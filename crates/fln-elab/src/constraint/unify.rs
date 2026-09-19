@@ -445,6 +445,7 @@ pub(super) struct TypingConstraint {
     pub expr: Expr,
     pub expected_type: Expr,
     pub depth: u32,
+    pub locals: LocalContext,
 }
 
 enum ValidationTarget {
@@ -1027,18 +1028,19 @@ impl Engine<'_> {
 
     fn solve(
         &mut self,
-        equations: &[(Expr, Expr)],
+        equations: &[Equation],
         typings: &[TypingConstraint],
         delayed: &[DelayedConstraint],
     ) -> Result<(), UnificationError> {
         let mut pending = VecDeque::new();
-        for (left, right) in equations {
+        for (left, right, locals) in equations {
             if left.has_loose_bvars() || right.has_loose_bvars() {
                 return Err(UnificationError::LooseBoundVariable);
             }
             self.scan(left)?;
             self.scan(right)?;
-            pending.push_back((left.clone(), right.clone(), self.work.lctx.clone()));
+            self.reserve_context(locals)?;
+            pending.push_back((left.clone(), right.clone(), locals.clone()));
         }
         for typing in typings {
             if typing.expr.has_loose_bvars() || typing.expected_type.has_loose_bvars() {
@@ -1046,10 +1048,12 @@ impl Engine<'_> {
             }
             self.scan(&typing.expr)?;
             self.scan(&typing.expected_type)?;
+            self.reserve_context(&typing.locals)?;
         }
         for obligation in delayed {
             self.scan(&Expr::mvar(obligation.mvar.clone()))?;
             self.scan(&obligation.val)?;
+            self.reserve_context(&obligation.locals)?;
             if obligation.val.has_loose_bvars() {
                 return Err(UnificationError::LooseBoundVariable);
             }
@@ -1126,14 +1130,10 @@ impl Engine<'_> {
                 let mut typing = self.retry_assignment_types()?;
                 for obligation in typings {
                     self.meter.node()?;
-                    for _ in self.work.lctx.decls() {
-                        self.meter.node()?;
-                    }
-                    let locals = self.work.lctx.clone();
                     if let Some(equation) = self.value_type_equation(
                         &obligation.expected_type,
                         &obligation.expr,
-                        &locals,
+                        &obligation.locals,
                     )? {
                         typing.push_back(equation);
                     }
@@ -1193,18 +1193,35 @@ impl Engine<'_> {
         for typing in typings {
             self.meter.node()?;
             let target = ValidationTarget::Constraint(typing.id);
-            for _ in self.work.lctx.decls() {
-                self.meter.node()?;
-            }
-            let locals = self.work.lctx.clone();
             let prepared = self.prepare_value_check(
                 &target,
                 &typing.expr,
                 &typing.expected_type,
-                &locals,
+                &typing.locals,
                 typing.depth,
             )?;
             self.check_prepared_value(&target, prepared)?;
+        }
+        Ok(())
+    }
+
+    /// Saved contexts can be absent from the active transaction and from every
+    /// metavariable declaration. Reserve all their identities before opening
+    /// binders, and meter their type/value roots under the same request budget.
+    fn reserve_context(&mut self, locals: &LocalContext) -> Result<(), UnificationError> {
+        let mut seen = HashSet::new();
+        for (index, local) in locals.decls().iter().enumerate() {
+            self.meter.node()?;
+            if local.index != index || !seen.insert(local.id.clone()) {
+                return Err(UnificationError::Deferred(
+                    UnificationDeferred::InvalidLocalContext,
+                ));
+            }
+            self.reserved.insert(local.id.clone());
+            self.scan(&local.type_)?;
+            if let Some(value) = &local.value {
+                self.scan(value)?;
+            }
         }
         Ok(())
     }
@@ -1313,12 +1330,31 @@ impl ElabTxn {
         budget: UnificationBudget,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<UnificationReport, UnificationError> {
-        self.unify_obligations_with(equations, &[], &[], budget, cancelled)
+        if cancelled() {
+            return Err(UnificationError::Cancelled);
+        }
+        if equations
+            .len()
+            .saturating_mul(self.lctx.len().saturating_add(1))
+            > budget.max_visited_nodes
+        {
+            return Err(UnificationError::NodeLimit {
+                limit: budget.max_visited_nodes,
+            });
+        }
+        let mut scoped = Vec::new();
+        for (left, right) in equations {
+            if cancelled() {
+                return Err(UnificationError::Cancelled);
+            }
+            scoped.push((left.clone(), right.clone(), self.lctx.clone()));
+        }
+        self.unify_obligations_with(&scoped, &[], &[], budget, cancelled)
     }
 
     pub(super) fn unify_obligations_with(
         &mut self,
-        equations: &[(Expr, Expr)],
+        equations: &[Equation],
         typings: &[TypingConstraint],
         delayed: &[DelayedConstraint],
         budget: UnificationBudget,

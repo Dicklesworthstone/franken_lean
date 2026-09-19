@@ -170,7 +170,8 @@ impl ElabTxn {
 
     /// Postpone an obligation using its current term/context dependencies.
     pub fn postpone(&mut self, kind: ConstraintKind, depth: u32) -> ConstraintId {
-        self.constraints.enqueue_inferred(kind, &self.mvars, depth)
+        self.constraints
+            .enqueue_scoped(kind, &self.mvars, &self.lctx, depth)
     }
 
     /// Assign and return the deterministically ordered obligations to retry.

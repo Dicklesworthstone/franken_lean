@@ -13,6 +13,7 @@ pub(in crate::constraint) struct DelayedConstraint {
     pub fvars: Vec<FVarId>,
     pub val: Expr,
     pub depth: u32,
+    pub locals: LocalContext,
 }
 
 impl Engine<'_> {
@@ -41,10 +42,10 @@ impl Engine<'_> {
             ));
         }
         let mut type_ = declaration.type_.clone();
-        for _ in self.work.lctx.decls() {
+        for _ in obligation.locals.decls() {
             self.meter.node()?;
         }
-        let locals = self.work.lctx.clone();
+        let locals = obligation.locals.clone();
         let mut distinct = HashSet::new();
         let mut applied = Expr::mvar(obligation.mvar.clone());
         let mut staged = VecDeque::new();

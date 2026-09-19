@@ -8,10 +8,12 @@ pub mod unify;
 use self::unify::{
     DelayedConstraint, TypingConstraint, UnificationBudget, UnificationError, UnificationReport,
 };
+use crate::lctx::LocalContext;
 use crate::mvar::{AssignmentJustification, MetavarError, MetavarStore};
 use crate::txn::ElabTxn;
 use fln_core::expr::{Expr, FVarId, MVarId};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Unique identifier for a postponed constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -87,6 +89,28 @@ pub struct Constraint {
     pub kind: ConstraintKind,
     pub reads_mvars: HashSet<MVarId>,
     pub depth: u32,
+    /// The lexical scope at suspension, including an explicitly empty scope.
+    /// Raw queue producers may leave this absent to request the resumer's
+    /// context; `ElabTxn::postpone` always captures it. Sharing the immutable
+    /// snapshot keeps queue/transaction forks from copying its declarations.
+    pub local_context: Option<Arc<LocalContext>>,
+}
+
+impl Constraint {
+    /// Inputs include the saved context: K1 checks its dependent local types
+    /// and let values even when the obligation's terms themselves are ground.
+    pub fn dependencies(&self, store: &MetavarStore) -> HashSet<MVarId> {
+        let mut reads = self.kind.dependencies(store);
+        if let Some(locals) = &self.local_context {
+            for local in locals.decls() {
+                reads.extend(store.collect_mvars(&local.type_));
+                if let Some(value) = &local.value {
+                    reads.extend(store.collect_mvars(value));
+                }
+            }
+        }
+        reads
+    }
 }
 
 /// Hash maps are lookup indexes only: every returned batch is ordered by the
@@ -120,6 +144,16 @@ impl ConstraintQueue {
         reads_mvars: HashSet<MVarId>,
         depth: u32,
     ) -> ConstraintId {
+        self.enqueue_with_context(kind, reads_mvars, depth, None)
+    }
+
+    fn enqueue_with_context(
+        &mut self,
+        kind: ConstraintKind,
+        reads_mvars: HashSet<MVarId>,
+        depth: u32,
+        local_context: Option<Arc<LocalContext>>,
+    ) -> ConstraintId {
         let id = ConstraintId(self.next_id);
         self.next_id += 1;
         for mvar in &reads_mvars {
@@ -135,6 +169,7 @@ impl ConstraintQueue {
                 kind,
                 reads_mvars,
                 depth,
+                local_context,
             },
         );
         id
@@ -148,6 +183,27 @@ impl ConstraintQueue {
     ) -> ConstraintId {
         let reads = kind.dependencies(store);
         self.enqueue(kind, reads, depth)
+    }
+
+    /// Suspend under an immutable lexical snapshot. Wake-ups carry this same
+    /// scope, independently of later entry into or exit from sibling binders.
+    pub fn enqueue_scoped(
+        &mut self,
+        kind: ConstraintKind,
+        store: &MetavarStore,
+        locals: &LocalContext,
+        depth: u32,
+    ) -> ConstraintId {
+        let local_context = Some(Arc::new(locals.clone()));
+        let row = Constraint {
+            id: ConstraintId(self.next_id),
+            kind,
+            reads_mvars: HashSet::new(),
+            depth,
+            local_context,
+        };
+        let reads = row.dependencies(store);
+        self.enqueue_with_context(row.kind, reads, depth, row.local_context)
     }
 
     /// Update observed reads without changing identity or scheduling priority.
@@ -295,8 +351,8 @@ impl ElabTxn {
     /// SynthInstance remains Synod's responsibility, not a unifier verdict.
     /// Delayed rows assign only their designated target; their explicit
     /// arguments must be distinct, in-scope parameter locals, not local lets.
-    /// Like queued DefEq, selected rows are interpreted in this transaction's
-    /// local context. A caller must restore that context before resuming them.
+    /// Each scoped row uses its suspension context, not the caller's current
+    /// binders. Explicitly unscoped raw queue rows use the caller's context.
     pub fn solve_constraints_with(
         &mut self,
         ids: &[ConstraintId],
@@ -330,6 +386,7 @@ impl ElabTxn {
         let mut typings = Vec::new();
         let mut delayed = Vec::new();
         let mut delayed_arguments = 0usize;
+        let mut context_nodes = 0usize;
         for id in &selected {
             if cancelled() {
                 return Err(ConstraintSolveError::Unification(
@@ -351,8 +408,19 @@ impl ElabTxn {
             if defeq_only && !matches!(row.kind, ConstraintKind::DefEq { .. }) {
                 return Err(ConstraintSolveError::NotDefEq(*id));
             }
+            let locals = row.local_context.as_deref().unwrap_or(&self.lctx);
+            context_nodes = context_nodes.saturating_add(locals.len());
+            if context_nodes > budget.max_visited_nodes {
+                return Err(ConstraintSolveError::Unification(
+                    UnificationError::NodeLimit {
+                        limit: budget.max_visited_nodes,
+                    },
+                ));
+            }
             match &row.kind {
-                ConstraintKind::DefEq { lhs, rhs } => equations.push((lhs.clone(), rhs.clone())),
+                ConstraintKind::DefEq { lhs, rhs } => {
+                    equations.push((lhs.clone(), rhs.clone(), locals.clone()));
+                }
                 ConstraintKind::HasType {
                     expr,
                     expected_type,
@@ -361,6 +429,7 @@ impl ElabTxn {
                     expr: expr.clone(),
                     expected_type: expected_type.clone(),
                     depth: row.depth,
+                    locals: locals.clone(),
                 }),
                 ConstraintKind::DelayedAssign { mvar, fvars, val } => {
                     delayed_arguments = delayed_arguments.saturating_add(fvars.len());
@@ -377,6 +446,7 @@ impl ElabTxn {
                         fvars: fvars.clone(),
                         val: val.clone(),
                         depth: row.depth,
+                        locals: locals.clone(),
                     });
                 }
                 _ => return Err(ConstraintSolveError::UnsupportedKind(*id)),
