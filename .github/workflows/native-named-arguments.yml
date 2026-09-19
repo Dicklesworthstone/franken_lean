@@ -1,0 +1,116 @@
+name: Native named arguments
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-named-arguments.yml'
+      - 'crates/fln-parse/src/**'
+      - 'crates/fln-elab/src/**'
+      - 'crates/fln-parse/tests/named_arguments.rs'
+      - 'crates/fln/tests/source_named_arguments.rs'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  named-arguments:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Assemble native source integration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'named-arguments'
+          evidence.mkdir()
+          (evidence / 'base.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          def blob(sha):
+              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  data = json.load(response)
+              assert data['encoding'] == 'base64'
+              content = base64.b64decode(data['content'])
+              assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
+              return content
+          additions = {
+              'crates/fln-elab/src/source/application.rs': 'f22ea1eda887dc50bbff33a2485d249f7f30e206',
+              'crates/fln/tests/source_named_arguments.rs': 'd6183df4fa77ac37b706e623d99a4016189916db',
+              'crates/fln-parse/tests/named_arguments.rs': '5dda32cf166a9fb414780e661b8e488fa776a9f7',
+          }
+          paths = list(additions) + ['crates/fln-parse/src/lib.rs', 'crates/fln-elab/src/source.rs']
+          if not pathlib.Path(paths[0]).exists():
+              for name, sha in additions.items():
+                  path = pathlib.Path(name)
+                  assert not path.exists(), name
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(blob(sha))
+              script = evidence / 'integrate.py'
+              script.write_bytes(blob('22326628a062cb5b8b4bc66034be8183e4ca4c88'))
+              subprocess.run(['python3', '-I', str(script)], check=True)
+          (evidence / 'paths.json').write_text(json.dumps(paths))
+          for line in open('.beads/issues.jsonl'):
+              row = json.loads(line)
+              if row['id'] in ('fln-pv1', 'fln-qb5'):
+                  print('ACTIVE_CORE_BEAD', json.dumps(row), flush=True)
+      - name: Check native named applications and regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/named-arguments"
+          exec > >(tee "$evidence/validation.log") 2>&1
+          toolchain=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
+          rustc -Vv
+          python3 -I - <<'PY'
+          import json, os, pathlib, subprocess
+          paths = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'named-arguments/paths.json').read_text())
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',*paths], check=True)
+          PY
+          cargo test --locked -p fln-parse --test named_arguments -- --nocapture
+          cargo test --locked -p fln --test source_named_arguments -- --nocapture
+          cargo test --locked -p fln-parse -p fln-elab -p fln --all-targets --no-fail-fast -- --quiet
+          cargo clippy --locked -p fln-parse -p fln-elab -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+          git diff --check
+      - name: Export exact tested source tree without moving main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess, urllib.request
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'named-arguments'
+          paths = json.loads((evidence / 'paths.json').read_text())
+          subprocess.run(['git','add','--',*paths], check=True)
+          (evidence / 'integration.patch').write_bytes(subprocess.check_output(['git','diff','--cached','--binary']))
+          def post(endpoint, value):
+              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint, data=json.dumps(value).encode(), method='POST', headers={'Accept':'application/vnd.github+json','Content-Type':'application/json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          entries = []
+          for name in paths:
+              content = pathlib.Path(name).read_bytes()
+              assert content == subprocess.check_output(['git','show',':' + name])
+              sha = hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest()
+              assert post('blobs', {'content': content.decode(), 'encoding':'utf-8'})['sha'] == sha
+              entries.append({'path':name,'mode':'100644','type':'blob','sha':sha})
+              copy = evidence / 'files' / name
+              copy.parent.mkdir(parents=True, exist_ok=True)
+              copy.write_bytes(content)
+          tree = post('trees', {'base_tree':subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip(),'tree':entries})['sha']
+          assert tree == subprocess.check_output(['git','write-tree'], text=True).strip()
+          result = {'parent':(evidence / 'base.txt').read_text().strip(), 'tree':tree, 'files':entries}
+          (evidence / 'tested-tree.json').write_text(json.dumps(result, indent=2))
+          print('VALIDATED_SOURCE_TREE ' + json.dumps(result), flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-named-arguments-${{ github.sha }}
+          path: ${{ runner.temp }}/named-arguments
+          retention-days: 7
+          if-no-files-found: error
