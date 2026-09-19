@@ -379,3 +379,239 @@ fn malformed_saved_context_is_not_repaired_by_an_innocent_resumer() {
     );
     unchanged(&tx, &before);
 }
+
+fn detached_chain() -> (
+    ElabTxn,
+    Vec<fln_elab::constraint::Constraint>,
+    MVarId,
+    ConstraintId,
+) {
+    let mut tx = transaction();
+    let input = goal(&mut tx, "input", nat(), MetavarKind::Natural);
+    let output = goal(&mut tx, "output", nat(), MetavarKind::Natural);
+    local(&mut tx, "first_scope", nat());
+    tx.postpone(
+        ConstraintKind::DelayedAssign {
+            mvar: output.clone(),
+            fvars: vec![],
+            val: Expr::mvar(input.clone()),
+        },
+        0,
+    );
+    tx.lctx = LocalContext::new();
+    local(&mut tx, "second_scope", nat());
+    let last = typing(&mut tx, Expr::mvar(output.clone()), nat());
+    tx.lctx = LocalContext::new();
+    let ready = tx
+        .assign_mvar(input, number(7), AssignmentJustification::DirectDefEq)
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    (tx, ready, output, last)
+}
+
+#[test]
+fn successive_wakeups_resume_without_reissuing_ids_or_restoring_ambient_binders() {
+    let (mut tx, ready, output, last) = detached_chain();
+    let first = ready[0].id;
+    let report = tx
+        .resume_constraints_with(&ready, budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.solved, vec![first]);
+    assert_eq!(tx.mvars.get_assigned_expr(&output), Some(&number(7)));
+    assert_eq!(
+        report
+            .unification
+            .awakened
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![last]
+    );
+    assert_eq!(
+        report.unification.awakened[0]
+            .local_context
+            .as_deref()
+            .unwrap()
+            .decls()[0]
+            .user_name,
+        name("second_scope")
+    );
+    let final_report = tx
+        .resume_constraints_with(&report.unification.awakened, budget(), &|| false)
+        .unwrap();
+    assert_eq!(final_report.solved, vec![last]);
+    assert_eq!(final_report.unification.kernel_checks, 1);
+    assert!(tx.constraints.is_empty());
+    assert!(tx.lctx.is_empty());
+    assert_eq!(typing(&mut tx, number(7), nat()), ConstraintId(last.0 + 1));
+}
+
+#[test]
+fn ready_rows_can_be_resumed_with_their_original_scopes() {
+    let (mut tx, row) = saved_typing();
+    let ready = tx.constraints.take_ready();
+    assert_eq!(ready.len(), 1);
+    let report = tx
+        .resume_constraints_with(&ready, budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.solved, vec![row]);
+    assert!(tx.constraints.is_empty());
+}
+
+#[test]
+fn a_resume_failure_keeps_borrowed_rows_retriable_and_assignments_atomic() {
+    let (mut tx, mut ready, output, _) = detached_chain();
+    let invalid = typing(&mut tx, Expr::sort(Level::zero()), nat());
+    ready.push(tx.constraints.remove(&invalid).unwrap());
+    let before = tx.clone();
+    assert!(
+        tx.resume_constraints_with(&ready, budget(), &|| false)
+            .is_err()
+    );
+    unchanged(&tx, &before);
+    assert!(!tx.mvars.is_assigned(&output));
+    let report = tx
+        .resume_constraints_with(&ready[..1], budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.solved, vec![ready[0].id]);
+    assert_eq!(tx.mvars.get_assigned_expr(&output), Some(&number(7)));
+}
+
+#[test]
+fn resumed_rows_cannot_overwrite_active_rows_or_supply_competing_versions() {
+    let (mut tx, row) = saved_typing();
+    let still_queued = vec![tx.constraints.constraints()[&row].clone()];
+    let before = tx.clone();
+    assert!(
+        matches!(tx.resume_constraints_with(&still_queued, budget(), &|| false),
+        Err(ConstraintSolveError::AlreadyQueued(id)) if id == row)
+    );
+    unchanged(&tx, &before);
+    let detached = tx.constraints.take_ready();
+    let duplicates = vec![detached[0].clone(), detached[0].clone()];
+    let before = tx.clone();
+    assert!(
+        matches!(tx.resume_constraints_with(&duplicates, budget(), &|| false),
+        Err(ConstraintSolveError::DuplicateResumption(id)) if id == row)
+    );
+    unchanged(&tx, &before);
+    let mut unissued = detached.clone();
+    unissued[0].id = ConstraintId(u64::MAX);
+    assert!(matches!(
+        tx.resume_constraints_with(&unissued, budget(), &|| false),
+        Err(ConstraintSolveError::Missing(ConstraintId(u64::MAX)))
+    ));
+    unchanged(&tx, &before);
+    tx.resume_constraints_with(&detached, budget(), &|| false)
+        .unwrap();
+}
+
+#[test]
+fn resumed_selection_is_stable_and_leaves_unselected_queue_rows_alone() {
+    for reverse in [false, true] {
+        let (mut tx, first) = saved_typing();
+        let second = typing(&mut tx, number(3), nat());
+        let untouched = typing(&mut tx, number(4), nat());
+        let mut rows = vec![
+            tx.constraints.remove(&first).unwrap(),
+            tx.constraints.remove(&second).unwrap(),
+        ];
+        if reverse {
+            rows.reverse();
+        }
+        let report = tx
+            .resume_constraints_with(&rows, budget(), &|| false)
+            .unwrap();
+        assert_eq!(report.solved, vec![first, second]);
+        assert_eq!(tx.constraints.len(), 1);
+        assert!(tx.constraints.constraints().contains_key(&untouched));
+    }
+}
+
+#[test]
+fn resumed_proof_typing_checks_the_obligation_without_solving_the_proof() {
+    let mut tx = transaction();
+    let p = local(&mut tx, "P", Expr::sort(Level::zero()));
+    let proof = goal(&mut tx, "proof", p.clone(), MetavarKind::SyntheticOpaque);
+    let id = typing(&mut tx, Expr::mvar(proof.clone()), p);
+    let row = tx.constraints.remove(&id).unwrap();
+    tx.lctx = LocalContext::new();
+    let before = tx.mvars.clone();
+    let report = tx
+        .resume_constraints_with(&[row], budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.unification.residual_metavariables, vec![proof]);
+    assert_eq!(tx.mvars, before);
+}
+
+#[test]
+fn resumed_batch_cancellation_cannot_publish_a_successful_inner_transaction() {
+    let (base, ready, _, _) = detached_chain();
+    let polls = Cell::new(0);
+    base.clone()
+        .resume_constraints_with(&ready, budget(), &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .unwrap();
+    let total = polls.get();
+    for stop in [1, total / 2, total] {
+        let mut tx = base.clone();
+        polls.set(0);
+        assert!(matches!(
+            tx.resume_constraints_with(&ready, budget(), &|| {
+                polls.set(polls.get() + 1);
+                polls.get() >= stop
+            }),
+            Err(ConstraintSolveError::Unification(
+                UnificationError::Cancelled
+            ))
+        ));
+        unchanged(&tx, &base);
+    }
+}
+
+#[test]
+fn resumed_work_and_assignment_limits_leave_all_state_retriable() {
+    let (mut tx, ready, _, _) = detached_chain();
+    let before = tx.clone();
+    let mut limited = budget();
+    limited.max_visited_nodes = 1;
+    assert!(matches!(
+        tx.resume_constraints_with(&ready, limited, &|| false),
+        Err(ConstraintSolveError::Unification(
+            UnificationError::NodeLimit { .. }
+        ))
+    ));
+    unchanged(&tx, &before);
+    limited = budget();
+    limited.max_assignments = 0;
+    assert!(matches!(
+        tx.resume_constraints_with(&ready, limited, &|| false),
+        Err(ConstraintSolveError::Unification(
+            UnificationError::AssignmentLimit { .. }
+        ))
+    ));
+    unchanged(&tx, &before);
+    tx.resume_constraints_with(&ready, budget(), &|| false)
+        .unwrap();
+}
+
+#[test]
+fn an_instance_request_is_not_disguised_as_a_resumable_equality() {
+    let (mut tx, mut ready, output, _) = detached_chain();
+    let id = tx.postpone(
+        ConstraintKind::SynthInstance {
+            class: nat(),
+            mvar: output,
+        },
+        0,
+    );
+    ready.push(tx.constraints.remove(&id).unwrap());
+    let before = tx.clone();
+    assert!(
+        matches!(tx.resume_constraints_with(&ready, budget(), &|| false),
+        Err(ConstraintSolveError::UnsupportedKind(found)) if found == id)
+    );
+    unchanged(&tx, &before);
+}

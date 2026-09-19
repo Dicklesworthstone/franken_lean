@@ -285,6 +285,10 @@ impl ConstraintQueue {
 #[derive(Debug)]
 pub enum ConstraintSolveError {
     Missing(ConstraintId),
+    /// Detached input must not replace a row still owned by the queue.
+    AlreadyQueued(ConstraintId),
+    /// A detached batch contains two competing versions of the same identity.
+    DuplicateResumption(ConstraintId),
     NotDefEq(ConstraintId),
     UnsupportedKind(ConstraintId),
     Depth {
@@ -299,6 +303,10 @@ impl std::fmt::Display for ConstraintSolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing(id) => write!(f, "constraint {} is not queued", id.0),
+            Self::AlreadyQueued(id) => write!(f, "constraint {} is already queued", id.0),
+            Self::DuplicateResumption(id) => {
+                write!(f, "constraint {} occurs twice in a resumed batch", id.0)
+            }
             Self::NotDefEq(id) => write!(
                 f,
                 "constraint {} is not a definitional-equality obligation",
@@ -332,6 +340,79 @@ pub struct ConstraintSolveReport {
 }
 
 impl ElabTxn {
+    /// Execute rows detached by `assign_mvar`, `take_ready`, or an earlier
+    /// solver report, keeping their original identities and lexical scopes.
+    /// This is the same native solver, not a second scheduler or a proof path.
+    ///
+    /// The caller retains the borrowed rows on failure; no restored rows,
+    /// assignments or wake-ups are published. On success only the selected
+    /// rows are discharged, and further wake-ups are returned for the next
+    /// explicit batch. No fresh constraint IDs are allocated. IDs must have
+    /// been issued by this queue, must be unique, and must not still be queued.
+    pub fn resume_constraints_with(
+        &mut self,
+        rows: &[Constraint],
+        budget: UnificationBudget,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ConstraintSolveReport, ConstraintSolveError> {
+        let cancelled_error = || ConstraintSolveError::Unification(UnificationError::Cancelled);
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        let mut copied = rows.len();
+        let mut selected = BTreeSet::new();
+        for row in rows {
+            if cancelled() {
+                return Err(cancelled_error());
+            }
+            copied = copied
+                .saturating_add(row.reads_mvars.len())
+                .saturating_add(row.local_context.as_deref().map_or(0, LocalContext::len));
+            if copied > budget.max_visited_nodes {
+                return Err(ConstraintSolveError::Unification(
+                    UnificationError::NodeLimit {
+                        limit: budget.max_visited_nodes,
+                    },
+                ));
+            }
+            if row.id.0 >= self.constraints.next_id {
+                return Err(ConstraintSolveError::Missing(row.id));
+            }
+            if !selected.insert(row.id) {
+                return Err(ConstraintSolveError::DuplicateResumption(row.id));
+            }
+            if self.constraints.constraints.contains_key(&row.id) {
+                return Err(ConstraintSolveError::AlreadyQueued(row.id));
+            }
+        }
+        let mut trial = self.clone();
+        for row in rows {
+            for mvar in &row.reads_mvars {
+                if cancelled() {
+                    return Err(cancelled_error());
+                }
+                trial
+                    .constraints
+                    .mvar_to_constraints
+                    .entry(mvar.clone())
+                    .or_default()
+                    .insert(row.id);
+            }
+            trial.constraints.constraints.insert(row.id, row.clone());
+        }
+        let ids: Vec<_> = selected.into_iter().collect();
+        let result = trial.solve_constraints_with(&ids, budget, cancelled);
+        self.budget.heartbeats_consumed = trial.budget.heartbeats_consumed;
+        let report = result?;
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        self.mvars = trial.mvars;
+        self.universes = trial.universes;
+        self.constraints = trial.constraints;
+        Ok(report)
+    }
+
     /// Solve selected queued DefEq obligations as one atomic batch. Callers may
     /// pass IDs in any order or repeat them. Missing, non-DefEq or deeper rows
     /// refuse the selection before mutation. A later solver nonanswer preserves
