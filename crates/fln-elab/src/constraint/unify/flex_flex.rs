@@ -11,8 +11,9 @@
 //! their existing postponement behavior; this is not full Lean unification.
 //!
 //! Distinct heads share the intersection of their local arguments, even when
-//! the argument orders or arities differ. Their captured contexts must agree;
-//! both reconstructed assignments cross K1, and the shared hole stays explicit.
+//! the argument orders or arities differ. The residual captures only their
+//! common lexical context, never the union of private locals. Its depth is no
+//! deeper than either parent. Both reconstructed assignments cross K1.
 use super::*;
 use crate::constraint::ConstraintKind;
 use crate::mvar::MetavarDecl;
@@ -42,10 +43,40 @@ impl Engine<'_> {
             return Ok(false);
         };
         let same_head = left.declaration.id == right.declaration.id;
-        if left.declaration.lctx != right.declaration.lctx
-            || (same_head && left.binders.len() != right.binders.len())
-        {
+        if same_head && left.binders.len() != right.binders.len() {
             return Ok(false);
+        }
+        // A hole created before an intro and one created after it may still
+        // share a solution. Keep only the exact common lexical prefix; using
+        // either entire context would let a private local escape into the other
+        // assignment. Sibling scopes similarly retain just their common parent.
+        let mut common = LocalContext::new();
+        for (a, b) in left
+            .declaration
+            .lctx
+            .decls()
+            .iter()
+            .zip(right.declaration.lctx.decls())
+        {
+            self.meter.node()?;
+            if a != b {
+                break;
+            }
+            if let Some(value) = &a.value {
+                common.add_let(
+                    a.id.clone(),
+                    a.user_name.clone(),
+                    a.type_.clone(),
+                    value.clone(),
+                );
+            } else {
+                common.add_param(
+                    a.id.clone(),
+                    a.user_name.clone(),
+                    a.type_.clone(),
+                    a.binder_info,
+                );
+            }
         }
         let mut retained = Vec::new();
         if same_head {
@@ -86,9 +117,7 @@ impl Engine<'_> {
         // This also checks retained binder domains. In the dependent fragment,
         // intersection is legal only when its entire telescope is well-scoped.
         let free = self.scan(&residual_type)?.fvars;
-        if residual_type.has_loose_bvars()
-            || free.iter().any(|id| !left.declaration.lctx.contains(id))
-        {
+        if residual_type.has_loose_bvars() || free.iter().any(|id| !common.contains(id)) {
             return Ok(false);
         }
         let assignments = if same_head { 1 } else { 2 };
@@ -113,9 +142,11 @@ impl Engine<'_> {
             residual.clone(),
             residual.0.clone(),
             residual_type,
-            left.declaration.lctx,
+            common,
             MetavarKind::Natural,
-            left.declaration.depth.max(right.declaration.depth),
+            // Each parent's conditional K1 check must be allowed to quantify
+            // this residual. A shallower parent cannot depend on a deeper hole.
+            left.declaration.depth.min(right.declaration.depth),
             Some(left.declaration.id.0.clone()),
         );
         let id = left.declaration.id;
@@ -260,7 +291,10 @@ impl Engine<'_> {
                     roots.push(lhs.clone());
                     roots.push(rhs.clone());
                 }
-                ConstraintKind::HasType { expr, expected_type } => {
+                ConstraintKind::HasType {
+                    expr,
+                    expected_type,
+                } => {
                     roots.push(expr.clone());
                     roots.push(expected_type.clone());
                 }
@@ -292,11 +326,16 @@ impl Engine<'_> {
         loop {
             self.meter.node()?;
             let suffix = ordinal.to_string();
-            let id = MVarId(Name::from_components(["_fln_unify_pruned", suffix.as_str()]));
+            let id = MVarId(Name::from_components([
+                "_fln_unify_pruned",
+                suffix.as_str(),
+            ]));
             if !reserved.contains(&id) {
                 return Ok(id);
             }
-            ordinal = ordinal.checked_add(1).ok_or(UnificationError::ExpressionScope)?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(UnificationError::ExpressionScope)?;
         }
     }
 }
