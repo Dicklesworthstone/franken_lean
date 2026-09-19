@@ -604,10 +604,38 @@ impl Engine<'_> {
         let awakened = self
             .work
             .assign_mvar(id.clone(), value, AssignmentJustification::DirectDefEq)
-            .map_err(UnificationError::Metavariable)?;
+            .map_err(|error| match error {
+                // A cyclic candidate for an applied hole is not evidence that
+                // its equation is impossible: ?f x = ?f y may later reduce
+                // after ?f is assigned a constant function. Keep the store's
+                // occurs check, but postpone this failed approximation. A bare
+                // cyclic assignment still retains its original hard error.
+                MetavarError::OccursCheckFailed { .. } if !arguments.is_empty() => {
+                    UnificationError::Deferred(UnificationDeferred::NotAPattern)
+                }
+                other => UnificationError::Metavariable(other),
+            })?;
         self.awakened.extend(awakened);
         self.assigned.push(id.clone());
         Ok(true)
+    }
+
+    /// An unresolved function application must not fall through to rigid
+    /// congruence after both pattern orientations fail. Its eventual function
+    /// may discard arguments, so ?f a = ?g b does not require a = b.
+    fn is_flexible_application(&mut self, expr: &Expr) -> Result<bool, UnificationError> {
+        let ExprNode::App { .. } = expr.node() else {
+            return Ok(false);
+        };
+        let mut head = expr;
+        while let ExprNode::App { f, .. } = head.node() {
+            self.meter.tick()?;
+            head = f;
+        }
+        Ok(matches!(
+            head.node(),
+            ExprNode::MVar { id } if !self.work.mvars.is_assigned(id)
+        ))
     }
 
     fn levels(&mut self, left: &Level, right: &Level) -> Result<(), UnificationError> {
@@ -810,6 +838,15 @@ impl Engine<'_> {
                 }
             }
             (ExprNode::App { f: a, a: b }, ExprNode::App { f: c, a: d }) => {
+                if self.is_flexible_application(&left)?
+                    || self.is_flexible_application(&right)?
+                {
+                    // Keep the whole equation for the next assignment generation.
+                    // Decomposing it now would guess that the eventual function
+                    // is injective. Other rungs, including function eta, remain
+                    // available above and below this rigid-congruence case.
+                    return Err(UnificationError::Deferred(reason));
+                }
                 pending.push_front((b.clone(), d.clone(), locals.clone()));
                 pending.push_front((a.clone(), c.clone(), locals.clone()));
             }
