@@ -22,91 +22,21 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Retain exact current source
-        shell: bash
+      - name: Recover exact digest-bound validation script
+        shell: python
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/collection-source"
-          git archive --format=tar.gz -o "$RUNNER_TEMP/collection-source/source.tar.gz" HEAD
-          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/collection-source/identity.txt"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: collection-source-${{ github.sha }}
-          path: ${{ runner.temp }}/collection-source
-          retention-days: 1
-          if-no-files-found: error
-      - name: Prepare digest-bound implementation increments
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/collection-runtime"
-          cat > "$RUNNER_TEMP/collection-runtime/validate.py" <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          import pathlib, subprocess, textwrap, os
+          stored = subprocess.check_output(['git', 'show', '7f4b754f5997ad5fc9b64646cf7e7821085f2513:.github/workflows/native-collection-runtime.yml'], text=True)
+          start = stored.index('          import base64, gzip, hashlib, json, os, pathlib, subprocess, sys, urllib.request\n')
+          end = stored.index('          PY\n', start)
+          script = textwrap.dedent(stored[start:end])
+          old = 'base64.b64decode(encoded, validate=True)'
+          assert script.count(old) == 1
+          script = script.replace(old, 'base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=True)')
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
-          stage = int(sys.argv[1])
-          out = root / str(stage)
-          out.mkdir()
-          inputs = {
-              1: ('c8e9ab3bcffb8be8cc7f341a3b40b05431a41299', 'a5ee668bbe7c3e66ccc4657af67161460f71b21c211c92940ce46c49c5a17a37'),
-              2: ('bde7d57dbcec3570cb875acbcc4f3a36d30e3d0e', '32fd3e88d877c8c821d161a4d2dd5a51cb791b7b0cb58b0e1211ae006b6251cb'),
-          }
-          def api(path, value=None):
-              payload = None if value is None else json.dumps(value).encode()
-              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + path, data=payload, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  return json.load(response)
-          def blob_sha(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          sha, digest = inputs[stage]
-          blob = api('/git/blobs/' + sha)
-          data = base64.b64decode(blob['content'])
-          assert blob_sha(data) == sha
-          if stage == 1:
-              encoded = base64.b64encode(data).decode()
-              for old, new in [('J2ABdjaI4o1', 'J2ABcjaI4o1'), ('E8nY9dlltG', 'E8nY9dllhtG'), ('CsidZquxmxm6x', 'CsidZquxm6x'), ('HUXYkNfV8J8HA0', 'HUXYkNfV8JHA0')]:
-                  assert encoded.count(old) == 1
-                  encoded = encoded.replace(old, new)
-              data = base64.b64decode(encoded, validate=True)
-          patch = gzip.decompress(data)
-          assert hashlib.sha256(patch).hexdigest() == digest
-          patch_path = out / 'implementation.patch'
-          patch_path.write_bytes(patch)
-          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git a/')]
-          assert paths and len(paths) == len(set(paths))
-          assert all(p.startswith(('crates/', 'examples/')) and '..' not in p.split('/') for p in paths)
-          assert '\ndeleted file mode ' not in patch.decode()
-          before = {}
-          for path in paths:
-              result = subprocess.run(['git', 'rev-parse', 'HEAD:' + path], capture_output=True, text=True)
-              before[path] = result.stdout.strip() if result.returncode == 0 else None
-          def run(args):
-              with (out / 'validation.log').open('a') as log:
-                  log.write('\n$ ' + ' '.join(args) + '\n'); log.flush()
-                  subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, check=True)
-          run(['git', 'apply', '--check', str(patch_path)])
-          run(['git', 'apply', '--index', str(patch_path)])
-          run(['rustc', '-Vv'])
-          run(['cargo', 'test', '--locked', '-p', 'fln', '--test', 'runtime_polymorphic_data'])
-          if stage == 2:
-              run(['cargo', 'test', '--locked', '-p', 'fln', '--lib', '--test', 'runtime_collection_callbacks', '--test', 'runtime_conditionals', '--test', 'runtime_local_functions', '--test', 'runtime_nat_recursion', '--test', 'runtime_records', '--test', 'runtime_recursive_data', '--test', 'runtime_variants', '--test', 'source_module_check'])
-              run(['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_polymorphic_runtime', '--test', 'source_collection_notation', '--test', 'source_module_check'])
-              run(['cargo', 'clippy', '--locked', '-p', 'fln', '-p', 'fln-elab', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings'])
-              run(['cargo', 'check', '--locked', '--workspace', '--all-targets'])
-          run(['git', 'diff', '--cached', '--check'])
-          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
-          assert sorted(actual) == sorted(paths)
-          messages = {1: 'feat(runtime): specialize checked polymorphic data for Golem', 2: 'feat(runtime): execute higher-order collections and imported generic functions'}
-          run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', messages[stage]])
-          rows = []
-          for path in paths:
-              data = pathlib.Path(path).read_bytes()
-              sha = api('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
-              assert sha == blob_sha(data)
-              rows.append({'path': path, 'before': before[path], 'sha': sha, 'mode': '100644', 'type': 'blob'})
-          (out / 'blobs.json').write_text(json.dumps({'base': os.environ['GITHUB_SHA'], 'stage': stage, 'files': rows}, indent=2))
-          run(['git', 'archive', '--format=tar.gz', '-o', str(out / 'source.tar.gz'), 'HEAD'])
-          PY
-          python -m py_compile "$RUNNER_TEMP/collection-runtime/validate.py"
+          root.mkdir()
+          (root / 'validate.py').write_text(script)
+          compile(script, str(root / 'validate.py'), 'exec')
       - name: Validate concrete collection layouts and export exact blobs
         env:
           GH_TOKEN: ${{ github.token }}
