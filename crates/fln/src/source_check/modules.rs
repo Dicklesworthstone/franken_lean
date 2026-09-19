@@ -1,16 +1,16 @@
 //! Source libraries checked module-by-module, without compiling or executing code.
 //!
-//! Each module elaborates exactly once against its own transitive imports. Imports
-//! replay the already elaborated declaration terms through both checking engines;
-//! source is never re-elaborated in a larger sibling environment. Only native,
-//! append-ordered extension suffixes are exported. Diamonds replay shared modules
-//! once in first-discovery order, including their instance and simp journals.
+//! Imports replay already elaborated declarations through both checking engines.
+//! `SourceModuleSession` additionally retains exact, checked module snapshots and
+//! invalidates their transitive consumers when source or import identities change.
 use super::*;
 use crate::SourceModuleInput;
 use std::collections::BTreeMap;
 
+mod cache;
 mod graph;
 mod replay;
+pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
 
 #[derive(Debug, Clone, Copy)]
@@ -39,9 +39,9 @@ impl SourceModuleCheckLimits {
 
 #[derive(Debug)]
 pub struct SourceModuleCheck {
-    /// Aggregate counts and the entry module's complete checked import environment.
     pub checked: SourceFileCheck,
     pub module_order: Vec<Name>,
+    /// Declarations actually replayed in this invocation, not cache-hit work.
     pub replayed_declarations: usize,
 }
 
@@ -108,10 +108,8 @@ impl Meter {
 }
 
 impl Engine {
-    /// Check one closed source-library graph and return only its fully checked entry.
-    /// The supplied engine is the explicit initial environment (typically the native
-    /// source seed); no implicit Reference Init module, filesystem access, or runtime
-    /// execution is hidden here. Every provided module must belong to the closure.
+    /// Check a closed source graph against this explicit initial environment.
+    /// No Reference Init loader, filesystem access or runtime execution is hidden here.
     pub fn check_source_modules(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -122,8 +120,7 @@ impl Engine {
         self.check_source_modules_with_cancel(modules, entry, options, limits, None)
     }
 
-    /// Cancellation is sampled at module and import-replay boundaries. Individual
-    /// declaration checks retain their existing bounded, synchronous contract.
+    /// Cancellation is sampled at module, replay and publication boundaries.
     pub fn check_source_modules_with_cancel(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -132,90 +129,7 @@ impl Engine {
         limits: SourceModuleCheckLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceModuleCheck>, SourceModuleCheckError> {
-        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-            return Ok(Outcome::Inconclusive(Inconclusive::cancelled("source-modules/before-plan")));
-        }
-        let mut meter = Meter { work: 0, bytes: 0, limits };
-        let plan = graph::Plan::new(modules, entry, &mut meter)?;
-        let base_logical_root = self.logical_root(options);
-        let mut exports = BTreeMap::new();
-        let mut commands = 0usize;
-        let mut theorems = 0usize;
-        let mut replayed_declarations = 0usize;
-        let mut entry_result = None;
-        for &index in &plan.order {
-            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                return Ok(Outcome::Inconclusive(Inconclusive::cancelled("source-modules/before-module")));
-            }
-            let dependencies = plan.dependencies_of(index, modules, &mut meter)?;
-            let mut imported = self.clone();
-            for dependency in dependencies {
-                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled("source-modules/before-import")));
-                }
-                let export: &replay::Export = exports.get(&dependency).expect("postorder predecessor");
-                imported = match export.replay(imported, modules[dependency].name, options, &mut meter, cancellation)? {
-                    Outcome::Complete(engine) => engine,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                };
-                replayed_declarations += export.declarations.len();
-            }
-            let mut declarations = Vec::new();
-            let header = &plan.headers[index];
-            let source = &modules[index].source[header.body_start.0..];
-            let mut source_limits = limits.source;
-            source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
-            let result = if source.is_empty() {
-                // An import-only module has no command to charge. In particular,
-                // a dependency may consume the exact aggregate command budget.
-                let root = imported.logical_root(options);
-                Ok(Outcome::Complete(SourceFileCheck {
-                    engine: imported.clone(), files: 1, commands: 0, theorems: 0,
-                    base_logical_root: root, result_logical_root: root,
-                }))
-            } else {
-                imported.check_source_files_recording(
-                    &[source], options, source_limits, Some(&mut declarations),
-                )
-            }.map_err(|mut error| {
-                // The declaration checker operates on the untouched body slice.
-                // Public errors must still point into the original module bytes.
-                match &mut error {
-                    SourceCheckError::Scope { offset, .. } | SourceCheckError::Command { offset, .. } => {
-                        *offset = offset.saturating_add(header.body_start.0);
-                    }
-                    _ => {}
-                }
-                SourceModuleCheckError::Source { module: modules[index].name.clone(), error }
-            })?;
-            let mut checked = match result {
-                Outcome::Complete(checked) => checked,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            commands += checked.commands;
-            theorems += checked.theorems;
-            let export = replay::Export::capture(
-                modules[index].name, imported.environment(), checked.engine.environment(),
-                declarations, &mut meter,
-            )?;
-            exports.insert(index, export);
-            if index == plan.entry {
-                checked.files = plan.order.len();
-                checked.commands = commands;
-                checked.theorems = theorems;
-                checked.base_logical_root = base_logical_root;
-                entry_result = Some(checked);
-            }
-        }
-        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-            return Ok(Outcome::Inconclusive(Inconclusive::cancelled("source-modules/before-publication")));
-        }
-        Ok(Outcome::Complete(SourceModuleCheck {
-            checked: entry_result.expect("entry is last in its postorder"),
-            module_order: plan.order.iter().map(|&index| modules[index].name.clone()).collect(),
-            replayed_declarations,
-        }))
+        cache::run(self, modules, entry, options, limits, cancellation, None)
+            .map(|outcome| outcome.map_complete(|run| run.result.checked))
     }
 }

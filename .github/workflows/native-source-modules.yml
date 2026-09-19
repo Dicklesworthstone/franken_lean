@@ -9,6 +9,7 @@ on:
       - 'crates/fln/src/source_check/modules.rs'
       - 'crates/fln-parse/src/command_scope/imports.rs'
       - 'crates/fln/tests/source_module_check.rs'
+      - 'crates/fln/tests/source_module_session.rs'
       - 'crates/fln-cli/src/source_check.rs'
       - 'crates/fln-cli/src/source_check/**'
       - 'examples/native_modules/**'
@@ -50,10 +51,11 @@ jobs:
           import subprocess
           commands = [
               ['cargo', 'test', '--locked', '-p', 'fln-parse', 'command_scope', '--', '--nocapture'],
-              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_module_check', '--', '--nocapture'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_module_check', '--test', 'source_module_session', '--no-fail-fast'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_module_check', '--', '--nocapture'],
               ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_default_simp', '--test', 'source_instances', '--no-fail-fast'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_check'],
+              ['cargo', 'clippy', '--locked', '-p', 'fln', '--all-targets', '--', '-D', 'warnings'],
               ['cargo', 'check', '--locked', '--workspace', '--all-targets'],
           ]
           failed = []
