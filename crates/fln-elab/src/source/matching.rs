@@ -9,6 +9,7 @@ use super::*;
 use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
+mod mutual;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
@@ -420,7 +421,9 @@ impl Context {
         };
         if family.is_unsafe
             || family.num_nested != 0
-            || family.all != [name.clone()]
+            || family.all.is_empty()
+            || family.all.len() > 8
+            || !family.all.contains(name)
             || parameters.len() != family.num_params as usize + family.num_indices as usize
             || levels.len() != family.base.level_params.len()
         {
@@ -436,8 +439,8 @@ impl Context {
         if rec.is_unsafe
             || rec.num_indices != family.num_indices
             || rec.num_params != family.num_params
-            || rec.num_motives != 1
-            || rec.num_minors as usize != family.ctors.len()
+            || rec.num_motives as usize != family.all.len()
+            || (family.all.len() == 1 && rec.num_minors as usize != family.ctors.len())
             || rec.rules.len() != family.ctors.len()
             || rec.all != family.all
             || !(rec.base.level_params == family.base.level_params
@@ -455,6 +458,11 @@ impl Context {
             }
         };
         let recursive = self.recursive_match(&major.value);
+        // A match is a single-family case split, not mutual function recursion.
+        // The latter needs a separate call-graph and decreasing-argument proof.
+        if recursive && family.all.len() > 1 {
+            return Err(error(MatchError::UnsupportedFamily));
+        }
         // A sole variable/wildcard pattern does not refine any index. Lower it
         // to a checked local binding, retaining the original discriminant type.
         // In particular, `match xs with | _ => xs` must not force `xs` to have
@@ -610,7 +618,7 @@ impl Context {
         let mut rec_levels = if rec.base.level_params == family.base.level_params {
             Vec::new()
         } else {
-            vec![universe]
+            vec![universe.clone()]
         };
         rec_levels.extend(levels.iter().cloned());
         let mut recursor = Typed {
@@ -629,13 +637,12 @@ impl Context {
                 },
             )?;
         }
-        recursor = self.match_apply(
-            recursor,
-            Typed {
-                value: motive,
-                type_: motive_type,
-            },
-        )?;
+        let motive = Typed { value: motive, type_: motive_type };
+        recursor = if family.all.len() == 1 {
+            self.match_apply(recursor, motive)?
+        } else {
+            self.specialize_mutual_match(recursor, &family, &rec, motive, &motive_target, universe)?
+        };
         let MatchPatterns {
             constructors: mut patterns,
             fallback,
@@ -877,6 +884,10 @@ impl Context {
         &mut self,
         constructor: &ConstructorVal,
     ) -> Result<Vec<bool>, NatDefinitionElabError> {
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&constructor.induct) else {
+            return Err(error(MatchError::UnsupportedFamily));
+        };
+        let families = family.all.clone();
         let mut telescope = constructor.base.type_.clone();
         for _ in 0..constructor.num_params {
             self.tick()?;
@@ -907,7 +918,7 @@ impl Context {
                 head = f;
             }
             let recursive =
-                matches!(head.node(), ExprNode::Const { name, .. } if name == &constructor.induct);
+                matches!(head.node(), ExprNode::Const { name, .. } if families.contains(name));
             if !recursive {
                 let mut pending = vec![&domain];
                 let mut seen = HashSet::new();
@@ -917,7 +928,7 @@ impl Context {
                         continue;
                     }
                     match expr.node() {
-                        ExprNode::Const { name, .. } if name == &constructor.induct => {
+                        ExprNode::Const { name, .. } if families.contains(name) => {
                             return Err(error(MatchError::UnsupportedFamily));
                         }
                         ExprNode::App { f, a } => {
