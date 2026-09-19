@@ -555,14 +555,17 @@ impl Context {
         };
         if family.is_unsafe
             || family.num_nested != 0
-            || family.all != [name.clone()]
+            || family.all.is_empty()
+            || family.all.len() > 8
+            || !family.all.contains(name)
+            || (induction && family.all.len() > 1)
             || parameters.len() != family.num_params as usize + family.num_indices as usize
             || levels.len() != family.base.level_params.len()
             || rec.is_unsafe
             || rec.num_params != family.num_params
             || rec.num_indices != family.num_indices
-            || rec.num_motives != 1
-            || rec.num_minors as usize != family.ctors.len()
+            || rec.num_motives as usize != family.all.len()
+            || (family.all.len() == 1 && rec.num_minors as usize != family.ctors.len())
             || rec.rules.len() != family.ctors.len()
             || rec.all != family.all
         {
@@ -730,6 +733,17 @@ impl Context {
         for local in goal.lctx.decls() {
             if !removed.contains(&local.id) {
                 add_local(&mut retained, local);
+            } else if family.all.len() > 1
+                && (local.id == major.id || index_ids.contains(&local.id))
+            {
+                // Sibling motives may mention the original input in R -> R.
+                // Keep those outer identities available for typing hidden IHs,
+                // but not as source-visible locals after the case split. The
+                // selected family's target and dependent hypotheses still use
+                // the actual constructor and its indices in each branch.
+                let mut hidden = local.clone();
+                hidden.user_name = Name::anonymous();
+                add_local(&mut retained, &hidden);
             }
         }
         let mut generalized = self.instantiate(&goal.target)?;
@@ -791,7 +805,7 @@ impl Context {
         } else if rec.base.level_params.len() == levels.len() + 1
             && rec.base.level_params[1..] == family.base.level_params
         {
-            let mut result = vec![universe];
+            let mut result = vec![universe.clone()];
             result.extend(levels.iter().cloned());
             result
         } else {
@@ -813,13 +827,15 @@ impl Context {
                 },
             )?;
         }
-        recursor = self.match_apply(
-            recursor,
-            Typed {
-                value: motive,
-                type_: motive_type,
-            },
-        )?;
+        let motive = Typed {
+            value: motive,
+            type_: motive_type,
+        };
+        recursor = if family.all.len() == 1 {
+            self.match_apply(recursor, motive)?
+        } else {
+            self.specialize_mutual_match(recursor, &family, &rec, motive, &generalized, universe)?
+        };
 
         let mut scripts = HashMap::new();
         let mut fallback = None;

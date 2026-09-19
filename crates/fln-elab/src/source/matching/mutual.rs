@@ -71,7 +71,7 @@ impl Context {
         result
     }
 
-    pub(super) fn specialize_mutual_match(
+    pub(in crate::source) fn specialize_mutual_match(
         &mut self,
         mut recursor: Typed,
         family: &InductiveVal,

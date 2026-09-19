@@ -14,6 +14,14 @@ checker. Missing/duplicate cases, malformed branch types, and false proofs do
 not become successful declarations. The generated induction hypotheses are
 consumed but are not source pattern fields or user-accessible assumptions.
 
+The `cases` tactic uses the same specialization, including dependent hypotheses,
+named scrutinee equations, indexed families and empty-family elimination. A
+branch receives its constructor fields and specialized hypotheses, not a usable
+mutual induction hypothesis. Original major/index identities needed to type
+private sibling motives remain hidden typing dependencies; their source names
+are removed after the case split. Kernel exhaustion remains a typed nonanswer
+and leaves the immutable input environment reusable.
+
 For example, after admitting the mutual `Tree A` / `Forest A` source block:
 
 ```lean
@@ -25,6 +33,10 @@ def first (fallback : Nat) (xs : Forest Nat) : Nat :=
   match xs with
   | .nil => fallback
   | .cons t rest => head t
+
+theorem keep (t : Tree Nat) (P : Tree Nat -> Prop) (h : P t) : P t := by
+  cases t with
+  | node n children => exact h
 ```
 
 The tests construct that block through the existing native mutual-source
@@ -33,10 +45,12 @@ functions. They do not claim a new `mutual ... end` parser, full upstream
 eliminator compatibility, general mutual function recursion, termination
 inference, or runtime-code-generator support. Ordinary pattern matching is not
 permission to treat a sibling's induction hypothesis as a recursive call on the
-selected family.
+selected family. General mutual `induction` remains explicitly unsupported;
+ordinary `cases` does not introduce that stronger capability.
 
 Focused reproduction:
 
 ```sh
 cargo test --locked -p fln --test source_mutual_matching
+cargo test --locked -p fln --test source_mutual_cases
 ```
