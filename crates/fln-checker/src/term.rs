@@ -1330,7 +1330,7 @@ pub(crate) fn substitute_bound_subterms_with(
             replacement: Some((replacement, replacement_root)),
             operation: Operation::Bound { target: index },
             root_mode: Mode::Rewrite { scope: 0 },
-            compact_levels: false,
+            compact_levels: true,
         },
         budget,
         cancelled,

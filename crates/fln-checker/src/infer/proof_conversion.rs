@@ -13,7 +13,7 @@ pub(crate) enum ProofConversionOutcome {
 }
 struct Probe<'a> {
     budget: InferenceBudget,
-    mode: InferenceMode,
+    steps: u64,
     polls: u64,
     cancelled: &'a mut dyn FnMut() -> bool,
     stop: Option<InferenceStop>,
@@ -24,7 +24,7 @@ type Result<T> = std::result::Result<T, Box<InferenceOutcome>>;
 impl Probe<'_> {
     fn progress(&self) -> InferenceProgress {
         InferenceProgress {
-            steps: self.polls,
+            steps: self.steps,
             ..InferenceProgress::default()
         }
     }
@@ -40,20 +40,24 @@ impl Probe<'_> {
                 polls: self.polls,
                 progress: self.progress(),
             });
-        } else if self.polls > self.budget.max_steps {
+        }
+        self.stop.is_some()
+    }
+    fn tick(&mut self) -> Result<()> {
+        if self.poll() {
+            return self.check_stop();
+        }
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > self.budget.max_steps {
             self.stop = Some(InferenceStop::Resource {
                 limit: InferenceLimit::Steps,
                 allowed: self.budget.max_steps,
-                observed: self.polls,
+                observed: self.steps,
                 phase: InferencePhase::DomainComparison,
                 at: 0,
                 progress: self.progress(),
             });
         }
-        self.stop.is_some()
-    }
-    fn tick(&mut self) -> Result<()> {
-        self.poll();
         self.check_stop()
     }
     fn check_stop(&mut self) -> Result<()> {
@@ -134,7 +138,7 @@ impl Probe<'_> {
     }
     fn infer(&mut self, term: &WireExpr, context: &InferenceContext) -> Result<Option<WireExpr>> {
         let budget = self.budget;
-        let mode = self.mode;
+        let mode = InferenceMode::InferOnly;
         let result =
             infer_without_proof_conversion(term, context, mode, budget, &mut || self.poll());
         self.check_stop()?;
@@ -323,7 +327,7 @@ impl Probe<'_> {
                     Some(ExprNode::Lambda {
                         binder_type: rt,
                         body: rb,
-                        ..
+                    ..
                     }),
                 )
                 | (
@@ -345,6 +349,30 @@ impl Probe<'_> {
                     work.push(Work::Binders(l, r, lb, rb, domain.clone(), context.clone()));
                     work.push(Work::Pair(domain, other, context));
                 }
+                (
+                    Some(ExprNode::Projection {
+                        structure_name: ls,
+                        index: li,
+                        expression: le,
+                    }),
+                    Some(ExprNode::Projection {
+                        structure_name: rs,
+                        index: ri,
+                        expression: re,
+                    }),
+                ) if ls == rs && li == ri => {
+                    let le = self.piece(&l, *le)?;
+                    let re = self.piece(&r, *re)?;
+                    work.push(Work::Pair(le, re, context));
+                }
+                (Some(ExprNode::Metadata { expression: le, .. }), _) => {
+                    let le = self.piece(&l, *le)?;
+                    work.push(Work::Pair(le, r, context));
+                }
+                (_, Some(ExprNode::Metadata { expression: re, .. })) => {
+                    let re = self.piece(&r, *re)?;
+                    work.push(Work::Pair(l, re, context));
+                }
                 _ => return Ok(false),
             }
         }
@@ -356,13 +384,13 @@ pub(crate) fn proof_conversion_with(
     left: &WireExpr,
     right: &WireExpr,
     context: &InferenceContext,
-    mode: InferenceMode,
+    _mode: InferenceMode,
     budget: InferenceBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> ProofConversionOutcome {
     let mut probe = Probe {
         budget,
-        mode,
+        steps: 0,
         polls: 0,
         cancelled,
         stop: None,
@@ -372,7 +400,7 @@ pub(crate) fn proof_conversion_with(
     match probe.run(left, right, context) {
         Ok(equal) => ProofConversionOutcome::Complete {
             equal,
-            polls: probe.polls,
+            polls: probe.steps,
         },
         Err(halt) => ProofConversionOutcome::Halted(halt),
     }
