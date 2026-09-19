@@ -35,7 +35,8 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv > "$RUNNER_TEMP/mutual-elimination/compiler.txt"
       - name: Validate and publish the two recovered implementation commits
-        if: github.event.head_commit.message == 'feat(elab): validate and publish native mutual match and cases support'
+        if: >-
+          github.event.head_commit.message == 'feat(elab): validate and publish native mutual match and cases support'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
