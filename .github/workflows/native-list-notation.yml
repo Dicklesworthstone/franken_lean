@@ -34,12 +34,14 @@ jobs:
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-lists'
           root.mkdir()
           (root / 'parent.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
-          req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/51826ebf0d666874ed05473e38133481e20d3a4a', headers={'Accept':'application/vnd.github+json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-          with urllib.request.urlopen(req, timeout=60) as response:
-              stored = json.load(response)
-          payload = base64.b64decode(stored['content'])
-          assert hashlib.sha1(('blob ' + str(len(payload)) + '\0').encode() + payload).hexdigest() == '51826ebf0d666874ed05473e38133481e20d3a4a'
-          patch = gzip.decompress(base64.b64decode(payload))
+          def blob(sha):
+              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  stored = json.load(response)
+              payload = base64.b64decode(stored['content'])
+              assert hashlib.sha1(('blob ' + str(len(payload)) + '\0').encode() + payload).hexdigest() == sha
+              return payload
+          patch = gzip.decompress(base64.b64decode(blob('51826ebf0d666874ed05473e38133481e20d3a4a')))
           assert hashlib.sha256(patch).hexdigest() == '1262225a950fc4cdaba45c7bd9152fe18e3c8ff0520b5adf8db866cc14069266'
           patch_path = root / 'instances.patch'
           patch_path.write_bytes(patch)
@@ -47,6 +49,16 @@ jobs:
           if not pathlib.Path('crates/fln-elab/src/seed/collections/instances.rs').exists():
               subprocess.run(['git','apply','--check',str(patch_path)], check=True)
               subprocess.run(['git','apply',str(patch_path)], check=True)
+          # The old regression requests literal/constructor conversion against
+          # opaque Nat with no Nat.succ declaration. Use the ordinary admitted
+          # family, retaining every assertion and the unifier's authority gate.
+          fixture = 'crates/fln-elab/tests/native_unification_flex.rs'
+          correction = root / 'admitted-nat-fixture.patch'
+          correction.write_bytes(blob('4f53990f39f52fc56e39576a994f01a83a0f54da'))
+          if 'fn inductive_nat_transaction()' not in pathlib.Path(fixture).read_text():
+              subprocess.run(['git','apply','--check',str(correction)], check=True)
+              subprocess.run(['git','apply',str(correction)], check=True)
+          paths.append(fixture)
           (root / 'paths.json').write_text(json.dumps(paths))
       - name: Validate parser, dictionaries, proof checking and scalar execution
         shell: bash
