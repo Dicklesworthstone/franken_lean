@@ -188,14 +188,18 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
     let private_path = base.with_extension("olean.private");
     let private = std::fs::read(&private_path).expect("read Prelude private companion");
     let view = OleanView::parse_with_dependencies(&private, &[&exported, &server]).expect("parse");
-    let infos = DeclDecoder::new(&view, WalkBudget::default()).decode_module_constants().expect("decode");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode");
     let owners: std::collections::BTreeMap<_, _> = infos
         .iter()
         .enumerate()
         .map(|(i, c)| (c.name().clone(), i))
         .collect();
     let mut needed = std::collections::BTreeSet::new();
-    let mut queue = vec![fln_core::name::Name::from_components(target.iter().copied())];
+    let mut queue = vec![fln_core::name::Name::from_components(
+        target.iter().copied(),
+    )];
     loop {
         let mut added = false;
         while let Some(name) = queue.pop() {
@@ -225,12 +229,18 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
                                 stack.push(f.clone());
                                 stack.push(a.clone());
                             }
-                            fln_core::expr::ExprNode::Lam { binder_type, body, .. }
-                            | fln_core::expr::ExprNode::ForallE { binder_type, body, .. } => {
+                            fln_core::expr::ExprNode::Lam {
+                                binder_type, body, ..
+                            }
+                            | fln_core::expr::ExprNode::ForallE {
+                                binder_type, body, ..
+                            } => {
                                 stack.push(binder_type.clone());
                                 stack.push(body.clone());
                             }
-                            fln_core::expr::ExprNode::LetE { type_, value, body, .. } => {
+                            fln_core::expr::ExprNode::LetE {
+                                type_, value, body, ..
+                            } => {
                                 stack.push(type_.clone());
                                 stack.push(value.clone());
                                 stack.push(body.clone());
@@ -247,33 +257,49 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
         for info in &infos {
             match info {
                 ConstantInfo::Induct(ind) => {
-                    if needed.contains(&ind.base.name) || ind.all.iter().any(|m| needed.contains(m)) {
+                    if needed.contains(&ind.base.name) || ind.all.iter().any(|m| needed.contains(m))
+                    {
                         for m in &ind.all {
-                            if !needed.contains(m) { queue.push(m.clone()); }
+                            if !needed.contains(m) {
+                                queue.push(m.clone());
+                            }
                         }
                         for c in &ind.ctors {
-                            if !needed.contains(c) { queue.push(c.clone()); }
+                            if !needed.contains(c) {
+                                queue.push(c.clone());
+                            }
                         }
                     }
                 }
                 ConstantInfo::Ctor(ctor) => {
                     if needed.contains(&ctor.induct) || needed.contains(&ctor.base.name) {
-                        if !needed.contains(&ctor.induct) { queue.push(ctor.induct.clone()); }
-                        if !needed.contains(&ctor.base.name) { queue.push(ctor.base.name.clone()); }
+                        if !needed.contains(&ctor.induct) {
+                            queue.push(ctor.induct.clone());
+                        }
+                        if !needed.contains(&ctor.base.name) {
+                            queue.push(ctor.base.name.clone());
+                        }
                     }
                 }
                 ConstantInfo::Rec(rec) => {
-                    if rec.all.iter().any(|m| needed.contains(m)) || needed.contains(&rec.base.name) {
-                        if !needed.contains(&rec.base.name) { queue.push(rec.base.name.clone()); }
+                    if rec.all.iter().any(|m| needed.contains(m)) || needed.contains(&rec.base.name)
+                    {
+                        if !needed.contains(&rec.base.name) {
+                            queue.push(rec.base.name.clone());
+                        }
                         for m in &rec.all {
-                            if !needed.contains(m) { queue.push(m.clone()); }
+                            if !needed.contains(m) {
+                                queue.push(m.clone());
+                            }
                         }
                     }
                 }
                 ConstantInfo::Defn(defn) => {
                     if defn.all.iter().any(|m| needed.contains(m)) {
                         for m in &defn.all {
-                            if !needed.contains(m) { queue.push(m.clone()); }
+                            if !needed.contains(m) {
+                                queue.push(m.clone());
+                            }
                         }
                     }
                 }
@@ -285,7 +311,9 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
                             fln_core::name::Name::from_components(["Quot", "lift"]),
                             fln_core::name::Name::from_components(["Quot", "ind"]),
                         ] {
-                            if !needed.contains(&q) { queue.push(q); }
+                            if !needed.contains(&q) {
+                                queue.push(q);
+                            }
                         }
                     }
                 }
@@ -303,10 +331,13 @@ fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
 
     let engine = Engine::from_environment(Environment::new());
     let limits = OleanCheckLimits::new(64 * 1024 * 1024, Budget::for_stack_bytes(2 * 1024 * 1024));
-    let mut decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
-        .expect("decode");
+    let mut decoded =
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode");
     decoded.constants = subset;
-    engine.check_decoded_olean(decoded, &KVMap::new(), limits).expect("check_decoded_olean failed")
+    engine
+        .check_decoded_olean(decoded, &KVMap::new(), limits)
+        .expect("check_decoded_olean failed")
 }
 
 #[test]
@@ -354,8 +385,562 @@ fn inspect_lean_syntax() {
 fn inspect_lean_parser_descr_no_confusion() {
     let outcome = check_decl_closure(&["Lean", "ParserDescr", "noConfusion"]);
     let Outcome::Complete(checked) = outcome else {
-        panic!("Lean.ParserDescr.noConfusion dependency closure must pass council, got: {outcome:?}");
+        panic!(
+            "Lean.ParserDescr.noConfusion dependency closure must pass council, got: {outcome:?}"
+        );
     };
     assert!(!checked.declarations.is_empty());
 }
 
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude and Init.Coe companion chains"]
+fn pinned_init_coe_council_run() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+    let prelude_base = lib.join("Init/Prelude.olean");
+    let prelude_exported = std::fs::read(&prelude_base).expect("read exported Prelude");
+    let prelude_server =
+        std::fs::read(prelude_base.with_extension("olean.server")).expect("read Prelude server");
+    let prelude_private =
+        std::fs::read(prelude_base.with_extension("olean.private")).expect("read Prelude private");
+
+    let coe_base = lib.join("Init/Coe.olean");
+    let coe_exported = std::fs::read(&coe_base).expect("read exported Coe");
+    let coe_server =
+        std::fs::read(coe_base.with_extension("olean.server")).expect("read Coe server");
+    let coe_private =
+        std::fs::read(coe_base.with_extension("olean.private")).expect("read Coe private");
+
+    let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
+    let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
+
+    let modules = [
+        fln::OleanModuleInput {
+            name: &prelude_name,
+            artifact: &prelude_exported,
+            server_artifact: Some(&prelude_server),
+            private_artifact: Some(&prelude_private),
+        },
+        fln::OleanModuleInput {
+            name: &coe_name,
+            artifact: &coe_exported,
+            server_artifact: Some(&coe_server),
+            private_artifact: Some(&coe_private),
+        },
+    ];
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let result = engine.check_olean_modules(&modules, &KVMap::new(), limits);
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!("COMPLETE: checked {} modules!", checked.modules.len());
+            for m in &checked.modules {
+                eprintln!(
+                    "  module {}: {} declarations",
+                    m.name.to_display_string(),
+                    m.declarations.len()
+                );
+            }
+            assert_eq!(checked.modules.len(), 2);
+            assert_eq!(checked.modules[0].declarations.len(), 2314);
+            assert_eq!(checked.modules[1].declarations.len(), 158);
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Notation companion chain"]
+fn inspect_init_notation_module() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+    let notation_base = lib.join("Init/Notation.olean");
+    let exported = std::fs::read(&notation_base).expect("read exported Notation");
+    let server =
+        std::fs::read(notation_base.with_extension("olean.server")).expect("read Notation server");
+    let private = std::fs::read(notation_base.with_extension("olean.private"))
+        .expect("read Notation private");
+
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+        .expect("decode Notation");
+
+    eprintln!("Init.Notation module imports:");
+    for import in &decoded.module.imports {
+        eprintln!("  import: {}", import.module.to_display_string());
+    }
+    eprintln!("Init.Notation constant count: {}", decoded.constants.len());
+    let mut inducts = Vec::new();
+    let mut ctors = Vec::new();
+    let mut recs = Vec::new();
+    let mut defs = Vec::new();
+    let mut thms = Vec::new();
+    let mut axioms = Vec::new();
+    let mut opaques = Vec::new();
+    let mut quots = Vec::new();
+    for c in &decoded.constants {
+        match c {
+            ConstantInfo::Induct(i) => inducts.push(i.base.name.to_display_string()),
+            ConstantInfo::Ctor(ctor) => ctors.push(ctor.base.name.to_display_string()),
+            ConstantInfo::Rec(r) => recs.push(r.base.name.to_display_string()),
+            ConstantInfo::Defn(d) => defs.push(d.base.name.to_display_string()),
+            ConstantInfo::Thm(t) => thms.push(t.base.name.to_display_string()),
+            ConstantInfo::Axiom(a) => axioms.push(a.base.name.to_display_string()),
+            ConstantInfo::Opaque(o) => opaques.push(o.base.name.to_display_string()),
+            ConstantInfo::Quot(q) => quots.push(q.base.name.to_display_string()),
+        }
+    }
+    eprintln!("Inductives ({}): {:?}", inducts.len(), inducts);
+    eprintln!("Ctors ({}): {:?}", ctors.len(), ctors);
+    eprintln!("Recs ({}): {:?}", recs.len(), recs);
+    eprintln!("Axioms ({}): {:?}", axioms.len(), axioms);
+    eprintln!("Opaques ({}): {:?}", opaques.len(), opaques);
+    eprintln!("Quots ({}): {:?}", quots.len(), quots);
+    eprintln!("Defs count: {}", defs.len());
+    eprintln!("Thms count: {}", thms.len());
+    for c in &decoded.constants {
+        if c.name()
+            .to_display_string()
+            .starts_with("Lean.Parser.Category")
+        {
+            eprintln!("  {:?}: {:?}", c.name().to_display_string(), c);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude, Init.Coe, and Init.Notation companion chains"]
+fn preflight_init_notation_dependencies() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let prelude = load("Init/Prelude");
+    let coe = load("Init/Coe");
+    let notation = load("Init/Notation");
+
+    let mut available = std::collections::BTreeSet::new();
+    for c in &prelude.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &coe.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &notation.constants {
+        available.insert(c.name().clone());
+    }
+
+    eprintln!(
+        "Total available constants: Prelude={}, Coe={}, Notation={}",
+        prelude.constants.len(),
+        coe.constants.len(),
+        notation.constants.len()
+    );
+
+    let mut missing = std::collections::BTreeSet::new();
+    for c in &notation.constants {
+        let mut exprs = vec![c.constant_val().type_.clone()];
+        match c {
+            ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+            ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+            ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+            _ => {}
+        }
+        for e in exprs {
+            let mut stack = vec![e];
+            while let Some(cur) = stack.pop() {
+                match cur.node() {
+                    fln_core::expr::ExprNode::Const { name, .. } => {
+                        if !available.contains(name) {
+                            missing.insert((c.name().clone(), name.clone()));
+                        }
+                    }
+                    fln_core::expr::ExprNode::App { f, a } => {
+                        stack.push(f.clone());
+                        stack.push(a.clone());
+                    }
+                    fln_core::expr::ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | fln_core::expr::ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_.clone());
+                        stack.push(value.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::Proj { expr, .. } => {
+                        stack.push(expr.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    eprintln!("Missing constants count: {}", missing.len());
+    for (caller, dep) in &missing {
+        eprintln!(
+            "  caller {} needs missing: {}",
+            caller.to_display_string(),
+            dep.to_display_string()
+        );
+    }
+    assert!(
+        missing.is_empty(),
+        "all dependencies of Init.Notation must be available"
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude, Init.Coe, and Init.Notation companion chains"]
+fn pinned_init_prelude_coe_notation_council_run() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let prelude_base = lib.join("Init/Prelude.olean");
+    let prelude_exported = std::fs::read(&prelude_base).expect("read exported Prelude");
+    let prelude_server =
+        std::fs::read(prelude_base.with_extension("olean.server")).expect("read Prelude server");
+    let prelude_private =
+        std::fs::read(prelude_base.with_extension("olean.private")).expect("read Prelude private");
+
+    let coe_base = lib.join("Init/Coe.olean");
+    let coe_exported = std::fs::read(&coe_base).expect("read exported Coe");
+    let coe_server =
+        std::fs::read(coe_base.with_extension("olean.server")).expect("read Coe server");
+    let coe_private =
+        std::fs::read(coe_base.with_extension("olean.private")).expect("read Coe private");
+
+    let notation_base = lib.join("Init/Notation.olean");
+    let notation_exported = std::fs::read(&notation_base).expect("read exported Notation");
+    let notation_server =
+        std::fs::read(notation_base.with_extension("olean.server")).expect("read Notation server");
+    let notation_private = std::fs::read(notation_base.with_extension("olean.private"))
+        .expect("read Notation private");
+
+    let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
+    let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
+    let notation_name = fln_core::name::Name::from_components(["Init", "Notation"]);
+
+    let modules = [
+        fln::OleanModuleInput {
+            name: &prelude_name,
+            artifact: &prelude_exported,
+            server_artifact: Some(&prelude_server),
+            private_artifact: Some(&prelude_private),
+        },
+        fln::OleanModuleInput {
+            name: &coe_name,
+            artifact: &coe_exported,
+            server_artifact: Some(&coe_server),
+            private_artifact: Some(&coe_private),
+        },
+        fln::OleanModuleInput {
+            name: &notation_name,
+            artifact: &notation_exported,
+            server_artifact: Some(&notation_server),
+            private_artifact: Some(&notation_private),
+        },
+    ];
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let result = engine.check_olean_modules(&modules, &KVMap::new(), limits);
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!("COMPLETE: checked {} modules!", checked.modules.len());
+            for m in &checked.modules {
+                eprintln!(
+                    "  module {}: {} declarations",
+                    m.name.to_display_string(),
+                    m.declarations.len()
+                );
+            }
+            assert_eq!(checked.modules.len(), 3);
+            assert_eq!(checked.modules[0].declarations.len(), 2314);
+            assert_eq!(checked.modules[1].declarations.len(), 158);
+            assert_eq!(checked.modules[2].declarations.len(), 284);
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Tactics companion chain"]
+fn inspect_init_tactics_module() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+    let tactics_base = lib.join("Init/Tactics.olean");
+    let exported = std::fs::read(&tactics_base).expect("read exported Tactics");
+    let server =
+        std::fs::read(tactics_base.with_extension("olean.server")).expect("read Tactics server");
+    let private =
+        std::fs::read(tactics_base.with_extension("olean.private")).expect("read Tactics private");
+
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+        .expect("decode Tactics");
+
+    eprintln!("Init.Tactics module imports:");
+    for import in &decoded.module.imports {
+        eprintln!("  import: {}", import.module.to_display_string());
+    }
+    eprintln!("Init.Tactics constant count: {}", decoded.constants.len());
+    let mut inducts = Vec::new();
+    let mut ctors = Vec::new();
+    let mut recs = Vec::new();
+    let mut defs = Vec::new();
+    let mut thms = Vec::new();
+    let mut axioms = Vec::new();
+    let mut opaques = Vec::new();
+    let mut quots = Vec::new();
+    for c in &decoded.constants {
+        match c {
+            ConstantInfo::Induct(i) => inducts.push(i.base.name.to_display_string()),
+            ConstantInfo::Ctor(ctor) => ctors.push(ctor.base.name.to_display_string()),
+            ConstantInfo::Rec(r) => recs.push(r.base.name.to_display_string()),
+            ConstantInfo::Defn(d) => defs.push(d.base.name.to_display_string()),
+            ConstantInfo::Thm(t) => thms.push(t.base.name.to_display_string()),
+            ConstantInfo::Axiom(a) => axioms.push(a.base.name.to_display_string()),
+            ConstantInfo::Opaque(o) => opaques.push(o.base.name.to_display_string()),
+            ConstantInfo::Quot(q) => quots.push(q.base.name.to_display_string()),
+        }
+    }
+    eprintln!("Inductives ({}): {:?}", inducts.len(), inducts);
+    eprintln!("Ctors ({}): {:?}", ctors.len(), ctors);
+    eprintln!("Recs ({}): {:?}", recs.len(), recs);
+    eprintln!("Axioms ({}): {:?}", axioms.len(), axioms);
+    eprintln!("Opaques ({}): {:?}", opaques.len(), opaques);
+    eprintln!("Quots ({}): {:?}", quots.len(), quots);
+    eprintln!("Defs count: {}", defs.len());
+    eprintln!("Thms count: {}", thms.len());
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init companion chains"]
+fn preflight_init_tactics_dependencies() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let load = |name: &str| {
+        let base = lib.join(format!("{name}.olean"));
+        let exported = std::fs::read(&base).expect("read exported");
+        let server = std::fs::read(base.with_extension("olean.server")).expect("read server");
+        let private = std::fs::read(base.with_extension("olean.private")).expect("read private");
+        let limits =
+            OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+        fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+            .expect("decode")
+    };
+
+    let prelude = load("Init/Prelude");
+    let coe = load("Init/Coe");
+    let notation = load("Init/Notation");
+    let tactics = load("Init/Tactics");
+
+    let mut available = std::collections::BTreeSet::new();
+    for c in &prelude.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &coe.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &notation.constants {
+        available.insert(c.name().clone());
+    }
+    for c in &tactics.constants {
+        available.insert(c.name().clone());
+    }
+
+    eprintln!(
+        "Total available constants: Prelude={}, Coe={}, Notation={}, Tactics={}",
+        prelude.constants.len(),
+        coe.constants.len(),
+        notation.constants.len(),
+        tactics.constants.len()
+    );
+
+    let mut missing = std::collections::BTreeSet::new();
+    for c in &tactics.constants {
+        let mut exprs = vec![c.constant_val().type_.clone()];
+        match c {
+            ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+            ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+            ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+            _ => {}
+        }
+        for e in exprs {
+            let mut stack = vec![e];
+            while let Some(cur) = stack.pop() {
+                match cur.node() {
+                    fln_core::expr::ExprNode::Const { name, .. } => {
+                        if !available.contains(name) {
+                            missing.insert((c.name().clone(), name.clone()));
+                        }
+                    }
+                    fln_core::expr::ExprNode::App { f, a } => {
+                        stack.push(f.clone());
+                        stack.push(a.clone());
+                    }
+                    fln_core::expr::ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | fln_core::expr::ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_.clone());
+                        stack.push(value.clone());
+                        stack.push(body.clone());
+                    }
+                    fln_core::expr::ExprNode::Proj { expr, .. } => {
+                        stack.push(expr.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    eprintln!("Missing constants count: {}", missing.len());
+    for (caller, dep) in &missing {
+        eprintln!(
+            "  caller {} needs missing: {}",
+            caller.to_display_string(),
+            dep.to_display_string()
+        );
+    }
+    assert!(
+        missing.is_empty(),
+        "all dependencies of Init.Tactics must be available"
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init 4-module companion chain"]
+fn pinned_init_prelude_coe_notation_tactics_council_run() {
+    let lib = reference_lib().expect("pinned Reference library is unavailable");
+
+    let prelude_base = lib.join("Init/Prelude.olean");
+    let prelude_exported = std::fs::read(&prelude_base).expect("read exported Prelude");
+    let prelude_server =
+        std::fs::read(prelude_base.with_extension("olean.server")).expect("read Prelude server");
+    let prelude_private =
+        std::fs::read(prelude_base.with_extension("olean.private")).expect("read Prelude private");
+
+    let coe_base = lib.join("Init/Coe.olean");
+    let coe_exported = std::fs::read(&coe_base).expect("read exported Coe");
+    let coe_server =
+        std::fs::read(coe_base.with_extension("olean.server")).expect("read Coe server");
+    let coe_private =
+        std::fs::read(coe_base.with_extension("olean.private")).expect("read Coe private");
+
+    let notation_base = lib.join("Init/Notation.olean");
+    let notation_exported = std::fs::read(&notation_base).expect("read exported Notation");
+    let notation_server =
+        std::fs::read(notation_base.with_extension("olean.server")).expect("read Notation server");
+    let notation_private = std::fs::read(notation_base.with_extension("olean.private"))
+        .expect("read Notation private");
+
+    let tactics_base = lib.join("Init/Tactics.olean");
+    let tactics_exported = std::fs::read(&tactics_base).expect("read exported Tactics");
+    let tactics_server =
+        std::fs::read(tactics_base.with_extension("olean.server")).expect("read Tactics server");
+    let tactics_private =
+        std::fs::read(tactics_base.with_extension("olean.private")).expect("read Tactics private");
+
+    let prelude_name = fln_core::name::Name::from_components(["Init", "Prelude"]);
+    let coe_name = fln_core::name::Name::from_components(["Init", "Coe"]);
+    let notation_name = fln_core::name::Name::from_components(["Init", "Notation"]);
+    let tactics_name = fln_core::name::Name::from_components(["Init", "Tactics"]);
+
+    let modules = [
+        fln::OleanModuleInput {
+            name: &prelude_name,
+            artifact: &prelude_exported,
+            server_artifact: Some(&prelude_server),
+            private_artifact: Some(&prelude_private),
+        },
+        fln::OleanModuleInput {
+            name: &coe_name,
+            artifact: &coe_exported,
+            server_artifact: Some(&coe_server),
+            private_artifact: Some(&coe_private),
+        },
+        fln::OleanModuleInput {
+            name: &notation_name,
+            artifact: &notation_exported,
+            server_artifact: Some(&notation_server),
+            private_artifact: Some(&notation_private),
+        },
+        fln::OleanModuleInput {
+            name: &tactics_name,
+            artifact: &tactics_exported,
+            server_artifact: Some(&tactics_server),
+            private_artifact: Some(&tactics_private),
+        },
+    ];
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(128 * 1024 * 1024, Budget::for_stack_bytes(4 * 1024 * 1024));
+    let result = engine.check_olean_modules(&modules, &KVMap::new(), limits);
+    match result {
+        Ok(Outcome::Complete(checked)) => {
+            eprintln!("COMPLETE: checked {} modules!", checked.modules.len());
+            for m in &checked.modules {
+                eprintln!(
+                    "  module {}: {} declarations",
+                    m.name.to_display_string(),
+                    m.declarations.len()
+                );
+            }
+            assert_eq!(checked.modules.len(), 4);
+            assert_eq!(checked.modules[0].declarations.len(), 2314);
+            assert_eq!(checked.modules[1].declarations.len(), 158);
+            assert_eq!(checked.modules[2].declarations.len(), 284);
+            assert_eq!(checked.modules[3].declarations.len(), 360);
+        }
+        Ok(Outcome::Inconclusive(reason)) => {
+            panic!("INCONCLUSIVE: {reason:?}");
+        }
+        Ok(Outcome::InternalFault(fault)) => {
+            panic!("INTERNAL_FAULT: {fault:?}");
+        }
+        Err(error) => {
+            panic!("FRONTIER: {error}");
+        }
+    }
+}
