@@ -8,10 +8,10 @@ permissions:
   contents: write
 concurrency:
   group: native-higher-order-runtime
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   checked-landing:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
       CARGO_TERM_COLOR: never
@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 1
       - name: Install pinned compiler
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component clippy,rustfmt
-      - name: Apply digest-bound implementation
+      - name: Apply digest-bound implementation and recursive callback coverage
         shell: bash
         run: |
           set -euo pipefail
@@ -33,16 +33,19 @@ jobs:
           import base64, hashlib, pathlib, re, subprocess, zlib
           retained = subprocess.check_output(['git', 'show', '4d83f55f81efdd030f24f15e184fb078417206c5:.github/workflows/native-higher-order-runtime.yml'], text=True)
           encoded = re.search(r"base64.b64decode\('([^']+)'\)", retained).group(1)
-          # Repair the transfer transcription; the exact reviewed patch digest
-          # below is the authority and rejects every other byte difference.
           encoded = encoded.replace('WmZmhlh', 'WmZlh')
-          data = zlib.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(data).hexdigest() == '6eae6a84156a543073d7e51129286ea9636d2570c1978d16e52e791a460d2151'
-          path = pathlib.Path('target/native-higher-order/implementation.patch')
-          path.write_bytes(data)
-          if subprocess.run(['git', 'apply', '--reverse', '--check', str(path)], capture_output=True).returncode:
-              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
-              subprocess.run(['git', 'apply', str(path)], check=True)
+          supplement = 'eNqNU01P3DAQvedXDCAhR/lYdhe1ahBo1Y8DUlX1UPVCUWSSya5F4qRjB5a2/PeOE8Jm6ULxIfY4856fZ/yiKAI5yUhaNJOi1BND2YRabVWFEy1tTMYLggCu/pOzWEA0e/cmfAtBPy0WHrhx70G/OLhguL30IhcUGnJsUOeobUpo2tKaVOo8XanlCimtKedvI0lWaJH4H2Gqa5tWyhA2jGAg5sKH317wPCGDCIvWYN6RZ7Isr2R2/ZTY3jUPXDCMEi2gvlFU64op4RQ+baIk0Xgr/JPt9Kq1wMoct1W1ZsjXTdRDDkeUIZzrJSs1n1WlrEmSHAvJsoX/lPjxYk7FuqEkKWUlupLPZ3NXcjdNp481H4YfbsfvFdPQuS7qJPnYnzbK4GOjYS2NQbJ7YnSfmDudVrVVNygOx23yY2VSJOqEB1sV6bJZ9etoWn1LshFjll5Hij/3RI+JN62LS9TCD2H2WsDF0WUI32XZ4jdueJJ8kfZfKOOkzVZodhFMtwk+lLVpCUXq+y9r6B/kjsOfschTU7ptM1huyyM7/flyuns30/lxOIfATaN3MwgaXeBKGozLeqnYOynVtRWHdeP6aLjyLnaYey/wgkF8wFYkzFoyfPO0aHXWpbP5iO56q22MKGnZOjOYjZNxzWCLYlPPfXYGUzYoLQgNCbjagSj6FURnDxvr4Ve/n5xC10rQcKvsCv5A/AuphtMzWLvAtFkG1y4sQDzQX/N67f/QB3gjy+4NK53tYl5DANOTQdXxrMs72g9Hqo9nQ+gex733F+NSrSc='
+          for label, payload, expected in [
+              ('implementation', encoded, '6eae6a84156a543073d7e51129286ea9636d2570c1978d16e52e791a460d2151'),
+              ('recursive-callbacks', supplement, '01224fdbe2f7ec72789b8816ac714667134b57f80568cbd62661fbfcbb6b585e'),
+          ]:
+              data = zlib.decompress(base64.b64decode(payload, validate=True))
+              assert hashlib.sha256(data).hexdigest() == expected, label
+              path = pathlib.Path('target/native-higher-order') / (label + '.patch')
+              path.write_bytes(data)
+              if subprocess.run(['git', 'apply', '--reverse', '--check', str(path)], capture_output=True).returncode:
+                  subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+                  subprocess.run(['git', 'apply', str(path)], check=True)
           PY
       - name: Validate compiler, VM and source execution
         shell: bash
@@ -56,11 +59,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git add crates/fln-comp/src/ingress.rs crates/fln-comp/tests/closure_interfaces.rs crates/fln/src/lib.rs crates/fln/src/runtime.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/callables.rs crates/fln/tests/runtime_higher_order.rs docs/NATIVE_HIGHER_ORDER_EXECUTION.md
+          git add crates/fln-comp/src/ingress.rs crates/fln-comp/tests/closure_interfaces.rs crates/fln/src/lib.rs crates/fln/src/runtime.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/nat.rs crates/fln/tests/runtime_higher_order.rs docs/NATIVE_HIGHER_ORDER_EXECUTION.md
           if ! git diff --cached --quiet; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'feat(runtime): execute typed higher-order callbacks through the native VM' -m 'Derive nondependent monomorphic callback interfaces after dual admission, resolve canonical closure signatures including partial applications, and retain ordinary FIR/FLBC ownership and call validation. Cover nested callbacks, owned captures/results, deterministic artifacts, malformed interfaces and bounded failure-atomic execution. Scoped compiler, VM, engine and runtime tests plus clippy passed on this tree.'
+            git commit -m 'feat(runtime): execute typed higher-order callbacks through the native VM' -m 'Derive nondependent monomorphic callback interfaces after dual admission, resolve canonical closure signatures including partial applications, and retain ordinary FIR/FLBC ownership and call validation. Cover nested and recursive callbacks, owned captures/results, deterministic artifacts, malformed interfaces and bounded failure-atomic execution. Scoped compiler, VM, engine and runtime tests plus clippy passed on this tree.'
             git push origin HEAD:main
           fi
           git rev-parse HEAD > target/native-higher-order/source-commit.txt
