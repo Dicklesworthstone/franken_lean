@@ -12,6 +12,7 @@
 //! its metavariables, universes and constraint queue, atomically on success.
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
+mod application_head;
 mod assignment_types;
 mod assignment_universes;
 mod delayed;
@@ -1162,6 +1163,17 @@ impl Engine<'_> {
                     }
                 }
                 if !progress {
+                    // Rigid-argument applications are not Miller patterns.
+                    // Recover an aligned head only after ordinary constraints
+                    // and shared-residual intersections have had first choice.
+                    for equation in &postponed {
+                        if self.recover_application_head(equation, &mut pending)? {
+                            progress = true;
+                            break;
+                        }
+                    }
+                }
+                if !progress {
                     return Err(UnificationError::Deferred(
                         first_reason
                             .or_else(|| delayed_reason.clone())
@@ -1169,7 +1181,10 @@ impl Engine<'_> {
                     ));
                 }
             }
-            pending = postponed;
+            // Head recovery can produce a type equation. Keep it as well as
+            // every original application; neither a candidate nor its type
+            // hint is authority to discharge an unchecked obligation.
+            pending.extend(postponed);
         }
         for id in self.assigned.clone() {
             self.check_assignment(&id)?;
