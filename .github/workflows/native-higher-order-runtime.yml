@@ -20,21 +20,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 1
+          fetch-depth: 50
       - name: Install pinned compiler
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component clippy,rustfmt
-      - name: Apply digest-bound implementation and recursive callback coverage
+      - name: Apply digest-bound callback implementation
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/native-higher-order
-          git fetch --no-tags --depth=1 origin 4d83f55f81efdd030f24f15e184fb078417206c5
+          git fetch --no-tags --depth=1 origin 4d83f55f81efdd030f24f15e184fb078417206c5 05d0cfcedfb9783ec249b3892a096d951b7c6780
           python3 - <<'PY'
           import base64, hashlib, pathlib, re, subprocess, zlib
-          retained = subprocess.check_output(['git', 'show', '4d83f55f81efdd030f24f15e184fb078417206c5:.github/workflows/native-higher-order-runtime.yml'], text=True)
-          encoded = re.search(r"base64.b64decode\('([^']+)'\)", retained).group(1)
+          def retained(commit):
+              return subprocess.check_output(['git', 'show', commit + ':.github/workflows/native-higher-order-runtime.yml'], text=True)
+          encoded = re.search(r"base64.b64decode\('([^']+)'\)", retained('4d83f55f81efdd030f24f15e184fb078417206c5')).group(1)
           encoded = encoded.replace('WmZmhlh', 'WmZlh')
-          supplement = 'eNqNU01P3DAQvedXDCAhR/lYdhe1ahBo1Y8DUlX1UPVCUWSSya5F4qRjB5a2/PeOE8Jm6ULxIfY4856fZ/yiKAI5yUhaNJOi1BND2YRabVWFEy1tTMYLggCu/pOzWEA0e/cmfAtBPy0WHrhx70G/OLhguL30IhcUGnJsUOeobUpo2tKaVOo8XanlCimtKedvI0lWaJH4H2Gqa5tWyhA2jGAg5sKH317wPCGDCIvWYN6RZ7Isr2R2/ZTY3jUPXDCMEi2gvlFU64op4RQ+baIk0Xgr/JPt9Kq1wMoct1W1ZsjXTdRDDkeUIZzrJSs1n1WlrEmSHAvJsoX/lPjxYk7FuqEkKWUlupLPZ3NXcjdNp481H4YfbsfvFdPQuS7qJPnYnzbK4GOjYS2NQbJ7YnSfmDudVrVVNygOx23yY2VSJOqEB1sV6bJZ9etoWn1LshFjll5Hij/3RI+JN62LS9TCD2H2WsDF0WUI32XZ4jdueJJ8kfZfKOOkzVZodhFMtwk+lLVpCUXq+y9r6B/kjsOfschTU7ptM1huyyM7/flyuns30/lxOIfATaN3MwgaXeBKGozLeqnYOynVtRWHdeP6aLjyLnaYey/wgkF8wFYkzFoyfPO0aHXWpbP5iO56q22MKGnZOjOYjZNxzWCLYlPPfXYGUzYoLQgNCbjagSj6FURnDxvr4Ve/n5xC10rQcKvsCv5A/AuphtMzWLvAtFkG1y4sQDzQX/N67f/QB3gjy+4NK53tYl5DANOTQdXxrMs72g9Hqo9nQ+gex733F+NSrSc='
+          supplement = re.search(r"supplement = '([^']+)'", retained('05d0cfcedfb9783ec249b3892a096d951b7c6780')).group(1)
           for label, payload, expected in [
               ('implementation', encoded, '6eae6a84156a543073d7e51129286ea9636d2570c1978d16e52e791a460d2151'),
               ('recursive-callbacks', supplement, '01224fdbe2f7ec72789b8816ac714667134b57f80568cbd62661fbfcbb6b585e'),
@@ -47,29 +48,46 @@ jobs:
                   subprocess.run(['git', 'apply', '--check', str(path)], check=True)
                   subprocess.run(['git', 'apply', str(path)], check=True)
           PY
-      - name: Validate compiler, VM and source execution
-        shell: bash
-        run: |
+          cat > target/native-higher-order/check.sh <<'SH'
           set -euo pipefail
           cargo +nightly-2026-08-31 test --offline --locked -p fln-comp -p fln-vm 2>&1 | tee target/native-higher-order/compiler-vm.log
           cargo +nightly-2026-08-31 test --offline --locked -p fln --test runtime_higher_order --test runtime_local_functions --test runtime_conditionals --test runtime_nat_recursion --test runtime_records --test runtime_recursive_data --test runtime_variants 2>&1 | tee target/native-higher-order/runtime.log
           cargo +nightly-2026-08-31 test --offline --locked -p fln --lib 2>&1 | tee target/native-higher-order/engine.log
           cargo +nightly-2026-08-31 clippy --offline --locked -p fln-comp -p fln --tests -- -D warnings 2>&1 | tee target/native-higher-order/clippy.log
-      - name: Commit checked implementation directly to main
+          SH
+      - name: Validate compiler, VM and source execution
+        run: bash target/native-higher-order/check.sh
+      - name: Commit and fast-forward main without overwriting concurrent work
         shell: bash
         run: |
           set -euo pipefail
           git add crates/fln-comp/src/ingress.rs crates/fln-comp/tests/closure_interfaces.rs crates/fln/src/lib.rs crates/fln/src/runtime.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/callables.rs crates/fln/src/runtime/nat.rs crates/fln/tests/runtime_higher_order.rs docs/NATIVE_HIGHER_ORDER_EXECUTION.md
-          if ! git diff --cached --quiet; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'feat(runtime): execute typed higher-order callbacks through the native VM' -m 'Derive nondependent monomorphic callback interfaces after dual admission, resolve canonical closure signatures including partial applications, and retain ordinary FIR/FLBC ownership and call validation. Cover nested and recursive callbacks, owned captures/results, deterministic artifacts, malformed interfaces and bounded failure-atomic execution. Scoped compiler, VM, engine and runtime tests plus clippy passed on this tree.'
-            git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo 'Implementation already present'
+            exit 0
           fi
-          git rev-parse HEAD > target/native-higher-order/source-commit.txt
-          git rev-parse HEAD^{tree} > target/native-higher-order/source-tree.txt
-          git archive --format=tar.gz HEAD > target/native-higher-order/source.tar.gz
-          sha256sum target/native-higher-order/source.tar.gz > target/native-higher-order/SHA256SUMS
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(runtime): execute typed higher-order callbacks through the native VM' -m 'Derive nondependent monomorphic callback interfaces after dual admission; resolve canonical closure signatures and partial-application suffixes. Preserve FIR/FLBC ownership and call validation. Cover nested and recursive callbacks, owned values, deterministic artifacts, malformed interfaces and bounded failure-atomic execution.'
+          for attempt in 1 2 3 4; do
+            git rev-parse HEAD > target/native-higher-order/source-commit.txt
+            git rev-parse HEAD^{tree} > target/native-higher-order/source-tree.txt
+            git archive --format=tar.gz HEAD > target/native-higher-order/source.tar.gz
+            sha256sum target/native-higher-order/source.tar.gz > target/native-higher-order/SHA256SUMS
+            if git push origin HEAD:main; then
+              git rev-parse HEAD > target/native-higher-order/published-commit.txt
+              exit 0
+            fi
+            if test "$attempt" = 4; then
+              echo 'Main kept advancing; tested source retained in artifact, never force-pushed' >&2
+              exit 1
+            fi
+            git fetch --no-tags --depth=50 origin main
+            # Exactly our single feature commit is replayed. Conflicts fail closed.
+            git rebase --onto origin/main HEAD^
+            # The rebased tree, not merely its former parent, must pass again.
+            bash target/native-higher-order/check.sh
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
