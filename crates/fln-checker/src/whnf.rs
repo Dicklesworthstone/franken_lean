@@ -1641,6 +1641,187 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }))
     }
 
+    /// KR-316 structure-eta coercion (`to_cnstr_when_structure`): a major of a
+    /// one-constructor, index-free, non-recursive, non-Prop structure type that
+    /// is not already a constructor application becomes
+    /// `mk params (proj 0 major) … (proj n-1 major)`. When the structure has zero
+    /// fields (like PUnit), it simplifies directly to `mk params`. Any gate
+    /// failure returns `Ok(None)` leaving the recursor major unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn recursor_major_to_structure_constructor(
+        &mut self,
+        level_parameters: &[WireName],
+        recursor_type: &WireExpr,
+        current: &Cursor,
+        levels: &[LevelId],
+        arguments: &VecDeque<Cursor>,
+        major_index: usize,
+    ) -> Result<Option<Cursor>, Halt> {
+        if self.major_is_constructor_application(&arguments[major_index])? {
+            return Ok(None);
+        }
+        let instantiated_type = match instantiate_term_parameters_from_level_roots_with(
+            recursor_type,
+            level_parameters,
+            current.arena.levels(),
+            levels,
+            self.control.budget.materialization,
+            &mut *self.cancelled,
+        ) {
+            InstantiationOutcome::Complete(term) => term,
+            InstantiationOutcome::Refused(refusal) => {
+                return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
+                    at: current.root.index(),
+                    refusal,
+                }));
+            }
+            InstantiationOutcome::Inconclusive(stop) => {
+                return Err(Halt::Stop(Box::new(WhnfStop::DefinitionInstantiation {
+                    at: current.root.index(),
+                    stop,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                })));
+            }
+            InstantiationOutcome::InternalFault(fault) => {
+                return Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
+                    at: current.root.index(),
+                    fault,
+                }));
+            }
+        };
+        let mut root = instantiated_type.root();
+        for _ in 0..major_index {
+            self.control.step(root.index(), self.cancelled)?;
+            let Some(ExprNode::Forall { body, .. }) = instantiated_type.node(root) else {
+                return Ok(None);
+            };
+            Self::validate_child(root, *body)?;
+            root = *body;
+        }
+        self.control.step(root.index(), self.cancelled)?;
+        let Some(ExprNode::Forall { binder_type, .. }) = instantiated_type.node(root) else {
+            return Ok(None);
+        };
+        Self::validate_child(root, *binder_type)?;
+        let domain = self.materialize_wire(&instantiated_type, *binder_type, WhnfPhase::Iota)?;
+        let Some(domain) = self.instantiate_k_slots(domain, arguments, major_index)? else {
+            return Ok(None);
+        };
+        let domain = Arc::new(domain);
+        let domain_cursor = Cursor {
+            root: domain.root(),
+            arena: Arc::clone(&domain),
+        };
+        let (domain_head, domain_args) = self.peel_application(&domain_cursor)?;
+        let (inductive_name, inductive_levels) = match self.node(&domain_head)? {
+            ExprNode::Constant { name, levels } => (name.clone(), levels.clone()),
+            _ => return Ok(None),
+        };
+        let Some(inductive_entry) = self.context.source.constants().find(&inductive_name) else {
+            return Ok(None);
+        };
+        let Some(inductive_metadata) = inductive_entry.inductive_metadata() else {
+            return Ok(None);
+        };
+        // Must be a non-recursive, index-free structure with exactly 1 constructor.
+        if inductive_metadata.constructors().len() != 1
+            || inductive_metadata.num_indices() != 0
+            || inductive_metadata.is_recursive()
+        {
+            return Ok(None);
+        }
+        let Some(constructor_name) = inductive_metadata.constructors().first().cloned() else {
+            return Ok(None);
+        };
+        let Some(constructor_entry) = self.context.source.constants().find(&constructor_name)
+        else {
+            return Ok(None);
+        };
+        let Some(constructor_meta) = constructor_entry.constructor_metadata() else {
+            return Ok(None);
+        };
+        let num_fields = usize::try_from(constructor_meta.num_fields()).unwrap_or(usize::MAX);
+        let ctor_params = usize::try_from(constructor_meta.num_parameters()).unwrap_or(usize::MAX);
+
+        // Prop-valued structures are excluded (proof irrelevance covers them).
+        let mut ind_type_root = inductive_entry.type_().root();
+        for _ in 0..inductive_metadata.num_parameters() {
+            let Some(ExprNode::Forall { body, .. }) = inductive_entry.type_().node(ind_type_root) else {
+                break;
+            };
+            ind_type_root = *body;
+        }
+        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root) {
+            if matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero)) {
+                return Ok(None);
+            }
+        }
+
+        // Build the constructor application:
+        // Ctor.{inductive_levels} domain_args[0..ctor_params] (proj 0 major) … (proj (n-1) major)
+        let mut composer = Composer::new(
+            self.control.budget.materialization,
+            WhnfPhase::Iota,
+            self.control.steps,
+            self.control.reductions,
+            &mut *self.cancelled,
+        );
+        let domain_source = composer.source_index(&domain);
+        let mut level_ids = Vec::with_capacity(inductive_levels.len());
+        for level in &inductive_levels {
+            level_ids.push(composer.copy_level_root(domain_source, *level, 0)?);
+        }
+        let mut root = composer.push_expression(
+            ExprNode::Constant {
+                name: constructor_name,
+                levels: level_ids,
+            },
+            1,
+            0,
+        )?;
+        for (index, argument) in domain_args.iter().take(ctor_params).enumerate() {
+            let argument = composer.copy_cursor(argument, index.saturating_add(1))?;
+            root = composer.push_expression(
+                ExprNode::Apply {
+                    function: root,
+                    argument,
+                },
+                1,
+                index,
+            )?;
+        }
+        if num_fields > 0 {
+            let major_cursor =
+                composer.copy_cursor(&arguments[major_index], ctor_params.saturating_add(1))?;
+            for i in 0..num_fields {
+                let proj = composer.push_expression(
+                    ExprNode::Projection {
+                        structure_name: inductive_name.clone(),
+                        index: i as u64,
+                        expression: major_cursor,
+                    },
+                    1,
+                    ctor_params.saturating_add(i),
+                )?;
+                root = composer.push_expression(
+                    ExprNode::Apply {
+                        function: root,
+                        argument: proj,
+                    },
+                    1,
+                    ctor_params.saturating_add(i),
+                )?;
+            }
+        }
+        let term = composer.finish(root);
+        Ok(Some(Cursor {
+            root: term.root(),
+            arena: Arc::new(term),
+        }))
+    }
+
+
     /// Expose one layer of an admitted Nat constructor for a literal major.
     /// Never build a unary numeral: successor fields remain compact literals.
     /// The family and constructors must be present with the expected metadata;
@@ -1770,7 +1951,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
     /// minor premises (the indices are consumed by the motive, never applied
     /// to the rule), then the constructor's fields, then the trailing
     /// arguments. Nat literal majors expose one compact constructor layer;
-    /// String literal majors and structure-eta coercion remain unsupported.
+    /// structure-eta coercion reduces non-Prop structures; String literal
+    /// majors remain unsupported.
     #[allow(clippy::too_many_arguments)]
     fn finish_recursor_reduction(
         &mut self,
@@ -1945,6 +2127,15 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 parameter_count,
             )?
         {
+            major = replacement;
+        } else if let Some(replacement) = self.recursor_major_to_structure_constructor(
+            &level_parameters,
+            &recursor_type,
+            current,
+            &levels,
+            arguments,
+            major_index,
+        )? {
             major = replacement;
         }
         let prefix = parameter_count
