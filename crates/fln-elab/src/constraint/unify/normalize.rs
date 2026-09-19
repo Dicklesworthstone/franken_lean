@@ -315,13 +315,25 @@ fn impredicative_maximum(
 }
 
 fn rebuild(form: &Form, meter: &mut Meter<'_>) -> Result<Level, UnificationError> {
+    if form.is_empty() {
+        return Ok(Level::zero());
+    }
+    // Successor is injective; max is not. Exposing the common offset lets the
+    // ordinary solver cancel successors without pairing or assigning max atoms.
+    let mut common = u32::MAX;
+    for term in form.iter() {
+        meter.node()?;
+        common = common.min(term.offset);
+    }
     let mut result = None;
     for term in form.iter() {
         meter.node()?;
         let mut level = term.atom.clone();
-        for _ in 0..term.offset {
+        for _ in 0..term.offset - common {
             meter.node()?;
-            level = level.succ().map_err(|error| UnificationError::Universe(error.into()))?;
+            level = level
+                .succ()
+                .map_err(|error| UnificationError::Universe(error.into()))?;
         }
         result = Some(match result {
             None => level,
@@ -332,7 +344,14 @@ fn rebuild(form: &Form, meter: &mut Meter<'_>) -> Result<Level, UnificationError
             }
         });
     }
-    Ok(result.unwrap_or_else(Level::zero))
+    let mut result = result.expect("a nonempty normal form has a maximum");
+    for _ in 0..common {
+        meter.node()?;
+        result = result
+            .succ()
+            .map_err(|error| UnificationError::Universe(error.into()))?;
+    }
+    Ok(result)
 }
 
 pub(super) fn simplify(level: &Level, meter: &mut Meter<'_>) -> Result<Level, UnificationError> {

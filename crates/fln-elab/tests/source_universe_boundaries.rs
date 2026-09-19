@@ -51,3 +51,23 @@ fn source_sort_checking_never_uses_cumulativity() {
     }
     checked("def valid : Type := Nat");
 }
+
+#[test]
+fn polymorphic_function_types_infer_their_result_universe() {
+    for source in [
+        "def arrowUniverse.{u,v} (A : Type u) (B : Type v) : Type _ := A -> B",
+        "def dependentUniverse.{u,v} (A : Type u) (B : A -> Type v) : Type _ := forall a : A, B a",
+        "def shiftedUniverse.{u,v} (A : Type (u + 1)) (B : Type v) : Type _ := A -> B",
+    ] {
+        let Declaration::Defn(value) = checked(source) else {
+            panic!("definition")
+        };
+        assert_eq!(
+            value.base.level_params.len(),
+            2,
+            "the result hole must be solved, not generalized: {source}"
+        );
+        assert!(!value.base.type_.has_level_mvar(), "{source}");
+        assert!(!value.value.has_level_mvar(), "{source}");
+    }
+}
