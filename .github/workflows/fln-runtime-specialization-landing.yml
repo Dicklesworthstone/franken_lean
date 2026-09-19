@@ -56,11 +56,12 @@ jobs:
               'crates/fln-elab/src/universe.rs': '4d2433ffb8863f8d531135ddea9b37bd8d616be9',
               'crates/fln-elab/src/universe/parameters.rs': 'b1b83033abd666241dde841ca89ce741d6c12d2a',
               'crates/fln-parse/src/lib.rs': 'b46f7375a72576c59910d147c396b985481fa495',
-              'crates/fln/src/lib.rs': '9c67c24ff3995abcb09b0c2f2ae2ddd3681f1992',
+              'crates/fln/src/lib.rs': '11d692111607b5c76fd46df566227c605851405d',
               'crates/fln/src/runtime.rs': 'c28046ffcca64eabf2681267820039d88f3df191',
               'crates/fln/src/runtime/records.rs': '044398291ce52b45bc3458997dbfb6f944198eb7',
               'crates/fln/tests/source_do.rs': 'fccad2363336d2f1fb3fce7edcab200a1bf5ff7d',
               'docs/NATIVE_DO_NOTATION.md': 'add2dbf10a673bfe347c5a5cae170a595e453034',
+              'crates/fln-checker/src/whnf.rs': '74bcebaed2cc777baa044071c3a5183503e01ac1',
           }
           new = {
               'crates/fln-cli/tests/source_do_runtime.rs',
@@ -96,30 +97,71 @@ jobs:
           mailbox.write_bytes(patch)
           assert not output('git', 'status', '--porcelain')
           run('git', 'apply', '--index', '--whitespace=error', str(mailbox))
+          # Preserve the concurrent checker's semantics while fixing the warning
+          # found after all 992 tests passed in the preceding real-main run.
+          checker = pathlib.Path('crates/fln-checker/src/whnf.rs')
+          old = '\n'.join([
+              '        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root) {',
+              '            if matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero)) {',
+              '                return Ok(None);',
+              '            }',
+              '        }',
+          ])
+          replacement = '\n'.join([
+              '        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root)',
+              '            && matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero))',
+              '        {',
+              '            return Ok(None);',
+              '        }',
+          ])
+          source = checker.read_text()
+          assert source.count(old) == 1
+          checker.write_text(source.replace(old, replacement))
+          run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', str(checker), 'crates/fln/src/lib.rs')
+          run('git', 'add', '--', str(checker), 'crates/fln/src/lib.rs')
           changed = output('git', 'diff', '--cached', '--name-only').splitlines()
           assert set(changed) == set(expected) | new
           run('git', 'diff', '--cached', '--check')
-          checked('fmt', 'rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *(p for p in changed if p.endswith('.rs')))
-          checked('frontend-tests', 'cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--', '--test-threads=1')
           targets = [
               'runtime_conditionals', 'runtime_higher_order', 'runtime_local_functions',
               'runtime_nat_recursion', 'runtime_records', 'runtime_recursive_data',
               'runtime_variants', 'runtime_specialization', 'source_do',
           ]
-          command = ['cargo', 'test', '--locked', '-p', 'fln']
+          runtime_tests = ['cargo', 'test', '--locked', '-p', 'fln']
           for target in targets:
-              command.extend(['--test', target])
-          checked('runtime-tests', *command, '--', '--test-threads=1')
-          checked('runtime-units', 'cargo', 'test', '--locked', '-p', 'fln', '--lib', 'runtime::')
-          checked('cli-tests', 'cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_do_runtime', '--', '--test-threads=1')
-          checked('frontend-clippy', 'cargo', 'clippy', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--all-targets', '--', '-D', 'warnings')
-          checked('product-clippy', 'cargo', 'clippy', '--locked', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings')
-          checked('workspace-check', 'cargo', 'check', '--locked', '--workspace', '--all-targets')
+              runtime_tests.extend(['--test', target])
+          runtime_tests.extend(['--', '--test-threads=1'])
+          checks = [
+              ('fmt', ['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', *(p for p in changed if p.endswith('.rs'))]),
+              ('frontend-tests', ['cargo', 'test', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--', '--test-threads=1']),
+              ('runtime-tests', runtime_tests),
+              ('runtime-units', ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'runtime::']),
+              ('cli-tests', ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_do_runtime', '--', '--test-threads=1']),
+              ('frontend-clippy', ['cargo', 'clippy', '--locked', '-p', 'fln-parse', '-p', 'fln-elab', '--all-targets', '--', '-D', 'warnings']),
+              ('product-clippy', ['cargo', 'clippy', '--locked', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings']),
+              ('workspace-check', ['cargo', 'check', '--locked', '--workspace', '--all-targets']),
+          ]
+          def validate(prefix):
+              for label, command in checks:
+                  checked(prefix + label, *command)
+          validate('')
           run('git', 'config', 'user.name', 'github-actions[bot]')
           run('git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
           run('git', 'commit', '-m', 'feat(runtime): execute specialized polymorphic and monadic source programs')
-          run('git', 'push', 'origin', 'HEAD:main')
-          (root / 'published-commit.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
+          # No force push, discarded work, or unchecked rebased publication.
+          # Every changed base receives the same complete validation again.
+          for attempt in range(5):
+              if subprocess.run(['git', 'push', 'origin', 'HEAD:main']).returncode == 0:
+                  (root / 'published-commit.txt').write_text(output('git', 'rev-parse', 'HEAD') + '\n')
+                  break
+              run('git', 'fetch', 'origin', 'main')
+              previous = output('git', 'rev-parse', 'HEAD')
+              run('git', 'rebase', 'origin/main')
+              assert output('git', 'rev-parse', 'HEAD') != previous, 'push failed without a changed base'
+              assert not output('git', 'status', '--porcelain')
+              validate('rebase-' + str(attempt + 1) + '-')
+          else:
+              raise RuntimeError('concurrent publication retry limit reached')
       - name: Retain final source and worktree status
         if: always()
         shell: bash

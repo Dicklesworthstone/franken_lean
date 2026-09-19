@@ -1747,15 +1747,16 @@ impl<'a, 'c> Reducer<'a, 'c> {
         // Prop-valued structures are excluded (proof irrelevance covers them).
         let mut ind_type_root = inductive_entry.type_().root();
         for _ in 0..inductive_metadata.num_parameters() {
-            let Some(ExprNode::Forall { body, .. }) = inductive_entry.type_().node(ind_type_root) else {
+            let Some(ExprNode::Forall { body, .. }) = inductive_entry.type_().node(ind_type_root)
+            else {
                 break;
             };
             ind_type_root = *body;
         }
-        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root) {
-            if matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero)) {
-                return Ok(None);
-            }
+        if let Some(ExprNode::Sort { level }) = inductive_entry.type_().node(ind_type_root)
+            && matches!(inductive_entry.type_().level(*level), Some(LevelNode::Zero))
+        {
+            return Ok(None);
         }
 
         // Build the constructor application:
@@ -1820,7 +1821,6 @@ impl<'a, 'c> Reducer<'a, 'c> {
             arena: Arc::new(term),
         }))
     }
-
 
     /// Expose one layer of an admitted Nat constructor for a literal major.
     /// Never build a unary numeral: successor fields remain compact literals.
@@ -2206,7 +2206,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
             NatBudget::new(steps, materialization.max_output_units),
         );
         let result = reduce_nat_at_with(
-            NatReductionQuery::new(&app.arena, app.root, &app.arena, app.root, self.context.source),
+            NatReductionQuery::new(
+                &app.arena,
+                app.root,
+                &app.arena,
+                app.root,
+                self.context.source,
+            ),
             budget,
             NatReductionScope::ClosedPair,
             &mut *self.cancelled,

@@ -7,6 +7,7 @@ mod callables;
 mod data_recursion;
 mod nat;
 mod records;
+mod specialize;
 mod variants;
 
 use super::*;
@@ -29,6 +30,7 @@ pub(super) struct Preparation<'a> {
     nat_family_checked: bool,
     value_types: ExecutableValueTypes,
     interfaces: Vec<fln_comp::ingress::ClosureSignature>,
+    specializations: specialize::Store,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
 
@@ -43,6 +45,7 @@ enum Task {
         result: ValueType,
     },
     Visit(Expr),
+    Callee(Expr),
     Apply(usize),
     Lam {
         name: Name,
@@ -82,6 +85,7 @@ impl<'a> Preparation<'a> {
             nat_family_checked: false,
             value_types: ExecutableValueTypes::bounded_source(),
             interfaces: Vec::new(),
+            specializations: specialize::Store::default(),
             constructors: Vec::new(),
         }
     }
@@ -265,6 +269,22 @@ impl<'a> Preparation<'a> {
                 Task::Visit(expr) => {
                     if matches!(expr.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&expr)?;
+                        if let Some(specialized) = self.specialize_call(&head, &args)? {
+                            tasks.push(Task::Visit(specialized));
+                            continue;
+                        }
+                        if let Some(reduced) = self.static_apply(&head, &args)? {
+                            tasks.push(Task::Visit(reduced));
+                            continue;
+                        }
+                        if let Some(partial) = self.partial_call(&head, &args)? {
+                            tasks.push(Task::Visit(partial));
+                            continue;
+                        }
+                        if let Some(annotated) = self.annotate_call(&head, &args)? {
+                            tasks.push(Task::Visit(annotated));
+                            continue;
+                        }
                         if matches!(head.node(), ExprNode::Const { name: n, levels }
                             if n == &name("Bool.rec") && levels.len() == 1)
                             && args.len() == 4
@@ -392,7 +412,11 @@ impl<'a> Preparation<'a> {
                         })?;
                         tasks.push(Task::Apply(args.len()));
                         tasks.extend(args.into_iter().rev().map(Task::Visit));
-                        tasks.push(Task::Visit(head));
+                        tasks.push(if matches!(head.node(), ExprNode::Const { .. }) {
+                            Task::Callee(head)
+                        } else {
+                            Task::Visit(head)
+                        });
                         continue;
                     }
                     match expr.node() {
@@ -410,7 +434,7 @@ impl<'a> Preparation<'a> {
                         } => {
                             tasks.push(Task::Lam {
                                 name: binder_name.clone(),
-                                type_: binder_type.clone(),
+                                type_: self.normalize_type(binder_type)?,
                                 info: *binder_info,
                             });
                             tasks.push(Task::Visit(body.clone()));
@@ -424,7 +448,7 @@ impl<'a> Preparation<'a> {
                         } => {
                             tasks.push(Task::Let {
                                 name: name.clone(),
-                                type_: type_.clone(),
+                                type_: self.normalize_type(type_)?,
                                 nondep: *nondep,
                             });
                             tasks.push(Task::Visit(body.clone()));
@@ -436,6 +460,10 @@ impl<'a> Preparation<'a> {
                             idx,
                             expr,
                         } => {
+                            if let Some(selected) = self.static_projection(type_name, *idx, expr)? {
+                                tasks.push(Task::Visit(selected));
+                                continue;
+                            }
                             self.value_type(&Expr::const_(type_name.clone(), vec![]))?;
                             tasks.push(Task::Proj {
                                 name: type_name.clone(),
@@ -444,11 +472,21 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(expr.clone()));
                         }
                         ExprNode::Const { name, .. } => {
+                            if let Some(partial) = self.partial_call(&expr, &[])? {
+                                tasks.push(Task::Visit(partial));
+                                continue;
+                            }
                             self.constructor(name)?;
                             values.push(expr.clone());
                         }
                         _ => values.push(expr.clone()),
                     }
+                }
+                Task::Callee(expr) => {
+                    if let ExprNode::Const { name, .. } = expr.node() {
+                        self.constructor(name)?;
+                    }
+                    values.push(expr);
                 }
                 Task::ConstructorCase {
                     name,
@@ -642,6 +680,34 @@ fn result_ownership(result: ValueType) -> CallableResultOwnership {
         ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
         _ => CallableResultOwnership::Owned,
     }
+}
+
+/// Purely syntactic template classification. Actual uses still require complete
+/// type/instance arguments, ordinary admission, and compiler validation.
+pub(super) fn is_template(definition: &DefinitionVal) -> bool {
+    if !definition.base.level_params.is_empty() {
+        return true;
+    }
+    match definition.base.type_.node() {
+        ExprNode::Sort { .. } => true,
+        ExprNode::ForallE {
+            binder_type,
+            binder_info,
+            ..
+        } => {
+            *binder_info == BinderInfo::InstImplicit
+                || matches!(binder_type.node(), ExprNode::Sort { .. })
+                || matches!(binder_type.node(), ExprNode::ForallE { .. })
+                    && type_constructor_kind(binder_type)
+        }
+        _ => false,
+    }
+}
+fn type_constructor_kind(mut type_: &Expr) -> bool {
+    while let ExprNode::ForallE { body, .. } = type_.node() {
+        type_ = body;
+    }
+    matches!(type_.node(), ExprNode::Sort { .. })
 }
 
 #[cfg(test)]

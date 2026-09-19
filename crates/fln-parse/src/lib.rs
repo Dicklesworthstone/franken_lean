@@ -1817,7 +1817,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
             TokenKind::Symbol(symbol)
                 if matches!(
                     symbol.as_str(),
-                    "def" | "theorem" | "structure" | "class" | "inductive"
+                    "def" | "theorem" | "instance" | "structure" | "class" | "inductive"
                 ) =>
             {
                 let parsed = parse_definition(source)?;

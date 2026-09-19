@@ -603,6 +603,7 @@ impl Engine<'_> {
                 UnificationDeferred::EscapingLocal(id.clone()),
             ));
         }
+        self.assignment_residual_scope(id, &value, &declaration.lctx, declaration.depth)?;
         let typing = self.assignment_type_equation(&function_type, rhs, locals)?;
         self.assignment_slot()?;
         let awakened = self

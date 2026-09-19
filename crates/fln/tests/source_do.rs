@@ -179,3 +179,25 @@ theorem matchedValue : matched = 8 := by rfl
 "#,
     );
 }
+
+#[test]
+fn do_programs_execute_through_golem() {
+    use fln::{EngineExecutionLimits, VmExit};
+    let source = "def runDo : Id Nat := do let x ← (17 : Id Nat); return (x + 25)\n#eval runDo";
+    let result = engine()
+        .execute_source_definitions(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &result.executions.last().unwrap().exit else {
+        panic!("not returned")
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+}
