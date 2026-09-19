@@ -30,7 +30,7 @@ impl Context {
 
     /// Probe one isolated equation without publishing a failed assignment or
     /// consuming the caller's unrelated suspended source equations.
-    fn coercion_eq(
+    pub(in crate::source) fn coercion_eq(
         &mut self,
         actual: &Expr,
         expected: &Expr,

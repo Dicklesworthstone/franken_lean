@@ -195,6 +195,18 @@ pub fn elaborate_inductive(
     inductive::elaborate_inductive_scoped(syntax, env, kernel, budget, scope)
 }
 
+/// Elaborate a mutual family group into one candidate, with no provisional
+/// global declarations. The caller must admit the whole result atomically.
+pub fn elaborate_mutual_inductives(
+    syntax: &[Syntax],
+    env: &Environment,
+    kernel: Budget,
+    budget: crate::records::RecordBudget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    inductive::elaborate_mutual(syntax, env, kernel, budget, scope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

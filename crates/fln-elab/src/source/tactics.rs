@@ -218,7 +218,12 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<ProofState<'a>, NatDefinitionElabError> {
         let target = expected.ok_or_else(|| error(TacticError::ExpectedGoal))?;
-        let parts = expect_node(syntax, &parser_kind(&["Term", "byTactic"]), 2, "by proof")?;
+        let kind = if syntax.kind() == Some(&parser_kind(&["Term", "byTactic'"])) {
+            parser_kind(&["Term", "byTactic'"])
+        } else {
+            parser_kind(&["Term", "byTactic"])
+        };
+        let parts = expect_node(syntax, &kind, 2, "by proof")?;
         expect_atom(&parts[0], "by", "by keyword")?;
         let instructions = self.proof_instructions(&parts[1])?;
         let (root, goal) = self.proof_goal(target.clone())?;

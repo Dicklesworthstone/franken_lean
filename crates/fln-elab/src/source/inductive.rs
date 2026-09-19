@@ -6,6 +6,9 @@ use crate::inductive::{
 };
 use crate::records::{Builder, RecordBudget};
 
+mod mutual;
+pub(super) use mutual::elaborate_mutual;
+
 pub fn is_inductive(syntax: &Syntax) -> bool {
     matches!(syntax,Syntax::Node { kind,args,.. } if kind == &parser_kind(&["Command","declaration"])
         && matches!(args.as_slice(),[_,Syntax::Node { kind,.. }] if kind == &parser_kind(&["Command","inductive"])))
@@ -87,13 +90,23 @@ pub fn elaborate_inductive(
     elaborate_inductive_scoped(syntax, env, kernel, budget, &SourceScope::default())
 }
 
-pub(super) fn elaborate_inductive_scoped(
-    syntax: &Syntax,
+struct Header<'a> {
+    context: Context,
+    name: Name,
+    parameters: Vec<LocalDecl>,
+    indices: Vec<LocalDecl>,
+    explicit: Option<Level>,
+    family_type: Expr,
+    ctors: &'a [Syntax],
+}
+
+fn header<'a>(
+    syntax: &'a Syntax,
     env: &Environment,
     kernel: Budget,
     budget: RecordBudget,
     scope: &SourceScope,
-) -> Result<Declaration, NatDefinitionElabError> {
+) -> Result<Header<'a>, NatDefinitionElabError> {
     let root = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -153,14 +166,14 @@ pub(super) fn elaborate_inductive_scoped(
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     let mut context = Context::scoped(env, kernel, scope);
-    let name = &context.enter_declaration(name)?;
-    if env.contains(name) {
+    let name = context.enter_declaration(name)?;
+    if env.contains(&name) {
         return Err(invalid());
     }
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
-    let mut parameters = context.bind_parameters(&sig[0])?;
-    if parameters.iter().any(|p| &p.user_name == name) {
+    let parameters = context.bind_parameters(&sig[0])?;
+    if parameters.iter().any(|p| p.user_name == name) {
         return Err(invalid());
     }
     let parameter_context = context.txn.lctx.clone();
@@ -223,6 +236,33 @@ pub(super) fn elaborate_inductive_scoped(
     let family_type = closer
         .close(&parameters, indexed_result, false, false)
         .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
+    Ok(Header {
+        context,
+        name,
+        parameters,
+        indices,
+        explicit,
+        family_type,
+        ctors,
+    })
+}
+
+pub(super) fn elaborate_inductive_scoped(
+    syntax: &Syntax,
+    env: &Environment,
+    kernel: Budget,
+    budget: RecordBudget,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let Header {
+        mut context,
+        name,
+        mut parameters,
+        mut indices,
+        explicit,
+        family_type,
+        ctors,
+    } = header(syntax, env, kernel, budget, scope)?;
     let self_id = FVarId(context.fresh_name()?);
     context.txn.lctx.add_param(
         self_id.clone(),
@@ -230,6 +270,114 @@ pub(super) fn elaborate_inductive_scoped(
         family_type,
         BinderInfo::Default,
     );
+    let Bodies {
+        mut constructors,
+        field_universes,
+        annotations,
+        inferred,
+    } = bodies(&mut context, &parameters, &indices, &self_id, ctors, budget)?;
+    for parameter in &mut parameters {
+        parameter.type_ = context.instantiate(&parameter.type_)?;
+        context.require_resolved(std::slice::from_ref(&parameter.type_))?;
+    }
+    for index in &mut indices {
+        index.type_ = context.instantiate(&index.type_)?;
+        context.require_resolved(std::slice::from_ref(&index.type_))?;
+    }
+    context.resolve_instances(true)?;
+    context.flush(true)?;
+    let result_level = explicit.unwrap_or(inferred);
+    let mut closer = Builder {
+        remaining: budget.max_nodes,
+    };
+    let indexed_result = closer
+        .close(&indices, Expr::sort(result_level.clone()), false, false)
+        .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
+    let family_type = closer
+        .close(&parameters, indexed_result, false, false)
+        .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
+    for (annotation, locals) in annotations {
+        let mut final_context = LocalContext::new();
+        for local in locals.decls() {
+            let type_ = if local.id == self_id {
+                family_type.clone()
+            } else {
+                local.type_.clone()
+            };
+            if let Some(value) = &local.value {
+                final_context.add_let(
+                    local.id.clone(),
+                    local.user_name.clone(),
+                    type_,
+                    value.clone(),
+                );
+            } else {
+                final_context.add_param(
+                    local.id.clone(),
+                    local.user_name.clone(),
+                    type_,
+                    local.binder_info,
+                );
+            }
+        }
+        context.txn.lctx = final_context;
+        checked_type(&mut context, annotation, budget)?;
+    }
+    let mut roots = vec![family_type];
+    for ctor in &constructors {
+        roots.extend(ctor.fields.iter().map(|f| f.type_.clone()));
+        roots.extend(ctor.result_indices.iter().cloned());
+    }
+    let level_params = context.declaration_levels(&roots)?;
+    let family_constant = Expr::const_(
+        name.clone(),
+        level_params.iter().cloned().map(Level::param).collect(),
+    );
+    for ctor in &mut constructors {
+        for field in &mut ctor.fields {
+            field.type_ = field
+                .type_
+                .abstract_fvar(&self_id, 0)
+                .map_err(|_| invalid())?
+                .subst_loose(0, std::slice::from_ref(&family_constant))
+                .map_err(|_| invalid())?;
+        }
+        for index in &mut ctor.result_indices {
+            *index = index
+                .abstract_fvar(&self_id, 0)
+                .map_err(|_| invalid())?
+                .subst_loose(0, std::slice::from_ref(&family_constant))
+                .map_err(|_| invalid())?;
+        }
+    }
+    let specification = InductiveSpec {
+        name,
+        level_params,
+        parameters,
+        indices,
+        constructors,
+        result_level,
+    };
+    inductive_with_field_universes(&specification, budget, &field_universes)
+        .map_err(|e| failure(SourceInferenceError::Inductive(e)))
+}
+
+struct Bodies {
+    constructors: Vec<ConstructorSpec>,
+    field_universes: Vec<Vec<Level>>,
+    annotations: Vec<(Expr, LocalContext)>,
+    inferred: Level,
+}
+
+fn bodies(
+    context: &mut Context,
+    parameters: &[LocalDecl],
+    indices: &[LocalDecl],
+    self_id: &FVarId,
+    ctors: &[Syntax],
+    budget: RecordBudget,
+) -> Result<Bodies, NatDefinitionElabError> {
+    let kernel = context.kernel;
     let base = context.txn.lctx.clone();
     let family = parameters.iter().fold(Expr::fvar(self_id.clone()), |f, p| {
         Expr::app(f, Expr::fvar(p.id.clone()))
@@ -320,7 +468,7 @@ pub(super) fn elaborate_inductive_scoped(
                 arguments.push(a.clone());
                 head = f.clone();
             }
-            if !matches!(head.node(), ExprNode::FVar { id } if id == &self_id) {
+            if !matches!(head.node(), ExprNode::FVar { id } if id == self_id) {
                 return Err(invalid());
             }
             arguments.reverse();
@@ -380,85 +528,10 @@ pub(super) fn elaborate_inductive_scoped(
             result_indices,
         });
     }
-    for parameter in &mut parameters {
-        parameter.type_ = context.instantiate(&parameter.type_)?;
-        context.require_resolved(std::slice::from_ref(&parameter.type_))?;
-    }
-    for index in &mut indices {
-        index.type_ = context.instantiate(&index.type_)?;
-        context.require_resolved(std::slice::from_ref(&index.type_))?;
-    }
-    context.resolve_instances(true)?;
-    context.flush(true)?;
-    let result_level = explicit.unwrap_or(inferred);
-    let indexed_result = closer
-        .close(&indices, Expr::sort(result_level.clone()), false, false)
-        .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
-    let family_type = closer
-        .close(&parameters, indexed_result, false, false)
-        .map_err(|e| failure(SourceInferenceError::Inductive(e.into())))?;
-    for (annotation, locals) in annotations {
-        let mut final_context = LocalContext::new();
-        for local in locals.decls() {
-            let type_ = if local.id == self_id {
-                family_type.clone()
-            } else {
-                local.type_.clone()
-            };
-            if let Some(value) = &local.value {
-                final_context.add_let(
-                    local.id.clone(),
-                    local.user_name.clone(),
-                    type_,
-                    value.clone(),
-                );
-            } else {
-                final_context.add_param(
-                    local.id.clone(),
-                    local.user_name.clone(),
-                    type_,
-                    local.binder_info,
-                );
-            }
-        }
-        context.txn.lctx = final_context;
-        checked_type(&mut context, annotation, budget)?;
-    }
-    let mut roots = vec![family_type];
-    for ctor in &constructors {
-        roots.extend(ctor.fields.iter().map(|f| f.type_.clone()));
-        roots.extend(ctor.result_indices.iter().cloned());
-    }
-    let level_params = context.declaration_levels(&roots)?;
-    let family_constant = Expr::const_(
-        name.clone(),
-        level_params.iter().cloned().map(Level::param).collect(),
-    );
-    for ctor in &mut constructors {
-        for field in &mut ctor.fields {
-            field.type_ = field
-                .type_
-                .abstract_fvar(&self_id, 0)
-                .map_err(|_| invalid())?
-                .subst_loose(0, std::slice::from_ref(&family_constant))
-                .map_err(|_| invalid())?;
-        }
-        for index in &mut ctor.result_indices {
-            *index = index
-                .abstract_fvar(&self_id, 0)
-                .map_err(|_| invalid())?
-                .subst_loose(0, std::slice::from_ref(&family_constant))
-                .map_err(|_| invalid())?;
-        }
-    }
-    let specification = InductiveSpec {
-        name: name.clone(),
-        level_params,
-        parameters,
-        indices,
+    Ok(Bodies {
         constructors,
-        result_level,
-    };
-    inductive_with_field_universes(&specification, budget, &field_universes)
-        .map_err(|e| failure(SourceInferenceError::Inductive(e)))
+        field_universes,
+        annotations,
+        inferred,
+    })
 }

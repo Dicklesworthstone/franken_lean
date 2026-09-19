@@ -996,6 +996,10 @@ impl Engine<'_> {
         for root in roots {
             self.scan(&root)?;
         }
+        // Revisit assignment-derived typing at most once per generation. A
+        // missing Pi/sort at assignment time may become known through a later
+        // equation. Rechecking is worklist production, never kernel admission.
+        let mut typing_generation = None;
         loop {
             let generation = self.generation();
             let mut postponed = VecDeque::new();
@@ -1008,6 +1012,18 @@ impl Engine<'_> {
                         postponed.push_back(equation);
                     }
                     Err(error) => return Err(error),
+                }
+            }
+            let current_generation = self.generation();
+            if typing_generation != Some(current_generation) {
+                typing_generation = Some(current_generation);
+                let mut typing = self.retry_assignment_types()?;
+                if !typing.is_empty() {
+                    // Keep every postponed equation. Type progress may unlock
+                    // it; an inferred type is not permission to discard it.
+                    typing.extend(postponed);
+                    pending = typing;
+                    continue;
                 }
             }
             if postponed.is_empty() {
