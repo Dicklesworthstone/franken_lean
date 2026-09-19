@@ -119,6 +119,7 @@ fn tactic(
             "rw",
             "rewrite",
             "simp",
+            "simpa",
             "subst",
             "injection",
             "contradiction",
@@ -141,6 +142,7 @@ fn tactic(
     };
     match keyword {
         "simp" => simplify(leaves, view, tokens, range, atom),
+        "simpa" => simpa(leaves, view, tokens, range, atom),
         "rw" | "rewrite" => rewrite(leaves, view, tokens, range, atom, keyword == "rw"),
         "generalize" => generalize(leaves, view, tokens, range, atom),
         "by_cases" => by_cases(leaves, view, tokens, range, atom),
@@ -414,6 +416,73 @@ fn rewrite(
         parser_kind(&["Tactic", if close { "rwSeq" } else { "rewriteSeq" }]),
         vec![keyword, null_node(Vec::new()), rules, location],
     ))
+}
+
+/// Separate a top-level evidence clause without splitting identifiers inside
+/// selected rules or the evidence term. The prefix shares the simp grammar.
+#[inline(never)]
+fn simpa(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut depth = 0usize;
+    let mut using_at = None;
+    for at in range.start + 1..range.end {
+        match &tokens[at].kind {
+            TokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | ".{" | "⦃") => {
+                depth += 1
+            }
+            TokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⦄") => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| refusal(view, tokens, at))?;
+            }
+            TokenKind::Ident(name)
+                if depth == 0
+                    && name == &Name::from_components(["using"])
+                    && &view.normalized().as_str()
+                        [tokens[at].extent.start().0..tokens[at].extent.end().0]
+                        == "using" =>
+            {
+                using_at = Some(at);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let prefix_end = using_at.unwrap_or(range.end);
+    let using = if let Some(at) = using_at {
+        let term = bounded_term(
+            leaves,
+            view,
+            tokens,
+            at + 1..range.end,
+            DefinitionGrammar::Scalar,
+        )?;
+        let leaf = leaves.leaf(at)?;
+        null_node(vec![
+            Syntax::Atom {
+                info: leaf.info(),
+                val: "using".into(),
+            },
+            term,
+        ])
+    } else {
+        null_node(Vec::new())
+    };
+    let mut parsed = simplify(leaves, view, tokens, range.start..prefix_end, keyword)?;
+    let Syntax::Node { kind, args, .. } = &mut parsed else {
+        unreachable!("simplify builds a tactic node");
+    };
+    if !matches!(&args[5], Syntax::Node { args, .. } if args.is_empty()) {
+        return Err(refusal(view, tokens, prefix_end));
+    }
+    *kind = parser_kind(&["Tactic", "simpa"]);
+    args[5] = using;
+    Ok(parsed)
 }
 
 /// Simplification with either an explicit-only set or the environment's native
@@ -990,6 +1059,63 @@ mod construction_refinement_tests {
                     let parsed = parse_definition(source.as_bytes()).unwrap();
                     assert_eq!(parsed.reconstruct_original(), source.as_bytes());
                 }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod simpa_tests {
+    use super::*;
+    #[test]
+    fn completion_preserves_using_terms_comments_and_scoped_identifiers() {
+        for tail in [
+            "simpa",
+            "simpa only",
+            "simpa only []",
+            "simpa using p",
+            "simpa only [h, *] using (f p)",
+            "simpa [using, -N.rule] /- 🦀 -/ using «using»",
+            "simpa only [(N.rule.{u} x)] using p",
+            "simpa using p at h",
+        ] {
+            let source = format!("theorem t (P : Prop) (p : P) : P := by\r\n  {tail}\r\n");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+    }
+    #[test]
+    fn completion_does_not_ignore_bad_options_locations_or_missing_evidence() {
+        for tail in [
+            "simpa using",
+            "simpa only [,h]",
+            "simpa at h",
+            "simpa [h] at h using p",
+            "simpa (config := {})",
+            "simpa only [← *]",
+            "simpa using (p",
+            "simpa only [by rfl]",
+            "simpa using (by rfl)",
+        ] {
+            let source = format!("theorem t : True := by {tail}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{tail}");
+        }
+        assert!(parse_definition(b"def simpa (using : Nat) := using").is_ok());
+    }
+    #[test]
+    fn deeply_grouped_using_evidence_uses_the_bounded_heap_parser() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!(
+                    "theorem t (P : Prop) (p : P) : P := by simpa only [] using {}p{}",
+                    "(".repeat(2000),
+                    ")".repeat(2000)
+                );
+                let parsed = parse_definition(source.as_bytes()).unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
             })
             .unwrap()
             .join()

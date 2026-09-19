@@ -147,6 +147,11 @@ pub(super) struct RewriteRule<'a> {
 }
 
 pub(super) enum ProofAction<'a> {
+    Simpa {
+        goal: ProofGoal,
+        args: &'a [Syntax],
+        using: &'a Syntax,
+    },
     Eliminate {
         goal: ProofGoal,
         args: &'a [Syntax],
@@ -604,6 +609,19 @@ impl Context {
                 });
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "simpa"]) {
+                let [keyword, _, _, _, _, using] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "simpa", "simplifying completion")?;
+                match expect_null_args(using, "optional simpa evidence")? {
+                    [] => self.simpa_proof_term(proof, goal, args, None)?,
+                    [keyword, using] => {
+                        expect_atom(keyword, "using", "simpa evidence keyword")?;
+                        return Ok(ProofAction::Simpa { goal, args, using });
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                }
             } else if kind == &parser_kind(&["Tactic", "rwSeq"])
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
             {

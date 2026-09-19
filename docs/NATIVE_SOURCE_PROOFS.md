@@ -265,7 +265,8 @@ The proof-automation increment is additionally tested with the complete checker 
 `simp [*]` and `simp only [*]` select the current propositional hypotheses by
 local identity, including shadowed hypotheses and checked local `have` values.
 Equality and equivalence hypotheses become rewrite rules; other selected proofs
-can close matching goals or discharge conditional rules. Quantified hypotheses
+can close matching goals, discharge conditional rules, or use the existing
+proved/refuted proposition compilation to True/False. Quantified hypotheses
 remain polymorphic and are instantiated at each matching occurrence. Arbitrary
 data variables are not guessed as missing theorem parameters. Repeated stars do
 not duplicate evidence, and the persistent registry is unchanged.
@@ -279,5 +280,30 @@ work. Both declaration checkers retain their veto.
 
 Run `fln check-source --json examples/native_simp_hypotheses.lean` for five
 examples. This increment does not add `at *`, local-hypothesis erasure, automatic
-rule orientation, proposition-to-True/False compilation, or complete upstream
-simplifier semantics. `-name` retains its existing global-erasure meaning.
+rule orientation, or complete upstream simplifier semantics. `-name` retains its existing global-erasure meaning.
+
+
+### Closing with `simpa`
+
+`simpa [rules] using proof` simplifies the evidence's type and the goal with the
+same selected set, then closes only when their resulting types match. `only`,
+registered defaults, rule exclusions and wildcard local evidence use the same
+selection code as `simp`. The evidence is elaborated by the ordinary heap term
+driver and checked before a tactic alternative can commit. Its original type
+and value remain in a checked let binding even when simplification discards
+parts of that type. The supplied proof is not implicitly added as a rewrite
+rule or as wildcard evidence.
+
+Without `using`, `simpa` tries local assumptions in reverse declaration order,
+normalizing each in an isolated trial. A failed candidate retains no semantic
+state but does retain consumed work. As a final alternative, simplification can
+close the goal without an assumption. Unlike `simp`, `simpa` must finish: a
+changed but unsolved goal is a tactic failure, not permission for later tactics
+to complete it. Resource and internal nonanswers still propagate.
+
+Evidence and goal rewriting share the 256-step productive limit per candidate.
+All generated transports and local evidence still pass both admission checkers.
+`examples/native_simpa.lean` exercises defaults, explicit evidence, context
+search, wildcard selection and reflexivity. This bounded form does not implement
+`simpa!`, `simpa?`, custom dischargers/configuration, locations, or nested `by`
+inside the `using` term. It does not claim complete Lean simplifier parity.

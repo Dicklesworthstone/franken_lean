@@ -4,6 +4,7 @@
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
 mod locations;
+mod simpa;
 mod unfold;
 
 use super::*;
@@ -243,10 +244,17 @@ impl Context {
         let [keyword, config, discharger, only, arguments, location] = args else {
             return Err(error(TacticError::MalformedScript));
         };
-        expect_atom(keyword, "simp", "simplification keyword")?;
+        let simpa = matches!(keyword, Syntax::Atom { val, .. } if val == "simpa");
+        expect_atom(
+            keyword,
+            if simpa { "simpa" } else { "simp" },
+            "simplification keyword",
+        )?;
         expect_empty_null(config, "default simplification configuration")?;
         expect_empty_null(discharger, "default simplification discharger")?;
-        self.rewrite_locations(location)?;
+        if !simpa {
+            self.rewrite_locations(location)?;
+        }
         let use_default = match expect_null_args(only, "optional explicit simp set")? {
             [] => true,
             [only] => {
@@ -301,7 +309,7 @@ impl Context {
                 let locals = self.txn.lctx.decls().to_vec();
                 for local in locals {
                     self.tick()?;
-                    if !wildcard_ids.insert(local.id.clone()) {
+                    if self.is_matrix_hypothesis(&local) || !wildcard_ids.insert(local.id.clone()) {
                         continue;
                     }
                     let type_ = self.instantiate(&local.type_)?;
@@ -638,7 +646,7 @@ impl Context {
             return Ok(());
         }
         let rules = self.simp_rules(args)?;
-        self.simplify_goal_with_rules(proof, goal, &rules, 0)
+        self.simplify_goal_with_rules(proof, goal, &rules, 0, None)
     }
 
     // Hypothesis and goal simplification share one productive-step limit. A
@@ -649,6 +657,7 @@ impl Context {
         mut goal: ProofGoal,
         rules: &[SimpRule<'_>],
         mut steps: usize,
+        completion: Option<&Typed>,
     ) -> Result<(), NatDefinitionElabError> {
         let mut history = vec![self.instantiate(&goal.target)?];
         loop {
@@ -683,7 +692,14 @@ impl Context {
             if advanced {
                 continue;
             }
-            if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
+            if let Some(completion) = completion {
+                let mut budget = UnificationBudget::new(self.kernel);
+                budget.zeta_delta = false;
+                if !self.proof_types_match_with_budget(&completion.type_, &goal.target, budget)? {
+                    return Err(error(TacticError::NoMatchingAssumption));
+                }
+                self.close_proof_goal(goal, completion.value.clone())?;
+            } else if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
                 self.close_proof_goal(goal, value)?;
             } else if let Some(value) = self.simp_reflexivity(&goal)? {
                 self.close_proof_goal(goal, value)?;
