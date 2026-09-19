@@ -196,3 +196,40 @@ fn opaque_scopes_preserve_arithmetic_and_transactional_alternatives() {
         );
     }
 }
+
+#[test]
+fn suffices_checks_the_subgoal_before_using_it_in_the_continuation() {
+    for source in [
+        "theorem chain (P Q : Prop) (f : P -> Q) (p : P) : Q := suffices h : P from f h; p",
+        "theorem chain (P Q : Prop) (f : P -> Q) (p : P) : Q := suffices P from f this; p",
+        "theorem chain (P : Prop) (p : P) : P := suffices h : P from (by exact h); p",
+        "theorem chain (P : Prop) (p : P) : P := suffices h : P from h; by exact p",
+        "theorem chain (P : Prop) (p : P) : P := suffices h : P -> P from h p; fun x => x",
+        "theorem chain (P : Prop) (h : P) : P := suffices h : P from h; h",
+        "def chain (f : Nat -> Nat) : Nat := suffices n : Nat from f n; 7",
+    ] {
+        accepted(source);
+    }
+}
+#[test]
+fn suffices_composes_with_nested_assertions_lets_and_show() {
+    for source in [
+        "theorem chain (P : Prop) (p : P) : P := suffices P from this; suffices P from this; p",
+        "theorem chain (P : Prop) (p : P) : P := suffices h : P from have q : P := h; show P from q; p",
+        "theorem chain (P : Prop) (p : P) : P := have h : P := suffices P from this; p; h",
+        "def chain : Nat := let n := suffices h : Nat from h; 7; n",
+    ] {
+        accepted(source);
+    }
+}
+#[test]
+fn suffices_never_proves_its_own_subgoal_or_discards_bad_evidence() {
+    for source in [
+        "theorem circular (P : Prop) : P := suffices h : P from h; h",
+        "theorem circular (P : Prop) : P := suffices P from this; this",
+        "def bad (P : Prop) : Nat := suffices h : P from 7; 0",
+        "theorem bad (P : Prop) (p : P) : P := suffices h : P from 0; p",
+    ] {
+        refused(source);
+    }
+}

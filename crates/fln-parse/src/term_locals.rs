@@ -23,8 +23,15 @@ pub(super) struct Assertion {
     assignment: Option<usize>,
     value: Option<Syntax>,
     separator: Option<usize>,
-    show: bool,
+    form: Form,
     phase: Phase,
+    proof_intro: Option<usize>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    Have,
+    Show,
+    Suffices,
 }
 #[derive(Clone, Copy)]
 enum Phase {
@@ -64,7 +71,13 @@ impl Prefix {
         cursor: &mut usize,
         end: usize,
     ) -> Result<Self, NatDefinitionParseError> {
-        let show = word(tokens, keyword, "show");
+        let form = if word(tokens, keyword, "show") {
+            Form::Show
+        } else if word(tokens, keyword, "suffices") {
+            Form::Suffices
+        } else {
+            Form::Have
+        };
         let mut assertion = Assertion {
             keyword,
             name: None,
@@ -73,10 +86,22 @@ impl Prefix {
             assignment: None,
             value: None,
             separator: None,
-            show,
+            form,
             phase: Phase::Annotation,
+            proof_intro: None,
         };
-        if !show {
+        if form == Form::Suffices {
+            // The pin makes only `identifier :` optional; without it the next
+            // expression is the complete proposition, not a declaration name.
+            if *cursor + 1 < end
+                && matches!(&tokens[*cursor].kind, TokenKind::Ident(_))
+                && word(tokens, *cursor + 1, ":")
+            {
+                assertion.name = Some(*cursor);
+                assertion.colon = Some(*cursor + 1);
+                *cursor += 2;
+            }
+        } else if form == Form::Have {
             if *cursor < end && matches!(&tokens[*cursor].kind, TokenKind::Ident(_)) {
                 assertion.name = Some(*cursor);
                 *cursor += 1;
@@ -108,7 +133,9 @@ impl Prefix {
         match self {
             Self::Binders(p) => p.closes_header(tokens, at),
             Self::Assertion(p) => match p.phase {
-                Phase::Annotation if p.show => word(tokens, at, "from") || word(tokens, at, "by"),
+                Phase::Annotation if p.form != Form::Have => {
+                    word(tokens, at, "from") || word(tokens, at, "by")
+                }
                 Phase::Annotation => word(tokens, at, ":="),
                 Phase::Value => word(tokens, at, ";"),
                 Phase::Body => false,
@@ -136,9 +163,13 @@ impl Prefix {
         match p.phase {
             Phase::Annotation => {
                 p.annotation = Some(expression);
-                if p.show {
-                    p.separator = Some(at);
-                    p.phase = Phase::Body;
+                if p.form != Form::Have {
+                    p.proof_intro = Some(at);
+                    p.phase = if p.form == Form::Show {
+                        Phase::Body
+                    } else {
+                        Phase::Value
+                    };
                     // `by` owns its original token and remains a complete term.
                     if word(tokens, at, "by") {
                         next = at;
@@ -171,8 +202,8 @@ impl Prefix {
             };
             return p.finish(leaves, body);
         };
-        let separator = p.separator.expect("completed assertion separator");
-        let syntax = if p.show {
+        let syntax = if p.form == Form::Show {
+            let separator = p.proof_intro.expect("show proof introducer");
             let rhs = if body.kind() == Some(&parser_kind(&["Term", "byTactic"]))
                 && matches!(&leaves.leaf(separator)?, Syntax::Atom { val, .. } if val == "by")
             {
@@ -191,7 +222,43 @@ impl Prefix {
                     rhs,
                 ],
             )
+        } else if p.form == Form::Suffices {
+            let binder = match p.name {
+                Some(at) => null_node(vec![
+                    leaves.leaf(at)?,
+                    leaves.leaf(p.colon.expect("suffices colon"))?,
+                ]),
+                None => Syntax::node(
+                    Name::from_components(["hygieneInfo"]),
+                    vec![hygiene_ident()],
+                ),
+            };
+            let intro = p.proof_intro.expect("suffices proof introducer");
+            let proof = p.value.expect("suffices continuation");
+            let rhs = if proof.kind() == Some(&parser_kind(&["Term", "byTactic"]))
+                && matches!(&leaves.leaf(intro)?, Syntax::Atom { val, .. } if val == "by")
+            {
+                proof
+            } else {
+                Syntax::node(
+                    parser_kind(&["Term", "fromTerm"]),
+                    vec![atom(leaves, intro, "from")?, proof],
+                )
+            };
+            Syntax::node(
+                parser_kind(&["Term", "suffices"]),
+                vec![
+                    atom(leaves, p.keyword, "suffices")?,
+                    Syntax::node(
+                        parser_kind(&["Term", "sufficesDecl"]),
+                        vec![binder, p.annotation.expect("suffices proposition"), rhs],
+                    ),
+                    leaves.leaf(p.separator.expect("suffices separator"))?,
+                    body,
+                ],
+            )
         } else {
+            let separator = p.separator.expect("have separator");
             let name = match p.name {
                 Some(at) => leaves.leaf(at)?,
                 None => Syntax::node(

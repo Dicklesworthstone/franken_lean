@@ -778,7 +778,10 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
     let mut delimiters = Vec::new();
     let mut nested_lets = 0usize;
     for (index, token) in tokens.iter().enumerate().skip(from) {
-        if delimiters.is_empty() && term_locals::word(tokens, index, "have") {
+        if delimiters.is_empty()
+            && (term_locals::word(tokens, index, "have")
+                || term_locals::word(tokens, index, "suffices"))
+        {
             nested_lets += 1;
             continue;
         }
@@ -1322,7 +1325,8 @@ fn bounded_term_spliced(
         match tokens.get(index).map(|token| &token.kind) {
             _ if grammar == DefinitionGrammar::Scalar
                 && (term_locals::word(tokens, index, "have")
-                    || term_locals::word(tokens, index, "show")) =>
+                    || term_locals::word(tokens, index, "show")
+                    || term_locals::word(tokens, index, "suffices")) =>
             {
                 let prefix =
                     term_locals::Prefix::assertion(view, tokens, index, &mut cursor, range.end)?;

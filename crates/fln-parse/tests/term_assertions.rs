@@ -84,3 +84,50 @@ fn contextual_keywords_do_not_steal_declaration_or_escaped_names() {
         assert_eq!(parsed.reconstruct_original(), source.as_bytes());
     }
 }
+
+#[test]
+fn suffices_retains_its_source_order_and_rejects_incomplete_chains() {
+    for source in [
+        "theorem t (P : Prop) (p : P) : P := suffices h : P from h; p",
+        "theorem t (P : Prop) (p : P) : P := suffices P from this; p",
+        "theorem t (P : Prop) (p : P) : P := suffices /- fact -/ h : P from (by exact h);\r\n  p\r\n",
+    ] {
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            parsed.reconstruct_normalized().unwrap(),
+            source.replace('\r', "").as_bytes()
+        );
+    }
+    for tail in [
+        "suffices",
+        "suffices h : P",
+        "suffices h : P from h",
+        "suffices P from this;",
+        "suffices : P from this; p",
+        "suffices h := p; h",
+    ] {
+        assert!(
+            parse_definition(format!("theorem t (P : Prop) (p : P) : P := {tail}").as_bytes())
+                .is_err(),
+            "{tail}"
+        );
+    }
+}
+#[test]
+fn deeply_chained_suffices_does_not_recurse_on_the_host_stack() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let mut source = String::from("def chain : Nat := ");
+            for _ in 0..600 {
+                source.push_str("suffices h : Nat from h; ");
+            }
+            source.push('0');
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

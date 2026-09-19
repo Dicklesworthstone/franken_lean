@@ -998,6 +998,25 @@ impl Context {
                                     tasks.push(Task::Visit(&parts[0], None, true));
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "suffices"]) {
+                                    let (name, annotation, witness, continuation) =
+                                        self.suffices_parts(args)?;
+                                    // Backward chaining checks the last source term
+                                    // first. The proposed fact is not in its own scope.
+                                    tasks.push(Task::LetAnnotation(
+                                        name,
+                                        witness,
+                                        continuation,
+                                        expected,
+                                        true,
+                                    ));
+                                    tasks.push(Task::Visit(
+                                        annotation,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "show"]) {
                                     let parts = expect_node(syntax, kind, 3, "show term")?;
                                     expect_atom(&parts[0], "show", "show keyword")?;
@@ -1814,6 +1833,61 @@ impl Context {
                 }
             }
         }
+    }
+
+    fn suffices_parts<'a>(
+        &mut self,
+        parts: &'a [Syntax],
+    ) -> Result<(Name, &'a Syntax, &'a Syntax, &'a Syntax), NatDefinitionElabError> {
+        let [keyword, declaration, separator, witness] = parts else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(keyword, "suffices", "suffices keyword")?;
+        expect_atom(separator, ";", "suffices separator")?;
+        let parts = expect_node(
+            declaration,
+            &parser_kind(&["Term", "sufficesDecl"]),
+            3,
+            "suffices declaration",
+        )?;
+        let name = if parts[0].kind() == Some(&Name::from_components(["null"])) {
+            let [id, colon] = expect_null_args(&parts[0], "suffices binder")? else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            expect_atom(colon, ":", "suffices binder colon")?;
+            let Syntax::Ident { val, .. } = id else {
+                return Err(failure(SourceInferenceError::Scope));
+            };
+            if val.is_anonymous() {
+                return Err(NatDefinitionElabError::AnonymousReferenceName);
+            }
+            val.clone()
+        } else {
+            let hygiene = expect_node(
+                &parts[0],
+                &Name::from_components(["hygieneInfo"]),
+                1,
+                "suffices hygiene",
+            )?;
+            if !matches!(&hygiene[0], Syntax::Ident { val, preresolved, .. } if val.is_anonymous() && preresolved.is_empty())
+            {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            Name::from_components(["this"])
+        };
+        let continuation = if parts[2].kind() == Some(&parser_kind(&["Term", "byTactic"])) {
+            &parts[2]
+        } else {
+            let rhs = expect_node(
+                &parts[2],
+                &parser_kind(&["Term", "fromTerm"]),
+                2,
+                "suffices continuation",
+            )?;
+            expect_atom(&rhs[0], "from", "suffices proof introducer")?;
+            &rhs[1]
+        };
+        Ok((name, &parts[1], witness, continuation))
     }
 
     fn let_parts<'a>(
