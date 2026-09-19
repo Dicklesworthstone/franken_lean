@@ -7,9 +7,10 @@ on:
       - 'crates/fln-elab/src/source/matching/**'
       - 'crates/fln-elab/src/source/matching.rs'
       - 'crates/fln-elab/src/source/tactics/eliminate.rs'
-      - 'crates/fln/tests/source_mutual_matching.rs'
-      - 'crates/fln/tests/source_mutual_cases.rs'
-      - 'crates/fln/tests/source_mutual_recursion.rs'
+      - 'crates/fln/src/runtime/**'
+      - 'crates/fln/src/runtime.rs'
+      - 'crates/fln/tests/source_mutual_*.rs'
+      - 'crates/fln/tests/runtime_mutual_data.rs'
 permissions:
   contents: read
 concurrency:
@@ -19,7 +20,7 @@ jobs:
   elimination:
     if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -35,78 +36,103 @@ jobs:
           channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
           rustc -Vv > "$RUNNER_TEMP/mutual-elimination/compiler.txt"
-      - name: Stage the identity-bound structural recursion implementation
+      - name: Stage structural recursion and native execution
         if: >-
-          github.event.head_commit.message == 'feat(elab): validate structural recursion over mutual families'
+          github.event.head_commit.message == 'feat(runtime): validate and publish native mutual data execution'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: python
         run: |
           import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mutual-elimination'
-          manifest = {
-              'crates/fln-elab/src/source/matching.rs': ['8a388d1aad0bc432feeb799f425049c397671049','ab90555ef397c68550d48799a2403d443a507afd'],
-              'crates/fln-elab/src/source/tactics/eliminate.rs': ['48fe5f57a6a7e4451ceec1e533ddbc6a8b75196a','1ec0181971e6ac5ef3eaa7b6ebf5fcf5eea4bc66'],
-              'crates/fln/tests/source_mutual_recursion.rs': [None,'34caca0d23129bae516b3627c0f94aa08542bf96'],
-              'docs/NATIVE_MUTUAL_ELIMINATION.md': ['312343c83d91f21ed39af0de5204636deada85e9','3cc70a49bbb3012087f540a32e1a3b41e264956f'],
-          }
+          def run(*args):
+              subprocess.run(args, check=True)
+          def output(*args):
+              return subprocess.check_output(args, text=True).strip()
           def blob(data):
               return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
           def fetch_blob(sha):
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(request, timeout=60) as response:
+              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha, headers={'Accept':'application/vnd.github+json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(req, timeout=60) as response:
                   value = json.load(response)
               assert value['encoding'] == 'base64'
               data = base64.b64decode(value['content'])
               assert blob(data) == sha
               return data
-          subprocess.run(['git','fetch','origin','main'], check=True)
-          subprocess.run(['git','merge','--ff-only','origin/main'], check=True)
-          assert not subprocess.check_output(['git','status','--porcelain']).strip()
-          for path, (old, new) in manifest.items():
-              p = pathlib.Path(path)
-              assert (blob(p.read_bytes()) if p.exists() else None) == old, 'concurrent edit: ' + path
-          chunks = ['2df219b368fdffae403c1231b1e1ae00d42e51ec','718eb66fd5e0c0ce2f7c492f05aed2fbdb423fef','8322257711476aacefe65537cb4a14f3fd0a3506']
-          encoded = b''.join(fetch_blob(sha) for sha in chunks)
-          assert blob(encoded) == '1fdfa96615a05466c61767b392e56b45e996be67'
-          mailbox = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(mailbox).hexdigest() == '85f73f1b521b7ed582da33d7451db3524f44f345a99190ba9a422f835b7ee340'
-          patch = root / 'implementation.mbox'
-          patch.write_bytes(mailbox)
-          subprocess.run(['git','apply','--index','--whitespace=error',str(patch)], check=True)
-          changed = subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()
-          assert set(changed) == set(manifest)
-          for path, (old, new) in manifest.items():
-              assert blob(pathlib.Path(path).read_bytes()) == new, path
-          (root / 'manifest.json').write_text(json.dumps(manifest,indent=2))
-      - name: Check source elimination and surrounding engine behavior
+          def stage(label, chunks, encoded_sha, patch_sha, manifest, extra=None):
+              for path, (old, new) in manifest.items():
+                  p = pathlib.Path(path)
+                  assert (blob(p.read_bytes()) if p.exists() else None) == old, 'concurrent edit: ' + path
+              encoded = b''.join(fetch_blob(sha) for sha in chunks)
+              assert blob(encoded) == encoded_sha
+              patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+              assert hashlib.sha256(patch).hexdigest() == patch_sha
+              saved = root / (label + '.patch')
+              saved.write_bytes(patch)
+              run('git','apply','--index','--whitespace=error',str(saved))
+              if extra:
+                  saved = root / (label + '-test.patch')
+                  saved.write_bytes(fetch_blob(extra))
+                  run('git','apply','--index','--whitespace=error',str(saved))
+              assert set(output('git','diff','--cached','--name-only').splitlines()) == set(manifest)
+              for path, (old, new) in manifest.items():
+                  assert blob(pathlib.Path(path).read_bytes()) == new, path
+              run('git','diff','--cached','--check')
+              (root / (label + '-manifest.json')).write_text(json.dumps(manifest,indent=2))
+          run('git','fetch','origin','main')
+          run('git','merge','--ff-only','origin/main')
+          assert not output('git','status','--porcelain')
+          (root / 'base.txt').write_text(output('git','rev-parse','HEAD') + '\n')
+          run('git','config','user.name','github-actions[bot]')
+          run('git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
+          source = {
+              'crates/fln-elab/src/source/matching.rs': ['8a388d1aad0bc432feeb799f425049c397671049','ab90555ef397c68550d48799a2403d443a507afd'],
+              'crates/fln-elab/src/source/tactics/eliminate.rs': ['48fe5f57a6a7e4451ceec1e533ddbc6a8b75196a','1ec0181971e6ac5ef3eaa7b6ebf5fcf5eea4bc66'],
+              'crates/fln/tests/source_mutual_recursion.rs': [None,'34caca0d23129bae516b3627c0f94aa08542bf96'],
+              'docs/NATIVE_MUTUAL_ELIMINATION.md': ['312343c83d91f21ed39af0de5204636deada85e9','3cc70a49bbb3012087f540a32e1a3b41e264956f'],
+          }
+          stage('source', ['2df219b368fdffae403c1231b1e1ae00d42e51ec','718eb66fd5e0c0ce2f7c492f05aed2fbdb423fef','8322257711476aacefe65537cb4a14f3fd0a3506'], '1fdfa96615a05466c61767b392e56b45e996be67', '85f73f1b521b7ed582da33d7451db3524f44f345a99190ba9a422f835b7ee340', source)
+          run('cargo','test','--locked','-p','fln','--test','source_mutual_recursion')
+          run('git','commit','-m','feat(elab): compile structural self-recursion over mutual data families','-m','Preserve family ownership of recursive fields and consume only selected-family induction hypotheses for structural self-calls. Support accumulators, function-valued children, polymorphic/indexed results and recursive pattern matrices. Twelve focused dual-checker regressions passed. Full combined-tree validation follows with native execution; no general mutual induction or mutual function group claim. fln-qb5 remains open.')
+          (root / 'source-commit.txt').write_text(output('git','rev-parse','HEAD') + '\n')
+          runtime = {
+              'crates/fln/src/runtime.rs': ['0f646655a7beaeb20dbf7a4a7fadecd6a07abc65','9198412b536e1630e69c6bebb996b639315e717d'],
+              'crates/fln/src/runtime/data_recursion.rs': ['c6eafe8803002aea9d51572e8ba2374d94a69440','ffd0f5b8d88f32bc5461ab7d1a3b0a8286a1553e'],
+              'crates/fln/src/runtime/records.rs': ['fa80009b2e6a1672bd5499ece61a951ef38cbb79','aaa36b50f768f4e64860c57b3d90a91f7dc22410'],
+              'crates/fln/src/runtime/specialize.rs': ['9bb42df752617723f5741c44711a5e0f41a89d13','964140bb3881169a4ec9a41fa8299b496c3131f7'],
+              'crates/fln/tests/runtime_mutual_data.rs': [None,'742ab20963e4ec01b195e4d424a482bf7832480e'],
+              'crates/fln/tests/source_instances.rs': ['f2d11d970cc663cda3214ce543e39bcf46fb4cdf','fd67c6489fced9779ce2fc2cc973b9641d5aef3d'],
+              'docs/NATIVE_MUTUAL_ELIMINATION.md': ['3cc70a49bbb3012087f540a32e1a3b41e264956f','84ed55fb301e05095eaf4a6ba5ef5a8539b6073e'],
+          }
+          stage('runtime', ['d082e95baf4822de9397727c59ef08d493a704d0','742403688608bcf61d85b46c9520680ba01c2711','bb317fa3afe48338729fac25b66461dc1d548bb8','a7c7343b50307754998fc37b8bdade60f705b340'], '29a2f541d64377d5d5556c04fb00b87d0bb52d42', '3eacb27859e70fa28a6fee980ce9ee23a6c5548ecb54b091b57bb021e5d3660a', runtime, 'b5c48ee794079d7e9e4e4b6dbd75e73c7bfe6573')
+          (root / 'tested-tree.txt').write_text(output('git','write-tree') + '\n')
+      - name: Check source and VM execution on the combined tree
         shell: bash
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/mutual-elimination"
-          rustfmt --edition 2024 --config skip_children=true --check crates/fln/tests/source_mutual_recursion.rs
-          cargo test --locked -p fln --test source_mutual_matching --test source_mutual_cases --test source_mutual_recursion 2>&1 | tee "$root/focused.log"
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/data_recursion.rs crates/fln/src/runtime/records.rs crates/fln/src/runtime/specialize.rs crates/fln/tests/runtime_mutual_data.rs
+          cargo test --locked -p fln --test source_mutual_matching --test source_mutual_cases --test source_mutual_recursion --test runtime_mutual_data 2>&1 | tee "$root/focused.log"
           cargo test --locked -p fln-elab -p fln --no-fail-fast 2>&1 | tee "$root/package-tests.log"
           cargo clippy --locked -p fln-elab -p fln --all-targets -- -D warnings 2>&1 | tee "$root/clippy.log"
           cargo check --locked --workspace --all-targets 2>&1 | tee "$root/workspace.log"
           git diff --check
           git diff --cached --check
-      - name: Publish the checked structural recursion implementation
+      - name: Publish both validated implementation increments
         if: >-
-          github.event.head_commit.message == 'feat(elab): validate structural recursion over mutual families'
+          github.event.head_commit.message == 'feat(runtime): validate and publish native mutual data execution'
         shell: python
         run: |
           import hashlib, json, os, pathlib, subprocess
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mutual-elimination'
-          manifest = json.loads((root / 'manifest.json').read_text())
+          manifest = json.loads((root / 'runtime-manifest.json').read_text())
           assert set(subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()) == set(manifest)
           for path, (old, new) in manifest.items():
               data = pathlib.Path(path).read_bytes()
               assert data == subprocess.check_output(['git','show',':' + path])
               assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == new
-          subprocess.run(['git','config','user.name','github-actions[bot]'], check=True)
-          subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'], check=True)
-          subprocess.run(['git','commit','-m','feat(elab): compile structural self-recursion over mutual data families','-m','Preserve recursive-field ownership and use only the selected family hypotheses for structural self-calls. Support accumulators, function-valued children, polymorphic and indexed results, constrained index equations and recursive pattern matrices. Retain termination restrictions, hidden sibling motives and resource nonanswers. Twelve new dual-checker regressions, full elaborator and engine tests, all-target package Clippy and workspace compilation passed before publication. No general mutual function groups, mutual induction or runtime-codegen claim; fln-qb5 remains open.'], check=True)
+          assert subprocess.check_output(['git','write-tree'],text=True).strip() == (root / 'tested-tree.txt').read_text().strip()
+          subprocess.run(['git','commit','-m','feat(runtime): execute closed mutual data matches and structural folds','-m','Derive block-wide object layouts, specialize the selected recursor motive and minor offset, retain strict let-wrapped callback captures and share self-recursive results. Reject used cross-family hypotheses. Eleven new Golem regressions cover results, owned strings, callbacks, deterministic bytecode, lazy/shared recursive work and resource recovery. Fix observed context-depth resource classification and update the stale named-instance command test to require exact declaration syntax. Full fln-elab and fln tests, package all-target Clippy and workspace compilation passed on this exact tree. Indexed/polymorphic layouts and general mutual function execution remain outside this bounded runtime support.'], check=True)
           subprocess.run(['git','push','origin','HEAD:main'], check=True)
           (root / 'published.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
       - name: Retain exact source and any unpublished changes
@@ -115,8 +141,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/mutual-elimination"
-          git rev-parse HEAD > "$RUNNER_TEMP/mutual-elimination/source-commit.txt"
-          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/mutual-elimination/source-tree.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/mutual-elimination/final-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/mutual-elimination/final-tree.txt"
           git status --porcelain > "$RUNNER_TEMP/mutual-elimination/worktree-status.txt"
           git diff HEAD --binary > "$RUNNER_TEMP/mutual-elimination/unpublished.patch"
           git archive --format=tar.gz HEAD > "$RUNNER_TEMP/mutual-elimination/source.tar.gz"
