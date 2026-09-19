@@ -24,10 +24,31 @@ imports and ambiguous open URI aliases are refused. Import-free and untitled
 documents require no filesystem resolution. Resolution is not a race-proof
 filesystem sandbox or a Lake/LEAN_PATH package resolver.
 
-Dependency edits are consumed on the next open/change/save of the importer.
-Automatic rechecking of all open reverse-dependents, cursor goal inspection,
-semantic hover/completion/definition, and Lean RPC sessions are not implemented
-by this change. An error in a dependency is reported on the importing document
+Accepted dependency opens, changes and saves, rejected edits that invalidate
+source, and closes now automatically recheck affected open importers before
+the next request is processed. Transitive consumers are selected from the
+resolver's complete source closure and checked once in deterministic URI
+order. Incomplete resolution and dependency-retention pressure fall back to
+conservative rechecking, never silently missing an edge. The dependency
+index retains at most 16,384 paths and 4 MiB of path bytes, in addition to
+session-bounded document identities; these are not allocator RSS limits.
+Old diagnostic frontiers are replaced even when the importer version has
+not changed. Unavailable importer text produces a nonanswer, not disk fallback.
+Legacy callback APIs keep their original single-document behavior; embedders
+opt into `serve_workspace` with a typed `WorkspaceChecker`.
+Closed-file changes are handled through `workspace/didChangeWatchedFiles`.
+When the client advertises dynamic registration, the server requests one
+`**/*.lean` watcher for create/change/delete events after initialization.
+A declined registration leaves ordinary editor checking available. Clients
+with preconfigured watchers may also send notifications without registration.
+Notification batches are structurally validated and bounded to 4,096 events
+and 1 MiB before any rechecking; repeated URIs are coalesced. File and folder
+observations trigger dependency rechecks, not document text/version changes.
+Actual bounded disk snapshots and current open buffers remain the authority.
+No filesystem polling, external watcher process or source writes are added.
+Cursor goal inspection, semantic hover/completion/definition and Lean RPC
+sessions remain separate work.
+An error in a dependency is reported on the importing document
 with the module and original dependency offset in the error text; it is not a
 claim of dependency-local editor range projection.
 

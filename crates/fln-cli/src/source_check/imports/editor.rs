@@ -19,7 +19,7 @@ fn hex(byte: u8) -> Option<u8> {
 
 /// Local UTF-8 file URIs only. Preserve literal '+' and decode percent escapes
 /// once. Fragments, queries, remote authorities and nonabsolute paths are refused.
-fn document_path(uri: &str) -> Result<PathBuf, Failure> {
+pub(in crate::source_check) fn document_path(uri: &str) -> Result<PathBuf, Failure> {
     let rest = uri.strip_prefix("file://").ok_or_else(|| Failure::input("source imports require a local file URI"))?;
     let rest = if rest.starts_with('/') { rest } else {
         rest.strip_prefix("localhost").filter(|s| s.starts_with('/'))

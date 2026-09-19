@@ -5,9 +5,11 @@
 //! unification equations. Only fully instantiated candidates leave this module.
 //! The caller still owns final kernel checking and declaration publication.
 
+mod application;
 mod binders;
 mod calc;
 mod coercions;
+mod collections;
 pub mod scope;
 use scope::SourceScope;
 mod equations;
@@ -42,6 +44,8 @@ pub enum SourceInferenceError {
     Match(matching::MatchError),
     Inductive(crate::inductive::InductiveError),
     UnknownConstant(Name),
+    InvalidNamedArgument(Name),
+    DuplicateNamedArgument(Name),
     LevelSyntax(LevelSyntaxError),
     ExpectedFunction,
     ExpectedType,
@@ -71,6 +75,14 @@ impl std::fmt::Display for SourceInferenceError {
             Self::Inductive(error) => write!(f, "{error}"),
             Self::UnknownConstant(_) => {
                 write!(f, "source reference does not name a known constant")
+            }
+            Self::InvalidNamedArgument(name) => write!(
+                f,
+                "invalid argument name `{}` for this application",
+                name.to_display_string()
+            ),
+            Self::DuplicateNamedArgument(name) => {
+                write!(f, "duplicate named argument `{}`", name.to_display_string())
             }
             Self::ExpectedFunction => write!(f, "source application requires a function type"),
             Self::Tactic(error) => write!(f, "{error}"),
@@ -766,6 +778,8 @@ impl Context {
             RecordField(record_terms::RecordBuild<'a>, Expr),
             Visit(&'a Syntax, Option<Expr>, bool),
             Function(&'a [Syntax], Option<Expr>, bool),
+            NamedNext(application::NamedApplication<'a>),
+            NamedArgument(application::NamedApplication<'a>, Expr),
             Argument(Typed, Expr, &'a [Syntax], Option<Expr>, bool),
             Apply(Typed, &'a [Syntax], Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
@@ -1446,7 +1460,30 @@ impl Context {
                         }
                         Task::Function(arguments, expected, explicit) => {
                             let function = values.pop().expect("function task follows its visit");
-                            tasks.push(Task::Apply(function, arguments, expected, explicit));
+                            if application::has_named(arguments) {
+                                tasks.push(Task::NamedNext(self.start_named_application(
+                                    function, arguments, expected, explicit,
+                                )?));
+                            } else {
+                                tasks.push(Task::Apply(function, arguments, expected, explicit));
+                            }
+                        }
+                        Task::NamedNext(mut state) => {
+                            if let Some(argument) = self.next_named_argument(&mut state)? {
+                                tasks.push(Task::NamedArgument(state, argument.codomain));
+                                tasks.push(Task::Visit(
+                                    argument.syntax,
+                                    Some(argument.domain),
+                                    true,
+                                ));
+                            } else {
+                                values.push(self.finish_named_application(state)?);
+                            }
+                        }
+                        Task::NamedArgument(mut state, codomain) => {
+                            let argument = values.pop().expect("named argument follows its value");
+                            self.add_named_argument(&mut state, &codomain, argument)?;
+                            tasks.push(Task::NamedNext(state));
                         }
                         Task::Apply(function, arguments, expected, explicit) => {
                             if let Some((first, rest)) = arguments.split_first() {

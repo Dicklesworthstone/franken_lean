@@ -110,7 +110,7 @@ fn open_imports_override_disk_and_closed_imports_return_to_disk_without_stale_hi
         change(&entry, 3, "import Lib\ntheorem use : value = 0 := by rfl"),
     ]);
     assert_eq!(successes(&messages).len(), 5, "{messages:#?}");
-    assert_eq!(errors(&messages, &entry).len(), 2, "{messages:#?}");
+    assert_eq!(errors(&messages, &entry).len(), 4, "{messages:#?}");
     assert_eq!(std::fs::read_to_string(root.join("Lib.lean")).unwrap(), "def value := 0");
 }
 
@@ -130,7 +130,7 @@ fn invalidated_open_imports_block_disk_fallback_and_diagnostic_waits_then_recove
     assert!(messages.iter().any(|m| m.contains("disk fallback is forbidden")), "{messages:#?}");
     assert!(messages.iter().any(|m| m.contains("\"id\":23") && m.contains("\"error\"")), "{messages:#?}");
     assert!(messages.iter().any(|m| m.contains("\"id\":24") && m.contains("\"result\":{}")), "{messages:#?}");
-    assert_eq!(successes(&messages).len(), 4, "{messages:#?}");
+    assert_eq!(successes(&messages).len(), 5, "{messages:#?}");
 }
 
 #[test]
@@ -176,3 +176,9 @@ fn admission_only_editor_reports_eval_instead_of_running_or_silently_ignoring_it
     assert!(successes(&messages).is_empty());
     assert_eq!(errors(&messages, "untitled:NoExecution.lean").len(), 1, "{messages:#?}");
 }
+
+#[path = "lsp_proof_modules/reactive.rs"]
+mod reactive;
+
+#[path = "lsp_proof_modules/watched.rs"]
+mod watched;

@@ -10838,11 +10838,7 @@ pub fn serve_lsp() -> MultiplexerOutput {
     let mut writer = BufWriter::new(stdout.lock());
 
     let mut checker = source_check::lsp::Checker::new();
-    let mut on_did_open = move |uri: &str, text: &str, documents: &[fln_server::dispatch::OpenDocumentSource<'_>]| {
-        checker.check(uri, text, documents)
-    };
-
-    let outcome = fln_server::dispatch::serve_with_documents(&mut reader, &mut writer, &mut on_did_open);
+    let outcome = fln_server::dispatch::serve_workspace(&mut reader, &mut writer, &mut checker);
     if let Err(error) = writer.flush() {
         return MultiplexerOutput::failure(format!("fln serve-lsp: transport flush error: {error}\n"), 1);
     }

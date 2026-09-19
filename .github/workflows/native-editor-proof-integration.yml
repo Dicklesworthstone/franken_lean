@@ -2,194 +2,52 @@ name: Native editor proof integration
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/native-editor-proof-integration.yml']
+    paths:
+      - '.github/workflows/native-editor-proof-integration.yml'
+      - 'crates/fln-server/**'
+      - 'crates/fln-cli/src/lib.rs'
+      - 'crates/fln-cli/src/bin/**'
+      - 'crates/fln-cli/src/source_check*'
+      - 'crates/fln-cli/src/source_check/**'
+      - 'crates/fln-cli/tests/lsp*'
+      - 'crates/fln-cli/tests/lsp_proof_modules/**'
+      - 'crates/fln-cli/tests/source_module_check.rs'
+      - 'crates/fln/src/source_check*'
+      - 'crates/fln/src/source_check/**'
+      - 'crates/fln/tests/source_module*'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   editor-proofs:
-    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Apply source integration to exact checked-out inputs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'editor-proof-integration'
-          root.mkdir()
-          (root / 'base.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
-          blobs = {
-              'crates/fln-server/src/dispatch/documents.rs': 'ebb10c3dc20b952967e15fae6abd7d7626f71441',
-              'crates/fln-cli/src/source_check/imports/editor.rs': '4fb4feca10bddadf79976def5e6b6ecb5ab0fd77',
-              'crates/fln-cli/src/source_check/lsp.rs': '8d3e9154da46ba85083829c14803f312c6889c60',
-              'crates/fln-cli/tests/lsp_proof_modules.rs': 'b44cf7900806256d0c4fe31d24ac6d39158bc1c2',
-              'docs/NATIVE_EDITOR_PROOFS.md': 'a062b60c7bb7f05fa6ef8cd5276a74bb63a14812',
-          }
-          for path, sha in blobs.items():
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + sha,
-                  headers={'Accept':'application/vnd.github+json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  data = json.load(response)
-              assert data['encoding'] == 'base64'
-              content = base64.b64decode(data['content'])
-              assert hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest() == sha
-              text = content.decode('utf-8')
-              if path.endswith('/imports/editor.rs'):
-                  text = text.replace('pub(crate)', 'pub(in crate::source_check)')
-              if path.endswith('/source_check/lsp.rs'):
-                  text = text.replace('pub(super)', 'pub(crate)')
-                  old = '                SourceModuleCheckError::Source { module, error } if module == &sources.names[0] => match error {\n                    fln::SourceCheckError::Command { offset, .. } | fln::SourceCheckError::Scope { offset, .. } => *offset,\n                    _ => 0,\n                },'
-                  new = '                SourceModuleCheckError::Source {\n                    module,\n                    error: fln::SourceCheckError::Command { offset, .. }\n                        | fln::SourceCheckError::Scope { offset, .. },\n                } if module == &sources.names[0] => *offset,'
-                  assert text.count(old) == 1, 'source diagnostic match anchor'
-                  text = text.replace(old, new)
-              target = pathlib.Path(path)
-              assert not target.exists(), 'source integration already present: ' + path
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_text(text)
-          def replace(text, old, new, count=1):
-              assert text.count(old) == count, (old, text.count(old), count)
-              return text.replace(old, new)
-          path = pathlib.Path('crates/fln-server/src/dispatch.rs')
-          text = path.read_text()
-          text = replace(text, 'mod json;\n', 'mod documents;\nuse documents::CheckSource;\npub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};\nmod json;\n')
-          text = replace(text, "on_did_open: &mut OnDidOpen<'_>,", 'on_did_open: &mut dyn CheckSource,', 5)
-          text = replace(text, 'pub fn serve(\n', 'fn serve_inner(\n')
-          text = replace(text, '    on_did_open: &mut dyn CheckSource,\n) -> io::Result<DiagnosticCompletion>', '    on_did_open: &mut dyn CheckSource,\n    session: &DocumentSession,\n) -> io::Result<DiagnosticCompletion>')
-          text = replace(text, 'let notifications = on_did_open(uri, content);', 'let notifications = on_did_open.check(uri, content, &session.sources());')
-          text = replace(text, 'check_document(output, &uri, &text, on_did_open)?', 'check_document(output, &uri, &text, on_did_open, session)?', 4)
-          path.write_text(text)
-          path = pathlib.Path('crates/fln-server/src/dispatch/session.rs')
-          text = path.read_text()
-          addition = '''impl DocumentSession {
-              pub(super) fn sources(&self) -> Vec<super::OpenDocumentSource<'_>> {
-                  self.documents.iter().map(|(uri, document)| super::OpenDocumentSource {
-                      uri, version: document.version, text: document.text.as_deref(),
-                  }).collect()
-              }
-          }
-
-          '''
-          path.write_text(replace(text, '#[cfg(test)]\nmod tests {', addition + '#[cfg(test)]\nmod tests {'))
-          path = pathlib.Path('crates/fln-cli/src/source_check.rs')
-          path.write_text(replace(path.read_text(), 'mod imports;\n', 'mod imports;\npub(super) mod lsp;\n'))
-          path = pathlib.Path('crates/fln-cli/src/source_check/imports.rs')
-          text = path.read_text()
-          text = replace(text, 'use super::*;\n', 'use super::*;\npub(super) mod editor;\n')
-          text = replace(text, 'fn module_path(root: &Path, name: &Name) -> Result<PathBuf, Failure> {', '''fn module_path(root: &Path, name: &Name) -> Result<PathBuf, Failure> {
-              checked_module_path(root, name, false)
-          }
-
-          fn checked_module_path(root: &Path, name: &Name, allow_missing_final: bool) -> Result<PathBuf, Failure> {''')
-          text = replace(text, 'let metadata = std::fs::symlink_metadata(&path).map_err(|e| Failure::io(&path, e))?;', '''let metadata = match std::fs::symlink_metadata(&path) {
-                      Ok(metadata) => metadata,
-                      Err(error) if allow_missing_final && index == last && error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
-                      Err(error) => return Err(Failure::io(&path, error)),
-                  };''')
-          path.write_text(text)
-          path = pathlib.Path('crates/fln-cli/src/lib.rs')
-          text = path.read_text()
-          start = text.index('fn serve_lsp() -> MultiplexerOutput {')
-          callback = text.index('    let lsp_request = ProjectionRequest {', start)
-          dispatch = text.index('    match fln_server::dispatch::serve(', callback)
-          text = text[:callback] + '''    let mut checker = source_check::lsp::Checker::new();
-              let mut on_did_open = move |uri: &str, text: &str, documents: &[fln_server::dispatch::OpenDocumentSource<'_>]| {
-                  checker.check(uri, text, documents)
-              };
-
-          ''' + text[dispatch:]
-          text = replace(text, 'fn serve_lsp() -> MultiplexerOutput {\n    use std::io::{BufReader, BufWriter};', '/// Run the shared native proof-checking LSP session on process standard streams.\npub fn serve_lsp() -> MultiplexerOutput {\n    use std::io::{BufReader, BufWriter, Write};')
-          text = replace(text, 'match fln_server::dispatch::serve(&mut reader, &mut writer, &mut on_did_open) {', '''let outcome = fln_server::dispatch::serve_with_documents(&mut reader, &mut writer, &mut on_did_open);
-              if let Err(error) = writer.flush() {
-                  return MultiplexerOutput::failure(format!("fln serve-lsp: transport flush error: {error}\\n"), 1);
-              }
-              match outcome {''')
-          start = text.index('/// Run source bytes through the bounded Engine')
-          end = text.index('/// Convert a byte offset in the UTF-8 document', start)
-          text = text[:start] + text[end:]
-          start = text.index('/// Build a `ProjectionSnapshot::Complete` with a single error diagnostic at the')
-          end = text.index('/// Run the native `fln` multiplexer', start)
-          text = text[:start] + text[end:]
-          for name in ['lsp_source_snapshot', 'lsp_execution_error_snapshot', 'lsp_error_snapshot', 'lsp_positioned_error_snapshot']:
-              assert name not in text, 'obsolete checker still referenced: ' + name
-          path.write_text(text)
-          path = pathlib.Path('crates/fln-cli/src/bin/support/mod.rs')
-          text = path.read_text()
-          start = text.index('pub(super) fn serve_lsp()')
-          end = text.index('fn lsp_error_snapshot(', start)
-          text = text[:start] + '''pub(super) fn serve_lsp() -> fln_cli::MultiplexerOutput {
-              fln_cli::serve_lsp()
-          }
-
-          ''' + text[end:]
-          text = replace(text, 'use std::io::{BufReader, BufWriter, Write};', 'use std::io::Write;')
-          text = replace(text, 'use fln_core::diag::{', '#[cfg(test)]\nuse fln_core::diag::{')
-          text = replace(text, 'StructuredDiagnostic, StructuredInconclusive,\n    StructuredInternalFault,', 'StructuredDiagnostic,')
-          text = replace(text, 'use fln_core::outcome::BoundedText;', '#[cfg(test)]\nuse fln_core::outcome::BoundedText;')
-          text = replace(text, 'use fln_core::pos::{FileMap, Position, RawPos};', '#[cfg(test)]\nuse fln_core::pos::Position;')
-          text = replace(text, 'const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;\n', '')
-          for name in ['lsp_projection_request', 'project_snapshot', 'lsp_error_snapshot', 'lsp_positioned_error_snapshot']:
-              text = replace(text, 'fn ' + name + '(', '#[cfg(test)]\nfn ' + name + '(')
-          path.write_text(text)
-          changed = list(blobs) + ['crates/fln-server/src/dispatch.rs', 'crates/fln-server/src/dispatch/session.rs', 'crates/fln-cli/src/source_check.rs', 'crates/fln-cli/src/source_check/imports.rs', 'crates/fln-cli/src/lib.rs', 'crates/fln-cli/src/bin/support/mod.rs']
-          (root / 'paths.json').write_text(json.dumps(changed))
-          subprocess.run(['git', 'add', '--', *changed], check=True)
-          (root / 'integration.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
-      - name: Validate module reuse, real editor traffic and downstream compilation
+      - name: Check native proof libraries, reactive documents and watched files
         shell: bash
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/editor-proof-integration"
-          exec > >(tee "$evidence/validation.log") 2>&1
+          exec > >(tee "$RUNNER_TEMP/native-editor-validation.log") 2>&1
+          git rev-parse HEAD
+          git rev-parse HEAD^{tree}
           toolchain=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
           rustc -Vv
           cargo test --locked -p fln-server
-          cargo test --locked -p fln --test source_module_session --test source_module_check --no-fail-fast
+          cargo test --locked -p fln-cli --lib source_check::lsp::dependencies
           cargo test --locked -p fln-cli --test lsp_proof_modules --test lsp_stdio_e2e --test source_module_check --no-fail-fast
+          cargo test --locked -p fln --test source_module_session --test source_module_check --no-fail-fast
           cargo clippy --locked -p fln-server -p fln -p fln-cli --all-targets -- -D warnings
           cargo check --locked --workspace --all-targets
-          git diff --cached --check
-      - name: Export the exact validated source tree without moving main
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: python
-        run: |
-          import hashlib, json, os, pathlib, subprocess, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'editor-proof-integration'
-          paths = json.loads((root / 'paths.json').read_text())
-          actual = subprocess.check_output(['git','diff','--cached','--name-only'], text=True).splitlines()
-          assert sorted(actual) == sorted(paths), actual
-          def post(endpoint, value):
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint,
-                  data=json.dumps(value).encode(), method='POST',
-                  headers={'Accept':'application/vnd.github+json','Content-Type':'application/json','Authorization':'Bearer ' + os.environ['GH_TOKEN']})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  return json.load(response)
-          tree = []
-          for path in paths:
-              content = pathlib.Path(path).read_bytes()
-              assert content == subprocess.check_output(['git','show',':' + path])
-              sha = hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest()
-              result = post('blobs', {'content':content.decode('utf-8'),'encoding':'utf-8'})
-              assert result['sha'] == sha
-              tree.append({'path':path,'mode':'100644','type':'blob','sha':sha})
-          base_tree = subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip()
-          result = post('trees', {'base_tree':base_tree,'tree':tree})
-          assert result['sha'] == subprocess.check_output(['git','write-tree'], text=True).strip()
-          result = {'parent':(root / 'base.txt').read_text().strip(), 'tree':result['sha'], 'files':tree}
-          (root / 'tested-tree.json').write_text(json.dumps(result, indent=2))
-          print('VALIDATED_SOURCE_TREE ' + json.dumps(result), flush=True)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: editor-proof-integration-${{ github.sha }}
-          path: ${{ runner.temp }}/editor-proof-integration
+          name: native-editor-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/native-editor-validation.log
           retention-days: 7
           if-no-files-found: error

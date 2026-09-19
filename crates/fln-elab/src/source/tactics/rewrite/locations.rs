@@ -6,6 +6,7 @@ use super::*;
 pub(super) struct RewriteLocations {
     pub(super) hypotheses: Vec<Name>,
     pub(super) target: bool,
+    pub(super) all: bool,
 }
 
 impl Context {
@@ -28,6 +29,40 @@ impl Context {
             "rewrite location",
         )?;
         expect_atom(&parts[0], "at", "location keyword")?;
+        if matches!(&parts[1], Syntax::Node { kind, .. }
+            if kind == &parser_kind(&["Tactic", "locationWildcard"]))
+        {
+            let marker = expect_node(
+                &parts[1],
+                &parser_kind(&["Tactic", "locationWildcard"]),
+                1,
+                "wildcard location",
+            )?;
+            expect_atom(&marker[0], "*", "wildcard location marker")?;
+            let mut hypotheses = Vec::new();
+            // Snapshot source-visible names in context order. Hidden transport
+            // identities and shadowed binders must not become new locations.
+            for local in self.txn.lctx.decls().to_vec() {
+                self.tick()?;
+                if local.user_name.is_anonymous()
+                    || scope::components(&local.user_name).is_err()
+                    || self.is_matrix_hypothesis(&local)
+                    || !self
+                        .txn
+                        .lctx
+                        .find_by_user_name(&local.user_name)
+                        .is_some_and(|visible| visible.id == local.id)
+                {
+                    continue;
+                }
+                hypotheses.push(local.user_name);
+            }
+            return Ok(Some(RewriteLocations {
+                hypotheses,
+                target: true,
+                all: true,
+            }));
+        }
         let parts = expect_node(
             &parts[1],
             &parser_kind(&["Tactic", "locationHyp"]),
@@ -41,6 +76,7 @@ impl Context {
         let mut result = RewriteLocations {
             hypotheses: Vec::new(),
             target: false,
+            all: false,
         };
         for name in names {
             self.tick()?;
@@ -79,6 +115,31 @@ impl Context {
             }
         }
         self.term(syntax, None)
+    }
+
+    /// Keep explicitly selected evidence and its local dependency telescope
+    /// unchanged during wildcard traversal. Otherwise `rw [h] at *` can turn
+    /// h : x = y into h : y = y before reaching a hypothesis that needs it.
+    pub(super) fn wildcard_rule_dependencies(
+        &mut self,
+        rule: &Typed,
+    ) -> Result<HashSet<FVarId>, NatDefinitionElabError> {
+        let value = self.instantiate(&rule.value)?;
+        let type_ = self.instantiate(&rule.type_)?;
+        let mut needed: HashSet<_> = self.elimination_reads(&value)?.into_iter().collect();
+        needed.extend(self.elimination_reads(&type_)?);
+        for local in self.txn.lctx.decls().to_vec().into_iter().rev() {
+            self.tick()?;
+            if needed.contains(&local.id) {
+                let type_ = self.instantiate(&local.type_)?;
+                needed.extend(self.elimination_reads(&type_)?);
+                if let Some(value) = &local.value {
+                    let value = self.instantiate(value)?;
+                    needed.extend(self.elimination_reads(&value)?);
+                }
+            }
+        }
+        Ok(needed)
     }
 
     /// Produce a forward map T a -> T b rather than the contravariant map
@@ -230,10 +291,14 @@ impl Context {
         let [_, _, _, location] = args else {
             return Err(error(TacticError::MalformedScript));
         };
+        self.txn.lctx = initial.lctx.clone();
         let Some(locations) = self.rewrite_locations(location)? else {
             return Ok(false);
         };
         let rules = self.rewrite_rules(args, close)?;
+        if locations.all {
+            return self.rewrite_at_all(proof, initial, rules, locations.hypotheses, close);
+        }
         // Resolve every requested name before making a successful prefix.
         for name in &locations.hypotheses {
             if initial.lctx.find_by_user_name(name).is_none() {
@@ -292,6 +357,98 @@ impl Context {
                     .work
                     .extend(premises.into_iter().rev().map(Work::Goal));
                 goal = next;
+            }
+        }
+        if !close || !self.rewrite_reflexivity(&goal)? {
+            proof.work.push(Work::Goal(goal));
+        }
+        Ok(true)
+    }
+
+    fn rewrite_at_all<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        initial: &ProofGoal,
+        rules: VecDeque<RewriteRule<'a>>,
+        hypotheses: Vec<Name>,
+        close: bool,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut goal = initial.clone();
+        for rule in rules {
+            self.txn.lctx = goal.lctx.clone();
+            // Inspect in isolation; do not leave the inspection's implicit
+            // metavariables behind. Every actual location elaborates afresh.
+            let mut trial = self.rewrite_trial();
+            let inspected = (|| {
+                let term = trial.located_rule_term(rule.syntax)?;
+                trial.flush(false)?;
+                trial.wildcard_rule_dependencies(&term)
+            })();
+            self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            let protected = inspected?;
+            let mut changed = false;
+            for name in &hypotheses {
+                self.tick()?;
+                self.txn.lctx = goal.lctx.clone();
+                let local = goal
+                    .lctx
+                    .find_by_user_name(name)
+                    .cloned()
+                    .ok_or_else(|| error(TacticError::RewriteLocation))?;
+                if protected.contains(&local.id) {
+                    continue;
+                }
+                let mut trial = self.rewrite_trial();
+                let result: Result<_, NatDefinitionElabError> = (|| {
+                    let term = trial.located_rule_term(rule.syntax)?;
+                    trial.flush(false)?;
+                    let target = trial.instantiate(&local.type_)?;
+                    let Some(RewriteMatch { rule: term, occurrence, premises }) = trial
+                        .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    else {
+                        return Ok(None);
+                    };
+                    let replacement = trial
+                        .rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
+                    let (next, parent, value) = trial
+                        .replace_rewritten_hypothesis(goal.clone(), &local, replacement)?;
+                    Ok(Some((next, parent, value, premises)))
+                })();
+                self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                let Some((next, parent, value, premises)) = result? else {
+                    continue;
+                };
+                *self = trial;
+                proof.work.push(Work::Close(parent, value));
+                proof.work.extend(premises.into_iter().rev().map(Work::Goal));
+                goal = next;
+                changed = true;
+            }
+            self.txn.lctx = goal.lctx.clone();
+            let mut trial = self.rewrite_trial();
+            let result: Result<_, NatDefinitionElabError> = (|| {
+                let term = trial.located_rule_term(rule.syntax)?;
+                trial.flush(false)?;
+                let target = trial.instantiate(&goal.target)?;
+                let Some(RewriteMatch { rule: term, occurrence, premises }) = trial
+                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                else {
+                    return Ok(None);
+                };
+                let (next, value) =
+                    trial.rewrite_transport(&goal, term, &occurrence, rule.reverse)?;
+                Ok(Some((next, value, premises)))
+            })();
+            self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            if let Some((next, value, premises)) = result? {
+                *self = trial;
+                proof.work.push(Work::Close(goal, value));
+                proof.work.extend(premises.into_iter().rev().map(Work::Goal));
+                goal = next;
+                changed = true;
+            }
+            if !changed {
+                return Err(error(TacticError::RewriteNoMatch));
             }
         }
         if !close || !self.rewrite_reflexivity(&goal)? {

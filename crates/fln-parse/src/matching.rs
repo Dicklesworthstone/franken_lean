@@ -403,6 +403,12 @@ fn pattern(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    if range
+        .clone()
+        .any(|at| is_symbol(tokens, at, "[") || is_symbol(tokens, at, "::"))
+    {
+        return collections::pattern(leaves, view, tokens, range);
+    }
     enum Task {
         Parse(Range<usize>),
         Group(usize, usize),

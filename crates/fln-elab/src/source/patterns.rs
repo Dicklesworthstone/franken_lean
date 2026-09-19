@@ -695,7 +695,13 @@ impl Context {
                         let head = if resolved.relative {
                             self.copy_pattern_syntax(&constructor.syntax)?
                         } else {
-                            identifier(resolved.name.clone())
+                            // This name was resolved against the admitted
+                            // environment already. Preserve that identity on
+                            // re-entry: an enclosing namespace may contain a
+                            // different declaration with the same suffix.
+                            identifier(
+                                Name::from_components(["_root_"]).append_core(&resolved.name),
+                            )
                         };
                         let pattern = if fields.is_empty() {
                             head
@@ -761,7 +767,9 @@ impl Context {
         let mut needed = false;
         while let Some(node) = scan.pop() {
             self.tick()?;
-            needed |= complex(node, &self.txn.env) || pattern_function(node);
+            needed |= complex(node, &self.txn.env)
+                || pattern_function(node)
+                || collections::is_notation(node);
             if let Syntax::Node { args, .. } = node {
                 scan.extend(args);
             }
@@ -775,25 +783,35 @@ impl Context {
             root = inner;
         }
         enum Task<'a> {
-            Visit(&'a Syntax),
-            Node(&'a Syntax, usize),
+            Visit(&'a Syntax, bool),
+            Node(&'a Syntax, usize, bool),
         }
-        let mut tasks = vec![Task::Visit(syntax)];
+        let alternative_kind = parser_kind(&["Term", "matchAlt"]);
+        let mut tasks = vec![Task::Visit(syntax, false)];
         let mut built = Vec::new();
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
-                Task::Visit(node @ Syntax::Node { args, .. }) => {
-                    tasks.push(Task::Node(node, built.len()));
-                    tasks.extend(args.iter().rev().map(Task::Visit));
+                Task::Visit(node @ Syntax::Node { kind, args, .. }, pattern) => {
+                    tasks.push(Task::Node(node, built.len(), pattern));
+                    for (index, argument) in args.iter().enumerate().rev() {
+                        self.tick()?;
+                        let pattern = if kind == &alternative_kind {
+                            index == 1
+                        } else {
+                            pattern
+                        };
+                        tasks.push(Task::Visit(argument, pattern));
+                    }
                 }
-                Task::Visit(leaf) => built.push(leaf.clone()),
-                Task::Node(original @ Syntax::Node { info, kind, .. }, start) => {
+                Task::Visit(leaf, _) => built.push(leaf.clone()),
+                Task::Node(original @ Syntax::Node { info, kind, .. }, start, pattern) => {
                     let node = Syntax::Node {
                         info: *info,
                         kind: kind.clone(),
                         args: built.split_off(start),
                     };
+                    let node = self.expand_collection_node(node, pattern)?;
                     let mut required = Vec::new();
                     let node = if pattern_function(&node) {
                         self.compile_pattern_function(node, &mut required)?

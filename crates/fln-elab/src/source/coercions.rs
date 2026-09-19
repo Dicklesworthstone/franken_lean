@@ -6,6 +6,18 @@ use super::*;
 use crate::instances::InstanceRegistry;
 
 impl Context {
+    /// Expected function types expose domain/codomain universe constraints that
+    /// a single sort equality can hide behind max/imax. Generate them inside
+    /// the same speculative context as ordinary conversion, before coercions.
+    fn constrain_expected_type(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.constrain_telescope_universes(actual, expected)?;
+        self.constrain_type(actual, expected)
+    }
+
     fn has_coercion_class(&self, name: &str) -> Result<bool, NatDefinitionElabError> {
         let name = Name::from_components([name]);
         if !self.txn.env.contains(&name) {
@@ -370,12 +382,12 @@ impl Context {
         expected: &Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
         if !self.has_coercion_class("CoeT")? && !self.has_coercion_class("CoeSort")? {
-            self.constrain_type(&term.type_, expected)?;
+            self.constrain_expected_type(&term.type_, expected)?;
             return Ok(term);
         }
         let mut trial = self.clone();
         let normal = (|| {
-            trial.constrain_type(&term.type_, expected)?;
+            trial.constrain_expected_type(&term.type_, expected)?;
             trial.resolve_instances(false)?;
             let actual = trial.instantiate(&term.type_)?;
             let target = trial.instantiate(expected)?;
@@ -419,7 +431,7 @@ impl Context {
         }
         // No path: retain the original diagnostic boundary. Closed mismatches
         // still reach K1, while an unification/resource nonanswer stays typed.
-        self.constrain_type(&term.type_, expected)?;
+        self.constrain_expected_type(&term.type_, expected)?;
         Ok(term)
     }
 }

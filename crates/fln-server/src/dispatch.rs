@@ -14,6 +14,9 @@ use crate::transport;
 mod diagnostic_wait;
 #[cfg(test)]
 mod incremental;
+mod watch;
+mod workspace;
+pub use workspace::{WorkspaceChecker, serve_workspace};
 mod documents;
 use documents::CheckSource;
 pub use documents::{OnDocumentCheck, OpenDocumentSource, serve, serve_with_documents};
@@ -756,6 +759,7 @@ fn is_notification_method(method: &str) -> bool {
             | "textDocument/didChange"
             | "textDocument/didSave"
             | "textDocument/didClose"
+            | "workspace/didChangeWatchedFiles"
     )
 }
 
@@ -829,6 +833,7 @@ fn serve_inner(
     let mut session = DocumentSession::new();
     let mut waits = PendingDiagnosticWaits::new();
     let mut frontiers = BTreeMap::new();
+    let mut file_watcher = watch::Registration::default();
 
     loop {
         let Some(message) = transport::read_message(input)? else {
@@ -874,6 +879,7 @@ fn serve_inner(
             write_protocol_message(output, response)?;
             continue;
         }
+        if file_watcher.consume(output, &text, &envelope)? { continue; }
         let method = match method(&envelope, id) {
             Ok(method) => method,
             Err(response) => {
@@ -899,8 +905,13 @@ fn serve_inner(
             continue;
         }
 
+        let before = if on_did_open.tracks_dependencies() && state == ServerState::Running
+            && id.is_none() && matches!(method.as_str(), "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave" | "textDocument/didClose")
+        { Some(workspace::BeforeChange::capture(&session)) } else { None };
+        let mut checked_event = None;
         match (method.as_str(), id, state) {
             ("initialize", Some(request_id), ServerState::Uninitialized) => {
+                file_watcher.configure(envelope.params, on_did_open.tracks_dependencies());
                 write_protocol_message(output, initialize_response(request_id))?;
                 state = ServerState::Initializing;
             }
@@ -912,6 +923,7 @@ fn serve_inner(
             }
             ("initialized", None, ServerState::Initializing) => {
                 state = ServerState::Running;
+                file_watcher.start(output)?;
             }
             ("initialized", None, _) => {
                 write_warning(
@@ -927,6 +939,7 @@ fn serve_inner(
                 )?;
                 write_protocol_message(output, null_response(request_id))?;
                 state = ServerState::ShuttingDown;
+                file_watcher.stop();
             }
             ("shutdown", Some(request_id), _) => {
                 if !running_request(output, state, request_id)? {
@@ -946,6 +959,7 @@ fn serve_inner(
                     handle_open(output, &mut session, envelope.params, on_did_open)?
                 {
                     documents_opened = documents_opened.saturating_add(1);
+                    checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
                         output,
@@ -964,6 +978,7 @@ fn serve_inner(
                     on_did_open,
                 )? {
                     documents_changed = documents_changed.saturating_add(1);
+                    checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
                         output,
@@ -982,6 +997,7 @@ fn serve_inner(
                     on_did_open,
                 )? {
                     documents_saved = documents_saved.saturating_add(1);
+                    checked_event = Some(checked.uri.clone());
                     record_frontier(&mut frontiers, &checked);
                     settle_waits(
                         output,
@@ -999,6 +1015,17 @@ fn serve_inner(
                         waits.drain_uri(&uri),
                         "document closed before the requested diagnostics version was published",
                     )?;
+                }
+            }
+            ("workspace/didChangeWatchedFiles", None, ServerState::Running) => {
+                if on_did_open.tracks_dependencies() {
+                    match json::watched_file_uris(envelope.params) {
+                        Ok(uris) if !uris.is_empty() => workspace::refresh(
+                            output, &session, &mut waits, &mut frontiers, on_did_open, &uris, None,
+                        )?,
+                        Ok(_) => {},
+                        Err(message) => write_warning(output, message)?,
+                    }
                 }
             }
             ("textDocument/waitForDiagnostics", Some(request_id), state) => {
@@ -1066,6 +1093,13 @@ fn serve_inner(
                 }
             }
             (_, None, _) => {}
+        }
+        if let Some(before) = before {
+            let changed = before.changed(&session, checked_event.as_deref());
+            if !changed.is_empty() {
+                workspace::refresh(output, &session, &mut waits, &mut frontiers,
+                    on_did_open, &changed, checked_event.as_deref())?;
+            }
         }
     }
 }

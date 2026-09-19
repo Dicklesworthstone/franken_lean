@@ -1,0 +1,73 @@
+name: Native collection integration
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-collections.yml'
+      - 'crates/fln-elab/src/seed.rs'
+      - 'crates/fln-elab/src/seed/collections.rs'
+      - 'crates/fln-elab/src/seed/collections/**'
+      - 'crates/fln-elab/src/source/infer.rs'
+      - 'crates/fln-elab/src/source/coercions.rs'
+      - 'crates/fln-elab/src/constraint/unify.rs'
+      - 'crates/fln-elab/tests/universe_maximum_constraints.rs'
+      - 'crates/fln/tests/source_function_universes.rs'
+      - 'crates/fln/tests/source_collections.rs'
+      - 'crates/fln-cli/tests/source_collections.rs'
+      - 'examples/native_collections.lean'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  collections:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Identify source and install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/collection-evidence
+          git rev-parse HEAD > target/collection-evidence/base.txt
+          git rev-parse HEAD^{tree} > target/collection-evidence/tree.txt
+          channel=$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv > target/collection-evidence/compiler.txt
+      - name: Check native collections, inference, and installed commands
+        shell: python
+        run: |
+          import pathlib, subprocess
+          evidence = pathlib.Path('target/collection-evidence')
+          commands = [
+              ('source', ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_collections', '--test', 'source_function_universes']),
+              ('cli', ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_collections']),
+              ('elaborator', ['cargo', 'test', '--locked', '-p', 'fln-elab']),
+              ('engine', ['cargo', 'test', '--locked', '-p', 'fln', '--lib']),
+              ('clippy', ['cargo', 'clippy', '--locked', '-p', 'fln-elab', '-p', 'fln', '-p', 'fln-cli', '--all-targets', '--', '-D', 'warnings']),
+              ('workspace', ['cargo', 'check', '--locked', '--workspace', '--all-targets']),
+          ]
+          failed = []
+          for label, command in commands:
+              with (evidence / (label + '.log')).open('wb') as log:
+                  code = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT).returncode
+              print(label, code, flush=True)
+              if code:
+                  failed.append(label)
+                  print((evidence / (label + '.log')).read_text()[-16000:], flush=True)
+          raise SystemExit(bool(failed))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-collections-${{ github.sha }}
+          path: target/collection-evidence
+          retention-days: 3
+          if-no-files-found: error

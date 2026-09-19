@@ -5,7 +5,8 @@ use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleCheckError
 use fln_server::dispatch::OpenDocumentSource;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
-pub(crate) struct Checker { worker: Option<Worker> }
+mod dependencies;
+pub(crate) struct Checker { worker: Option<Worker>, dependencies: dependencies::Dependencies }
 struct Worker {
     input: SyncSender<Option<Sources>>,
     output: Receiver<Vec<String>>,
@@ -33,15 +34,18 @@ impl Drop for Worker {
     }
 }
 impl Checker {
-    pub(crate) fn new() -> Self { Self { worker: None } }
+    pub(crate) fn new() -> Self { Self { worker: None, dependencies: dependencies::Dependencies::default() } }
     pub(crate) fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+        self.dependencies.begin(uri, documents);
         if text.len() > SOURCE_RUN_DEFAULT_MAX_BYTES {
             return project(uri, text, &nonanswer("resource", "editor source exceeds its byte limit"));
         }
         // Header parsing uses the complete lexical source view. Keep its exact
         // error offset instead of flattening a syntax error into an I/O failure.
-        if let Err(error) = fln::source_check::modules::parse_source_header(text.as_bytes()) {
-            return project(uri, text, &diagnostic(uri, text.as_bytes(), error.primary_offset().map_or(0, |p| p.0), &error.to_string()));
+        match fln::source_check::modules::parse_source_header(text.as_bytes()) {
+            Ok(header) if header.imports.is_empty() => self.dependencies.no_imports(uri),
+            Ok(_) => {},
+            Err(error) => return project(uri, text, &diagnostic(uri, text.as_bytes(), error.primary_offset().map_or(0, |p| p.0), &error.to_string())),
         }
         let sources = match editor::load(uri, text, documents, SOURCE_RUN_DEFAULT_MAX_BYTES) {
             Ok(sources) => sources,
@@ -50,6 +54,7 @@ impl Checker {
                 return project(uri, text, &snapshot);
             }
         };
+        self.dependencies.loaded(uri, &sources.uris);
         if self.worker.is_none() {
             match Worker::new() {
                 Ok(worker) => self.worker = Some(worker),
@@ -160,5 +165,14 @@ fn check_sources(session: &mut Option<SourceModuleSession>, sources: &Sources) -
             let (class, _, _) = error.disposition();
             project(uri, text, &failure(uri, &sources.sources[0], offset, class, &error.to_string()))
         }
+    }
+}
+
+impl fln_server::dispatch::WorkspaceChecker for Checker {
+    fn check(&mut self, uri: &str, text: &str, documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+        Checker::check(self, uri, text, documents)
+    }
+    fn affected(&mut self, changed: &[String], documents: &[OpenDocumentSource<'_>]) -> Vec<String> {
+        self.dependencies.affected(changed, documents)
     }
 }

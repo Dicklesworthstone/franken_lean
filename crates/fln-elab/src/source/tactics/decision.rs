@@ -46,6 +46,68 @@ impl Context {
         self.close_proof_goal(goal, value)
     }
 
+    /// Recover the universe telescope of a closed conversion query, including
+    /// levels occurring only in local binder types or let-bound dictionaries.
+    /// Expression closure does not close universe parameters. In particular,
+    /// passing an empty telescope after closing a polymorphic local context
+    /// makes a valid decision query look like an out-of-scope kernel term.
+    ///
+    /// This is syntax collection, not universe inference or proof admission.
+    /// Callers must instantiate and check for unresolved holes first; the final
+    /// declaration still has to pass both ordinary checkers at its own telescope.
+    fn decision_level_params(
+        &mut self,
+        terms: &[&Expr],
+    ) -> Result<Vec<Name>, NatDefinitionElabError> {
+        use fln_core::level::LevelView;
+        use std::collections::{BTreeSet, HashSet};
+
+        let mut parameters = BTreeSet::new();
+        let mut expressions = terms.to_vec();
+        let mut seen_expressions = HashSet::new();
+        let mut levels = Vec::new();
+        while let Some(expression) = expressions.pop() {
+            self.tick()?;
+            if !seen_expressions.insert(expression.allocation_identity()) {
+                continue;
+            }
+            match expression.node() {
+                ExprNode::Sort { level } => levels.push(level),
+                ExprNode::Const { levels: arguments, .. } => levels.extend(arguments),
+                ExprNode::App { f, a } => expressions.extend([f, a]),
+                ExprNode::Lam { binder_type, body, .. }
+                | ExprNode::ForallE { binder_type, body, .. } => {
+                    expressions.extend([binder_type, body]);
+                }
+                ExprNode::LetE { type_, value, body, .. } => {
+                    expressions.extend([type_, value, body]);
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    expressions.push(expr);
+                }
+                _ => {}
+            }
+        }
+        let mut seen_levels = HashSet::new();
+        while let Some(level) = levels.pop() {
+            self.tick()?;
+            if !seen_levels.insert(std::ptr::from_ref(level)) {
+                continue;
+            }
+            match level.view() {
+                LevelView::Param(name) => {
+                    parameters.insert(name.clone());
+                }
+                LevelView::Succ(inner) => levels.push(inner),
+                LevelView::Max(left, right) | LevelView::IMax(left, right) => {
+                    levels.extend([left, right]);
+                }
+                _ => {}
+            }
+        }
+        Ok(parameters.into_iter().collect())
+    }
+
     /// Source WHNF and the pattern unifier intentionally do not implement the
     /// complete kernel evaluator. Close the relevant local telescope and ask
     /// the existing K1 conversion query; this is tactic selection, not admission.
@@ -75,6 +137,7 @@ impl Context {
             return Err(failure(SourceInferenceError::Scope));
         }
         self.require_resolved(&[computation.clone(), truth.clone()])?;
+        let parameters = self.decision_level_params(&[&computation, &truth])?;
         let budget = &self.txn.budget;
         let remaining = if budget.max_heartbeats == 0 {
             u64::MAX
@@ -86,7 +149,7 @@ impl Context {
         let kernel = self
             .kernel
             .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
-        match fln_kernel::check_def_eq(&self.txn.env, &[], &computation, &truth, kernel) {
+        match fln_kernel::check_def_eq(&self.txn.env, &parameters, &computation, &truth, kernel) {
             Outcome::Complete(verdict) => {
                 let consumed = match &verdict {
                     Verdict::Accepted { consumption } | Verdict::Rejected { consumption, .. } => {
@@ -182,5 +245,69 @@ impl Context {
         proof.work.push(Work::Goal(no_goal));
         proof.work.push(Work::Goal(yes_goal));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> Context {
+        Context::new(&Environment::new(), Budget::for_stack_bytes(2 * 1024 * 1024))
+    }
+
+    #[test]
+    fn decision_collects_binder_and_constant_universes_from_both_endpoints() {
+        let a = Name::from_components(["a"]);
+        let z = Name::from_components(["z"]);
+        let left = Expr::forall_e(
+            Name::anonymous(),
+            Expr::sort(Level::param(z.clone())),
+            Expr::sort(Level::param(a.clone())),
+            BinderInfo::Default,
+        );
+        let right = constant("polymorphic", vec![Level::param(z.clone())]);
+        assert_eq!(
+            context().decision_level_params(&[&left, &right]).unwrap(),
+            vec![a, z]
+        );
+    }
+
+    #[test]
+    fn decision_collects_universes_used_only_by_a_let_value() {
+        let u = Name::from_components(["u"]);
+        let term = Expr::let_e(
+            Name::anonymous(),
+            Expr::sort(Level::one()),
+            constant("dictionary", vec![Level::param(u.clone())]),
+            Expr::sort(Level::zero()),
+            false,
+        );
+        assert_eq!(context().decision_level_params(&[&term]).unwrap(), vec![u]);
+    }
+
+    #[test]
+    fn decision_universe_collection_preserves_sharing_and_charges_work() {
+        let u = Name::from_components(["u"]);
+        let mut term = Expr::sort(Level::param(u.clone()));
+        for _ in 0..24 {
+            term = Expr::app(term.clone(), term);
+        }
+        let mut context = context();
+        context.txn.budget.max_heartbeats = 200;
+        assert_eq!(context.decision_level_params(&[&term]).unwrap(), vec![u]);
+        assert!(context.txn.budget.heartbeats_consumed > 0);
+        assert!(context.txn.budget.heartbeats_consumed < 200);
+    }
+
+    #[test]
+    fn decision_universe_collection_cannot_bypass_the_source_budget() {
+        let mut context = context();
+        context.txn.budget.max_heartbeats = 1;
+        let term = Expr::sort(Level::param(Name::from_components(["u"])));
+        assert!(matches!(
+            context.decision_level_params(&[&term]),
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit))
+        ));
     }
 }
