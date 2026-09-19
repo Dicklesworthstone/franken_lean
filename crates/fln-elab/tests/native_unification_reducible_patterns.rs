@@ -1,7 +1,7 @@
 //! Reducible higher-order patterns through the public transactional unifier.
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
@@ -326,4 +326,187 @@ fn successful_existing_patterns_get_first_choice_before_let_unfolding() {
     assert_eq!(report.kernel_checks, 1);
     txn.unify(&app(Expr::mvar(f), &[number(7), number(9)]), &number(7), budget())
         .unwrap();
+}
+
+fn pruning_equation() -> (ElabTxn, MVarId, Expr, Expr) {
+    let mut txn = transaction();
+    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())), MetavarKind::Natural);
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let z = local(&mut txn, "z", nat());
+    let left = app(Expr::mvar(f.clone()), &[beta(nat(), x.clone()), y]);
+    let right = app(Expr::mvar(f.clone()), &[x, beta(nat(), z)]);
+    (txn, f, left, right)
+}
+
+#[test]
+fn normalized_same_head_pruning_replays_the_original_equation() {
+    for reverse in [false, true] {
+        let (mut txn, f, left, right) = pruning_equation();
+        let environment = txn.env.clone();
+        let (left, right) = if reverse {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.expression_assignments, vec![f.clone()]);
+        assert_eq!(report.kernel_checks, 1);
+        assert_eq!(report.residual_metavariables.len(), 1);
+        let residual = report.residual_metavariables[0].clone();
+        assert!(!txn.mvars.is_assigned(&residual));
+        assert!(txn.mvars.get_decl(&residual).unwrap().lctx.is_empty());
+        // The residual is a real outstanding obligation, not an assumed result.
+        txn.unify(&Expr::mvar(residual), &lam(nat(), bvar(0)), budget())
+            .unwrap();
+        txn.unify(&left, &right, budget()).unwrap();
+        txn.unify(&app(Expr::mvar(f), &[number(23), number(91)]), &number(23), budget())
+            .unwrap();
+        assert_eq!(txn.env, environment);
+    }
+}
+
+fn distinct_pruning_equation() -> (ElabTxn, MVarId, MVarId, Expr, Expr) {
+    let mut txn = transaction();
+    let type_ = pi(nat(), pi(nat(), nat()));
+    let f = hole(&mut txn, "f", type_.clone(), MetavarKind::Natural);
+    let g = hole(&mut txn, "g", type_, MetavarKind::Natural);
+    let x = local(&mut txn, "x", nat());
+    let y = local(&mut txn, "y", nat());
+    let z = local(&mut txn, "z", nat());
+    let left = app(Expr::mvar(f.clone()), &[beta(nat(), x.clone()), y]);
+    let right = app(Expr::mvar(g.clone()), &[beta(nat(), z), x]);
+    (txn, f, g, left, right)
+}
+
+#[test]
+fn distinct_heads_share_the_normalized_intersection_in_each_argument_order() {
+    for reverse in [false, true] {
+        let (mut txn, f, g, left, right) = distinct_pruning_equation();
+        let environment = txn.env.clone();
+        let (left, right) = if reverse {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(report.expression_assignments.len(), 2);
+        assert_eq!(report.residual_metavariables.len(), 1);
+        let residual = report.residual_metavariables[0].clone();
+        assert!(!txn.mvars.is_assigned(&residual));
+        assert!(txn.mvars.get_decl(&residual).unwrap().lctx.is_empty());
+        txn.unify(&Expr::mvar(residual), &lam(nat(), bvar(0)), budget())
+            .unwrap();
+        txn.unify(&app(Expr::mvar(f), &[number(7), number(9)]), &number(7), budget())
+            .unwrap();
+        txn.unify(&app(Expr::mvar(g), &[number(9), number(7)]), &number(7), budget())
+            .unwrap();
+        txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(txn.env, environment);
+    }
+}
+
+#[test]
+fn normalized_dependent_pruning_does_not_invent_an_inhabitant() {
+    let mut txn = transaction();
+    let f = hole(
+        &mut txn,
+        "f",
+        pi(Expr::sort(Level::one()), pi(bvar(0), bvar(1))),
+        MetavarKind::Natural,
+    );
+    let a = local(&mut txn, "A", Expr::sort(Level::one()));
+    let x = local(&mut txn, "x", a.clone());
+    let y = local(&mut txn, "y", a.clone());
+    let report = txn
+        .unify(
+            &app(
+                Expr::mvar(f.clone()),
+                &[
+                    beta(Expr::sort(Level::one()), a.clone()),
+                    beta(a.clone(), x),
+                ],
+            ),
+            &app(Expr::mvar(f), &[a, y]),
+            budget(),
+        )
+        .unwrap();
+    assert_eq!(report.kernel_checks, 1);
+    assert_eq!(report.residual_metavariables.len(), 1);
+    let residual = report.residual_metavariables[0].clone();
+    assert!(!txn.mvars.is_assigned(&residual));
+    let declaration = txn.mvars.get_decl(&residual).unwrap();
+    let ExprNode::ForallE {
+        binder_type, body, ..
+    } = declaration.type_.node()
+    else {
+        panic!("expected an explicitly quantified dependent obligation");
+    };
+    assert_eq!(binder_type, &Expr::sort(Level::one()));
+    assert_eq!(body, &bvar(0));
+    let before = txn.clone();
+    assert!(
+        txn.unify(
+            &Expr::mvar(residual),
+            &lam(Expr::sort(Level::one()), number(0)),
+            budget(),
+        )
+        .is_err()
+    );
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn normalization_never_assumes_an_unknown_function_is_injective() {
+    let mut txn = transaction();
+    let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::Natural);
+    let a = hole(&mut txn, "a", nat(), MetavarKind::Natural);
+    let b = hole(&mut txn, "b", nat(), MetavarKind::Natural);
+    let left = Expr::app(Expr::mvar(f.clone()), beta(nat(), Expr::mvar(a.clone())));
+    let right = Expr::app(Expr::mvar(f.clone()), Expr::mvar(b.clone()));
+    let before = txn.clone();
+    assert!(matches!(
+        txn.unify(&left, &right, budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&txn, &before);
+    let report = txn
+        .unify_many_with(
+            &[(left, right), (Expr::mvar(f.clone()), lam(nat(), number(0)))],
+            budget(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(report.expression_assignments, vec![f]);
+    assert!(!txn.mvars.is_assigned(&a));
+    assert!(!txn.mvars.is_assigned(&b));
+}
+
+#[test]
+fn pruning_assignment_limits_do_not_leak_a_shared_residual() {
+    let (mut txn, _, _, left, right) = distinct_pruning_equation();
+    let before = txn.clone();
+    let mut limits = budget();
+    limits.max_assignments = 1;
+    assert!(matches!(
+        txn.unify(&left, &right, limits),
+        Err(UnificationError::AssignmentLimit { .. })
+    ));
+    unchanged(&txn, &before);
+}
+
+#[test]
+fn a_late_failure_discards_the_residual_and_both_parent_assignments() {
+    let (mut txn, _, _, left, right) = distinct_pruning_equation();
+    let before = txn.clone();
+    assert!(
+        txn.unify_many_with(
+            &[(left, right), (number(0), number(1))],
+            budget(),
+            &|| false,
+        )
+        .is_err()
+    );
+    unchanged(&txn, &before);
 }

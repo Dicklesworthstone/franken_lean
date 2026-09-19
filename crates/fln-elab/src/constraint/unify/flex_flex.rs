@@ -177,7 +177,7 @@ impl Engine<'_> {
         expr: &Expr,
         locals: &LocalContext,
     ) -> Result<Option<PruningPattern>, UnificationError> {
-        let normalized = self.whnf(expr, locals)?;
+        let normalized = self.pattern_whnf(expr, locals)?;
         let mut head = &normalized;
         let mut arguments = Vec::new();
         loop {
