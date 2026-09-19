@@ -118,8 +118,8 @@ jobs:
           source = checker.read_text()
           assert source.count(old) == 1
           checker.write_text(source.replace(old, replacement))
-          run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', str(checker))
-          run('git', 'add', '--', str(checker))
+          run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', str(checker), 'crates/fln/src/lib.rs')
+          run('git', 'add', '--', str(checker), 'crates/fln/src/lib.rs')
           changed = output('git', 'diff', '--cached', '--name-only').splitlines()
           assert set(changed) == set(expected) | new
           run('git', 'diff', '--cached', '--check')
