@@ -703,6 +703,20 @@ impl Engine<'_> {
                     self.assigned_levels.push(id.clone());
                 }
                 (LevelView::Succ(a), LevelView::Succ(b)) => pending.push((a.clone(), b.clone())),
+                // Zero has forced preimages even though Max/IMax are not
+                // injective. max a b = 0 requires both operands to be zero;
+                // imax a b = 0 requires only b = 0. Its domain a is arbitrary.
+                // Use the ordinary metered worklist and assignment gate, so
+                // partial propagation still rolls back on any later refusal.
+                (LevelView::Max(a, b), LevelView::Zero)
+                | (LevelView::Zero, LevelView::Max(a, b)) => {
+                    pending.push((b.clone(), Level::zero()));
+                    pending.push((a.clone(), Level::zero()));
+                }
+                (LevelView::IMax(_, guard), LevelView::Zero)
+                | (LevelView::Zero, LevelView::IMax(_, guard)) => {
+                    pending.push((guard.clone(), Level::zero()));
+                }
                 // Max and IMax are not injective constructors. In particular,
                 // normalization may sort unknown atoms differently from their
                 // eventual values. Pairing those positions guesses assignments
