@@ -2440,8 +2440,10 @@ fn eta_candidate(
         let mut inside = eta_visible(child(lambda, body)?, sources, control, cancelled)?;
 
         let sources = TermSources::new(left, right, generated);
-        let inside_term = sources.source(inside)?;
-        if !matches!(inside_term.node(inside.root), Some(ExprNode::Lambda { .. })) {
+        let has_delta_head = definition_height(inside, sources, context, control, cancelled)?.is_some();
+        if has_delta_head {
+            let sources = TermSources::new(left, right, generated);
+            let inside_term = sources.source(inside)?;
             let budget = control.begin_normalization(cancelled)?;
             match whnf_at_with(inside_term, inside.root, context, budget, cancelled) {
                 WhnfOutcome::Complete(result) => {
@@ -2475,7 +2477,16 @@ fn eta_candidate(
 
         let mut width = 1u64;
         let sources = TermSources::new(left, right, generated);
-        while let Some(ExprNode::Lambda { body, .. }) = sources.source(inside)?.node(inside.root) {
+        let mut binder_types = Vec::new();
+        if let Some(ExprNode::Lambda { binder_type, .. }) =
+            sources.source(lambda)?.node(lambda.root)
+        {
+            binder_types.push(child(lambda, *binder_type)?);
+        }
+        while let Some(ExprNode::Lambda { binder_type, body, .. }) =
+            sources.source(inside)?.node(inside.root)
+        {
+            binder_types.push(child(inside, *binder_type)?);
             width = width
                 .checked_add(1)
                 .ok_or_else(|| control.bound_index(u64::MAX))?;
@@ -2499,10 +2510,36 @@ fn eta_candidate(
                 match whnf_at_with(argument_term, argument.root, context, budget, cancelled) {
                     WhnfOutcome::Complete(result) => {
                         control.absorb_whnf(&result, cancelled)?;
-                        matches!(
+                        let matched_bound = matches!(
                             result.term.node(result.term.root()),
                             Some(ExprNode::Bound { index: actual }) if u64::from(*actual) == index
-                        )
+                        );
+                        if matched_bound {
+                            true
+                        } else {
+                            let binder_idx = width as usize - 1 - index as usize;
+                            let unit_like = if let Some(&bt) = binder_types.get(binder_idx) {
+                                unit_like_inductive_for_binder(bt, sources, context, control, cancelled)?
+                            } else {
+                                None
+                            };
+                            if let Some((_induct_name, ctor_name)) = unit_like {
+                                let mut arg_head = result.term.root();
+                                while let Some(node) = result.term.node(arg_head) {
+                                    match node {
+                                        ExprNode::Apply { function, .. } => arg_head = *function,
+                                        ExprNode::Metadata { expression, .. } => arg_head = *expression,
+                                        _ => break,
+                                    }
+                                }
+                                matches!(
+                                    result.term.node(arg_head),
+                                    Some(ExprNode::Constant { name, .. }) if name == &ctor_name
+                                )
+                            } else {
+                                false
+                            }
+                        }
                     }
                     WhnfOutcome::Refused(refusal) => {
                         return Err(SlowHalt::Refusal {
@@ -2541,20 +2578,6 @@ fn eta_candidate(
             lambda = inside;
             body = *inner;
             continue;
-        }
-
-        let sources = TermSources::new(left, right, generated);
-        let inside_term = sources.source(inside)?;
-        if !matches!(inside_term.node(inside.root), Some(ExprNode::Bound { .. })) {
-            let budget = control.begin_normalization(cancelled)?;
-            if let WhnfOutcome::Complete(result) =
-                whnf_at_with(inside_term, inside.root, context, budget, cancelled)
-            {
-                control.absorb_whnf(&result, cancelled)?;
-                if result.reductions != 0 {
-                    inside = retain_generated(generated, lambda.side(), result.term);
-                }
-            }
         }
 
         let sources = TermSources::new(left, right, generated);
@@ -2629,6 +2652,77 @@ fn is_non_rec_structure(
         return false;
     };
     induct.constructors().len() == 1 && induct.num_indices() == 0 && !induct.is_recursive()
+}
+
+fn unit_like_inductive_for_binder(
+    binder: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<(WireName, WireName)>, SlowHalt> {
+    let budget = control.begin_normalization(cancelled)?;
+    let term = sources.source(binder)?;
+    let norm = match whnf_at_with(term, binder.root, context, budget, cancelled) {
+        WhnfOutcome::Complete(result) => {
+            control.absorb_whnf(&result, cancelled)?;
+            result.term
+        }
+        WhnfOutcome::Refused(refusal) => {
+            return Err(SlowHalt::Refusal {
+                side: binder.side(),
+                refusal: Box::new(refusal),
+                progress: Box::new(control.progress),
+            });
+        }
+        WhnfOutcome::Inconclusive(stop) => {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+                side: binder.side(),
+                stop,
+                progress: control.progress,
+            })));
+        }
+        WhnfOutcome::InternalFault(fault) => {
+            return Err(SlowHalt::Fault(DefEqFault::Whnf {
+                side: binder.side(),
+                fault,
+            }));
+        }
+    };
+    let mut head = norm.root();
+    while let Some(node) = norm.node(head) {
+        match node {
+            ExprNode::Metadata { expression, .. } => head = *expression,
+            ExprNode::Apply { function, .. } => head = *function,
+            _ => break,
+        }
+    }
+    let Some(ExprNode::Constant { name, .. }) = norm.node(head) else {
+        return Ok(None);
+    };
+    let constants = context.constants();
+    if !is_non_rec_structure(constants, name) {
+        return Ok(None);
+    }
+    let Some(decl) = constants.find(name) else {
+        return Ok(None);
+    };
+    let Some(induct) = decl.inductive_metadata() else {
+        return Ok(None);
+    };
+    let Some(ctor_name) = induct.constructors().first() else {
+        return Ok(None);
+    };
+    let Some(ctor_decl) = constants.find(ctor_name) else {
+        return Ok(None);
+    };
+    let Some(ctor) = ctor_decl.constructor_metadata() else {
+        return Ok(None);
+    };
+    if ctor.num_fields() == 0 {
+        return Ok(Some((name.clone(), ctor_name.clone())));
+    }
+    Ok(None)
 }
 
 fn collect_constructor_spine(

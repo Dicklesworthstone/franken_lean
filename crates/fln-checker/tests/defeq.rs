@@ -8,8 +8,9 @@ use fln_checker::defeq::{
     QuickDefEqResult, QuickDefEqStop, def_eq, def_eq_with, quick_def_eq, quick_def_eq_with,
 };
 use fln_checker::environment::{
-    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
-    DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, ConstructorDeclaration,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, InductiveDeclaration,
+    ReducibilityHint,
 };
 use fln_checker::term::TermBudget;
 use fln_checker::whnf::{
@@ -2603,4 +2604,73 @@ fn long_spine_classification_is_metered_cancellable_and_query_local() {
         if progress.slow_comparisons < complete.slow_comparisons));
     // No completed or partially built cache leaks across a failed query.
     assert_eq!(slow_equal(&left, &right, &context), complete);
+}
+
+#[test]
+fn unit_like_structure_argument_satisfies_eta_contraction() {
+    let punit = checker_name("PUnit");
+    let punit_unit = checker_name("PUnit.unit");
+    let entries = vec![
+        ConstantEntry::new(
+            punit.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![punit.clone()],
+                    vec![punit_unit.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            punit_unit.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&constant("PUnit")),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(punit.clone(), 0, 0, 0),
+            ),
+        ),
+        definition_entry(
+            "Unit",
+            decoded(&constant("PUnit")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "Unit.unit",
+            decoded(&constant("PUnit.unit")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ];
+    let environment = match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+        EnvironmentOutcome::Complete { environment, .. } => environment,
+        other => panic!("constant environment did not build: {other:?}"),
+    };
+    let context = WhnfContext::new(Vec::new(), Vec::new(), environment);
+
+    let function = constant("target_fn");
+    let contracted = Expr::lam(
+        name("u"),
+        constant("Unit"),
+        Expr::app(function.clone(), constant("Unit.unit")),
+        BinderInfo::Default,
+    );
+    let left = decoded(&contracted);
+    let right = decoded(&function);
+    assert!(matches!(
+        def_eq(&left, &right, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(matches!(
+        def_eq(&right, &left, &context, DefEqBudget::unlimited()),
+        DefEqOutcome::Equal(_)
+    ));
 }
