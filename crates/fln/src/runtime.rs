@@ -3,6 +3,7 @@
 //! This never changes the declaration sent to either checker. Special forms
 //! are recognized only against exact admitted seed declarations, not by name
 //! alone. Unsupported dependent result representations remain typed refusals.
+mod callables;
 mod data_recursion;
 mod nat;
 mod records;
@@ -27,6 +28,7 @@ pub(super) struct Preparation<'a> {
     next_nat: u64,
     nat_family_checked: bool,
     value_types: ExecutableValueTypes,
+    interfaces: Vec<fln_comp::ingress::ClosureSignature>,
     pub(super) constructors: Vec<fln_comp::ingress::ConstructorBinding>,
 }
 
@@ -79,6 +81,7 @@ impl<'a> Preparation<'a> {
             next_nat: 0,
             nat_family_checked: false,
             value_types: ExecutableValueTypes::bounded_source(),
+            interfaces: Vec::new(),
             constructors: Vec::new(),
         }
     }

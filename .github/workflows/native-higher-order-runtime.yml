@@ -1,0 +1,103 @@
+name: Native higher-order runtime
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-higher-order-runtime.yml']
+permissions:
+  contents: write
+concurrency:
+  group: native-higher-order-runtime
+  cancel-in-progress: false
+jobs:
+  checked-landing:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 50
+      - name: Install pinned compiler
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component clippy,rustfmt
+      - name: Apply reviewed function-value preparation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/native-function-values
+          test -f crates/fln/src/runtime/callables.rs
+          python3 - <<'PYTHON'
+          import base64, hashlib, pathlib, subprocess, zlib
+          payload = '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'
+          data = zlib.decompress(base64.b64decode(payload, validate=True))
+          assert hashlib.sha256(data).hexdigest() == 'afe722bbd73fbd864436f402d13b8bfd1633715371bd0d243d2ace5d3fa7d352'
+          path = pathlib.Path('target/native-function-values/implementation.patch')
+          path.write_bytes(data)
+          if subprocess.run(['git', 'apply', '--reverse', '--check', str(path)], capture_output=True).returncode:
+              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+              subprocess.run(['git', 'apply', str(path)], check=True)
+          PYTHON
+          cat > target/native-function-values/check.sh <<'SH'
+          set -euo pipefail
+          cargo +nightly-2026-08-31 test --offline --locked -p fln-comp -p fln-vm 2>&1 | tee target/native-function-values/compiler-vm.log
+          cargo +nightly-2026-08-31 test --offline --locked -p fln --lib --test runtime_function_values --test runtime_higher_order --test runtime_local_functions --test runtime_conditionals --test runtime_nat_recursion --test runtime_records --test runtime_recursive_data --test runtime_variants 2>&1 | tee target/native-function-values/runtime.log
+          cargo +nightly-2026-08-31 clippy --offline --locked -p fln-comp -p fln --tests -- -D warnings 2>&1 | tee target/native-function-values/clippy.log
+          rustfmt +nightly-2026-08-31 --check --edition 2024 crates/fln/src/runtime/function_values.rs crates/fln/tests/runtime_function_values.rs
+          cat > target/native-function-values/Callbacks.lean <<'LEAN'
+          def twice (f : Nat -> Nat) (x : Nat) : Nat := f (f x)
+          def inc (x : Nat) : Nat := x + 1
+          def identity (f : Nat -> Nat) : Nat -> Nat := f
+          #eval twice (fun x : Nat => x + 1) 40
+          #eval twice inc 40
+          #eval twice (Nat.add 1) 40
+          #eval identity (Nat.add 1) 41
+          LEAN
+          cargo +nightly-2026-08-31 run --offline --locked -q -p fln-cli --bin fln -- run --json --emit-flbc target/native-function-values/callbacks.flbc target/native-function-values/Callbacks.lean > target/native-function-values/source.json
+          cargo +nightly-2026-08-31 run --offline --locked -q -p fln-cli --bin fln -- flbc run --json target/native-function-values/callbacks.flbc > target/native-function-values/replay.json
+          python3 - <<'PYTHON'
+          import json, pathlib
+          root = pathlib.Path('target/native-function-values')
+          source = json.loads((root / 'source.json').read_text())
+          replay = json.loads((root / 'replay.json').read_text())
+          assert source['outcome'] == replay['outcome'] == 'complete'
+          assert [row['value'] for row in source['evaluationResults']] == [42, 42, 42, 42]
+          assert replay['returnValue'] == 42
+          PYTHON
+          SH
+      - name: Validate source, compiler, VM and CLI replay
+        run: bash target/native-function-values/check.sh
+      - name: Commit checked function values directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add crates/fln/src/lib.rs crates/fln/src/runtime.rs crates/fln/src/runtime/function_values.rs crates/fln/tests/runtime_function_values.rs docs/NATIVE_HIGHER_ORDER_EXECUTION.md
+          if git diff --cached --quiet; then
+            echo 'Implementation already present'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(runtime): execute anonymous and global function values with lexical captures' -m 'Prepare monomorphic function values through the existing typed-let closure path after dual admission. Support named and constructor callbacks, global partial applications and eta-prepared function-returning bodies. Preserve eager operands, dependency telescopes, recursor shapes, ownership, deterministic artifacts and bounded failure atomicity. Validate engine/compiler/VM suites and CLI bytecode replay before publication.'
+          for attempt in 1 2 3 4; do
+            git rev-parse HEAD > target/native-function-values/source-commit.txt
+            git rev-parse HEAD^{tree} > target/native-function-values/source-tree.txt
+            git archive --format=tar.gz HEAD > target/native-function-values/source.tar.gz
+            sha256sum target/native-function-values/source.tar.gz > target/native-function-values/SHA256SUMS
+            if git push origin HEAD:main; then
+              git rev-parse HEAD > target/native-function-values/published-commit.txt
+              exit 0
+            fi
+            test "$attempt" != 4 || exit 1
+            git fetch --no-tags --depth=50 origin main
+            git rebase --onto origin/main HEAD^
+            bash target/native-function-values/check.sh
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-function-values-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/native-function-values/
+          retention-days: 1

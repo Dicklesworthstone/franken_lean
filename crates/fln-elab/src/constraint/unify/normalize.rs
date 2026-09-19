@@ -2,8 +2,10 @@
 //!
 //! Normalize max/successor expressions as a sorted maximum of atoms plus
 //! offsets. Equal atoms keep their largest offset; an explicit numeral drops
-//! only when another atom's offset dominates it. IMax remains an atom unless
-//! its zero/one/idempotence or definitely-positive-right law applies. This is
+//! only when another atom's offset dominates it. IMax distributes over maxima
+//! on either side and nested right guards, retaining the zero case rather than
+//! assuming an unknown universe is positive. Remaining IMax atoms have a
+//! parameter or metavariable as their right guard. This is
 //! a sufficient conversion procedure, not complete universe constraint solving
 //! and not the Reference-observable `Level.normalize` API.
 //!
@@ -197,17 +199,141 @@ fn maximum(a: &Form, b: &Form, meter: &mut Meter<'_>) -> Result<Form, Unificatio
         meter.node()?;
         out.remove(0);
     }
-    Ok(Arc::from(out))
+    remove_covered_guards(out, meter)
+}
+
+/// `imax a u >= u`, including at `u = 0`. An offset on the guarded atom
+/// therefore covers a no-larger offset on its guard. Never use the left
+/// operand for this test: it disappears when the guard is zero.
+fn remove_covered_guards(
+    terms: Vec<Term>,
+    meter: &mut Meter<'_>,
+) -> Result<Form, UnificationError> {
+    let mut guards = Vec::new();
+    for term in &terms {
+        meter.node()?;
+        if let LevelView::IMax(_, guard) = term.atom.view() {
+            guards.push((guard, term.offset));
+        }
+    }
+    if guards.is_empty() {
+        return Ok(Arc::from(terms));
+    }
+    let mut retained = Vec::new();
+    for term in &terms {
+        meter.node()?;
+        let mut covered = false;
+        if matches!(term.atom.view(), LevelView::Param(_) | LevelView::MVar(_)) {
+            for (guard, offset) in &guards {
+                meter.node()?;
+                if term.offset <= *offset
+                    && compare_atoms(&term.atom, guard, meter)? == Ordering::Equal
+                {
+                    covered = true;
+                    break;
+                }
+            }
+        }
+        if !covered {
+            retained.push(term.clone());
+        }
+    }
+    Ok(Arc::from(retained))
+}
+
+/// Apply a single, still-unknown guard to one atom plus its offset.
+/// Offsets stay INSIDE the guard: `imax (u+1) v` is zero at `v = 0`.
+fn guarded_term(
+    term: &Term,
+    guard: &Level,
+    meter: &mut Meter<'_>,
+) -> Result<Form, UnificationError> {
+    meter.node()?;
+    if (term.atom.is_zero() && term.offset <= 1)
+        || (term.offset == 0 && compare_atoms(&term.atom, guard, meter)? == Ordering::Equal)
+    {
+        return singleton(guard.clone(), 0, meter);
+    }
+    if term.offset == 0
+        && let LevelView::IMax(_, inner_guard) = term.atom.view()
+        && compare_atoms(inner_guard, guard, meter)? == Ordering::Equal
+    {
+        // imax (imax a u) u = imax a u, without choosing u's value.
+        return singleton(term.atom.clone(), 0, meter);
+    }
+    let mut left = term.atom.clone();
+    for _ in 0..term.offset {
+        meter.node()?;
+        left = left.succ().map_err(|error| UnificationError::Universe(error.into()))?;
+    }
+    meter.node()?;
+    let atom = Level::imax(left, guard.clone())
+        .map_err(|error| UnificationError::Universe(error.into()))?;
+    singleton(atom, 0, meter)
+}
+
+fn impredicative_maximum(
+    a: &Form,
+    b: &Form,
+    meter: &mut Meter<'_>,
+) -> Result<Form, UnificationError> {
+    if b.is_empty() || a.is_empty()
+        || (a.len() == 1 && a[0].atom.is_zero() && a[0].offset == 1)
+        || equal_forms(a, b, meter)?
+    {
+        return Ok(Arc::clone(b));
+    }
+    for term in b.iter() {
+        meter.node()?;
+        if term.offset > 0 {
+            return maximum(a, b, meter);
+        }
+    }
+    // imax distributes over max on both sides. Child forms are already
+    // normalized, so a right IMax's guard is atomic; no recursive helper or
+    // repeated normalization of generated levels is necessary.
+    let mut result: Form = Arc::from([]);
+    for right in b.iter() {
+        meter.node()?;
+        let guard = match right.atom.view() {
+            LevelView::Param(_) | LevelView::MVar(_) => &right.atom,
+            LevelView::IMax(_, guard) => {
+                // imax a (imax c u) = max (imax a u) (imax c u).
+                let inner = singleton(right.atom.clone(), 0, meter)?;
+                result = maximum(&result, &inner, meter)?;
+                guard
+            }
+            _ => unreachable!("a normalized zero-offset right atom is a universe or an IMax"),
+        };
+        for left in a.iter() {
+            meter.node()?;
+            let guarded = guarded_term(left, guard, meter)?;
+            result = maximum(&result, &guarded, meter)?;
+        }
+    }
+    Ok(result)
 }
 
 fn rebuild(form: &Form, meter: &mut Meter<'_>) -> Result<Level, UnificationError> {
+    if form.is_empty() {
+        return Ok(Level::zero());
+    }
+    // Successor is injective; max is not. Exposing the common offset lets the
+    // ordinary solver cancel successors without pairing or assigning max atoms.
+    let mut common = u32::MAX;
+    for term in form.iter() {
+        meter.node()?;
+        common = common.min(term.offset);
+    }
     let mut result = None;
     for term in form.iter() {
         meter.node()?;
         let mut level = term.atom.clone();
-        for _ in 0..term.offset {
+        for _ in 0..term.offset - common {
             meter.node()?;
-            level = level.succ().map_err(|error| UnificationError::Universe(error.into()))?;
+            level = level
+                .succ()
+                .map_err(|error| UnificationError::Universe(error.into()))?;
         }
         result = Some(match result {
             None => level,
@@ -218,7 +344,14 @@ fn rebuild(form: &Form, meter: &mut Meter<'_>) -> Result<Level, UnificationError
             }
         });
     }
-    Ok(result.unwrap_or_else(Level::zero))
+    let mut result = result.expect("a nonempty normal form has a maximum");
+    for _ in 0..common {
+        meter.node()?;
+        result = result
+            .succ()
+            .map_err(|error| UnificationError::Universe(error.into()))?;
+    }
+    Ok(result)
 }
 
 pub(super) fn simplify(level: &Level, meter: &mut Meter<'_>) -> Result<Level, UnificationError> {
@@ -265,31 +398,7 @@ pub(super) fn simplify(level: &Level, meter: &mut Meter<'_>) -> Result<Level, Un
                 }
             }
             LevelView::Max(a, b) => maximum(&child(a), &child(b), meter)?,
-            LevelView::IMax(a, b) => {
-                let (a, b) = (child(a), child(b));
-                if b.is_empty() || a.is_empty()
-                    || (a.len() == 1 && a[0].atom.is_zero() && a[0].offset == 1)
-                    || equal_forms(&a, &b, meter)?
-                {
-                    b
-                } else {
-                    let mut positive = false;
-                    for term in b.iter() {
-                        meter.node()?;
-                        if term.offset > 0 {
-                            positive = true;
-                            break;
-                        }
-                    }
-                    if positive {
-                        maximum(&a, &b, meter)?
-                    } else {
-                        let atom = Level::imax(rebuild(&a, meter)?, rebuild(&b, meter)?)
-                            .map_err(|error| UnificationError::Universe(error.into()))?;
-                        singleton(atom, 0, meter)?
-                    }
-                }
-            }
+            LevelView::IMax(a, b) => impredicative_maximum(&child(a), &child(b), meter)?,
         };
         done.insert(key, form);
     }
@@ -387,5 +496,134 @@ mod tests {
         assert_eq!(norm(&level), level);
         assert_eq!(evaluate(&norm(&level), 8, 0, 0), 0);
         assert_ne!(norm(&level), norm(&max(param("u"), param("v"))));
+    }
+
+    fn guarded_equations() -> Vec<(Level, Level)> {
+        let (u, v) = (param("u"), param("v"));
+        let w = Level::mvar(LMVarId(Name::from_components(["guard"])));
+        vec![
+            (imax(max(u.clone(), v.clone()), w.clone()),
+                max(imax(u.clone(), w.clone()), imax(v.clone(), w.clone()))),
+            (imax(u.clone(), max(v.clone(), w.clone())),
+                max(imax(u.clone(), v.clone()), imax(u.clone(), w.clone()))),
+            (imax(u.clone(), imax(v.clone(), w.clone())),
+                max(imax(u.clone(), w.clone()), imax(v.clone(), w.clone()))),
+            (imax(imax(u.clone(), v.clone()), v.clone()), imax(u.clone(), v.clone())),
+            (imax(max(u.clone().succ().unwrap(), v.clone()), w.clone()),
+                max(imax(u.clone().succ().unwrap(), w.clone()), imax(v.clone(), w))),
+            (max(v.clone(), imax(u.clone(), v.clone())), imax(u, v)),
+        ]
+    }
+
+    #[test]
+    fn guarded_distributivity_is_used_by_the_transactional_solver() {
+        use fln_core::options::KVMap;
+        use fln_env::environment::Environment;
+        let mut txn = ElabTxn::new(Environment::new(), KVMap::new(), 79);
+        let before = txn.clone();
+        let equations: Vec<_> = guarded_equations().into_iter()
+            .map(|(a, b)| (Expr::sort(a), Expr::sort(b))).collect();
+        let report = txn.unify_many_with(
+            &equations,
+            UnificationBudget::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+            &|| false,
+        ).unwrap();
+        assert!(report.expression_assignments.is_empty());
+        assert!(report.universe_assignments.is_empty());
+        assert_eq!(report.kernel_checks, 0);
+        assert_eq!(txn.mvars, before.mvars);
+        assert_eq!(txn.universes, before.universes);
+        assert_eq!(txn.constraints, before.constraints);
+        assert_eq!(txn.env, before.env);
+    }
+
+    #[test]
+    fn guarded_laws_preserve_zero_cases_and_are_idempotent() {
+        for (left, right) in guarded_equations() {
+            let normalized = norm(&left);
+            assert_eq!(normalized, norm(&right));
+            assert_eq!(norm(&normalized), normalized);
+            for u in 0..=4 { for v in 0..=4 { for m in 0..=4 {
+                assert_eq!(evaluate(&left, u, v, m), evaluate(&normalized, u, v, m));
+                assert_eq!(evaluate(&right, u, v, m), evaluate(&normalized, u, v, m));
+            }}}
+        }
+    }
+
+    #[test]
+    fn offsets_do_not_escape_a_guard_and_left_operands_are_not_absorbed() {
+        let guarded = imax(param("u").succ().unwrap(), param("v"));
+        let wrong = imax(param("u"), param("v")).succ().unwrap();
+        assert_ne!(norm(&guarded), norm(&wrong));
+        assert_eq!(evaluate(&norm(&guarded), 7, 0, 0), 0);
+        assert_eq!(evaluate(&norm(&wrong), 7, 0, 0), 1);
+        let retained = max(param("u"), imax(param("u"), param("v")));
+        assert_eq!(evaluate(&norm(&retained), 7, 0, 0), 7);
+        let covered = max(param("v").succ().unwrap(), guarded.clone().succ().unwrap());
+        assert_eq!(norm(&covered), norm(&guarded.clone().succ().unwrap()));
+        let not_covered = max(param("v").succ().unwrap(), guarded);
+        assert_eq!(evaluate(&norm(&not_covered), 0, 0, 0), 1);
+    }
+
+    #[test]
+    fn colliding_guard_hashes_do_not_authorize_absorption() {
+        let root = Name::from_components(["guard"]);
+        let a = Level::param(Name::num_overflowing(root.clone(), 1));
+        let b = Level::param(Name::num_overflowing(root, 2));
+        assert_eq!(a.hash(), b.hash());
+        let guarded = imax(param("u"), a);
+        assert_ne!(norm(&max(b, guarded.clone())), norm(&guarded));
+    }
+
+    fn expansion() -> Level {
+        let mut a = param("a0");
+        let mut b = param("b0");
+        for i in 1..6 {
+            a = max(a, param(&format!("a{i}")));
+            b = max(b, param(&format!("b{i}")));
+        }
+        imax(a, b)
+    }
+
+    #[test]
+    fn distributive_expansion_remains_metered_and_cancellable() {
+        use std::cell::Cell;
+        let input = expansion();
+        let mut control = meter();
+        let expected = simplify(&input, &mut control).unwrap();
+        assert!(control.nodes > 100);
+        let mut limited = meter();
+        limited.max_nodes = control.nodes / 2;
+        assert!(matches!(simplify(&input, &mut limited), Err(UnificationError::NodeLimit { .. })));
+        let polls = Cell::new(0);
+        let stop = || { polls.set(polls.get() + 1); polls.get() > control.steps / 2 };
+        let mut cancelled = Meter { cancelled: &stop, ..meter() };
+        assert!(matches!(simplify(&input, &mut cancelled), Err(UnificationError::Cancelled)));
+        assert_eq!(norm(&input), expected);
+    }
+
+    #[test]
+    fn later_invalid_guard_conversion_rolls_back_tentative_assignments() {
+        use fln_core::options::KVMap;
+        use fln_env::environment::Environment;
+        let mut txn = ElabTxn::new(Environment::new(), KVMap::new(), 80);
+        let before = txn.clone();
+        let tentative = LMVarId(Name::from_components(["tentative"]));
+        let mut equations = vec![(Expr::sort(Level::mvar(tentative)), Expr::sort(Level::one()))];
+        equations.extend(guarded_equations().into_iter().map(|(a, b)| (Expr::sort(a), Expr::sort(b))));
+        equations.push((
+            Expr::sort(imax(param("u"), param("v"))),
+            Expr::sort(max(param("u"), param("v"))),
+        ));
+        let result = txn.unify_many_with(
+            &equations,
+            UnificationBudget::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+            &|| false,
+        );
+        assert!(matches!(result, Err(UnificationError::Deferred(_))));
+        assert_eq!(txn.mvars, before.mvars);
+        assert_eq!(txn.universes, before.universes);
+        assert_eq!(txn.constraints, before.constraints);
+        assert_eq!(txn.env, before.env);
     }
 }

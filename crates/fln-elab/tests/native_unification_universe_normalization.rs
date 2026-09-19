@@ -194,3 +194,59 @@ fn deeply_shared_max_dags_normalize_without_expansion_or_host_recursion() {
         assert!(report.universe_assignments.is_empty());
     }).unwrap().join().unwrap();
 }
+
+#[test]
+fn common_successor_offsets_allow_universe_metavariable_inversion() {
+    for reverse in [false, true] {
+        for extra in [false, true] {
+            let mut tx = txn();
+            let id = LMVarId(name("result"));
+            let u = if extra { s(p("u")) } else { p("u") };
+            let left = max(s(u.clone()), s(p("v")));
+            let right = s(Level::mvar(id.clone()));
+            let (a, b) = if reverse {
+                pair(right, left)
+            } else {
+                pair(left, right)
+            };
+            let report = tx.unify(&a, &b, budget()).unwrap();
+            assert_eq!(report.universe_assignments, vec![id.clone()]);
+            assert!(report.expression_assignments.is_empty());
+            let solved = tx.universes.instantiate(&Level::mvar(id)).unwrap();
+            let (a, b) = pair(solved, max(u, p("v")));
+            let report = tx.unify(&a, &b, budget()).unwrap();
+            assert!(report.universe_assignments.is_empty());
+        }
+    }
+}
+
+#[test]
+fn successor_inversion_retains_independent_universe_holes() {
+    let mut tx = txn();
+    let u = LMVarId(name("left"));
+    let v = LMVarId(name("right"));
+    let result = LMVarId(name("result"));
+    let (a, b) = pair(
+        max(s(Level::mvar(u.clone())), s(Level::mvar(v.clone()))),
+        s(Level::mvar(result.clone())),
+    );
+    let report = tx.unify(&a, &b, budget()).unwrap();
+    assert_eq!(report.universe_assignments, vec![result]);
+    assert!(!tx.universes.is_assigned(&u));
+    assert!(!tx.universes.is_assigned(&v));
+}
+
+#[test]
+fn missing_common_offset_does_not_guess_a_universe_predecessor() {
+    let mut tx = txn();
+    let before = tx.clone();
+    let (a, b) = pair(
+        max(p("u"), s(p("v"))),
+        s(Level::mvar(LMVarId(name("predecessor")))),
+    );
+    assert!(matches!(
+        tx.unify(&a, &b, budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&tx, &before);
+}

@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn dependent_results_and_higher_order_parameters_are_not_misrepresented() {
+    fn dependent_results_are_refused_and_callback_parameters_are_typed() {
         let environment = Environment::new();
         let mut preparation = Preparation::new(&environment, IngressLimits::default());
         let dependent = Expr::lam(
@@ -323,7 +323,11 @@ mod tests {
             ),
             BinderInfo::Default,
         );
-        assert!(preparation.nat_motive(&higher_order).is_err());
+        let motive = preparation.nat_motive(&higher_order).unwrap();
+        assert_eq!(motive.parameters.len(), 2);
+        assert_eq!(motive.parameters[0], ValueType::Nat);
+        assert!(matches!(motive.parameters[1], ValueType::Closure(_)));
+        assert_eq!(motive.result, ValueType::Nat);
     }
 
     #[test]
