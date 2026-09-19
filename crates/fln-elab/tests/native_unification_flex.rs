@@ -12,6 +12,10 @@ use fln_elab::constraint::unify::{UnificationBudget, UnificationDeferred, Unific
 use fln_elab::mvar::{MetavarError, MetavarKind};
 use fln_elab::seed::bootstrap_nat_environment;
 use fln_elab::txn::ElabTxn;
+use fln_env::environment::{DeclarationBudget, Environment};
+use fln_env::pmap::CollisionBudget;
+use fln_kernel::capability::{Published, admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::{Budget, Verdict};
 use std::cell::Cell;
 
@@ -41,6 +45,33 @@ fn transaction() -> ElabTxn {
         bootstrap_nat_environment(budget().kernel).unwrap(),
         KVMap::new(),
         17,
+    )
+}
+
+/// Constructor equations need the actual admitted family, not an opaque Nat
+/// axiom with constructor-shaped names. K1 regenerates the eliminator here.
+fn constructor_transaction() -> ElabTxn {
+    let env = Environment::new();
+    let declaration = fln_elab::seed::nat_inductive_seed_declaration();
+    let Outcome::Complete(admitted) = admit(&env, declaration, budget().kernel) else {
+        panic!("Nat admission did not complete");
+    };
+    let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("Nat was rejected");
+    };
+    let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) else {
+        panic!("Nat publication did not complete");
+    };
+    ElabTxn::new(publication.environment, KVMap::new(), 17)
+}
+fn successor(value: Expr) -> Expr {
+    Expr::app(
+        Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new()),
+        value,
     )
 }
 fn goal(txn: &mut ElabTxn, text: &str, type_: Expr) -> MVarId {
@@ -164,14 +195,11 @@ fn distinct_flexible_heads_do_not_force_distinct_arguments_equal() {
 fn a_flexible_head_is_not_prematurely_assigned_the_rigid_head() {
     for reverse_order in [false, true] {
         for reverse_sides in [false, true] {
-            let mut txn = transaction();
+            let mut txn = constructor_transaction();
             let f = goal(&mut txn, "f", function_type());
             let n = goal(&mut txn, "n", nat());
             let left = Expr::app(Expr::mvar(f.clone()), numeral(0));
-            let right = Expr::app(
-                Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new()),
-                Expr::mvar(n.clone()),
-            );
+            let right = successor(Expr::mvar(n.clone()));
             let equation = if reverse_sides {
                 (right, left)
             } else {
@@ -189,6 +217,70 @@ fn a_flexible_head_is_not_prematurely_assigned_the_rigid_head() {
             assert_eq!(txn.mvars.get_assigned_expr(&n), Some(&numeral(3)));
         }
     }
+}
+
+#[test]
+fn constructor_spelling_in_an_opaque_seed_cannot_solve_a_flexible_equation() {
+    let mut txn = transaction();
+    assert!(txn.env.find(&Name::from_components(["Nat", "succ"])).is_none());
+    let f = goal(&mut txn, "f", function_type());
+    let n = goal(&mut txn, "n", nat());
+    let before = txn.clone();
+    let equations = [
+        (
+            Expr::app(Expr::mvar(f.clone()), numeral(0)),
+            successor(Expr::mvar(n)),
+        ),
+        (Expr::mvar(f), constant(4)),
+    ];
+    assert!(matches!(
+        txn.unify_many_with(&equations, budget(), &|| false),
+        Err(UnificationError::Deferred(_))
+    ));
+    assert_semantics_unchanged(&txn, &before);
+}
+
+#[test]
+fn nested_constructors_resume_after_flexible_head_assignment() {
+    for reverse_sides in [false, true] {
+        let mut txn = constructor_transaction();
+        let f = goal(&mut txn, "f", function_type());
+        let n = goal(&mut txn, "n", nat());
+        let left = Expr::app(Expr::mvar(f.clone()), numeral(0));
+        let right = successor(successor(Expr::mvar(n.clone())));
+        let equation = if reverse_sides {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let env = txn.env.clone();
+        let report = txn
+            .unify_many_with(&[equation, (Expr::mvar(f), constant(9))], budget(), &|| false)
+            .unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        assert_eq!(txn.mvars.get_assigned_expr(&n), Some(&numeral(7)));
+        assert_eq!(txn.env, env);
+    }
+}
+
+#[test]
+fn an_impossible_constructor_endpoint_rolls_back_recovered_functions() {
+    let mut txn = constructor_transaction();
+    let f = goal(&mut txn, "f", function_type());
+    let n = goal(&mut txn, "n", nat());
+    let before = txn.clone();
+    let equations = [
+        (
+            Expr::app(Expr::mvar(f.clone()), numeral(0)),
+            successor(Expr::mvar(n)),
+        ),
+        (Expr::mvar(f), constant(0)),
+    ];
+    assert!(matches!(
+        txn.unify_many_with(&equations, budget(), &|| false),
+        Err(UnificationError::Deferred(_))
+    ));
+    assert_semantics_unchanged(&txn, &before);
 }
 
 #[test]
@@ -331,10 +423,7 @@ fn bare_occurs_checks_and_opaque_hole_policy_are_not_weakened() {
     let mut txn = transaction();
     let n = goal(&mut txn, "n", nat());
     let before = txn.clone();
-    let cyclic = Expr::app(
-        Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new()),
-        Expr::mvar(n.clone()),
-    );
+    let cyclic = successor(Expr::mvar(n.clone()));
     assert!(matches!(
         txn.unify(&Expr::mvar(n), &cyclic, budget()),
         Err(UnificationError::Metavariable(

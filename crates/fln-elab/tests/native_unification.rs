@@ -226,18 +226,17 @@ fn later_equations_resolve_earlier_assignment_typing_dependencies() {
 }
 
 #[test]
-fn unresolved_assignment_typing_does_not_become_success() {
+fn assignment_values_determine_missing_types_without_an_extra_caller_equation() {
     let mut txn = transaction();
     let type_hole = natural(&mut txn, "type", Expr::sort(Level::one()));
-    let value_hole = natural(&mut txn, "value", Expr::mvar(type_hole));
-    let before = txn.clone();
-    assert!(matches!(
-        txn.unify(&Expr::mvar(value_hole), &numeral(1), budget()),
-        Err(UnificationError::Deferred(
-            UnificationDeferred::UnresolvedAssignmentType(_)
-        ))
-    ));
-    assert_semantics_unchanged(&txn, &before);
+    let value_hole = natural(&mut txn, "value", Expr::mvar(type_hole.clone()));
+    let report = txn
+        .unify(&Expr::mvar(value_hole.clone()), &numeral(1), budget())
+        .unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&type_hole), Some(&nat()));
+    assert_eq!(txn.mvars.get_assigned_expr(&value_hole), Some(&numeral(1)));
+    assert_eq!(report.kernel_checks, 2);
+    assert!(report.residual_metavariables.is_empty());
 }
 
 #[test]

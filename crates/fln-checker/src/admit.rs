@@ -97,6 +97,10 @@
 
 mod uniform;
 
+// Motives and all constructor minors are shared by each mutual recursor.
+// Keep their quadratic reconstruction independently bounded.
+const MAX_MUTUAL_TYPES: usize = 8;
+
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
     QuickDefEqBudget, QuickDefEqFault, QuickDefEqLimit, QuickDefEqSide, QuickDefEqStop,
@@ -7613,8 +7617,8 @@ fn admit_init_false(
     })
 }
 
-/// Independently reconstruct one bounded, field-bearing, single `Type`
-/// inductive block, including direct self-recursive fields.
+/// Independently reconstruct bounded single-family or mutual data-inductive
+/// blocks, including indexed and strictly positive function-valued recursion.
 pub fn admit_inductive(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
@@ -7639,7 +7643,7 @@ pub fn admit_inductive_with(
     environment_budget: EnvironmentBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> InductiveVerdict {
-    let maximum_rows = MAX_NONRECURSIVE_CONSTRUCTORS.saturating_add(2);
+    let maximum_rows = MAX_NONRECURSIVE_CONSTRUCTORS.saturating_add(2 * MAX_MUTUAL_TYPES);
     if declarations.len() > maximum_rows {
         return InductiveVerdict::Deferred(InductiveSupportLimit::DeclarationRows {
             observed: declarations.len(),
@@ -7653,10 +7657,41 @@ pub fn admit_inductive_with(
     let Some(inductive) = inductives.next() else {
         return InductiveVerdict::Rejected(InductiveRejection::MissingInductive);
     };
+    // A duplicated single-family row must not borrow the mutual profile's
+    // larger allowance. Metadata can only narrow the absolute outer ceiling.
+    let declared_types = inductive
+        .declaration()
+        .inductive_metadata()
+        .map_or(1, |m| m.mutual().len().clamp(1, MAX_MUTUAL_TYPES));
+    let maximum_rows = MAX_NONRECURSIVE_CONSTRUCTORS + 2 * declared_types;
+    if declarations.len() > maximum_rows {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::DeclarationRows {
+            observed: declarations.len(),
+            limit: maximum_rows,
+        });
+    }
     let extra_types = inductives.count();
     if extra_types != 0 {
-        return InductiveVerdict::Deferred(InductiveSupportLimit::MultipleTypes {
-            observed: extra_types.saturating_add(1),
+        if extra_types >= MAX_MUTUAL_TYPES {
+            return InductiveVerdict::Deferred(InductiveSupportLimit::MultipleTypes {
+                observed: extra_types.saturating_add(1),
+            });
+        }
+        return uniform::admit_mutual(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
+    }
+    let maximum_rows = MAX_NONRECURSIVE_CONSTRUCTORS.saturating_add(2);
+    if declarations.len() > maximum_rows {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::DeclarationRows {
+            observed: declarations.len(),
+            limit: maximum_rows,
         });
     }
     let name = inductive.name();

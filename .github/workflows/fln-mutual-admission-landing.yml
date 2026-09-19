@@ -1,0 +1,85 @@
+name: Native mutual-inductive admission landing
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fln-mutual-admission-landing.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: fln-mutual-admission-landing
+  cancel-in-progress: false
+
+jobs:
+  mutual:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply checksum-bound native generator with context-checked hunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/mutual-landing
+          git rev-parse HEAD | tee target/mutual-landing/base.txt
+          python3 -I - <<'PY'
+          import base64, gzip, hashlib, os, pathlib, subprocess
+          encoded = 'H4sIAAAAAAAC/+VcW3PbRpZ+969ocaoUMKIh2ZndmoUs5zJxal2beLbirF9UKhQENkWMQIADgLIVSf99z6W70d1okJTsZB9WDyIJ9OX06XP5zunL8+fPRXacN1kn2+NFWT2XZXZ53Db5cVHNN3lX3Mi4aZ8dHR2Jy93FvvtOPP9m9u/i6JvZf4jvvnsmjo8PxA91txT5UubXRXUlZHVVVLIVq03biZusLObQpuiWUlyWdX4di9+WRSuuZCWhs7oRy6yal7LlpuZyLau5rDqR11XbNdAzFFkUspy3AgoKeFbkXXkr1nVbIFViUxWLulmJRuabpsUnXPxUFJ2o5I1suOmiWsim1fWK7lYsmnolMrEosysBvaw3l2XRLoH0TOTQFxNeVF0NPcOwboqmrlZAW/zsaFXPYYDdJitPnx1BRbFppXqQJPyZGsalc5mXGYy2qCso/owKE6uTpMy7T0nyc51n5Y9Q6tR5CUOqm3mbJHc/bIpyLpuZ+JUe/bCZX8lO/3rTNDW8ytbrGYxJtkv4uHlQTcFcplAIWpOf1g02BXTJ5m21qGfiDTzi/+/quZyJnz5kzds5VH0OUnM8lzfH1aYs9xGOYx60lpGT2Yk4ejH767+doJQcIf/fZTRdZl6BGaJeiLrCZ6t1KTvNQQGMz56bppXcUCvc1PsCZgpErc5hyhtZ5ThnjRRZWdYf5RzaBAHJWiMaWmieG6HJl8BPqMmtijdZvuRnyLMWJKcFUWy7oqJJ+wqkucZ6MxCHeUHdgSyyxNUNirSEX+2m7Li9wpGhGYuhJ0VisyYBA8nLeu3JZdMViyKHN0AbTmC7WUuYt69Rco6YdeLvROrdsyMBf4tsVZS3CVBe/C5n/KyToFJ5vZYJygjrxU+oFvD+wTTzS1HVzauvstfbmrIUMRGHX2Xi7/2D92uZ62KKo4n4IPNX/1gj314Rna9fc6fPjhaVaIErEde4ZJmGRmHahZZwTX+zghckn/xEjebwP7N2+V52r1hUX+u3QEgLb8/faqlB0i7g7VQ8fw08wLl5FU1nwhQgrelHDtOAjcAEc2P6hUVpTMQjaTMmZyYOsWxcZSs5/faUKzzwxz+uo2g67QdO/PlTR45vSxC8kl7/jN/0Y5Cruep92KrNMWceR5kHuouqKy7r+a04oyHEeQmaHU1P3RI0FihCnyNlsuZqgwrSQjmQpSSp5Me+UF2vQ1PTFfl1ZOYA/1ZZB0qNJMUVGLdoalfDP232kuSXH8HgiDshyRzGsXgQZ6/1aPChpnQ21sJPdQPG543fBVFI9jZFGZmNvu1u18G3QEKiLMt45QJtufuWBhAg5vhYvJNXyhI3dds+Z5UfmlIwghV5b/xaqTrBBltZLuz6aCTzcjNHcwba1Lv0xaZisz+vV1lRtfGwOdKwS+3sbOaAqrHKkcA7M63/fAGCySN3GKG4z8QEnk+cRs20iq8tVk4DTesmY2iK5xIat2bWE2V/DqGwdg8i8Be3m8u2S0G2WxmdwFDPFzfRoe5zejEdqbbK1qlsmug+vfdUM0ne8uz9ph1BkGOshjAV4HUiM8ZiroezjRVtvN4Abw2VXtEH92dKGtXI7NqS1AfHYqIJjlgceZanxhjHBdiUaBrLCvpCGOJqc7GguX9fr2SkHPSUWK48X6oe9pJ1iLPCvcyUkdQSNv3WVxwkDKf6E9JzqBHA3S7ppSq75NZjUyO7TVOh86DBOH7eIYnZNHwx6vjBvJmZ62HMg283nCl35wdUnaA7azdUrupKIyyEQwD6OwRfvSVIsAiguuxWXAKQKUrovLw1rQEoblsAO5JsDKAjwLKAuJpbRvDU6OXtGgrZqB1BcQ8hY+0jbc6r2Q1zHnj7DqjSrvkYCDGIRnQfawF4XxZXS3BW2UISFmV2FzDkjwWEOjimdglWci7WAOtXgFwR3M25MWAJgD0AbmYqYvHfpliBlhCGoiAkWiEVKmVXjQS7S1aZST7lBiWCUxKmYzsoMs0j2oQITDYfC4SL+GhO5ZXdLW9jCtG4tWy+KoDrdWUCNYC5ZckIFBE0zNMVwN5Ng5ZcDwa+MqmEezfQc8xxDyCbbeFOtA9IuaRoJnFjGxeH/Ng3OYpCwAocRC/j+Oxv0xgY1aGLiQ7ZfoDkgTWzNUlpGjQR7TSdLrJDU7Momhb9Czd/fnLhYRglilBCoTu3a3R/4B4TNXQw5J9SBCmt4siD11xeb8idnRAw916i/0GspJCch5dUIXSBO8uoyU63tghsptHHZDZT0gDFYPHaHhC7x3ZPpsNE15smlz8Xq6LzOI4GmHwu2t9h5/vhQaCbPHXRphmYpdtVvWmB5Pt7ceAOXPtD268PwOMTxGdoUQ0rGRykNKh4mbXp6iZrFHGBEjAEiijT32VTR/uK9f9UEEqu6waM9Hv4H5BquxMET8OeIV5cweB+l+mi+LSui6ozcrFXBBWcFhNDhebGmZK+5NPn5R0Ga8MpsWlxhOvgLCDvbqdAJ9Uz3kDrg6nrvwnWH3pzq17gJYOiwIvfi3V06HccKphVt9F9lAEont6LDIAfUnyJn/f4G01+yo/4Kz21oDK/s7Fz38kXVRh7drYoy/B9SGCRakfU9yd1RIc8SrW5pk+37Zj8rJyn2XweBYXGmyeYo3kK3r2K7qt7UQ3rKyinKj+2toUoxpqor9N6l722NRoNASEUtNaDTnxmb+HVgF/YQMzZ3SCvdo2Y6quZ38q2J43bFVUe1y6H+BSn6PXlp1aCTlvPS4mJZm2hbdFTAVa+BGTCoCk2kZRH77gt17EYdoK2HEhTesnpHgPKVIn5NBTbPNFSBKIpigoOLTwGMQF3TeZsV2zmRMea5FBobHWLOCuWnzqA3tGARPul15WvJo8x94sy69JVto7u83uRawVRM0rPF/diYdNuJ7ICOACiAE7jpq8xV2dH4NRcCzPqumGgvSxl3jmYEiI1RlRWY9C00xToKDrkJIGRR1WfkJlA5UmgXQcKmg68ZMDBl8RxI3jBYpdOsppBkuvta4wgh8GEMpFz5xEyiVK3SUL1neIBnqOwQ8zXFDKcPjUBhRE1g/ZHC3OyIXWs+Jm4kfnBuVVHWJHWxennpnQe50R2mqQDygbL9oB9AIlEKbNFelMg8TPxM/z4AN+T5D0IIhg9rNSiEZOrdXcbdDUIT/vmYHokogsPxLrVnmTufAkMWDqcKpWV7DFytsYMAK3+RYeG0GmAO/vryw6Kf9ysS1q8shaJdpAekK5zfnbBGUaHnlMfPXhy3Ffxizp+MjHrHr3CBtwhmaj1vVjbxnOgd34PeikspFO2fHOWCwXcAjbBJYSt4m0iSai+1euqEmGv+5meNzCx9qogT4u9Bub/OW56pAgPgH33SBF26OGXZHfGKqok8BbiaBVh+H767XRXZl0zfkyKHwYaOYpUMXYZwv4/Fka5+e8AaaO5cBd7PSUhrnwZyw+tVz8qHe4sXuP/2biMDlLhW50+OdqyWIGSM4DB3SQp7mSAKa66NjqfbCYXvivlDHfpp/I+AgnSy79Ziov9TPdLp+gOjs7EC+vxdkoxhZ91B9Fkk96pBh4m0xhCa0Rl04sARMTBrLJ/MhQYRQ68a2K0yLqREJU7+JCEYhtG0gDUkwLwdQHD8oa2vJAQpJELWfWyj9HJgGRscwuLG7+GReXDNpj2dFBEbEWmm5VNl4IxMzXpJrMhuzT3jbc1nHEMjDtmf9D9biJw/nKRuQvVtgoh8R2uhGrhhe5a6cdB3RxCAYAQWkyBRrAiOObQ4juUrcG+2gA5QlEPBjpsKMpW7njm6NMI1U6EjGsjM9UMf7gbEVgJ2IQ9ZtoOjV5yE+ndw2SmbJ04Ei/8wXW3j5ucqbNbAnWZaWR2j+g8muB9Q4txxefU6pkVGn/zMkm65jbFWY/CSdPp1gXvcGLGUFXMP+mg5QQ6Gw9XlJdCx3NLmqld0G7dpIDljKva8crpMFuzvF3jml0bNo69maA9W+yiiBg7BaYIomyv6lO5sgEgsFfIVWNnasPbXXgjRZc1V5KWuKhYbJYbRzZeAKLYYPiBlmVxw4SDKeFm4n7TgGdORlojlWMND1t2bcRwo4RSsHMmVFmzvm/PkOkgezqC9WggIZy3jVTPOvij3mEhfOEolsbA97ZBTIrlhBsK6HWIumLpbFdR4WCx1JGAeRmq3AsoG4ViuQUleulII/q05jicQMctD0K4c9LAi30d9ZiTVqlMS2FCjjvoocYELyyKtgiyGhoRDIDNALD3BNOHFbORkNfxF3t42sN+SnfI41gDFi/3aMG4i6Aw05v95JmKOqLcZ12G+67YQylPht+DrBlOpYFDzhyO7Px73DROvzhvQy34iuA0AxLjtuIs/BCzrJTNh2ywKHaZtTLhnTJZ1QUK4B9OSSJ2anTI8vUZ0iS0v2C8KqUDkiH48bc28f6UBDPQ+00xIIaE/rvFvWKABgzd/BkowPOaeChnr+WsR0Aef8BtuqlwD1MygLhObDscoh09evgPU+5sjzWaGgffGlb1dfTiB//y1woC4aDJ8O8MCaunhITWgoNF5K6IcGQ35ra1+q0LOGqdk9yVciS7SpGN27It9DPCUzPTuMvrMXn+Pwc4N8u2R5mKEcq+wCwG4HEAaf6/htY57vHbD1yH32iVNg7Twd1bLLWx2Ftx+UjFLwXX1fB3AnYsx25zG2Jnaex5Cb+56n5gmatvQwLU4BgVweqsEk+qybbnKVWH2GN7G2hbPC9MGORXdaTqVygw2CnCSdzHgYtKu15nfUlV6V2zVwuJD3jLfiP09yqrwxuCq9ra9YymJFPAt2jx+EhZ5EUXg/dGgNAV+abMcL+waYxWGEWrDrXRZuCq7sRVhi1VmBbGo4vZJbCkWHFrqvvYNdkIheZpn3TVmScXJKP1U9RjPn9Y0VuGVUPBopz8edTiK+kcCgmGgtRAAOQQhgvt5bmEOcvyLl3gFi8loHEBZvvksVhp53kIXHUhOmlPGZ3FSC+h2za8vKJosTfDnTmBzFs1VaEjIXgOYqeBcDZm6rOtZ9qrbgNEtK1vdS9WxmtpI4tv+ExXkgA+bMFpTV0Ytijlp7076neeQG+HfXd+mc7d88gE5rh83js/25H1q+6nQwnfmn3UZzJ3FdK7OxW+Qdxqw1UVdSi4GohH/GTSF8nt70yPu2nn0Xz4cBvkWO7kS6XDt8ae4RBWrx2eud27IVJgh+MTksA6TFSBrqn0eWHuYDPy/01cu1cAqliYiLDs0IYv3Jo1nu1A8rfs1BjxvtA1HwtKxMkwPAVNS3rbtn/4aqorY5X0dmssyLWXzng9ydD+2Aygne/rk82PWDODBgYrWnukiIJrY6qhp2WMRhexBtmisRY02HxS9w7q+FOSXsY7uGjz8+yAyVGc7w6BXHtgeZrPtwM7dPhLmAksoqYrCRjqp1joUA8kU34HKq372T1Q6JHwQvNKrqCH7FpyZpqjkpHk/fWoGdqZZOtvBLCOsSEiVXT3DukHvOnCljTyWlabyhLbJngWEG99jIwvINh+mccxfHbtsbqQBRXSO8/Xepd6vPjbS/9SD3VvR3+pS7ds6s0VHr+H8AjQbjk8dzijIGeFA76RDYhbh2cK/3KAu1Eui3nEbAVvM5fTC74KA6ilu1D48pM31I7+/F63T9MOrf/Xh1+yNR6k2/MWFHP3iVfhruQEJ+U5Z6zzCW6ksYvihShQVB3r0pyDJ/5lGZ60Wr/59bbDlFrjvTtjZga28mUx3jFKh8zqBjjQ30GSJG/6H6fqpgocYYSnNYFwOoOJg9VCGd5B1MYtBDtd9FX8lbrzAtqhHfO6IbTLCXGamjTE63YHD4iRABt4WiImynGlZkEoUSTbL0NWk1JFicDTv9ZTK4JLduyYoLRBj2Qe9EjBoYPtPTRjoCHiWPVgGE5QEOucIdANAKxoo0WiJBECITTBED+CdHT1246V6hV8WSls8nrQBVaK8bKiVIGPRV1C5DLroYzpjS1cVOmZ2dgXhDyxdxyAm1rHKamm2HoMREGUheEHtW4IQa3oydCZGkz+G1a+ngl3mY3f91R4CqYJGnnce21Nn5Xr8DNBbsf+pJPHi/SdFgmYurpUexwR7uJPIhDJdZTcuTZlAyx1VlCIrslm4oXlSElftN3kebTpdyRvqo8NYM3QFhuOb1kXJ99PZnacyM32m6XsU8wZrtoC0uV2zk+crYwF7qVRbRbQZubvbCWi7VL/HCulk9uqHP0cK7sooGCx0EwWdzw4JJPqTS/Eg5DghfWbC+ckNR2Sx2Gx/PcTPfkJLH3rbJILb0TbTP0iqGxJUle5jDJrhzgt0ywKP+62B0NoFvdt61tRLBFV9oIulUllxEbXOlRg8WfGwwovoiuRVTyxdolileFRc161MHNBP2mJ3qEbrykIMfE3ePHnsnApM4tc/IXUAhkOvVlRmkIWufjcJncwoBHJ2HNoweGND8te4tDUkwj3rx0j4ocjllHjifBpcSMPatqYGn9Nuw+ndKwwElT08cJAKYtPAWWcjZ7e0DSRS5jgXQgwlfSENLuXdhLKC/QW/TqzD/GtzJe+PSkwAJuavXmr5OHLcnd/rjZPZGt4IxIwGnUgwGeXwbOx6tiTU39GOjkjpaM2/Lr7zFVgji4MUspzueYMZ+BCEcYlFA/YTtbC0LgIse2+Ej4j4lxFkiRzNqcjnrakgAOhUSgQ4Qy0bglMetp2WX6dXt5C3BW9FF+LFycv/6o+jLfjppRxsQB79MYG75TbdvLq0HfnjGduX5xySDGRqjdThNv1eXQpEIkSFt3Le5DQqsgPosmdTL59mDi9EdrUdzc6+X0IsnBLwYTCv1ZmwB5dbuKUo2HS3P7lHOPQC5rkPhadFxDWEARDLUjxbLf2l6lebEjxhqAUu0qpqz6vToestHstKnFu5YUu/GUurWnbyukpp9V4lsRDFwcaBDgNnfhiKobaNPCdO/yPqROzpRytGFeuk/NfswKPNY5ncLdUDry+CKXJYHpk0x1EMrYl2b6kR4FxPPd7V4GU7bM25slMtwSKU31RE0kKrSGlal21Ta+lXKcIqECzZdNnHnt5MUcE9UGUyMlH+sdsadkWSgI49pZY6VWsNiuyI3iDjyZuAWcPXl5KvMZCFVAZSiqnnxmJs1ebFmYR11243db4Q6A9j536xj9iZH/RV0rXU6VqJUCl7kEX+ToarbdplprLT5/C3QXJl2Gtvd4AvzlOO39xwcvGHuv3qWIS/AZh94wbYm3HTABdMx+n22dQBg5zPKNgplWpx1a/dLjNKeF6adMMV0u3c3pPTu0TLR2ej8Swtrs/H+PWxR/KEE+wV1mJggzqT9cKs6X4WDfX4JfrNfxsJMh7l9JWDeidIYlnJAaMpZUGh/xU/uvAYtoel6T1i7yeUbWHGdyKoG8PGy6ykZeNR/g0amQDkIDYGQLMoaT7MFKjc6AUrPm7UeApSlsPilEKCyxpZ/4m82KxkHjAvk+M7CcmlwhHH605W2nV13/Cr5OL0Db0P4EylyLv4i6lXXw72B9E08Oz/wWcjVHUWl4AAA=='
+          raw = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(raw).hexdigest() == 'e6ac0407dc9194c634f888279e3e991e4ed98bb9b75a2b20f828c601d64e1482'
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-mutual-generator.patch'
+          path.write_bytes(raw)
+          if subprocess.run(['git', 'apply', '--reverse', '--check', str(path)], capture_output=True).returncode != 0:
+              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+              subprocess.run(['git', 'apply', str(path)], check=True)
+          PY
+          git diff --check
+      - name: Install configured compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc -Vv | tee target/mutual-landing/compiler.txt
+      - name: Validate generated blocks through both seats
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-elab 2>&1 | tee target/mutual-landing/elaborator-tests.log
+          cargo test --locked -p fln --lib --test generated_mutual_inductives --test mutual_inductive_admission 2>&1 | tee target/mutual-landing/engine-tests.log
+          cargo clippy --locked -p fln-elab -p fln --all-targets -- -D warnings 2>&1 | tee target/mutual-landing/clippy.log
+          cargo check --locked --workspace --all-targets 2>&1 | tee target/mutual-landing/workspace-check.log
+      - name: Publish verified implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/fln-elab/src/inductive.rs crates/fln-elab/src/inductive/mutual.rs crates/fln/tests/generated_mutual_inductives.rs
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat(elab): generate native dependent mutual data-inductive blocks' -m 'Construct all motives, constructor premises and cross-family iota rules natively with uniform dependent parameters, family-specific indices and function-valued children. Preserve capture-free scopes, strict positivity, empty-family motive inference and explicit work bounds. Both admission seats, elaborator tests, strict scoped Clippy and workspace compilation passed before this fast-forward publication.'
+            git push origin HEAD:main
+          fi
+          git rev-parse HEAD | tee target/mutual-landing/published.txt
+      - name: Retain results
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p target/mutual-landing
+          git diff > target/mutual-landing/uncommitted.patch
+          git rev-parse HEAD > target/mutual-landing/source-commit.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mutual-generator-${{ github.run_id }}
+          path: target/mutual-landing
+          retention-days: 3
+          if-no-files-found: error

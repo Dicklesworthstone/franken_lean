@@ -1,4 +1,5 @@
-//! Universally checked aliases must not assign or guess unresolved universes.
+//! Assignment typing may infer necessary universe equations; validation itself
+//! must not guess or capture universes, and residual values stay unassigned.
 #![forbid(unsafe_code)]
 use fln_core::expr::{Expr, MVarId};
 use fln_core::level::{LMVarId, Level};
@@ -68,44 +69,51 @@ fn an_alias_can_be_checked_universally_before_its_universe_is_known() {
     );
 }
 #[test]
-fn unrelated_universe_holes_are_not_silently_identified_by_validation() {
+fn alias_typing_reports_its_necessary_universe_equation() {
     let mut txn = txn();
+    let u = LMVarId(n("u"));
+    let v = LMVarId(n("v"));
     let a = hole(
         &mut txn,
         "a",
-        Expr::sort(Level::mvar(LMVarId(n("u")))),
+        Expr::sort(Level::mvar(u.clone())),
         MetavarKind::Natural,
     );
     let b = hole(
         &mut txn,
         "b",
-        Expr::sort(Level::mvar(LMVarId(n("v")))),
+        Expr::sort(Level::mvar(v.clone())),
         MetavarKind::Natural,
     );
-    let before = txn.clone();
-    assert!(matches!(
-        txn.unify(&Expr::mvar(a), &Expr::mvar(b), budget()),
-        Err(UnificationError::Deferred(
-            UnificationDeferred::UnresolvedAssignmentType(_)
-        ))
-    ));
-    assert_eq!(txn.mvars, before.mvars);
-    assert_eq!(txn.universes, before.universes);
+    let report = txn
+        .unify(&Expr::mvar(a), &Expr::mvar(b.clone()), budget())
+        .unwrap();
+    assert_eq!(report.universe_assignments, vec![u.clone()]);
+    assert_eq!(
+        txn.universes.instantiate(&Level::mvar(u)).unwrap(),
+        Level::mvar(v)
+    );
+    assert_eq!(report.residual_metavariables, vec![b.clone()]);
+    assert!(!txn.mvars.is_assigned(&b));
+    assert_eq!(report.kernel_checks, 1);
 }
+
 #[test]
 fn generalization_cannot_capture_an_existing_universe_parameter() {
     let mut txn = txn();
+    let collision = Name::num(n("_fln_residual_universe"), 0);
+    // The assigned hole's type is closed, so this exercises validation-only
+    // generalization, not assignment-generated inference of a necessary u = p.
     let a = hole(
         &mut txn,
         "a",
-        Expr::sort(Level::mvar(LMVarId(n("u")))),
+        Expr::sort(Level::param(collision)),
         MetavarKind::Natural,
     );
-    let collision = Name::num(n("_fln_residual_universe"), 0);
     let b = hole(
         &mut txn,
         "b",
-        Expr::sort(Level::param(collision)),
+        Expr::sort(Level::mvar(LMVarId(n("u")))),
         MetavarKind::Natural,
     );
     let before = txn.clone();
@@ -118,6 +126,7 @@ fn generalization_cannot_capture_an_existing_universe_parameter() {
     assert_eq!(txn.mvars, before.mvars);
     assert!(txn.universes.is_empty());
 }
+
 #[test]
 fn universally_checked_aliases_do_not_solve_opaque_residuals() {
     let mut txn = txn();

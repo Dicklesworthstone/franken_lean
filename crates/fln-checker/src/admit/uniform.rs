@@ -6,6 +6,9 @@
 //! actual index expressions determine every induction hypothesis and recursive
 //! call. Strictly positive function-valued children retain their argument telescopes.
 //! Nested occurrences under unrelated type constructors remain unsupported.
+mod mutual;
+pub(super) use mutual::admit as admit_mutual;
+
 use super::*;
 use crate::infer::LocalDeclaration;
 use crate::term::{

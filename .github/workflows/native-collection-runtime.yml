@@ -1,0 +1,61 @@
+name: Native collection runtime integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/native-collection-runtime.yml']
+permissions:
+  contents: write
+jobs:
+  integrate:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(runtime): validate and publish native polymorphic collection execution'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recover exact digest-bound validation script
+        shell: python
+        run: |
+          import pathlib, subprocess, textwrap, os
+          stored = subprocess.check_output(['git', 'show', '7f4b754f5997ad5fc9b64646cf7e7821085f2513:.github/workflows/native-collection-runtime.yml'], text=True)
+          start = stored.index('          import base64, gzip, hashlib, json, os, pathlib, subprocess, sys, urllib.request\n')
+          end = stored.index('          PY\n', start)
+          script = textwrap.dedent(stored[start:end])
+          old = 'base64.b64decode(encoded, validate=True)'
+          assert script.count(old) == 1
+          script = script.replace(old, 'base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=True)')
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'collection-runtime'
+          root.mkdir()
+          (root / 'validate.py').write_text(script)
+          compile(script, str(root / 'validate.py'), 'exec')
+      - name: Validate concrete collection layouts and export exact blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python "$RUNNER_TEMP/collection-runtime/validate.py" 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: collection-runtime-stage1-${{ github.sha }}
+          path: ${{ runner.temp }}/collection-runtime/1
+          retention-days: 3
+          if-no-files-found: error
+      - name: Validate higher-order collection execution and installed consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python "$RUNNER_TEMP/collection-runtime/validate.py" 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: collection-runtime-stage2-${{ github.sha }}
+          path: ${{ runner.temp }}/collection-runtime/2
+          retention-days: 3
+          if-no-files-found: error

@@ -509,10 +509,18 @@ mod tests {
             Expr::sort(Level::one()),
             MetavarKind::Natural,
         );
-        let a = declare(&mut txn, "a", Expr::mvar(t.clone()), MetavarKind::Natural);
+        // A literal would now infer t = Nat. An opaque residual value instead
+        // still needs conditional validation; it cannot be retagged as Nat.
+        let b = declare(
+            &mut txn,
+            "b",
+            Expr::mvar(t.clone()),
+            MetavarKind::SyntheticOpaque,
+        );
+        let a = declare(&mut txn, "a", nat(), MetavarKind::Natural);
         let before = txn.mvars.clone();
         assert!(matches!(
-            txn.unify(&Expr::mvar(a), &number(9), budget()),
+            txn.unify(&Expr::mvar(a), &Expr::mvar(b), budget()),
             Err(UnificationError::Deferred(
                 UnificationDeferred::UnresolvedAssignmentType(_)
             ))

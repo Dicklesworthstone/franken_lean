@@ -12,7 +12,9 @@
 //! its metavariables, universes and constraint queue, atomically on success.
 //! Failures retain spent work but no speculative assignments or wake-ups.
 
+mod assignment_types;
 mod assignment_universes;
+mod flex_flex;
 mod normalize;
 mod proof_irrelevance;
 mod record_eta;
@@ -535,6 +537,7 @@ impl Engine<'_> {
         lhs: &Expr,
         rhs: &Expr,
         locals: &LocalContext,
+        pending: &mut VecDeque<Equation>,
     ) -> Result<bool, UnificationError> {
         let mut head = lhs;
         let mut arguments = Vec::new();
@@ -600,6 +603,7 @@ impl Engine<'_> {
                 UnificationDeferred::EscapingLocal(id.clone()),
             ));
         }
+        let typing = self.assignment_type_equation(&function_type, rhs, locals)?;
         self.assignment_slot()?;
         let awakened = self
             .work
@@ -617,6 +621,9 @@ impl Engine<'_> {
             })?;
         self.awakened.extend(awakened);
         self.assigned.push(id.clone());
+        if let Some(equation) = typing {
+            pending.push_front(equation);
+        }
         Ok(true)
     }
 
@@ -799,13 +806,13 @@ impl Engine<'_> {
             return Ok(());
         }
         let mut reason = UnificationDeferred::UnsupportedEquation;
-        match self.pattern(&left, &right, locals) {
+        match self.pattern(&left, &right, locals, pending) {
             Ok(true) => return Ok(()),
             Err(UnificationError::Deferred(found)) => reason = found,
             Ok(false) => {}
             Err(error) => return Err(error),
         }
-        match self.pattern(&right, &left, locals) {
+        match self.pattern(&right, &left, locals, pending) {
             Ok(true) => return Ok(()),
             Err(UnificationError::Deferred(found))
                 if reason == UnificationDeferred::UnsupportedEquation =>
@@ -993,9 +1000,22 @@ impl Engine<'_> {
                 break;
             }
             if self.generation() == generation {
-                return Err(UnificationError::Deferred(
-                    first_reason.expect("a postponed equation has a reason"),
-                ));
+                // Ordinary assignments get first choice. Only at their fixed
+                // point may a pattern intersection introduce a typed residual.
+                // Replay every original equation after that progress; creating
+                // an assignment is not a license to discard its obligation.
+                let mut progress = false;
+                for equation in &postponed {
+                    if self.prune_flex_flex(equation)? {
+                        progress = true;
+                        break;
+                    }
+                }
+                if !progress {
+                    return Err(UnificationError::Deferred(
+                        first_reason.expect("a postponed equation has a reason"),
+                    ));
+                }
             }
             pending = postponed;
         }
