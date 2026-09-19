@@ -57,12 +57,12 @@ fn binder_name(
     }
 }
 
-pub(super) fn frame(prefix: Prefix) -> BoundedTermFrame {
+pub(super) fn frame(prefix: impl Into<term_locals::Prefix>) -> BoundedTermFrame {
     BoundedTermFrame {
         record: None,
         ascription: None,
         open: None,
-        prefix: Some(prefix),
+        prefix: Some(prefix.into()),
         negation: None,
         application: Vec::new(),
         operands: Vec::new(),

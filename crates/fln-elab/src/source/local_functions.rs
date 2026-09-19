@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) struct Binding<'a> {
     pub name: Name,
+    pub opaque: bool,
     pub parameters: &'a Syntax,
     pub annotation: Option<&'a Syntax>,
     pub value: &'a Syntax,

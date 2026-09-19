@@ -39,6 +39,7 @@ mod proofs;
 mod record_terms;
 mod records;
 mod term_binders;
+mod term_locals;
 
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
@@ -254,7 +255,7 @@ struct BoundedTermFrame {
     record: Option<record_terms::RecordFrame>,
     ascription: Option<(Syntax, usize)>,
     open: Option<usize>,
-    prefix: Option<term_binders::Prefix>,
+    prefix: Option<term_locals::Prefix>,
     negation: Option<usize>,
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
@@ -777,6 +778,10 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
     let mut delimiters = Vec::new();
     let mut nested_lets = 0usize;
     for (index, token) in tokens.iter().enumerate().skip(from) {
+        if delimiters.is_empty() && term_locals::word(tokens, index, "have") {
+            nested_lets += 1;
+            continue;
+        }
         if let TokenKind::Symbol(symbol) = &token.kind {
             match symbol.as_str() {
                 "(" => delimiters.push(")"),
@@ -1276,8 +1281,13 @@ fn bounded_term_spliced(
             continue;
         }
         if grammar == DefinitionGrammar::Scalar
-            && matches!(&tokens[index].kind, TokenKind::Symbol(s)
-                if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "," | "=>" | "↦"))
+            && (matches!(&tokens[index].kind, TokenKind::Symbol(s)
+                if matches!(s.as_str(), ")" | "}" | "]" | "⦄" | "," | "=>" | "↦" | ";" | ":=" | "from"))
+                || term_locals::word(tokens, index, "from")
+                || frames
+                    .last()
+                    .and_then(|frame| frame.prefix.as_ref())
+                    .is_some_and(|prefix| prefix.closes_header(tokens, index)))
         {
             finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, index)?;
             if let Some(mut frame) = frames.pop_if(|frame| {
@@ -1310,6 +1320,14 @@ fn bounded_term_spliced(
             continue;
         }
         match tokens.get(index).map(|token| &token.kind) {
+            _ if grammar == DefinitionGrammar::Scalar
+                && (term_locals::word(tokens, index, "have")
+                    || term_locals::word(tokens, index, "show")) =>
+            {
+                let prefix =
+                    term_locals::Prefix::assertion(view, tokens, index, &mut cursor, range.end)?;
+                frames.push(term_binders::frame(prefix));
+            }
             Some(TokenKind::Symbol(symbol))
                 if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
             {

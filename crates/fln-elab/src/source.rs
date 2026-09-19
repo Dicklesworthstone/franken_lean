@@ -170,6 +170,9 @@ struct Context {
     // their successful alternative. Outside speculation, ordinary final K1
     // admission retains its existing error boundary.
     attempt_depth: usize,
+    // Opaque assertions remain parameter assumptions until their continuations
+    // have been checked. Visibility comes from lctx, including after rollback.
+    opaque_locals: std::collections::HashSet<FVarId>,
     txn: ElabTxn,
     kernel: Budget,
     next: u64,
@@ -199,6 +202,7 @@ impl Context {
         Self {
             source_scope: SourceScope::default(),
             attempt_depth: 0,
+            opaque_locals: std::collections::HashSet::new(),
             txn,
             kernel,
             next: 0,
@@ -498,6 +502,29 @@ impl Context {
         self.constrain(&actual, &expected)
     }
 
+    fn check_scoped_equation(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.check_attempt_equation(actual, expected)?;
+        // Reinstating the witness in the final let would otherwise make K1
+        // accept conversions which are unavailable under an opaque hypothesis.
+        // The kernel fallback preserves arithmetic and proof irrelevance; it
+        // closes live parameters as lambdas, never as their hidden witnesses.
+        if self
+            .opaque_locals
+            .iter()
+            .any(|id| self.txn.lctx.contains(id))
+            && !self.coercion_eq(actual, expected)?
+        {
+            return Err(failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Deferred(UnificationDeferred::UnsupportedEquation),
+            ))));
+        }
+        Ok(())
+    }
+
     fn constrain(&mut self, actual: &Expr, expected: &Expr) -> Result<(), NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
@@ -506,7 +533,7 @@ impl Context {
             && !actual.has_level_mvar()
             && !expected.has_level_mvar()
         {
-            self.check_attempt_equation(&actual, &expected)?;
+            self.check_scoped_equation(&actual, &expected)?;
             // Closed constraints are checked by the declaration's ordinary K1
             // admission. Keeping them there preserves its original verdict.
             return Ok(());
@@ -607,7 +634,7 @@ impl Context {
                     && !left.has_level_mvar()
                     && !right.has_level_mvar()
                 {
-                    self.check_attempt_equation(&left, &right)?;
+                    self.check_scoped_equation(&left, &right)?;
                     // Exactly the same policy as `constrain`: once inference
                     // has finished, the retained source terms and annotations
                     // are obligations of the final ordinary K1 declaration.
@@ -768,8 +795,8 @@ impl Context {
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
-            Ascription(&'a Syntax, Option<Expr>),
-            AscribedValue(Expr, Option<Expr>),
+            Ascription(&'a Syntax, Option<Expr>, bool),
+            AscribedValue(Expr, Option<Expr>, bool),
             Projection(Name, Option<Expr>, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -789,9 +816,9 @@ impl Context {
             BinderBody(binders::Telescope<'a>),
             LocalFunctionAnnotation(local_functions::Build<'a>),
             LocalFunctionValue(local_functions::Build<'a>),
-            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>),
-            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>),
-            LetBody(LocalContext, FVarId, Name, Typed),
+            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, bool),
+            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, bool),
+            LetBody(LocalContext, FVarId, Name, Typed, bool),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -923,7 +950,13 @@ impl Context {
                                         value.value.clone(),
                                     );
                                     self.matrix_aliases.insert(id.clone(), value.value.clone());
-                                    tasks.push(Task::LetBody(saved, id, name.clone(), value));
+                                    tasks.push(Task::LetBody(
+                                        saved,
+                                        id,
+                                        name.clone(),
+                                        value,
+                                        false,
+                                    ));
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
                                 }
@@ -965,6 +998,31 @@ impl Context {
                                     tasks.push(Task::Visit(&parts[0], None, true));
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "show"]) {
+                                    let parts = expect_node(syntax, kind, 3, "show term")?;
+                                    expect_atom(&parts[0], "show", "show keyword")?;
+                                    let value = if parts[2].kind()
+                                        == Some(&parser_kind(&["Term", "byTactic"]))
+                                    {
+                                        &parts[2]
+                                    } else {
+                                        let rhs = expect_node(
+                                            &parts[2],
+                                            &parser_kind(&["Term", "fromTerm"]),
+                                            2,
+                                            "show value",
+                                        )?;
+                                        expect_atom(&rhs[0], "from", "show separator")?;
+                                        &rhs[1]
+                                    };
+                                    tasks.push(Task::Ascription(value, expected, true));
+                                    tasks.push(Task::Visit(
+                                        &parts[1],
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "typeAscription"]) {
                                     let parts = expect_node(syntax, kind, 5, "term ascription")?;
                                     expect_atom(&parts[2], ":", "ascription colon")?;
@@ -973,7 +1031,7 @@ impl Context {
                                     else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
-                                    tasks.push(Task::Ascription(&parts[1], expected));
+                                    tasks.push(Task::Ascription(&parts[1], expected, false));
                                     tasks.push(Task::Visit(
                                         annotation,
                                         Some(self.type_expected()?),
@@ -1009,8 +1067,11 @@ impl Context {
                                     tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "let"]) {
-                                    let binding = self.let_parts(args)?;
+                                if kind == &parser_kind(&["Term", "let"])
+                                    || kind == &parser_kind(&["Term", "have"])
+                                {
+                                    let opaque = kind == &parser_kind(&["Term", "have"]);
+                                    let binding = self.let_parts(args, opaque)?;
                                     if !expect_null_args(
                                         binding.parameters,
                                         "local function parameters",
@@ -1040,15 +1101,18 @@ impl Context {
                                         ..
                                     } = binding;
                                     if let Some(annotation) = annotation {
-                                        tasks
-                                            .push(Task::LetAnnotation(name, value, body, expected));
+                                        tasks.push(Task::LetAnnotation(
+                                            name, value, body, expected, opaque,
+                                        ));
                                         tasks.push(Task::Visit(
                                             annotation,
                                             Some(self.type_expected()?),
                                             true,
                                         ));
                                     } else {
-                                        tasks.push(Task::LetValue(name, None, body, expected));
+                                        tasks.push(Task::LetValue(
+                                            name, None, body, expected, opaque,
+                                        ));
                                         tasks.push(Task::Visit(value, None, true));
                                     }
                                     continue;
@@ -1166,13 +1230,16 @@ impl Context {
                             self.accept_match_branch(&mut state, binders, branch)?;
                             tasks.push(Task::MatchNext(state));
                         }
-                        Task::Ascription(syntax, expected) => {
+                        Task::Ascription(syntax, expected, show) => {
                             let type_ = values.pop().expect("ascription type visit");
                             self.sort_level(&type_)?;
-                            tasks.push(Task::AscribedValue(type_.value.clone(), expected));
+                            if show && let Some(expected) = &expected {
+                                self.constrain_result_hint(&type_.value, expected)?;
+                            }
+                            tasks.push(Task::AscribedValue(type_.value.clone(), expected, show));
                             tasks.push(Task::Visit(syntax, Some(type_.value), true));
                         }
-                        Task::AscribedValue(annotation, expected) => {
+                        Task::AscribedValue(annotation, expected, show) => {
                             let term = values.pop().expect("ascribed term follows its annotation");
                             // The value's actual type guides surrounding inference.
                             // The written annotation still constrains the inner value
@@ -1186,9 +1253,12 @@ impl Context {
                                     annotation.clone(),
                                     term.value,
                                     Expr::bvar(0).expect("fixed ascription identity binder"),
-                                    false,
+                                    show,
                                 ),
-                                type_: term.type_,
+                                // `show` pins the structural result type, not merely
+                                // a definitionally equal inferred type. Rewriters
+                                // consume precisely the equation the user wrote.
+                                type_: if show { annotation } else { term.type_ },
                             };
                             // Coerce outside the assertion: its inner annotation
                             // must remain checked even if a conversion discards it.
@@ -1634,9 +1704,10 @@ impl Context {
                                 None,
                                 build.binding.body,
                                 build.expected,
+                                build.binding.opaque,
                             ));
                         }
-                        Task::LetAnnotation(name, value, body, expected) => {
+                        Task::LetAnnotation(name, value, body, expected, opaque) => {
                             let annotation = values.pop().expect("let annotation visit");
                             self.sort_level(&annotation)?;
                             tasks.push(Task::LetValue(
@@ -1644,26 +1715,45 @@ impl Context {
                                 Some(annotation.value.clone()),
                                 body,
                                 expected,
+                                opaque,
                             ));
                             tasks.push(Task::Visit(value, Some(annotation.value), true));
                         }
-                        Task::LetValue(name, annotation, body, expected) => {
+                        Task::LetValue(name, annotation, body, expected, opaque) => {
                             let mut value = values.pop().expect("let value visit");
                             if let Some(annotation) = annotation {
                                 value.type_ = annotation;
                             }
                             let saved = self.txn.lctx.clone();
                             let id = FVarId(self.fresh_name()?);
-                            self.txn.lctx.add_let(
-                                id.clone(),
-                                name.clone(),
-                                value.type_.clone(),
-                                value.value.clone(),
-                            );
-                            tasks.push(Task::LetBody(saved, id, name, value));
+                            if opaque {
+                                // A `have` witness is checked, but cannot unfold in
+                                // the continuation's elaboration context.
+                                self.txn.lctx.add_param(
+                                    id.clone(),
+                                    name.clone(),
+                                    value.type_.clone(),
+                                    BinderInfo::Default,
+                                );
+                                self.opaque_locals.insert(id.clone());
+                            } else {
+                                self.txn.lctx.add_let(
+                                    id.clone(),
+                                    name.clone(),
+                                    value.type_.clone(),
+                                    value.value.clone(),
+                                );
+                            }
+                            tasks.push(Task::LetBody(saved, id, name, value, opaque));
                             tasks.push(Task::Visit(body, expected, true));
                         }
-                        Task::LetBody(saved, id, name, value) => {
+                        Task::LetBody(saved, id, name, value, opaque) => {
+                            if opaque {
+                                // Do not postpone equations past the context that
+                                // gives this assertion its opaque interpretation.
+                                self.flush(true)?;
+                                self.opaque_locals.remove(&id);
+                            }
                             self.matrix_aliases.remove(&id);
                             let mut body = values.pop().expect("let body visit");
                             body.value = self.instantiate(&body.value)?;
@@ -1683,7 +1773,7 @@ impl Context {
                                     value.type_,
                                     value.value,
                                     abstract_body,
-                                    false,
+                                    opaque,
                                 ),
                                 type_,
                             });
@@ -1729,11 +1819,16 @@ impl Context {
     fn let_parts<'a>(
         &mut self,
         parts: &'a [Syntax],
+        opaque: bool,
     ) -> Result<local_functions::Binding<'a>, NatDefinitionElabError> {
         let [keyword, config, declaration, separator, body] = parts else {
             return Err(failure(SourceInferenceError::Scope));
         };
-        expect_atom(keyword, "let", "let keyword")?;
+        expect_atom(
+            keyword,
+            if opaque { "have" } else { "let" },
+            "local binding keyword",
+        )?;
         let config = expect_node(
             config,
             &parser_kind(&["Term", "letConfig"]),
@@ -1759,7 +1854,21 @@ impl Context {
             1,
             "let identifier",
         )?;
-        let Syntax::Ident { val: name, .. } = &id[0] else {
+        let name = if let Syntax::Ident { val: name, .. } = &id[0] {
+            name.clone()
+        } else if opaque {
+            let hygiene = expect_node(
+                &id[0],
+                &Name::from_components(["hygieneInfo"]),
+                1,
+                "anonymous assertion hygiene",
+            )?;
+            if !matches!(&hygiene[0], Syntax::Ident { val, preresolved, .. } if val.is_anonymous() && preresolved.is_empty())
+            {
+                return Err(failure(SourceInferenceError::Scope));
+            }
+            Name::from_components(["this"])
+        } else {
             return Err(failure(SourceInferenceError::Scope));
         };
         if name.is_anonymous() {
@@ -1770,7 +1879,8 @@ impl Context {
         expect_atom(&declaration[3], ":=", "let assignment")?;
         expect_atom(separator, ";", "let separator")?;
         Ok(local_functions::Binding {
-            name: name.clone(),
+            name,
+            opaque,
             parameters: &declaration[1],
             annotation,
             value: &declaration[4],
