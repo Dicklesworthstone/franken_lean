@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":475,"projection_hash":"714f8cc2920a8e376311ddf5a0f59a5e9c63559d0d5ba45946cfac6caecf034b"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":476,"projection_hash":"92127a9e44072ab7be94dd68113751f33af2ae17969360e453356aaf4799d57c"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -120,6 +120,7 @@
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-in1"}
 {"id":"fln-init-chain-council-3116-kipb"}
+{"id":"fln-init-core-council-4442-aiwk"}
 {"id":"fln-init-sizeof-council-3290-w4xk"}
 {"id":"fln-iron-target-profile-contract-ba9"}
 {"id":"fln-it70"}
