@@ -43,10 +43,31 @@ impl Context {
         let [_, _, _, _, _, location] = args else {
             return Err(error(TacticError::MalformedScript));
         };
+        self.txn.lctx = initial.lctx.clone();
         let Some(locations) = self.rewrite_locations(location)? else {
             return Ok(false);
         };
         let mut rules = self.simp_rules(args)?;
+        let mut protected = HashSet::new();
+        if locations.all {
+            // Preserve explicitly selected evidence for the entire traversal.
+            // `[*]` evidence is different: the per-hypothesis self filter and
+            // identity remapping below let other hypotheses use its new form.
+            for rule in &rules {
+                self.tick()?;
+                if !matches!(rule, SimpRule::Explicit(_)) {
+                    continue;
+                }
+                let mut trial = self.rewrite_trial();
+                let inspected = (|| {
+                    let term = trial.selected_simp_term(rule)?;
+                    trial.flush(false)?;
+                    trial.wildcard_rule_dependencies(&term)
+                })();
+                self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                protected.extend(inspected?);
+            }
+        }
         for name in &locations.hypotheses {
             self.tick()?;
             if initial.lctx.find_by_user_name(name).is_none() {
@@ -62,6 +83,9 @@ impl Context {
                 .find_by_user_name(&name)
                 .cloned()
                 .ok_or_else(|| error(TacticError::RewriteLocation))?;
+            if protected.contains(&local.id) {
+                continue;
+            }
             let mut history = vec![self.instantiate(&local.type_)?];
             loop {
                 self.tick()?;
