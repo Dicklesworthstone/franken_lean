@@ -11,8 +11,16 @@ use super::*;
 pub(super) enum Demand {
     Never,
     Always,
+    Constructor,
     /// Additional applications needed before an eliminator demands its major.
     Arguments(u64),
+}
+
+#[derive(Clone, Copy)]
+enum PathStep {
+    Apply,
+    Metadata,
+    Projection,
 }
 
 impl SlowControl {
@@ -42,16 +50,22 @@ impl SlowControl {
                     }))?;
             let demand = match node {
                 ExprNode::Apply { function, .. } => {
-                    path.push((current, true));
+                    path.push((current, PathStep::Apply));
                     current = child(current, *function)?;
                     continue;
                 }
                 ExprNode::Metadata { expression, .. } => {
-                    path.push((current, false));
+                    path.push((current, PathStep::Metadata));
+                    current = child(current, *expression)?;
+                    continue;
+                }
+                ExprNode::Projection { expression, .. } => {
+                    path.push((current, PathStep::Projection));
                     current = child(current, *expression)?;
                     continue;
                 }
                 ExprNode::Lambda { .. } | ExprNode::Let { .. } => Demand::Always,
+                ExprNode::StringLiteral(_) => Demand::Constructor,
                 ExprNode::Free { name } => {
                     let mut found = false;
                     for binding in context.free_bindings() {
@@ -65,6 +79,11 @@ impl SlowControl {
                 }
                 ExprNode::Constant { name, .. } => match context.constants().find(name) {
                     Some(entry) if entry.delta_body().is_some() => Demand::Always,
+                    Some(entry)
+                        if entry.kind() == crate::environment::ConstantKind::Constructor =>
+                    {
+                        Demand::Constructor
+                    }
                     Some(entry) => match entry.quotient_kind() {
                         Some(crate::environment::QuotientKind::Lift) => Demand::Arguments(6),
                         Some(crate::environment::QuotientKind::Induction) => Demand::Arguments(5),
@@ -86,13 +105,22 @@ impl SlowControl {
             self.spines.insert(current, demand);
             break demand;
         };
-        for (parent, application) in path.into_iter().rev() {
+        for (parent, step) in path.into_iter().rev() {
             // This insertion was charged on descent, but even cache completion
             // must remain cancellable for a deep spine.
             self.poll(cancelled)?;
-            if application && let Demand::Arguments(remaining) = demand {
-                demand = Demand::Arguments(remaining.saturating_sub(1));
-            }
+            demand = match step {
+                PathStep::Apply => match demand {
+                    Demand::Arguments(remaining) => Demand::Arguments(remaining.saturating_sub(1)),
+                    other => other,
+                },
+                PathStep::Metadata => demand,
+                PathStep::Projection => match demand {
+                    Demand::Always | Demand::Constructor => Demand::Always,
+                    Demand::Arguments(0) => Demand::Always,
+                    _ => Demand::Never,
+                },
+            };
             self.spines.insert(parent, demand);
         }
         Ok(matches!(demand, Demand::Always)

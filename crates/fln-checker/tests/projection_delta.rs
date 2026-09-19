@@ -119,6 +119,17 @@ fn projection_conversion_unfolds_its_defined_major_and_retains_outer_arguments()
 }
 
 #[test]
+fn projection_application_head_reduces_before_application_congruence() {
+    let context = defined_projection_context(DefinitionSafety::Safe);
+    let proj1 = Expr::proj(name("S"), 0, constant("dictionaryAlias"));
+    let proj2 = Expr::proj(name("S"), 0, constant("dictionary"));
+    let applied1 = Expr::app(proj1, Expr::app(identity(), nat_literal(19)));
+    let applied2 = Expr::app(proj2, nat_literal(19));
+    slow_equal(&decoded(&applied1), &decoded(&applied2), &context);
+    slow_equal(&decoded(&applied2), &decoded(&applied1), &context);
+}
+
+#[test]
 fn projection_delta_does_not_bypass_constructor_field_or_safety_checks() {
     for (structure, field, safety) in [
         ("OtherStructure", 0, DefinitionSafety::Safe),
