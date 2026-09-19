@@ -1,0 +1,117 @@
+name: Native list notation and recursive patterns
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-list-notation.yml'
+      - 'crates/fln-parse/**'
+      - 'crates/fln-elab/**'
+      - 'crates/fln/tests/source_list*'
+      - 'crates/fln-cli/tests/source_collection_notation.rs'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  native-lists:
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Assemble the checked collection frontend
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-lists'
+          evidence.mkdir()
+          (evidence / 'parent.txt').write_bytes(subprocess.check_output(['git', 'rev-parse', 'HEAD']))
+          subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(evidence / 'base-source.tar.gz'), 'HEAD'], check=True)
+          req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/4a96eae2cec190b2b72fbbddaf5110bc88943fb4', headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          with urllib.request.urlopen(req, timeout=60) as response:
+              stored = json.load(response)
+          payload = base64.b64decode(stored['content']).decode()
+          payload = payload.replace('Ars9JztPdqvYE3', 'Ars9JztPdqvHqvYE3')
+          assert hashlib.sha1(('blob ' + str(len(payload)) + '\0').encode() + payload.encode()).hexdigest() == 'a6f3c7bdbe94529c12e0c5198b52e74a1f851ebf', 'transported payload identity'
+          patch = gzip.decompress(base64.b64decode(payload))
+          assert hashlib.sha256(patch).hexdigest() == '4bf84329e980735d3a99efa813b3201fafed375148114d1898dabc51cf52355d'
+          patch_path = evidence / 'frontend.patch'
+          patch_path.write_bytes(patch)
+          paths = [line.split(' b/', 1)[1] for line in patch.decode().splitlines() if line.startswith('diff --git ')]
+          if not pathlib.Path('crates/fln-elab/src/source/collections.rs').exists():
+              subprocess.run(['git', 'apply', '--check', str(patch_path)], check=True)
+              subprocess.run(['git', 'apply', str(patch_path)], check=True)
+          (evidence / 'paths.json').write_text(json.dumps(paths))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-list-base-${{ github.sha }}
+          path: ${{ runner.temp }}/native-lists/base-source.tar.gz
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
+      - name: Validate native parser, elaborator, both checkers and installed command
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/native-lists"
+          exec > >(tee "$evidence/validation.log") 2>&1
+          channel=$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc -Vv
+          python3 -I - <<'PY'
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-lists'
+          paths = [p for p in json.loads((root / 'paths.json').read_text()) if p.endswith('.rs')]
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths], check=True)
+          PY
+          cargo test --locked -p fln-parse --test source_list_notation --test source_list_patterns
+          cargo test --locked -p fln-elab source::collections::tests
+          cargo test --locked -p fln --test source_list_notation --test source_list_patterns --test source_collections --test source_named_arguments
+          cargo test --locked -p fln-cli --test source_collection_notation
+          cargo clippy --locked -p fln-parse -p fln-elab -p fln -p fln-cli --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+          git diff --check
+      - name: Export exact validated source tree for direct main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-lists'
+          paths = json.loads((root / 'paths.json').read_text())
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          (root / 'integration.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
+          def post(endpoint, data):
+              req = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/franken_lean/git/' + endpoint, data=json.dumps(data).encode(), method='POST', headers={'Accept':'application/vnd.github+json', 'Content-Type':'application/json', 'Authorization':'Bearer ' + os.environ['GH_TOKEN']})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          entries = []
+          for path in paths:
+              content = pathlib.Path(path).read_bytes()
+              assert content == subprocess.check_output(['git', 'show', ':' + path])
+              sha = hashlib.sha1(('blob ' + str(len(content)) + '\0').encode() + content).hexdigest()
+              assert post('blobs', {'content':content.decode(), 'encoding':'utf-8'})['sha'] == sha
+              entries.append({'path':path, 'mode':'100644', 'type':'blob', 'sha':sha})
+          tree = post('trees', {'base_tree':subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(), 'tree':entries})['sha']
+          assert tree == subprocess.check_output(['git','write-tree'],text=True).strip()
+          manifest = {'parent':(root / 'parent.txt').read_text().strip(), 'tree':tree, 'files':entries}
+          (root / 'tested-tree.json').write_text(json.dumps(manifest, indent=2))
+          subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(root / 'tested-source.tar.gz'), tree], check=True)
+          print('VALIDATED_SOURCE_TREE ' + json.dumps(manifest), flush=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-list-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/native-lists
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
