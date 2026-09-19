@@ -175,3 +175,191 @@ fn pinned_init_prelude_reaches_two_checker_council_frontier() {
         }
     }
 }
+
+fn check_decl_closure(target: &[&str]) -> Outcome<fln::CheckedOlean> {
+    let lib = reference_lib().expect(
+        "pinned Reference library is unavailable; install Lean v4.32.0 or set FLN_REFERENCE_LIB before invoking this ignored real-artifact test",
+    );
+    let base = lib.join("Init/Prelude.olean");
+    let exported = std::fs::read(&base).expect("read exported Prelude");
+    let server_path = base.with_extension("olean.server");
+    let server = std::fs::read(&server_path).expect("read Prelude server companion");
+    let private_path = base.with_extension("olean.private");
+    let private = std::fs::read(&private_path).expect("read Prelude private companion");
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server]).expect("parse");
+    let infos = DeclDecoder::new(&view, WalkBudget::default()).decode_module_constants().expect("decode");
+    let owners: std::collections::BTreeMap<_, _> = infos
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name().clone(), i))
+        .collect();
+    let mut needed = std::collections::BTreeSet::new();
+    let mut queue = vec![fln_core::name::Name::from_components(target.iter().copied())];
+    loop {
+        let mut added = false;
+        while let Some(name) = queue.pop() {
+            if !needed.insert(name.clone()) {
+                continue;
+            }
+            added = true;
+            if let Some(&idx) = owners.get(&name) {
+                let info = &infos[idx];
+                let mut exprs = vec![info.constant_val().type_.clone()];
+                match info {
+                    ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+                    ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+                    ConstantInfo::Ctor(c) => exprs.push(c.base.type_.clone()),
+                    _ => {}
+                }
+                for e in exprs {
+                    let mut stack = vec![e];
+                    while let Some(cur) = stack.pop() {
+                        match cur.node() {
+                            fln_core::expr::ExprNode::Const { name, .. } => {
+                                if !needed.contains(name) {
+                                    queue.push(name.clone());
+                                }
+                            }
+                            fln_core::expr::ExprNode::App { f, a } => {
+                                stack.push(f.clone());
+                                stack.push(a.clone());
+                            }
+                            fln_core::expr::ExprNode::Lam { binder_type, body, .. }
+                            | fln_core::expr::ExprNode::ForallE { binder_type, body, .. } => {
+                                stack.push(binder_type.clone());
+                                stack.push(body.clone());
+                            }
+                            fln_core::expr::ExprNode::LetE { type_, value, body, .. } => {
+                                stack.push(type_.clone());
+                                stack.push(value.clone());
+                                stack.push(body.clone());
+                            }
+                            fln_core::expr::ExprNode::Proj { expr, .. } => {
+                                stack.push(expr.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        for info in &infos {
+            match info {
+                ConstantInfo::Induct(ind) => {
+                    if needed.contains(&ind.base.name) || ind.all.iter().any(|m| needed.contains(m)) {
+                        for m in &ind.all {
+                            if !needed.contains(m) { queue.push(m.clone()); }
+                        }
+                        for c in &ind.ctors {
+                            if !needed.contains(c) { queue.push(c.clone()); }
+                        }
+                    }
+                }
+                ConstantInfo::Ctor(ctor) => {
+                    if needed.contains(&ctor.induct) || needed.contains(&ctor.base.name) {
+                        if !needed.contains(&ctor.induct) { queue.push(ctor.induct.clone()); }
+                        if !needed.contains(&ctor.base.name) { queue.push(ctor.base.name.clone()); }
+                    }
+                }
+                ConstantInfo::Rec(rec) => {
+                    if rec.all.iter().any(|m| needed.contains(m)) || needed.contains(&rec.base.name) {
+                        if !needed.contains(&rec.base.name) { queue.push(rec.base.name.clone()); }
+                        for m in &rec.all {
+                            if !needed.contains(m) { queue.push(m.clone()); }
+                        }
+                    }
+                }
+                ConstantInfo::Defn(defn) => {
+                    if defn.all.iter().any(|m| needed.contains(m)) {
+                        for m in &defn.all {
+                            if !needed.contains(m) { queue.push(m.clone()); }
+                        }
+                    }
+                }
+                ConstantInfo::Quot(_) => {
+                    if needed.contains(info.name()) {
+                        for q in [
+                            fln_core::name::Name::from_components(["Quot"]),
+                            fln_core::name::Name::from_components(["Quot", "mk"]),
+                            fln_core::name::Name::from_components(["Quot", "lift"]),
+                            fln_core::name::Name::from_components(["Quot", "ind"]),
+                        ] {
+                            if !needed.contains(&q) { queue.push(q); }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if queue.is_empty() && !added {
+            break;
+        }
+    }
+    println!("Closed dependencies count for {target:?}: {}", needed.len());
+    let subset: Vec<ConstantInfo> = infos
+        .into_iter()
+        .filter(|c| needed.contains(c.name()))
+        .collect();
+
+    let target_name = fln_core::name::Name::from_components(target.iter().copied());
+    for c in &subset {
+        if c.name() == &target_name {
+            println!("TARGET DECL: {:?}", c.name());
+            println!("  type: {:?}", c.constant_val().type_);
+            if let ConstantInfo::Induct(ind) = c {
+                println!("  ctors: {:?}", ind.ctors);
+            }
+        }
+        if let ConstantInfo::Rec(rec) = c {
+            if rec.base.name.to_display_string() == "Lean.ParserDescr.rec" {
+                println!("RECURSOR TYPE OF Lean.ParserDescr.rec:");
+                let mut cur = rec.base.type_.clone();
+                let mut b_idx = 0;
+                while let fln_core::expr::ExprNode::ForallE { binder_name, binder_type, body, binder_info } = cur.node() {
+                    println!("  binder #{b_idx}: name={:?}, info={:?}, type={:?}", binder_name.to_display_string(), binder_info, binder_type);
+                    cur = body.clone();
+                    b_idx += 1;
+                }
+                println!("  return: {:?}", cur);
+            }
+        }
+    }
+
+    let engine = Engine::from_environment(Environment::new());
+    let limits = OleanCheckLimits::new(64 * 1024 * 1024, Budget::for_stack_bytes(2 * 1024 * 1024));
+    let mut decoded = fln::decode_olean_module_artifacts(&exported, &server, &private, limits.decode)
+        .expect("decode");
+    decoded.constants = subset;
+    engine.check_decoded_olean(decoded, &KVMap::new(), limits).expect("check_decoded_olean failed")
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude companion chain"]
+fn inspect_char_of_nat_proof_2() {
+    let outcome = check_decl_closure(&["Char", "ofNat", "_proof_2"]);
+    let Outcome::Complete(checked) = outcome else {
+        panic!("Char.ofNat._proof_2 dependency closure must pass council, got: {outcome:?}");
+    };
+    assert!(!checked.declarations.is_empty());
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude companion chain"]
+fn inspect_nat_mod_core_lt() {
+    let outcome = check_decl_closure(&["Nat", "modCore_lt"]);
+    let Outcome::Complete(checked) = outcome else {
+        panic!("Nat.modCore_lt dependency closure must pass council, got: {outcome:?}");
+    };
+    assert!(!checked.declarations.is_empty());
+}
+
+#[test]
+#[ignore = "requires the pinned Lean v4.32.0 Init.Prelude companion chain"]
+fn inspect_lean_parser_descr() {
+    let outcome = check_decl_closure(&["Lean", "ParserDescr"]);
+    let Outcome::Complete(checked) = outcome else {
+        panic!("Lean.ParserDescr dependency closure must pass council, got: {outcome:?}");
+    };
+    assert!(!checked.declarations.is_empty());
+}
+
