@@ -5,6 +5,7 @@
 //! reduce. A blocked major is rebuilt once; it is never re-entered in a loop.
 //! This module has no declaration-publication authority. Assignment validation
 //! and all-or-nothing publication remain in the parent solver.
+mod k;
 mod quotient;
 
 use super::*;
@@ -220,9 +221,13 @@ impl Engine<'_> {
                         prefix,
                         major,
                     } => {
-                        if let Some(result) =
-                            self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?
-                        {
+                        let reduced =
+                            self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?;
+                        let reduced = match reduced {
+                            Some(value) => Some(value),
+                            None => self.k_iota(&rec_head, &recursor, &outer)?,
+                        };
+                        if let Some(result) = reduced {
                             // The reversed spine starts with arguments after
                             // the major. Keep these for a function-valued result.
                             outer.truncate(outer.len() - major - 1);
