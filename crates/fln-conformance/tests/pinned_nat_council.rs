@@ -1545,9 +1545,13 @@ fn preflight_candidate_next_batch_council_admission() {
     ];
 
     let mut env = Environment::new();
+    let mut set_of_all: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
+    let mut available_consts: std::collections::BTreeSet<fln_core::name::Name> = std::collections::BTreeSet::new();
     for name in &base_modules {
+        set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
         let m = load(name);
         for c in m.constants {
+            available_consts.insert(c.name().clone());
             env = env.add_decl(c).expect("add decl to env");
         }
     }
@@ -1566,15 +1570,86 @@ fn preflight_candidate_next_batch_council_admission() {
         "Init/Sym/DSimp/DSimprocDSL",
         "Init/Sym/Simp/SimprocDSL",
         "Init/SimpLemmas",
-        "Init/Grind/Config",
-        "Init/MetaTypes",
+        "Init/Grind/Interactive",
+        "Init/Grind/Tactics",
+        "Init/Data/Option/Basic",
+        "Init/Data/Nat/Basic",
     ];
 
     for name in candidates {
         let start = std::time::Instant::now();
         let m = load(name);
         let num_decls = m.constants.len();
-        eprintln!("Checking candidate {name} ({num_decls} declarations)...");
+        eprintln!("\n=== CANDIDATE {name} ({num_decls} declarations) ===");
+
+        let mut missing_imports = Vec::new();
+        for imp in &m.module.imports {
+            if !set_of_all.contains(&imp.module) {
+                missing_imports.push(imp.module.to_display_string());
+            }
+        }
+        if !missing_imports.is_empty() {
+            eprintln!("SKIPPING {name}: missing imports {missing_imports:?}");
+            continue;
+        }
+
+        let mut missing_consts = std::collections::BTreeSet::new();
+        for c in &m.constants {
+            let mut exprs = vec![c.constant_val().type_.clone()];
+            match c {
+                ConstantInfo::Thm(t) => exprs.push(t.value.clone()),
+                ConstantInfo::Defn(d) => exprs.push(d.value.clone()),
+                ConstantInfo::Ctor(ctor) => exprs.push(ctor.base.type_.clone()),
+                _ => {}
+            }
+            for e in exprs {
+                let mut stack = vec![e];
+                while let Some(cur) = stack.pop() {
+                    match cur.node() {
+                        fln_core::expr::ExprNode::Const { name: cname, .. } => {
+                            if !available_consts.contains(cname) {
+                                missing_consts.insert(cname.clone());
+                            }
+                        }
+                        fln_core::expr::ExprNode::App { f, a } => {
+                            stack.push(f.clone());
+                            stack.push(a.clone());
+                        }
+                        fln_core::expr::ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | fln_core::expr::ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            stack.push(binder_type.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            stack.push(type_.clone());
+                            stack.push(value.clone());
+                            stack.push(body.clone());
+                        }
+                        fln_core::expr::ExprNode::Proj { expr, .. } => {
+                            stack.push(expr.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if !missing_consts.is_empty() {
+            eprintln!(
+                "SKIPPING {name}: {} missing constant references (sample: {:?})",
+                missing_consts.len(),
+                missing_consts.iter().take(5).map(|n| n.to_display_string()).collect::<Vec<_>>()
+            );
+            continue;
+        }
+
+        eprintln!("All imports and constants closed! Running council check...");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine.clone().check_decoded_olean(m, &KVMap::new(), limits)
         }));
@@ -1586,6 +1661,10 @@ fn preflight_candidate_next_batch_council_admission() {
                     checked.declarations.len(),
                     elapsed
                 );
+                set_of_all.insert(fln_core::name::Name::from_components(name.split('/')));
+                for c in &checked.declarations {
+                    available_consts.insert(c.name.clone());
+                }
                 engine = checked.engine;
             }
             Ok(Ok(Outcome::Inconclusive(reason))) => {
