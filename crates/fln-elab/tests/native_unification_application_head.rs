@@ -50,8 +50,9 @@ fn budget() -> UnificationBudget {
 fn transaction() -> ElabTxn {
     // The opaque Nat bootstrap supports literals, not constructor names.
     // These tests need the real inductive block, admitted through K1.
+    let env = Environment::new();
     let Outcome::Complete(admitted) = admit(
-        &Environment::new(),
+        &env,
         fln_elab::seed::nat_inductive_seed_declaration(),
         budget().kernel,
     ) else {
