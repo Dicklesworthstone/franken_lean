@@ -23,13 +23,14 @@ const MAX_KEY_UNITS: usize = 65_536;
 struct Key {
     expected: Expr,
     output_types: Vec<Expr>,
+    syntax_units: usize,
     locals: LocalContext,
     ancestors: Vec<Expr>,
 }
 
 impl Key {
     fn units(&self) -> usize {
-        1 + self.output_types.len() + self.locals.len() + self.ancestors.len()
+        1 + self.syntax_units + self.output_types.len() + self.locals.len() + self.ancestors.len()
     }
 }
 
@@ -129,12 +130,13 @@ fn key(
             return Ok(None);
         }
     }
-    let Some((expected, output_types)) = outputs::canonical(context, frame)? else {
+    let Some(canonical) = outputs::canonical(context, frame)? else {
         return Ok(None);
     };
     Ok(Some(Key {
-        expected,
-        output_types,
+        expected: canonical.expected,
+        output_types: canonical.types,
+        syntax_units: canonical.units,
         locals: locals.clone(),
         ancestors: ancestors.iter().map(|frame| frame.key.clone()).collect(),
     }))

@@ -1,17 +1,29 @@
-//! Canonical keys for fresh, bare output and semi-output holes. Placeholders are key data only.
-//! Sharing preserves repeated-hole identity and the exact declared hole types.
-//! Arbitrary open terms, opaque/delayed holes and foreign scopes are not guessed.
+//! Canonical keys for structured outputs and bare semi-output holes.
+//! Hole alias patterns, declared types, binders and sharing remain explicit.
+//! Opaque/delayed holes, open declared types and foreign scopes are not guessed.
 use super::*;
+
+mod syntax;
+
+pub(super) struct Canonical {
+    pub expected: Expr,
+    pub types: Vec<Expr>,
+    pub units: usize,
+}
 
 pub(super) fn canonical(
     context: &mut Context,
     frame: &Frame,
-) -> Result<Option<(Expr, Vec<Expr>)>, NatDefinitionElabError> {
-    if ground(&frame.expected) {
-        return Ok(Some((frame.expected.clone(), Vec::new())));
-    }
-    if frame.expected.has_level_mvar() {
+) -> Result<Option<Canonical>, NatDefinitionElabError> {
+    if frame.expected.has_level_mvar() || frame.expected.has_loose_bvars() {
         return Ok(None);
+    }
+    if ground(&frame.expected) {
+        return Ok(Some(Canonical {
+            expected: frame.expected.clone(),
+            types: Vec::new(),
+            units: 0,
+        }));
     }
     let mut expected = &frame.expected;
     let mut shape = &frame.key;
@@ -30,52 +42,28 @@ pub(super) fn canonical(
         }
     }
     let mut canonical = expected.clone();
-    let mut holes = Vec::new();
-    let mut types = Vec::new();
+    let mut templates = syntax::Templates::default();
+    let mut spine_units = 0;
     for (argument, output) in arguments.into_iter().rev() {
         context.tick()?;
         let argument = if ground(argument) {
             argument.clone()
         } else {
-            let ExprNode::MVar { id } = argument.node() else {
-                return Ok(None);
-            };
             if !output {
                 return Ok(None);
             }
-            let Some(decl) = frame.base.txn.mvars.get_decl(id) else {
+            let Some(value) = templates.rewrite(context, frame, argument)? else {
                 return Ok(None);
             };
-            if decl.kind != MetavarKind::Natural
-                || decl.depth != 0
-                || decl.delayed.is_some()
-                || frame.base.txn.mvars.is_assigned(id)
-                || decl.lctx != frame.base.txn.lctx
-                || !ground(&decl.type_)
-            {
-                return Ok(None);
-            }
-            let mut previous = None;
-            for (index, old) in holes.iter().enumerate() {
-                context.tick()?;
-                if old == id {
-                    previous = Some(index);
-                    break;
-                }
-            }
-            let position = if let Some(index) = previous {
-                index
-            } else {
-                if holes.len() >= MAX_KEY_UNITS {
-                    return Ok(None);
-                }
-                holes.push(id.clone());
-                types.push(decl.type_.clone());
-                holes.len() - 1
-            };
-            Expr::bvar((position + 1) as u32).map_err(|_| failure(SourceInferenceError::Scope))?
+            value
         };
         canonical = Expr::app(canonical, argument);
+        spine_units += 1;
     }
-    Ok(Some((canonical, types)))
+    let units = spine_units + templates.units();
+    Ok(Some(Canonical {
+        expected: canonical,
+        types: templates.types,
+        units,
+    }))
 }
